@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from hmac import compare_digest
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, IPv4Network
 import os
 from pathlib import Path
 import re
@@ -26,6 +26,7 @@ class LanIngress:
     authority: str
     health_authority: str
     proxy_token: bytes = field(repr=False)
+    allowed_client_cidrs: tuple[IPv4Network, ...]
 
     def check(self, request: Request) -> JSONResponse | None:
         hosts = request.headers.getlist('host')
@@ -46,6 +47,8 @@ class LanIngress:
             client = None
         if client is None or client.is_unspecified or client.is_multicast or client.is_reserved:
             return _denied(403, '无法确认客户端地址。')
+        if not any(client in network for network in self.allowed_client_cidrs):
+            return _denied(403, '客户端不在允许的局域网范围内。')
         origins = request.headers.getlist('origin')
         if request.method not in READ_METHODS and origins != [f'https://{self.authority}']:
             return _denied(403, '跨站请求已拒绝。')
@@ -58,9 +61,13 @@ def load_lan_ingress() -> LanIngress | None:
     authority = os.getenv('CITRUS_LAN_AUTHORITY')
     token_path = os.getenv('CITRUS_LAN_TOKEN_FILE')
     local_port = os.getenv('CITRUS_LAN_UPSTREAM_PORT')
-    if authority is None and token_path is None and local_port is None:
+    allowed = os.getenv('CITRUS_LAN_CLIENT_CIDRS')
+    if all(value is None for value in (authority, token_path, local_port, allowed)):
         return None
     try:
+        cidrs = tuple(IPv4Network(value) for value in (allowed or '').split())
+        if not cidrs or any(network.prefixlen == 0 for network in cidrs):
+            raise ValueError
         host, port = (authority or '').split(':')
         ip = IPv4Address(host)
         if (ip.is_unspecified or ip.is_multicast or ip.is_reserved or ip.is_link_local
@@ -85,4 +92,4 @@ def load_lan_ingress() -> LanIngress | None:
             raise ValueError
     except (OSError, ValueError):
         raise RuntimeError('Invalid LAN proxy credential file') from None
-    return LanIngress(f'{ip}:{port}', f'{LOOPBACK}:{int(local_port)}', token)
+    return LanIngress(f'{ip}:{port}', f'{LOOPBACK}:{int(local_port)}', token, cidrs)

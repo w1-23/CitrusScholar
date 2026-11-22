@@ -19,6 +19,8 @@ from .journal import Journal, _ACTIVATING, read_pointer, write_pointer
 logger = logging.getLogger(__name__)
 CORPUS_ID = "shared_agent_literature"
 FAMILY_ID = "agent_literature"
+MAX_INDEX_DOCUMENTS = 100
+INDEX_WARNING_DOCUMENTS = 80
 _runtime = None
 _HEALTH_TIMEOUT_SEC = 5
 
@@ -99,7 +101,9 @@ class SharedCorpusRuntime:
 
     def enqueue_build(self, owner, publishable):
         documents = sorted({(row["document_id"], row["version_id"]) for row in publishable})
-        if not documents or len(documents) > 100:
+        if len(documents) > MAX_INDEX_DOCUMENTS:
+            raise ValueError("shared_index_document_limit")
+        if not documents:
             raise ValueError("shared_publishable_batch_out_of_bounds")
         job = self.journal.enqueue(owner, documents)
         self.notify()
@@ -174,10 +178,11 @@ class SharedCorpusRuntime:
         if not self.unavailable and version in self.journal.active_versions(self.generation, document):
             return {"indexing_status": "active", "index_generation": self.generation}
         pending = self.journal.pending()
-        if (pending and pending["generation"] and pending["state"] != "rolling_back"
+        if (pending and pending["state"] != "rolling_back"
                 and [document, version] in json.loads(pending["documents"])):
-            return {"indexing_status": "indexed_ready", "index_generation": pending["generation"]}
-        return inactive
+            state = "indexed_ready" if pending["generation"] else "build_pending"
+            return {"indexing_status": state, "index_generation": pending["generation"]}
+        return {**inactive, "indexing_status": "awaiting_build"}
 
     def preview(self, document, *, generation=None, version=None, start=0, length=12000, digest=None):
         with self.activity.reader():
@@ -414,6 +419,68 @@ class SharedCorpusRuntime:
                 await asyncio.wait_for(self.wake.wait(), timeout=interval)
             except TimeoutError:
                 pass
+
+    def preparation_states(self, candidates):
+        from .prepare import MAX_SOURCE_BYTES
+
+        if not candidates:
+            return {}
+        ids = [row["id"] for row in candidates]
+        placeholders = ','.join('?' for _ in ids)
+        with self.journal.connection() as conn:
+            rows = {row["candidate_id"]: row for row in conn.execute(
+                "SELECT p.candidate_id,p.state,s.state AS proposal_state,s.document_id,s.version_id "
+                "FROM shared_preparations p LEFT JOIN shared_proposals s "
+                "ON s.candidate_id=p.candidate_id AND s.owner_user_id=p.owner "
+                f"WHERE p.candidate_id IN ({placeholders})", ids)}
+        states = {}
+        for candidate in candidates:
+            cid = candidate["id"]
+            row = rows.get(cid)
+            if candidate.get("archive_state") == "fulltext_missing":
+                state = "fulltext_missing"
+            elif candidate.get("status") == "rejected":
+                state = "rejected"
+            elif int(candidate.get("raw_bytes") or 0) > MAX_SOURCE_BYTES:
+                state = "source_too_large"
+            elif row is None:
+                state = "not_queued"
+            elif row["state"] != "prepared":
+                state = row["state"]
+            else:
+                state = row["proposal_state"] or "prepared"
+                if row["document_id"] and row["version_id"]:
+                    indexed = self.indexing_status(row["document_id"], row["version_id"])["indexing_status"]
+                    if indexed != "unindexed":
+                        state = indexed
+            states[cid] = state
+        return states
+
+    def capacity(self):
+        from src.core.corpus_review import MAX_ARCHIVE_BYTES
+        from .orchestrator import MAX_PENDING
+        from .prepare import MAX_SOURCE_BYTES
+
+        with self.journal.connection() as conn:
+            documents = conn.execute(
+                "SELECT count(*) FROM shared_documents d JOIN shared_rights r "
+                "ON d.document_id=r.document_id AND d.version_id=r.version_id "
+                "WHERE r.status='granted' AND d.superseded_by IS NULL").fetchone()[0]
+            preparations = dict(conn.execute("SELECT state,count(*) FROM shared_preparations GROUP BY state"))
+        alerts = []
+        if documents > MAX_INDEX_DOCUMENTS:
+            alerts.append("index_document_limit_exceeded")
+        elif documents == MAX_INDEX_DOCUMENTS:
+            alerts.append("index_document_limit_reached")
+        elif documents >= INDEX_WARNING_DOCUMENTS:
+            alerts.append("index_document_limit_near")
+        queued, deferred = (preparations.get(name, 0) for name in ("queued", "queue_full"))
+        if queued >= MAX_PENDING or deferred:
+            alerts.append("preparation_queue_full")
+        return {"authorized_documents": documents, "index_document_limit": MAX_INDEX_DOCUMENTS,
+                "archive_byte_limit": MAX_ARCHIVE_BYTES, "preparation_byte_limit": MAX_SOURCE_BYTES,
+                "preparation_queued": queued, "preparation_deferred": deferred, "preparation_limit": MAX_PENDING,
+                "alerts": alerts}
 
     def status(self):
         job = self.journal.pending()

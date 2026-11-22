@@ -7,6 +7,8 @@ from src.figures.script_outputs import strict_json
 from .integrity_review import finding
 
 SCHEMA = "custom-audit-finding/1"
+REPORT_SCHEMA = "custom-audit-report/1"
+_METHOD_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,79}")
 MAX_OUTPUT_BYTES = 64 * 1024
 MAX_FINDINGS = 20
 MAX_CELLS = 64
@@ -65,14 +67,7 @@ def _verified_locations(cells, refs, snapshots):
             for (fid, sheet, row), columns in sorted(coordinates.items())]
 
 
-def _finding(raw, inputs, snapshots, provenance):
-    if (not isinstance(raw, dict) or set(raw) != _FIELDS or raw["schema"] != SCHEMA
-            or raw["interpretation_scope"] != "review_lead_only"
-            or any(not isinstance(raw[key], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,79}", raw[key])
-                   for key in ("method_id", "method_version"))
-            or any(not isinstance(raw[key], dict) for key in ("parameters", "numerical_evidence"))):
-        raise ValueError("custom_audit_finding_invalid")
-    coverage = raw["coverage"]
+def _validate_coverage(coverage):
     count_keys = {"requested", "executed", "skipped", "truncated"}
     if (not isinstance(coverage, dict) or set(coverage) != count_keys | {"reason"}
             or any(type(coverage[key]) is not int or not 0 <= coverage[key] <= 100_000_000 for key in count_keys)
@@ -80,6 +75,17 @@ def _finding(raw, inputs, snapshots, provenance):
             or not isinstance(coverage["reason"], str) or len(coverage["reason"]) > 200
             or ((coverage["truncated"] or coverage["skipped"]) and not coverage["reason"].strip())):
         raise ValueError("custom_audit_coverage_invalid")
+
+
+def _finding(raw, inputs, snapshots, provenance):
+    if (not isinstance(raw, dict) or set(raw) != _FIELDS or raw["schema"] != SCHEMA
+            or raw["interpretation_scope"] != "review_lead_only"
+            or any(not isinstance(raw[key], str) or not _METHOD_TOKEN.fullmatch(raw[key])
+                   for key in ("method_id", "method_version"))
+            or any(not isinstance(raw[key], dict) for key in ("parameters", "numerical_evidence"))):
+        raise ValueError("custom_audit_finding_invalid")
+    coverage = raw["coverage"]
+    _validate_coverage(coverage)
     refs = _source_refs(raw["source_refs"], inputs)
     locations = _verified_locations(raw["cells"], refs, snapshots)
     return finding(rule="custom." + raw["method_id"], version=raw["method_version"],
@@ -113,8 +119,6 @@ def admit(reference, snapshots):
                 or environment.get("revision") != request.environment_revision):
             raise ValueError("custom_audit_environment_mismatch")
         payload = strict_json(data)
-        if not isinstance(payload, list) or len(payload) > MAX_FINDINGS:
-            raise ValueError("custom_audit_finding_list_invalid")
         inputs = {item.file_id: item.sha256 for item in request.inputs}
         if not inputs or any(not any(fid == key[0] and snapshot.source_sha256 == digest
                                     for key, snapshot in snapshots.items()) for fid, digest in inputs.items()):
@@ -125,10 +129,31 @@ def admit(reference, snapshots):
                           "request_fingerprint": request.fingerprint, "network_policy": "offline",
                           "output_sha256": ref["sha256"], "image_id": environment["image_id"],
                           "environment_id": request.environment_id, "environment_revision": request.environment_revision}}
+        report = {}
+        if isinstance(payload, dict):
+            keys = {"schema", "method_id", "method_version", "input_sha256", "coverage", "findings"}
+            if (set(payload) != keys or payload["schema"] != REPORT_SCHEMA
+                    or any(not isinstance(payload[key], str) or not _METHOD_TOKEN.fullmatch(payload[key])
+                           for key in ("method_id", "method_version"))):
+                raise ValueError("custom_audit_report_invalid")
+            if payload["input_sha256"] != inputs:
+                raise ValueError("custom_audit_execution_input_mismatch")
+            _validate_coverage(payload["coverage"])
+            report = {key: payload[key] for key in keys - {"findings"}}
+            report["coverage"] = {**report["coverage"], "coverage_basis": "script_reported"}
+            payload = payload["findings"]
+        if not isinstance(payload, list) or len(payload) > MAX_FINDINGS:
+            raise ValueError("custom_audit_finding_list_invalid")
         findings = [_finding(raw, inputs, snapshots, provenance) for raw in payload]
-        complete = bool(findings) and all(not (row["coverage"]["skipped"] or row["coverage"]["truncated"])
-                                          for row in findings)
-        return findings, {"status": "complete" if complete else "partial", "findings": len(findings),
+        if report and any((row["method_id"], row["method_version"]) !=
+                          (report["method_id"], report["method_version"]) for row in payload):
+            raise ValueError("custom_audit_report_method_mismatch")
+        coverage = report.get("coverage") or {}
+        complete = bool(coverage.get("executed")) and all(
+            not (scope["skipped"] or scope["truncated"]) for scope in
+            [coverage, *(row["coverage"] for row in findings)]
+        )
+        return findings, {**report, "status": "complete" if complete else "partial", "findings": len(findings),
                           "runtime_receipt": provenance["runtime_receipt"]}
 
 
@@ -139,7 +164,6 @@ def admit(reference, snapshots):
 METHOD_SCHEMA = "custom-audit-method-candidate/1"
 MIN_METHOD_REPEATS = 2
 MAX_METHOD_REPEATS = 8
-_METHOD_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,79}")
 
 
 def _receipt_environment(receipt):

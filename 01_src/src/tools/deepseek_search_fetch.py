@@ -493,11 +493,12 @@ def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "
                                                license_source_url=evidence_url)
         if archived is None:
             return {"retention_status": "archive_unavailable"}
-        if runtime is not None and archived["status"] in {"pending", "approved"}:
-            from src.shared_corpus.orchestrator import schedule
-            schedule(runtime, archived["id"], owner, verified_license=archived["verified_license"])
+        from src.shared_corpus.orchestrator import schedule
+        preparation = (schedule(runtime, archived["id"], owner, verified_license=archived["verified_license"],
+                                raw_bytes=archived["raw_bytes"])
+                       if archived["status"] in {"pending", "approved"} else "rejected")
         return {"candidate_id": archived["id"], "retention_status": archived["status"],
-                "deduped": archived["deduped"]}
+                "archive_state": "archived", "preparation_status": preparation, "deduped": archived["deduped"]}
     except Exception as error:
         logger.warning("Online paper retention unavailable: %s", type(error).__name__)
         return {"retention_status": "archive_unavailable"}

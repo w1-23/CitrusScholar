@@ -54,7 +54,12 @@ In `research_integrity` mode, bind the selected account files into the
 existing offline Code Workspace by ID and hash. Declare a JSON output under
 `/outputs/`. Pass only its `execution_id` and `path` as
 `checks_json.custom_findings` after successful Code Worker acceptance.
-Emit a JSON array of up to 20 records with these fields:
+Emit a JSON object with `schema` = `custom-audit-report/1`, `method_id`,
+`method_version`, `input_sha256` (a map from each Worker input file ID to
+its SHA-256), report-level `coverage`, and `findings` (up to 20 records).
+Report coverage uses the counts below. Account for every requested unit
+in exactly one of `executed`, `skipped`, or `truncated`. Each finding uses
+the same method ID and version and has these fields:
 
 - `schema` = `custom-audit-finding/1`, `method_id`, `method_version`
 - `source_refs` with `{file_id, sha256}` and `cells` with
@@ -66,6 +71,8 @@ Emit a JSON array of up to 20 records with these fields:
 The host obtains the script hash, offline runtime receipt, output hash and
 installed dependency versions from the Worker. It checks locations against
 its own selected table snapshots. Treat parameters, numerical results and
-coverage counts as script observations. A result with no admitted finding
-provides no finding-level coverage receipt. Use the existing review record
+coverage counts as script observations. An empty `findings` list can have
+complete coverage when a verified offline run executed the full declared
+scope on the matching inputs. A legacy array still returns its admitted
+findings with partial coverage. Use the existing review record
 for decisions. Scripts are one-off and have read-only original inputs.

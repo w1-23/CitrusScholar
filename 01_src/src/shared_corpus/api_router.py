@@ -83,7 +83,8 @@ def admin_status(request: Request):
         pending = {**_job_view(job), "error_category": job["error"],
                    "document_count": len(json.loads(job["documents"])),
                    "deferred": job["state"] == "waiting_for_idle" and time.time() - job["updated"] >= 86400}
-    result.update(gate_closed=runtime.activity.gated, activity=dict(runtime.activity.counts), pending=pending)
+    result.update(gate_closed=runtime.activity.gated, activity=dict(runtime.activity.counts),
+                  pending=pending, capacity=runtime.capacity())
     return JSONResponse(result, headers=_PRIVATE)
 
 
@@ -93,6 +94,8 @@ def admin_build(request: Request):
     try:
         job = _runtime().request_build(owner)
     except ValueError as error:
+        if str(error) == "shared_index_document_limit":
+            raise HTTPException(409, "已授权文献超过单代索引容量上限。请检查共享库容量状态。") from error
         raise HTTPException(409, "无法申请共享库构建，请检查候选文献、待处理任务或构建额度。") from error
     return JSONResponse(_job_view(job), status_code=202, headers=_PRIVATE)
 

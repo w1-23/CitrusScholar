@@ -750,6 +750,7 @@ def test_lan_mode_auth_uses_https_origin_cookie_and_verified_client(api, monkeyp
     monkeypatch.setenv('CITRUS_LAN_AUTHORITY', address)
     monkeypatch.setenv('CITRUS_LAN_UPSTREAM_PORT', '8043')
     monkeypatch.setenv('CITRUS_LAN_TOKEN_FILE', str(token_path))
+    monkeypatch.setenv('CITRUS_LAN_CLIENT_CIDRS', '192.0.2.16/28 198.51.100.5/32')
     monkeypatch.setenv('CITRUS_COOKIE_SECURE', '0')
     monkeypatch.setenv('CITRUS_TRUST_CLOUDFLARE_PROXY', '1')
     app = api.client.app
@@ -774,6 +775,8 @@ def test_lan_mode_auth_uses_https_origin_cookie_and_verified_client(api, monkeyp
     assert same_host.post(login_path, json=body, headers={**headers, 'Origin': f'http://{address}'}).status_code == 403
     assert same_host.post(login_path, json=body, headers={**headers, 'X-Citrus-Proxy-Auth': ''}).status_code == 403
     assert other_host.post(login_path, json=body, headers=headers).status_code == 403
+    for outside in ('192.0.2.32', '198.51.100.6', '::ffff:192.0.2.21'):
+        assert same_host.post(login_path, json=body, headers={**headers, 'X-Citrus-Client-Ip': outside}).status_code == 403
     assert rate_keys == []
 
     response = same_host.post(login_path, json=body, headers=headers)
@@ -783,6 +786,12 @@ def test_lan_mode_auth_uses_https_origin_cookie_and_verified_client(api, monkeyp
     assert same_host.get('/api/v2/auth/me', headers=headers).status_code == 200
     assert same_host.post(login_path, json=body, headers={**headers, 'X-Citrus-Client-Ip': '192.0.2.22'}).status_code == 200
     assert rate_keys == [('login', f'192.0.2.{number}|lan-test-member') for number in (21, 22)]
+
+    for invalid in ('', '0.0.0.0/0', '192.0.2.10/24', '::/0'):
+        with monkeypatch.context() as settings:
+            settings.setenv('CITRUS_LAN_CLIENT_CIDRS', invalid)
+            with pytest.raises(RuntimeError, match='Invalid LAN ingress configuration'):
+                load_lan_ingress()
 
     token_path.chmod(0o644)
     with pytest.raises(RuntimeError, match='Invalid LAN proxy credential file'):

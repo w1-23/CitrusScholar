@@ -4,12 +4,13 @@ Web 在 `127.0.0.1:8043` 运行。Caddy 在已核实的 LAN IPv4 的 `18443` 提
 
 ## 候选部署配置
 
-将 `deployment.example.json` 的 `lan_ingress` 设为包含以下三个字段的对象。
+将 `deployment.example.json` 的 `lan_ingress` 设为包含以下四个字段的对象。
 
 | 字段 | 值 |
 |---|---|
 | `ipv4` | 受邀设备能够路由到的服务器 LAN IPv4，与 Caddy 的 `CITRUS_LAN_IP` 一致 |
 | `port` | `18443` |
+| `allowed_client_cidrs` | 网管确认的非空 IPv4 CIDR 列表。将完全相同的网段以空格连接，从 `CITRUS_CAMPUS_IPV4_CIDRS` 传给 Caddy，并配置到防火墙。拒绝默认路由 `0.0.0.0/0`。 |
 | `proxy_token_file` | Web 服务用户专用的绝对文件路径，文件权限为 `0600` 或 `0400` |
 
 由部署环境生成 32 字节随机值，以 64 个小写十六进制字符写入该文件，Caddy 使用同一值的 `CITRUS_PROXY_TOKEN`。通过服务账户的私有文件或 systemd 凭证传递，避免出现在命令参数、源码、请求头日志和验证记录中。代理配置及 Caddy 进程环境仅对运维和服务账户开放。凭证轮换时协调 Web 和代理切换。LAN 模式自动启用 Secure Cookie，应用仅对代理流量和本机健康检查开放，入口的写操作须带准确的 HTTPS Origin。

@@ -1,5 +1,6 @@
 {
 	admin off
+	default_sni {$CITRUS_LAN_IP}
 	auto_https disable_redirects
 	skip_install_trust
 	servers {
@@ -11,11 +12,17 @@ https://{$CITRUS_LAN_IP}:18443 {
 	bind {$CITRUS_LAN_IP}
 	tls internal
 
-	reverse_proxy 127.0.0.1:8043 {
-		header_up X-Citrus-Proxy-Auth {env.CITRUS_PROXY_TOKEN}
-		header_up X-Citrus-Client-Ip {http.request.remote.host}
-		header_up -Forwarded
-		header_up -Cf-Connecting-Ip
+	@campus remote_ip {$CITRUS_CAMPUS_IPV4_CIDRS}
+	handle @campus {
+		reverse_proxy 127.0.0.1:8043 {
+			header_up X-Citrus-Proxy-Auth {env.CITRUS_PROXY_TOKEN}
+			header_up X-Citrus-Client-Ip {http.request.remote.host}
+			header_up -Forwarded
+			header_up -Cf-Connecting-Ip
+		}
+	}
+	handle {
+		respond 403
 	}
 }
 

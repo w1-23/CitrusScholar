@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, IPv4Network
 import json
 import os
 from pathlib import Path
@@ -27,8 +27,15 @@ def lan_ingress(config, port):
     ingress = config.get('lan_ingress')
     if ingress is None:
         return [], []
-    if not isinstance(ingress, dict) or set(ingress) != {'ipv4', 'port', 'proxy_token_file'}:
-        raise ValueError('LAN ingress requires ipv4, port and proxy_token_file')
+    required = {'ipv4', 'port', 'proxy_token_file', 'allowed_client_cidrs'}
+    if not isinstance(ingress, dict) or set(ingress) != required:
+        raise ValueError('LAN ingress requires ipv4, port, proxy_token_file and allowed_client_cidrs')
+    allowed = ingress['allowed_client_cidrs']
+    if not isinstance(allowed, list) or not allowed or not all(isinstance(cidr, str) for cidr in allowed):
+        raise ValueError('LAN ingress requires explicit IPv4 client networks')
+    cidrs = [IPv4Network(cidr) for cidr in allowed]
+    if any(network.prefixlen == 0 for network in cidrs):
+        raise ValueError('LAN ingress disallows a global client allowlist')
     if not isinstance(ingress['ipv4'], str):
         raise ValueError('LAN ingress requires an explicit IPv4 address')
     ip = IPv4Address(ingress['ipv4'])
@@ -40,7 +47,8 @@ def lan_ingress(config, port):
     token_file = absolute(ingress['proxy_token_file'])
     return ([(token_file, 'ro')], ['--env', f'CITRUS_LAN_AUTHORITY={ip}:{ingress_port}',
                                   '--env', f'CITRUS_LAN_UPSTREAM_PORT={port}',
-                                  '--env', f'CITRUS_LAN_TOKEN_FILE={token_file}'])
+                                  '--env', f'CITRUS_LAN_TOKEN_FILE={token_file}',
+                                  '--env', 'CITRUS_LAN_CLIENT_CIDRS=' + ' '.join(map(str, cidrs))])
 
 
 def release_identity(config):

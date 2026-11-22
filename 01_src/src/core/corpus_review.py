@@ -597,6 +597,7 @@ def archive_fetch(winner: dict[str, Any], *, doi: str = "", title: str = "", pmi
             stored_path=str(path), raw_sha256=digest, raw_bytes=len(payload),
             session_id=session_id, request_id=request_id, user_id=user_id, pmid=pmid,
             verified_license=(path.parent / "license.json").is_file())
+        archived["raw_bytes"] = len(payload)
         archived["verified_license"] = (path.parent / "license.json").is_file()
         return archived
     except Exception:

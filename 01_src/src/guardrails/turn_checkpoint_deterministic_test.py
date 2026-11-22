@@ -134,6 +134,28 @@ class DeterministicCheckpointTests(unittest.TestCase):
         self.assertEqual(len(restored.history_messages), 1)
         self.assertTrue(restored.history_messages[0].content.startswith("<conversation_checkpoint>"))
 
+    def test_legacy_structured_checkpoint_without_publication_keeps_raw_history(self):
+        call = {'id': 'legacy-read', 'name': 'read_data', 'args': {}}
+        original = [AIMessage(content='', tool_calls=[call]),
+                    ToolMessage(content='verified synthetic evidence', tool_call_id=call['id'], name=call['name']),
+                    AIMessage(content='original answer')]
+        asyncio.run(self.manager.save_messages(self.sid, original, idempotency_key='crid:legacy-raw'))
+        cutoff = self.manager.get_checkpoint(self.sid)['message_watermark']
+        legacy = {'schema': 'citrus-turn-checkpoint/1', 'owner_user_id': self.owner,
+                  'session_id': self.sid, 'navigation': {'goal': 'unverified legacy navigation'},
+                  'tool_result_call_ids': [call['id']]}
+        with manager._connect_db(self.manager.db_path) as conn:
+            conn.execute('UPDATE sessions SET checkpoint_summary=?, checkpoint_msg_id=? WHERE session_id=?',
+                         (json.dumps(legacy), cutoff, self.sid))
+            conn.commit()
+        restored = self.restore()
+        self.assertEqual(restored.history_load_reason, 'legacy_checkpoint_untrusted')
+        self.assertEqual([m.content for m in restored.history_messages],
+                         ['What changed?', 'A' * 300, '', 'verified synthetic evidence', 'original answer'])
+        self.assertEqual(restored.history_messages[2].tool_calls[0]['id'], call['id'])
+        self.assertEqual(restored.history_messages[3].tool_call_id, call['id'])
+        self.assertNotIn('host_publication', restored.history_messages[3].additional_kwargs)
+
     def test_missing_covered_row_preserves_remaining_history(self):
         self.assertTrue(self.build())
         with manager._connect_db(self.manager.db_path) as conn:

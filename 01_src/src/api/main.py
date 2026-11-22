@@ -1358,9 +1358,19 @@ async def admin_corpus_candidates(request: Request, status: str = "pending",
                                   order: str = "frequency"):
     require_admin(request)
     from src.core import corpus_review
-    return await asyncio.to_thread(
-        corpus_review.list_candidates, status=status, limit=limit,
-        before_id=before_id, order=order)
+    from src.shared_corpus.runtime import current_runtime
+    runtime = current_runtime()
+
+    def list_with_preparation():
+        result = corpus_review.list_candidates(status=status, limit=limit, before_id=before_id, order=order)
+        if runtime is not None:
+            states = runtime.preparation_states(result["candidates"])
+            for item in result["candidates"]:
+                item["preparation_status"] = states[item["id"]]
+            result["shared_capacity"] = runtime.capacity()
+        return result
+
+    return await asyncio.to_thread(list_with_preparation)
 
 
 @app.get("/api/v2/admin/corpus/candidates/{candidate_id}")
@@ -1399,9 +1409,9 @@ async def admin_corpus_fulltext(candidate_id: int, request: Request):
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     runtime = current_runtime()
-    if runtime is not None:
-        await asyncio.to_thread(schedule, runtime, candidate_id, owner)
-    return {"candidate": {key: item[key] for key in ("id", "status", "archive_state", "origin")}}
+    preparation = await asyncio.to_thread(schedule, runtime, candidate_id, owner, raw_bytes=item["raw_bytes"])
+    return {"candidate": {**{key: item[key] for key in ("id", "status", "archive_state", "origin")},
+                          "preparation_status": preparation}}
 
 
 @app.post("/api/v2/admin/corpus/candidates/{candidate_id}/approve")

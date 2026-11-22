@@ -2391,7 +2391,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
     window_search（两侧明确的 rectangles，每个包含原表 rows/columns，及 window={rows,columns}、可选 max_windows/max_pairs/seed）。
     每个比较都要绑定来源 file_index/sheet、已知 units，异单位给 right_factor_to_left，并可指定绝对/相对容差。
     自定义检测在完整性模式传 checks_json.custom_findings={execution_id,path}，path 是已接纳的 /outputs/*.json，
-    内容按 data-audit Skill 的 custom-audit-finding/1 格式。宿主验签、核对坐标，再列为人工复核线索。
+    内容按 data-audit Skill 的 custom-audit-report/1 格式（含输入哈希、报告级覆盖和 findings）。宿主验签、核对坐标，再列为人工复核线索。
     """
     def summarize_findings(targets, digest):
         # Marked-cell counts belong to workbook rendering, not computation.

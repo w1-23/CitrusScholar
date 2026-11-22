@@ -236,12 +236,31 @@
   var corpusBefore = null;
   var corpusNext = null;
   var corpusSupplementId = null;
+  var preparationLabels = {
+    queued: '等待索引准备', queue_full: '准备队列已满，未排队', source_too_large: '已归档，超过 8 MiB 索引准备上限',
+    not_queued: '已归档，未排队', prepared: '已准备', needs_review: '等待授权审核',
+    awaiting_build: '等待共享索引构建', build_pending: '共享索引构建已排队', indexed_ready: '等待索引切换',
+    active: '已进入共享索引', failed: '索引准备失败', expired: '索引准备已过期', revoked: '共享授权已撤销',
+    scheduling_unavailable: '已归档，暂时无法排队', disabled: '共享索引未启用'
+  };
   function renderCorpusCandidates(data) {
     var host = el('corpusList');
     var counts = data.counts || {};
     el('corpusSummary').textContent = '待审 ' + (counts.pending || 0) + ' 篇 · 已保留 ' +
       (counts.approved || 0) + ' 篇 · 已拒绝 ' + (counts.rejected || 0) +
       ' 篇';
+    var capacity = data.shared_capacity;
+    if (capacity) {
+      var notices = {
+        index_document_limit_near: '接近索引容量上限', index_document_limit_reached: '已达到索引容量上限',
+        index_document_limit_exceeded: '授权文献超限，无法构建新索引', preparation_queue_full: '有文献因准备队列容量等待重试'
+      };
+      el('corpusSummary').textContent += ' · 索引授权 ' + capacity.authorized_documents + '/' + capacity.index_document_limit +
+        ' · 待准备 ' + capacity.preparation_queued + '/' + capacity.preparation_limit +
+        ' · 联网归档 ' + (capacity.archive_byte_limit / 1048576) + ' MiB · 索引准备 ' + (capacity.preparation_byte_limit / 1048576) + ' MiB' +
+        (capacity.preparation_deferred ? ' · 未排入 ' + capacity.preparation_deferred : '') +
+        capacity.alerts.map(function (alert) { return ' · ' + (notices[alert] || alert); }).join('');
+    }
     corpusNext = data.next_before_id;
     el('corpusPager').hidden = corpusFilter() !== 'fulltext_missing' || (!corpusBefore && !corpusNext);
     el('corpusNewest').disabled = !corpusBefore;
@@ -275,6 +294,7 @@
         ? ' · <a href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer">文献来源</a>' : '';
       if (missing) format = '待补全文';
       if (item.origin === 'admin_fulltext') format = '已补录全文 · ' + format;
+      if (preparationLabels[item.preparation_status]) format += ' · ' + preparationLabels[item.preparation_status];
       return '<article class="corpus-item"><div class="corpus-main"><strong>' + esc(item.title || '(无标题)') + '</strong>' +
         '<small>' + doi + pmid + source + ' · ' + corpusBadge(item.source_kind) + ' · ' + esc(format) +
         ' · ' + (bytes ? (bytes / 1024).toFixed(1) + ' KB' : '—') +
@@ -321,10 +341,11 @@
     button.disabled = true;
     el('corpusFulltextCancel').disabled = true;
     try {
-      await jsonRequest('/api/v2/admin/corpus/candidates/' + corpusSupplementId + '/fulltext',
+      var result = await jsonRequest('/api/v2/admin/corpus/candidates/' + corpusSupplementId + '/fulltext',
         {method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:file});
       el('corpusFulltextDialog').close();
-      notify('已保存全文，等待共享发布核验');
+      var preparation = preparationLabels[result.candidate.preparation_status];
+      notify('已保存全文' + (preparation ? '，' + preparation : ''));
       await loadCorpus();
     } catch (error) {
       if (el('corpusFulltextDialog').open) errorBox.textContent = error.message;

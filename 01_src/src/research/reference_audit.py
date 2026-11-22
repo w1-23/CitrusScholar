@@ -588,6 +588,18 @@ def verification_rows(owner, session_id, audit_id):
     return get_audit(owner, session_id, audit_id, limit=5000)['rows']
 
 
+_EXPORT_VERDICT_LABELS = {
+    'verified': '已核实',
+    'correction_required': '建议更正',
+    'not_confirmed': '尚未确认',
+}
+
+
+def _export_decision(verdict):
+    decision = verdict.get('decision')
+    return decision if decision in _EXPORT_VERDICT_LABELS else 'not_confirmed'
+
+
 def export_audit(owner, session_id, audit_id, *, format='json'):
     payload = get_audit(owner, session_id, audit_id, limit=5000)
     format = str(format).lower()
@@ -599,7 +611,9 @@ def export_audit(owner, session_id, audit_id, *, format='json'):
         wb = Workbook()
         entries = wb.active
         entries.title = 'References'
-        entries.append(['record_index', 'record_id', 'citation', 'status', 'existence', 'identity', 'claims', 'positions'])
+        entries.append(['record_index', 'record_id', 'citation', 'status', 'existence', 'identity', 'claims', 'positions',
+                        'verdict', 'verdict_code', 'verdict_identity', 'benign_variants', 'material_differences',
+                        'critical_unknowns', 'source_coverage'])
         fields = wb.create_sheet('Fields')
         fields.append(['record_id', 'field', 'status', 'submitted', 'registered', 'reason',
                        'input_certainty', 'comparison_status'])
@@ -620,9 +634,16 @@ def export_audit(owner, session_id, audit_id, *, format='json'):
 
         for row in payload['rows']:
             result = row.get('result') or {}
+            verdict = row.get('verdict') or {}
+            decision = _export_decision(verdict)
+            details = [safe(_json(verdict.get(key, []))[:30000]) for key in
+                       ('benign_variants', 'material_differences', 'critical_unknowns')]
+            coverage = verdict.get('coverage') or {'status': 'not_checked'}
             entries.append([row['record_index'], row['record_id'], safe(row['citation'][:30000]), row['status'],
                             result.get('existence', 'not_checked'), result.get('identity', 'not_checked'),
-                            safe(_json(row['claims'])[:30000]), safe(_json(row['positions'])[:30000])])
+                            safe(_json(row['claims'])[:30000]), safe(_json(row['positions'])[:30000]),
+                            _EXPORT_VERDICT_LABELS[decision], decision, verdict.get('identity', 'unresolved'),
+                            *details, safe(_json(coverage)[:30000])])
             evidence_json(row['record_id'], 'original_entry', {k: v for k, v in row.items() if k != 'result'})
             evidence_json(row['record_id'], 'full_result', result)
             for field, check in result.get('fields', {}).items():
@@ -643,7 +664,9 @@ def export_audit(owner, session_id, audit_id, *, format='json'):
         claims = row['claims']
         # Bibliographic projection of submitted claims, never silently replace
         # an incorrect DOI with a candidate's DOI. JSON/XLSX is the full audit.
-        note = f"audit_id={audit_id}; record_id={row['record_id']}; status={row['status']}; bibliographic projection only; full evidence in JSON/XLSX"
+        decision = _export_decision(row.get('verdict') or {})
+        note = (f"verdict={decision} ({_EXPORT_VERDICT_LABELS[decision]}); audit_id={audit_id}; "
+                f"record_id={row['record_id']}; status={row['status']}; full evidence in JSON/XLSX")
         clean = lambda value: re.sub(r'[\r\n\x00-\x1f]+', ' ', str(value or ''))
         if format == 'ris':
             lines.append('TY  - GEN')

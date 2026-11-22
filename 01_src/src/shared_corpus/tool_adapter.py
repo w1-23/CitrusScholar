@@ -260,6 +260,8 @@ def prepare_document(proposal_id: str) -> str:
         indexed = runtime.indexing_status(proposal.get("document_id"), proposal.get("version_id"))
         if indexed["indexing_status"] == "active":
             summary = "该文献版本已在共享索引中。"
+        elif indexed["indexing_status"] == "build_pending":
+            summary = "该文献版本已进入共享索引构建队列。"
         elif indexed["indexing_status"] == "indexed_ready":
             summary = "共享索引候选已包含该版本，正在等待全站更新。"
         return _render({"proposal": _public_proposal(proposal), **indexed},
@@ -299,6 +301,7 @@ def commit_document_index() -> str:
         code = _safe_code(error, "shared_build_rejected")
         messages = {
             "shared_publishable_batch_out_of_bounds": "当前没有可索引的已发布文献，或批次超出范围。",
+            "shared_index_document_limit": "已授权文献超过单代索引容量上限。",
             "shared_build_pending": "已有待处理的共享索引构建任务。",
             "shared_documents_already_indexed": "相同文献已经索引。",
             "shared_daily_build_budget": "今日共享索引构建次数已达上限。",

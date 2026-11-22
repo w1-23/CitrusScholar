@@ -33,7 +33,7 @@ jobs:
           python -m pip check
       - name: Run isolated application regressions
         env:
-          PYTHONPATH: 01_src
+          PYTHONPATH: ${{ github.workspace }}/01_src
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
           CITRUSQA_ALLOW_EMPTY_DATA: '1'
           HF_HUB_OFFLINE: '1'
@@ -51,6 +51,9 @@ jobs:
             01_src/src/guardrails/turn_checkpoint_deterministic_test.py \
             01_src/src/api/task_observation_regression_test.py \
             01_src/src/research/render_script_contract_test.py \
+            01_src/src/research/audit_release_test.py \
+            01_src/src/shared_corpus/maintenance_regression_test.py \
+            01_src/src/shared_corpus/pmc_intake_test.py \
             01_src/src/research/nature_composition_test.py \
             01_src/src/figures/nature_current_qa_test.py
   node:

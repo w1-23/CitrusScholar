@@ -91,7 +91,8 @@ class _ThinkingOffWrapper:
         scope = _observation.get()
         if scope is not None:
             scope.update(redirected=True, transport_error=type(error).__name__)
-        task_events.finish_attempt(task_events._active_model_attempt.get(), error=type(error).__name__)
+        task_events.finish_attempt(task_events._active_model_attempt.get(), error=type(error).__name__,
+            observation=task_events._attempt_response(scope, None, type(error).__name__) if scope else None)
 
     async def ainvoke(self, messages, **kw):
         try:
@@ -130,7 +131,7 @@ class _ThinkingOffWrapper:
                         await stream.aclose()
                     return aggregate
                 aggregate = await run_model_attempt(self.fallback, messages, collect,
-                    purpose="thinking_parameter_fallback", output_tokens=kw.get("max_tokens"))
+                    purpose="thinking_parameter_fallback", output_tokens=kw.get("max_tokens"), streaming=True)
                 if aggregate is not None:
                     yield aggregate
             else:

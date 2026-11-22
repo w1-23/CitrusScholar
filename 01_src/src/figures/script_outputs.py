@@ -134,7 +134,7 @@ def normalize_output_contract(value: Any) -> dict:
     """Normalize v2 only; an absent/empty contract preserves the legacy path."""
     if value is None or value == {}:
         return {}
-    if not isinstance(value, dict) or set(value) - {"version", "tables", "figures"}:
+    if not isinstance(value, dict) or set(value) - {"version", "tables", "figures", "input_contract"}:
         raise ValueError("Invalid output contract fields.")
     if type(value.get("version")) is not int or value["version"] != 2:
         raise ValueError("Output contract version must be 2.")
@@ -194,7 +194,33 @@ def normalize_output_contract(value: Any) -> dict:
                         raise ValueError("render_script requires explicit nonempty declared output table parents.")
                     item["render_script"] = source
             result[kind].append(item)
+    if value.get("input_contract") is not None:
+        from .worker import normalize_input_contract
+        inputs = normalize_input_contract(value["input_contract"])
+        if inputs:
+            if inputs["frozen"]:
+                raise ValueError("Initial output contracts cannot declare frozen replay inputs.")
+            mapping = inputs["render"]
+            separated = [item for item in result["figures"] if "render_script" in item]
+            parents = {name for item in separated for name in item["parents"]}
+            if mapping and set(mapping.values()) != parents:
+                raise ValueError("Render input mapping must cover the parents of each separated figure.")
+            result["input_contract"] = inputs
     return result
+
+
+def input_contract_for_target(contract: dict, output_key: str) -> dict:
+    """Replays bind only the selected renderer's persisted parent tables."""
+    inputs = contract.get("input_contract") or {}
+    if not inputs or not output_key:
+        return inputs
+    target, = [item for item in contract["figures"] if item["name"] == output_key]
+    if "render_script" not in target:
+        raise ValueError("A typed input replay requires a separated figure.")
+    parents = target["parents"]
+    mapping = inputs["render"] or {name: name for name in parents}
+    return {"version": inputs["version"], "raw": [], "tables": [], "frozen": parents,
+            "render": {key: name for key, name in mapping.items() if name in parents}}
 
 
 def output_slots(contract: Any, *, output_key: str = "") -> dict[str, str]:

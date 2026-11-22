@@ -147,6 +147,13 @@ class SandboxJob:
     output_key: str = ""
 
     def as_json(self) -> str:
+        from .script_outputs import input_contract_for_target
+
+        typed = input_contract_for_target(self.output_contract, self.output_key)
+        if typed:
+            required = set(typed["raw"]) | set(typed["frozen"]) | {t["input"] for t in typed["tables"]}
+            if not required <= set(self.inputs):
+                raise SandboxError("绘图输入合同包含未绑定的输入名称。")
         return json.dumps({
             "job_id": self.job_id,
             "script": self.script,
@@ -162,6 +169,7 @@ class SandboxJob:
             "expected_input_sha256": self.expected_input_sha256,
             "output_contract": self.output_contract,
             "output_key": self.output_key,
+            **({"input_contract": typed} if typed else {}),
         }, ensure_ascii=False)
 
 
@@ -180,6 +188,7 @@ class SandboxResult:
     backend: str = ""
     # Set by the host's completed-process interpreter, never worker JSON.
     process_exited: bool = False
+    diagnostic: dict[str, Any] = field(default_factory=dict)
 
     def describe(self) -> str:
         """A short, actionable sentence for the model."""
@@ -766,6 +775,29 @@ def _read_declared_outputs(workdir: Path, job: SandboxJob, *,
     return outputs
 
 
+def _script_diagnostic(value: Any) -> dict:
+    """Keep bounded repair hints from the worker outside the output receipt."""
+    if not isinstance(value, dict) or value.get("stage") not in ("input", "analysis", "render"):
+        return {}
+    code = value.get("error_code")
+    if code not in ("invalid_input_contract", "input_binding_failed", "script_syntax",
+                    "forbidden_import", "script_error", "unreadable_labels",
+                    "render_script_emit_not_available"):
+        return {}
+    result = {"stage": value["stage"], "error_code": code}
+    line = value.get("line")
+    if type(line) is int and 0 < line <= MAX_SCRIPT_BYTES:
+        result["line"] = line
+    inputs = value.get("inputs")
+    if isinstance(inputs, dict):
+        known = {name: kind for name, kind in list(inputs.items())[:16]
+                 if len(name) <= 64 and name.isascii() and name.isidentifier()
+                 and kind in ("Path", "DataFrame", "DataFrame mapping")}
+        if known:
+            result["inputs"] = known
+    return result
+
+
 def _interpret(exit_code: int, stdout: str, stderr: str,
                outputs: dict[str, bytes], duration_ms: int,
                backend: str, *, timeout_sec: int = 0) -> SandboxResult:
@@ -800,11 +832,13 @@ def _interpret(exit_code: int, stdout: str, stderr: str,
     # carries warnings and tracebacks, so the JSON is the reliable source.
     message = ""
     script_stdout = ""
+    diagnostic = {}
     try:
         payload = json.loads(stdout)
         if isinstance(payload, dict):
             message = str(payload.get("message") or "")
             script_stdout = str(payload.get("script_stdout") or "")
+            diagnostic = _script_diagnostic(payload.get("diagnostic"))
     except (TypeError, ValueError):
         message = ""
     if not message:
@@ -817,7 +851,8 @@ def _interpret(exit_code: int, stdout: str, stderr: str,
     return SandboxResult(
         ok=False, exit_code=exit_code, stdout=stdout[:8000], stderr=stderr[:4000],
         duration_ms=duration_ms, failure_kind=kind, message=message,
-        outputs=outputs, backend=backend, timed_out=(kind == FAILURE_TIMEOUT), process_exited=True)
+        outputs=outputs, backend=backend, timed_out=(kind == FAILURE_TIMEOUT), process_exited=True,
+        diagnostic=diagnostic)
 
 
 __all__ = [

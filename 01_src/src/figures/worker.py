@@ -31,7 +31,9 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import keyword
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -52,6 +54,178 @@ _FORBIDDEN_MODULES = (
 
 _MAX_OUTPUT_BYTES = 24 * 1024 * 1024
 
+_INPUT_CONTRACT_VERSION = 1
+_INPUT_TABLE_FORMATS = ("csv", "tsv", "excel", "dataset")
+_INPUT_NAME = re.compile("[A-Za-z_][A-Za-z0-9_]{0,63}", re.ASCII)
+_INPUT_RESERVED = frozenset({"__name__", "__builtins__", "plt", "matplotlib", "show", "emit",
+                             "load_dataset", "parameters", "_citrus_parameters_json"})
+_INPUT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _input_name(value, role: str, *, binding: bool = True) -> str:
+    """Validate a contract name without echoing untrusted text."""
+    if (not isinstance(value, str) or not _INPUT_NAME.fullmatch(value)
+            or (binding and keyword.iskeyword(value))):
+        raise ValueError(f"Input contract {role} names must be ASCII identifiers.")
+    return value
+
+
+def normalize_input_contract(value) -> dict:
+    """Normalize the opt-in v1 input namespace; empty keeps the legacy path.
+
+    The host declares each sandbox input's role before execution. The worker
+    never guesses a name or a format from an extension, a filename or bytes.
+    """
+    if value is None or value == {}:
+        return {}
+    if not isinstance(value, dict) or set(value) - {"version", "raw", "tables", "frozen", "render"}:
+        raise ValueError("Invalid input contract fields.")
+    if type(value.get("version")) is not int or value["version"] != _INPUT_CONTRACT_VERSION:
+        raise ValueError("Input contract version must be 1.")
+    raw = value.get("raw", [])
+    tables = value.get("tables", [])
+    frozen = value.get("frozen", [])
+    render = value.get("render", {})
+    if not isinstance(raw, list) or len(raw) > 8:
+        raise ValueError("Input contract raw bindings must be a list of at most eight names.")
+    if not isinstance(tables, list) or len(tables) > 8:
+        raise ValueError("Input contract tables must be a list of at most eight entries.")
+    if not isinstance(frozen, list) or len(frozen) > 8:
+        raise ValueError("Input contract frozen tables must be a list of at most eight names.")
+    if not isinstance(render, dict) or len(render) > 8:
+        raise ValueError("Input contract render mapping must be an object of at most eight entries.")
+    normalized = {"version": _INPUT_CONTRACT_VERSION, "raw": [], "tables": [],
+                  "frozen": [], "render": {}}
+    names: set[str] = set()
+    for item in raw:
+        name = _input_name(item, "raw binding")
+        if name in names or name in _INPUT_RESERVED:
+            raise ValueError("Input contract names must be unique and not reserved.")
+        names.add(name)
+        normalized["raw"].append(name)
+    for entry in tables:
+        if not isinstance(entry, dict) or set(entry) - {"name", "input", "format", "sheet", "header"}:
+            raise ValueError("Invalid input contract table entry.")
+        name = _input_name(entry.get("name"), "table")
+        source = _input_name(entry.get("input"), "table source")
+        fmt = entry.get("format")
+        if fmt not in _INPUT_TABLE_FORMATS:
+            raise ValueError("Input contract table format must be declared as csv, tsv, excel or dataset.")
+        if name in names or name in _INPUT_RESERVED:
+            raise ValueError("Input contract names must be unique and not reserved.")
+        names.add(name)
+        item = {"name": name, "input": source, "format": fmt}
+        if "sheet" in entry:
+            sheet = entry["sheet"]
+            if fmt != "excel" or (type(sheet) is not int and not isinstance(sheet, str)):
+                raise ValueError("Input contract sheet is only valid for a named Excel table.")
+            if isinstance(sheet, str) and (not sheet or len(sheet) > 256
+                                           or any(ord(char) < 32 for char in sheet)):
+                raise ValueError("Input contract sheet name is invalid.")
+            item["sheet"] = sheet
+        header = entry.get("header", "infer")
+        if header != "infer" and (type(header) is not int or header < 0):
+            raise ValueError("Input contract header must be 'infer' or a nonnegative row index.")
+        if fmt == "dataset" and "header" in entry:
+            raise ValueError("Dataset tables do not accept header options.")
+        if fmt != "dataset":
+            item["header"] = header
+        normalized["tables"].append(item)
+    for item in frozen:
+        name = _input_name(item, "frozen table", binding=False)
+        if name in names:
+            raise ValueError("Input contract names must be unique.")
+        names.add(name)
+        normalized["frozen"].append(name)
+    for key, source in render.items():
+        render_name = _input_name(key, "render", binding=False)
+        _input_name(source, "render source", binding=False)
+        if source in normalized["render"].values():
+            raise ValueError("Input contract render sources must be unique.")
+        normalized["render"][render_name] = source
+    return normalized
+
+
+def _read_declared_input(path: Path, allowed: set) -> bytes:
+    """Read one declared input with the same bounded, no-symlink discipline."""
+    import stat
+    candidate = Path(path)
+    if candidate.resolve() not in allowed:
+        raise ValueError("Declared input is not bound by the job.")
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    before = candidate.lstat()
+    with os.fdopen(os.open(candidate, flags), "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or not os.path.samestat(before, info) or info.st_size > _INPUT_MAX_BYTES):
+            raise ValueError("Declared input is not a bounded regular file.")
+        data = handle.read(_INPUT_MAX_BYTES + 1)
+        after = os.fstat(handle.fileno())
+        if (len(data) != info.st_size or after.st_size != info.st_size
+                or after.st_mtime_ns != info.st_mtime_ns or after.st_ctime_ns != info.st_ctime_ns):
+            raise ValueError("Declared input changed during reading.")
+    return data
+
+
+def _ingest_table(data: bytes, fmt: str, *, sheet=None, header="infer"):
+    """Ingest one explicitly declared table; the format is never inferred."""
+    import io as _io
+    if fmt not in _INPUT_TABLE_FORMATS:
+        raise ValueError("Input contract table format is not supported.")
+    if fmt == "dataset":
+        if sheet is not None or header != "infer":
+            raise ValueError("Dataset tables do not accept sheet or header options.")
+        try:
+            from src.figures.dataset_codec import decode_frame
+            from src.figures.script_outputs import strict_json
+        except ImportError:
+            from figures.dataset_codec import decode_frame
+            from figures.script_outputs import strict_json
+        try:
+            return decode_frame(strict_json(data))
+        except Exception:
+            raise ValueError("Declared dataset table input could not be ingested.") from None
+    import pandas as pd
+    options = {"header": header}
+    try:
+        if fmt == "csv":
+            return pd.read_csv(_io.BytesIO(data), **options)
+        if fmt == "tsv":
+            return pd.read_csv(_io.BytesIO(data), sep=chr(9), **options)
+        if header == "infer":
+            options["header"] = 0
+        return pd.read_excel(_io.BytesIO(data),
+                             sheet_name=sheet if sheet is not None else 0, **options)
+    except Exception:
+        raise ValueError("Declared " + fmt + " table input could not be ingested.") from None
+
+
+def _contract_namespace(job: dict, contract: dict, paths: dict) -> dict:
+    """Build the opt-in namespace; legacy names and behavior stay unchanged."""
+    replay = bool(job.get("output_contract") and job.get("output_key"))
+    namespace: dict = {"__name__": "__citrusfig__"}
+    if replay:
+        return namespace
+    allowed = {path.resolve() for path in paths.values()}
+    for name in contract["raw"]:
+        if name not in paths:
+            raise ValueError("Input contract raw binding is not bound by the job.")
+        namespace[name] = paths[name]
+    for entry in contract["tables"]:
+        if entry["input"] not in paths:
+            raise ValueError("Input contract table source is not bound by the job.")
+        try:
+            data = _read_declared_input(paths[entry["input"]], allowed)
+        except OSError:
+            raise ValueError("Declared input bytes could not be read.") from None
+        # _ingest_table owns a generic, non-echoing diagnostic for every
+        # backend failure; no pandas or file detail escapes this boundary.
+        namespace[entry["name"]] = _ingest_table(
+            data, entry["format"], sheet=entry.get("sheet"),
+            header=entry.get("header", "infer"))
+    return namespace
+
 
 def _bootstrap_engine_path() -> None:
     """Make the figure engine importable however this file was laid out.
@@ -65,7 +239,13 @@ def _bootstrap_engine_path() -> None:
     candidates = []
     root = os.environ.get("CITRUS_FIGURES_ROOT", "").strip()
     if root:
-        candidates.append(Path(root))
+        source = Path(root)
+        candidates.append(source)
+        # LocalBackend points at the trusted service checkout. Its subprocess
+        # must pair that checkout with its support source during development.
+        packages = source.parent / "packages"
+        if (packages / "citrus_figures" / "__init__.py").is_file():
+            sys.path.insert(0, str(packages))
     here = Path(__file__).resolve().parent
     candidates.extend([here.parent, here])
     for candidate in candidates:
@@ -110,7 +290,7 @@ FAILURE_TEXT = {
 
 
 def _report(code: int, detail: str = "", script_stdout: str = "",
-            nature_skill_receipt: dict | None = None) -> int:
+            nature_skill_receipt: dict | None = None, *, diagnostic: dict | None = None) -> int:
     """Report a failure and return the exit code.
 
     The message goes to stdout as JSON as well as to stderr as text. The
@@ -125,6 +305,7 @@ def _report(code: int, detail: str = "", script_stdout: str = "",
     try:
         sys.stdout.write(json.dumps({"ok": False, "code": code, "message": text,
                                      "script_stdout": str(script_stdout or "")[:4000],
+                                     **({"diagnostic": diagnostic} if diagnostic else {}),
                                      **({"nature_skill_receipt": nature_skill_receipt}
                                         if nature_skill_receipt is not None else {})},
                                     ensure_ascii=False))
@@ -151,7 +332,7 @@ def _promote_current_qa(manifest: dict, container=None, *, receipt=None, layout=
         manifest["current_qa_layout"] = layout
 
 
-def _guard_imports(script: str) -> str | None:
+def _check_script(script: str) -> tuple[str, str, int | None] | None:
     """Refuse a script that imports a forbidden module.
 
     A plain textual check: it does not pretend to be a security boundary
@@ -161,7 +342,7 @@ def _guard_imports(script: str) -> str | None:
     try:
         tree = ast.parse(script)
     except SyntaxError as exc:
-        return f"脚本语法错误：{exc}"
+        return f"脚本语法错误：{exc}", "script_syntax", exc.lineno
     for node in ast.walk(tree):
         names: list[str] = []
         if isinstance(node, ast.Import):
@@ -171,8 +352,28 @@ def _guard_imports(script: str) -> str | None:
         for name in names:
             root = str(name).split(".", 1)[0]
             if root in _FORBIDDEN_MODULES:
-                return f"脚本导入了被禁止的模块「{root}」。"
+                return f"脚本导入了被禁止的模块「{root}」。", "forbidden_import", node.lineno
     return None
+
+
+def _guard_imports(script: str) -> str | None:
+    issue = _check_script(script)
+    return issue[0] if issue else None
+
+
+def _script_diagnostic(stage, error_code, line=None, bindings=None):
+    diagnostic = {"stage": stage, "error_code": error_code}
+    if type(line) is int and line > 0:
+        diagnostic["line"] = line
+    if bindings:
+        diagnostic["inputs"] = bindings
+    return diagnostic
+
+
+def _script_bindings(namespace):
+    from pandas import DataFrame
+    return {name: "Path" if isinstance(value, Path) else "DataFrame"
+            for name, value in namespace.items() if isinstance(value, (Path, DataFrame))}
 
 
 def _resolve(base: Path, relative: str) -> Path:
@@ -202,12 +403,19 @@ def run(job_path: Path) -> int:
         sys.stderr.write("作业没有提供脚本。\n")
         return EXIT_SCRIPT_ERROR
 
-    problem = _guard_imports(script_text)
-    if problem:
-        return _report(EXIT_FORBIDDEN, problem)
+    issue = _check_script(script_text)
+    if issue:
+        message, error_code, line = issue
+        return _report(EXIT_FORBIDDEN, message,
+                       diagnostic=_script_diagnostic("analysis", error_code, line))
 
     # The inputs the script may read, bound to names the script chooses.
-    namespace: dict = {"__name__": "__citrusfig__"}
+    try:
+        input_contract = normalize_input_contract(job.get("input_contract"))
+    except (ValueError, TypeError) as exc:
+        return _report(EXIT_FORBIDDEN, str(exc),
+                       diagnostic=_script_diagnostic("input", "invalid_input_contract"))
+    paths: dict[str, Path] = {}
     for name, relative in (job.get("inputs") or {}).items():
         try:
             path = _resolve(in_dir, str(relative))
@@ -223,7 +431,15 @@ def run(job_path: Path) -> int:
                 actual = hashlib.file_digest(handle, "sha256").hexdigest()
             if actual != expected:
                 return _report(EXIT_FORBIDDEN, "脚本输入快照摘要不匹配，拒绝重放。")
-        namespace[str(name)] = path
+        paths[str(name)] = path
+    try:
+        if input_contract:
+            namespace = _contract_namespace(job, input_contract, paths)
+        else:
+            namespace = {"__name__": "__citrusfig__", **paths}
+    except (ValueError, OSError) as exc:
+        return _report(EXIT_FORBIDDEN, str(exc),
+                       diagnostic=_script_diagnostic("input", "input_binding_failed"))
 
     core, exporter, manifest_module = _engine()
     try:
@@ -238,10 +454,11 @@ def run(job_path: Path) -> int:
         return _report(EXIT_FORBIDDEN, str(exc))
 
     if job.get("output_contract"):
-        namespace["load_dataset"] = _dataset_loader(tuple(namespace.values()))
+        namespace["load_dataset"] = _dataset_loader(tuple(paths.values()))
 
     if job.get("output_contract"):
-        return _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_module)
+        return _run_outputs(job, script_text, namespace, out_dir, core, exporter,
+                            manifest_module, inputs_contract=input_contract, paths=paths)
 
     result = core.capture_figure(script_text, namespace=namespace, check_layout=mode == "initial")
     if result.error:
@@ -249,7 +466,9 @@ def run(job_path: Path) -> int:
             return _report(EXIT_NO_FIGURE, script_stdout=result.stdout)
         return _report(EXIT_SCRIPT_ERROR,
                        result.stdout[-2000:] + "\n" + result.error,
-                       script_stdout=result.stdout)
+                       script_stdout=result.stdout,
+                       diagnostic=_script_diagnostic("analysis", result.error_type,
+                           result.script_line, _script_bindings(namespace)))
     if result.figures_seen > 1:
         return _report(EXIT_MULTIPLE_FIGURES,
                        f"脚本生成了 {result.figures_seen} 张图。")
@@ -390,7 +609,8 @@ def _dataset_loader(inputs):
     return load_dataset
 
 
-def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_module) -> int:
+def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_module,
+                 *, inputs_contract=None, paths=None) -> int:
     """v2: execute to completion, then serialize each host-declared slot."""
     import hashlib
     if core.__name__.startswith("src."):
@@ -410,11 +630,37 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
         separated = [entry for entry in contract["figures"] if "render_script" in entry
                      and (not target or entry["name"] == target)]
         for entry in separated:
-            problem = _guard_imports(entry["render_script"])
-            if problem:
-                raise ValueError(problem)
+            issue = _check_script(entry["render_script"])
+            if issue:
+                message, error_code, line = issue
+                return _report(EXIT_FORBIDDEN, message,
+                               diagnostic=_script_diagnostic("render", error_code, line))
         frozen_tables = None
-        if target and separated:
+        render_mapping = None
+        if inputs_contract:
+            if target and separated:
+                required = set(separated[0]["parents"])
+                if inputs_contract["raw"] or inputs_contract["tables"]:
+                    raise ValueError("Frozen replay accepts only declared frozen tables.")
+                if set(inputs_contract["frozen"]) != required:
+                    raise ValueError("Input contract frozen tables must match the figure parents.")
+                if (not inputs_contract["render"]
+                        or set(inputs_contract["render"].values()) != required):
+                    raise ValueError("Input contract render mapping must cover the figure parents.")
+                bound = paths or {}
+                if any(name not in bound for name in required):
+                    raise ValueError("Input contract frozen table is not bound by the job.")
+                load = _dataset_loader(tuple(bound[name] for name in required))
+                frozen_tables = {name: load(bound[name]) for name in required}
+                render_mapping = dict(inputs_contract["render"])
+            else:
+                if inputs_contract["frozen"]:
+                    raise ValueError("Frozen tables require a separated render replay.")
+                render_mapping = dict(inputs_contract["render"]) or None
+            parents = {name for entry in separated for name in entry["parents"]}
+            if render_mapping is not None and set(render_mapping.values()) != parents:
+                raise ValueError("Input contract render mapping must cover the figure parents.")
+        elif target and separated:
             required = set(separated[0]["parents"])
             supplied = set(namespace) - {"__name__", "load_dataset"}
             if supplied != required or any(not isinstance(namespace[name], Path) for name in required):
@@ -427,9 +673,14 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
         return _report(EXIT_FORBIDDEN, str(exc))
     result = core.capture_outputs(script_text, namespace=namespace,
                                   output_contract=contract, output_key=target,
-                                  frozen_tables=frozen_tables)
+                                  frozen_tables=frozen_tables,
+                                  render_mapping=render_mapping)
     if result.error:
-        return _report(EXIT_SCRIPT_ERROR, result.error, script_stdout=result.stdout)
+        inputs = ({"data": "DataFrame mapping"} if result.error_stage == "render"
+                  else _script_bindings(namespace))
+        return _report(EXIT_SCRIPT_ERROR, result.error, script_stdout=result.stdout,
+                       diagnostic=_script_diagnostic(result.error_stage, result.error_type,
+                                                     result.script_line, inputs))
 
     states = {key: {"status": "missing", "error": "Output was not emitted."}
               for key in slots if key != "result"}

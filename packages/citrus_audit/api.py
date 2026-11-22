@@ -6,7 +6,7 @@ import hashlib
 import json
 from .envelope import TableEnvelope
 from .methods import audit_frame
-from .readers import read_tables
+from .readers import read_tables, read_regions
 from .data_audit_rules import RULES
 
 
@@ -72,8 +72,16 @@ class AuditSnapshot:
         return cls(data,value['source_name'],json.dumps(value['report'],ensure_ascii=False,allow_nan=False),value['source_sha256'])
 
 
-def review_bytes(data: bytes, name: str, *, checks=None, sheet_name='', header_row=1, header_rows=None, **options):
-    tables,errors=read_tables(data,name,sheet_name=sheet_name,header_row=header_row,header_rows=header_rows)
+def review_bytes(data: bytes, name: str, *, checks=None, sheet_name='', header_row=1, header_rows=None, regions=None, **options):
+    # ``regions`` is an explicit list of absolute rectangles. Legacy callers
+    # keep omitting it and retain whole-sheet discovery and header_row
+    # semantics; region coordinates are already absolute so header_row is
+    # not used on that path.
+    if regions is not None:
+        tables=read_regions(data,name,regions=regions,sheet_name=sheet_name)
+        errors=[]
+    else:
+        tables,errors=read_tables(data,name,sheet_name=sheet_name,header_row=header_row,header_rows=header_rows)
     entries=[]
     for table in tables:
         entries.append({'table':table.to_dict(),'result':audit_table(table,checks=checks,**options)})

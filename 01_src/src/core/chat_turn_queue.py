@@ -1154,6 +1154,58 @@ def mark_reconcile_required(*, owner_user_id: int, session_id: str,
         return _reread(conn, owner_user_id, session_id, client_request_id)
 
 
+
+def resolve_reconcile(*, owner_user_id: int, session_id: str,
+                      client_request_id: str,
+                      generation: int | None = None,
+                      reason: str = "turn_reconciled_by_user") -> dict:
+    """Settle a frozen turn once its owner acknowledges an unknown outcome.
+
+    The turn is never replayed: it becomes terminal with ``history_saved=0``
+    and an explicit reason, so the session can admit its queued successors
+    again. Only a turn this queue froze (``reconcile_required``) can be
+    settled here; queued, claimed, running and terminal turns keep their own
+    transition paths.
+    """
+    _validate_identity(owner_user_id, session_id)
+    _validate_client_request_id(client_request_id)
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 64:
+        raise ValueError("reason must be a bounded non-empty string")
+    with _transaction() as conn:
+        row = _scoped(conn, owner_user_id, session_id, client_request_id)
+        if row is None:
+            raise TurnNotFound("turn_not_found")
+        if row["state"] == TERMINAL:
+            return _with_position(conn, _decode(row))
+        if row["state"] != RECONCILE_REQUIRED:
+            raise TurnStateConflict(row["state"], job_id=row["root_job_id"])
+        expected = row["generation"] if generation is None else generation
+        _check_generation(row, expected)
+        now = time.time()
+        cursor = conn.execute(
+            "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
+            "history_saved=0, clear_reason=?, finished_at=?, updated_at=? "
+            "WHERE owner_user_id=? AND session_id=? AND client_request_id=? "
+            "AND state=? AND generation=?",
+            (TERMINAL, reason.strip(), now, now, owner_user_id, session_id,
+             client_request_id, RECONCILE_REQUIRED, expected),
+        )
+        if cursor.rowcount != 1:
+            raise TurnQueueNotReady("reconcile_lost",
+                                    job_id=row["root_job_id"])
+        job = _require_root_job(conn, row)
+        if job["status"] not in jobs.TERMINAL_STATUS:
+            now_iso = datetime.now().isoformat()
+            conn.execute(
+                "UPDATE task_jobs SET status='failed', "
+                "current_step='reconciled', error=?, updated_at=?, "
+                "finished_at=? WHERE job_id=?",
+                ("outcome_unknown_reconciled", now_iso, now_iso,
+                 row["root_job_id"]),
+            )
+        return _reread(conn, owner_user_id, session_id, client_request_id)
+
+
 def cancel_queued(*, owner_user_id: int, session_id: str,
                   client_request_id: str) -> dict:
     """Atomically cancel only a still-queued turn (never the running one).

@@ -3,7 +3,7 @@ name: data-audit
 description: 对上传表格按适用前提选择检查，给出原始坐标、原值、执行回执和覆盖缺口；按用户需要输出不改数据的标注副本。
 license: MIT
 metadata:
-  version: "2.1.0"
+  version: "2.1.1"
 ---
 
 # 数据审查
@@ -76,3 +76,7 @@ complete coverage when a verified offline run executed the full declared
 scope on the matching inputs. A legacy array still returns its admitted
 findings with partial coverage. Use the existing review record
 for decisions. Scripts are one-off and have read-only original inputs.
+
+### 工作簿区域
+
+同一工作表包含多个独立表格时，先查看布局。使用 `checks_json.regions` 精确指定文件序号、工作表、A1 范围和绝对表头行。跨区域比较使用 `audit_plan.comparisons`，每一侧带 `region_id` 或 `region_bounds`。结果中的原始行列用于复核。覆盖回执说明已检查区域及跳过的检查。

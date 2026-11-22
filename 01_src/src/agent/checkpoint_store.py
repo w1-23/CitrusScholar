@@ -7,12 +7,16 @@ execution policy. Only synthetic tests import this module without application co
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, replace
+from datetime import date
+from functools import lru_cache
 import hashlib
+from importlib.metadata import version
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
+import re
 import stat
 import tempfile
 from typing import Any, AsyncIterator
@@ -36,9 +40,14 @@ from langgraph.types import Interrupt, Send
 from src.agent.identity import ExecutionIdentity
 from src.core.provider_protocol import _DeepSeekMessage, _DeepSeekMessageChunk, _ProtocolState
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 _TAG = "__citrus_checkpoint_v1__"
 _FORMAT = "citrus-checkpoint-v1"
 _CIPHER = "aesgcm-v1"
+WORKING_CONTEXT_ARCHIVE_NAMESPACE = "working-context-archive-v1"
 _MESSAGES = (
     AIMessage, AIMessageChunk, ChatMessage, ChatMessageChunk,
     FunctionMessage, FunctionMessageChunk, HumanMessage, HumanMessageChunk,
@@ -48,6 +57,98 @@ _MESSAGES = (
 
 class CheckpointProtectionError(ValueError):
     """A checkpoint cannot safely be written or resumed; contains no payload data."""
+
+    def __init__(self, reason: str, *, structure: str = "unknown", value_kind: str = "unknown"):
+        super().__init__(reason)
+        self.structure = structure
+        self.value_kind = value_kind
+
+
+# Diagnostic fields are fixed independently of exception text, checkpoint keys,
+# graph topology, provider identifiers and user-controlled data.
+_CHECKPOINT_REASONS = {
+    "checkpoint_identity_required": "checkpoint_binding_mismatch",
+    "checkpoint_binding_mismatch": "checkpoint_binding_mismatch",
+    "checkpoint_provider_scope_required": "checkpoint_provider_scope_mismatch",
+    "private_protocol_scope_mismatch": "checkpoint_provider_scope_mismatch",
+    "checkpoint_provider_scope_mismatch": "checkpoint_provider_scope_mismatch",
+    "checkpoint_authentication_failed": "checkpoint_authentication_failed",
+    "private_protocol_state_missing": "private_protocol_state_missing",
+    "unsupported_checkpoint_value": "unsupported_checkpoint_value",
+    "unsupported_checkpoint_key": "unsupported_checkpoint_value",
+    "nested_message_in_public_fields": "unsupported_public_message_field",
+    "private_state_in_public_fields": "unsupported_public_message_field",
+    "unsupported_public_message_field": "unsupported_public_message_field",
+    "unsafe_checkpoint_directory": "checkpoint_storage_rejected",
+    "unsafe_checkpoint_key": "checkpoint_key_rejected",
+    "unsafe_checkpoint_key_permissions": "checkpoint_key_rejected",
+    "invalid_checkpoint_key": "checkpoint_key_rejected",
+    "checkpoint_key_missing": "checkpoint_key_rejected",
+    "unsafe_checkpoint_database": "checkpoint_storage_rejected",
+    "unsafe_checkpoint_database_permissions": "checkpoint_storage_rejected",
+}
+_CHECKPOINT_STRUCTURES = frozenset({
+    "envelope", "envelope.binding", "envelope.value", "value.tag",
+    "value.mapping_key", "message.public", "message.private", "ciphertext",
+})
+
+_CHECKPOINT_VALUE_KINDS = frozenset({"path", "date", "message", "other"})
+
+
+def _value_kind(value: Any) -> str:
+    if isinstance(value, PurePath):
+        return "path"
+    if isinstance(value, date):
+        return "date"
+    if isinstance(value, BaseMessage):
+        return "message"
+    return "other"
+
+
+def _admission_stopped_type():
+    """Closed allowlist: the only application exception a graph node raises
+    as ordinary control flow, and the one LangGraph stores in pending writes
+    so a resumed task can re-raise it. Imported lazily to avoid a cycle."""
+    from .runtime import AdmissionStopped
+    return AdmissionStopped
+
+
+def _admission_reason(value: Any) -> str:
+    reason = getattr(value, "reason", None)
+    if type(reason) is not str or not reason or len(reason) > 200 or any(ord(c) < 32 for c in reason):
+        return ""
+    return reason
+
+
+@lru_cache(maxsize=1)
+def _dependency_versions() -> dict[str, str]:
+    return {name.replace("-", "_") + "_version": version(name) for name in (
+        "langgraph", "langgraph-checkpoint", "langgraph-checkpoint-sqlite", "langchain-core",
+    )}
+
+
+@contextmanager
+def _checkpoint_operation(stage: str, namespace: str = ""):
+    try:
+        yield
+    except CheckpointProtectionError as error:
+        try:
+            from src.core.diag import diag
+            original_reason = error.args[0] if error.args and type(error.args[0]) is str else None
+            kind = {"": "execution", WORKING_CONTEXT_ARCHIVE_NAMESPACE: "working_context"}.get(
+                namespace, "graph_subspace")
+            structure = error.structure if error.structure in _CHECKPOINT_STRUCTURES else "unknown"
+            value_kind = error.value_kind if error.value_kind in _CHECKPOINT_VALUE_KINDS else "unknown"
+            image = os.environ.get("CITRUSQA_APP_IMAGE_SHA256", "")
+            diag("checkpoint_protection_failed",
+                 reason=_CHECKPOINT_REASONS.get(original_reason, "invalid_checkpoint_payload"),
+                 stage=stage, namespace=kind, structure=structure, schema_version=1,
+                 key_slot="checkpoint_storage_v1", value_kind=value_kind,
+                 app_image_sha256=image if re.fullmatch(r"[a-f0-9]{64}", image) else None,
+                 **_dependency_versions())
+        except Exception:
+            pass  # Diagnostics must never replace the protection exception.
+        raise
 
 
 def _binding(identity: ExecutionIdentity, provider_scope: tuple[str, str]) -> dict:
@@ -92,9 +193,9 @@ class _PrivateMessages(SerializerProtocol):
     def _state(self, value: Any) -> _ProtocolState:
         if (type(value) is not dict or set(value) != {"scope", "reasoning"}
                 or not isinstance(value["reasoning"], str)):
-            raise CheckpointProtectionError("private_protocol_state_missing")
+            raise CheckpointProtectionError("private_protocol_state_missing", structure="message.private")
         if value["scope"] != list(self.scope):
-            raise CheckpointProtectionError("private_protocol_scope_mismatch")
+            raise CheckpointProtectionError("private_protocol_scope_mismatch", structure="message.private")
         return _ProtocolState(self.scope, value["reasoning"])
 
     def _walk(self, value: Any, *, reading: bool = False) -> Any:
@@ -135,6 +236,12 @@ class _PrivateMessages(SerializerProtocol):
                         raise CheckpointProtectionError("invalid_public_message")
                     self._check_public_field(public)
                     return cls(**public)
+                if kind == "admission_stopped" and set(value) == {_TAG, "reason"}:
+                    reason = value["reason"]
+                    if type(reason) is not str or not reason or len(reason) > 200:
+                        raise CheckpointProtectionError("invalid_checkpoint_payload",
+                                                        structure="value.tag")
+                    return _admission_stopped_type()(reason)
                 if kind in ("deepseek", "deepseek_chunk") and set(value) == {_TAG, "public", "private"}:
                     state = self._state(value["private"])
                     public = self._walk(value["public"], reading=True)
@@ -145,9 +252,9 @@ class _PrivateMessages(SerializerProtocol):
                         return cls(**public, provider_protocol=state)
                     except Exception:
                         raise CheckpointProtectionError("invalid_private_message") from None
-                raise CheckpointProtectionError("invalid_checkpoint_tag")
+                raise CheckpointProtectionError("invalid_checkpoint_tag", structure="value.tag")
             if any(type(k) not in (str, int, float, bool, bytes, type(None)) for k in value):
-                raise CheckpointProtectionError("unsupported_checkpoint_key")
+                raise CheckpointProtectionError("unsupported_checkpoint_key", structure="value.mapping_key")
             return {k: self._walk(v, reading=reading) for k, v in value.items()}
         if type(value) is tuple:
             if reading:
@@ -174,21 +281,29 @@ class _PrivateMessages(SerializerProtocol):
             return {_TAG: "bytearray", "value": bytes(value)}
         if value is None or type(value) in (str, bool, int, float, bytes, bytearray):
             return value
-        raise CheckpointProtectionError("unsupported_checkpoint_value")
+        if type(value) is _admission_stopped_type():
+            reason = _admission_reason(value)
+            if reason:
+                return {_TAG: "admission_stopped", "reason": reason}
+        logger.warning("checkpoint value unsupported: %s", type(value).__name__)
+        raise CheckpointProtectionError("unsupported_checkpoint_value", structure="envelope.value",
+                                        value_kind=_value_kind(value))
 
     def _check_public_field(self, value: Any) -> None:
         if isinstance(value, BaseMessage):
-            raise CheckpointProtectionError("nested_message_in_public_fields")
+            raise CheckpointProtectionError("nested_message_in_public_fields", structure="message.public",
+                                            value_kind="message")
         if type(value) is dict:
             if _TAG in value or "provider_protocol" in value:
-                raise CheckpointProtectionError("private_state_in_public_fields")
+                raise CheckpointProtectionError("private_state_in_public_fields", structure="message.public")
             for child in value.values():
                 self._check_public_field(child)
         elif type(value) in (list, tuple, set, frozenset):
             for child in value:
                 self._check_public_field(child)
         elif value is not None and type(value) not in (str, bool, int, float, bytes, bytearray):
-            raise CheckpointProtectionError("unsupported_public_message_field")
+            raise CheckpointProtectionError("unsupported_public_message_field", structure="message.public",
+                                            value_kind=_value_kind(value))
 
     def dumps_typed(self, obj: Any) -> tuple[str, bytes]:
         envelope = {"version": 1, "binding": self.binding, "value": self._walk(obj)}
@@ -203,13 +318,22 @@ class _PrivateMessages(SerializerProtocol):
         try:
             envelope = self.delegate.loads_typed(("msgpack", data[1]))
             if (type(envelope) is not dict or set(envelope) != {"version", "binding", "value"}
-                    or envelope["version"] != 1 or envelope["binding"] != self.binding):
-                raise CheckpointProtectionError("checkpoint_binding_mismatch")
+                    or type(envelope["version"]) is not int or envelope["version"] != 1
+                    or type(envelope["binding"]) is not dict
+                    or set(envelope["binding"]) != set(self.binding)):
+                raise CheckpointProtectionError("invalid_checkpoint_payload", structure="envelope")
+            saved_binding = envelope["binding"]
+            if (type(saved_binding["owner_user_id"]) is not int
+                    or any(saved_binding[k] != v for k, v in self.binding.items()
+                           if k not in {"provider", "model"})):
+                raise CheckpointProtectionError("checkpoint_binding_mismatch", structure="envelope.binding")
+            if (saved_binding["provider"], saved_binding["model"]) != self.scope:
+                raise CheckpointProtectionError("checkpoint_provider_scope_mismatch", structure="envelope.binding")
             return self._walk(envelope["value"], reading=True)
         except CheckpointProtectionError:
             raise
         except Exception:
-            raise CheckpointProtectionError("invalid_checkpoint_payload") from None
+            raise CheckpointProtectionError("invalid_checkpoint_payload", structure="envelope.value") from None
 
 
 class _AesGcm:
@@ -223,11 +347,11 @@ class _AesGcm:
 
     def decrypt(self, ciphername: str, ciphertext: bytes) -> bytes:
         if ciphername != _CIPHER or len(ciphertext) < 28:
-            raise CheckpointProtectionError("invalid_checkpoint_ciphertext")
+            raise CheckpointProtectionError("invalid_checkpoint_ciphertext", structure="ciphertext")
         try:
             return self.aes.decrypt(ciphertext[:12], ciphertext[12:], self.aad)
         except InvalidTag:
-            raise CheckpointProtectionError("checkpoint_authentication_failed") from None
+            raise CheckpointProtectionError("checkpoint_authentication_failed", structure="ciphertext") from None
 
 
 class ProtectedCheckpointSerializer(EncryptedSerializer):
@@ -240,7 +364,7 @@ class ProtectedCheckpointSerializer(EncryptedSerializer):
     def loads_typed(self, data: tuple[str, bytes]) -> Any:
         # Upstream EncryptedSerializer accepts plaintext. This boundary does not.
         if data[0] != f"{_FORMAT}+{_CIPHER}":
-            raise CheckpointProtectionError("encrypted_checkpoint_required")
+            raise CheckpointProtectionError("encrypted_checkpoint_required", structure="ciphertext")
         return super().loads_typed(data)
 
 
@@ -304,6 +428,14 @@ def _load_key(directory: Path) -> bytes:
 
 
 class _ProtectedSqliteSaver(AsyncSqliteSaver):
+    async def aget_tuple(self, config):
+        with _checkpoint_operation("read", config["configurable"].get("checkpoint_ns", "")):
+            return await super().aget_tuple(config)
+
+    async def aput_writes(self, config, writes, task_id, task_path=""):
+        with _checkpoint_operation("write_pending", config["configurable"].get("checkpoint_ns", "")):
+            await super().aput_writes(config, writes, task_id, task_path)
+
     async def aput(self, config, checkpoint, metadata, new_versions):
         # SQLite's metadata column bypasses serde. Persist only fixed control
         # fields, NEVER arbitrary metadata/config strings, messages or reasoning.
@@ -315,7 +447,8 @@ class _ProtectedSqliteSaver(AsyncSqliteSaver):
         safe_metadata["parents"] = {}
         safe_config = {"configurable": {k: v for k, v in config["configurable"].items()
                                         if k in {"thread_id", "checkpoint_ns", "checkpoint_id"}}}
-        return await super().aput(safe_config, checkpoint, safe_metadata, new_versions)
+        with _checkpoint_operation("write", safe_config["configurable"].get("checkpoint_ns", "")):
+            return await super().aput(safe_config, checkpoint, safe_metadata, new_versions)
 
 
 def _prepare(root: Path, identity: ExecutionIdentity, provider_scope: tuple[str, str]):
@@ -351,8 +484,9 @@ async def open_checkpoint(root: Path, identity: ExecutionIdentity,
     the deployment owner's responsibility). Metadata is limited to source/step;
     arbitrary metadata and parent-namespace indexes are intentionally omitted.
     """
-    _binding(identity, provider_scope)  # Validate before creating any state.
-    path, key = await asyncio.to_thread(_prepare, Path(root), identity, provider_scope)
+    with _checkpoint_operation("prepare"):
+        _binding(identity, provider_scope)  # Validate before creating any state.
+        path, key = await asyncio.to_thread(_prepare, Path(root), identity, provider_scope)
     async with aiosqlite.connect(str(path)) as connection:
         yield _ProtectedSqliteSaver(
             connection, serde=ProtectedCheckpointSerializer(key, identity, provider_scope))

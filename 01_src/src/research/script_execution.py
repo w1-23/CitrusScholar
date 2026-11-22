@@ -68,6 +68,8 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
         observe_failed_worker(result, source)
         described = result.describe() or "脚本未完成；未接收本次残留输出。"
         content, payload = _error("SCRIPT_ERROR", described)
+        if result.diagnostic:
+            payload["diagnostic"] = result.diagnostic
         if "RENDER_SCRIPT_EMIT_NOT_AVAILABLE" in described:
             payload["error_code"] = "render_script_emit_not_available"
         return content, payload

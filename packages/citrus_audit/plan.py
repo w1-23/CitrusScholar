@@ -44,6 +44,49 @@ def _rows(value):
             and len(set(value)) == len(value))
 
 
+def _region_key(ref):
+    """Stable identity for one logical region inside a sheet."""
+    return ref.get("region_id") or ref.get("region_bounds") or ""
+
+
+def _region_fields_ok(ref):
+    for key in ("region_id", "region_bounds"):
+        if key in ref and (not isinstance(ref[key], str) or not ref[key].strip()
+                           or len(ref[key]) > 250):
+            return False
+    return True
+
+
+def _same_selection(first, second):
+    return ((first["file_index"], first["sheet"], _region_key(first))
+            == (second["file_index"], second["sheet"], _region_key(second)))
+
+
+def _snapshot_entry(ref, snapshots):
+    """Resolve a legacy (file, sheet) key or an explicit region identity.
+
+    Same-sheet non-overlapping regions are stored with a third identity
+    element. An unqualified reference that matches more than one region on the
+    same sheet is ambiguous and must not silently select one.
+    """
+    base = (ref["file_index"], ref["sheet"])
+    region = _region_key(ref)
+    if region:
+        key = (base[0], base[1], region)
+        return (snapshots.get(key), "") if key in snapshots else (None, "bound_region_unavailable")
+    if base in snapshots:
+        return snapshots[base], ""
+    matches = [key for key in snapshots
+               if isinstance(key, tuple) and len(key) >= 3
+               and key[0] == base[0] and key[1] == base[1]]
+    identities = {str(key[2]) for key in matches}
+    if len(identities) == 1:
+        return snapshots[matches[0]], ""
+    if len(identities) > 1:
+        return None, "bound_region_ambiguous"
+    return None, ""
+
+
 def _rect_rows(value):
     """Authorized rectangle rows: ordered, unique, original 1-based coordinates."""
     return (isinstance(value, list) and 3 <= len(value) <= MAX_RECTANGLE_ROWS
@@ -121,18 +164,22 @@ def parse_plan(raw):
             sides = []
             for side in ("left", "right"):
                 ref = comparison.get(side)
-                if (not isinstance(ref, dict) or set(ref) != {"file_index", "sheet", "rectangles"}
+                if (not isinstance(ref, dict)
+                        or not {"file_index", "sheet", "rectangles"} <= set(ref)
+                        or set(ref) - {"file_index", "sheet", "rectangles", "region_id", "region_bounds"}
                         or type(ref["file_index"]) is not int or not 0 <= ref["file_index"] < 20
-                        or not isinstance(ref["sheet"], str) or len(ref["sheet"]) > 250):
-                    raise ValueError("Use original sheet names and explicit authorized rectangles")
+                        or not isinstance(ref["sheet"], str) or len(ref["sheet"]) > 250
+                        or not _region_fields_ok(ref)):
+                    raise ValueError("Use original sheet names, explicit authorized rectangles and optional region identities")
                 rectangles = _rectangles(ref["rectangles"])
                 if rectangles is None:
                     raise ValueError("Rectangles need ordered 1-based rows and 2-8 distinct columns without overlap")
                 if not any(len(rect["rows"]) >= window["rows"] and len(rect["columns"]) >= window["columns"]
                            for rect in rectangles):
                     raise ValueError("The window must fit inside an authorized rectangle on both sides")
-                sides.append({"file_index": ref["file_index"], "sheet": ref["sheet"], "rectangles": rectangles})
-            if (sides[0]["file_index"], sides[0]["sheet"]) == (sides[1]["file_index"], sides[1]["sheet"]):
+                sides.append({**ref, "file_index": ref["file_index"], "sheet": ref["sheet"],
+                              "rectangles": rectangles})
+            if _same_selection(sides[0], sides[1]):
                 raise ValueError("Two distinct table selections must have matching comparison dimensions")
             max_windows = _int_cap(comparison.get("max_windows"), DEFAULT_MAX_WINDOWS, MAX_MAX_WINDOWS)
             max_pairs = _int_cap(comparison.get("max_pairs"), DEFAULT_MAX_PAIRS, MAX_MAX_PAIRS)
@@ -147,16 +194,20 @@ def parse_plan(raw):
             sides = []
             for side in ("left", "right"):
                 ref = comparison.get(side)
-                if (not isinstance(ref, dict) or set(ref) != {"file_index", "sheet", "columns", selection}
+                if (not isinstance(ref, dict)
+                        or not {"file_index", "sheet", "columns", selection} <= set(ref)
+                        or set(ref) - {"file_index", "sheet", "columns", selection,
+                                       "region_id", "region_bounds"}
                         or type(ref["file_index"]) is not int or not 0 <= ref["file_index"] < 20
                         or not isinstance(ref["sheet"], str) or len(ref["sheet"]) > 250
+                        or not _region_fields_ok(ref)
                         or not _labels(ref["columns"], 8)
                         or (selection == "key_columns" and (not _labels(ref[selection], 4) or set(ref[selection]) & set(ref["columns"])))
                         or (selection == "rows" and (not _rows(ref[selection]) or len(ref["columns"]) < 2))):
                     raise ValueError("Use original sheet names, exact columns and explicit keys or source rows")
                 sides.append(ref)
             left, right = sides
-            if ((left["file_index"], left["sheet"]) == (right["file_index"], right["sheet"])
+            if (_same_selection(left, right)
                     or len(left["columns"]) != len(right["columns"]) or len(left[selection]) != len(right[selection])):
                 raise ValueError("Two distinct table selections must have matching comparison dimensions")
         numbers = {}
@@ -374,7 +425,15 @@ def compare_bound(plan, snapshots):
                    "interpretation_scope": "review_lead_only"}
         results.append(receipt)
         sides = [binding[name] for name in ("left", "right")]
-        found = [snapshots.get((ref["file_index"], ref["sheet"])) for ref in sides]
+        found, lookup_reason = [], ""
+        for ref in sides:
+            value, reason = _snapshot_entry(ref, snapshots)
+            found.append(value)
+            if reason and not lookup_reason:
+                lookup_reason = reason
+        if lookup_reason:
+            receipt["reason"] = lookup_reason
+            continue
         if any(value is None for value in found):
             receipt["reason"] = "bound_sheet_unavailable"
             continue

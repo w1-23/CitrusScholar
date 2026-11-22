@@ -34,6 +34,7 @@ from .deep_agent_runtime import create_host_agent, EXECUTOR_ID, MODEL_PROVIDER
 class HarnessState(DeepAgentState):
     executor_id: NotRequired[str]
     model_steps: NotRequired[int]
+    final_answer_recovery: NotRequired[bool]
     host_state: NotRequired[dict]
     batch_notes: NotRequired[list[str]]
     batch_status: NotRequired[str]
@@ -245,6 +246,18 @@ class HarnessRuntime:
                             or len(set(ids)) != len(ids) or previous.intersection(ids)):
                     invalid = "invalid_or_reused_tool_call_id"
                 await event("model_finished", state, ids)
+                if response.response_metadata.get("citrus_stream_terminal_unconfirmed"):
+                    return {"stop_status": "incomplete", "stop_reason": "model_stream_unconfirmed", "jump_to": "end"}
+                if state.get("final_answer_recovery") and (invalid or ids):
+                    return {"stop_status": "incomplete", "stop_reason": "final_answer_recovery_incomplete", "jump_to": "end"}
+                if (adapter.recover_output and invalid == "model_length" and not ids
+                        and not response.invalid_tool_calls):
+                    # One answer-only attempt with the same retained evidence.
+                    # The normal model admission still owns budget and deadlines.
+                    await event("model_output_rejected", {**state, "stop_reason": invalid}, ids)
+                    return {"messages": [control("上一份答复达到输出上限。仅用已保存证据重新给出精简且完整的最终答复；"
+                                                 "不要调用任何工具，不要将截断内容当作完成。")],
+                            "final_answer_recovery": True, "host_state": host_snapshot(), "jump_to": "model"}
                 if (adapter.recover_output and (invalid == "invalid_tool_call" or (
                         invalid == "model_length" and not response.response_metadata.get("citrus_output_limit_exhausted")))):
                     # No tool in this response has been dispatched. Preserve raw
@@ -274,6 +287,8 @@ class HarnessRuntime:
                 if not response.tool_calls:
                     check = await adapter.check_final(response, tuple(state["messages"]), identity)
                     if not check.accepted:
+                        if state.get("final_answer_recovery"):
+                            return {"stop_status": "incomplete", "stop_reason": "final_answer_recovery_incomplete", "jump_to": "end"}
                         return {"messages": [control("Final result validation returned these observations:\n" + "\n".join(check.observations))],
                                 "host_state": host_snapshot(), "jump_to": "model"}
                     return {"stop_status": "complete", "stop_reason": "answered", "host_state": host_snapshot()}

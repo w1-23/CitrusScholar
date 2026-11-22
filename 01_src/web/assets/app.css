@@ -433,6 +433,8 @@ a.rail-button { text-decoration: none; color: var(--text-muted); }
 .sent-attachment-count { margin-top: 5px; color: var(--text-secondary); font-size: 11px; }
 .sent-attachment-gallery { display: flex; flex-wrap: wrap; gap: 7px; max-width: 340px; margin-top: 9px; }
 .sent-attachment-card { position: relative; width: 112px; height: 92px; flex: 0 0 112px; overflow: hidden; border: 1px solid rgba(0,0,0,.12); border-radius: 9px; background: rgba(255,255,255,.55); }
+.sent-attachment-open-image { display: block; width: 100%; height: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
+.sent-attachment-open-image:focus-visible { outline: 2px solid currentColor; outline-offset: -3px; }
 .sent-attachment-image { display: block; width: 100%; height: 100%; object-fit: cover; }
 .sent-attachment-icon { display: flex; width: 100%; height: 100%; align-items: center; justify-content: center; color: var(--accent); font-size: 18px; font-weight: 700; }
 .sent-attachment-name { position: absolute; right: 0; bottom: 0; left: 0; overflow: hidden; padding: 17px 5px 4px; background: linear-gradient(transparent, rgba(0,0,0,.72)); color: #fff; font-size: 10px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }

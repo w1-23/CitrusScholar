@@ -214,7 +214,7 @@ def create_research_figure(
     数据引用 kind：attachment（本轮上传的表，按列名取）、account_file（资料库
     file_id + 列名）、inline（直接给 values，≤200 行）。
     error：none / sd / se / ci95 —— 误差棒的含义，必须与数据实际算出的量一致。
-    formats_json：需要的格式，默认只交付 SVG；其他格式按明确请求导出。
+    formats_json：新图件统一交付 SVG，可省略此参数。
     output_name：文件名（不含扩展名），默认用标题。
 
     先检查数据形状、研究问题和单位；样本编号/高唯一率标签不是默认处理组，
@@ -232,15 +232,10 @@ def create_research_figure(
         if title:
             raw_spec = dict(raw_spec)
             raw_spec.setdefault("title", title)
-        formats = _json_arg(formats_json, "formats_json") or ["svg"]
-        if isinstance(formats, str):
-            formats = [formats]
-        formats = [str(item).strip().lower() for item in formats
-                   if str(item).strip().lower() in FIGURE_FORMATS]
-        if not formats:
-            formats = ["svg"]
+        _json_arg(formats_json, "formats_json")
     except ToolArgumentError as exc:
         return _error("ARG", str(exc))
+    formats = ("svg",)
 
     from src.figures.spec import SpecError, parse_spec
     try:
@@ -380,6 +375,7 @@ def _run_research_figure_script(
     min_font_pt、min_linewidth_pt、caption，返回实际测量及明确的 unsupported 检查。
     inputs_json也可绑定 {"tidy":{"dataset_ref":上一执行返回的dataset_ref}}，
     用 df=load_dataset(tidy) 读取保留类型/精度的内部表；普通文件仍用pandas读取。
+    可选 outputs_json.input_contract 版本 1 区分原始文件和读入的表。raw 声明 Path 变量。tables 逐项声明 name、input、format（csv/tsv/excel/dataset）及需要时的 sheet、header，主脚本收到对应 DataFrame。独立 renderer 只收到冻结表映射 data。可用 render 指定 renderer 键到父表的映射。emit.table 的 parents 使用 inputs_json 中的原始绑定名。省略 input_contract 时沿用旧变量合同。
     默认用冻结表与独立渲染的outputs_json版本2协议，支持后续保真样式编辑。例如：
     {"version":2,"tables":[{"name":"tidy","parents":["data"]}],
     "figures":[{"name":"relations","title":"变量关系","formats":["svg"],
@@ -409,7 +405,7 @@ def _run_research_figure_script(
     ax.bar(['CK', 'T1'], [10.1, 12.2], color='#0F4D92', label='果实重量')
     ax.set_ylabel('g'); ax.set_title('果实重量')
 
-    formats_json：需要的格式，默认只交付 SVG；其他格式按明确请求导出。
+    formats_json：新图件统一交付 SVG，可省略此参数。
     output_name：文件名（不含扩展名）。
 
     失败时返回 [FIGURE_...] 形式的说明，指出问题与改法；沙箱不会执行任何
@@ -424,16 +420,7 @@ def _run_research_figure_script(
     if len(text) > _MAX_SCRIPT_CHARS + (65000 if script_record else 0):
         return _error("ARG", f"脚本超过 {_MAX_SCRIPT_CHARS} 字符上限，请精简后重试。")
 
-    try:
-        formats = _json_arg(formats_json, "formats_json") or ["svg"]
-        if isinstance(formats, str):
-            formats = [formats]
-        formats = [str(item).strip().lower() for item in formats
-                   if str(item).strip().lower() in FIGURE_FORMATS]
-        if not formats:
-            formats = ["svg"]
-    except ToolArgumentError as exc:
-        return _error("ARG", str(exc))
+    formats = ("svg",)
 
     runner = _sandbox_runner if _sandbox_runner is not None else _select_script_runner()
     if runner is None:
@@ -446,6 +433,11 @@ def _run_research_figure_script(
     try:
         from src.figures.script_outputs import normalize_output_contract
         contract = normalize_output_contract(_json_arg(outputs_json, "outputs_json"))
+        if contract:
+            # Apply delivery policy after the runtime has identified the request.
+            # Presets and retained repairs keep their original request identity.
+            contract["figures"] = [{**figure, "formats": list(formats)}
+                                   for figure in contract["figures"]]
         bindings = _json_arg(inputs_json, "inputs_json") or {}
         profile = parse_qa_profile(_json_arg(qa_profile_json, "qa_profile_json"))
         internal_file_ids = []
@@ -531,7 +523,10 @@ def _run_research_figure_script(
         code = {"timeout": "SCRIPT_TIMEOUT", "oom": "SCRIPT_OOM",
                 "forbidden": "SCRIPT_FORBIDDEN",
                 "output": "SCRIPT_OUTPUT"}.get(result.failure_kind, "SCRIPT_ERROR")
-        return _error(code, message)
+        content, payload = _error(code, message)
+        if result.diagnostic:
+            payload["diagnostic"] = result.diagnostic
+        return content, payload
 
     try:
         manifest_bytes = result.outputs["manifest"]
@@ -680,7 +675,7 @@ def run_research_figure_script(
         formats = _json_arg(formats_json, "formats_json")
         if formats is not None and (not isinstance(formats, (list, tuple))
                 or any(not isinstance(fmt, str) or fmt.lower().strip() not in FIGURE_FORMATS for fmt in formats)):
-            raise ToolArgumentError("formats_json 需要 svg、png、pdf 的 JSON 数组。")
+            raise ToolArgumentError("formats_json 需要 JSON 格式数组，例如 [\"svg\"]。新图件统一交付 SVG。")
     except (ValueError, TypeError) as exc:
         if isinstance(exc, RenderScriptEmitUnavailable):
             # Pure, repeatable rejection: no script save, run reservation or
@@ -726,7 +721,7 @@ run_research_figure_script.__doc__ = inspect.cleandoc(_run_research_figure_scrip
 script与script_ref_json二选一；源码执行前自动暂存，返回script_ref及run_id，
 失败也保留源码。parameters_json是JSON对象，脚本内通过parameters读取，不拼接代码。
 修复已保存的failed/partial运行时，只提供修改后的script或script_ref_json与repair_from_run_id；
-其余参数留空。宿主继承该运行的固定输入、参数、输出约定和审核选项，重新校验后创建新运行。
+其余参数留空。宿主继承该运行的固定输入、参数、输出约定和审核选项，重新校验后创建新运行。新图件仍统一交付 SVG。
 改变输出契约（如改为独立render_script）需显式绑定授权输入发起新运行，不传repair_from_run_id。
 先read_run查看具体失败；running或状态未知的运行不能重放。旧记录缺少完整修复输入时须显式绑定授权来源。
 内置脚本可自动使用其声明的输出契约；任务脚本需要明确绑定输入和输出。

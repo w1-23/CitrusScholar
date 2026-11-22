@@ -35,9 +35,13 @@ class TurnEnvelope:
     terminal_seq: int = 0
     tool_resolutions: tuple[dict[str, str], ...] = ()
     task_snapshot: dict[str, Any] = field(default_factory=dict)
+    artifact_delivery: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        if self.artifact_delivery is None:
+            result.pop("artifact_delivery")
+        return result
 
 
 def build_turn_envelope(
@@ -53,6 +57,7 @@ def build_turn_envelope(
     notices: list[str] | tuple[str, ...] | None = None,
     terminal_seq: int = 0,
     task_snapshot: dict[str, Any] | None = None,
+    artifact_delivery: dict[str, Any] | None = None,
 ) -> TurnEnvelope:
     """Compose the single terminal view from structured records only.
 
@@ -157,6 +162,7 @@ def build_turn_envelope(
         terminal_seq=max(0, int(terminal_seq or 0)),
         tool_resolutions=tuple(resolved_tool_attempts(tool_status, outcome)),
         task_snapshot=snapshot,
+        artifact_delivery=_public_artifact_delivery(artifact_delivery),
     )
 
 
@@ -169,11 +175,28 @@ def public_task_snapshot(snapshot: dict) -> dict:
     return result
 
 
+def _public_artifact_delivery(delivery: Any) -> dict | None:
+    if not isinstance(delivery, dict) or delivery.get("status") not in (
+            "available", "partial", "unavailable"):
+        return None
+    ids = delivery.get("verified_file_ids")
+    if not isinstance(ids, (list, tuple)):
+        ids = []
+    count = delivery.get("unavailable_count")
+    return {"status": delivery["status"],
+            "verified_file_ids": list(dict.fromkeys(value for value in ids
+                if isinstance(value, str) and value)),
+            "unavailable_count": count if type(count) is int and count >= 0 else None}
+
+
 def public_terminal_snapshot(envelope: dict) -> dict:
     """Apply the same boundary to old persisted terminal envelopes on read."""
     result = dict(envelope)
     if isinstance(result.get("task_snapshot"), dict):
         result["task_snapshot"] = public_task_snapshot(result["task_snapshot"])
+    delivery = _public_artifact_delivery(result.pop("artifact_delivery", None))
+    if delivery is not None:
+        result["artifact_delivery"] = delivery
     return result
 
 

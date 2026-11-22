@@ -44,7 +44,7 @@ from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.runtime import Runtime
 from pydantic import Field
 
-from .checkpoint_store import checkpoint_scope, open_checkpoint
+from .checkpoint_store import WORKING_CONTEXT_ARCHIVE_NAMESPACE, checkpoint_scope, open_checkpoint
 from .identity import ExecutionIdentity
 from .runtime import AdmissionStopped
 from src.core.model_context import is_skill_result
@@ -53,7 +53,7 @@ from src.core.request_context import estimate_request, message_dict, model_reque
 
 logger = logging.getLogger(__name__)
 
-_ARCHIVE_NS = "working-context-archive-v1"
+_ARCHIVE_NS = WORKING_CONTEXT_ARCHIVE_NAMESPACE
 # Unknown extension fields may be provider protocol, so they pin their message.
 _CONTEXT_METADATA = frozenset({"context_origin", "context_trusted", "session_id", "turn_id",
     "context_turn_id", "request_id", "run_id", "source_id"})
@@ -245,6 +245,11 @@ def _view(raw, removed, summary):
                  ([] if index in removed else [original]))
 
 
+_OPTIONAL_SUMMARY_FAILURES = frozenset({
+    'context_summary_input_limit', 'context_summary_incomplete',
+    'context_summary_timeout', 'context_summary_attempt_failed',
+})
+
 _SUMMARY_ADMISSION_REASONS = {
     "context_budget_exhausted": "context_summary_input_limit",
     "model_budget_exhausted:tokens": "model_budget_exhausted:tokens",
@@ -354,7 +359,7 @@ class _MeteredSummaryModel(BaseChatModel):
             except task_events.TaskConflict as exc:
                 reason = str(exc).split(" (", 1)[0]
                 raise AdmissionStopped(_SUMMARY_ADMISSION_REASONS.get(
-                    reason, "context_summary_attempt_failed")) from None
+                    reason, "context_summary_admission_rejected")) from None
             except TimeoutError:
                 code = ("context_projection_deadline" if time.monotonic() >= self.deadline
                         else "context_summary_timeout")
@@ -412,6 +417,7 @@ class WorkingContextProjection(AgentMiddleware):
         self.tool_schemas = tool_schemas if callable(tool_schemas) else list(tool_schemas or [])
         self._schemas = None if callable(tool_schemas) else self.tool_schemas
         self._cache = None
+        self._summary_unavailable = False
 
     def _count(self, messages) -> int:
         if self._schemas is None:
@@ -500,6 +506,8 @@ class WorkingContextProjection(AgentMiddleware):
                     return self._defer(baseline, reason="no_new_eligible_units", before=before,
                                        protected=len(protected), eligible=len(eligible))
         trace.mark("estimate")
+        if self._summary_unavailable:
+            return baseline
         if not tail or not eligible:
             return self._defer(baseline, reason="no_eligible_units", before=before,
                                protected=len(protected), eligible=len(eligible))
@@ -556,9 +564,19 @@ class WorkingContextProjection(AgentMiddleware):
             model=model, trigger=("messages", 1), keep=("messages", keep),
             token_counter=self._count, trim_tokens_to_summarize=None, summarizer=summarize_source)
         trace.mark("middleware")
-        update = await middleware.abefore_model({"messages": working}, Runtime())
-        if model.failure is not None:
-            raise model.failure
+        try:
+            update = await middleware.abefore_model({"messages": working}, Runtime())
+            if model.failure is not None:
+                raise model.failure
+        except AdmissionStopped as error:
+            if error.reason not in _OPTIONAL_SUMMARY_FAILURES:
+                raise
+            # The original graph messages and archive were validated above.
+            # Do not retry compression again in this run. The model admission
+            # gate still checks the bound fallback request and remaining budget.
+            self._summary_unavailable = True
+            return self._defer(baseline, reason=error.reason, before=before,
+                               protected=len(protected), eligible=len(eligible))
         trace.mark("middleware")
         if update is None:
             raise AdmissionStopped("context_projection_middleware_contract_changed")
@@ -600,7 +618,6 @@ class WorkingContextProjection(AgentMiddleware):
                                protected=len(protected), eligible=len(eligible))
         trace.mark("middleware")
         _complete_tool_groups(view)
-        self._check_tool_budget(view, after)
         if self.on_projection:
             trace.mark("callback")
             await self.on_projection({"event": ("working_context_archived" if archived_only == removed
@@ -613,24 +630,12 @@ class WorkingContextProjection(AgentMiddleware):
         self._cache = (tuple(m.model_copy(deep=True) for m in raw), required, removed, summary)
         return view
 
-    def _check_tool_budget(self, view, tokens):
-        if tokens < self.trigger_tokens:
-            return
-        without_tools = [message for message in view if not isinstance(message, ToolMessage)]
-        if len(without_tools) < len(view) and self._count(without_tools) < self.trigger_tokens:
-            # Protected tool groups and exact readback pages cannot be shortened
-            # here without breaking provider pairing or losing requested evidence.
-            logger.info("context_projection_stopped reason=tool_observations input_tokens=%s soft_limit=%s",
-                        tokens, self.trigger_tokens)
-            raise AdmissionStopped("context_budget_exhausted:tool_observations")
-
     def _defer(self, view, *, reason, before, protected, eligible):
         # The callback is reserved for actual compression (hosts may announce
         # success from it). Log only sizes and stable codes, never message data.
         # The caller's ModelDriver must still admit the complete bound request;
         # this soft threshold cannot bypass its input/output/schema budget.
         after = self._count(view)
-        self._check_tool_budget(view, after)
         logger.info("context_projection_deferred reason=%s before_tokens=%s after_tokens=%s "
                     "trigger_tokens=%s target_tokens=%s protected_messages=%s eligible_units=%s",
                     reason, before, after, self.trigger_tokens, self.target_tokens,

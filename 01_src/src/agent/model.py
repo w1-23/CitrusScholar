@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, BaseMessage, message_chunk_to_mes
 
 from .capabilities import CapabilityCatalog
 from .identity import ExecutionIdentity
+from .runtime import AdmissionStopped
 
 
 @dataclass
@@ -40,15 +41,25 @@ class ModelDriver:
             model = model.model_copy(update={"max_tokens": limit})
         bound = model.bind_tools(schemas) if schemas else model
         from src.core.stream_llm import stream_llm_response
-        from src.core.task_events import run_model_attempt
-        response = await run_model_attempt(
-            bound, list(messages),
-            lambda: stream_llm_response(bound, list(messages), self.on_text),
-            purpose="main_loop", usage_session_id=identity.session_id)
+        from src.core.task_events import TaskConflict, run_model_attempt
+        try:
+            response = await run_model_attempt(
+                bound, list(messages),
+                lambda: stream_llm_response(bound, list(messages), self.on_text),
+                purpose="main_loop", usage_session_id=identity.session_id, streaming=True)
+        except TaskConflict as error:
+            if str(error) == "context_budget_exhausted:tool_observations":
+                raise AdmissionStopped(str(error)) from None
+            raise
         # The stream accumulator returns a chunk. Executor state and context
         # admission require a complete message, including the adapter's exact
         # private protocol class, tool calls, usage and response metadata.
         response = message_chunk_to_message(response)
+        terminal = response.response_metadata.get("finish_reason")
+        if response.tool_calls and terminal not in (
+                "tool_calls", "tool_use", "function_call", "stop", "end_turn", "stop_sequence",
+                "length", "max_output_tokens", "max_tokens"):
+            response.response_metadata["citrus_stream_terminal_unconfirmed"] = True
         if self.max_output_tokens is not None:
             truncated = response.response_metadata.get("finish_reason") in {
                 "length", "max_tokens", "max_output_tokens"}

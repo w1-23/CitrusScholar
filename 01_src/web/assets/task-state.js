@@ -10,6 +10,24 @@
     return displayStatus(job) || (job && terminal.indexOf(job.status) >= 0 ? job.status : '');
   }
   function list(value) { return Array.isArray(value) ? value : []; }
+  // Artifact delivery is an explicit terminal-tail fact: which verified files
+  // the turn actually delivered, and how many expected files are unavailable.
+  // Unknown status values stay truthful; file ids are never guessed.
+  function normalizeDelivery(data) {
+    if (!data || typeof data !== 'object') return null;
+    var status = String(data.status || '').trim();
+    if (!status) return null;
+    var seen = new Set(), ids = [];
+    list(data.verified_file_ids).forEach(function (id) {
+      var text = String(id == null ? '' : id).trim();
+      if (!text || seen.has(text)) return;
+      seen.add(text); ids.push(text);
+    });
+    var unavailable = Number(data.unavailable_count);
+    unavailable = Number.isFinite(unavailable) && unavailable > 0 ? Math.floor(unavailable) : 0;
+    return {status: status, verified_file_ids: ids, unavailable_count: unavailable,
+      seq: Number.isSafeInteger(data.seq) ? data.seq : 0};
+  }
   // Event arrival is ordered separately from the public process projection.
   // All aliases identify one logical operation; attempts remain separate facts.
   function createProcess() {
@@ -233,10 +251,40 @@
   function create(options) {
     options = options || {};
     var state = {job_id: '', cursor: 0, task_version: 0, applied_version: 0, status: '', started_at: 0, finished_at: 0,
-      display_status: '', terminal_snapshot: null, question: null, pending_updates: [], not_applied_updates: [], operations: [], approvals: []};
+      display_status: '', terminal_snapshot: null, question: null, pending_updates: [], not_applied_updates: [], operations: [], approvals: [],
+      artifact_delivery: null};
     var pending = new Map(), subscribers = [], context = createContext(options);
     state.context_snapshot = null;
     function notify() { subscribers.slice().forEach(function (fn) { fn(state); }); }
+    // Ordered events own the newest delivery. A snapshot without a sequence
+    // (terminal_snapshot / hydrated job) fills only when no ordered fact exists.
+    function applyDelivery(data) {
+      var next = normalizeDelivery(data), previous = state.artifact_delivery;
+      if (!next) return false;
+      if (previous) {
+        if (next.seq && previous.seq && next.seq < previous.seq) return false;
+        if (next.seq && next.seq === previous.seq) return false;
+        if (!next.seq && previous.seq) return false;
+        if (!next.seq && !previous.seq && next.status === previous.status &&
+            next.unavailable_count === previous.unavailable_count &&
+            next.verified_file_ids.join('\u0000') === previous.verified_file_ids.join('\u0000')) return false;
+      }
+      state.artifact_delivery = next;
+      return true;
+    }
+    // A terminal or delivery fact must belong to the exact originating request.
+    // The initial job frame may name the server-side request id; its client id
+    // is authoritative when present.
+    function foreignRequest(type, data) {
+      if (!options.request_id || !data || (!data.request_id && !data.client_request_id)) return false;
+      if (data.request_id === options.request_id) return false;
+      if (data.client_request_id === options.request_id) return false;
+      // A durable event naming this exact job is already bound to the turn;
+      // job identity is the stronger, unambiguous origin.
+      if (data.job_id && state.job_id && data.job_id === state.job_id) return false;
+      if (type === 'job') return !!data.client_request_id;
+      return true;
+    }
     function recordTimes(data) {
       // The execution clock accepts epoch seconds. Legacy local ISO strings
       // do not establish a timezone or an execution start.
@@ -246,6 +294,9 @@
     }
     function hydrate(job) {
       if (!job || job.job_id && state.job_id && job.job_id !== state.job_id) return false;
+      // A durable snapshot is bound by job identity. A continuation child
+      // legitimately has a client request id different from the root turn, so
+      // request scoping applies to events (foreignRequest), not snapshots.
       if (Number.isSafeInteger(job.event_cursor) && job.event_cursor < state.cursor) return false;
       if (Number.isSafeInteger(job.task_version) && job.task_version < state.task_version) return false;
       if (job.job_id) state.job_id = String(job.job_id);
@@ -261,6 +312,13 @@
       });
       var savedContext = job.context_snapshot || (job.terminal_snapshot || {}).context_snapshot;
       if (savedContext) state.context_snapshot = context.receive('context_snapshot', savedContext);
+      // The terminal snapshot is the authoritative tail when the delivery event
+      // itself is no longer in the page window. Its sequence is the job cursor,
+      // so a stale page can never replace a newer ordered event.
+      var savedDelivery = job.artifact_delivery || (job.terminal_snapshot || {}).artifact_delivery
+        || (job.turn_envelope || {}).artifact_delivery;
+      if (savedDelivery) applyDelivery(Object.assign({}, savedDelivery, {
+        seq: Number.isSafeInteger(job.event_cursor) ? job.event_cursor : (savedDelivery.seq || 0)}));
       if (job.question) state.question = newerQuestion(state.question, job.question);
       if (job.status && !state.display_status) state.status = String(job.status);
       var settled = snapshotStatus(job);
@@ -272,6 +330,12 @@
       notify(); return true;
     }
     function reduce(type, data) {
+      if (type === 'artifact_delivery') applyDelivery(data);
+      if (data.artifact_delivery) applyDelivery(Object.assign({}, data.artifact_delivery,
+        {seq: Number.isSafeInteger(data.seq) ? data.seq : (data.artifact_delivery.seq || 0)}));
+      var envelope = data.turn_envelope || data.terminal_snapshot;
+      if (envelope && envelope.artifact_delivery) applyDelivery(Object.assign({}, envelope.artifact_delivery,
+        {seq: Number.isSafeInteger(data.seq) ? data.seq : (envelope.artifact_delivery.seq || 0)}));
       if (['context_snapshot', 'context_status', 'context_budget', 'context_usage'].indexOf(type) >= 0) {
         state.context_snapshot = context.receive(type, data);
       }
@@ -340,6 +404,7 @@
     }
     function receive(type, data, eventId) {
       data = data && typeof data === 'object' ? data : {};
+      if (foreignRequest(type, data)) return false;
       if (data.job_id && state.job_id && data.job_id !== state.job_id) return false;
       var seq = data.seq;
       if (seq === undefined && eventId && /^\d+$/.test(String(eventId))) seq = Number(eventId);
@@ -357,7 +422,8 @@
     function reset(jobId) {
       pending.clear(); context = createContext(options); state.context_snapshot = null;
       Object.assign(state, {job_id: jobId, cursor: 0, task_version: 0, applied_version: 0, status: '', started_at: 0, finished_at: 0,
-        display_status: '', terminal_snapshot: null, question: null, approvals: [], operations: [], pending_updates: [], not_applied_updates: []});
+        display_status: '', terminal_snapshot: null, question: null, approvals: [], operations: [], pending_updates: [], not_applied_updates: [],
+        artifact_delivery: null});
     }
     return {state: state, receive: receive, hydrate: hydrate,
       hasGap: function () { return pending.size > 0; },

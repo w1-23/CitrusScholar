@@ -136,7 +136,7 @@ async def _run(state, identity, ledger):
             from src.config import PROJECT_ROOT as runtime_root
             host.allowed_names.update(CODE_TOOL_NAMES)
             if not worker_available(runtime_root / "state" / "code_executions.sqlite3"):
-                host.allowed_names.discard("code_execute")
+                host.allowed_names.difference_update({"code_execute", "code_environment_install"})
         tracing.set_request_authorizations(executor_authorizations(str(state.get("query") or "")))
         return set(host.allowed_names)
     refresh_allowed()
@@ -181,6 +181,18 @@ async def _run(state, identity, ledger):
             prompt += "\n已登记的本地资料类别（选择工具时使用真实family id）：\n" + load_corpus_registry().describe_families()
         except Exception:
             prompt += "\n本地资料类别目录暂不可用；不得猜测family id。"
+    # Keep the brief public introduction after the internal tool directories.
+    intro_capabilities = [description for names, description in (
+        ({"browse_web"}, "浏览公开网页"),
+        ({"local_hybrid_search", "deepseek_search", "deepseek_fetch", "deepseek_fetch_paper"}, "查找资料"),
+        ({"inspect_uploaded_table"}, "分析附件"),
+        ({"code_execute"}, "运行离线代码"),
+    ) if names & host.allowed_names]
+    intro_example = "我是 CitrusScholar，一名通用智能助手。我可以回答日常和专业问题"
+    if intro_capabilities:
+        intro_example += "，也可以" + "、".join(intro_capabilities)
+    prompt += ("\n如果用户只问身份或能力，用一两句自然的话回答，不加标题、列表、工具名称、"
+               "资料库类别或追问。可以参考这样的长度和用词：" + intro_example + "。")
     messages, trace_start = assemble_supervisor_messages(prompt, state, human)
     messages = ops._sanitize_history_tool_protocol(messages)
     model = get_llm(model=get_deepseek_model(), api_key=settings.RESOLVED_MAIN_API_KEY,
@@ -359,6 +371,9 @@ async def _run(state, identity, ledger):
         except (ValueError, TypeError):
             task_events.append_event(identity.run_id, "agent_control", {"reason_code": "completion_schema_invalid"})
             return FinalCheck(False, ("旧任务的终答声明格式无效；请按原契约修正，不重新执行已完成操作。",))
+        if any(row.get('name') == 'browse_web' for row in host.records):
+            from src.core.progress_bus import emit_progress
+            emit_progress('browse_phase', {'phase': 'organizing'})
         public_answer = statement.answer
         if "[[FIGURE:" in public_answer:
             public_answer = figures.expand(public_answer)
@@ -475,7 +490,7 @@ async def _run(state, identity, ledger):
             request_version=update_version, request_hash=completion_digest(state["query"]))
         return FinalCheck()
 
-    from .batch_journal import BatchJournal
+    from .batch_journal import BatchJournal, BatchObservationNotStored, RecoveryRequiresReconciliation
     from .checkpoint_store import open_checkpoint, checkpoint_scope
     from src.config import PROJECT_ROOT
     journal = BatchJournal(identity)
@@ -584,7 +599,11 @@ async def _run(state, identity, ledger):
         locations = " -> ".join(f"{frame.name}:{frame.lineno}" for frame in frames[-12:])
         logger.warning("General agent stopped: %s [%s]", type(exc).__name__, locations)
         reason = "execution_error:" + type(exc).__name__
-        if isinstance(exc, task_events.TaskConflict):
+        if isinstance(exc, (BatchObservationNotStored, RecoveryRequiresReconciliation)):
+            reason = ("recovery_requires_reconciliation"
+                      if isinstance(exc, RecoveryRequiresReconciliation) or exc.effects_uncertain
+                      else exc.reason)
+        elif isinstance(exc, task_events.TaskConflict):
             code = str(exc).split(" (", 1)[0]
             reason = code if code in {"model_budget_exhausted:deadline", "model_budget_exhausted:calls",
                 "model_budget_exhausted:tokens", "context_budget_exhausted", "resource_busy",
@@ -622,10 +641,44 @@ def _settled_trace(messages, host, result):
                     tool_call_id=cid, name=call["name"], status="error",
                     artifact={"_tool_outcome": {"status": status, "reason_code": result.reason}},
                     additional_kwargs=host.identity.message_metadata("tool"))
+                from uuid import uuid4
                 from src.graph.agent_operations import _emit_completed_tool_step
+                if not call.get("_host_logical_key"):
+                    call["_host_logical_key"] = "host:" + uuid4().hex
                 _emit_completed_tool_step(call, observed, host.records)
             trace.append(observed)
     return trace
+
+
+def _verified_turn_delivery(host):
+    import sqlite3
+    from src.core.task_events import TaskConflict
+    from src.session.files import list_turn_files, get_account_file, _sha256_file
+
+    failed = 0
+    links, verified = [], []
+    try:
+        identity = host.identity
+        request_id = host._result_request_id()
+        rows = list_turn_files(identity.session_id, identity.owner_user_id, [request_id]).get(request_id, [])
+    except (OSError, sqlite3.Error, TaskConflict):
+        return links, {"status": "unavailable", "verified_file_ids": verified, "unavailable_count": None}
+    for entry in rows:
+        if entry.get("origin") != "generated":
+            continue
+        try:
+            owned = get_account_file(entry["file_id"], identity.owner_user_id, touch=False)
+            valid = owned and _sha256_file(Path(owned["path"])) == owned.get("sha256")
+        except (OSError, sqlite3.Error):
+            valid = False
+        if not valid:
+            failed += 1
+            continue
+        name = str(owned["filename"]).replace("[", "\\[").replace("]", "\\]")
+        links.append(f"- [{name}]({owned['download_url']})")
+        verified.append(entry["file_id"])
+    status = (("partial" if verified else "unavailable") if failed else ("available" if verified else "none"))
+    return links, {"status": status, "verified_file_ids": verified, "unavailable_count": failed}
 
 
 async def _finish(state, identity, ledger, host, result, trace_start, started, *, final_review=None):
@@ -651,7 +704,8 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
             reviewed = None
             result = RunResult("incomplete", "completion_proof_invalid", result.messages,
                                result.model_steps)
-    uncertain = bool(result.unknown_operations or result.reason == "operation_outcome_unknown"
+    uncertain = bool(result.unknown_operations or result.reason in {
+        "operation_outcome_unknown", "recovery_requires_reconciliation"}
         or any(isinstance(message, ToolMessage) and (
             message.additional_kwargs.get("operation_uncertain") or
             ((message.artifact or {}).get("_tool_outcome") or {}).get("status") == "unknown")
@@ -671,7 +725,11 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
         status = "cancelled"
     else:
         notices = {
+            "batch_observation_not_stored": "执行结果与模型回执分开保存；批次回执未能提交，未重跑操作。",
+            "recovery_requires_reconciliation": "批次状态尚不能安全恢复。",
             "model_length": "模型输出达到单次输出上限，未完成的提议没有执行。",
+            "model_stream_unconfirmed": "未收到可确认的模型流结束信号，未执行该次返回的工具提议。",
+            "final_answer_recovery_incomplete": "一次限额内的答复补写未完成，没有发起新的工具操作。",
             "model_budget_exhausted:tokens": "本轮累计模型用量预算不足以继续请求。",
             "model_budget_exhausted:calls": "本轮模型调用次数已达上限。",
             "model_budget_exhausted:deadline": "本轮任务时间预算已用完。",
@@ -691,7 +749,7 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
         answer += " 已取得的结果和原始证据已保留。"
         if uncertain:
             answer += " 部分已执行操作结果尚未确认，须先对账，不能直接重放。"
-        elif result.pending_tool_calls:
+        elif result.pending_tool_calls and result.reason != "batch_observation_not_stored":
             answer += " 尚未派发的提议标记为未执行，无需为它们对账。"
         if host.records:
             from collections import Counter
@@ -713,19 +771,14 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
                 answer += (f"\n\n可沿用最近一次回执的引用，从第 {page['retry']['start_char']} 个字符起"
                            f"读取最多 {page['retry']['max_chars']} 个字符。")
         emit_encoded("context_degraded", notice)
+    delivery = {"status": "not_checked", "verified_file_ids": [], "unavailable_count": 0}
     if result.status != "complete" and status in {"partial", "failed", "cancelled"}:
-        from src.session.files import list_turn_files, get_account_file, _sha256_file
-        links = []
-        for entry in list_turn_files(identity.session_id, identity.owner_user_id,
-                                     [identity.user_turn_id]).get(identity.user_turn_id, []):
-            if entry.get("origin") != "generated":
-                continue
-            owned = get_account_file(entry["file_id"], identity.owner_user_id, touch=False)
-            if owned and _sha256_file(Path(owned["path"])) == owned.get("sha256"):
-                name = str(owned["filename"]).replace("[", "\\[").replace("]", "\\]")
-                links.append(f"- [{name}]({owned['download_url']})")
+        links, delivery = await asyncio.to_thread(_verified_turn_delivery, host)
         if links:
-            answer += "\n\n已生成并核对文件完整性的产物（不表示整项任务已完成）：\n" + "\n".join(links)
+            answer += "\n\n已生成并核对文件完整性的产物（不表示整项任务已完成或已通过 QA）：\n" + "\n".join(links)
+        if delivery["status"] in {"partial", "unavailable"}:
+            answer += "\n\n部分或全部已登记文件当前无法核验；未提供未经核验的链接。"
+        emit_encoded("artifact_delivery", delivery)
     ledger.close(status="unknown" if uncertain else
                  "cancelled" if status == "cancelled" else "failed", reason_code=result.reason)
     reason_code = "budget_blocked" if budget_blocked else result.reason
@@ -733,7 +786,7 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
     task_result = build_task_result(host.records, requested_status=status, turn_outcome=outcome)
     # Even stopped paths use the same conservative task decision as the API.
     if task_result.status != outcome.status and outcome.status not in {"cancelled", "awaiting_input"}:
-        outcome = TurnOutcome(task_result.status, reason_code if budget_blocked else "execution_incomplete", result.reason)
+        outcome = TurnOutcome(task_result.status, reason_code, result.reason)
         task_result = build_task_result(host.records, requested_status=outcome.status, turn_outcome=outcome)
     task_events.release_finalization(identity.run_id)
     emit_answer_start()
@@ -750,4 +803,5 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
         "export_gate": {"status": "not_applicable", "reason": "model_owned_delivery"},
         "_trace": {"node": "supervisor", "elapsed_ms": elapsed, "stop_reason": result.reason,
             "model_steps": result.model_steps, "task_result": task_result.as_dict(),
+            "artifact_delivery": delivery,
             "summary": f"{result.model_steps} model steps; {result.reason}"}}

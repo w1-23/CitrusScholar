@@ -49,8 +49,14 @@
 .cg-steps h3, .cg-steps h4 { margin: 0 0 3px; font-size: 14px; font-weight: 600; line-height: 1.6; }
 .cg-steps p { margin: 0; font-size: 13px; line-height: 1.8; color: var(--text-secondary); max-width: 74ch; }
 .cg-example { padding: 12px 16px; margin-top: 18px; border-left: 3px solid var(--accent); background: var(--bg-deep); }
+.cg-example-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .cg-example span { font-size: 11px; color: var(--text-secondary); }
 .cg-example p { margin: 4px 0 0; font-size: 13px; line-height: 1.8; }
+.cg-copy { flex: 0 0 auto; padding: 4px 10px; border: 1px solid var(--border-hover); border-radius: 6px; background: var(--guide-paper); color: var(--text-secondary); font-size: 11px; line-height: 1.4; }
+.cg-copy:hover { color: var(--guide-ink); border-color: var(--accent); }
+.cg-copy[data-copied="true"] { color: var(--accent); border-color: var(--accent); }
+.cg-optional { margin: 12px 0 0; padding: 9px 12px; border: 1px dashed var(--border-hover); border-radius: 8px; font-size: 12px; line-height: 1.75; color: var(--text-secondary); }
+.cg-optional strong { margin-right: 6px; color: var(--guide-ink); font-weight: 600; }
 .cg-note { margin: 18px 0 0; padding-top: 12px; border-top: 1px solid var(--border-hairline); font-size: 12px; line-height: 1.8; color: var(--text-secondary); }
 .cg-footer { display: flex; justify-content: space-between; align-items: center; padding: 14px 24px; gap: 12px; border-top: 1px solid var(--border-hairline); }
 .cg-footer button { min-width: 90px; padding: 9px 16px; border: 1px solid var(--border-hover); border-radius: 7px; color: var(--guide-ink); background: var(--guide-paper); font-size: 13px; }
@@ -75,6 +81,9 @@
   .cg-page { padding: 20px 18px; }
   .cg-illustration { margin: 14px 0; }
   .cg-steps { gap: 13px; }
+  .cg-example-head { gap: 8px; }
+  .cg-copy { padding: 6px 10px; }
+  .cg-optional { font-size: 11px; }
   .cg-footer { padding: 12px; gap: 6px; }
   .cg-footer button { min-width: 72px; padding: 10px; font-size: 12px; }
   .cg-footer span { font-size: 11px; max-width: 145px; }

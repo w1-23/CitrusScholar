@@ -653,27 +653,6 @@ async function saveAccountAvatar() {
 function openOnboardingGuide(startPage) {
   if (window.CitrusGuide) window.CitrusGuide.open(startPage || 'research', {onClose: completeOnboarding});
 }
-var memorySettingsCurrentTab = 'preferences';
-
-function switchMemorySettingsTab(tab) {
-  var selected = tab === 'records' ? 'records' : 'preferences';
-  memorySettingsCurrentTab = selected;
-  var preferencesPane = document.getElementById('preferencesPane');
-  var recordsPane = document.getElementById('recordsPane');
-  var preferencesTab = document.getElementById('preferencesTab');
-  var recordsTab = document.getElementById('recordsTab');
-  if (preferencesPane) preferencesPane.hidden = selected !== 'preferences';
-  if (recordsPane) recordsPane.hidden = selected !== 'records';
-  if (preferencesTab) {
-    preferencesTab.classList.toggle('is-active', selected === 'preferences');
-    preferencesTab.setAttribute('aria-selected', selected === 'preferences' ? 'true' : 'false');
-  }
-  if (recordsTab) {
-    recordsTab.classList.toggle('is-active', selected === 'records');
-    recordsTab.setAttribute('aria-selected', selected === 'records' ? 'true' : 'false');
-  }
-}
-
 function setPreferenceFormValues(data) {
   var preferences = (data && data.preferences) || {};
   var fields = document.querySelectorAll('#preferenceForm [data-preference-field]');
@@ -752,64 +731,20 @@ async function resetAccountPreferences() {
   }
 }
 
-async function loadAccountMemoryRecords() {
-  var epoch = authEpoch;
-  var content = document.getElementById('accountMemoryContent');
-  var status = document.getElementById('accountMemoryStatus');
-  if (content) content.textContent = '正在读取记录…';
-  if (status) status.textContent = '';
-  try {
-    var response = await accountFetch('/api/v2/auth/memory', {credentials:'same-origin'});
-    var data = await response.json(); if (epoch !== authEpoch) return;
-    if (!response.ok) throw new Error(data.detail || '读取记录失败。');
-    var facts = data.facts || [];
-    if (!facts.length) {
-      if (content) content.innerHTML = '<div class="memory-empty">没有残留长期记录。<br>自动记忆已停用，项目资料请使用科研笔记保存。</div>';
-      return;
-    }
-    if (content) {
-      content.innerHTML = '<h3>残留长期记录</h3><div class="memory-list">' + facts.map(function(item) {
-        return '<article class="memory-row"><strong>' + escapeHtml(item.key || '记录') + '</strong><span>' + escapeHtml(item.value || '') + '</span><small>置信度 ' + Math.round(Number(item.confidence || 0) * 100) + '% · ' + escapeHtml((item.updated_at || '').slice(0,10)) + '</small></article>';
-      }).join('') + '</div>';
-    }
-  } catch (error) { if (epoch !== authEpoch) return;
-    if (content) content.textContent = error.message || '读取记录失败。';
-  }
-}
-
-async function openMemorySettings(tab) {
+async function openMemorySettings() {
   var epoch = authEpoch;
   var overlay = document.getElementById('memorySettingsOverlay');
   if (!overlay) return;
   overlay.hidden = false;
-  switchMemorySettingsTab(tab || 'preferences');
-  if (memorySettingsCurrentTab === 'records') {
-    await loadAccountMemoryRecords();
-  } else {
-    await loadAccountPreferences();
-    if (epoch !== authEpoch) return;
-    var first = document.querySelector('#preferenceForm select');
-    if (first) first.focus();
-  }
+  await loadAccountPreferences();
+  if (epoch !== authEpoch || overlay.hidden) return;
+  var first = document.querySelector('#preferenceForm select');
+  if (first) first.focus();
 }
 function closeMemorySettings() {
   var overlay = document.getElementById('memorySettingsOverlay'); if (overlay) overlay.hidden = true;
   var trigger = document.getElementById('accountTrigger'); if (trigger) trigger.focus();
 }
-async function clearAccountMemory() {
-  var epoch = authEpoch;
-  if (!window.confirm('清除这个账号残留的长期记录？个人偏好、会话和资料库不会删除。')) return;
-  var status = document.getElementById('accountMemoryStatus');
-  var content = document.getElementById('accountMemoryContent');
-  try {
-    var response = await accountFetch('/api/v2/auth/memory', {method:'DELETE', credentials:'same-origin'});
-    var data = await response.json(); if (epoch !== authEpoch) return;
-    if (!response.ok) throw new Error(data.detail || '清理失败。');
-    if (status) status.textContent = '记录已清除';
-    if (content) content.innerHTML = '<div class="memory-empty">没有残留长期记录。<br>自动记忆已停用，项目资料请使用科研笔记保存。</div>';
-  } catch (error) { if (epoch !== authEpoch) return; if (status) status.textContent = error.message || '清理失败。'; }
-}
-
 document.addEventListener('input', function (event) {
   if (event.target && event.target.matches &&
       event.target.matches('#preferenceForm [data-preference-field="custom_note"]')) {
@@ -1464,7 +1399,15 @@ function appendSentAttachmentPreviews(contentEl, files) {
       image.className = 'sent-attachment-image';
       image.src = previewUrl;
       image.alt = file.name;
-      card.appendChild(image);
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'sent-attachment-open-image';
+      button.setAttribute('aria-label', '预览图片 ' + file.name);
+      button.onclick = function () {
+        if (window.openSentImagePreview) window.openSentImagePreview(file);
+      };
+      button.appendChild(image);
+      card.appendChild(button);
     } else {
       var icon = document.createElement('span');
       icon.className = 'sent-attachment-icon';
@@ -3592,6 +3535,9 @@ function publicTaskNote(value) {
 
 function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
+  var settled = false, browsePhase = '';
+  var browseStages = {waiting: '等待浏览器', navigating: '正在访问网页', interacting: '正在读取或操作网页',
+    downloading: '正在下载资料', verifying: '正在核验附件', organizing: '正在组织回答'};
   var panel = document.createElement('div'); panel.className = 'research-process';
   var body = document.createElement('div'); body.className = 'research-process-body'; panel.appendChild(body);
   var label = document.createElement('span'); label.className = 'research-task-status';
@@ -3669,17 +3615,45 @@ function createResearchProcessPanel(goal) {
       if (!knownJobId || String(data.plan_id) === knownJobId) view.plan(data);
     }
     else if (type === 'agent_recovery' && data.status === 'admitted') {
+      settled = false; browsePhase = '';
       view.terminal(false); label.textContent = '正在恢复任务'; panel.classList.remove('has-failure');
     }
+    else if (type === 'browse_phase' && !settled && ownsDetails() &&
+        Object.prototype.hasOwnProperty.call(browseStages, data.phase)) {
+      browsePhase = data.phase; label.textContent = browseStages[browsePhase];
+    }
     else if (type === 'tool_resolution') view.resolution(data);
+    else if ((type === 'answer_start' || type === 'thinking') && browsePhase === 'organizing' && !settled) {
+      browsePhase = ''; label.textContent = '';
+    }
     else if (type === 'request_user_input' || type === 'question') label.textContent = '等待你的选择';
     else if (['assistant_progress', 'commentary', 'working_note'].indexOf(type) >= 0) {
       note(data.text || data.working_note || data.content,
         data.seq ? 'seq-' + data.seq : data.message_id ? 'message-' + data.message_id : '', data);
-    } else if (type === 'tool_progress') view.progress(data);
+    } else if (type === 'tool_progress') {
+      var stages = {
+        local_prefetch_finished: '本地候选预取完成',
+        local_prefetch_rewrite_failed: '查询改写失败，本地候选预取未执行',
+        web_search_finished: '联网检索已返回候选来源',
+        web_search_zero_hits: '联网检索未返回候选来源',
+        local_search_finished: '本地检索已返回候选片段',
+        local_search_zero_hits: '本地检索未返回候选片段',
+        local_search_rewrite_failed: '查询改写失败，本地检索未执行',
+        full_text_read: '已读取可核对的全文',
+        abstract_only: '目前只取得摘要或部分正文',
+        full_text_unavailable: '未取得可核对的全文'
+      };
+      if (data.origin === 'host' && data.visibility === 'public' &&
+          Object.prototype.hasOwnProperty.call(stages, data.retrieval_stage)) {
+        view.note(stages[data.retrieval_stage], data.seq ? 'seq-' + data.seq : '', {public_note: true});
+      } else view.progress(data);
+    }
     else if (['tool_call_start', 'tool_executing', 'tool_result', 'operation'].indexOf(type) >= 0 &&
         (data.tool_call_id || data.operation_id || data.logical_key || Array.isArray(data.aliases) && data.aliases.length) &&
         data.internal !== true && ['private', 'internal'].indexOf(data.visibility) < 0) {
+      if (type === 'tool_result' && data.tool_name === 'browse_web' && browsePhase && !settled) {
+        browsePhase = ''; label.textContent = '';
+      }
       view.action(Object.assign({}, data.outcome || {}, data, {status: data.status || (type === 'tool_result' ? (data.is_error ? 'failed' : 'complete') : 'running')}));
     }
     // status/plan/thinking/section/context events are never promoted to prose.
@@ -3687,7 +3661,9 @@ function createResearchProcessPanel(goal) {
   function terminal(status) {
     var names = {completed: '已完成', partial: '部分完成', cancelled: '已停止', failed: '未完成'};
     if (!Object.prototype.hasOwnProperty.call(names, status)) return false;
-    stopClock(); line.dataset.state = status; label.textContent = names[status]; view.terminal();
+    settled = true; browsePhase = '';
+    stopClock(); line.dataset.state = status;
+    label.textContent = names[status]; view.terminal();
     panel.classList.toggle('has-failure', status === 'failed');
     return true;
   }
@@ -4285,7 +4261,13 @@ async function sendMsg(isFollowUp) {
   var citationsDiv = document.createElement('div');
   citationsDiv.style.display = 'none';
 
+  var deliveryDiv = document.createElement('div');
+  deliveryDiv.className = 'turn-delivery';
+  deliveryDiv.setAttribute('role', 'status');
+  deliveryDiv.hidden = true;
+
   botContent.appendChild(answerDiv);
+  botContent.appendChild(deliveryDiv);
   botContent.appendChild(citationsDiv);
 
   var fullText = '';
@@ -4317,6 +4299,7 @@ async function sendMsg(isFollowUp) {
   registerTurnBinding(myBinding);
   var unsubscribeBinding = taskStore.subscribe(function () {
     if (!ownsTurn()) return;
+    renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     myBinding.following = !!queueFollowedJobId;
     selectActiveTurn();
     renderQueueStatus();
@@ -4332,6 +4315,7 @@ async function sendMsg(isFollowUp) {
     if (!ownsTurn()) return;
     _turnDisconnected = false;
     processPanel.receive('snapshot', job);
+    renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     syncWaiting();
     if (taskStore.state.question && taskStore.state.question.status === 'pending' && !CitrusTaskState.displayStatus(job)) {
       statusLabel.textContent = '等待你的选择';
@@ -4470,6 +4454,7 @@ async function sendMsg(isFollowUp) {
   function handleEvent(type, data) {
     if (!ownsTurn()) return;
     processPanel.receive(type, data);
+    renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     // Retired rounds may finish replaying into their own DOM. They cannot
     // release the composer, alter context usage, permissions or the sidebar.
     if (!ownsControls()) {
@@ -4500,6 +4485,9 @@ async function sendMsg(isFollowUp) {
       case 'thinking': mascotSay('planning'); break;
       case 'tool_call_start':
       case 'tool_executing': mascotSay('retrieving'); break;
+      case 'browse_phase':
+        if (!hasTerminalEvent && data.phase === 'organizing') mascotSay('generating');
+        break;
       case 'tool_progress':
       case 'tool_result':
       case 'agent_switch':
@@ -4561,6 +4549,8 @@ async function sendMsg(isFollowUp) {
         break;
       case 'task_update':
         break; // Version/pending state is reduced by CitrusTaskState.
+      case 'artifact_delivery':
+        break; // Reduced by CitrusTaskState and rendered above; text only, no links.
       case 'operation':
         break; // Every operation uses the shared public process projection.
       case 'request_user_input':
@@ -4793,6 +4783,7 @@ async function sendMsg(isFollowUp) {
     currentJobId = String(data.job_id || '');
     window._currentJobId = currentJobId;
     taskStore.hydrate(data);
+    renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     answerDiv.style.display = '';
     answerDiv.replaceChildren();
     var note = document.createElement('p');
@@ -4870,6 +4861,14 @@ async function sendMsg(isFollowUp) {
       cancel.setAttribute('aria-label', '取消这条排队中的消息');
       cancel.onclick = function () { cancelQueuedEntry(); };
       node.appendChild(cancel);
+    }
+    if (entry.state === 'reconcile_required') {
+      var settle = document.createElement('button');
+      settle.type = 'button'; settle.className = 'turn-queue-cancel turn-queue-reconcile';
+      settle.textContent = '确认并继续';
+      settle.setAttribute('aria-label', '确认上一轮结果无法核对并继续本会话');
+      settle.onclick = function () { reconcileQueuedEntry(); };
+      node.appendChild(settle);
     }
   }
 
@@ -5049,11 +5048,39 @@ async function sendMsg(isFollowUp) {
       });
   }
 
+  function reconcileQueuedEntry() {
+    if (!queueEntry || queueEntry.state !== 'reconcile_required') return;
+    if (!window.confirm('上一轮的执行结果无法核对。确认后不会重新执行它，只解除本会话的阻塞，以便继续提问。')) return;
+    var node = queueStatusEl;
+    var button = node && node.querySelector ? node.querySelector('.turn-queue-reconcile') : null;
+    if (button) button.disabled = true;
+    accountFetch(turnQueueURL(requestSessionId) + '/' + encodeURIComponent(clientRequestId) + '/reconcile', {method: 'POST'})
+      .then(function (response) {
+        return response.json().then(function (body) {
+          return {ok: response.ok, status: response.status, body: body};
+        }, function () { return {ok: response.ok, status: response.status, body: null}; });
+      })
+      .then(function (outcome) {
+        if (!ownsTurn()) return;
+        if (outcome.ok && outcome.body) adoptTurnEntry(outcome.body, true);
+        else {
+          if (button) button.disabled = false;
+          showBanner((outcome.body && outcome.body.detail && outcome.body.detail.message) || '状态核对未完成，请刷新后重试。');
+        }
+      })
+      .catch(function () {
+        if (!ownsTurn()) return;
+        if (button) button.disabled = false;
+        showBanner('解除状态核对的请求暂未确认，请稍后重试。');
+      });
+  }
+
   function streamOnce() {
     if (!ownsTurn()) return;
     fullText = ''; preAnswerText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
     renderPending = false; _turnDisconnected = false; _turnDisplayStatus = ''; _turnEnvelope = null;
     answerDiv.style.display = ''; answerDiv.innerHTML = '';
+    deliveryDiv.hidden = true; deliveryDiv.replaceChildren();
     statusLabel.textContent = ''; statusElapsed.textContent = '';
     statusDiv.className = 'research-process'; hasTerminalEvent = false;
 
@@ -5712,6 +5739,40 @@ function orderHistoryTrace(trace) {
   return out.map(function(x) { return x.entry; });
 }
 
+/* Artifact delivery is an explicit server fact carried by the ordered event
+   tail and the terminal snapshot. Render it as text only: the client never
+   guesses download URLs and never promotes an unverified file. */
+function artifactDeliveryText(delivery) {
+  if (!delivery || !delivery.status || ['none', 'not_checked'].includes(delivery.status)) return '';
+  var statuses = {available: '文件已交付', delivered: '文件已交付', verified: '文件已核实', partial: '部分文件已交付',
+    unavailable: '文件暂不可用', failed: '文件交付未完成'};
+  var ids = Array.isArray(delivery.verified_file_ids) ? delivery.verified_file_ids : [];
+  var unavailable = Number(delivery.unavailable_count);
+  var parts = [statuses[delivery.status] || ('文件交付状态：' + delivery.status)];
+  if (ids.length) parts.push('已核实 ' + ids.length + ' 个文件');
+  if (Number.isFinite(unavailable) && unavailable > 0) parts.push(Math.floor(unavailable) + ' 个文件暂不可用');
+  return parts.join(' · ');
+}
+function renderArtifactDelivery(container, delivery) {
+  if (!container) return null;
+  var node = container.querySelector('.turn-delivery');
+  if (!node) {
+    node = document.createElement('div'); node.className = 'turn-delivery';
+    node.setAttribute('role', 'status');
+    container.appendChild(node);
+  }
+  var text = artifactDeliveryText(delivery);
+  node.hidden = !text;
+  if (!text) { node.replaceChildren(); return node; }
+  var ids = Array.isArray(delivery.verified_file_ids) ? delivery.verified_file_ids : [];
+  var unavailable = Number(delivery.unavailable_count);
+  node.dataset.status = String(delivery.status);
+  node.dataset.verifiedCount = String(ids.length);
+  node.dataset.unavailableCount = String(Number.isFinite(unavailable) && unavailable > 0 ? Math.floor(unavailable) : 0);
+  if (node.textContent !== text) node.textContent = text;
+  return node;
+}
+
 /* Canonical turn adapter: the server's ``/messages.turns`` uses snake_case
    for a few keys; normalise them once so rendering never cares where the
    turn came from. A legacy session without ``turns`` still goes through
@@ -5764,6 +5825,7 @@ function normalizeHistoryTurn(raw) {
     jobStatus: String(t.job_status || ''),
     terminalSnapshot: t.terminal_snapshot || null,
     contextSnapshot: t.context_snapshot || (t.terminal_snapshot || {}).context_snapshot || null,
+    artifactDelivery: t.artifact_delivery || (t.terminal_snapshot || {}).artifact_delivery || null,
     replayCursor: Number.isSafeInteger(t.replay_cursor) ? t.replay_cursor : 0,
     question: t.question || null,
     parentJobId: String(t.parent_job_id || ''),
@@ -5816,7 +5878,7 @@ function mergeHistoryTurns(earlierTurns, laterTurns) {
       if (turn.intentSummary) base.intentSummary = turn.intentSummary;
       if (turn.displayStatus) base.displayStatus = turn.displayStatus;
       if (turn.stageLabel) base.stageLabel = turn.stageLabel;
-      ['jobId', 'jobStatus', 'terminalSnapshot', 'contextSnapshot', 'question', 'parentJobId', 'parentQuestionId'].forEach(function (key) { if (turn[key]) base[key] = turn[key]; });
+      ['jobId', 'jobStatus', 'terminalSnapshot', 'contextSnapshot', 'artifactDelivery', 'question', 'parentJobId', 'parentQuestionId'].forEach(function (key) { if (turn[key]) base[key] = turn[key]; });
       // Merging history windows never advertises events as consumed.
       base.replayCursor = 0;
       for (var i = 0; i < turn.trace.length; i++) mergeEntry(base, turn.trace[i]);
@@ -5961,6 +6023,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (!owns()) return;
     disconnected = false;
     process.receive('snapshot', job);
+    renderArtifactDelivery(content, store.state.artifact_delivery);
     answer.dataset.displayStatus = store.state.display_status;
     if (!process.terminal(store.state.display_status)) {
       var labels = {queued: '任务排队中', detached: '任务在后台执行'};
@@ -5986,6 +6049,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
   var store = CitrusTaskState.create({request_id: turn.turnRequestId, session_id: sid, onEvent: function (type, data) {
     if (!owns()) return;
     process.receive(type, data);
+    renderArtifactDelivery(content, store.state.artifact_delivery);
     if (type === 'agent_recovery' && data.status === 'admitted') answer.dataset.displayStatus = '';
     if (type.indexOf('context_') === 0 || data.context_snapshot) projectContext();
     if (type === 'answer_start') armed = true;
@@ -6012,7 +6076,8 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     onChange: function() { if (binding) reconcileControls(); }});
   var questionCard = CitrusTaskControls.createQuestion({container: content, store: store, transport: transport, owns: owns,
     onContinue: function (result) { if (!entry) refreshQuestionContinuation(result, owns, questionCard.element); }});
-  store.hydrate({job_id: turn.jobId, status: turn.jobStatus, terminal_snapshot: turn.terminalSnapshot, question: turn.question, context_snapshot: turn.contextSnapshot});
+  store.hydrate({job_id: turn.jobId, status: turn.jobStatus, terminal_snapshot: turn.terminalSnapshot,
+    artifact_delivery: turn.artifactDelivery, question: turn.question, context_snapshot: turn.contextSnapshot});
   if (useComposer || entry && entry.state !== 'terminal') {
     binding = {owns: owns, store: store, controls: controls, cancel: cancel, stopping: false,
       queueEntry: entry, following: false, dispose: dispose};
@@ -6046,7 +6111,25 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       };
       queueStatus.appendChild(button);
     }
-    var job = observeQueuedJob(entry);
+    var job = observeQueuedJob(entry);    if (entry.state === 'reconcile_required') {
+      var settle = document.createElement('button');
+      settle.type = 'button'; settle.className = 'turn-queue-cancel turn-queue-reconcile';
+      settle.textContent = '确认并继续';
+      settle.setAttribute('aria-label', '确认上一轮结果无法核对并继续本会话');
+      settle.onclick = async function () {
+        if (!window.confirm('上一轮的执行结果无法核对。确认后不会重新执行它，只解除本会话的阻塞，以便继续提问。')) return;
+        settle.disabled = true;
+        try {
+          var response = await accountFetch(turnQueueURL(sid) + '/' + encodeURIComponent(entry.client_request_id) + '/reconcile', {method: 'POST'});
+          var result = await response.json();
+          if (response.ok && owns()) adopt(result);
+          else if (owns()) showBanner('状态核对未完成，请刷新后重试。');
+        } catch (_) { if (owns()) showBanner('解除状态核对的请求暂未确认，请稍后重试。'); }
+        finally { settle.disabled = false; }
+      };
+      queueStatus.appendChild(settle);
+    }
+
     if (job && job !== observed) {
       observed = job;
       streamedAnswer = ''; armed = false;
@@ -6113,6 +6196,7 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     var answerBody = document.createElement('div'); answerBody.className = 'turn-answer';
     answerBody.dataset.displayStatus = turn.displayStatus;
     answerBody.innerHTML = renderMarkdownSafe(answer.content); contentEl.appendChild(answerBody);
+    if (turn.artifactDelivery) renderArtifactDelivery(contentEl, turn.artifactDelivery);
     var process = createResearchProcessPanel(turn.intentSummary || (turn.user && turn.user.content));
     contentEl.insertBefore(process.element, contentEl.firstChild);
     process.receive('snapshot', {terminal_snapshot: turn.terminalSnapshot});

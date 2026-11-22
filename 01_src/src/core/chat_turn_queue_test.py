@@ -587,6 +587,36 @@ def test_reconcile_required_blocks_session_successors_not_admission():
             reason="late")
 
 
+def test_resolve_reconcile_settles_unknown_turn_and_unblocks_successor():
+    _turn(client="a")
+    _turn(client="b")
+    running = _running(client="a")
+    frozen = turn_queue.mark_reconcile_required(
+        owner_user_id=1, session_id="s1", client_request_id="a",
+        generation=running["generation"], reason="dispatch_unknown")
+    with pytest.raises(turn_queue.TurnReconcileRequired):
+        _claim()
+
+    settled = turn_queue.resolve_reconcile(
+        owner_user_id=1, session_id="s1", client_request_id="a",
+        generation=frozen["generation"])
+    assert settled["state"] == "terminal"
+    assert settled["history_saved"] is False
+    assert settled["clear_reason"] == "turn_reconciled_by_user"
+    assert turn_queue.session_blocker(owner_user_id=1, session_id="s1") is None
+
+    claimed = _claim()
+    assert claimed["client_request_id"] == "b"
+    assert claimed["state"] == "claimed"
+    with pytest.raises(turn_queue.TurnStateConflict):
+        turn_queue.resolve_reconcile(
+            owner_user_id=1, session_id="s1", client_request_id="b",
+            reason="late")
+
+    settled_again = turn_queue.resolve_reconcile(
+        owner_user_id=1, session_id="s1", client_request_id="a")
+    assert settled_again["state"] == "terminal"
+
 def test_unknown_session_does_not_consume_another_sessions_capacity():
     # Reconcile in s1 must not block s2's head.
     _turn(session="s1", client="a")

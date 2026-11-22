@@ -38,9 +38,16 @@ def init_schema(conn):
         "CREATE TABLE IF NOT EXISTS task_model_attempts (attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, purpose TEXT NOT NULL, status TEXT NOT NULL, reserved_tokens INTEGER NOT NULL, usage TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL)",
     ):
         conn.execute(statement)
+    operation_columns = {r[1] for r in conn.execute("PRAGMA table_info(task_operations)")}
+    if "retry_of" not in operation_columns:
+        conn.execute("ALTER TABLE task_operations ADD COLUMN retry_of TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_operation_retry "
+                 "ON task_operations(retry_of) WHERE retry_of IS NOT NULL")
     attempt_columns = {r[1] for r in conn.execute("PRAGMA table_info(task_model_attempts)")}
     if "budget_scope" not in attempt_columns:
         conn.execute("ALTER TABLE task_model_attempts ADD COLUMN budget_scope TEXT NOT NULL DEFAULT 'execution'")
+    if "observation" not in attempt_columns:
+        conn.execute("ALTER TABLE task_model_attempts ADD COLUMN observation TEXT NOT NULL DEFAULT '{}'")
     budget_columns = {r[1] for r in conn.execute("PRAGMA table_info(task_budgets)")}
     for name in ("final_tokens", "final_calls"):
         if name not in budget_columns:
@@ -86,19 +93,25 @@ def current_terminal_event(conn, job_id):
 def _append(conn, job_id, event, data):
     _job(conn, job_id)
     terminal = current_terminal_event(conn, job_id)
+    from src.core.progress_bus import public_progress_payload, stamp_sse_event, _encode_event
     if terminal is not None and event not in {"operation", "agent_recovery"}:
         # One terminal frame per explicitly admitted event generation. Earlier
         # terminal facts remain unchanged; safe-step recovery emits operation facts.
         return {"seq": terminal[0], "event": terminal[1], "data": json.loads(terminal[2]), "created_at": terminal[3]}
     seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM task_events WHERE job_id=?", (job_id,)).fetchone()[0]
-    from src.core.progress_bus import stamp_sse_event, _encode_event
+    # task_state is also the model's private durable snapshot. Only its
+    # public event view is reduced, without changing the event or sequence.
+    if event != "task_state":
+        data = public_progress_payload(event, data)
     frame = stamp_sse_event(_encode_event(event, data), seq)
     payload = json.loads(frame["data"])
     now = time.time()
     conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", (job_id, seq, event, canonical(payload), now))
     if event == "done" and isinstance(payload.get("turn_envelope"), dict):
         conn.execute("UPDATE task_jobs SET terminal_snapshot=? WHERE job_id=?", (canonical(payload["turn_envelope"]), job_id))
-    return {"seq": seq, "event": event, "data": payload, "created_at": now}
+    return {"seq": seq, "event": event,
+            "data": public_progress_payload(event, payload) if event == "task_state" else payload,
+            "created_at": now}
 
 
 def append_event(job_id, event, data):
@@ -126,37 +139,96 @@ def replay(job_id, after=0, limit=200):
         job = dict(_job(conn, job_id))
         rows = conn.execute("SELECT * FROM task_events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?", (job_id, after, limit + 1)).fetchall()
         events = [dict(row) | {"data": json.loads(row["data"])} for row in rows[:limit]]
-        from src.core.turn_envelope import public_terminal_snapshot
+        from src.core.progress_bus import public_progress_payload
         for event in events:
-            if event["event"] == "done" and isinstance(event["data"].get("turn_envelope"), dict):
-                event["data"]["turn_envelope"] = public_terminal_snapshot(event["data"]["turn_envelope"])
-        from src.core.jobs import decode_terminal_snapshot
+            # Live SSE reads this same projection. Keep every legacy cursor.
+            event["data"] = public_progress_payload(event["event"], event["data"]) | {"seq": event["seq"]}
         return {"protocol": PROTOCOL, "job_id": job_id, "events": events,
                 "next_cursor": events[-1]["seq"] if events else after,
                 "has_more": len(rows) > limit, "status": job["status"],
                 "recovery_cursor": recovery_cursor(conn, job_id),
-                "terminal_snapshot": decode_terminal_snapshot(job),
+                "terminal_snapshot": public_job_terminal(job),
                 "context_snapshot": _latest_context_snapshot(conn, job_id)}
 
 
+def _public_terminal(envelope):
+    from src.core.turn_envelope import public_terminal_snapshot
+    from src.core.progress_bus import public_tool_reason, public_tool_resolutions
+    envelope = public_terminal_snapshot(envelope)
+    visible = {key: envelope[key] for key in (
+        "schema_version", "display_status", "execution_status", "acceptance_status",
+        "acceptance_reason", "job_status", "stop_reason", "history_saved", "verified_artifacts",
+        "artifact_ids", "terminal_seq",
+    ) if key in envelope}
+    if "tool_resolutions" in envelope:
+        visible["tool_resolutions"] = public_tool_resolutions(envelope["tool_resolutions"])
+    snapshot = envelope.get("task_snapshot")
+    if isinstance(snapshot, dict):
+        outcome = snapshot.get("turn_outcome")
+        visible["task_snapshot"] = {"turn_outcome": {key: public_tool_reason(outcome[key])
+            for key in ("status", "reason_code", "stop_reason") if key in outcome
+        }} if isinstance(outcome, dict) else {}
+    # Notices may embed requirement labels or model-supplied reasons. Keep only
+    # system-owned notices and never replay arbitrary prose as progress.
+    if isinstance(envelope.get("notices"), (list, tuple)):
+        visible["notices"] = [note for note in envelope["notices"] if note in (
+            "本轮已停止", "本轮回答已完成，但历史写入未确认；刷新后可能无法恢复。",
+            "服务进程在任务完成前停止；可恢复已验证的安全步骤。",
+            "主模型尚未配置，请联系管理员配置模型后重试。附件仍可在资料库中查看。",
+            "处理请求时发生内部错误，请稍后重试",
+        )]
+    return visible
+
+
+def public_job_terminal(job):
+    from src.core.jobs import decode_terminal_snapshot
+    return _public_terminal(decode_terminal_snapshot(dict(job)))
+
+
+_JOB_SUMMARIES = {
+    "queued": "正在排队", "preparing_attachments": "正在安全解析本轮附件",
+    "starting": "正在启动本轮请求", "waiting_code": "正在等待代码执行",
+    "code_cancel_pending": "等待执行队列确认停止", "awaiting_input": "正在等待你的选择",
+    "interrupted": "服务进程在任务完成前停止；可显式申请恢复。",
+    "running": "正在处理任务", "detached": "任务在后台处理",
+    "cancel_requested": "正在停止任务", "cancelled": "任务已停止",
+    "completed": "任务已完成", "failed": "任务未完成",
+}
+
+
+def public_job_record(job):
+    """The status/list surface must not copy persisted job prose or paths."""
+    from src.core.progress_bus import public_tool_reason
+    job = dict(job)
+    visible = {key: job[key] for key in (
+        "job_id", "session_id", "request_id", "client_request_id", "job_type", "status",
+        "current_step", "created_at", "updated_at", "finished_at", "owner_user_id",
+        "parent_job_id", "question_id", "cancel_requested_at", "detached_at",
+    ) if key in job}
+    return visible | {"terminal_snapshot": public_job_terminal(job),
+                      "progress_summary": _JOB_SUMMARIES.get(job.get("current_step"),
+                                          _JOB_SUMMARIES.get(job.get("status"), "")),
+                      "error": (public_tool_reason(job.get("error")) or "task_failed") if job.get("error") else "",
+                      "stop_reason": public_tool_reason(job.get("stop_reason"))}
+
+
 def projection(job_id, *, include_job=False):
+    from src.core.progress_bus import public_progress_payload, public_result_refs, public_tool_outcome
     with transaction() as conn:
         job = _job(conn, job_id)
-        status = {}
-        if include_job:
-            from src.core.jobs import decode_terminal_snapshot
-            status = dict(job)
-            status["terminal_snapshot"] = decode_terminal_snapshot(status)
-        updates = [dict(r) for r in conn.execute("SELECT * FROM task_updates WHERE job_id=? ORDER BY version", (job_id,))]
+        status = public_job_record(job) if include_job else {}
+        updates = [dict(r) for r in conn.execute(
+            "SELECT job_id,version,status,created_at,applied_at FROM task_updates WHERE job_id=? ORDER BY version", (job_id,))]
         operations = []
         for row in conn.execute("SELECT * FROM task_operations WHERE job_id=? ORDER BY updated_at", (job_id,)):
-            item = dict(row)
-            item["result_available"] = bool(item.get("result"))
+            item = public_progress_payload("operation", dict(row))
+            item.update({key: row[key] for key in ("job_id", "recovery_mode", "attempts", "updated_at")})
+            item["status"] = row["status"]
+            item["result_available"] = bool(row["result"])
             item["result_url"] = f"/jobs/{job_id}/operations/{item['operation_id']}/result" if item["result_available"] else ""
-            for key in ("inputs", "lease", "result"):
-                item.pop(key, None)
-            for key in ("input_refs", "result_refs", "outcome"):
-                item[key] = json.loads(item[key])
+            item["result_refs"] = public_result_refs(json.loads(row["result_refs"]))
+            outcome = json.loads(row["outcome"])
+            item["outcome"] = public_tool_outcome(outcome) if outcome else {}
             item["resumable"] = (job["current_step"] == "interrupted"
                                  and job["status"] == "failed"
                                  and item["recovery_mode"] != "never" and item["status"] == "interrupted")
@@ -174,7 +246,9 @@ def projection(job_id, *, include_job=False):
                 "pending_updates": [u for u in updates if u["status"] == "pending"],
                 "operations": operations,
                 "context_snapshot": _latest_context_snapshot(conn, job_id),
-                "approvals": [dict(r) for r in conn.execute("SELECT * FROM task_approvals WHERE job_id=? ORDER BY created_at", (job_id,))],
+                "approvals": [public_progress_payload("permission_decision", dict(row)) |
+                              {"created_at": row["created_at"], "decided_at": row["decided_at"]}
+                              for row in conn.execute("SELECT * FROM task_approvals WHERE job_id=? ORDER BY created_at", (job_id,))],
                 "budget": budget}
 
 
@@ -191,7 +265,7 @@ def submit_update(job_id, expected_version, instruction):
             raise TaskConflict("task_version_conflict")
         version += 1
         conn.execute("INSERT INTO task_updates VALUES (?,?,?,'pending',?,NULL)", (job_id, version, instruction, time.time()))
-        _append(conn, job_id, "task_update", {"version": version, "status": "pending", "instruction": instruction})
+        _append(conn, job_id, "task_update", {"version": version, "status": "pending"})
         return {"job_id": job_id, "version": version, "status": "pending"}
 
 
@@ -205,7 +279,7 @@ def apply_updates(job_id):
         rows = [dict(r) for r in conn.execute("SELECT * FROM task_updates WHERE job_id=? AND status='pending' ORDER BY version", (job_id,))]
         for row in rows:
             conn.execute("UPDATE task_updates SET status='applied',applied_at=? WHERE job_id=? AND version=?", (time.time(), job_id, row["version"]))
-            _append(conn, job_id, "task_update", {"version": row["version"], "status": "applied", "instruction": row["instruction"]})
+            _append(conn, job_id, "task_update", {"version": row["version"], "status": "applied"})
         return rows
 
 
@@ -222,12 +296,12 @@ def acknowledge_updates(job_id, version):
     """Idempotent outbox acknowledgement after durable graph state includes updates."""
     with transaction() as conn:
         _job(conn, job_id)
-        rows = list(conn.execute("SELECT version,instruction FROM task_updates WHERE job_id=? AND version<=? AND status='pending' ORDER BY version",
+        rows = list(conn.execute("SELECT version FROM task_updates WHERE job_id=? AND version<=? AND status='pending' ORDER BY version",
                                  (job_id, int(version))))
         for row in rows:
             conn.execute("UPDATE task_updates SET status='applied',applied_at=? WHERE job_id=? AND version=?",
                          (time.time(), job_id, row["version"]))
-            _append(conn, job_id, "task_update", {"version": row["version"], "status": "applied", "instruction": row["instruction"]})
+            _append(conn, job_id, "task_update", {"version": row["version"], "status": "applied"})
 
 
 def create_approval(job_id, tool_name, args):
@@ -265,7 +339,8 @@ def approval_status(approval_id):
         return row[0] if row else "missing"
 
 
-def start_operation(job_id, owner, tool_name, args, *, recovery_mode="never", input_refs=None, lease_seconds=600, tool_call_id="", attempt=1):
+def start_operation(job_id, owner, tool_name, args, *, recovery_mode="never", input_refs=None,
+                    lease_seconds=600, tool_call_id="", attempt=1, retry_of=None):
     refs = input_refs or []
     operation_id, lease = uuid.uuid4().hex, uuid.uuid4().hex
     digest = input_hash({"tool": tool_name, "args": args, "refs": refs})
@@ -273,8 +348,16 @@ def start_operation(job_id, owner, tool_name, args, *, recovery_mode="never", in
         job = _job(conn, job_id)
         if job["owner_user_id"] != owner or job["status"] not in {"running", "detached"}:
             raise TaskConflict("operation_owner_or_state_conflict")
-        conn.execute("INSERT INTO task_operations (operation_id,job_id,owner_user_id,tool_name,input_hash,inputs,input_refs,recovery_mode,status,lease,lease_until,attempts,updated_at) VALUES (?,?,?,?,?,?,?,?,'running',?,?,1,?)",
-                     (operation_id, job_id, owner, tool_name, digest, canonical(args), canonical(refs), recovery_mode, lease, time.time()+lease_seconds, time.time()))
+        if retry_of is not None:
+            parent = conn.execute(
+                "SELECT result FROM task_operations WHERE operation_id=? AND job_id=? "
+                "AND owner_user_id=? AND tool_name=? AND status='failed' AND recovery_mode='never'",
+                (retry_of, job_id, owner, tool_name)).fetchone()
+            if (tool_name != 'browse_web' or not parent or not parent['result']
+                    or conn.execute("SELECT 1 FROM task_operations WHERE retry_of=?", (retry_of,)).fetchone()):
+                raise TaskConflict('browse_retry_rejected')
+        conn.execute("INSERT INTO task_operations (operation_id,job_id,owner_user_id,tool_name,input_hash,inputs,input_refs,recovery_mode,status,lease,lease_until,attempts,updated_at,retry_of) VALUES (?,?,?,?,?,?,?,?,'running',?,?,1,?,?)",
+                     (operation_id, job_id, owner, tool_name, digest, canonical(args), canonical(refs), recovery_mode, lease, time.time()+lease_seconds, time.time(), retry_of))
         _append(conn, job_id, "operation", {"operation_id": operation_id, "tool_name": tool_name, "status": "running", "input_hash": digest, "tool_call_id": tool_call_id, "attempt": attempt})
     return operation_id, lease
 
@@ -328,15 +411,16 @@ def abandon_operation(operation_id, lease):
         conn.execute("UPDATE task_operations SET status='interrupted',lease_until=0,updated_at=? WHERE operation_id=? AND lease=? AND status='running'", (time.time(), operation_id, lease))
 
 
-def operation_result(job_id, operation_id):
+def operation_result(job_id, operation_id, *, include_retry=False):
     with transaction() as conn:
         _job(conn, job_id)
-        row = conn.execute("SELECT result,outcome,input_hash,result_refs FROM task_operations WHERE job_id=? AND operation_id=?", (job_id, operation_id)).fetchone()
+        row = conn.execute("SELECT result,outcome,input_hash,result_refs,retry_of FROM task_operations WHERE job_id=? AND operation_id=?", (job_id, operation_id)).fetchone()
         if row is None or not row["result"]:
             raise TaskConflict("operation_result_unavailable")
         return {"job_id": job_id, "operation_id": operation_id,
                 "input_hash": row["input_hash"], "result": json.loads(row["result"]),
-                "outcome": json.loads(row["outcome"]), "result_refs": json.loads(row["result_refs"])}
+                "outcome": json.loads(row["outcome"]), "result_refs": json.loads(row["result_refs"]),
+                **({"retry_of": row["retry_of"]} if include_retry else {})}
 
 
 def claim_resume(job_id, operation_id, owner):
@@ -428,10 +512,59 @@ def model_input_limit(output_tokens):
         - int(settings.CONTEXT_SAFETY_MARGIN_TOKENS)))
 
 
-async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", output_tokens=None, usage_session_id=None):
+_FINISH_REASONS = frozenset({"stop", "end_turn", "stop_sequence", "tool_calls", "function_call", "tool_use",
+    "length", "max_tokens", "max_output_tokens", "content_filter", "error", "unknown", "aborted",
+    "refusal", "pause_turn", "incomplete"})
+
+
+def _attempt_provider(model):
+    # Use only configured provider identifiers, not arbitrary endpoints/headers.
+    from src.config import settings
+    from src.core.provider_protocol import DeepSeekChatOpenAI
+    primary = getattr(model, "primary", model)
+    client = getattr(primary, "bound", primary)
+    url = str(getattr(client, "openai_api_base", None) or "").rstrip("/")
+    provider = settings.RESOLVED_PROVIDER_ID
+    if (url and url == settings.RESOLVED_MAIN_BASE_URL.rstrip("/") and isinstance(provider, str)
+            and 0 < len(provider) <= 40 and provider.replace("_", "").replace("-", "").isalnum()):
+        return provider
+    return "deepseek_compatible" if isinstance(client, DeepSeekChatOpenAI) else "openai_compatible" if url else "unknown"
+
+
+def _attempt_response(scope, response, error):
+    from langchain_core.messages import AIMessage, AIMessageChunk
+    meta = response.response_metadata if isinstance(response, AIMessage) else {}
+    finish = meta.get("finish_reason")
+    known = isinstance(finish, str) and finish in _FINISH_REASONS
+    streaming = isinstance(response, AIMessageChunk) or scope.get("streaming", False)
+    if error:
+        terminal = "cancelled" if error == "CancelledError" else "failed"
+    elif response is None:
+        terminal = "no_response"
+    else:
+        terminal = "terminal_observed" if known else "terminal_unavailable"
+    if isinstance(response, AIMessage) and response.invalid_tool_calls:
+        response_type = "invalid_tool_calls"
+    elif isinstance(response, AIMessage) and response.tool_calls:
+        response_type = "tool_calls"
+    elif isinstance(response, AIMessage):
+        response_type = "answer" if response.content else "empty"
+    else:
+        response_type = "none" if response is None else "other"
+    estimate = scope["estimate"]
+    return {"provider": scope["provider"], "estimated_input_tokens": estimate["estimated_input_tokens"],
+            "max_output_tokens": estimate["output_tokens"], "streaming": streaming,
+            "stream_state": terminal if streaming else "not_streaming",
+            "finish_reason": finish if known else None,
+            "finish_reason_status": "reported" if known else "missing" if finish is None else "unrecognized",
+            "response_type": response_type}
+
+
+async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", output_tokens=None, usage_session_id=None,
+                            streaming=False):
     from src.core.tracing import get_job_id, get_session_id
     from src.core.cache_metrics import extract_usage, emit_usage_from_response
-    from src.core.request_context import model_request, _observation, _epoch, _logical_call
+    from src.core.request_context import estimate_request, model_request, _observation, _epoch, _logical_call
     from src.core.context_snapshot import build_context_snapshot, emit_context_snapshot
     phase = _epoch.get()
     parent = _observation.get()
@@ -451,6 +584,7 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
              "history_load_status": phase.history_load_status if phase else "unknown",
              "history_load_reason": phase.history_load_reason if phase else "",
              "estimate": estimate, "model": str(payload.get("model", "")),
+             "provider": _attempt_provider(model), "streaming": streaming,
              "parent_purpose": parent.get("purpose", "") if parent else ""}
 
     def publish_context(*, usage=None, status="running", error=""):
@@ -467,7 +601,15 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
     scope["publish_context"] = publish_context
     try:
         if estimate["estimated_input_tokens"] > limit:
-            raise TaskConflict("context_budget_exhausted")
+            reason = "context_budget_exhausted"
+            if purpose == "main_loop" and estimate["tool_message_count"]:
+                # Attribute the overage using the converted request. This
+                # hypothetical payload is never sent or used for admission.
+                without_observations = {**payload, "messages": [
+                    msg for msg in payload["messages"] if msg.get("role") not in {"tool", "function"}]}
+                if estimate_request(without_observations)["estimated_input_tokens"] <= limit:
+                    reason = "context_budget_exhausted:tool_observations"
+            raise TaskConflict(reason)
         attempt_id = reserve_attempt(get_job_id(), purpose, estimate["estimated_total_tokens"])
     except TaskConflict as exc:
         publish_context(status="not_admitted", error=str(exc))
@@ -491,7 +633,8 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
         redirected = scope.get("redirected", False)
         usage = {} if redirected else extract_usage(response) or {}
         error = scope.get("transport_error", error)
-        finish_attempt(attempt_id, usage, error=error)
+        finish_attempt(attempt_id, usage, error=error, observation=_attempt_response(
+            scope, None if redirected else response, error))
         if response is not None and not redirected:
             emit_usage_from_response(usage_session_id or get_session_id(), purpose, response,
                 attempt_id=scope["attempt_id"], logical_call_id=scope["logical_call_id"],
@@ -607,7 +750,7 @@ def reserve_attempt(job_id, purpose, estimated_tokens):
         return attempt_id
 
 
-def finish_attempt(attempt_id, usage=None, error=""):
+def finish_attempt(attempt_id, usage=None, error="", *, observation=None):
     if not attempt_id:
         return
     usage = usage or {}
@@ -622,11 +765,14 @@ def finish_attempt(attempt_id, usage=None, error=""):
         # Unknown usage retains the reservation instead of silently charging zero.
         if reported and row["budget_scope"] == "execution":
             conn.execute("UPDATE task_budgets SET tokens=tokens+? WHERE job_id=?", (measured-row["reserved_tokens"], row["job_id"]))
-        conn.execute("UPDATE task_model_attempts SET status=?,usage=?,error=? WHERE attempt_id=?", ("failed" if error else "complete", canonical(usage), error, attempt_id))
+        observation = observation or {}
+        conn.execute("UPDATE task_model_attempts SET status=?,usage=?,error=?,observation=? WHERE attempt_id=?",
+                     ("failed" if error else "complete", canonical(usage), error, canonical(observation), attempt_id))
         _append(conn, row["job_id"], "model_attempt", {"attempt_id": attempt_id,
             "purpose": row["purpose"], "status": "failed" if error else "complete",
             "usage": usage, "usage_status": "reported" if reported else "unknown_reserved",
-            "charged_tokens": measured if reported else row["reserved_tokens"], "error": error})
+            "charged_tokens": measured if reported else row["reserved_tokens"], "error": error,
+            "observation": observation})
 
 
 def _usage_totals(conn, job_id):

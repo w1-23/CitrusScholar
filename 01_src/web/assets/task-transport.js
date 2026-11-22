@@ -64,6 +64,12 @@
           (page.events || []).forEach(function (frame) {
             if (owns()) store.receive(frame.event, Object.assign({}, frame.data, {seq: frame.seq}), String(frame.seq));
           });
+          // A cursor is a watermark: a page may repeat consumed events, never
+          // move it backwards. The terminal snapshot is hydrated only after the
+          // page (including the artifact-delivery tail before ``done``) is applied.
+          if (Number.isSafeInteger(page.next_cursor) && page.next_cursor < store.state.cursor) {
+            throw new Error('任务事件游标回退。');
+          }
           if (store.hasGap() || Number.isSafeInteger(page.next_cursor) && store.state.cursor < page.next_cursor) {
             throw new Error('任务状态暂未同步，正在补读事件。');
           }
@@ -79,6 +85,8 @@
       if (!job || !owns()) return null;
       if (job.job_id !== jobId) throw new Error('任务状态标识不匹配。');
       var taskState = root.CitrusTaskState;
+      // A late status response must not move the consumed watermark backwards.
+      if (Number.isSafeInteger(job.event_cursor) && job.event_cursor < store.state.cursor) return job;
       // The status read may see recovery admitted after replay returned a terminal event.
       if ((withEvents !== false || taskState.snapshotStatus(job) || taskState.isTerminal(store.state)) &&
           job.event_cursor > store.state.cursor) {

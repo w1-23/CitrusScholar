@@ -199,6 +199,9 @@ async def build_checkpoint(manager, session_id: str, state: dict, snapshot: dict
             return _reject("request_identity_mismatch")
         # Pin before writing: legacy missing/truncated evidence is not compressible.
         if call_ids and not await asyncio.to_thread(tool_results.pin_references, session_id, call_ids):
+            from src.core.diag import diag
+            diag("turn_navigation_checkpoint_deferred", stage="pin", reason="evidence_not_pinnable",
+                 evidence_count=len(call_ids))
             return _reject("evidence_not_pinnable")
         tool_hashes = {}
         for call_id in call_ids:

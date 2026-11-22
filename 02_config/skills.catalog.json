@@ -137,12 +137,12 @@
     },
     {
       "id": "data-audit",
-      "version": "2.1.0",
+      "version": "2.1.1",
       "path": "skills/data-audit",
       "entry": "SKILL.md",
       "package": "citrus_audit",
       "dependency": "citrusscholar-support[audit]==2.0.0",
-      "sha256": "42be5d63a924075901c5cc79dfa6fd698bbf565632097f2a253b26bd567f6bb7",
+      "sha256": "39182c64c3ec9095e0fbf2385fd8d4073af5829717fdc83d3c83a19acdfe76dc",
       "files": [
         {
           "path": "PROVENANCE.md",
@@ -181,8 +181,8 @@
         },
         {
           "path": "SKILL.md",
-          "sha256": "7cdbe69fd053dba7f5a291a0995ddbddf0f5b73bd3e04ea052f453424cbc8390",
-          "size": 5408
+          "sha256": "da012b6d61fc5ae48c8db4f190a702f99442ebaeabed4325fda338b40ce8e6ee",
+          "size": 6278
         },
         {
           "path": "tests/cli_test.py",
@@ -193,17 +193,17 @@
     },
     {
       "id": "nature-figure",
-      "version": "2.1.0",
+      "version": "2.1.1",
       "path": "skills/nature-figure",
       "entry": "SKILL.md",
       "package": "citrus_figures",
       "dependency": "citrusscholar-support[figures]==2.0.0",
-      "sha256": "ed8c4840844904f7ccf7be7845382db58b7127534b9b4c1792de35570af30e7b",
+      "sha256": "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6",
       "files": [
         {
           "path": "ADAPTER.md",
-          "sha256": "1847f2f9541667b5abe9278a0c620a4d0808c86b6fd4a7644071ffb72de5f09f",
-          "size": 4958
+          "sha256": "c0e708e274a0ac94b45c45b845ab0da396a5376920b92caa14b517e798e73f09",
+          "size": 7228
         },
         {
           "path": "provenance.extra.json",
@@ -212,12 +212,12 @@
         },
         {
           "path": "provenance.json",
-          "sha256": "67def594c3024d54e402344b8762bcd53dfdd6fe19bd1316286ada19f35ca8b5",
+          "sha256": "b6ba9070c52cb88ac799bc082bdc6bf6d3f9e065b5b9ce9dbca724dcbfa30cf0",
           "size": 12408
         },
         {
           "path": "references/bridge.md",
-          "sha256": "20d9aa14ab17374315d3002d8b599ff20919522abce7a6658465326f2c00a1a9",
+          "sha256": "61b89e70eecdbc8e26b29232b3f28fc2fa16e6b5a979b16dc6a0b4781812d11d",
           "size": 6948
         },
         {
@@ -252,8 +252,8 @@
         },
         {
           "path": "SKILL.md",
-          "sha256": "9cb7b20f075d4178afcfb35b5e10862c2f794f2b72be15d5a187849b59e9a9e0",
-          "size": 5177
+          "sha256": "5fd5fe22b50915995f0ed1dab3e83cdef22be275a6e73270d4950aef3f313a87",
+          "size": 5304
         },
         {
           "path": "vendor/nature-skills/INTEGRATION.md",

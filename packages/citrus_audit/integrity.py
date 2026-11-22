@@ -129,6 +129,8 @@ class IntegrityTable:
     source_columns: int
     truncation_reasons: tuple[str, ...]
     table_sha256: str
+    region_id: str = ""
+    region_bounds: str = ""
 
     @property
     def key(self) -> tuple[str, str]:
@@ -136,7 +138,7 @@ class IntegrityTable:
 
     def coverage(self) -> dict[str, Any]:
         reasons = Counter(reason for row in self.exclusions for reason in row if reason)
-        return {
+        result = {
             "source_id": self.source_id, "source_name": self.source_name,
             "source_sha256": self.source_sha256, "sheet": self.sheet,
             "table_sha256": self.table_sha256,
@@ -155,6 +157,9 @@ class IntegrityTable:
             } for col, name in enumerate(self.column_names)],
             "truncation_reasons": list(self.truncation_reasons),
         }
+        if self.region_id or self.region_bounds:
+            result.update(region_id=self.region_id, region_bounds=self.region_bounds)
+        return result
 
 
 def table_from_rows(
@@ -164,6 +169,7 @@ def table_from_rows(
     column_numbers: Sequence[int] | None = None,
     source_rows: int | None = None, source_columns: int | None = None,
     truncation_reasons: Sequence[str] = (),
+    region_id: str = "", region_bounds: str = "",
     max_rows: int = DEFAULT_MAX_INPUT_ROWS,
     max_columns: int = DEFAULT_MAX_INPUT_COLUMNS,
     max_cells: int = DEFAULT_MAX_INPUT_CELLS,
@@ -180,6 +186,9 @@ def table_from_rows(
     """
     if not source_id or not isinstance(source_bytes, bytes):
         raise ValueError("source_id and original source_bytes are required")
+    if (not isinstance(region_id, str) or len(region_id) > 160
+            or not isinstance(region_bounds, str) or len(region_bounds) > 250):
+        raise ValueError("Region identity must be a bounded string")
     for key, limit in (("max_rows", max_rows), ("max_columns", max_columns), ("max_cells", max_cells)):
         if type(limit) is not int or limit < 1:
             raise ValueError(f"{key} must be a positive integer")
@@ -225,7 +234,8 @@ def table_from_rows(
                         "excluded": exclusions})
     return IntegrityTable(str(source_id), str(source_name), hashlib.sha256(source_bytes).hexdigest(),
                           str(sheet), names, rn, cn, values, exclusions,
-                          total_rows, total_cols, tuple(str(reason) for reason in reasons), table_hash)
+                          total_rows, total_cols, tuple(str(reason) for reason in reasons), table_hash,
+                          str(region_id), str(region_bounds))
 
 
 def table_from_frame(frame: Any, **source: Any) -> IntegrityTable:
@@ -285,7 +295,7 @@ class IntegrityConfig:
 
 
 def _location(table: IntegrityTable, rows: Sequence[int], cols: Sequence[int]) -> dict[str, Any]:
-    return {
+    location = {
         "source_id": table.source_id, "source_name": table.source_name,
         "source_sha256": table.source_sha256, "table_sha256": table.table_sha256,
         "sheet": table.sheet, "header_row": table.row_numbers[0] - 1 if table.row_numbers else 1,
@@ -294,6 +304,9 @@ def _location(table: IntegrityTable, rows: Sequence[int], cols: Sequence[int]) -
         "columns": [{"index": table.column_numbers[col], "name": table.column_names[col]} for col in cols],
         "cells": [[_cell(table.column_numbers[col], table.row_numbers[row]) for col in cols] for row in rows],
     }
+    if table.region_id or table.region_bounds:
+        location.update(region_id=table.region_id, region_bounds=table.region_bounds)
+    return location
 
 
 def _mapped_rows(left: Sequence[Any], right: Sequence[Any], left_rows: Sequence[int],

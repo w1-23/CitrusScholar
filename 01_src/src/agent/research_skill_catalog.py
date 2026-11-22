@@ -3,6 +3,11 @@
 The manifest authenticates the release identity; only requested guidance bytes
 are read. Vendor scripts/assets are optional resources, never imports or tools.
 The archived prompt registry remains an independent compatibility namespace.
+
+Current releases stay pinned by exact identity. A prior release remains readable
+only from ``02_config/skill-history/<id>/<version>`` after its own manifest
+authenticates the requested identity. Archived bytes are never silently replaced
+by current bytes, and a missing optional file is reported instead of granted.
 """
 from __future__ import annotations
 
@@ -13,22 +18,24 @@ import re
 
 ROOT = Path(__file__).resolve().parents[3]
 CATALOG_PATH = "02_config/skills.catalog.json"
+HISTORY_ROOT = "02_config/skill-history"
 PINNED = {
     "candidate-search": ("2.0.0", "0c216b5803a20b50290a72b44d4e019f3f5cf4c256fd3b3549fd844465ae4d50"),
     "reference-verification": ("2.0.0", "1d2f55aaec2531b178d79dd005a44a11d3d04c0cc50e54f72f75c3813fbf3a62"),
-    "data-audit": ("2.1.0", "42be5d63a924075901c5cc79dfa6fd698bbf565632097f2a253b26bd567f6bb7"),
-    "nature-figure": ("2.1.0", "ed8c4840844904f7ccf7be7845382db58b7127534b9b4c1792de35570af30e7b"),
+    "data-audit": ("2.1.1", "39182c64c3ec9095e0fbf2385fd8d4073af5829717fdc83d3c83a19acdfe76dc"),
+    "nature-figure": ("2.1.1", "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6"),
 }
+# Compatibility aliases naming the known prior releases that remain readable.
+# Discovery itself is generic under HISTORY_ROOT; these values are retained for
+# callers that reference the established archived identities by name.
 _ARCHIVED_NATURE_IDENTITY = ("2.0.0", "00779e01d2c8756245c3553adb8abf451c4eb1dcd15c46ce7192ce3892d7f127")
-_ARCHIVED_NATURE_ROOT = "02_config/skill-history/nature-figure/2.0.0"
-_ARCHIVED_NATURE_RESOURCES = frozenset({
-    "SKILL.md", "provenance.json", "provenance.extra.json", "references/bridge.md",
-})
+_ARCHIVED_NATURE_ROOT = HISTORY_ROOT + "/nature-figure/2.0.0"
 _ARCHIVED_DATA_AUDIT_IDENTITY = ("2.0.0", "87247d295c5fcb2bd97ac833361afb0f9376c69bc35de309f5a0e09839b60339")
-_ARCHIVED_DATA_AUDIT_ROOT = "02_config/skill-history/data-audit/2.0.0"
+_ARCHIVED_DATA_AUDIT_ROOT = HISTORY_ROOT + "/data-audit/2.0.0"
 _MAX_CATALOG_BYTES = 256_000
 _MAX_RESOURCE_BYTES = 1_000_000
 _MAX_FILES = 512
+_SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 
 
 def _path(root: Path, name: str) -> Path:
@@ -50,7 +57,9 @@ def _path(root: Path, name: str) -> Path:
 
 
 def _bytes(path: Path, limit: int) -> bytes:
-    if not path.is_file() or path.stat().st_size > limit:
+    if not path.is_file():
+        raise ValueError("skill_resource_missing")
+    if path.stat().st_size > limit:
         raise ValueError("skill_resource_size_limit")
     with path.open("rb") as stream:
         content = stream.read(limit + 1)
@@ -102,20 +111,76 @@ def _manifest(row, identity):
     return records
 
 
+def _archived_root(skill_id, version):
+    """Return the history root for an exact, path-safe prior release, if any."""
+    if (type(skill_id) is not str or type(version) is not str
+            or _SAFE_COMPONENT.fullmatch(skill_id) is None
+            or _SAFE_COMPONENT.fullmatch(version) is None):
+        return None
+    root = HISTORY_ROOT + "/" + skill_id + "/" + version
+    try:
+        if not _path(_path(ROOT, root), "manifest.json").is_file():
+            return None
+    except ValueError:
+        return None
+    return root
+
+
+def _archived_row(skill_id, version, sha256):
+    """Authenticate a prior identity from its own manifest before serving it."""
+    root = _archived_root(skill_id, version)
+    if root is None:
+        return None
+    try:
+        row = json.loads(_bytes(_path(ROOT, root + "/manifest.json"), _MAX_CATALOG_BYTES))
+    except (OSError, ValueError, TypeError):
+        return None
+    if (type(row) is not dict or row.get("id") != skill_id
+            or (row.get("version"), row.get("sha256")) != (version, sha256)):
+        return None
+    return root, row
+
+
+def _resource_roots(row):
+    """Archived bytes first for prior identities, then the current package."""
+    roots = []
+    if PINNED.get(row.get("id")) != (row.get("version"), row.get("sha256")):
+        archived = _archived_root(row.get("id"), row.get("version"))
+        if archived is not None:
+            roots.append(archived)
+    roots.append(row["path"])
+    return list(dict.fromkeys(roots))
+
+
+def _verified_bytes(row, resource, record):
+    """Read one exact manifest resource; never substitute different bytes."""
+    missing, mismatch = False, False
+    for root in _resource_roots(row):
+        try:
+            content = _bytes(_path(_path(ROOT, root), resource), record["size"])
+        except ValueError as exc:
+            if str(exc) == "skill_resource_missing":
+                missing = True
+                continue
+            raise
+        if len(content) == record["size"] and hashlib.sha256(content).hexdigest() == record["sha256"]:
+            return content
+        mismatch = True
+    raise ValueError("skill_resource_integrity_mismatch" if mismatch
+                     else "skill_resource_missing")
+
+
 def _text(row, records, resource):
     if resource not in records:
         raise ValueError("skill_resource_not_in_manifest")
-    record = records[resource]
-    archived = (row["id"] == "nature-figure"
-                and (row["version"], row["sha256"]) == _ARCHIVED_NATURE_IDENTITY)
-    source = _ARCHIVED_NATURE_ROOT if archived and resource in _ARCHIVED_NATURE_RESOURCES else row["path"]
-    if (row["id"] == "data-audit" and resource == "SKILL.md"
-            and (row["version"], row["sha256"]) == _ARCHIVED_DATA_AUDIT_IDENTITY):
-        source = _ARCHIVED_DATA_AUDIT_ROOT
-    content = _bytes(_path(_path(ROOT, source), resource), record["size"])
-    if len(content) != record["size"] or hashlib.sha256(content).hexdigest() != record["sha256"]:
-        raise ValueError("skill_resource_integrity_mismatch")
-    return content.decode("utf-8")
+    return _verified_bytes(row, resource, records[resource]).decode("utf-8")
+
+
+def _required_resources(records):
+    # Local method references suffice for default loads. Vendored libraries,
+    # scripts, templates and tests remain exact-manifest optional resources.
+    return ["SKILL.md", *sorted(name for name in records
+                 if name.startswith("references/") and name.endswith(".md"))]
 
 
 def _info(row, records):
@@ -128,13 +193,11 @@ def _info(row, records):
     version = re.search(r"^(?:  )?version:[ \t]*[\"']?([^\"'\r\n]+)[\"']?[ \t]*$", header[1], re.M)
     if fields.get("name") != row["id"] or version is None or version[1].strip() != row["version"]:
         raise ValueError("research_skill_identity_mismatch")
-    # Local method references suffice for default loads. Vendored libraries,
-    # scripts, templates and tests remain exact-manifest optional resources.
-    resources = ["SKILL.md", *sorted(name for name in records
-                 if name.startswith("references/") and name.endswith(".md"))]
     return {"id": row["id"], "version": row["version"], "sha256": row["sha256"],
             "description": fields.get("description", row["id"]), "applicability": "",
-            "entrypoint": "SKILL.md", "required_resources": resources,
+            "entrypoint": "SKILL.md", "required_resources": _required_resources(records),
+            "method_resources": [name for name in records if name == "ADAPTER.md"
+                                 or name in _required_resources(records) and name != "SKILL.md"],
             "depends_on": [], "requires_any": [], "verified": True}
 
 
@@ -155,28 +218,69 @@ def list_skills():
 
 def has_identity(skill_id, version, sha256):
     identity = (version, sha256)
-    return (PINNED.get(skill_id) == identity
-            or (skill_id == "nature-figure" and identity == _ARCHIVED_NATURE_IDENTITY)
-            or (skill_id == "data-audit" and identity == _ARCHIVED_DATA_AUDIT_IDENTITY))
+    if PINNED.get(skill_id) == identity:
+        return True
+    return _archived_row(skill_id, version, sha256) is not None
 
 
-def resolve(skill_id, version, sha256):
-    """Resolve current and archived guidance by full, pinned identity."""
+def _resolve_row(skill_id, version, sha256):
     identity = (version, sha256)
-    if not has_identity(skill_id, version, sha256):
-        raise ValueError("research_skill_identity_mismatch")
-    archived_root = {("nature-figure", _ARCHIVED_NATURE_IDENTITY): _ARCHIVED_NATURE_ROOT,
-                     ("data-audit", _ARCHIVED_DATA_AUDIT_IDENTITY): _ARCHIVED_DATA_AUDIT_ROOT}.get((skill_id, identity))
-    if archived_root:
-        row = json.loads(_bytes(_path(ROOT, archived_root + "/manifest.json"), _MAX_CATALOG_BYTES))
-        if type(row) is not dict or row.get("id") != skill_id:
-            raise ValueError("research_skill_identity_mismatch")
-    else:
+    if PINNED.get(skill_id) == identity:
         row = next((entry for entry in _catalog() if entry["id"] == skill_id), None)
         if row is None:
             raise ValueError("research_skill_unavailable")
-    records = _manifest(row, identity)
+        return row, False
+    archived = _archived_row(skill_id, version, sha256)
+    if archived is None:
+        raise ValueError("research_skill_identity_mismatch")
+    return archived[1], True
+
+
+def resolve(skill_id, version, sha256):
+    """Resolve current and prior guidance by full, authenticated identity."""
+    row, _ = _resolve_row(skill_id, version, sha256)
+    records = _manifest(row, (version, sha256))
     return row, records, _info(row, records)
+
+
+def validate_release(skill_id, version, sha256):
+    """Report missing/invalid manifest files for a current or prior release.
+
+    ``verified`` means every declared file is present at its recorded digest.
+    ``delivery_ready`` means the method entrypoint and local references are all
+    readable. Optional scripts/assets/tests may therefore be absent without
+    making authorized tools unavailable; archived prior releases are checked
+    against their own history manifest, never against current bytes.
+    """
+    row, archived = _resolve_row(skill_id, version, sha256)
+    records = _manifest(row, (version, sha256))
+    missing, invalid = [], []
+    for name, record in records.items():
+        try:
+            _verified_bytes(row, name, record)
+        except ValueError as exc:
+            if str(exc) == "skill_resource_missing":
+                missing.append(name)
+            else:
+                invalid.append(name)
+    required = _required_resources(records)
+    unavailable = set(missing) | set(invalid)
+    info_ok = "SKILL.md" not in unavailable
+    if info_ok:
+        try:
+            _info(row, records)
+        except (OSError, ValueError):
+            info_ok = False
+            invalid.append("SKILL.md")
+    return {"id": row["id"], "version": row["version"], "sha256": row["sha256"],
+            "archived": archived,
+            "verified": not missing and not invalid,
+            "delivery_ready": info_ok and all(name not in unavailable for name in required),
+            "missing_files": sorted(set(missing)),
+            "invalid_files": sorted(set(invalid)),
+            "required_resources": required,
+            "available_required_resources": [name for name in required
+                                             if name not in unavailable]}
 
 
 def read_resource(skill_id, version, sha256, resource="", *, start_char=0, max_chars=3000):

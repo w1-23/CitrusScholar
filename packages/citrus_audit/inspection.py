@@ -1,4 +1,12 @@
-"""Read bounded workbook layout and source-coordinate pages without building a DataFrame."""
+"""Bounded workbook layout, region discovery and source-coordinate pages.
+
+Layout inspection never builds a DataFrame.  Region discovery is a
+deliberately conservative partition of the bounded scan window: a full blank
+row or a full blank column separates regions, because side-by-side and stacked
+tables are otherwise indistinguishable from one table with a gap.  Every
+reported coordinate is an absolute 1-based sheet coordinate, so the same
+bounds can be handed to envelope construction without re-originating rows.
+"""
 from contextlib import closing
 from hashlib import sha256
 import io
@@ -11,7 +19,37 @@ from .readers import _missing_sheet_message, open_xlsx_readonly
 _MAX_BYTES = 12_000
 _MAX_CELLS = 200
 _MAX_SCAN_ROW = 100_000
+_SCAN_ROWS = 24
+_SCAN_COLUMNS = 48
+_MAX_REGIONS = 40
+_MAX_LAYOUT_BYTES = 23_000
+_MAX_FORMULA_CELLS = 80
+_MAX_REGION_FORMULAS = 20
+_MAX_HIDDEN_SHEETS = 40
+_MAX_HINT_ROWS = 3
 _XML_NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+
+_LIMITATION_NOTES = {
+    'scan_window_limited': 'Only the first 24 rows and 48 columns are scanned; '
+                           'data outside that window is not discovered.',
+    'regions_truncated': 'Only a bounded subset of non-empty regions is reported (cap 40 and '
+                        'an overall layout byte budget).',
+    'merged_ranges_truncated': 'More than 80 merged ranges exist; later merges are not reported '
+                              'and do not extend an observed region.',
+    'sheet_layout_truncated': 'Only the first 40 worksheets are listed with visibility.',
+    'hidden_sheet_list_truncated': 'Only 40 hidden worksheets are named; the count is exact.',
+    'formula_cells_truncated': 'Only a bounded sample of formula coordinates is reported.',
+    'header_rows_outside_scan': 'Requested header rows fall outside the bounded scan window.',
+    'region_without_header_rows': 'No requested header row intersects this region; no data rows '
+                                 'are claimed and header_hint_rows are heuristic only.',
+    'rows_before_first_header': 'Observed rows above the first requested header row are neither '
+                               'header nor data and are left unclassified.',
+    'noncontiguous_header_rows': 'Requested header rows inside this region are not contiguous.',
+    'region_touches_scan_boundary': 'The region reaches the right or bottom scan boundary; its '
+                                   'reported bounds may be incomplete.',
+    'merged_range_outside_scan': 'A merged range intersecting this region extends outside the '
+                                'bounded scan window.',
+}
 
 
 def _size(value):
@@ -50,18 +88,228 @@ def _merges(data, path):
     return result, False
 
 
+def _merge_rectangles(merges):
+    """Parse merge references into clamped scan rectangles and clipping flags."""
+    from openpyxl.utils.cell import range_boundaries
+
+    parsed = []
+    for item in merges:
+        try:
+            left, top, right, bottom = range_boundaries(item['range'])
+        except (TypeError, ValueError):
+            continue
+        if None in (left, top, right, bottom):
+            continue
+        parsed.append({'range': item['range'],
+                       'box': (max(1, top), min(_SCAN_ROWS, bottom),
+                               max(1, left), min(_SCAN_COLUMNS, right)),
+                       'outside_scan': top < 1 or left < 1 or bottom > _SCAN_ROWS
+                                       or right > _SCAN_COLUMNS})
+    return parsed
+
+
+def _tiles(occupied):
+    """Partition observed cells into rectangles separated by full blank rows/cols.
+
+    The partition intentionally does not bridge a completely blank row or
+    column: two tables that look adjacent are kept separate rather than being
+    joined into one misleading region.  Ordering is stable (top-left first).
+    """
+    rows = sorted(occupied)
+    columns = sorted({column for cells in occupied.values() for column in cells})
+    if not rows or not columns:
+        return []
+    output = []
+
+    def split(top, bottom, left, right):
+        points = {(row, column) for row in range(top, bottom + 1)
+                  for column in occupied.get(row, ()) if left <= column <= right}
+        if not points:
+            return
+        seen_rows = sorted({row for row, _ in points})
+        seen_columns = sorted({column for _, column in points})
+        top, bottom, left, right = seen_rows[0], seen_rows[-1], seen_columns[0], seen_columns[-1]
+        empty_rows = [row for row in range(top, bottom + 1)
+                      if not any((row, column) in points for column in range(left, right + 1))]
+        if empty_rows:
+            start = top
+            for row in range(top, bottom + 1):
+                if row in empty_rows:
+                    if start <= row - 1:
+                        split(start, row - 1, left, right)
+                    start = row + 1
+            if start <= bottom:
+                split(start, bottom, left, right)
+            return
+        empty_columns = [column for column in range(left, right + 1)
+                         if not any((row, column) in points for row in range(top, bottom + 1))]
+        if empty_columns:
+            start = left
+            for column in range(left, right + 1):
+                if column in empty_columns:
+                    if start <= column - 1:
+                        split(top, bottom, start, column - 1)
+                    start = column + 1
+            if start <= right:
+                split(top, bottom, start, right)
+            return
+        output.append((top, bottom, left, right))
+
+    split(rows[0], rows[-1], columns[0], columns[-1])
+    output.sort()
+    return output
+
+
+def _header_like(values):
+    texts = [str(value).strip() for value in values if value is not None and str(value).strip()]
+    if len(texts) < 2 or len(set(texts)) < 2:
+        return False
+    if any(len(text) > 40 for text in texts):
+        return False
+    numeric = sum(1 for text in texts
+                  if re.fullmatch(r'[+-]?[0-9]+(?:[.][0-9]+)?', text))
+    return numeric < max(1, len(texts) // 2)
+
+
+def _header_hint_rows(top, bottom, values_by_row):
+    """Conservative hint only; never applied as an actual header selection."""
+    hints = []
+    previous_distinct = 0
+    for row in range(top, min(bottom, top + _MAX_HINT_ROWS - 1) + 1):
+        values = values_by_row.get(row, ())
+        if not _header_like(values):
+            break
+        distinct = len({str(value).strip() for value in values if str(value).strip()})
+        if hints and distinct <= previous_distinct:
+            break
+        hints.append(row)
+        previous_distinct = distinct
+    return hints
+
+
+def _column_letter(number):
+    result = ''
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _bounds(top, bottom, left, right):
+    return f'{_column_letter(left)}{top}:{_column_letter(right)}{bottom}'
+
+
+def _separation(first, second):
+    a_top, a_bottom, a_left, a_right = first
+    b_top, b_bottom, b_left, b_right = second
+    rows_overlap = max(a_top, b_top) <= min(a_bottom, b_bottom)
+    columns_overlap = max(a_left, b_left) <= min(a_right, b_right)
+    if rows_overlap and not columns_overlap:
+        return 'horizontal'
+    if columns_overlap and not rows_overlap:
+        return 'vertical'
+    if rows_overlap and columns_overlap:
+        return 'overlap'
+    return 'diagonal'
+
+
+def _regions(sheet, tiles, values_by_row, formulas_by_row, merges, header_rows, hidden):
+    requested = sorted({row for row in header_rows if type(row) is int})
+    region_rows = []
+    for index, (top, bottom, left, right) in enumerate(tiles, 1):
+        limitations = []
+        headers = [row for row in requested if top <= row <= bottom]
+        if headers and headers != list(range(min(headers), max(headers) + 1)):
+            limitations.append('noncontiguous_header_rows')
+        if headers and min(headers) > top:
+            limitations.append('rows_before_first_header')
+        header_bottom = max(headers) if headers else None
+        data_rows = [row for row in range(header_bottom + 1, bottom + 1)] if headers else []
+        formula_cells = sorted(((f'{_column_letter(column)}{row}', row, column)
+                                for row in range(top, bottom + 1)
+                                for column in formulas_by_row.get(row, ()) if left <= column <= right),
+                               key=lambda item: (item[1], item[2]))
+        region_formulas = formula_cells[:_MAX_REGION_FORMULAS]
+        if len(formula_cells) > len(region_formulas):
+            limitations.append('formula_cells_truncated')
+        region_merges = [item['range'] for item in merges
+                         if max(top, item['box'][0]) <= min(bottom, item['box'][1])
+                         and max(left, item['box'][2]) <= min(right, item['box'][3])]
+        if any(item['outside_scan'] and max(top, item['box'][0]) <= min(bottom, item['box'][1])
+               and max(left, item['box'][2]) <= min(right, item['box'][3]) for item in merges):
+            limitations.append('merged_range_outside_scan')
+        touches = []
+        if right >= _SCAN_COLUMNS:
+            touches.append('right')
+        if bottom >= _SCAN_ROWS:
+            touches.append('bottom')
+        if touches:
+            limitations.append('region_touches_scan_boundary')
+        if not headers:
+            limitations.append('region_without_header_rows')
+        hints = [] if headers else _header_hint_rows(top, bottom, values_by_row)
+        rows = list(range(top, bottom + 1))
+        region = {
+            'region_id': f'{sheet.title}!R{index}',
+            'sheet': sheet.title,
+            'bounds': _bounds(top, bottom, left, right),
+            'header_rows': headers,
+            'header_bounds': (_bounds(min(headers), max(headers), left, right)
+                              if headers else None),
+            'data_rows': data_rows,
+            'data_bounds': (_bounds(min(data_rows), max(data_rows), left, right)
+                            if data_rows else None),
+            'rows': rows,
+            'column_numbers': list(range(left, right + 1)),
+            'header_hint_rows': hints,
+            'header_detection': 'requested' if headers else
+                                ('heuristic_hint' if hints else 'none'),
+            'formula_cells': [cell for cell, _row, _column in region_formulas],
+            'formula_count': len(formula_cells),
+            'formulas_truncated': len(formula_cells) > len(region_formulas),
+            'merged_ranges': region_merges,
+            'sheet_visibility': sheet.sheet_state,
+            'hidden_sheet': hidden,
+            'touches_scan_boundary': touches,
+            'separation': 'single',
+            'neighbors': [],
+            'limitations': limitations,
+        }
+        region_rows.append((region, (top, bottom, left, right)))
+
+    # Stable pairwise orientation.  Overlapping boxes can only appear when the
+    # tile cap truncated the list, and are reported rather than guessed away.
+    for index, (region, box) in enumerate(region_rows):
+        kinds = set()
+        for other_index, (other, other_box) in enumerate(region_rows):
+            if index == other_index:
+                continue
+            kind = _separation(box, other_box)
+            if kind in {'horizontal', 'vertical'}:
+                kinds.add(kind)
+                region['neighbors'].append(other['region_id'])
+        region['separation'] = ('single' if not kinds else
+                                kinds.pop() if len(kinds) == 1 else 'grid')
+    return [region for region, _box in region_rows]
+
+
 def _layout(workbook, sheet, data, header_rows):
     from openpyxl.utils import get_column_letter
 
     names = [item.title for item in workbook.worksheets]
     reported = sheet.calculate_dimension() if sheet.max_row and sheet.max_column else None
     sheet.reset_dimensions()
-    scan_rows, scan_columns = 24, 48
+    scan_rows, scan_columns = _SCAN_ROWS, _SCAN_COLUMNS
     headers, occupied = [], {}
+    values_by_row, formulas_by_row = {}, {}
     for row_index, cells in enumerate(sheet.iter_rows(min_row=1, max_row=scan_rows,
                                                        max_col=scan_columns), 1):
         present = [cell for cell in cells if cell.value is not None]
         occupied[row_index] = {cell.column for cell in present}
+        values_by_row[row_index] = [cell.value for cell in present]
+        formulas = {cell.column for cell in present if cell.data_type == 'f'}
+        if formulas:
+            formulas_by_row[row_index] = formulas
         if row_index in header_rows:
             headers.extend(_cell_value(cell) for cell in present)
     # Each block is a contiguous rectangle of observed occupied cells. Gaps are
@@ -96,6 +344,85 @@ def _layout(workbook, sheet, data, header_rows):
             result['header_cells'].pop()
             break
     result['header_cells_omitted'] = len(headers) - len(result['header_cells'])
+
+    # Region discovery: merge rectangles extend occupancy so a merged group
+    # heading keeps its visible width, but only the bounded scan window is used.
+    parsed_merges = _merge_rectangles(merges)
+    expanded = {row: set(columns) for row, columns in occupied.items()}
+    for item in parsed_merges:
+        top, bottom, left, right = item['box']
+        if top > bottom or left > right:
+            continue
+        for row in range(top, bottom + 1):
+            expanded.setdefault(row, set()).update(range(left, right + 1))
+    tiles = _tiles(expanded)
+    regions_truncated = len(tiles) > _MAX_REGIONS
+    tiles = tiles[:_MAX_REGIONS]
+    hidden = sheet.sheet_state != 'visible'
+    regions = _regions(sheet, tiles, values_by_row, formulas_by_row, parsed_merges,
+                       header_rows, hidden)
+    # Keep the additive view bounded as well: legacy header cells are already
+    # trimmed, so the region list may not grow the response without limit.
+    kept = []
+    for region in regions:
+        if _size({**result, 'regions': kept + [region]}) > _MAX_LAYOUT_BYTES:
+            regions_truncated = True
+            break
+        kept.append(region)
+    regions = kept
+    total_formulas = [f'{_column_letter(column)}{row}'
+                      for row, columns in sorted(formulas_by_row.items())
+                      for column in sorted(columns)]
+    formula_cells = total_formulas[:_MAX_FORMULA_CELLS]
+    hidden_names = [item.title for item in workbook.worksheets if item.sheet_state != 'visible']
+    limitations = ['scan_window_limited']
+    if regions_truncated:
+        limitations.append('regions_truncated')
+    if merges_truncated:
+        limitations.append('merged_ranges_truncated')
+    if len(workbook.worksheets) > 40:
+        limitations.append('sheet_layout_truncated')
+    if len(hidden_names) > _MAX_HIDDEN_SHEETS:
+        limitations.append('hidden_sheet_list_truncated')
+    if len(total_formulas) > len(formula_cells):
+        limitations.append('formula_cells_truncated')
+    if any(type(row) is not int or row < 1 or row > _SCAN_ROWS for row in header_rows):
+        limitations.append('header_rows_outside_scan')
+    for region in regions:
+        for code in region['limitations']:
+            if code not in limitations:
+                limitations.append(code)
+    if not regions:
+        region_layout = 'none'
+    else:
+        kinds = {region['separation'] for region in regions}
+        if 'grid' in kinds or {'horizontal', 'vertical'} <= kinds:
+            region_layout = 'grid'
+        elif 'horizontal' in kinds:
+            region_layout = 'horizontal'
+        elif 'vertical' in kinds:
+            region_layout = 'vertical'
+        else:
+            region_layout = 'single'
+    result.update(
+        regions=regions,
+        region_count=len(regions),
+        regions_truncated=regions_truncated,
+        region_layout=region_layout,
+        limitations=limitations,
+        detection={'method': 'blank_row_and_column_partition',
+                   'scan_rows': scan_rows, 'scan_columns': scan_columns,
+                   'max_regions': _MAX_REGIONS,
+                   'max_layout_bytes': _MAX_LAYOUT_BYTES,
+                   'formula_scan': 'scan_window_only',
+                   'notes': {code: _LIMITATION_NOTES.get(code, code) for code in limitations}},
+        formula_cells=formula_cells,
+        formula_cells_truncated=len(total_formulas) > len(formula_cells),
+        hidden_sheets=hidden_names[:_MAX_HIDDEN_SHEETS],
+        hidden_sheet_count=len(hidden_names),
+        sheet_visibility=sheet.sheet_state,
+        sheet_layout_truncated=len(workbook.worksheets) > 40,
+    )
     return result
 
 
@@ -167,3 +494,24 @@ def inspect_workbook(data, name, *, sheet_name, header_rows, mode, cell_range, p
         result = (_layout(workbook, sheet, data, header_rows) if mode == 'layout'
                   else _cells(sheet, cell_range, page_rows, cursor, digest))
     return {'name': name, 'inspection': mode, 'source_sha256': digest, **result}
+
+
+def discover_regions(data, name, *, sheet_name='', header_rows=None):
+    """Return only the additive multi-region discovery view of a workbook.
+
+    Existing callers keep using ``inspect_workbook``; this helper is the stable
+    entry point for region-aware integration.
+    """
+    result = inspect_workbook(data, name, sheet_name=sheet_name,
+                              header_rows=([1] if header_rows is None
+                                           else sorted(set(header_rows))),
+                              mode='layout', cell_range='', page_rows=10, cursor='')
+    return {'name': result['name'], 'sheet': result['sheet'],
+            'sheet_visibility': result['sheet_visibility'],
+            'source_sha256': result['source_sha256'],
+            'region_count': result['region_count'],
+            'regions_truncated': result['regions_truncated'],
+            'region_layout': result['region_layout'],
+            'regions': result['regions'],
+            'limitations': result['limitations'],
+            'detection': result['detection']}

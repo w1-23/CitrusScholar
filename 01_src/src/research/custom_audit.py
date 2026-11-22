@@ -41,30 +41,76 @@ def _source_refs(value, inputs):
     return refs
 
 
+_CELL_FIELDS = {"file_id", "sheet", "row", "column", "region_id", "region_bounds"}
+
+
+def _cell_region(cell):
+    return cell.get("region_id") or cell.get("region_bounds") or ""
+
+
+def _resolve_snapshot(fid, sheet, region, snapshots):
+    """Resolve a whole-sheet snapshot or one explicit region identity.
+
+    Existing callers keep using ``(file_id, sheet)``. When several logical
+    regions share a sheet, cells must name one; an unqualified cell that
+    matches multiple regions is rejected instead of guessed.
+    """
+    if region:
+        key = (fid, sheet, region)
+        if key in snapshots:
+            return snapshots[key]
+        for candidate, value in snapshots.items():
+            if (isinstance(candidate, tuple) and len(candidate) >= 3
+                    and candidate[0] == fid and candidate[1] == sheet
+                    and getattr(value, "region_bounds", "") == region):
+                return value
+        raise ValueError("custom_audit_source_not_selected")
+    table = snapshots.get((fid, sheet))
+    if table is not None:
+        return table
+    matches = [(key, value) for key, value in snapshots.items()
+               if isinstance(key, tuple) and len(key) >= 3
+               and key[0] == fid and key[1] == sheet]
+    identities = {str(key[2]) for key, _ in matches}
+    if len(identities) == 1:
+        return matches[0][1]
+    if len(identities) > 1:
+        raise ValueError("custom_audit_region_ambiguous")
+    raise ValueError("custom_audit_source_not_selected")
+
+
 def _verified_locations(cells, refs, snapshots):
     if not isinstance(cells, list) or not 1 <= len(cells) <= MAX_CELLS:
         raise ValueError("custom_audit_cells_invalid")
-    coordinates = defaultdict(list)
+    coordinates, resolved = defaultdict(list), {}
     for cell in cells:
-        if (not isinstance(cell, dict) or set(cell) != {"file_id", "sheet", "row", "column"}
+        if (not isinstance(cell, dict) or not {"file_id", "sheet", "row", "column"} <= set(cell)
+                or set(cell) - _CELL_FIELDS
                 or not isinstance(cell["file_id"], str) or not isinstance(cell["sheet"], str)
-                or type(cell["row"]) is not int or type(cell["column"]) is not int):
+                or type(cell["row"]) is not int or type(cell["column"]) is not int
+                or any(key in cell and (not isinstance(cell[key], str) or not cell[key].strip()
+                                        or len(cell[key]) > 250)
+                       for key in ("region_id", "region_bounds"))):
             raise ValueError("custom_audit_cells_invalid")
         fid, sheet = cell["file_id"], cell["sheet"]
-        table = snapshots.get((fid, sheet))
-        if table is None or refs.get(fid) != table.source_sha256:
+        table = _resolve_snapshot(fid, sheet, _cell_region(cell), snapshots)
+        if refs.get(fid) != table.source_sha256:
             raise ValueError("custom_audit_source_not_selected")
         try:
             row = table.row_numbers.index(cell["row"])
             column = table.column_numbers.index(cell["column"])
         except ValueError:
             raise ValueError("custom_audit_coordinates_not_covered") from None
-        if column not in coordinates[fid, sheet, row]:
-            coordinates[fid, sheet, row].append(column)
-    if {fid for fid, _, _ in coordinates} != refs.keys():
+        identity = table.region_id or table.region_bounds or ""
+        resolved[fid, sheet, identity] = table
+        key = (fid, sheet, identity, row)
+        if column not in coordinates[key]:
+            coordinates[key].append(column)
+    if {fid for fid, _, _, _ in coordinates} != refs.keys():
         raise ValueError("custom_audit_source_refs_not_located")
-    return [{**_location(snapshots[fid, sheet], [row], sorted(columns)), "file_id": fid}
-            for (fid, sheet, row), columns in sorted(coordinates.items())]
+    return [{**_location(resolved[fid, sheet, identity], [row], sorted(columns)),
+             "file_id": fid}
+            for (fid, sheet, identity, row), columns in sorted(coordinates.items())]
 
 
 def _validate_coverage(coverage):

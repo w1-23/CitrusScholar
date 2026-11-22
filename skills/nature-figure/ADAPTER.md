@@ -38,3 +38,40 @@ Each check separately reports `executed=not_run|attempted|executed` and `conclus
 `render_figure(spec=..., tables=...)` retains host spec parsing, aligned rows, error definitions and chart rendering. `render_figure(source=..., data=..., parameters=...)` handles arbitrary Matplotlib plots without template selection. `revise_figure` reuses an existing FigureSession; `write_bundle` exports and audits one final PDF. `load_spec_bundle` rebuilds from resolved numbers and reapplies styles without statistical recomputation. Arbitrary source reopening does not deserialize pickles or execute source; use the original in-memory session for frozen style revisions, or explicitly authorize a new initial render.
 
 The library handles computation and local file bundles only. Ownership, leases, sandboxing, cancellation, deadlines, execution budgets, publication, project history and UI/API behavior remain host responsibilities. The old worker receipt validator remains as `nature_receipts.validate_nature_receipt` for explicitly versioned legacy integrations; it does not accept or impersonate the new receipt schema.
+
+## Hosted script Worker
+
+For the hosted figure tool, `inputs_json` binds authorized files to names. A v2 `outputs_json` may opt into `input_contract` v1. The Worker exposes the original files named in `raw` as `Path` objects and the declared `tables` as DataFrames. CSV, TSV, Excel (including named sheets) and frozen datasets have explicit formats. With no input contract the original file names still bind to `Path` objects.
+
+For example, bind `csv_file` to a CSV with columns `time` and `signal`, and `workbook` to an XLSX whose `runs` sheet has the same columns. Declare the analysis and renderer together in `outputs_json`:
+
+```json
+{
+  "version": 2,
+  "input_contract": {
+    "version": 1,
+    "raw": ["csv_file"],
+    "tables": [
+      {"name": "csv_rows", "input": "csv_file", "format": "csv"},
+      {"name": "excel_rows", "input": "workbook", "format": "excel", "sheet": "runs"}
+    ],
+    "render": {"measurements": "joined"}
+  },
+  "tables": [{"name": "joined", "parents": ["csv_file", "workbook"]}],
+  "figures": [{"name": "panel", "formats": ["svg"], "parents": ["joined"], "render_script": "frame = data['measurements']\nfig, ax = plt.subplots(figsize=(3.5, 2.8))\nax.scatter(frame['time'], frame['signal'], s=8)\nax.set(xlabel='Time', ylabel='Signal')\nfig.subplots_adjust(left=0.23, bottom=0.23)"}]
+}
+```
+
+The analysis script reads only its declared bindings. For this example, concatenate the two tables and preserve their sources:
+
+```python
+import pandas as pd
+
+joined = pd.concat([
+    csv_rows.assign(source="csv"),
+    excel_rows.assign(source="excel"),
+], ignore_index=True)
+emit.table("joined", joined, parents=["csv_file", "workbook"])
+```
+
+Use original `inputs_json` binding names for input parents. A renderer receives only the frozen parent DataFrames under its `data` keys. It leaves one Figure and does not call `emit`. A composition can name multiple emitted parent tables and select each by its own key. Subsequent style-only edits use that renderer and the frozen data, and compare the numerical receipt before accepting the edit. Recompute the analysis when the underlying data change. Review actual final-file QA statuses separately from successful execution and preserve the source, data hashes, and QA in the reproduction package.

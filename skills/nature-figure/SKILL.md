@@ -1,7 +1,7 @@
 ---
 name: nature-figure
 description: Create, revise, package and audit scientific Matplotlib figures using explicit data and final artifact bytes. Apply pinned Nature figure guidance with honest per-check coverage, reproducible source/data bundles and frozen style edits.
-version: 2.1.0
+version: 2.1.1
 ---
 
 # Scientific figure workflow
@@ -22,3 +22,5 @@ For the application workflow, see [figure methods](references/figure-methods.md)
 All CLI observations are one JSON object on stdout; diagnostics go to stderr. `status=incomplete` is successful observation delivery with coverage gaps, not successful scientific verification. Read `coverage` and the receipt; process exit alone is insufficient.
 
 The vendored snapshot is the fixed 44-file upstream set (40 core files plus four pinned execution peripherals) at commit `7bff1d0`; a separately supplied user ZIP is a different upstream snapshot (8 of 39 same-named files differ) and is not packaged. Python paths are the `citrus_figures` library and the `scripts/citrus/` adapters. R execution and OpenRouter image generation are disabled and never invoked by the service; image-generation networks, private templates, gallery images, and external models are not automatically enabled. Keep acquisition, local execution authorization and network authorization distinct. Consult the [resource bridge](references/bridge.md), [release scope](RELEASE.md) and [vendor provenance](vendor/nature-skills/provenance.json). Do not claim a complete upstream repository or availability of excluded assets.
+
+CitrusScholar 托管绘图统一交付 SVG。Excel/CSV 分析、冻结表和独立渲染示例见 [ADAPTER.md](ADAPTER.md)。

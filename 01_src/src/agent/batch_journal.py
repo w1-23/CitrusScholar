@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import math
+import sqlite3
 import time
 from typing import Awaitable, Callable
 
@@ -19,6 +22,7 @@ from .runtime import BatchObservation, validate_execution_waits
 
 # A checkpoint must stay bounded. Reject, rather than silently trim a published
 # observation; the host's full-result references remain the source of truth.
+logger = logging.getLogger(__name__)
 MAX_BATCH_BYTES = 1024 * 1024
 _MESSAGE_FIELDS = frozenset({"content", "tool_call_id", "name", "id", "status",
                              "artifact", "additional_kwargs", "response_metadata"})
@@ -32,11 +36,34 @@ class RecoveryRequiresReconciliation(task_events.TaskConflict):
         super().__init__(self.reason)
 
 
+class BatchObservationNotStored(task_events.TaskConflict):
+    """Effects are not retried when their model observation cannot be saved."""
+
+    def __init__(self, *, effects_uncertain):
+        self.reason = "batch_observation_not_stored"
+        self.effects_uncertain = effects_uncertain
+        super().__init__(self.reason)
+
+
+class _EncodingError(ValueError):
+    pass
+
+
+def _report_failure(stage, reason, count):
+    # reason is supplied by local encoders, never by tool payloads or sqlite.
+    logger.warning("batch_journal_failed stage=%s reason=%s call_count=%s",
+                   stage, reason, count)
+
+
 def _json(value):
     # No default encoder, model dumping, pickle, or import-based revival. Reject
     # objects (including private provider messages) even inside tool artifacts.
     def check(item):
-        if item is None or type(item) in (str, int, float, bool):
+        if item is None or type(item) in (str, int, bool):
+            return
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise _EncodingError("batch_non_finite_number")
             return
         # Product operation receipts contain immutable artifact sequences.
         # JSON preserves their ordered values as arrays; never revive classes.
@@ -90,7 +117,10 @@ def _validate(batch, calls):
 
 
 def _encode(batch, calls):
-    _validate(batch, calls)
+    try:
+        _validate(batch, calls)
+    except (ValueError, TypeError) as exc:
+        raise _EncodingError("batch_observation_contract_invalid") from exc
     data = {"version": 2 if batch.execution_waits else 1, "messages": [
         {key: getattr(message, key) for key in _MESSAGE_FIELDS}
         for message in batch.messages],
@@ -99,9 +129,17 @@ def _encode(batch, calls):
         "context_notes": list(batch.context_notes)}
     if batch.execution_waits:
         data["execution_waits"] = list(batch.execution_waits)
-    encoded = _json(data)
-    if len(encoded.encode("utf-8")) > MAX_BATCH_BYTES:
-        raise ValueError("batch_observation_exceeds_checkpoint_limit")
+    try:
+        encoded = _json(data)
+        encoded_size = len(encoded.encode("utf-8"))
+    except _EncodingError:
+        raise
+    except UnicodeError as exc:
+        raise _EncodingError("batch_observation_invalid_text") from exc
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise _EncodingError("batch_observation_not_json") from exc
+    if encoded_size > MAX_BATCH_BYTES:
+        raise _EncodingError("batch_observation_exceeds_checkpoint_limit")
     return encoded
 
 
@@ -131,8 +169,9 @@ def _decode(encoded, calls):
             execution_waits=tuple(data.get("execution_waits", ())))
         _encode(batch, calls)  # Recheck schema, JSON types, size and pairing.
         return batch
-    except (ValueError, TypeError, KeyError, AttributeError) as exc:
-        raise RecoveryRequiresReconciliation() from exc
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        _report_failure("read", "batch_observation_invalid", len(calls))
+        raise RecoveryRequiresReconciliation() from None
 
 
 class BatchJournal:
@@ -191,13 +230,23 @@ class BatchJournal:
         # Intent is committed and the connection is closed before this await.
         # Any exception/cancellation leaves intent untouched and propagates.
         batch = await execute(response, identity)
-        encoded = _encode(batch, calls)
-        with task_events.transaction() as conn:
-            self._authorize(conn)
-            changed = conn.execute(
-                "UPDATE agent_batch_journal SET status='complete',observation=?,completed_at=? "
-                "WHERE run_id=? AND batch_digest=? AND status='intent'",
-                (encoded, time.time(), identity.run_id, digest)).rowcount
-            if changed != 1:
-                raise RecoveryRequiresReconciliation()
+        try:
+            encoded = _encode(batch, calls)
+        except _EncodingError as exc:
+            reason = exc.args[0]
+            _report_failure("encode", reason, len(calls))
+            raise BatchObservationNotStored(effects_uncertain=(
+                reason == "batch_observation_contract_invalid" or bool(batch.unknown_operations))) from None
+        try:
+            with task_events.transaction() as conn:
+                self._authorize(conn)
+                changed = conn.execute(
+                    "UPDATE agent_batch_journal SET status='complete',observation=?,completed_at=? "
+                    "WHERE run_id=? AND batch_digest=? AND status='intent'",
+                    (encoded, time.time(), identity.run_id, digest)).rowcount
+                if changed != 1:
+                    raise RecoveryRequiresReconciliation()
+        except sqlite3.Error:
+            _report_failure("commit", "batch_observation_commit_unconfirmed", len(calls))
+            raise BatchObservationNotStored(effects_uncertain=bool(batch.unknown_operations)) from None
         return batch

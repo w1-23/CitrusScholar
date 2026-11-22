@@ -33,6 +33,7 @@ from citrus_figures.core import (
     compile_spec as _package_compile_spec,
     ScriptResult,
     capture_figure,
+    script_error_line,
 )
 
 
@@ -70,6 +71,8 @@ class ScriptOutputsResult:
     stdout: str = ""
     error: str = ""
     error_type: str = ""
+    error_stage: str = "analysis"
+    script_line: int | None = None
 
 
 class _OutputEmitter:
@@ -106,6 +109,10 @@ class _OutputEmitter:
         if "render_script" in entry:
             raise ValueError("emit.figure cannot emit a separated render_script target.")
         if not self.output_key or self.output_key == name:
+            from matplotlib.figure import Figure
+            if isinstance(fig, Figure) and not callable(getattr(fig.canvas, "get_renderer", None)):
+                from matplotlib.backends.backend_agg import FigureCanvasAgg
+                FigureCanvasAgg(fig)
             self.result.figures[name] = fig
 
     def report(self, value: Any) -> None:
@@ -119,12 +126,16 @@ class _OutputEmitter:
 def capture_outputs(script: str, *, output_contract: dict,
                     namespace: dict[str, Any] | None = None,
                     output_key: str = "",
-                    frozen_tables: dict[str, Any] | None = None) -> ScriptOutputsResult:
+                    frozen_tables: dict[str, Any] | None = None,
+                    render_mapping: dict[str, str] | None = None) -> ScriptOutputsResult:
     """Execute only in the sandbox worker; this function provides no isolation.
 
     Unlike legacy capture, explicit v2 emission accepts zero pyplot figures,
     closed figures and Figure objects created without pyplot. A failed script
     publishes no objects, even if it called emit before raising/SystemExit.
+
+    ``render_mapping`` optionally maps each renderer ``data`` name to a
+    declared table name; ``None`` keeps the legacy parent-keyed mapping.
     """
     import matplotlib
     matplotlib.use("Agg", force=True)
@@ -147,6 +158,13 @@ def capture_outputs(script: str, *, output_contract: dict,
             raise ValueError("Frozen replay inputs must exactly match the target table parents.")
     elif frozen_tables is not None:
         raise ValueError("Frozen inputs are only accepted for a separated target replay.")
+    if render_mapping is not None:
+        if not render_entries:
+            raise ValueError("Render input mapping requires a separated figure.")
+        if (not isinstance(render_mapping, dict) or not render_mapping
+                or not all(isinstance(key, str) and key for key in render_mapping)
+                or not all(isinstance(value, str) and value for value in render_mapping.values())):
+            raise ValueError("Render input mapping must map names to table names.")
     apply_base_rcparams(font_size=7.0, font_stack_values=font_stack(script))
     plt.close("all")
     result = ScriptOutputsResult()
@@ -165,6 +183,7 @@ def capture_outputs(script: str, *, output_contract: dict,
             else:
                 exec(compile(script, "<citrusfig>", "exec"), scope)  # noqa: S102 - sandbox only
         if render_entries:
+            result.error_stage = "render"
             from src.figures.dataset_codec import encode_frame, decode_frame
             from src.figures.frozen_render import render_receipt
             from src.figures.worker import _guard_imports
@@ -178,12 +197,17 @@ def capture_outputs(script: str, *, output_contract: dict,
                 if missing:
                     raise ValueError("Missing frozen output tables: " + ", ".join(sorted(missing)))
                 payloads = {name: encode_frame(tables[name]) for name in entry["parents"]}
-                data = {name: decode_frame(payload) for name, payload in payloads.items()}
+                mapping = render_mapping or {name: name for name in payloads}
+                local_mapping = {key: name for key, name in mapping.items() if name in payloads}
+                if set(local_mapping.values()) != set(payloads) or len(local_mapping) != len(payloads):
+                    raise ValueError("Render input mapping must cover the figure parents.")
+                data = {key: decode_frame(payloads[name]) for key, name in local_mapping.items()}
                 # Fresh globals and default rcParams: neither analysis locals nor
                 # its filesystem bindings/style state are supplied to rendering.
                 with matplotlib.rc_context(rc=matplotlib.rcParamsDefault):
                     captured = capture_figure(source, namespace={"data": data}, check_layout=False)
                     stdout.write(captured.stdout)
+                    result.script_line = captured.script_line
                     if captured.error and classify_render_script_error(captured.error):
                         # Dynamic code (eval/exec/format) can hide an emit call
                         # from the static precheck; classify the real missing
@@ -196,6 +220,7 @@ def capture_outputs(script: str, *, output_contract: dict,
                         source, payloads, captured.figure)
                     result.figures[entry["name"]] = captured.figure
     except BaseException as exc:
+        result.script_line = result.script_line or script_error_line(exc)
         result.tables.clear()
         result.figures.clear()
         result.frozen_render_receipts.clear()

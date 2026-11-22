@@ -515,8 +515,15 @@ def _build_resolved_figure(resolved: ResolvedFigure, *, rendered=None, ax=None,
             raise SpecError("empty_data", "直方图没有可用的数值。")
         if resolved.scientific_geometry:
             geometry = resolved.scientific_geometry
-            patches = ax.bar(geometry['edges'][:-1], geometry['counts'],
-                             width=np.diff(geometry['edges']), align='edge',
+            # Match Axes.hist's own placement instead of approximating it:
+            # hist draws centers = edges[:-1] + 0.5*width with align="center".
+            # Edge-aligned bars differ by one float ulp, changing patches and
+            # autoscaled tick readability.
+            edges = np.asarray(geometry['edges'], dtype=float)
+            widths = np.diff(edges)
+            centers = edges[:-1] + 0.5 * widths
+            patches = ax.bar(centers, np.asarray(geometry['counts'], dtype=float),
+                             width=widths, align='center',
                              color=colours[0], edgecolor='white', linewidth=0.5).patches
         else:
             _, _, patches = ax.hist(y_values, bins=20, color=colours[0], edgecolor="white",
@@ -777,6 +784,20 @@ class ScriptResult:
     error_type: str = ""
     stdout: str = ""
     figures_seen: int = 0
+    script_line: int | None = None
+
+
+def script_error_line(error: BaseException) -> int | None:
+    """Return the innermost known user-script line without copying traceback text."""
+    if isinstance(error, SyntaxError) and error.filename == "<citrusfig>":
+        return error.lineno
+    trace = error.__traceback__
+    line = None
+    while trace is not None:
+        if trace.tb_frame.f_code.co_filename == "<citrusfig>":
+            line = trace.tb_lineno
+        trace = trace.tb_next
+    return line
 
 
 def capture_figure(script: str, *, namespace: dict[str, Any] | None = None,
@@ -831,6 +852,9 @@ def capture_figure(script: str, *, namespace: dict[str, Any] | None = None,
         result.figures_seen = len(figures)
         if figures:
             result.figure = figures[-1]
+            if not callable(getattr(result.figure.canvas, "get_renderer", None)):
+                from matplotlib.backends.backend_agg import FigureCanvasAgg
+                FigureCanvasAgg(result.figure)
             if check_layout:
                 from citrus_figures.styling import prepare_figure_fonts
                 prepare_figure_fonts(result.figure)
@@ -850,6 +874,7 @@ def capture_figure(script: str, *, namespace: dict[str, Any] | None = None,
         result.stdout = stdout.getvalue()
         result.error = f"{type(exc).__name__}: {exc}"
         result.error_type = "script_error"
+        result.script_line = script_error_line(exc)
     finally:
         sys.stdout = original_stdout
         plt.show = previous_show

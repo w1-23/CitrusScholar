@@ -75,6 +75,12 @@ def _snapshot(status: str, *, reason: str = "", families=(), error: str = "",
 
 
 def _response(snapshot: dict, notice: str = "") -> dict:
+    from src.core.public_progress import emit_retrieval_stage
+    status = snapshot.get("status")
+    if status in {STATUS_READY, STATUS_ZERO_HIT}:
+        emit_retrieval_stage("local_prefetch_finished")
+    elif status == STATUS_TRANSLATION_ERROR:
+        emit_retrieval_stage("local_prefetch_rewrite_failed")
     return {
         "candidate_pool": snapshot,
         "candidate_pool_notice": notice,
@@ -289,9 +295,9 @@ async def _prefetch(state: AgentState) -> dict:
         if not families:
             return _response(_snapshot(STATUS_NO_FAMILY, reason="no_matching_family"))
 
-        # Re-evaluate with the translated family match. The router may now say
-        # "fusion" instead of "web"; a time-sensitive web query still skips local
-        # prefetch because stale corpus evidence is not what the user asked for.
+        # Re-evaluate with the translated family match. For current questions
+        # local matches can still supply background candidates; verification
+        # of freshness belongs to the Agent and its network evidence.
         decision = decide_retrieval(
             query, scope,
             has_history_evidence=bool(state.get("history_evidence_block")),
@@ -302,14 +308,6 @@ async def _prefetch(state: AgentState) -> dict:
                 "no_retrieval_or_social", "transformation_from_context",
                 "memory_write_only", "recent_evidence_reuse"}:
             return _response(_snapshot(STATUS_SKIPPED, reason=decision.reason_code))
-        if (decision.mode == "web" and scope not in {"local", "fusion"}
-                and decision.reason_code != "explicit_search"):
-            # A time-sensitive / latest web query should not be answered from a
-            # stale corpus prefetch. A generic "检索一下…" is different: the user
-            # asked for search, not specifically for the web, so local prefetch is
-            # still useful and the model can combine both sources.
-            return _response(_snapshot(STATUS_SKIPPED, reason="time_sensitive_web"))
-
         artifact = await run_before_deadline(
             _run_search, normalized, sorted(families),
             max(1, int(getattr(settings, "CANDIDATE_POOL_SIZE", 12) or 12)))

@@ -70,25 +70,28 @@ def read_skill(skill_id: str, version: str, sha256: str, resource: str = "",
 
 @tool(args_schema=SkillLoad, response_format="content_and_artifact")
 def load_skill(skill_id: str, version: str, sha256: str):
-    """Load a selected installed method and all required resources/dependencies.
+    """Open a selected installed method and discover its resources.
 
-    Use the exact catalog identity. Method documents are returned without loading
-    the full vendor tree. Partial or missing reads never gate tools. Loading is
-    guidance only and cannot execute or authorize domain tools. Use read_skill
-    for optional manifest resources. Failures are local and explicitly not_run.
+    Use the exact catalog identity. Installed research skills return the first
+    entrypoint page and an index of method resources. Use read_skill to continue
+    the entrypoint or read one listed resource. Archived workflows retain their
+    original loading behavior. Partial or missing reads never gate tools.
     """
     session = _current_session()
     try:
-        payload = session.load([{"id": skill_id, "version": version, "sha256": sha256}])
+        payload = session.load([{"id": skill_id, "version": version, "sha256": sha256}], entry_only=True)
     except (ValueError, KeyError, TypeError, OSError) as exc:
         return _failure(exc)
     return _encode(payload), {"_tool_outcome": {"status": "complete", "reason_code": "skill_loaded"}}
 
 
 def _failure(exc):
-    outcome = {"status": "not_run", "reason_code": "skill_resource_unavailable"}
-    return _encode({"error": str(exc), "error_type": type(exc).__name__,
-                    "_tool_outcome": outcome}), {"_tool_outcome": outcome}
+    reason = ("skill_resource_missing" if str(exc) == "skill_resource_missing"
+              else "skill_resource_unavailable")
+    outcome = {"status": "not_run", "reason_code": reason}
+    import logging
+    logging.getLogger(__name__).debug("Skill resource unavailable", exc_info=exc)
+    return _encode({"error": reason, "_tool_outcome": outcome}), {"_tool_outcome": outcome}
 
 
 def _register(reader):

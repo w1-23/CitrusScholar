@@ -6,12 +6,16 @@ import logging
 import re
 import zipfile
 import xml.etree.ElementTree as ET
+from contextlib import closing
 from pathlib import Path
 logger=logging.getLogger(__name__)
 _MAX_TABLE_ROWS=100000
 _MAX_TABLE_COLUMNS=200
 _MAX_TABLE_CELLS=2000000
 _MAX_EXTRACTED_TABLES=500
+_MAX_XLSX_ROWS=1_048_576
+_MAX_XLSX_COLUMNS=16_384
+_ABSOLUTE_BOUNDS=re.compile(r"[A-Z]{1,3}[1-9][0-9]{0,6}:[A-Z]{1,3}[1-9][0-9]{0,6}")
 
 def _header_cell_text(value: Any) -> str:
     return "" if value is None else str(value).strip()
@@ -73,7 +77,9 @@ def _resolve_headers(raw_rows: list[list[Any]], header_rows: list[int],
         row = raw_rows[row_no - 1] if 0 < row_no <= len(raw_rows) else []
         values = [_header_cell_text(v) for v in row]
         values = (values + [""] * width)[:width]
-        if sum(bool(v) for v in values) <= 1:  # 单标题/日期说明行，不是字段头
+        populated = sum(bool(v) for v in values)
+        # 多列表头要求至少两个字段；单列区域不能用列数阈值丢弃显式表头。
+        if (width > 1 and populated <= 1) or (width == 1 and not populated):
             continue
         # Excel 的合并表头只在最左格保存可见值：向右补齐，保证每列都带分组名。
         filled: list[str] = []
@@ -541,6 +547,207 @@ def _load_frame_from_bytes(data: bytes, name: str = "table", sheet_name: str = "
     meta['source_rows_exact'] = not meta.get('truncated', False)
     meta['formula_evaluation'] = 'cached_values_only_no_recalculation' if suffix in {'.xlsx', '.xlsm', '.xls', '.xlsb'} else 'not_applicable'
     return frame, meta
+
+def _region_box(bounds):
+    from openpyxl.utils.cell import range_boundaries
+    if not isinstance(bounds, str):
+        raise ValueError("区域范围必须是不含 $ 的绝对 A1 范围，例如 D5:F40")
+    normalized = bounds.strip().upper()
+    if not _ABSOLUTE_BOUNDS.fullmatch(normalized):
+        raise ValueError("区域范围必须是不含 $ 的绝对 A1 范围，例如 D5:F40")
+    left, top, right, bottom = range_boundaries(normalized)
+    if (None in (left, top, right, bottom)
+            or not 1 <= left <= right <= _MAX_XLSX_COLUMNS
+            or not 1 <= top <= bottom <= _MAX_XLSX_ROWS):
+        raise ValueError("区域范围超出工作表坐标上限")
+    return left, top, right, bottom
+
+
+def _a1(left, top, right, bottom):
+    from openpyxl.utils import get_column_letter
+    return f"{get_column_letter(left)}{top}:{get_column_letter(right)}{bottom}"
+
+
+def _region_header_rows(header_rows, top, bottom):
+    if header_rows is None:
+        raise ValueError("显式区域必须指定绝对表头行，例如 [4,5]")
+    raw = list(header_rows)
+    if not raw or any(type(row) is not int for row in raw):
+        raise ValueError("区域表头行必须是非空整数数组")
+    if len(set(raw)) != len(raw):
+        raise ValueError("区域表头行必须唯一")
+    rows = sorted(raw)
+    if rows[0] < top or rows[-1] >= bottom:
+        raise ValueError("区域表头行必须位于区域内且至少保留一行数据")
+    return rows
+
+
+def normalize_regions(regions, *, default_sheet='', limit=20):
+    """Validate explicit absolute rectangles and reject overlaps.
+
+    Regions on the same sheet must not overlap; distinct rectangles keep
+    distinct identities. A region without ``region_id`` is identified by its
+    absolute bounds at read time.
+    """
+    if not isinstance(regions, (list, tuple)) or not 1 <= len(regions) <= limit:
+        raise ValueError(f"区域选择必须包含 1 到 {limit} 个显式区域")
+    normalized, boxes, identifiers = [], {}, set()
+    for item in regions:
+        if not isinstance(item, dict):
+            raise ValueError("每个区域必须是对象")
+        unknown = set(item) - {'file_index', 'sheet', 'bounds', 'header_rows', 'region_id'}
+        if unknown:
+            raise ValueError(f"区域配置包含未知字段：{sorted(unknown)}")
+        if 'file_index' in item and (type(item['file_index']) is not int or item['file_index'] < 0):
+            raise ValueError("区域 file_index 必须是非负整数")
+        sheet = item.get('sheet') or default_sheet or ''
+        if not isinstance(sheet, str) or len(sheet) > 250:
+            raise ValueError("区域工作表名无效")
+        left, top, right, bottom = _region_box(item.get('bounds'))
+        rows = _region_header_rows(item.get('header_rows'), top, bottom)
+        region_id = item.get('region_id') or ''
+        if not isinstance(region_id, str) or len(region_id) > 160:
+            raise ValueError("区域ID必须是不超过160字符的字符串")
+        if region_id:
+            if region_id in identifiers:
+                raise ValueError("区域ID必须唯一")
+            identifiers.add(region_id)
+        box = (left, top, right, bottom)
+        for other in boxes.get(sheet, ()):
+            if (max(left, other[0]) <= min(right, other[2])
+                    and max(top, other[1]) <= min(bottom, other[3])):
+                raise ValueError("同一工作表的显式区域不能重叠")
+        boxes.setdefault(sheet, []).append(box)
+        normalized.append({**item, 'sheet': sheet, 'bounds': _a1(*box),
+                           'header_rows': rows, 'region_id': region_id})
+    return normalized
+
+
+def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id=''):
+    """Read one explicit absolute XLSX rectangle with true source coordinates.
+
+    ``bounds`` and ``header_rows`` are absolute 1-based sheet coordinates.
+    Data rows are every row below the last header row; rows above the first
+    supplied header row are reported as title rows and never become data.
+    Columns keep their original Excel numbers (D=4), and header rows may be
+    late (not near the top) under the existing workbook budgets.
+    """
+    if not isinstance(data, bytes) or not data or len(data) > 30 * 1024 * 1024:
+        raise ValueError('Source exceeds 30 MiB byte budget')
+    suffix = Path(name).suffix.lower()
+    if suffix not in {'.xlsx', '.xlsm'}:
+        raise ValueError("显式区域读取仅支持 XLSX/XLSM 原始坐标")
+    left, top, right, bottom = _region_box(bounds)
+    width = right - left + 1
+    if width > _MAX_TABLE_COLUMNS:
+        raise ValueError(f"区域列数 {width} 超过限制 {_MAX_TABLE_COLUMNS}")
+    total_rows = bottom - top + 1
+    if total_rows * width > _MAX_TABLE_CELLS:
+        raise ValueError(f"区域单元格数 {total_rows * width:,} 超过限制 {_MAX_TABLE_CELLS:,}")
+    rows = _region_header_rows(header_rows, top, bottom)
+    data_row_count = bottom - max(rows)
+    if data_row_count > _MAX_TABLE_ROWS:
+        raise ValueError(f"区域数据行数 {data_row_count:,} 超过限制 {_MAX_TABLE_ROWS:,}")
+    normalized = _a1(left, top, right, bottom)
+    import hashlib
+    from .envelope import TableEnvelope
+    from .integrity import _number
+    with closing(open_xlsx_readonly(data, name, data_only=True)) as workbook:
+        names = list(workbook.sheetnames)
+        chosen = sheet_name.strip() or next(
+            (item for item in names if workbook[item].sheet_state == 'visible'), '')
+        if chosen not in names:
+            raise ValueError(_missing_sheet_message(chosen, names))
+        worksheet = workbook[chosen]
+        visibility = worksheet.sheet_state
+        worksheet.reset_dimensions()
+        raw = []
+        for values in worksheet.iter_rows(min_row=top, max_row=bottom, min_col=left,
+                                          max_col=right, values_only=True):
+            row = list(values if isinstance(values, (list, tuple)) else (values,))
+            raw.append((row + [None] * width)[:width])
+        if len(raw) < total_rows:
+            raw.extend([[None] * width for _ in range(total_rows - len(raw))])
+        raw = raw[:total_rows]
+    relative = [row - top + 1 for row in rows]
+    header, used = _resolve_headers(raw, relative, width)
+    used = sorted(used)
+    absolute_headers = [row + top - 1 for row in used]
+    first_header, header_bottom = min(absolute_headers), max(absolute_headers)
+    values = tuple(tuple(row) for row in raw[header_bottom - top + 1:])
+    row_numbers = tuple(range(header_bottom + 1, bottom + 1))
+    column_numbers = tuple(range(left, right + 1))
+    if not values or len(values) != len(row_numbers) or len(header) != width:
+        raise ValueError("区域解析结果与显式矩形不一致")
+    evidence = []
+    for row, cell_values in zip(row_numbers, values):
+        for column, value in zip(column_numbers, cell_values):
+            if not isinstance(value, str) or len(value) > 256:
+                continue
+            match = re.fullmatch(r'[+-]?(?:[0-9]+(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?',
+                                 value.strip())
+            if match and _number(value)[0] is not None:
+                evidence.append({'row': row, 'column': column, 'raw': value,
+                                 'places': len(match[1] or match[2] or ''),
+                                 'exp': int(match[3] or 0)})
+    by_column = {}
+    for offset, (column, label) in enumerate(zip(column_numbers, header)):
+        actual = sum(_number(row[offset])[0] is not None for row in values)
+        tokens = [item for item in evidence if item['column'] == column]
+        status = ('not_applicable' if not actual else 'preserved' if len(tokens) == actual
+                  else 'partial' if tokens else 'unavailable')
+        by_column[str(label)] = {'status': status, 'numeric_values': actual,
+            'tokens': len(tokens), 'rows': [item['row'] for item in tokens],
+            'reason': 'actual parser tokens only; numeric display format does not establish lexical precision'}
+    identity = (region_id.strip() if isinstance(region_id, str) and region_id.strip()
+                else f"{chosen}!{normalized}")
+    if len(identity) > 160:
+        raise ValueError("区域ID不能超过160字符")
+    data_bounds = _a1(left, header_bottom + 1, right, bottom)
+    header_bounds = _a1(left, first_header, right, header_bottom)
+    title_rows = list(range(top, first_header))
+    detection = 'requested' if absolute_headers == rows else 'auto'
+    limitations = []
+    if detection == 'auto':
+        limitations.append('header_rows_auto_detected')
+    if absolute_headers != list(range(first_header, header_bottom + 1)):
+        limitations.append('noncontiguous_header_rows')
+    if title_rows:
+        limitations.append('rows_before_first_header')
+    provenance = {'bounds': normalized, 'header_bounds': header_bounds,
+                  'data_bounds': data_bounds, 'header_rows': absolute_headers,
+                  'title_rows': title_rows, 'header_detection': detection,
+                  'column_numbers': list(column_numbers), 'sheet_visibility': visibility,
+                  'selection': 'explicit_absolute_rectangle', 'limitations': limitations}
+    meta = {'name': name, 'sheet': chosen, 'sheets': names, 'encoding': suffix[1:],
+            'header_row': header_bottom, 'header_rows': absolute_headers,
+            'header_detection': detection, 'region_id': identity,
+            'region_bounds': normalized, 'title_rows': title_rows,
+            'source_rows': len(row_numbers), 'source_columns': width,
+            'processed_rows': len(row_numbers), 'processed_columns': width,
+            'truncated': False, 'truncation_reasons': [],
+            'lexical_precision_preserved': False,
+            'formula_evaluation': 'cached_values_only_no_recalculation',
+            'source_rows_exact': True, 'region': provenance}
+    return TableEnvelope(columns=tuple(header), values=values, row_numbers=row_numbers,
+        column_numbers=column_numbers, source_sha256=hashlib.sha256(data).hexdigest(),
+        source_name=name, sheet=chosen, header_row=header_bottom,
+        header_rows=tuple(absolute_headers), precision_evidence=tuple(evidence),
+        lexical_coverage={'columns': by_column, 'tokens': len(evidence)},
+        parser_limits={'max_rows': _MAX_TABLE_ROWS, 'max_columns': _MAX_TABLE_COLUMNS,
+                       'max_cells': _MAX_TABLE_CELLS, 'max_bytes': 30 * 1024 * 1024,
+                       'max_extracted_tables': _MAX_EXTRACTED_TABLES},
+        coverage=meta, region_id=identity, region_bounds=normalized,
+        region_separation='single', source_provenance=provenance)
+
+
+def read_regions(data, name, *, regions, sheet_name=''):
+    """Read a bounded set of explicit, non-overlapping absolute regions."""
+    normalized = normalize_regions(regions, default_sheet=sheet_name)
+    return [read_region(data, name, bounds=item['bounds'], header_rows=item['header_rows'],
+                        sheet_name=item['sheet'], region_id=item['region_id'])
+            for item in normalized]
+
 
 
 def read_table(data: bytes, name: str, *, sheet_name='', header_row=1, header_rows=None):

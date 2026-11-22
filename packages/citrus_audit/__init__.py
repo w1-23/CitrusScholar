@@ -2,7 +2,7 @@
 __version__ = '2.0.0'
 from .envelope import TableEnvelope
 from .api import AuditSnapshot, audit_table, review_bytes, export_workbook
-from .readers import read_table, read_tables
+from .readers import read_table, read_tables, read_region, read_regions, normalize_regions
 from .methods import audit_frame, audit_selected_checks, audit_duplicates, audit_group_outliers
 from .data_audit_rules import RULES, describe_rule, rule_manifest
 from .integrity import IntegrityTable, IntegrityConfig, table_from_rows, table_from_frame, audit_numeric_reuse

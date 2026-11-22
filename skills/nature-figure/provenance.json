@@ -1,6 +1,6 @@
 {
   "name": "nature-figure",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "distribution": "citrusscholar-support==2.0.0",
   "package": "citrus_figures",
   "vendor": {
@@ -15,8 +15,8 @@
   "files": [
     {
       "path": "ADAPTER.md",
-      "sha256": "1847f2f9541667b5abe9278a0c620a4d0808c86b6fd4a7644071ffb72de5f09f",
-      "size": 4958
+      "sha256": "c0e708e274a0ac94b45c45b845ab0da396a5376920b92caa14b517e798e73f09",
+      "size": 7228
     },
     {
       "path": "RELEASE.md",
@@ -25,8 +25,8 @@
     },
     {
       "path": "SKILL.md",
-      "sha256": "9cb7b20f075d4178afcfb35b5e10862c2f794f2b72be15d5a187849b59e9a9e0",
-      "size": 5177
+      "sha256": "5fd5fe22b50915995f0ed1dab3e83cdef22be275a6e73270d4950aef3f313a87",
+      "size": 5304
     },
     {
       "path": "provenance.extra.json",
@@ -35,7 +35,7 @@
     },
     {
       "path": "references/bridge.md",
-      "sha256": "20d9aa14ab17374315d3002d8b599ff20919522abce7a6658465326f2c00a1a9",
+      "sha256": "61b89e70eecdbc8e26b29232b3f28fc2fa16e6b5a979b16dc6a0b4781812d11d",
       "size": 6948
     },
     {

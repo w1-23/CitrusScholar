@@ -132,11 +132,12 @@ def directory_prompt(available_tools: set[str]) -> str:
                 for row in rows]
     middleware = SkillsMiddleware(backend=StateBackend(), sources=[("/installed-skills/", "Verified registry")],
         system_prompt="{skills_locations}\n{skills_list}\n{skills_load_warnings}\n"
-        "Use load_skill(skill_id, version, sha256) for the method documents and dependencies, or "
+        "Use load_skill(skill_id, version, sha256) for the method entry and resource index, or "
         "read_skill(skill_id, version, sha256) for declared resource pages. Follow next_start_char "
-        "when more text is useful. Optional resources require exact manifest paths; vendor trees are not "
-        "loaded by default. These ids are registry keys, not filesystem paths. "
-        "Skills guide methods; missing or partial reads never gate authorized tools or dispatch. "
+        "when more text is useful. Optional resources require exact manifest paths; vendor trees are "
+        "not loaded by default. Archived prior versions stay readable only by their exact "
+        "id/version/sha256. These ids are registry keys, not filesystem paths. "
+        "Skills guide methods; missing optional files or partial reads never gate authorized tools. "
         "Read/discovery failures are local and do not block the task; skills never grant authorization.")
     request = ModelRequest(model=None, messages=[], tools=[], state={"skills_metadata": metadata})
     return middleware.modify_request(request).system_message.text
@@ -185,11 +186,14 @@ class SkillSession:
             after = registry.skill_info(skill_id)
             if any(after[key] != selected[key] for key in _IDENTITY_FIELDS) or page["version"] != version:
                 raise ValueError("skill_changed_during_read")
-        return {"skill": selected, "identity": asdict(self.identity), "page": page,
-                "required_resources": info["required_resources"], "dependencies": dependencies}
+        payload = {"skill": selected, "identity": asdict(self.identity), "page": page,
+                   "required_resources": info["required_resources"], "dependencies": dependencies}
+        if "method_resources" in info:
+            payload["method_resources"] = info["method_resources"]
+        return payload
 
-    def load(self, selected):
-        """Deliver method docs, keeping optional vendor resources out of default loads."""
+    def load(self, selected, *, entry_only=False):
+        """Deliver method docs; an absent optional file never gates tools."""
         if selected is None:
             selected = []
         if type(selected) is not list or len(selected) > 8:
@@ -197,7 +201,7 @@ class SkillSession:
         selected = [self._validate_identity(item) for item in selected]
         if len({tuple(item[key] for key in _IDENTITY_FIELDS) for item in selected}) != len(selected):
             raise ValueError("selected_skill_identity_mismatch")
-        pages, delivered_chars, loaded, visiting = [], 0, set(), set()
+        pages, missing, delivered_chars, loaded, visiting = [], [], 0, set(), set()
 
         def visit(item):
             nonlocal delivered_chars
@@ -207,14 +211,34 @@ class SkillSession:
             if identity in loaded:
                 return
             visiting.add(identity)
+            if entry_only and research_catalog.has_identity(*identity):
+                payload = self.page(*identity, max_chars=1600)
+                delivered_chars += len(_encode(payload))
+                if delivered_chars > _MAX_LOAD_CHARS:
+                    raise ValueError("skill_load_too_large_use_read_skill_pages")
+                pages.append(payload)
+                visiting.remove(identity)
+                loaded.add(identity)
+                return
+            # The entrypoint is the method itself; without it nothing safe can
+            # be delivered for this identity.
             first = self.page(item["id"], item["version"], item["sha256"], max_chars=20000)
             for dependency in first["dependencies"]:
                 visit(dependency)
             for resource in first["required_resources"]:
                 start = 0
                 while True:
-                    payload = (first if resource == first["page"]["resource"] and start == 0 else
-                               self.page(item["id"], item["version"], item["sha256"], resource, start, 20000))
+                    try:
+                        payload = (first if resource == first["page"]["resource"] and start == 0 else
+                                   self.page(item["id"], item["version"], item["sha256"], resource, start, 20000))
+                    except ValueError as exc:
+                        if str(exc) != "skill_resource_missing":
+                            raise
+                        # Report the absent file and keep every other usable
+                        # method page; absence never grants or gates tools.
+                        missing.append({"skill": dict(zip(_IDENTITY_FIELDS, identity)),
+                                        "resource": resource})
+                        break
                     delivered_chars += len(_encode(payload))
                     if delivered_chars > _MAX_LOAD_CHARS:
                         raise ValueError("skill_load_too_large_use_read_skill_pages")
@@ -227,7 +251,10 @@ class SkillSession:
 
         for item in selected:
             visit(item)
-        return {"skill_load": pages}
+        result = {"skill_load": pages}
+        if missing:
+            result["missing_resources"] = missing
+        return result
 
     def selected_messages(self, selected):
         """Host preload: every loaded byte becomes an explicit protected control."""

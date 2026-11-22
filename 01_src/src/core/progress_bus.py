@@ -495,6 +495,13 @@ def _fields(data: dict, *, tokens=(), numbers=()) -> dict:
             **{key: data[key] for key in numbers if type(data.get(key)) is int}}
 
 
+PUBLIC_WORK_NOTES = {
+    "table_processed": "已完成表格处理。",
+    "checking_references": "正在核验文献来源。",
+    "figure_registered": "图件已登记，可查看或下载。",
+}
+
+
 def public_progress_payload(event: str, data: dict) -> dict:
     """Project progress events only. Chat, citations and explicit reads are separate."""
     cursor = _fields(data, numbers=("seq",))
@@ -516,13 +523,18 @@ def public_progress_payload(event: str, data: dict) -> dict:
             if isinstance(data.get("outcome"), dict):
                 public["outcome"] = public_tool_outcome(data["outcome"])
     elif event == "assistant_progress":
+        category = data.get("category")
+        text = PUBLIC_WORK_NOTES.get(category) if isinstance(category, str) else None
         public = _fields(data, tokens=("job_id", "note_id", "step_id"), numbers=("model_step",))
         # Note IDs include ':' in both graph and agent producers.
         if note_id := _token(data.get("note_id"), r"[A-Za-z0-9_:-]{1,160}"):
             public["note_id"] = note_id
         call_ids = data.get("tool_call_ids")
-        public.update(visibility="public", origin="model", phase="working",
-                      text=_PUBLIC_WORK_NOTE, chars=len(_PUBLIC_WORK_NOTE),
+        if text:
+            public["category"] = category
+        text = text or _PUBLIC_WORK_NOTE
+        public.update(visibility="public", origin="host" if "category" in public else "model", phase="working",
+                      text=text, chars=len(text),
                       tool_call_ids=[cid for item in call_ids if (cid := _token(item))]
                       if isinstance(call_ids, (list, tuple)) else [])
     elif event == "task_update":

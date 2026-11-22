@@ -6,11 +6,31 @@
     message.setAttribute('role', 'status'); host.appendChild(message);
     var recover = document.createElement('div'); recover.className = 'task-recovery'; host.appendChild(recover);
     options.container.appendChild(host);
+    var updateToggle = document.createElement('button'); updateToggle.type = 'button';
+    updateToggle.textContent = '补充本轮要求'; updateToggle.hidden = true;
+    updateToggle.setAttribute('aria-expanded', 'false'); host.appendChild(updateToggle);
+    var expanded = false, draftJob = '';
     var updateForm = document.createElement('div'); updateForm.className = 'task-update-form'; updateForm.hidden = true;
+    updateToggle.onclick = function () {
+      expanded = !expanded;
+      render(options.store.state);
+      if (expanded) updateInput.focus();
+    };
     var updateInput = document.createElement('textarea'); updateInput.className = 'task-update-input';
     updateInput.rows = 2; updateInput.maxLength = 8000;
     updateInput.setAttribute('aria-label', '补充本轮要求');
     updateInput.placeholder = '补充本轮要求（仅作用于当前任务）';
+    function draft(value) {
+      if (!draftJob) return '';
+      var key = 'citrus.task-draft.' + draftJob;
+      try {
+        if (value === undefined) return root.sessionStorage.getItem(key) || '';
+        if (value) root.sessionStorage.setItem(key, value);
+        else root.sessionStorage.removeItem(key);
+      } catch (_) {}
+      return '';
+    }
+    updateInput.addEventListener('input', function () { draft(updateInput.value); });
     var updateSubmit = document.createElement('button'); updateSubmit.type = 'button';
     updateSubmit.className = 'task-update-submit'; updateSubmit.textContent = '添加要求';
     updateForm.appendChild(updateInput); updateForm.appendChild(updateSubmit); host.appendChild(updateForm);
@@ -20,7 +40,10 @@
       if (!String(instruction || '').trim()) return;
       updateSubmit.disabled = true;
       var accepted = await submitUpdate(instruction);
-      if (accepted && alive() && updateInput.value === instruction) updateInput.value = '';
+      if (accepted && alive() && updateInput.value === instruction) {
+        updateInput.value = '';
+        draft('');
+      }
       updateSubmit.disabled = false;
       if (alive()) render(options.store.state);
     };
@@ -67,7 +90,14 @@
         }
       }
       var updatable = canUpdate();
-      updateForm.hidden = !updatable;
+      if (draftJob !== state.job_id) {
+        draftJob = state.job_id;
+        updateInput.value = draft();
+      }
+      if (root.CitrusTaskState.isTerminal(state)) draft('');
+      updateToggle.hidden = !updatable;
+      updateToggle.setAttribute('aria-expanded', String(updatable && expanded));
+      updateForm.hidden = !updatable || !expanded;
       updateSubmit.disabled = !updatable;
       updateInput.disabled = !updatable;
       host.hidden = !state.job_id || (!message.textContent && !eligible.length && !updatable);

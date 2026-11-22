@@ -51,22 +51,27 @@
     },
     {
       "id": "reference-verification",
-      "version": "2.0.0",
+      "version": "2.0.1",
       "path": "skills/reference-verification",
       "entry": "SKILL.md",
       "package": "citrus_refcheck",
       "dependency": "citrusscholar-support[refcheck]==2.0.0",
-      "sha256": "1d2f55aaec2531b178d79dd005a44a11d3d04c0cc50e54f72f75c3813fbf3a62",
+      "sha256": "303849896abdf947b3555f416fbf4408bf05bd2691588c2d109e2bc2e4ab0d00",
       "files": [
-        {
-          "path": "assets/status-vocabulary.json",
-          "sha256": "346b67aa554b72ce97f46c5b030ea265dc2277a438280dba30ad2d7b2497d320",
-          "size": 257
-        },
         {
           "path": "PROVENANCE.md",
           "sha256": "b7cde9604f037076d4a74f2eb38c9e448c4296e1d9515a05ed77b354e2c5367f",
           "size": 646
+        },
+        {
+          "path": "SKILL.md",
+          "sha256": "f84ef58f5f963f66bb4193fdf4476133884032439d5366f67f6f900218b5d672",
+          "size": 1880
+        },
+        {
+          "path": "assets/status-vocabulary.json",
+          "sha256": "346b67aa554b72ce97f46c5b030ea265dc2277a438280dba30ad2d7b2497d320",
+          "size": 257
         },
         {
           "path": "references/01-identity-and-evidence.md",
@@ -119,35 +124,30 @@
           "size": 199
         },
         {
-          "path": "SKILL.md",
-          "sha256": "843b9e500076c3aa79a9816d548682cee9bd5e8b03643f9908b22e125df46962",
-          "size": 1606
-        },
-        {
           "path": "templates/correction-table.md",
           "sha256": "babf1a2e2784d116337bc9539d806e5fff291f096832812603683ef9509236d5",
           "size": 114
-        },
-        {
-          "path": "tests/entry_test.py",
-          "sha256": "10ce5823028bb2e273686f6a89282fb929136e3c1e123eab15d136c0c22df17f",
-          "size": 1223
         }
       ]
     },
     {
       "id": "data-audit",
-      "version": "2.1.1",
+      "version": "2.1.2",
       "path": "skills/data-audit",
       "entry": "SKILL.md",
       "package": "citrus_audit",
       "dependency": "citrusscholar-support[audit]==2.0.0",
-      "sha256": "39182c64c3ec9095e0fbf2385fd8d4073af5829717fdc83d3c83a19acdfe76dc",
+      "sha256": "9466c9b6ff7b13ec09d598a35d51d4559481105df92fd262da33d8e579b054a5",
       "files": [
         {
           "path": "PROVENANCE.md",
           "sha256": "b5d0af7e0b4c998e40888bc9a49e6d4ec595b2c097ed84cfe4c677500e023080",
           "size": 564
+        },
+        {
+          "path": "SKILL.md",
+          "sha256": "57213483ac30425dfcdc258e80ecbf31417b4419af571438d1ea45777046677c",
+          "size": 6594
         },
         {
           "path": "references/marking.md",
@@ -178,32 +178,32 @@
           "path": "scripts/catalog.py",
           "sha256": "5bd67927dc1554115c6eb9be8103981e1209d3afc2d4fa182d235ebd5f459b12",
           "size": 99
-        },
-        {
-          "path": "SKILL.md",
-          "sha256": "da012b6d61fc5ae48c8db4f190a702f99442ebaeabed4325fda338b40ce8e6ee",
-          "size": 6278
-        },
-        {
-          "path": "tests/cli_test.py",
-          "sha256": "4ef065fbc258d0599d84a9b4c4a6887604a9f8c152c12db8025c60c0b907ad42",
-          "size": 1186
         }
       ]
     },
     {
       "id": "nature-figure",
-      "version": "2.1.1",
+      "version": "2.1.2",
       "path": "skills/nature-figure",
       "entry": "SKILL.md",
       "package": "citrus_figures",
       "dependency": "citrusscholar-support[figures]==2.0.0",
-      "sha256": "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6",
+      "sha256": "d8a629298048632590fc58b3e00030bf06a439cb79324ed7a9615bef2a7e174e",
       "files": [
         {
           "path": "ADAPTER.md",
           "sha256": "c0e708e274a0ac94b45c45b845ab0da396a5376920b92caa14b517e798e73f09",
           "size": 7228
+        },
+        {
+          "path": "RELEASE.md",
+          "sha256": "6bf7ae55b78f1aa22a3d44f36999a51f27e16d32d828475faadd24e5bc83bdb8",
+          "size": 2784
+        },
+        {
+          "path": "SKILL.md",
+          "sha256": "d74e8d7661bfaa9b0d5ea120f56655c8bee2fe32dfdd6b32673806a0afcfa35d",
+          "size": 2218
         },
         {
           "path": "provenance.extra.json",
@@ -212,12 +212,12 @@
         },
         {
           "path": "provenance.json",
-          "sha256": "b6ba9070c52cb88ac799bc082bdc6bf6d3f9e065b5b9ce9dbca724dcbfa30cf0",
-          "size": 12408
+          "sha256": "82a3fe2cdb2aa05a574b9eab6a8ba9517459f981ec5cb381a7b91ea5eb09d9e1",
+          "size": 12445
         },
         {
           "path": "references/bridge.md",
-          "sha256": "61b89e70eecdbc8e26b29232b3f28fc2fa16e6b5a979b16dc6a0b4781812d11d",
+          "sha256": "a968acb6cbea2d234e6b89f5946388e03d80db998ac3a136a4012302e66cb73c",
           "size": 6948
         },
         {
@@ -226,9 +226,9 @@
           "size": 7038
         },
         {
-          "path": "RELEASE.md",
-          "sha256": "6bf7ae55b78f1aa22a3d44f36999a51f27e16d32d828475faadd24e5bc83bdb8",
-          "size": 2784
+          "path": "references/standalone-cli.md",
+          "sha256": "482dba6da354612c09ed728118e2bacfab1eb3ca07a557d8851496b5e5cb7473",
+          "size": 3915
         },
         {
           "path": "scripts/citrus/bundle_figure.py",
@@ -251,11 +251,6 @@
           "size": 430
         },
         {
-          "path": "SKILL.md",
-          "sha256": "5fd5fe22b50915995f0ed1dab3e83cdef22be275a6e73270d4950aef3f313a87",
-          "size": 5304
-        },
-        {
           "path": "vendor/nature-skills/INTEGRATION.md",
           "sha256": "319bfab0ce13e390a12d9e9df3640c42ddd9caac38cda3562d18a75dbcc54f3b",
           "size": 8945
@@ -269,6 +264,11 @@
           "path": "vendor/nature-skills/provenance.json",
           "sha256": "43f5229b5052ecfc77b5fc86bf0c6fc390a5b5a118a7d2e3e73cfcb1f74da013",
           "size": 7984
+        },
+        {
+          "path": "vendor/nature-skills/skills/nature-figure/SKILL.md",
+          "sha256": "5aefe708a2531c5ddaa8ee74d5155d747e96c0f21a33143d38316b7c5c88ffc4",
+          "size": 12367
         },
         {
           "path": "vendor/nature-skills/skills/nature-figure/assets/figures4papers/THIRD_PARTY_NOTICES.md",
@@ -441,11 +441,6 @@
           "size": 33447
         },
         {
-          "path": "vendor/nature-skills/skills/nature-figure/SKILL.md",
-          "sha256": "5aefe708a2531c5ddaa8ee74d5155d747e96c0f21a33143d38316b7c5c88ffc4",
-          "size": 12367
-        },
-        {
           "path": "vendor/nature-skills/skills/nature-figure/static/core/contract.md",
           "sha256": "a2b6523a48192cf1dff0d194264c5662c832f4d1da6e9e4763ccd98cc0664d4c",
           "size": 6274
@@ -487,12 +482,8 @@
         }
       ],
       "supersedes": {
-        "version": "2.0.0",
-        "manifest_sha256": "00779e01d2c8756245c3553adb8abf451c4eb1dcd15c46ce7192ce3892d7f127",
-        "removed_dangling_entries": [
-          "tests/test_resources.py",
-          "vendor/nature-skills/.gitattributes"
-        ]
+        "version": "2.1.1",
+        "manifest_sha256": "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6"
       }
     }
   ]

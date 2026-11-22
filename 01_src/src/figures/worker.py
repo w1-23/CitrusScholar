@@ -679,8 +679,8 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
         inputs = ({"data": "DataFrame mapping"} if result.error_stage == "render"
                   else _script_bindings(namespace))
         return _report(EXIT_SCRIPT_ERROR, result.error, script_stdout=result.stdout,
-                       diagnostic=_script_diagnostic(result.error_stage, result.error_type,
-                                                     result.script_line, inputs))
+                       diagnostic={**_script_diagnostic(result.error_stage, result.error_type,
+                                                        result.script_line, inputs), **result.error_details})
 
     states = {key: {"status": "missing", "error": "Output was not emitted."}
               for key in slots if key != "result"}

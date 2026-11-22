@@ -62,7 +62,7 @@ file_id、operation_id、result_reference、dataset_ref、review_id、audit_id�
         prompt += "\n科研绘图时，先确定图回答的问题、数据来源和单位、实验单位与样本量，以及各面板的证据角色。" \
             "误差、统计量、检验及显著性标记必须有数据或用户给定的方法依据。" \
             "可按需回读 nature-figure 的 references/figure-methods.md，核对选图、组合布局和图注。说明每个面板、缩写、样本与误差口径。" \
-            "新图件只交付 SVG，用户明确请求组合图时，按证据关系组织共享坐标、图例和面板标签。" \
+            "新图件默认交付 SVG，用户要求其他格式时交付实际生成且可用的格式，用户明确请求组合图时，按证据关系组织共享坐标、图例和面板标签。" \
             "样式编辑复用已保存的科学内容，说明实际运行的质量检查及其覆盖。"
     if {"research_workspace", "run_research_figure_script"} <= available:
         prompt += "\n适合的图件可先从 research_workspace 取得内置脚本的精确引用与参数合同。" \

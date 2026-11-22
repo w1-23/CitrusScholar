@@ -270,8 +270,18 @@ function bytesResponse(buffer, headers = {}) {
     ok: true,
     status: 200,
     headers: {get: name => headers[name] === undefined ? null : String(headers[name])},
-    arrayBuffer: async () => buffer
+    body: new ReadableStream({start(controller) {
+      controller.enqueue(new Uint8Array(buffer));
+      controller.close();
+    }})
   };
+}
+
+function workbookBuffer() {
+  const xlsx = require('../assets/xlsx.full.min.js');
+  const book = xlsx.utils.book_new();
+  xlsx.utils.book_append_sheet(book, xlsx.utils.aoa_to_sheet([['A', 'B'], [1, 2]]), 'S1');
+  return xlsx.write(book, {type: 'array', bookType: 'xlsx'});
 }
 
 function bufferOf(text) {
@@ -424,7 +434,7 @@ test('streamed CSV is cancelled as soon as the byte cap is crossed', async () =>
           reads++;
           return Promise.resolve({done: false, value: chunk});
         },
-        cancel() { cancelled = true; }
+        async cancel() { cancelled = true; }
       };
     }
   };
@@ -461,7 +471,7 @@ test('XLSX parsing is bounded with sheetRows and its DOM is paged client-side', 
       encode_cell(cell) { return String.fromCharCode(65 + cell.c) + (cell.r + 1); }
     }
   };
-  const node = await openTablePreview(b, file, new ArrayBuffer(16));
+  const node = await openTablePreview(b, file, workbookBuffer());
   assert.equal(readOptions.sheetRows, 2000);
 
   let body = node.querySelector('.sf-sheet-body');
@@ -490,7 +500,7 @@ test('XLSX at the sheetRows cap is described as bounded, never as complete', asy
       encode_cell(cell) { return 'A' + (cell.r + 1); }
     }
   };
-  const node = await openTablePreview(b, file, new ArrayBuffer(16));
+  const node = await openTablePreview(b, file, workbookBuffer());
   const body = node.querySelector('.sf-sheet-body');
   const status = body.querySelector('.sf-table-status').textContent;
   assert.match(status, /已达解析上限 2000 行/);

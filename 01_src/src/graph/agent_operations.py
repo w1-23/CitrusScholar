@@ -1132,11 +1132,12 @@ def _record_execution_terminal(call: dict, step: dict, content: str,
 
 
 def _emit_completed_tool_step(call: dict, message: ToolMessage,
-                              tool_status_sink: list[dict] | None = None) -> dict[str, Any]:
+                              tool_status_sink: list[dict] | None = None, *,
+                              logical_key: str = "", attempt: int = 1) -> dict[str, Any]:
     """Publish one completed tool as soon as it finishes, with no raw payload."""
     name = str(call.get("name") or "")
     content = str(getattr(message, "content", "") or "")
-    artifact = getattr(message, "artifact", None) or {}
+    artifact = message.artifact if isinstance(message.artifact, dict) else {}
     artifact_validations: list[dict] = []
     step: dict[str, Any] = {
         "status": "failed", "reason_code": "status_unavailable", "retryable": True,
@@ -1180,8 +1181,7 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
                 step["status"] = "failed"
                 step["reason_code"] = "artifact_validation_unavailable"
                 step["retryable"] = True
-        logical_key = call.get("_host_logical_key") or _logical_key(name, call, step)
-        attempt = max(1, int(call.get("_attempt") or 1))
+        logical_key = logical_key or _logical_key(name, call, step)
         ledger = current_execution_ledger()
         registered = ledger.record(str(call.get("id") or "")) if ledger else None
         if registered is not None:

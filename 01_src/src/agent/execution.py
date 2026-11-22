@@ -11,6 +11,7 @@ They are never converted into 'failed' writes that the model might replay.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -28,6 +29,8 @@ class ToolExecution:
     uncertain: bool = False
     pending_question: bool = False
     execution_waits: tuple[str, ...] = ()
+    logical_key: str = ""
+    attempt: int = 1
 
     def __post_init__(self):
         from .runtime import validate_execution_waits
@@ -60,6 +63,7 @@ class CapabilityExecutor:
         if (any(not isinstance(cid, str) or not cid for cid in ids)
                 or len(ids) != len(set(ids)) or response.invalid_tool_calls):
             raise ValueError("invalid_batch_call_ids")
+        calls = deepcopy(calls)
         modes = [self.catalog.execution_mode(c["name"]) for c in calls]
         results: dict[str, tuple[ToolExecution, ToolMessage]] = {}
         permits = asyncio.Semaphore(self.max_parallel)

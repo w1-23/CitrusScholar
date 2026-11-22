@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -782,12 +783,17 @@ def _script_diagnostic(value: Any) -> dict:
     code = value.get("error_code")
     if code not in ("invalid_input_contract", "input_binding_failed", "script_syntax",
                     "forbidden_import", "script_error", "unreadable_labels",
-                    "render_script_emit_not_available"):
+                    "render_script_emit_not_available", "input_type_mismatch"):
         return {}
     result = {"stage": value["stage"], "error_code": code}
     line = value.get("line")
     if type(line) is int and 0 < line <= MAX_SCRIPT_BYTES:
         result["line"] = line
+    if code == "input_type_mismatch" and value["stage"] == "render":
+        parameter, actual = value.get("parameter"), value.get("actual")
+        if (isinstance(parameter, str) and re.fullmatch(r"data\[(?:'[_a-zA-Z][_a-zA-Z0-9]{0,63}'|\?)\]", parameter)
+                and actual in ("Path", "PosixPath", "WindowsPath", "non-DataFrame")):
+            result.update(parameter=parameter, expected="DataFrame", actual=actual)
     inputs = value.get("inputs")
     if isinstance(inputs, dict):
         known = {name: kind for name, kind in list(inputs.items())[:16]

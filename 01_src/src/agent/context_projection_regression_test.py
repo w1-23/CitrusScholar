@@ -84,6 +84,47 @@ class ProjectionTests(unittest.IsolatedAsyncioTestCase):
         return [SystemMessage(content="control", id="sys"), *groups,
                 HumanMessage(content="latest user request", id="tail")]
 
+    async def test_authenticated_legacy_calls_reopen_without_host_fields(self):
+        from src.agent.checkpoint_store import (CheckpointProtectionError, ProtectedCheckpointSerializer,
+                                                checkpoint_scope, open_checkpoint)
+        from langgraph.checkpoint.base import empty_checkpoint
+
+        scope = self.projector.archive.provider_scope
+        private = _ProtocolState(scope, "fixture private protocol")
+        call = {"id": "legacy-call", "name": "read_data", "args": {}}
+        legacy = _DeepSeekMessage(content="", tool_calls=[call], provider_protocol=private)
+        legacy.tool_calls[0].update(_host_logical_key="host:" + "a" * 32, _attempt=1)
+        fixture_text = "Synthetic checkpoint content for long-context restoration. " * 3500
+        raw = [HumanMessage(content=fixture_text), legacy,
+               ToolMessage(content="fixture", name="read_data", tool_call_id="legacy-call")]
+        _, estimate = model_request(self.model, raw, output_tokens=4096)
+        self.assertTrue(40_000 < estimate["estimated_input_tokens"] < 60_000)
+        config = {"configurable": checkpoint_scope(self.identity, scope)}
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"messages": raw}
+        checkpoint["channel_versions"] = {"messages": 1}
+        async with open_checkpoint(self.root, self.identity, scope) as saver:
+            saved = await saver.aput(config, checkpoint, {"source": "input", "step": 0}, {"messages": 1})
+        async with open_checkpoint(self.root, self.identity, scope) as saver:
+            restored = (await saver.aget_tuple(saved)).checkpoint["channel_values"]["messages"]
+        self.assertEqual(restored[0].content, fixture_text)
+        self.assertEqual(restored[1].provider_protocol, private)
+        self.assertEqual(restored[1].tool_calls, [call | {"type": "tool_call"}])
+        self.assertIn("_host_logical_key", legacy.tool_calls[0])
+        serial = ProtectedCheckpointSerializer(bytes(32), self.identity, scope)
+        encrypted_format, encrypted = serial.dumps_typed(legacy)
+        with self.assertRaises(CheckpointProtectionError):
+            serial.loads_typed((encrypted_format, encrypted[:-1] + bytes([encrypted[-1] ^ 1])))
+        wrong_identity = ExecutionIdentity(12, self.identity.session_id, self.identity.user_turn_id, self.identity.run_id)
+        with self.assertRaises(CheckpointProtectionError):
+            ProtectedCheckpointSerializer(bytes(32), wrong_identity, scope).loads_typed((encrypted_format, encrypted))
+        with self.assertRaises(CheckpointProtectionError):
+            ProtectedCheckpointSerializer(bytes(32), self.identity, (scope[0], "other-model")).loads_typed(
+                (encrypted_format, encrypted))
+        legacy.tool_calls[0]["unknown_fixture_field"] = True
+        with self.assertRaises(CheckpointProtectionError):
+            serial.loads_typed(serial.dumps_typed(legacy))
+
     async def test_giant_tool_group_archive_only_and_paginated_hash(self):
         self.budget()
         raw = self.raw(tool_group('"\t\\字' * 160_000))

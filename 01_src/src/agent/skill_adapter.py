@@ -154,7 +154,6 @@ class SkillSession:
         self.available = available
         self.receipts: dict[str, dict] = {}
         self.active: set[str] = set()
-        self.required_message_ids: set[str] = set()
         self.diagnostics: list[str] = []
 
     @staticmethod
@@ -270,8 +269,12 @@ class SkillSession:
 
     @staticmethod
     def _receipt(kind, message_key, content, payload):
+        page = payload["page"]
         return {"kind": kind, "message_key": message_key,
-                "content_sha256": hashlib.sha256(content.encode()).hexdigest(), "payload": payload}
+                "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "skill": payload["skill"], "resource": page["resource"], "start_char": page["start_char"],
+                "length": len(page["text"]), "resource_sha256": page["sha256"],
+                "page_sha256": hashlib.sha256(page["text"].encode()).hexdigest()}
 
     def observe(self, message):
         """Only call with a HostTools-published/recovered observation, never model text."""
@@ -303,7 +306,6 @@ class SkillSession:
 
     def restore(self, saved):
         self.active.clear()
-        self.required_message_ids.clear()
         self.diagnostics.clear()
         if saved is None:  # Checkpoints predating source receipts.
             self.receipts = {}
@@ -316,7 +318,7 @@ class SkillSession:
     def verify_view(self, messages):
         """Diagnose source coverage; missing/partial/stale guidance never stops admission."""
         self.diagnostics.clear()
-        visible, message_ids = {}, {}
+        visible = {}
         for message in messages:
             if isinstance(message, ToolMessage):
                 key = ("tool", message.tool_call_id)
@@ -325,26 +327,34 @@ class SkillSession:
             else:
                 continue
             visible[key] = message.content
-            message_ids[key] = message.id
         covered, valid, packages = {}, {}, {}
         for key, receipt in self.receipts.items():
             try:
-                self._verify_page(receipt["payload"])
                 source_key = (receipt["kind"], receipt["message_key"])
                 content = visible.get(source_key)
-                if (not isinstance(content, str)
-                        or hashlib.sha256(content.encode()).hexdigest() != receipt["content_sha256"]):
-                    self.diagnostics.append("skill_receipt_missing_from_active_projection")
-                    continue
-                # Bind the saved payload to its visible observation as well as
-                # the source bytes, including after checkpoint reconstruction.
-                data = json.loads(content)
-                delivered = data.get("skill_load", [data])
-                if receipt["payload"] not in delivered:
-                    raise ValueError("skill_receipt_bytes_mismatch")
-                p = receipt["payload"]
-                identity = tuple(p["skill"][field] for field in _IDENTITY_FIELDS)
+                if content is not None:
+                    if (not isinstance(content, str)
+                            or hashlib.sha256(content.encode()).hexdigest() != receipt["content_sha256"]):
+                        raise ValueError("skill_receipt_bytes_mismatch")
+                if "payload" in receipt:
+                    p = receipt["payload"]
+                    self._verify_page(p)
+                    if content is not None:
+                        data = json.loads(content)
+                        if p not in data.get("skill_load", [data]):
+                            raise ValueError("skill_receipt_bytes_mismatch")
+                    receipt = self._receipt(receipt["kind"], receipt["message_key"], "", p) | {
+                        "content_sha256": receipt["content_sha256"]}
+                else:
+                    selected = self._validate_identity(receipt["skill"])
+                    p = self.page(*(selected[field] for field in _IDENTITY_FIELDS), receipt["resource"],
+                                  receipt["start_char"], max(1, receipt["length"]))
                 page = p["page"]
+                if (page["start_char"] != receipt["start_char"] or len(page["text"]) != receipt["length"]
+                        or page["sha256"] != receipt["resource_sha256"]
+                        or hashlib.sha256(page["text"].encode()).hexdigest() != receipt["page_sha256"]):
+                    raise ValueError("skill_receipt_bytes_mismatch")
+                identity = tuple(p["skill"][field] for field in _IDENTITY_FIELDS)
                 covered.setdefault((identity, page["resource"]), []).append(
                     (page["start_char"], page["start_char"] + len(page["text"]), page["total_chars"]))
                 packages[identity] = p
@@ -369,10 +379,6 @@ class SkillSession:
                        if all(tuple(dep[field] for field in _IDENTITY_FIELDS) in loaded
                               for dep in packages[identity]["dependencies"])}
         self.receipts = valid
-        # Kept for checkpoint/projection compatibility, never an admission rule.
-        self.required_message_ids = {message_ids[(receipt["kind"], receipt["message_key"])]
-                                     for receipt in valid.values()
-                                     if message_ids.get((receipt["kind"], receipt["message_key"]))}
         return set(self.active)
 
     def allowed(self, names):

@@ -24,7 +24,7 @@ The original demo references mention nine figures4papers directories not package
 
 ## Adapter resource identity
 
-- Current adapter resource set: `nature-figure` version `2.1.1`. The authoritative manifest digest is `skills[].sha256` in `02_config/skills.catalog.json`; it covers every delivered adapter and vendor file listed there.
+- Current adapter resource set: `nature-figure` version `2.1.2`. The authoritative manifest digest is `skills[].sha256` in `02_config/skills.catalog.json`; it covers every delivered adapter and vendor file listed there.
 - Superseded adapter identity: version `2.0.0`, manifest digest `00779e01d2c8756245c3553adb8abf451c4eb1dcd15c46ce7192ce3892d7f127`. That identity referenced two entries absent from the fixed snapshot: `tests/test_resources.py` (catalog) and `vendor/nature-skills/.gitattributes` (outer provenance). The current identity removes them instead of fabricating them.
 - The upstream pin is unchanged: commit `7bff1d0539c0dfad6c30178bb93ce6dd8a5cebf8`, skill version `2.8.0`, 44 fixed files, canonical inventory SHA-256 `a9b8e661bf460a401e17017f134a735432da9d7832e3f561a63c6cf47fb92b9e`. Vendor bytes are not modified.
 - The separate 40-file legacy identity remains under `01_src/src/prompts/skills/vendor/nature-skills` and is still readable through `src/prompts/skill_registry.py` (version `2.8.0`, same commit). It is frozen for historical receipts and is not the canonical adapter source.

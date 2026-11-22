@@ -330,6 +330,12 @@
     return '';
   }
 
+  function registeredSvgUrl(file) {
+    if (!file || !isSvgFile(file) || !/^[a-f0-9]{32}$/i.test(String(file.file_id || ''))) return '';
+    var expected = '/api/v2/files/' + encodeURIComponent(file.file_id) + '/download';
+    return safePreviewUrl(file.download_url) === expected ? expected : '';
+  }
+
   function unsafePreviewHtml(downloadUrl) {
     return '<div class="sf-preview-fallback">' +
       '<p class="sf-preview-warn">预览地址不是本站受保护的地址，已拒绝加载。</p>' +
@@ -2068,6 +2074,7 @@
   window.loadSessionFiles = loadSessionFiles;
   window.resetSessionFiles = resetSessionFiles;
   window.toggleSessionFiles = toggleSessionFiles;
+  window.registeredSvgUrl = registeredSvgUrl;
   window.openSessionFilePreview = openAccountFilePreview;
   window.openAccountFilePreview = openAccountFilePreview;
   window.openSentImagePreview = openSentImagePreview;

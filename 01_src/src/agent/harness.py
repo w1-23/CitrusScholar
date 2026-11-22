@@ -157,9 +157,9 @@ class HarnessRuntime:
                 tool_call_ids=[call["id"] for call in response.tool_calls], job_id=identity.run_id)
             if inspect.isawaitable(emitted):
                 await emitted
-        except Exception:
-            # A public timeline outage must not change execution or final checks.
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("public_progress_failed stage=tool_round kind=%s", type(exc).__name__)
 
     async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None):
         adapter = self

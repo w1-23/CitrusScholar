@@ -22,11 +22,14 @@ Hard rules:
 from __future__ import annotations
 
 from contextvars import ContextVar
+import logging
 import os
 import re
 import uuid
 
-from src.core.progress_bus import _PUBLIC_WORK_NOTE, emit_progress, get_turn_scope
+from src.core.progress_bus import PUBLIC_WORK_NOTES, _PUBLIC_WORK_NOTE, emit_progress, get_turn_scope
+
+logger = logging.getLogger(__name__)
 
 #: Longest single public note kept. The timeline row is one line; longer text
 #: is truncated instead of silently blowing up the trace.
@@ -134,16 +137,17 @@ def public_progress_text(chunks, has_tool_calls: bool) -> str:
 def emit_public_progress(text: str, *, step_id: str = "",
                          phase: str = "working", note_id: str = "",
                          model_step: int = 0, tool_call_ids=(),
-                         job_id: str = "") -> bool:
+                         job_id: str = "", category: str = "") -> bool:
     """Publish a sanitized note through the existing request/durable queue.
 
     ``job_id`` is host identity, never a model argument. DurableEventQueue owns
     persistence; this emitter must not append the same event separately.
     """
     try:
-        if not enabled() or not sanitize(text):
+        label = PUBLIC_WORK_NOTES.get(category)
+        if not enabled() or (not label and not sanitize(text)):
             return False
-        note = _PUBLIC_WORK_NOTE
+        note = label or _PUBLIC_WORK_NOTE
         from src.core.tracing import get_job_id
         job_id = str(job_id or get_job_id() or "")
         scope = (*get_turn_scope(), job_id)
@@ -151,8 +155,8 @@ def emit_public_progress(text: str, *, step_id: str = "",
         if _last_emitted.get() == event_key:
             return False
         emit_progress("assistant_progress", {
-            "visibility": "public", "origin": "model",
-            "step_id": step_id or "analysis",
+            "visibility": "public", "origin": "host" if label else "model",
+            "category": category if label else "", "step_id": step_id or "analysis",
             "phase": phase,
             "text": note,
             "chars": len(note),
@@ -162,13 +166,21 @@ def emit_public_progress(text: str, *, step_id: str = "",
             "job_id": job_id,
         })
         _last_emitted.set(event_key)
-    except Exception:  # noqa: BLE001 - never block the agent
+    except Exception as exc:
+        logger.warning("public_progress_failed stage=emit kind=%s", type(exc).__name__)
         return False
     _persist_last_note(note, job_id=job_id)
     return True
 
 
 _PROGRESS_SUMMARY_MAX = 200
+
+
+def emit_tool_milestone(category: str, *, job_id: str, tool_call_id: str) -> bool:
+    if category not in PUBLIC_WORK_NOTES:
+        return False
+    return emit_public_progress("", note_id=f"{job_id}:{category}:{tool_call_id}",
+                                tool_call_ids=(tool_call_id,), job_id=job_id, category=category)
 
 
 def _persist_last_note(note: str, *, job_id: str | None = None) -> None:
@@ -186,8 +198,8 @@ def _persist_last_note(note: str, *, job_id: str | None = None) -> None:
             return
         from src.core import jobs as jobs_mod
         jobs_mod.update_job(job_id, progress_summary=note[:_PROGRESS_SUMMARY_MAX])
-    except Exception:  # noqa: BLE001 - 进度持久化绝不能影响执行
-        return
+    except Exception as exc:
+        logger.warning("public_progress_failed stage=summary kind=%s", type(exc).__name__)
 
 
 def reset_emitted() -> None:

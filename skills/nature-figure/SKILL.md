@@ -1,26 +1,15 @@
 ---
 name: nature-figure
 description: Create, revise, package and audit scientific Matplotlib figures using explicit data and final artifact bytes. Apply pinned Nature figure guidance with honest per-check coverage, reproducible source/data bundles and frozen style edits.
-version: 2.1.1
+version: 2.1.2
 ---
 
-# Scientific figure workflow
+# CitrusScholar 托管绘图
 
-Use the installed `citrus_figures` package and the four adapters in `scripts/citrus/`. Resolve adapter and resource paths relative to this SKILL.md; see [ADAPTER.md](ADAPTER.md) for path bases and the public interface. Runtime loading always receives the explicit vendor directory. Imports do not contact services, initialize models or change the environment.
+1. 分析入口用 `inputs_json` 声明授权文件，并用 `input_contract.raw` 将原件绑定为 `Path`。分析脚本可直接读取这些文件，也可以用授权 Code 做计算。
+2. 在 `input_contract.tables` 中声明需由 Worker 预载的表格，或在分析脚本中将数据读为 `DataFrame`，用 `emit.table` 登记需要冻结的表。记录单位、实验单元、样本量、误差定义和统计参数。
+3. 独立 `render_script` 只接收冻结的 `data[name]` 表格。每项必须是 `DataFrame`，脚本生成一张 Figure。样式修改复用冻结数据，不重算统计。已声明表格的 CSV/Excel 加载示例见 [托管接口](ADAPTER.md) 和 [绘图方法](references/figure-methods.md)。
 
-Before choosing a form, identify the scientific question, units, experimental unit, replicate counts, uncertainty definition and any transformation/statistical parameters. Select the form from that evidence. Preserve source values and complete labels. Follow the pinned upstream [figure contract](vendor/nature-skills/skills/nature-figure/references/figure-contract.md), [design theory](vendor/nature-skills/skills/nature-figure/references/design-theory.md), [chart types](vendor/nature-skills/skills/nature-figure/references/chart-types.md) and [legend conventions](vendor/nature-skills/skills/nature-figure/references/figure-legend-conventions.md). The upstream scientific palette and typography remain the defaults.
-
-For the application workflow, see [figure methods](references/figure-methods.md) for template parameters, composite layouts, and frozen replay. The steps below describe the standalone package.
-
-1. Prepare an explicit spec JSON or trusted Matplotlib source. Source receives `data` (named DataFrames) and `parameters` (JSON). The source path is executable local Python: obtain the caller's normal execution authorization; do not execute uploaded/untrusted source implicitly. Library execution provides no sandbox.
-2. Render with `python scripts/citrus/render_figure.py --spec /absolute/spec.json --output /absolute/new-bundle`. For a non-template scientific plot, use `--source /absolute/plot_source.py --data measurements=/absolute/measurements.csv --parameters /absolute/parameters.json`. Specs support inline data and explicit CSV bindings such as `--table account_file:measurements=/absolute/measurements.csv` or `--table attachment:1=/absolute/measurements.csv`. Library callers inject already authorized table mappings.
-3. Inspect QA coverage and raw findings in `qa/receipt.json` and `qa/reports/`. FAIL stays FAIL. Program errors stay errors. Missing dependencies affect their own checks. Visual inspection without an explicitly supplied model remains `not_run/capability_absent`; do not claim visual or journal compliance. Source preflight is advisory by default, with its raw FAIL/WARN retained.
-4. Review the actual exported PDF and other requested outputs. `figure.pdf` is exactly the byte sequence audited. Geometry is captured during the PDF draw, with its SHA-256. Do not replace files after auditing or rerender to validate an old hash. Run `verify_figure.py --artifact pdf=/absolute/figure.pdf --source /absolute/source.py --layout /absolute/qa/layout.json` for an independent byte audit.
-5. For style changes use `revise_figure(session, overrides=...)` in process. It reuses the figure and refuses changed data, source or computation parameters. Reopened spec bundles use stored resolved values with no statistical recomputation: `python scripts/citrus/revise_figure.py --bundle /absolute/old --overrides /absolute/overrides.json --output /absolute/new`. Arbitrary-source frozen edits need the existing session; do not silently re-execute source. The bundle states this limit.
-6. Deliver the complete bundle: audited PDF, `plot.py` that saves its outputs when executed, original `source.py`, typed source data, transformation/statistical parameters and hashes, QA receipts and reports, object inventory and hashed `figure.bundle.json`. A new reaudit uses `--mode reaudit --supersedes RECEIPT_ID`; the old receipt only certifies its original hashes.
-
-All CLI observations are one JSON object on stdout; diagnostics go to stderr. `status=incomplete` is successful observation delivery with coverage gaps, not successful scientific verification. Read `coverage` and the receipt; process exit alone is insufficient.
+默认交付 SVG。用户要求 PNG、PDF 或多种格式时，按实际生成的成果交付。预览、正式和期刊模式选择相应的校验要求。QA 必须绑定最终文件的摘要，保留真实的 FAIL、未运行项及覆盖缺口。独立调用方式见 [standalone CLI](references/standalone-cli.md)。
 
 The vendored snapshot is the fixed 44-file upstream set (40 core files plus four pinned execution peripherals) at commit `7bff1d0`; a separately supplied user ZIP is a different upstream snapshot (8 of 39 same-named files differ) and is not packaged. Python paths are the `citrus_figures` library and the `scripts/citrus/` adapters. R execution and OpenRouter image generation are disabled and never invoked by the service; image-generation networks, private templates, gallery images, and external models are not automatically enabled. Keep acquisition, local execution authorization and network authorization distinct. Consult the [resource bridge](references/bridge.md), [release scope](RELEASE.md) and [vendor provenance](vendor/nature-skills/provenance.json). Do not claim a complete upstream repository or availability of excluded assets.
-
-CitrusScholar 托管绘图统一交付 SVG。Excel/CSV 分析、冻结表和独立渲染示例见 [ADAPTER.md](ADAPTER.md)。

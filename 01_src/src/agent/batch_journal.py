@@ -64,6 +64,8 @@ def _json_safe(value):
     closed families are converted; every other object still fails ``check``, so
     no provider message, custom class or host path can reach the journal.
     """
+    if type(value) is float and not math.isfinite(value):
+        return None
     if type(value) in (list, tuple):
         return [_json_safe(item) for item in value]
     if type(value) is dict:
@@ -72,15 +74,19 @@ def _json_safe(value):
     name = type(value).__name__
     if module == "numpy":
         if hasattr(value, "tolist"):
-            return _json_safe(value.tolist())
-        if hasattr(value, "item"):
-            return _json_safe(value.item())
+            converted = value.tolist()
+            if type(converted) is not type(value):
+                return _json_safe(converted)
+    if module == "pandas" and name in ("NAType", "NaTType"):
+        return None
     if module == "pandas" and name in ("Timestamp", "Timedelta"):
         return value.isoformat()
     if module == "datetime" and name in ("datetime", "date", "time"):
         return value.isoformat()
     return value
-def _json(value):
+
+
+def observation_json(value):
     # No default encoder, model dumping, pickle, or import-based revival. Reject
     # objects (including private provider messages) even inside tool artifacts.
     def check(item):
@@ -110,6 +116,29 @@ def _json(value):
                       separators=(",", ":"), allow_nan=False)
 
 
+_json = observation_json
+
+
+def persistent_message(message):
+    fields = {key: getattr(message, key) for key in _MESSAGE_FIELDS}
+    encoded = observation_json(fields)
+    if len(encoded.encode("utf-8")) > MAX_BATCH_BYTES:
+        raise _EncodingError("batch_observation_exceeds_checkpoint_limit")
+    return ToolMessage(**json.loads(encoded))
+
+
+def retain_observation(identity, execution, message, call):
+    if not execution.operation_id or not execution.logical_key or execution.uncertain:
+        return
+    try:
+        task_events.retain_operation_observation(identity, execution.operation_id, message.tool_call_id,
+            execution.logical_key, execution.attempt,
+            _encode(BatchObservation((message,), pending_question=execution.pending_question,
+                    execution_waits=execution.execution_waits), [call]))
+    except task_events.TaskConflict:
+        _report_failure("retain", "operation_observation_unconfirmed", 1)
+
+
 def _calls(response):
     if not isinstance(response, AIMessage):
         raise TypeError("batch_journal_requires_ai_message")
@@ -121,8 +150,8 @@ def _calls(response):
             or any(not isinstance(c.get("name"), str) or not c["name"]
                    or not isinstance(c.get("args"), dict) for c in calls)):
         raise ValueError("invalid_batch_call_ids")
-    # Snapshot only native calls, never the AIMessage or provider-private state.
-    return json.loads(_json(calls))
+    # Keep operation identities independent of observation normalization.
+    return json.loads(task_events.canonical(calls))
 
 
 def _validate(batch, calls):
@@ -138,7 +167,7 @@ def _validate(batch, calls):
         raise TypeError("executor_observation_must_be_tool_message")
     names = {call["id"]: call["name"] for call in calls}
     ids = [m.tool_call_id for m in batch.messages]
-    if len(ids) != len(names) or set(ids) != set(names):
+    if ids != list(names):
         raise ValueError("executor_observation_pairing_mismatch")
     if any(m.name and m.name != names[m.tool_call_id] for m in batch.messages):
         raise ValueError("executor_observation_name_mismatch")
@@ -171,11 +200,15 @@ def _encode(batch, calls):
     return encoded
 
 
+def _reject_nonfinite(_):
+    raise ValueError("batch_non_finite_number")
+
+
 def _decode(encoded, calls):
     try:
         if len(encoded.encode("utf-8")) > MAX_BATCH_BYTES:
             raise ValueError("oversized_batch_checkpoint")
-        data = json.loads(encoded)
+        data = json.loads(encoded, parse_constant=_reject_nonfinite)
         fields = {"version", "messages", "pending_question", "unknown_operations", "context_notes"}
         version = data.get("version") if isinstance(data, dict) else None
         if (type(version) is not int or version not in (1, 2)
@@ -195,7 +228,7 @@ def _decode(encoded, calls):
             unknown_operations=tuple(data["unknown_operations"]),
             context_notes=tuple(data["context_notes"]),
             execution_waits=tuple(data.get("execution_waits", ())))
-        _encode(batch, calls)  # Recheck schema, JSON types, size and pairing.
+        _validate(batch, calls)
         return batch
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         _report_failure("read", "batch_observation_invalid", len(calls))
@@ -226,8 +259,38 @@ class BatchJournal:
                 or job["status"] not in {"running", "detached"}):
             raise task_events.TaskConflict("agent_execution_identity_conflict")
 
+    def _read_intent(self, conn, calls):
+        observations = []
+        for call in calls:
+            row = conn.execute(
+                "SELECT * FROM task_operations WHERE job_id=? AND owner_user_id=? AND tool_call_id=? "
+                "AND logical_key <> '' AND host_observation <> ''",
+                (self.identity.run_id, self.identity.owner_user_id, call["id"])).fetchone()
+            if not row or row["tool_name"] != call["name"] or row["status"] in {"running", "interrupted", "unknown"}:
+                raise RecoveryRequiresReconciliation()
+            try:
+                expected = task_events.input_hash({"tool": call["name"], "args": call["args"],
+                                                   "refs": json.loads(row["input_refs"])})
+                item = _decode(row["host_observation"], [call])
+                metadata = item.messages[0].additional_kwargs
+                publication = metadata["host_publication"]
+                raw = json.loads(row["result"])["content"]
+                reference = metadata["result_reference"]
+                if (expected != row["input_hash"] or metadata["operation_id"] != row["operation_id"]
+                        or publication["logical_key"] != row["logical_key"]
+                        or publication["attempt"] != row["dispatch_attempt"] or item.unknown_operations
+                        or reference["full_sha256"] != hashlib.sha256(raw.encode("utf-8")).hexdigest()):
+                    raise RecoveryRequiresReconciliation()
+            except (KeyError, TypeError, ValueError, AttributeError):
+                raise RecoveryRequiresReconciliation() from None
+            observations.append(item)
+        return BatchObservation(tuple(item.messages[0] for item in observations),
+            pending_question=any(item.pending_question for item in observations),
+            execution_waits=tuple(dict.fromkeys(wait for item in observations for wait in item.execution_waits)))
+
     async def execute(self, response: AIMessage,
-                      execute: Callable[[AIMessage, ExecutionIdentity], Awaitable[BatchObservation]]
+                      execute: Callable[[AIMessage, ExecutionIdentity], Awaitable[BatchObservation]],
+                      *, validate_recovered: Callable[[ToolMessage], object] | None = None,
                       ) -> BatchObservation:
         calls = _calls(response)
         identity = self.identity
@@ -235,6 +298,7 @@ class BatchJournal:
             "owner_user_id": identity.owner_user_id, "session_id": identity.session_id,
             "request_id": identity.user_turn_id, "calls": calls,
         }).encode("utf-8")).hexdigest()
+        recovered = None
         with task_events.transaction() as conn:
             self._authorize(conn)
             conn.execute("""CREATE TABLE IF NOT EXISTS agent_batch_journal (
@@ -252,14 +316,23 @@ class BatchJournal:
                 row = conn.execute("SELECT status,observation FROM agent_batch_journal "
                                    "WHERE run_id=? AND batch_digest=?",
                                    (identity.run_id, digest)).fetchone()
-                if row["status"] != "complete":
+                if row["status"] == "complete":
+                    return _decode(row["observation"], calls)
+                if validate_recovered is None:
                     raise RecoveryRequiresReconciliation()
-                return _decode(row["observation"], calls)
-        # Intent is committed and the connection is closed before this await.
-        # Any exception/cancellation leaves intent untouched and propagates.
-        batch = await execute(response, identity)
+                recovered = self._read_intent(conn, calls)
+        if recovered is None:
+            batch = await execute(response, identity)
+        else:
+            for message in recovered.messages:
+                try:
+                    validate_recovered(message)
+                except (ValueError, RuntimeError, sqlite3.Error):
+                    raise RecoveryRequiresReconciliation() from None
+            batch = recovered
         try:
             encoded = _encode(batch, calls)
+            canonical_batch = _decode(encoded, calls)
         except _EncodingError as exc:
             reason = exc.args[0]
             _report_failure("encode", reason, len(calls))
@@ -277,4 +350,4 @@ class BatchJournal:
         except sqlite3.Error:
             _report_failure("commit", "batch_observation_commit_unconfirmed", len(calls))
             raise BatchObservationNotStored(effects_uncertain=bool(batch.unknown_operations)) from None
-        return batch
+        return canonical_batch

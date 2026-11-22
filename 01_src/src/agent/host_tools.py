@@ -5,6 +5,7 @@ verification and full-result storage. They do not own a model loop.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -183,7 +184,8 @@ class HostTools:
         from src.core.progress_bus import emit_tool_call_start, emit_tool_executing
         from src.tools.interaction import bind_question_context, reset_question_context
         from src.core.task_events import TaskConflict
-        logical_key = call['_host_logical_key'] = 'host:' + uuid.uuid4().hex
+        call = deepcopy(call)
+        logical_key = 'host:' + uuid.uuid4().hex
         retry_of = call['args'].get('retry_of') if call['name'] == 'browse_web' else None
         retry_target = self._claim_target(call, retry_of) if retry_of else None
         if retry_of and retry_target is None:
@@ -192,7 +194,6 @@ class HostTools:
         if retry_target:
             _, parent = self._find_retry_parent(retry_of)
             attempt += parent['attempt']
-        call['_attempt'] = attempt
         ledger = current_execution_ledger()
         if ledger:
             ledger.start(call["id"], call["name"], call["args"], source="provider",
@@ -214,6 +215,9 @@ class HostTools:
             and not retrieval_denied(query, "web"))
         def dispatched():
             self.dispatched[call["id"]] = call["name"]
+            if call['name'] == 'verify_uploaded_references' and call['args'].get('operation', 'run') == 'run':
+                from src.core.public_progress import emit_tool_milestone
+                emit_tool_milestone('checking_references', job_id=identity.run_id, tool_call_id=call['id'])
         try:
             from contextlib import nullcontext
             from .code_tools import CODE_TOOL_NAMES, EXECUTION_WAIT_TOOL_NAMES, code_execution_context
@@ -226,7 +230,8 @@ class HostTools:
                 retry_binding = bind_navigation_retry(retry_target)
             with binding, retry_binding:
                 message = await _run_single_tool(tool, call, require_durable=True,
-                                                 on_dispatch=dispatched, retry_of=retry_of or None)
+                                                 on_dispatch=dispatched, retry_of=retry_of or None,
+                                                 logical_key=logical_key, attempt=attempt)
         except TaskConflict as exc:
             if str(exc) != 'browse_retry_rejected':
                 raise
@@ -234,8 +239,6 @@ class HostTools:
         finally:
             tracing.set_web_search_enabled(previous_network)
             reset_question_context(token)
-        # Preserve the real observation even if publishing subsequently fails.
-        self.messages[call["id"]] = message
         artifact = message.artifact if isinstance(message.artifact, dict) else {}
         question = artifact.get("user_question")
         if call["name"] == "request_user_input" and isinstance(question, dict):
@@ -257,19 +260,24 @@ class HostTools:
             operation_id=str(message.additional_kwargs.get("operation_id") or ""),
             uncertain=bool(message.additional_kwargs.get("operation_uncertain")),
             pending_question=self.pending_question is not None,
-            execution_waits=execution_waits)
+            execution_waits=execution_waits, logical_key=logical_key, attempt=attempt)
 
     async def publish(self, call, execution, identity):
         if identity != self.identity:
             raise ValueError("publication_identity_mismatch")
-        from src.graph.agent_operations import _emit_completed_tool_step, _capture_interaction_refs
+        from src.graph.agent_operations import _emit_completed_tool_step
         from src.core.progress_bus import emit_encoded
         from src.core.tool_result_view import delivery_issue, first_delivery
-        message = execution.message
-        self.messages[call["id"]] = message
-        if '_host_logical_key' not in call:
-            call['_host_logical_key'] = 'host:' + uuid.uuid4().hex
-        _emit_completed_tool_step(call, message, self.records)
+        from .batch_journal import persistent_message, retain_observation
+        original = execution.message
+        message = original.model_copy(update={"additional_kwargs": dict(original.additional_kwargs)})
+        records = []
+        _emit_completed_tool_step(call, message, records,
+                                  logical_key=execution.logical_key or 'host:' + uuid.uuid4().hex,
+                                  attempt=execution.attempt)
+        if not records:
+            raise RuntimeError("operation_publication_unavailable")
+        record = records[0]
         storage = message.additional_kwargs.get("result_storage") or {}
         if not storage.get("complete"):
             # The operation receipt and its model delivery settle separately.
@@ -280,17 +288,18 @@ class HostTools:
         from src.core.tool_results import pin_references
         if not pin_references(identity.session_id, [message.tool_call_id]):
             raise RuntimeError("checkpoint_evidence_pin_failed")
-        _capture_interaction_refs(self.state, [message])
-        artifact = message.artifact if isinstance(message.artifact, dict) else {}
-        self.main_results.extend(artifact.get("main_results") or [])
-        self.web_results.extend(artifact.get("web_results") or [])
         delivered = first_delivery(message, call=call,
                                    reader_available="read_tool_result" in self.allowed_names)
         issue = delivery_issue(delivered) if delivered is not message else None
         if issue:
             emit_encoded("context_degraded", {"stage": "tool_delivery", "status": "degraded",
                 "reason_code": issue[0], "tool_call_id": message.tool_call_id, "message": issue[1]})
-        record = self.records[-1]
+        if isinstance(record.get('op_receipt'), dict):
+            from .batch_journal import observation_json
+            try:
+                record['op_receipt'] = json.loads(observation_json(record['op_receipt']))
+            except (ValueError, TypeError, RecursionError):
+                record['op_receipt'] = {}
         delivered.additional_kwargs['host_publication'] = record
         if delivered.name == 'browse_web':
             self.validate_observation(delivered)
@@ -300,7 +309,39 @@ class HostTools:
                 payload['host_browse_retry'] = {'retry_of': target['operation_id'], 'tab_id': target['tab_id']}
                 delivered = delivered.model_copy(update={'content': json.dumps(payload, ensure_ascii=False)})
         delivered.additional_kwargs['host_publication'] = dict(record)
-        self.messages[call["id"]] = delivered
+        try:
+            if original.artifact is not None and not isinstance(original.artifact, dict):
+                raise TypeError("unsupported_tool_artifact")
+            delivered = persistent_message(delivered)
+        except (TypeError, ValueError, RecursionError):
+            status = 'unknown' if execution.uncertain else 'partial' if record['status'] in {'complete', 'partial'} else record['status']
+            record.update(status=status, reason='batch_observation_not_stored')
+            delivered.additional_kwargs['host_publication'] = dict(record)
+            metadata = {key: delivered.additional_kwargs[key] for key in (
+                'operation_id', 'operation_uncertain', 'execution_dispatched', 'result_reference',
+                'result_storage', 'host_publication', 'host_preflight_reconciled',
+            ) if key in delivered.additional_kwargs}
+            delivered = persistent_message(ToolMessage(
+                content="回执已保存，但部分观察无法编码。请按原调用读取回执、查看已登记成果，勿重复执行。",
+                tool_call_id=call['id'], name=call['name'], status='error', additional_kwargs=metadata,
+                artifact={'_tool_outcome': {'status': status, 'reason_code': 'batch_observation_not_stored'},
+                          '_artifact_validations': record['artifact_validations']},
+            ))
+            emit_encoded("context_degraded", {"stage": "tool_delivery", "status": "degraded",
+                "reason_code": "batch_observation_not_stored", "tool_call_id": call['id'],
+                "message": "部分工具观察无法编码，已登记的成果仍可查看。"})
+        retain_observation(identity, execution, delivered, call)
+        self.records.append(record)
+        self._adopt_observation(delivered)
+        if record.get('status') == 'complete':
+            category = ''
+            if call['name'] in {'inspect_uploaded_table', 'audit_uploaded_table', 'audit_uploaded_data', 'audit_uploaded_data_bundle'}:
+                category = 'table_processed'
+            elif call['name'] in {'run_research_figure_script', 'draw_svg'} and record.get('artifact_count'):
+                category = 'figure_registered'
+            if category:
+                from src.core.public_progress import emit_tool_milestone
+                emit_tool_milestone(category, job_id=identity.run_id, tool_call_id=call['id'])
         self.publish_resolutions()
         return delivered
 
@@ -323,10 +364,13 @@ class HostTools:
     def restore_observation(self, message):
         """Hydrate a committed outbox result without re-publishing bounded text."""
         record = dict(self.validate_observation(message))
-        from src.graph.agent_operations import _capture_interaction_refs
         self._link_successful_retry(message, record)
-        self.messages[message.tool_call_id] = message
         self.records.append(record)
+        self._adopt_observation(message)
+
+    def _adopt_observation(self, message):
+        from src.graph.agent_operations import _capture_interaction_refs
+        self.messages[message.tool_call_id] = message
         _capture_interaction_refs(self.state, [message])
         artifact = message.artifact if isinstance(message.artifact, dict) else {}
         self.main_results.extend(artifact.get("main_results") or [])

@@ -21,9 +21,9 @@ CATALOG_PATH = "02_config/skills.catalog.json"
 HISTORY_ROOT = "02_config/skill-history"
 PINNED = {
     "candidate-search": ("2.0.0", "0c216b5803a20b50290a72b44d4e019f3f5cf4c256fd3b3549fd844465ae4d50"),
-    "reference-verification": ("2.0.0", "1d2f55aaec2531b178d79dd005a44a11d3d04c0cc50e54f72f75c3813fbf3a62"),
-    "data-audit": ("2.1.1", "39182c64c3ec9095e0fbf2385fd8d4073af5829717fdc83d3c83a19acdfe76dc"),
-    "nature-figure": ("2.1.1", "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6"),
+    "reference-verification": ("2.0.1", "303849896abdf947b3555f416fbf4408bf05bd2691588c2d109e2bc2e4ab0d00"),
+    "data-audit": ("2.1.2", "9466c9b6ff7b13ec09d598a35d51d4559481105df92fd262da33d8e579b054a5"),
+    "nature-figure": ("2.1.2", "d8a629298048632590fc58b3e00030bf06a439cb79324ed7a9615bef2a7e174e"),
 }
 # Compatibility aliases naming the known prior releases that remain readable.
 # Discovery itself is generic under HISTORY_ROOT; these values are retained for

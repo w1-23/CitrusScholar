@@ -75,6 +75,23 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual([turn['turn_request_id'] for turn in response.json()['turns']],
                          ['original-client-request', 'later-client'])
 
+    def test_history_and_replay_use_the_same_public_note_identity(self):
+        from src.core.progress_bus import PUBLIC_WORK_NOTES
+        job_id = self.claim.job_id
+        observed = task_events.append_event(job_id, "assistant_progress", {
+            "job_id": job_id, "visibility": "public", "origin": "host", "category": "table_processed",
+            "note_id": "fixture-progress", "text": "private fixture input"})
+        task_events.append_event(job_id, "text_reset", {"job_id": job_id})
+        live = self.client.get(f"/jobs/{job_id}/events").json()
+        saved = self.client.get(f"/sessions/{self.sid}/messages").json()
+        rows = [item for item in saved["turns"][0]["trace"] if item.get("event") == "assistant_progress"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["seq"], observed["seq"])
+        self.assertEqual(rows[0]["data"]["note_id"], "fixture-progress")
+        self.assertEqual(rows[0]["data"]["text"], PUBLIC_WORK_NOTES["table_processed"])
+        self.assertIn("fixture-progress", str(live))
+        self.assertNotIn("private fixture input", str(live) + str(saved))
+
     def test_terminal_snapshot_and_event_cursor_share_a_view(self):
         job_id = self.claim.job_id
         initial = task_events.append_event(job_id, 'job', {'job_id': job_id, 'status': 'running'})

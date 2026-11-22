@@ -11,9 +11,8 @@ Guards the F1 contract end to end without executing vendor code or any network:
 * the superseded adapter identity and the old 40-file identity stay documented,
   and the legacy read API still serves the old identity.
 
-The adapter catalog resolves one pinned identity per skill. Until the main
-session updates ``research_skill_catalog.PINNED`` to the new catalog identity,
-the runtime-integration test pins it locally and a wiring test reports a skip.
+The adapter catalog resolves one pinned identity per skill and serves exact
+resources for the superseded releases.
 """
 from __future__ import annotations
 
@@ -40,7 +39,10 @@ VENDOR_INVENTORY_SHA256 = (
 OLD_ADAPTER_VERSION = "2.0.0"
 OLD_ADAPTER_DIGEST = (
     "00779e01d2c8756245c3553adb8abf451c4eb1dcd15c46ce7192ce3892d7f127")
-NEW_ADAPTER_VERSION = "2.1.0"
+PREVIOUS_ADAPTER_VERSION = "2.1.1"
+PREVIOUS_ADAPTER_DIGEST = (
+    "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6")
+NEW_ADAPTER_VERSION = "2.1.2"
 REMOVED_DANGLING = ("tests/test_resources.py", "vendor/nature-skills/.gitattributes")
 VENDOR_ONLY_EXTRAS = {"INTEGRATION.md", "provenance.json"}
 
@@ -96,25 +98,26 @@ def test_catalog_identity_is_self_consistent():
 def test_catalog_closure_has_no_dangling_entries():
     row = _catalog_row()
     paths = [record["path"] for record in row["files"]]
-    assert len(paths) == len(set(paths)) == 57
+    assert len(paths) == len(set(paths)) == 58
     assert "references/figure-methods.md" in paths
+    assert "references/standalone-cli.md" in paths
     assert "tests/test_resources.py" not in paths
     assert "provenance.json" in paths
     _assert_records(SKILL_ROOT, row["files"])
     for dangling in REMOVED_DANGLING:
         if dangling == "tests/test_resources.py":
             assert not (SKILL_ROOT / dangling).exists()
-    # The superseded identity is stated explicitly on the current record.
-    assert row["supersedes"]["version"] == OLD_ADAPTER_VERSION
-    assert row["supersedes"]["manifest_sha256"] == OLD_ADAPTER_DIGEST
-    assert set(row["supersedes"]["removed_dangling_entries"]) == set(REMOVED_DANGLING)
+    assert row["supersedes"] == {
+        "version": PREVIOUS_ADAPTER_VERSION,
+        "manifest_sha256": PREVIOUS_ADAPTER_DIGEST,
+    }
 
 
 def test_outer_provenance_closure_has_no_dangling_entries():
     prov = _outer_provenance()
     assert prov["version"] == NEW_ADAPTER_VERSION
     paths = [record["path"] for record in prov["files"]]
-    assert len(paths) == len(set(paths)) == 56
+    assert len(paths) == len(set(paths)) == 57
     assert "references/figure-methods.md" in paths
     assert "vendor/nature-skills/.gitattributes" not in paths
     assert not (SKILL_ROOT / "vendor/nature-skills/.gitattributes").exists()
@@ -123,9 +126,10 @@ def test_outer_provenance_closure_has_no_dangling_entries():
     assert prov["vendor"]["skill_version"] == VENDOR_SKILL_VERSION
     identity = prov["adapter_identity"]
     assert identity["version"] == NEW_ADAPTER_VERSION
-    assert identity["supersedes"]["version"] == OLD_ADAPTER_VERSION
-    assert identity["supersedes"]["catalog_manifest_sha256"] == OLD_ADAPTER_DIGEST
-    assert set(identity["supersedes"]["removed_dangling_entries"]) == set(REMOVED_DANGLING)
+    assert identity["supersedes"] == {
+        "version": PREVIOUS_ADAPTER_VERSION,
+        "catalog_manifest_sha256": PREVIOUS_ADAPTER_DIGEST,
+    }
 
 
 def test_vendor_snapshot_and_legacy_snapshot_are_byte_identical():
@@ -168,10 +172,9 @@ def test_legacy_registry_still_reads_the_old_identity():
     assert "".join(pages) == text
 
 
-def test_runtime_discovery_and_paginated_reads(monkeypatch):
+def test_runtime_discovery_and_paginated_reads():
     row = _catalog_row()
     identity = (row["version"], row["sha256"])
-    monkeypatch.setitem(research_skill_catalog.PINNED, "nature-figure", identity)
 
     discovered = {entry["id"]: entry for entry in research_skill_catalog.list_skills()}
     assert "nature-figure" in discovered
@@ -179,7 +182,8 @@ def test_runtime_discovery_and_paginated_reads(monkeypatch):
     assert (info["version"], info["sha256"]) == identity
     assert info["verified"] is True
     assert info["required_resources"] == [
-        "SKILL.md", "references/bridge.md", "references/figure-methods.md"]
+        "SKILL.md", "references/bridge.md", "references/figure-methods.md",
+        "references/standalone-cli.md"]
 
     resolved_row, records, resolved_info = research_skill_catalog.resolve(
         "nature-figure", *identity)
@@ -236,15 +240,35 @@ def test_archived_adapter_reads_original_identity():
     assert all(entry["sha256"] != OLD_ADAPTER_DIGEST for entry in research_skill_catalog.list_skills())
 
 
+@pytest.mark.parametrize(("skill_id", "retired_version", "missing_optional"), [
+    ("data-audit", "2.1.1", "tests/cli_test.py"),
+    ("reference-verification", "2.0.0", "tests/entry_test.py"),
+    ("nature-figure", PREVIOUS_ADAPTER_VERSION, None),
+])
+def test_superseded_method_bundles_preserve_exact_resources(skill_id, retired_version, missing_optional):
+    archive = ROOT / research_skill_catalog.HISTORY_ROOT / skill_id / retired_version
+    row = json.loads((archive / "manifest.json").read_text(encoding="utf-8"))
+    identity = (retired_version, row["sha256"])
+    if skill_id == "nature-figure":
+        assert identity == (PREVIOUS_ADAPTER_VERSION, PREVIOUS_ADAPTER_DIGEST)
+    _, records, info = research_skill_catalog.resolve(skill_id, *identity)
+    assert (info["version"], info["sha256"]) == identity
+    if missing_optional is not None:
+        with pytest.raises(ValueError, match="skill_resource_missing"):
+            research_skill_catalog._verified_bytes(row, missing_optional, records[missing_optional])
+    for name, record in records.items():
+        if name != missing_optional:
+            content = research_skill_catalog._verified_bytes(row, name, record)
+            assert hashlib.sha256(content).hexdigest() == record["sha256"]
+    current = next(item for item in research_skill_catalog.list_skills() if item["id"] == skill_id)
+    current_row, current_records, _ = research_skill_catalog.resolve(skill_id, current["version"], current["sha256"])
+    _assert_records(ROOT / current_row["path"], list(current_records.values()))
+
+
 def test_runtime_pin_is_wired_to_current_identity():
     row = _catalog_row()
     identity = (row["version"], row["sha256"])
-    pinned = research_skill_catalog.PINNED.get("nature-figure")
-    if pinned != identity:
-        pytest.skip(
-            "main-session wiring: research_skill_catalog.PINNED names "
-            f"{pinned} but the catalog identity is {identity}; update PINNED "
-            "(and note the old 2.0.0 identity is documented in provenance.json).")
+    assert research_skill_catalog.PINNED["nature-figure"] == identity
     info = next(entry for entry in research_skill_catalog.list_skills()
                 if entry["id"] == "nature-figure")
     assert (info["version"], info["sha256"]) == identity

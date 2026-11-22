@@ -22,6 +22,7 @@ from unittest import mock
 import pandas as pd
 
 from src.figures.core import capture_outputs
+from src.figures.sandbox import LocalBackend, SandboxJob
 from src.figures.script_outputs import (RenderScriptEmitUnavailable,
                                         classify_render_script_error,
                                         normalize_output_contract,
@@ -68,6 +69,16 @@ def _contract(render_source: str, *, name: str = "relations") -> dict:
 
 
 class StaticRenderScriptContractTests(unittest.TestCase):
+    def test_frozen_renderer_refuses_a_path_before_execution(self):
+        result = capture_outputs("", output_contract=_contract(GOOD_RENDERER), output_key="relations",
+                                 frozen_tables={"tidy": Path("private-fixture-path.csv")})
+        self.assertEqual(result.error_stage, "render")
+        self.assertEqual(result.error_type, "input_type_mismatch")
+        self.assertEqual(result.error_details["parameter"], "data['tidy']")
+        self.assertEqual(result.error_details["expected"], "DataFrame")
+        self.assertNotIn("private-fixture-path.csv", result.error)
+        self.assertEqual(result.figures, {})
+
     def test_provable_emit_reference_is_rejected_with_stable_code(self):
         source = ("frame = data['tidy']\n"
                   "emit.table('tidy', frame, parents=['data'])\n")
@@ -146,6 +157,23 @@ class RealCaptureContractTests(unittest.TestCase):
             frozen_tables={"tidy": _frame()})
         self.assertEqual(result.error, "")
         self.assertIn("relations", result.figures)
+
+    def test_worker_surfaces_a_bounded_diagnostic_for_a_path_emitted_as_a_table(self):
+        contract = normalize_output_contract(_contract(GOOD_RENDERER))
+        with tempfile.TemporaryDirectory() as root:
+            csv = Path(root) / "fixture.csv"
+            csv.write_bytes(b"x,y\n1,2\n")
+            result = LocalBackend().run(SandboxJob(job_id="typed-render-fixture",
+                script="emit.table('tidy', data, parents=['data'])",
+                inputs={"data": "fixture.csv"}, sources={"data": str(csv)},
+                outputs=output_slots(contract), output_contract=contract))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.diagnostic, {
+            "stage": "render", "error_code": "input_type_mismatch",
+            "parameter": "data['tidy']", "expected": "DataFrame", "actual": "PosixPath" if os.name == "posix" else "WindowsPath",
+            "inputs": {"data": "DataFrame mapping"},
+            "line": 1,
+        }, result.message)
 
     def test_legacy_v2_emit_figure_still_works(self):
         contract = normalize_output_contract({

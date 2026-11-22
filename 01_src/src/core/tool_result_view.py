@@ -17,7 +17,7 @@ _WORKSPACE_READS = frozenset({"read", "read_run", "read_skill", "read_skill_reso
 _CONTROL_PRIORITY = (
     "status", "next_action", "terminal", "review_required", "can_resume", "export_ready",
     "audit_id", "review_id", "_tool_outcome", "dataset_ref", "analysis_result_ref",
-    "continuation", "counts", "coverage", "export_requests", "review", "files", "exports",
+    "audit_status", "continuation", "counts", "coverage", "export_requests", "review", "files", "exports",
 )
 
 

@@ -3,12 +3,14 @@ name: data-audit
 description: 对上传表格按适用前提选择检查，给出原始坐标、原值、执行回执和覆盖缺口；按用户需要输出不改数据的标注副本。
 license: MIT
 metadata:
-  version: "2.1.1"
+  version: "2.1.2"
 ---
 
 # 数据审查
 
 先读取表头、字段类型、单位、原始行列和解析覆盖。用户未说明时先做通用缺失、类型和重复检查；实验设计、合法范围、整数汇总和有序模式需要明确配置。38 项是包含诊断的能力目录，不是每次必须运行的检测清单。主 Agent 选择规则并解释结果，脚本不创建 Agent，也不限制其他合法工具。
+
+托管环境可先发现表格区域，再按实际数据选择批量检查或直接用授权 Code。模式提供默认项，接纳自定义结果取决于 Worker 回执、源文件哈希与区域坐标。
 
 独立运行依赖 `citrusscholar-support[audit]==2.0.0`，通过标准安装使用；不导入旧项目 `src`。方法分组见 [references/methods.md](references/methods.md)，精度与覆盖见 [references/precision-and-coverage.md](references/precision-and-coverage.md)，文件标注见 [references/marking.md](references/marking.md)。
 
@@ -31,7 +33,7 @@ metadata:
 
 Pass `checks_json.audit_plan` with `schema: "audit-plan/1"`. Choose
 `experimental_quality` for ordinary quality checks or `research_integrity`
-for specific reuse and consistency questions. Existing source selection,
+for specific reuse and consistency questions. Modes select defaults. Explicit checks still require their own inputs and can be used in either mode. Existing source selection,
 sheet, numeric column, and reported summary parameters still apply.
 Select the desired `cross_file_methods` from the documented fixed catalogue.
 For `comparisons`, bind `left` and `right` to the exact `file_index`, `sheet`,
@@ -50,7 +52,7 @@ All three methods report skipped or incomplete coverage separately from findings
 
 ### One-off Code Worker findings
 
-In `research_integrity` mode, bind the selected account files into the
+For a one-off method in either mode, bind the selected account files into the
 existing offline Code Workspace by ID and hash. Declare a JSON output under
 `/outputs/`. Pass only its `execution_id` and `path` as
 `checks_json.custom_findings` after successful Code Worker acceptance.

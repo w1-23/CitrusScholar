@@ -11,8 +11,8 @@ register the middleware in that case. Final request admission still belongs to
 ModelDriver/run_model_attempt (including bound tool schemas).
 
 required_message_ids is a host-owned callback returning IDs of methods or other
-requirements that must remain verbatim. All system controls, installed skill
-results, real user messages, and all provider-private messages are also protected.
+requirements that must remain verbatim. System controls, real user messages,
+and provider-private messages are also protected.
 Missing required IDs, unsafe protocol state, and archive/model failures raise
 AdmissionStopped; never fall back to lossy trimming. The working trigger
 is a soft compaction opportunity: when no safe reduction exists, the unchanged
@@ -44,10 +44,10 @@ from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.runtime import Runtime
 from pydantic import Field
 
-from .checkpoint_store import WORKING_CONTEXT_ARCHIVE_NAMESPACE, checkpoint_scope, open_checkpoint
+from .checkpoint_store import (CheckpointProtectionError, WORKING_CONTEXT_ARCHIVE_NAMESPACE,
+                               checkpoint_diagnostic, checkpoint_scope, open_checkpoint)
 from .identity import ExecutionIdentity
 from .runtime import AdmissionStopped
-from src.core.model_context import is_skill_result
 from src.core.provider_protocol import _DeepSeekMessage, current_tool_loop_start, uses_deepseek_protocol
 from src.core.request_context import estimate_request, message_dict, model_request
 
@@ -136,6 +136,7 @@ def _report_projection_failure(trace: _ProjectionTrace, error: BaseException,
         diag("context_projection_failed",
              stage=trace.stage,
              error_type=_exception_type(error),
+             checkpoint=checkpoint_diagnostic(error) if isinstance(error, CheckpointProtectionError) else None,
              message_count=trace.message_count,
              protected_count=trace.protected_count,
              eligible_units=trace.eligible_units,
@@ -484,7 +485,7 @@ class WorkingContextProjection(AgentMiddleware):
         units = _units(raw)
         protected = {i for i, m in enumerate(raw) if (
             m.id in required or isinstance(m, (HumanMessage, SystemMessage, _DeepSeekMessage))
-            or is_skill_result(m) or _opaque(m))}
+            or _opaque(m))}
         trace.protected_count = len(protected)
         # A new real user message is itself a valid retained tail. The preceding
         # answer then belongs to history, even if it is the only large message.
@@ -535,7 +536,16 @@ class WorkingContextProjection(AgentMiddleware):
         model = _MeteredSummaryModel(transport=self.summary_model,
                                      identity=self.archive.identity, deadline=self.deadline)
         trace.mark("archive")
-        ref = await self.archive.archive(raw)
+        try:
+            ref = await self.archive.archive(raw)
+        except CheckpointProtectionError as error:
+            diagnostic = checkpoint_diagnostic(error)
+            if diagnostic["reason"] not in {"unsupported_checkpoint_value", "unsupported_public_message_field"}:
+                raise
+            _report_projection_failure(trace, error, self.deadline)
+            self._summary_unavailable = True
+            return self._defer(baseline, reason=diagnostic["reason"], before=before,
+                               protected=len(protected), eligible=len(eligible))
         trace.archived = True
         trace.mark("summary")
         boundary = {sum(len(unit) for unit in selected[:i]) for i in range(1, len(selected))}

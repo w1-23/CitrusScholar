@@ -1,6 +1,6 @@
 {
   "name": "nature-figure",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "distribution": "citrusscholar-support==2.0.0",
   "package": "citrus_figures",
   "vendor": {
@@ -25,8 +25,8 @@
     },
     {
       "path": "SKILL.md",
-      "sha256": "5fd5fe22b50915995f0ed1dab3e83cdef22be275a6e73270d4950aef3f313a87",
-      "size": 5304
+      "sha256": "d74e8d7661bfaa9b0d5ea120f56655c8bee2fe32dfdd6b32673806a0afcfa35d",
+      "size": 2218
     },
     {
       "path": "provenance.extra.json",
@@ -35,13 +35,18 @@
     },
     {
       "path": "references/bridge.md",
-      "sha256": "61b89e70eecdbc8e26b29232b3f28fc2fa16e6b5a979b16dc6a0b4781812d11d",
+      "sha256": "a968acb6cbea2d234e6b89f5946388e03d80db998ac3a136a4012302e66cb73c",
       "size": 6948
     },
     {
       "path": "references/figure-methods.md",
       "sha256": "df985b96cfbac9f04d6931c536cb70f42993d930e91309d8749da309c6a2b8b6",
       "size": 7038
+    },
+    {
+      "path": "references/standalone-cli.md",
+      "sha256": "482dba6da354612c09ed728118e2bacfab1eb3ca07a557d8851496b5e5cb7473",
+      "size": 3915
     },
     {
       "path": "scripts/citrus/bundle_figure.py",
@@ -295,15 +300,11 @@
     }
   ],
   "adapter_identity": {
-    "version": "2.1.0",
+    "version": "2.1.2",
     "kind": "citrus-adapter-resource-set",
     "supersedes": {
-      "version": "2.0.0",
-      "catalog_manifest_sha256": "00779e01d2c8756245c3553adb8abf451c4eb1dcd15c46ce7192ce3892d7f127",
-      "removed_dangling_entries": [
-        "tests/test_resources.py",
-        "vendor/nature-skills/.gitattributes"
-      ]
+      "version": "2.1.1",
+      "catalog_manifest_sha256": "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6"
     },
     "current_catalog": "02_config/skills.catalog.json (skills[id=nature-figure].sha256)"
   }

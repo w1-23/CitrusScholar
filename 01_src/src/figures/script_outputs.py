@@ -29,6 +29,27 @@ class RenderScriptEmitUnavailable(ValueError):
         self.line = line
 
 
+class RenderInputTypeMismatch(ValueError):
+    reason_code = "input_type_mismatch"
+
+    def __init__(self, name: str, actual: str) -> None:
+        self.parameter = f"data[{name!r}]" if _NAME.fullmatch(name) else "data[?]"
+        self.actual = actual
+        super().__init__(f"{self.parameter} requires a frozen DataFrame, received {actual}.")
+
+    def diagnostic(self) -> dict:
+        return {"parameter": self.parameter, "expected": "DataFrame", "actual": self.actual}
+
+
+def require_render_table(name: str, value: Any) -> None:
+    from pathlib import Path
+    from pandas import DataFrame
+
+    if not isinstance(value, DataFrame):
+        actual = type(value).__name__ if isinstance(value, Path) else "non-DataFrame"
+        raise RenderInputTypeMismatch(name, actual if actual in {"Path", "PosixPath", "WindowsPath"} else "non-DataFrame")
+
+
 def _bound_names(tree: ast.AST) -> set[str]:
     """Names the renderer binds anywhere; a bound ``emit`` is not host emit.
 

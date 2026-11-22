@@ -74,6 +74,7 @@ _CHECKPOINT_REASONS = {
     "checkpoint_provider_scope_mismatch": "checkpoint_provider_scope_mismatch",
     "checkpoint_authentication_failed": "checkpoint_authentication_failed",
     "private_protocol_state_missing": "private_protocol_state_missing",
+    "invalid_legacy_tool_call": "invalid_legacy_tool_call",
     "unsupported_checkpoint_value": "unsupported_checkpoint_value",
     "unsupported_checkpoint_key": "unsupported_checkpoint_value",
     "nested_message_in_public_fields": "unsupported_public_message_field",
@@ -89,7 +90,7 @@ _CHECKPOINT_REASONS = {
 }
 _CHECKPOINT_STRUCTURES = frozenset({
     "envelope", "envelope.binding", "envelope.value", "value.tag",
-    "value.mapping_key", "message.public", "message.private", "ciphertext",
+    "value.mapping_key", "message.public", "message.public.tool_calls", "message.private", "ciphertext",
 })
 
 _CHECKPOINT_VALUE_KINDS = frozenset({"path", "date", "message", "other"})
@@ -133,6 +134,16 @@ def _dependency_versions() -> dict[str, str]:
     )}
 
 
+def checkpoint_diagnostic(error: CheckpointProtectionError) -> dict:
+    reason = error.args[0] if error.args and type(error.args[0]) is str else None
+    return {
+        "reason": _CHECKPOINT_REASONS.get(reason, "invalid_checkpoint_payload"),
+        "structure": error.structure if error.structure in _CHECKPOINT_STRUCTURES else "unknown",
+        "value_kind": error.value_kind if error.value_kind in _CHECKPOINT_VALUE_KINDS else "unknown",
+        "schema_version": 1,
+    }
+
+
 @contextmanager
 def _checkpoint_operation(stage: str, namespace: str = ""):
     try:
@@ -140,16 +151,12 @@ def _checkpoint_operation(stage: str, namespace: str = ""):
     except CheckpointProtectionError as error:
         try:
             from src.core.diag import diag
-            original_reason = error.args[0] if error.args and type(error.args[0]) is str else None
             kind = {"": "execution", WORKING_CONTEXT_ARCHIVE_NAMESPACE: "working_context"}.get(
                 namespace, "graph_subspace")
-            structure = error.structure if error.structure in _CHECKPOINT_STRUCTURES else "unknown"
-            value_kind = error.value_kind if error.value_kind in _CHECKPOINT_VALUE_KINDS else "unknown"
             image = os.environ.get("CITRUSQA_APP_IMAGE_SHA256", "")
             diag("checkpoint_protection_failed",
-                 reason=_CHECKPOINT_REASONS.get(original_reason, "invalid_checkpoint_payload"),
-                 stage=stage, namespace=kind, structure=structure, schema_version=1,
-                 key_slot="checkpoint_storage_v1", value_kind=value_kind,
+                 stage=stage, namespace=kind, **checkpoint_diagnostic(error),
+                 key_slot="checkpoint_storage_v1",
                  app_image_sha256=image if re.fullmatch(r"[a-f0-9]{64}", image) else None,
                  **_dependency_versions())
         except Exception:
@@ -204,6 +211,34 @@ class _PrivateMessages(SerializerProtocol):
             raise CheckpointProtectionError("private_protocol_scope_mismatch", structure="message.private")
         return _ProtocolState(self.scope, value["reasoning"])
 
+    @staticmethod
+    def _restore_tool_calls(public: dict) -> dict:
+        calls = public.get("tool_calls")
+        if calls is None:
+            return public
+        native = {"id", "name", "args", "type"}
+        legacy = {"_host_logical_key", "_attempt"}
+        if type(calls) is not list:
+            raise CheckpointProtectionError("invalid_legacy_tool_call", structure="message.public.tool_calls")
+        restored = []
+        for call in calls:
+            if type(call) is not dict or set(call) - native - legacy:
+                raise CheckpointProtectionError("invalid_legacy_tool_call", structure="message.public.tool_calls")
+            if "_host_logical_key" in call:
+                key = call["_host_logical_key"]
+                if (type(key) is not str or len(key) != 37 or not key.startswith("host:")
+                        or any(char not in "0123456789abcdef" for char in key[5:])):
+                    raise CheckpointProtectionError("invalid_legacy_tool_call", structure="message.public.tool_calls")
+            if "_attempt" in call and ("_host_logical_key" not in call or type(call["_attempt"]) is not int
+                                       or not 1 <= call["_attempt"] <= 2**31 - 1):
+                raise CheckpointProtectionError("invalid_legacy_tool_call", structure="message.public.tool_calls")
+            if set(call) & legacy and (type(call.get("id")) is not str or not call["id"]
+                                      or type(call.get("name")) is not str or not call["name"]
+                                      or type(call.get("args")) is not dict):
+                raise CheckpointProtectionError("invalid_legacy_tool_call", structure="message.public.tool_calls")
+            restored.append({key: value for key, value in call.items() if key in native})
+        return {**public, "tool_calls": restored}
+
     def _walk(self, value: Any, *, reading: bool = False) -> Any:
         if type(value) is _DeltaSnapshot:
             if reading:
@@ -241,6 +276,8 @@ class _PrivateMessages(SerializerProtocol):
                     if cls is None or type(public) is not dict:
                         raise CheckpointProtectionError("invalid_public_message")
                     self._check_public_field(public)
+                    if issubclass(cls, AIMessage):
+                        public = self._restore_tool_calls(public)
                     return cls(**public)
                 if (kind == "batch_observation_not_stored"
                         and set(value) == {_TAG, "effects_uncertain"}):
@@ -261,6 +298,8 @@ class _PrivateMessages(SerializerProtocol):
                     if type(public) is not dict or "provider_protocol" in public:
                         raise CheckpointProtectionError("invalid_private_message_public_fields")
                     cls = _DeepSeekMessage if kind == "deepseek" else _DeepSeekMessageChunk
+                    self._check_public_field(public)
+                    public = self._restore_tool_calls(public)
                     try:
                         return cls(**public, provider_protocol=state)
                     except Exception:

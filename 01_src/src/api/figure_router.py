@@ -401,8 +401,8 @@ async def _preview_image(figure_id: str, request: Request, fmt: str, version: in
                                  "Content-Disposition": "inline"})
 
 
-@router.get("/projects/{figure_id}/export/{fmt}")
-async def export_project(figure_id: str, fmt: str, request: Request):
+@router.api_route("/projects/{figure_id}/export/{fmt}", methods=["GET", "HEAD"])
+async def export_project(figure_id: str, fmt: str, request: Request, v: int | None = None):
     """Download the figure in one of its formats."""
     from src.figures import projects
     from src.session import files as session_files
@@ -418,12 +418,14 @@ async def export_project(figure_id: str, fmt: str, request: Request):
     except projects.ProjectError as exc:
         return _fail(exc)
 
+    if v is not None and v != detail["render_version"]:
+        return JSONResponse({"code": "revision_conflict", "detail": "图件版本已更新，请重新打开。"}, status_code=409)
     entry = _find_export(detail, name)
     if not entry:
         return JSONResponse({"detail": f"这张图没有 {name} 格式。"}, status_code=404)
     info = await asyncio.to_thread(session_files.get_account_file,
                                    str(entry.get("file_id") or ""), owner, touch=True)
-    if not info:
+    if not info or not await asyncio.to_thread(Path(info["path"]).is_file):
         return JSONResponse({"detail": "图件文件已不可用，请重新出图。"}, status_code=404)
     return FileResponse(path=info["path"],
                         media_type=projects.MIME_BY_FORMAT[name],

@@ -2602,13 +2602,9 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
             raise ToolArgumentError(f'{exc}；invalid_input') from None
         if plan['mode'] == 'experimental_quality':
             checks.setdefault('selected_checks', list(QUALITY_DEFAULT))
-            if set(checks['selected_checks']) - set(QUALITY_DEFAULT):
-                raise ToolArgumentError('实验质量模式不运行复用和整数一致性规则；请显式选择研究完整性模式。')
     custom = None
     if 'custom_findings' in checks:
         from src.research.custom_audit import validate_reference
-        if plan is None or plan['mode'] != 'research_integrity':
-            raise ToolArgumentError('自定义检测要求显式 research_integrity 审计计划。')
         try:
             custom = validate_reference(checks['custom_findings'])
         except (TypeError, ValueError) as exc:
@@ -2686,7 +2682,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
     完整性模式的 comparisons 支持 sample_alignment（真实 key_columns）、finite_rectangle（原表 rows/columns）、
     window_search（两侧明确的 rectangles，每个包含原表 rows/columns，及 window={rows,columns}、可选 max_windows/max_pairs/seed）。
     每个比较都要绑定来源 file_index/sheet、已知 units，异单位给 right_factor_to_left，并可指定绝对/相对容差。
-    自定义检测在完整性模式传 checks_json.custom_findings={execution_id,path}，path 是已接纳的 /outputs/*.json，
+    自定义检测可传 checks_json.custom_findings={execution_id,path}，path 是已接纳的 /outputs/*.json，
     内容按 data-audit Skill 的 custom-audit-report/1 格式（含输入哈希、报告级覆盖和 findings）。宿主验签、核对坐标，再列为人工复核线索。
     """
     def summarize_findings(targets, digest):

@@ -256,7 +256,7 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clipped["_tool_outcome"]["status"], "partial")
         self.assertEqual(clipped["result_text"], raw[:30])
 
-    async def test_thirty_published_pages_stop_at_budget_with_durable_resume_range(self):
+    async def test_published_pages_survive_soft_budget_and_have_hard_limit_resume_range(self):
         from src.agent.host import _finish
         from src.agent.runtime import RunResult
         from src.config import settings
@@ -296,9 +296,24 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         projector = WorkingContextProjection(archive=FixtureArchive(), summary_model=None, enabled=True,
             trigger_tokens=settings.CONTEXT_WORKING_SOFT_TOKENS, target_tokens=settings.CONTEXT_WORKING_TARGET_TOKENS,
             deadline=started + 12, readback_available=True)
-        with self.assertRaisesRegex(AdmissionStopped, "context_budget_exhausted:tool_observations") as halted:
-            await projector.project(messages)
+        view = await projector.project(messages)
+        self.assertEqual(view, tuple(messages))
         self.assertEqual(await projector.project(messages[:3]), tuple(messages[:3]))
+        calls = []
+
+        def unexpected_dispatch(request):
+            calls.append(request)
+            raise AssertionError("hard context cap must block transport")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected_dispatch)) as transport:
+            model = _ObservedDeepSeekChatOpenAI(model="deepseek-fixture", api_key="fixture",
+                base_url=FixtureArchive.provider_scope[0], max_retries=0, max_tokens=4096,
+                http_async_client=transport)
+            driver = ModelDriver(model, FixtureCatalog(), lambda _: {"analyze"})
+            with patch.object(settings, "CONTEXT_ACTIVE_MAX_INPUT_TOKENS", 5000):
+                with self.assertRaisesRegex(AdmissionStopped, "context_budget_exhausted:tool_observations") as halted:
+                    await driver(view, identity)
+        self.assertEqual(calls, [])
         ledger = ExecutionLedger(session_id=self.sid, request_id="request")
         result = await _finish({"query": "Read synthetic evidence"}, identity, ledger, host,
             RunResult("incomplete", halted.exception.reason, tuple(messages), 30), 1, started)
@@ -317,7 +332,7 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(smaller["result_text"], raw[203_000:206_500])
         self.assertEqual(smaller["tool_result_ref"]["full_sha256"], digest)
 
-    async def test_exact_latest_readback_stops_before_summary_when_it_exceeds_budget(self):
+    async def test_exact_latest_readback_is_retained_above_soft_budget(self):
         class FixtureArchive:
             provider_scope = ("http://127.0.0.1:9/v1", "fixture")
 
@@ -328,11 +343,104 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     ToolMessage(content="b" * 2600, name="read_tool_result", tool_call_id="page-b")]
         projector = WorkingContextProjection(archive=FixtureArchive(), summary_model=None, enabled=True,
             trigger_tokens=1000, target_tokens=650, deadline=time.monotonic() + 3, readback_available=True)
-        with self.assertRaisesRegex(AdmissionStopped, "context_budget_exhausted:tool_observations"):
-            await projector.project(messages)
+        self.assertEqual(await projector.project(messages), tuple(messages))
         self.assertEqual(len(messages[-1].content), 2600)
         projector.enabled = False
         self.assertEqual(await projector.project(messages), tuple(messages))
+
+    async def test_interrupted_batch_recovers_the_same_observations_without_redispatch(self):
+        from types import SimpleNamespace
+        import numpy as np
+        from src.agent.batch_journal import BatchJournal, RecoveryRequiresReconciliation
+        from src.agent.execution import CapabilityExecutor
+
+        self.enterContext(patch.object(jobs, "_DB_PATH", Path(self.session_store.db_path)))
+        claim = jobs.claim_job(self.sid, "request", owner_user_id=7, client_request_id="request", payload={})
+        self.addCleanup(tracing.set_job_id, tracing.get_job_id())
+        tracing.set_job_id(claim.job_id)
+        self.addCleanup(progress_bus.clear_turn_scope)
+        progress_bus.set_turn_scope(self.sid, "request")
+        identity = ExecutionIdentity(7, self.sid, "request", claim.job_id)
+        host = HostTools(identity, {}, allowed_names={"fixture_write"})
+        native = AIMessage(content="", tool_calls=[
+            {"name": "fixture_write", "args": {"mode": mode}, "id": "fixture-" + mode}
+            for mode in ("normal", "rejected")])
+        before = native.model_dump()
+        dispatched = []
+
+        class DispatchCatalog:
+            def resolve(self, name, allowed):
+                assert name in allowed
+                return SimpleNamespace(name=name)
+
+            def execution_mode(self, name):
+                return "parallel"
+
+        class CustomResult:
+            pass
+
+        async def dispatch(tool, call, *, on_dispatch, **kwargs):
+            on_dispatch()
+            dispatched.append(call["id"])
+            value = np.array([1.0, np.nan]) if call["args"]["mode"] == "normal" else CustomResult()
+            return ToolMessage(content="fixture output", name=tool.name, tool_call_id=call["id"],
+                artifact={"value": value, "_tool_outcome": {"status": "complete"}})
+
+        execute = CapabilityExecutor(DispatchCatalog(), lambda _: {"fixture_write"}, host.invoke, host.publish)
+        live = None
+
+        async def interrupt_after_publication(response, binding):
+            nonlocal live
+            live = await execute(response, binding)
+            raise RuntimeError("fixture interrupted before batch commit")
+
+        async def forbidden_dispatch(*args):
+            self.fail("an existing intent must never dispatch again")
+
+        with patch("src.tools.registry._execute_single_tool", dispatch):
+            with self.assertRaisesRegex(RuntimeError, "fixture interrupted"):
+                await BatchJournal(identity).execute(native, interrupt_after_publication)
+        self.assertEqual(native.model_dump(), before)
+        self.assertCountEqual(dispatched, ["fixture-normal", "fixture-rejected"])
+        self.assertEqual(live.messages[0].artifact["value"], [1.0, None])
+        self.assertEqual(live.messages[1].status, "error")
+        self.assertEqual(live.messages[1].artifact["_tool_outcome"]["status"], "partial")
+        restored = HostTools(identity, {}, allowed_names={"fixture_write"})
+        with task_events.transaction() as conn:
+            conn.execute("UPDATE task_operations SET status='unknown' WHERE tool_call_id='fixture-rejected'")
+        with self.assertRaises(RecoveryRequiresReconciliation):
+            await BatchJournal(identity).execute(native, forbidden_dispatch, validate_recovered=restored.validate_observation)
+        with task_events.transaction() as conn:
+            rows = conn.execute("SELECT status,host_observation FROM task_operations ORDER BY tool_call_id").fetchall()
+            self.assertEqual([row["status"] for row in rows], ["complete", "unknown"])
+            self.assertTrue(all(row["host_observation"] for row in rows))
+            conn.execute("UPDATE task_operations SET status='complete' WHERE tool_call_id='fixture-rejected'")
+        recovered = await BatchJournal(identity).execute(native, forbidden_dispatch,
+                                                         validate_recovered=restored.validate_observation)
+        for message in recovered.messages:
+            restored.restore_observation(message)
+        self.assertEqual(live, recovered)
+        self.assertEqual(host.messages, restored.messages)
+        self.assertEqual(recovered, await BatchJournal(identity).execute(native, forbidden_dispatch))
+
+    async def test_intent_without_operation_receipt_requires_reconciliation(self):
+        from src.agent.batch_journal import BatchJournal, RecoveryRequiresReconciliation
+
+        self.enterContext(patch.object(jobs, "_DB_PATH", Path(self.session_store.db_path)))
+        claim = jobs.claim_job(self.sid, "request", owner_user_id=7, client_request_id="request", payload={})
+        identity = ExecutionIdentity(7, self.sid, "request", claim.job_id)
+        native = AIMessage(content="", tool_calls=[{"name": "fixture_write", "args": {}, "id": "fixture"}])
+
+        async def interrupted(*args):
+            raise RuntimeError("fixture interrupted before receipt")
+
+        async def forbidden_dispatch(*args):
+            self.fail("unverified operations must not be replayed")
+
+        with self.assertRaisesRegex(RuntimeError, "fixture interrupted"):
+            await BatchJournal(identity).execute(native, interrupted)
+        with self.assertRaises(RecoveryRequiresReconciliation):
+            await BatchJournal(identity).execute(native, forbidden_dispatch, validate_recovered=lambda _: None)
 
     async def test_sdk_wire_pair_preserves_private_state_and_meters_fixture_usage(self):
         self.enterContext(patch.object(jobs, "_DB_PATH", Path(self.session_store.db_path)))

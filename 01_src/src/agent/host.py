@@ -491,7 +491,8 @@ async def _run(state, identity, ledger):
         return FinalCheck()
 
     from .batch_journal import BatchJournal, BatchObservationNotStored, RecoveryRequiresReconciliation
-    from .checkpoint_store import open_checkpoint, checkpoint_scope
+    from .checkpoint_store import (CheckpointProtectionError, checkpoint_diagnostic,
+                                   checkpoint_scope, open_checkpoint)
     from src.config import PROJECT_ROOT
     journal = BatchJournal(identity)
     from .context_projection import EncryptedContextArchive, WorkingContextProjection
@@ -504,7 +505,6 @@ async def _run(state, identity, ledger):
         enabled=bool(settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True)),
         deadline=deadline, trigger_tokens=settings.CONTEXT_WORKING_SOFT_TOKENS,
         target_tokens=min(settings.CONTEXT_WORKING_TARGET_TOKENS, settings.CONTEXT_WORKING_SOFT_TOKENS),
-        required_message_ids=lambda: skills.required_message_ids,
         readback_available="read_context_evidence" in refresh_allowed(),
         tool_schemas=lambda: driver.schemas_for(identity), on_projection=context_projected)
 
@@ -521,7 +521,7 @@ async def _run(state, identity, ledger):
         return await driver(view, current_identity)
 
     async def durable_execute(response, current_identity):
-        batch = await journal.execute(response, execute)
+        batch = await journal.execute(response, execute, validate_recovered=host.validate_observation)
         # Reconstruct publication views after replay of a fully saved outbox batch.
         known = {m.tool_call_id for m in host.messages.values()}
         for call, message in zip(response.tool_calls, batch.messages):
@@ -603,11 +603,16 @@ async def _run(state, identity, ledger):
             reason = ("recovery_requires_reconciliation"
                       if isinstance(exc, RecoveryRequiresReconciliation) or exc.effects_uncertain
                       else exc.reason)
+        elif isinstance(exc, CheckpointProtectionError):
+            diagnostic = checkpoint_diagnostic(exc)
+            logger.warning("Agent checkpoint rejected reason=%s structure=%s schema_version=%s",
+                           diagnostic["reason"], diagnostic["structure"], diagnostic["schema_version"])
+            reason = "checkpoint_recovery_incomplete"
         elif isinstance(exc, task_events.TaskConflict):
             code = str(exc).split(" (", 1)[0]
             reason = code if code in {"model_budget_exhausted:deadline", "model_budget_exhausted:calls",
                 "model_budget_exhausted:tokens", "context_budget_exhausted", "resource_busy",
-                "durable_operation_context_required", "identity_conflict"} else "resource_or_execution_conflict"
+                "durable_operation_context_required", "identity_conflict", "recovery_requires_reconciliation"} else "resource_or_execution_conflict"
         result = RunResult("incomplete", reason,
             latest.messages if latest else tuple(messages), latest.model_steps if latest else 0,
             pending_tool_calls=latest.pending_tool_calls if latest else ())
@@ -643,9 +648,7 @@ def _settled_trace(messages, host, result):
                     additional_kwargs=host.identity.message_metadata("tool"))
                 from uuid import uuid4
                 from src.graph.agent_operations import _emit_completed_tool_step
-                if not call.get("_host_logical_key"):
-                    call["_host_logical_key"] = "host:" + uuid4().hex
-                _emit_completed_tool_step(call, observed, host.records)
+                _emit_completed_tool_step(call, observed, host.records, logical_key="host:" + uuid4().hex)
             trace.append(observed)
     return trace
 
@@ -740,6 +743,7 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
             "context_summary_input_limit": "工作摘要的输入超过模型窗口，没有发出该摘要请求。",
             "context_summary_incomplete": "工作摘要输出未完成，原始上下文未被替换。",
             "context_summary_timeout": "工作摘要请求超时，原始上下文未被替换。",
+            "checkpoint_recovery_incomplete": "无法安全恢复本轮执行状态，已登记的成果仍可查看。",
             "context_projection_deadline": "准备工作上下文时达到任务时限。",
             "context_summary_attempt_failed": "工作摘要请求失败，原始上下文未被替换。",
             "model_budget_reserved:finalization": "余量已为最终答复保留，不再发起中间调用。",

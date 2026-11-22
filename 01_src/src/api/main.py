@@ -5603,7 +5603,7 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
                        include_pending: bool = True) -> list[dict]:
     """Join saved turns and rediscover unsaved tasks by durable identities only."""
     from src.core import jobs
-    from src.core.task_events import latest_context_snapshot, public_job_terminal
+    from src.core.task_events import latest_context_snapshot, public_job_terminal, public_working_notes
     from src.core.user_questions import list_questions, get_continuation
     keys = [str(turn.get("turn_request_id") or "") for turn in turns]
     saved = {key for key in (saved_request_ids or []) if key}
@@ -5619,6 +5619,15 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
                     terminal_snapshot=public_job_terminal(job), replay_cursor=0,
                     context_snapshot=latest_context_snapshot(job["job_id"]),
                     question=questions[0] if questions else None)
+        try:
+            notes = public_working_notes(job["job_id"])
+        except Exception as exc:
+            logger.warning("public_progress_failed stage=history kind=%s", type(exc).__name__)
+            notes = []
+        if any(item["data"].get("origin") == "model" for item in notes):
+            turn["trace"] = [item for item in turn["trace"]
+                             if not (item.get("kind") == "note" and item.get("origin") == "model")]
+        turn["trace"].extend(notes)
         return questions
 
     def is_saved(job):
@@ -6042,9 +6051,10 @@ async def preview_account_file(file_id: str, request: Request):
                      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
                      "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox"})
     if kind in {"pdf", "image", "text"}:
-        return FileResponse(path=info["path"], media_type=mime,
-                            headers={"Cache-Control": "private, no-store",
-                                     "X-Content-Type-Options": "nosniff"})
+        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
+        if mime == "image/svg+xml":
+            headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        return FileResponse(path=info["path"], media_type=mime, headers=headers)
     return {"file_id": file_id, "filename": info["filename"], "kind": kind,
             "mime_type": mime, "size_bytes": info["size_bytes"],
             "download_url": info["download_url"],

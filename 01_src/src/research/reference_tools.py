@@ -5,26 +5,22 @@ import json
 from langchain_core.tools import tool
 
 
-def _continuation(payload):
-    """Method-local next step; do not change audit evidence or tool permissions."""
-    action = payload.get("next_action")
+def _audit_status(payload):
     coverage = payload.get("coverage", {})
+    action = payload.get("next_action")
     ready = bool(payload.get("terminal") or action in {
         "export", "export_and_review", "budget_exhausted_export_partial"})
+    suggestions = ["review_saved_results", "export_saved_results"] if ready else []
+    if coverage.get("pending") and not ready:
+        suggestions.append("check_pending_entries")
+    if coverage.get("retryable"):
+        suggestions.append("review_retryable_source_errors")
     return {
-        "action": "report_saved_results" if ready else "follow_audit_next_action",
-        "audit_next_action": action,
-        "pending": coverage.get("pending"),
-        "retryable": coverage.get("retryable"),
-        "guidance": (
-            "本次核验已到交付或复核边界：依据已保存结果回答，明确未检出、身份冲突、来源错误和待复核项。"
-            "如需解释具体冲突，按 evidence_read 读取本条已存证据；不为证明绝对不存在或消除待复核状态，"
-            "再用 search_literature/deepseek_search/deepseek_fetch 重查相同 DOI、题名、期刊或登记库 API。"
-            "只有用户明确要求额外独立来源，或已存证据暴露会改变结论的具体缺口时，才按该缺口补查并说明目的；"
-            "来源错误仍保留，未检出不等于虚构。用户需要文件时才按同 audit_id 导出；否则直接答复。"
-            if ready else
-            "库存尚未到交付边界，遵循 next_action 处理待核条目或恢复条件，不把当前分页当全部完成。"
-        ),
+        "ready_for_report": ready,
+        "pending": coverage.get("pending", 0),
+        "retryable": coverage.get("retryable", 0),
+        "recommended_actions": suggestions,
+        "evidence_scope": "bibliographic_identity_and_fields",
     }
 
 
@@ -74,7 +70,7 @@ def verify_uploaded_references(file_index: int = 0, references_json: str | list 
                                resume: bool = False, offset: int = 0,
                                include_evidence: bool = False,
                                column_map: dict[str, str] | None = None, encoding: str = "") -> str:
-    """核验文献存在性与书目字段，共用持久 ReferenceAudit。CSV/TSV 可用 column_map 将核验字段映射到来源列名，同名列可省略映射。默认严格读取 UTF-8 或带 BOM 的 UTF-16，GBK/GB18030 等需指定 encoding。首次提供 references_json、粘贴 text、账号 file_id 或本轮附件 file_index；返回 audit_id 后必须沿该 ID 续查，勿重建库存。默认返回紧凑逐条结果，保留无 DOI、重复条目与原文位置；完整候选、证据和 attempt_history 用各行 evidence_read（operation=read、include_evidence=True）按需回读，导出直接使用 audit_id，无需先回读全部证据。operation=run/create/read/list/cancel；run 每次最多 max_rows（默认20，上限100）并继承任务截止和持久请求预算；取消后或重试联网错误用 resume=True；terminal=True/processing_complete=True 表示库存已全部尝试且无待重试项；next_action=export_and_review 时应先交付并人工复核，即使 partial/retryable 仍为真也无需持续默认 resume；不要因 extraction partial 反复 resume。start_index 已退役，不能跳过条目。batch_size 仅保留兼容，不创建独立线程池。登记库未查到不等于虚构；存在性与逐字段准确性分别报告。allow_web 仅兼容旧接口，通用网页回退未执行，所有登记库查询仍服从当前请求的联网授权。publish=True 按此 audit_id 导出全量 XLSX；其他格式用 deliver_research_artifact(kind=bibliography,audit_id=...)。
+    """核验文献存在性与书目字段，共用持久 ReferenceAudit。CSV/TSV 可用 column_map 将核验字段映射到来源列名，同名列可省略映射。默认严格读取 UTF-8 或带 BOM 的 UTF-16，GBK/GB18030 等需指定 encoding。首次提供 references_json、粘贴 text、账号 file_id 或本轮附件 file_index；需要续查同一库存时沿用 audit_id。默认返回紧凑逐条结果，保留无 DOI、重复条目与原文位置；完整候选、证据和 attempt_history 用各行 evidence_read（operation=read、include_evidence=True）按需回读，导出直接使用 audit_id，无需先回读全部证据。operation=run/create/read/list/cancel；run 每次最多 max_rows（默认20，上限100）并继承任务截止和持久请求预算；取消后或重试联网错误用 resume=True；terminal=True/processing_complete=True 表示库存已全部尝试且无待重试项；audit_status 报告待核条目、可重试错误及可选操作。已存结果可导出，缺失和不确定项保留原状态。start_index 已退役，不能跳过条目。batch_size 仅保留兼容，不创建独立线程池。登记库未查到不等于虚构；存在性与逐字段准确性分别报告。allow_web 仅兼容旧接口，通用网页回退未执行，所有登记库查询仍服从当前请求的联网授权。publish=True 按此 audit_id 导出全量 XLSX；其他格式用 deliver_research_artifact(kind=bibliography,audit_id=...)。
     """
     from src.core.tracing import get_user_id, get_session_id, get_client_request_id
     from src.research import reference_audit as service
@@ -174,7 +170,8 @@ def verify_uploaded_references(file_index: int = 0, references_json: str | list 
                     payload.update(export_status="failed", export_error=str(exc))
                     payload["_tool_outcome"].update(status="partial", reason_code="publication_failed")
         if operation != "list":
-            payload["continuation"] = _continuation(payload)
+            payload["audit_status"] = _audit_status(payload)
+            payload.pop("next_action", None)
             payload = ({**payload, "result_view": "full_evidence"} if include_evidence
                        else _compact_audit(payload))
         return json.dumps(payload, ensure_ascii=False, allow_nan=False)

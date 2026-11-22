@@ -174,6 +174,21 @@
 
   // ── The project list ───────────────────────────────────────────────────
 
+  function previewUrl(project, format) {
+    return API + '/projects/' + encodeURIComponent(project.figure_id) + '/preview.' + format +
+      '?v=' + encodeURIComponent(project.render_version);
+  }
+
+  function readPreference(name) {
+    try { return window.localStorage.getItem('citrus.figures.' + name); }
+    catch (_) { return null; }
+  }
+
+  function writePreference(name, value) {
+    try { window.localStorage.setItem('citrus.figures.' + name, value); }
+    catch (_) {}
+  }
+
   function renderProjects() {
     var list = el('projectList');
     var footer = el('projectListFooter'), moreButton = el('loadMoreProjects');
@@ -198,14 +213,26 @@
       var staticOnly = project.editable === false ||
         (project.source_kind !== 'svg' && !(project.exports && project.exports.svg));
       var readOnly = staticOnly ? '<span class="project-badge">只读</span>' : '';
+      var exports = project.exports || {};
+      var format = exports.png ? 'png' : exports.svg ? 'svg' : '';
+      var thumbnail = format ? '<img loading="lazy" alt="" src="' + esc(previewUrl(project, format)) + '">' : '';
+      var fallback = '<span class="project-thumb-fallback"' + (format ? ' hidden' : '') + '>无预览</span>';
       return '<li data-id="' + esc(project.figure_id) + '">' +
         '<button class="project-open' + current + '" data-open="' + esc(project.figure_id) +
         '" title="' + esc(when) + '" aria-current="' + (current ? 'true' : 'false') + '">' +
-        '<span class="project-thumb" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="M3 4v16h18M6 15l4-5 4 2 6-7"/><circle cx="6" cy="15" r="1"/><circle cx="10" cy="10" r="1"/><circle cx="14" cy="12" r="1"/><circle cx="20" cy="5" r="1"/></svg></span>' +
+        '<span class="project-thumb">' + thumbnail + fallback + '</span>' +
         '<span class="project-main"><strong>' + esc(project.title || '未命名图件') + '</strong>' +
         '<small>' + esc(project.source_kind === 'svg' ? 'SVG 示意图' : project.source_kind === 'script' ? '脚本图件' : '数据图件') +
         (project.source_kind === 'svg' ? '' : ' · ' + esc(project.objects || 0) + ' 个对象') + readOnly + '</small></span></button></li>';
     }).join('') + (state.projectsLoading ? '<li class="list-empty">正在加载图件…</li>' : '');
+    Array.from(list.querySelectorAll('.project-thumb img')).forEach(function (image) {
+      function showFallback() {
+        image.hidden = true;
+        image.nextElementSibling.hidden = false;
+      }
+      image.addEventListener('error', showFallback, {once: true});
+      if (image.complete && !image.naturalWidth) showFallback();
+    });
   }
 
   // Older projects are fetched with the router's existing limit/offset
@@ -244,13 +271,13 @@
 
   function openProject(figureId, prepareEdit, options) {
     options = options || {};
-    if (options.skipUnsavedGuard) return loadProject(figureId, prepareEdit);
+    if (options.skipUnsavedGuard) return loadProject(figureId, prepareEdit, options.keepSidebar);
     return confirmUnsaved('打开另一图件').then(function (ok) {
       return ok ? loadProject(figureId, prepareEdit) : undefined;
     });
   }
 
-  function loadProject(figureId, prepareEdit) {
+  function loadProject(figureId, prepareEdit, keepSidebar) {
     clearProject();
     state.staticPreview = false;
     var epoch = state.epoch;
@@ -265,6 +292,7 @@
       if (detail.figure_id !== figureId) throw new Error('图件标识不匹配');
       state.opening = null;
       state.current = detail;
+      writePreference('recent', detail.figure_id);
       state.saved = overridesMap(detail.overrides);
       el('saveButton').disabled = detail.editable === false;
       state.selected = '';
@@ -277,7 +305,7 @@
       renderDownloads();
       el('emptyState').hidden = true;
       el('deleteButton').disabled = false;
-      if (state.narrow) setSidebar('left', false);
+      if (state.narrow && !keepSidebar) setSidebar('left', false);
       // A freshly opened project starts on the canvas; the context inspector
       // returns when an object is selected.
       setSidebar('right', false);
@@ -491,26 +519,36 @@
     notice.hidden = !messages.length;
   }
 
-  // A download that never leaves the browser looks like a broken button. Say
-  // when the origin cannot be reached instead of leaving the click silent.
-  function probeExportTransport() {
-    var status = el('exportStatus');
-    if (!status || !state.current) return;
-    var controller = typeof AbortController === 'function' ? new AbortController() : null;
-    var timer = controller ? setTimeout(function () { controller.abort(); }, 4000) : null;
-    var url = API + '/projects/' + encodeURIComponent(state.current.figure_id) +
-      '/preview.svg' + (state.current.render_version ? '?v=' + state.current.render_version : '');
-    fetch(url, {method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
-                signal: controller ? controller.signal : undefined})
-      .then(function (response) {
-        if (timer) clearTimeout(timer);
-        status.hidden = response.ok || response.status === 405;
-        status.textContent = status.hidden ? '' : '服务器返回 ' + response.status + '，导出可能失败。';
-      }, function () {
-        if (timer) clearTimeout(timer);
-        status.hidden = false;
-        status.textContent = '当前无法连接服务器，导出会失败；恢复连接后再试。';
-      });
+  async function downloadSavedFigure(event) {
+    var link = event.currentTarget, url = link.getAttribute('href');
+    if (!url || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    var status = el('exportStatus'), epoch = state.epoch;
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, 5000);
+    status.hidden = true;
+    try {
+      var response = await fetch(url, {method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
+                                      redirect: 'error', signal: controller.signal});
+      if (epoch !== state.epoch || link.getAttribute('href') !== url) return;
+      if (!response.ok || !/^attachment(?:;|$)/i.test(response.headers.get('Content-Disposition') || '')) {
+        throw new Error(response.status === 409 ? '图件版本已更新，请重新打开后下载。' :
+          response.status === 404 ? '当前版本的文件不可用，请刷新图件。' :
+          response.status === 401 || response.status === 403 ? '无法访问此文件，请检查登录和权限。' :
+          '无法下载当前文件（HTTP ' + response.status + '）。');
+      }
+      var download = document.createElement('a');
+      download.href = url;
+      download.download = '';
+      document.body.appendChild(download);
+      download.click();
+      download.remove();
+    } catch (error) {
+      if (epoch !== state.epoch || link.getAttribute('href') !== url) return;
+      status.hidden = false;
+      status.textContent = controller.signal.aborted ? '下载连接超时，请检查连接后重试。' :
+        error instanceof TypeError ? '无法连接服务器，请检查连接后重试。' : error.message;
+    } finally { clearTimeout(timer); }
   }
   function renderDownloads() {
     renderQa();
@@ -519,7 +557,7 @@
       var link = el('download' + format.charAt(0).toUpperCase() + format.slice(1));
       var available = !!(state.current.exports || {})[format];
       link.setAttribute('aria-disabled', available ? 'false' : 'true');
-      if (available) link.href = base + '/export/' + format;
+      if (available) link.href = base + '/export/' + format + '?v=' + encodeURIComponent(state.current.render_version);
       else link.removeAttribute('href');
     });
   }
@@ -527,7 +565,7 @@
   // ── The overlay ────────────────────────────────────────────────────────
 
   function manifestObjects() {
-    if (!state.current || state.current.editable === false || !state.current.manifest) return [];
+    if (!state.current || !state.current.manifest) return [];
     return state.current.manifest.objects || [];
   }
 
@@ -589,9 +627,11 @@
   function fitView() {
     if (!state.current || state.drag || state.view.pan) return;
     var size = canvasSize(), bounds = viewBounds();
-    if (!size.width || !size.height) return;
-    var zoom = Math.min((bounds.width - 80) / (size.width * POINT_TO_CSS),
-      (bounds.height - 80) / (size.height * POINT_TO_CSS), 2);
+    if (![size.width, size.height, bounds.width, bounds.height].every(Number.isFinite) ||
+        size.width <= 0 || size.height <= 0 || bounds.width <= 0 || bounds.height <= 0) return;
+    var padding = Math.min(80, bounds.width / 4, bounds.height / 4);
+    var zoom = Math.min((bounds.width - padding) / (size.width * POINT_TO_CSS),
+      (bounds.height - padding) / (size.height * POINT_TO_CSS), 2);
     state.view.zoom = Math.max(.1, zoom);
     state.view.x = (bounds.width - size.width * POINT_TO_CSS * state.view.zoom) / 2;
     state.view.y = (bounds.height - size.height * POINT_TO_CSS * state.view.zoom) / 2;
@@ -683,9 +723,8 @@
     var narrow = (window.innerWidth || 1200) < 1000;
     if (narrow !== state.narrow) {
       state.narrow = narrow;
-      // Drawers are opt-in at every width. On narrow screens they overlap the
-      // canvas, so never carry two open drawers across a breakpoint change.
       if (narrow) { setSidebar('left', false); setSidebar('right', false); }
+      else setSidebar('left', readPreference('sidebar') !== 'closed');
     }
     if (state.view.fit) fitView();
   }
@@ -1467,9 +1506,8 @@
     var project = state.current, exports = project.exports || {}, image = el('previewImage');
     var figureId = project.figure_id, epoch = state.epoch, version = project.render_version;
     var generation = state.sceneGeneration, controller = new AbortController();
-    var base = API + '/projects/' + encodeURIComponent(figureId);
     var format = exports.svg ? 'svg' : exports.png ? 'png' : '';
-    var url = format ? base + '/preview.' + format + '?v=' + version : '';
+    var url = format ? previewUrl(project, format) : '';
     var maxSceneBytes = 8 * 1024 * 1024;
     function current() { return ownsProject(figureId, epoch) && state.sceneGeneration === generation &&
       state.current.render_version === version && !controller.signal.aborted; }
@@ -1485,10 +1523,21 @@
       };
       image.onerror = function () {
         if (!current() || image.src !== src && image.getAttribute('src') !== src) return;
+        if (usePngFallback()) return;
         state.savedPreviewStatus = '已保存的 ' + format.toUpperCase() + ' 无法预览；请检查下载或重新打开。';
         renderEditState();
       };
       if (image.getAttribute('src') !== src) image.src = src;
+    }
+    function usePngFallback() {
+      if (format !== 'svg' || !exports.png) return false;
+      format = 'png';
+      url = previewUrl(project, format);
+      state.scene = state.hitDocument = state.hitManifest = null;
+      project.edit_requires_preparation = false;
+      staticOnly('SVG 无法显示，已改用当前版本的 PNG 只读预览。');
+      renderEditState();
+      return true;
     }
     function staticOnly(message) {
       project.editable = false;
@@ -1523,6 +1572,9 @@
     fetch(url, {credentials: 'same-origin', signal: controller.signal}).then(function (response) {
       if (!current()) return null;
       if (!response.ok) throw new Error(response.status === 409 ? '图件版本已更新，请重新打开。' : '已保存的 SVG 无法读取。');
+      if (!/^image\/svg\+xml(?:;|$)/i.test(response.headers.get('Content-Type') || '')) {
+        throw new Error('图件预览响应格式不符。');
+      }
       var length = Number(response.headers.get('Content-Length'));
       if (!(length > 0 && length <= maxSceneBytes)) {
         if (response.body) response.body.cancel().catch(function () {});
@@ -1552,7 +1604,7 @@
         if (current()) state.previewError = '本地编辑预览不可用；仍可使用服务端检查。';
       }
     }).catch(function (error) {
-      if (current()) state.savedPreviewStatus = error.message || '已保存的 SVG 无法读取。';
+      if (current() && !usePngFallback()) state.savedPreviewStatus = error.message || '已保存的 SVG 无法读取。';
     }).finally(function () {
       if (!current()) return;
       state.sceneFlight = null;
@@ -2213,8 +2265,8 @@
 
   function init() {
     el('refreshButton').addEventListener('click', function () { loadProjects(); });
-    el('exportMenu').addEventListener('toggle', function () {
-      if (el('exportMenu').open) probeExportTransport();
+    ['downloadSvg', 'downloadPng', 'downloadPdf', 'downloadTiff'].forEach(function (id) {
+      el(id).addEventListener('click', downloadSavedFigure);
     });
     el('saveButton').addEventListener('click', saveEdits);
     el('verifyFigureButton').addEventListener('click', function () { return verifyFigure(false); });
@@ -2407,7 +2459,9 @@
     el('rulerToggle').addEventListener('change', renderGuides);
     ['left', 'right'].forEach(function (side) {
       el('toggle' + (side === 'left' ? 'Left' : 'Right')).addEventListener('click', function () {
-        setSidebar(side, el(side + 'Sidebar').hidden);
+        var open = el(side + 'Sidebar').hidden;
+        setSidebar(side, open);
+        if (side === 'left' && !state.narrow) writePreference('sidebar', open ? 'open' : 'closed');
       });
     });
     el('openProjects').addEventListener('click', function () { setSidebar('left', true); });
@@ -2431,12 +2485,18 @@
     });
     renderEditState();
 
+    if (!state.narrow) setSidebar('left', readPreference('sidebar') !== 'closed');
+    loadDataFiles().catch(function (error) { el('schemaStatus').textContent = error.message || '资料库加载失败。'; });
     var initialEpoch = state.epoch;
     loadProjects().then(function () {
       if (initialEpoch !== state.epoch) return;
       var wanted = new URLSearchParams(location.search).get('project');
-      if (wanted) return openProject(wanted);
-      return null;
+      var initialOpen = {skipUnsavedGuard: true, keepSidebar: true};
+      if (wanted) return openProject(wanted, false, initialOpen);
+      var recent = readPreference('recent');
+      var project = state.projects.find(function (item) { return item.figure_id === recent; }) ||
+        state.projects.find(function (item) { return item.exports && (item.exports.svg || item.exports.png); });
+      return project ? openProject(project.figure_id, false, initialOpen) : null;
     }).catch(function (error) {
       notify(error.message, true);
     });

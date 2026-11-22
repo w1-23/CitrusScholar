@@ -43,6 +43,16 @@ def init_schema(conn):
         conn.execute("ALTER TABLE task_operations ADD COLUMN retry_of TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_operation_retry "
                  "ON task_operations(retry_of) WHERE retry_of IS NOT NULL")
+    if "tool_call_id" not in operation_columns:
+        conn.execute("ALTER TABLE task_operations ADD COLUMN tool_call_id TEXT NOT NULL DEFAULT ''")
+    if "logical_key" not in operation_columns:
+        conn.execute("ALTER TABLE task_operations ADD COLUMN logical_key TEXT NOT NULL DEFAULT ''")
+    if "dispatch_attempt" not in operation_columns:
+        conn.execute("ALTER TABLE task_operations ADD COLUMN dispatch_attempt INTEGER NOT NULL DEFAULT 1")
+    if "host_observation" not in operation_columns:
+        conn.execute("ALTER TABLE task_operations ADD COLUMN host_observation TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_task_operation_call "
+                 "ON task_operations(job_id,tool_call_id) WHERE logical_key <> ''")
     attempt_columns = {r[1] for r in conn.execute("PRAGMA table_info(task_model_attempts)")}
     if "budget_scope" not in attempt_columns:
         conn.execute("ALTER TABLE task_model_attempts ADD COLUMN budget_scope TEXT NOT NULL DEFAULT 'execution'")
@@ -112,6 +122,16 @@ def _append(conn, job_id, event, data):
     return {"seq": seq, "event": event,
             "data": public_progress_payload(event, payload) if event == "task_state" else payload,
             "created_at": now}
+
+
+def public_working_notes(job_id):
+    from src.core.progress_bus import public_progress_payload
+    with transaction() as conn:
+        rows = conn.execute("SELECT seq,data FROM task_events WHERE job_id=? AND event='assistant_progress' "
+                            "ORDER BY seq DESC LIMIT ?", (job_id, LIVE_QUEUE_SIZE)).fetchall()
+    return [{"seq": row["seq"], "event": "assistant_progress",
+             "data": public_progress_payload("assistant_progress", json.loads(row["data"]))}
+            for row in reversed(rows)]
 
 
 def append_event(job_id, event, data):
@@ -340,7 +360,7 @@ def approval_status(approval_id):
 
 
 def start_operation(job_id, owner, tool_name, args, *, recovery_mode="never", input_refs=None,
-                    lease_seconds=600, tool_call_id="", attempt=1, retry_of=None):
+                    lease_seconds=600, tool_call_id="", attempt=1, retry_of=None, logical_key=""):
     refs = input_refs or []
     operation_id, lease = uuid.uuid4().hex, uuid.uuid4().hex
     digest = input_hash({"tool": tool_name, "args": args, "refs": refs})
@@ -356,8 +376,17 @@ def start_operation(job_id, owner, tool_name, args, *, recovery_mode="never", in
             if (tool_name != 'browse_web' or not parent or not parent['result']
                     or conn.execute("SELECT 1 FROM task_operations WHERE retry_of=?", (retry_of,)).fetchone()):
                 raise TaskConflict('browse_retry_rejected')
-        conn.execute("INSERT INTO task_operations (operation_id,job_id,owner_user_id,tool_name,input_hash,inputs,input_refs,recovery_mode,status,lease,lease_until,attempts,updated_at,retry_of) VALUES (?,?,?,?,?,?,?,?,'running',?,?,1,?,?)",
-                     (operation_id, job_id, owner, tool_name, digest, canonical(args), canonical(refs), recovery_mode, lease, time.time()+lease_seconds, time.time(), retry_of))
+        if logical_key and (not tool_call_id or conn.execute(
+                "SELECT 1 FROM task_operations WHERE job_id=? AND tool_call_id=? AND logical_key <> ''",
+                (job_id, tool_call_id)).fetchone()):
+            raise TaskConflict("recovery_requires_reconciliation")
+        conn.execute("INSERT INTO task_operations (operation_id,job_id,owner_user_id,tool_name,input_hash,"
+                     "inputs,input_refs,recovery_mode,status,lease,lease_until,attempts,updated_at,"
+                     "retry_of,tool_call_id,logical_key,dispatch_attempt) "
+                     "VALUES (?,?,?,?,?,?,?,?,'running',?,?,1,?,?,?,?,?)",
+                     (operation_id, job_id, owner, tool_name, digest, canonical(args), canonical(refs),
+                      recovery_mode, lease, time.time()+lease_seconds, time.time(), retry_of,
+                      tool_call_id, logical_key, attempt))
         _append(conn, job_id, "operation", {"operation_id": operation_id, "tool_name": tool_name, "status": "running", "input_hash": digest, "tool_call_id": tool_call_id, "attempt": attempt})
     return operation_id, lease
 
@@ -393,6 +422,8 @@ def finish_operation(operation_id, lease, message, *, attempt=1):
         row = conn.execute("SELECT * FROM task_operations WHERE operation_id=?", (operation_id,)).fetchone()
         if row is None or row["lease"] != lease or row["status"] != "running" or row["lease_until"] < time.time():
             raise TaskConflict("operation_lease_lost")
+        if row["logical_key"] and row["tool_call_id"] != message.tool_call_id:
+            raise TaskConflict("operation_call_identity_conflict")
         job = _job(conn, row["job_id"])
         # Resume commits are independent of the original interrupted terminal view.
         resuming = (job["status"] == "failed" and job["current_step"] == "interrupted"
@@ -400,10 +431,39 @@ def finish_operation(operation_id, lease, message, *, attempt=1):
         if job["status"] not in {"running", "detached"} and not resuming:
             raise TaskConflict("operation_cancelled_or_terminal")
         status = str(outcome.get("status") or "failed")
-        result = canonical({"content": content, "artifact": artifact})
+        from src.agent.batch_journal import observation_json
+        try:
+            if message.artifact is not None and not isinstance(message.artifact, dict):
+                raise TypeError("unsupported_tool_artifact")
+            result = observation_json({"content": content, "artifact": artifact})
+            outcome = json.loads(observation_json(outcome))
+        except (ValueError, TypeError, RecursionError):
+            outcome = {"status": status, "reason_code": "batch_observation_not_stored"}
+            for key in ("result_refs", "artifacts"):
+                refs = result_details(content, artifact).get(key) or artifact.get(key)
+                if isinstance(refs, list) and all(isinstance(ref, str) for ref in refs):
+                    outcome[key] = refs
+            result = canonical({"content": content, "artifact": {}, "observation_status": "encoding_rejected"})
         conn.execute("UPDATE task_operations SET status=?,result=?,result_refs=?,outcome=?,lease_until=0,updated_at=? WHERE operation_id=?", (status, result, canonical(outcome.get("result_refs") or outcome.get("artifacts") or []), canonical(outcome), time.time(), operation_id))
         _append(conn, row["job_id"], "operation", {"operation_id": operation_id, "tool_name": row["tool_name"], "status": status, "outcome": outcome, "tool_call_id": message.tool_call_id, "attempt": attempt})
     return outcome
+
+
+def retain_operation_observation(identity, operation_id, tool_call_id, logical_key, attempt, encoded):
+    with transaction() as conn:
+        job = _job(conn, identity.run_id)
+        if (job["owner_user_id"] != identity.owner_user_id or job["session_id"] != identity.session_id
+                or job["request_id"] != identity.user_turn_id):
+            raise TaskConflict("operation_call_identity_conflict")
+        changed = conn.execute(
+            "UPDATE task_operations SET host_observation=? WHERE operation_id=? AND job_id=? "
+            "AND owner_user_id=? AND tool_call_id=? AND logical_key=? AND dispatch_attempt=? "
+            "AND result <> '' AND status NOT IN ('running','interrupted','unknown') "
+            "AND (host_observation='' OR host_observation=?)",
+            (encoded, operation_id, identity.run_id, identity.owner_user_id,
+             tool_call_id, logical_key, attempt, encoded)).rowcount
+        if changed != 1:
+            raise TaskConflict("recovery_requires_reconciliation")
 
 
 def abandon_operation(operation_id, lease):

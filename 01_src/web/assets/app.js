@@ -3601,7 +3601,7 @@ function createResearchProcessPanel(goal) {
     },
     elapsed: function (ms) { return (Math.max(0, Number(ms) || 0) / 1000).toFixed(1) + ' 秒'; }});
   function note(text, id, metadata) {
-    if (!metadata || metadata.visibility !== 'public' || metadata.origin !== 'model' || metadata.internal === true || metadata.private === true) return;
+    if (!metadata || metadata.visibility !== 'public' || (metadata.origin !== 'model' && !(metadata.origin === 'host' && metadata.category)) || metadata.internal === true || metadata.private === true) return;
     view.note(text, id, Object.assign({}, metadata, {public_note: true}));
   }
   function answerVisible() { /* Public paragraphs remain visible beside the answer. */ }
@@ -3818,7 +3818,29 @@ function appendTurnGeneratedFiles(content, files, headingText) {
     preview.addEventListener('click', function() {
       if (window.openSessionFilePreview) window.openSessionFilePreview(file.file_id);
     });
-    card.appendChild(type); card.appendChild(info); card.appendChild(preview); list.appendChild(card);
+    var svgUrl = window.registeredSvgUrl && window.registeredSvgUrl(file);
+    if (svgUrl) {
+      var image = document.createElement('img');
+      image.className = 'turn-file-svg';
+      image.alt = file.filename || '已登记图件';
+      image.loading = 'lazy';
+      image.width = 64;
+      image.height = 48;
+      image.addEventListener('error', function () { image.hidden = true; type.hidden = false; });
+      type.hidden = true;
+      image.src = svgUrl;
+      card.appendChild(image);
+    }
+    card.appendChild(type); card.appendChild(info); card.appendChild(preview);
+    if (svgUrl) {
+      var download = document.createElement('a');
+      download.className = 'turn-file-open';
+      download.href = svgUrl;
+      download.download = '';
+      download.textContent = '下载原件';
+      card.appendChild(download);
+    }
+    list.appendChild(card);
     added++;
   });
   if (!added) return;                     // no new file: keep the DOM as it was

@@ -134,8 +134,6 @@ def parse_plan(raw):
         raise ValueError("Choose cross-file methods from the stable catalogue")
     if not isinstance(pairs, list) or len(pairs) > 12:
         raise ValueError("At most 12 explicit comparisons per audit")
-    if raw["mode"] != "research_integrity" and (methods or pairs):
-        raise ValueError("Explicit cross-source comparisons require research_integrity")
     parameter_source = raw.get("parameter_source", "provided_bindings")
     if parameter_source not in {"provided_bindings", "experimental_protocol", "instrument_metadata"}:
         raise ValueError("Unknown parameter source")

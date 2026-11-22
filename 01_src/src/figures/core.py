@@ -73,6 +73,7 @@ class ScriptOutputsResult:
     error_type: str = ""
     error_stage: str = "analysis"
     script_line: int | None = None
+    error_details: dict[str, str] = field(default_factory=dict)
 
 
 class _OutputEmitter:
@@ -100,6 +101,8 @@ class _OutputEmitter:
             if any(name in figure.get("parents", []) and "render_script" in figure
                    for figure in self.contract["figures"]):
                 from src.figures.dataset_codec import encode_frame, decode_frame
+                from src.figures.script_outputs import require_render_table
+                require_render_table(name, frame)
                 # Snapshot at emission, before analysis can mutate its frame again.
                 frame = decode_frame(encode_frame(frame))
             self.result.tables[name] = frame
@@ -140,7 +143,8 @@ def capture_outputs(script: str, *, output_contract: dict,
     import matplotlib
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
-    from src.figures.script_outputs import (RenderScriptEmitUnavailable,
+    from src.figures.script_outputs import (RenderInputTypeMismatch, RenderScriptEmitUnavailable,
+                                            require_render_table,
                                             classify_render_script_error,
                                             normalize_output_contract, output_slots,
                                             render_script_emit_runtime_message)
@@ -196,6 +200,9 @@ def capture_outputs(script: str, *, output_contract: dict,
                 missing = set(entry["parents"]) - set(tables)
                 if missing:
                     raise ValueError("Missing frozen output tables: " + ", ".join(sorted(missing)))
+                for name in entry["parents"]:
+                    binding = next((key for key, table in (render_mapping or {}).items() if table == name), name)
+                    require_render_table(binding, tables[name])
                 payloads = {name: encode_frame(tables[name]) for name in entry["parents"]}
                 mapping = render_mapping or {name: name for name in payloads}
                 local_mapping = {key: name for key, name in mapping.items() if name in payloads}
@@ -226,7 +233,12 @@ def capture_outputs(script: str, *, output_contract: dict,
         result.frozen_render_receipts.clear()
         result.report = None
         result.report_emitted = False
-        if isinstance(exc, RenderScriptEmitUnavailable):
+        if isinstance(exc, RenderInputTypeMismatch):
+            result.error_stage = "render"
+            result.error = str(exc)
+            result.error_type = exc.reason_code
+            result.error_details = exc.diagnostic()
+        elif isinstance(exc, RenderScriptEmitUnavailable):
             result.error = f"[RENDER_SCRIPT_EMIT_NOT_AVAILABLE] {exc}"
             result.error_type = exc.reason_code
         else:

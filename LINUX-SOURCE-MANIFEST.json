@@ -1870,8 +1870,8 @@
       "sha256": "c31b60a47ce200fa1e91b50eee4456f28e722999eb6c8375a19969acc4fafa57"
     },
     "01_src/web/assets/skill-picker.js": {
-      "bytes": 5784,
-      "sha256": "45ec25a7ce06eb96662b2e297288de747cdeca411cb2b5512ae22b4ef1343d4e"
+      "bytes": 6131,
+      "sha256": "4b26cbd21629bd176d452541eddc26a7de184b61dd5799969034f816832ec4ea"
     },
     "01_src/web/assets/task-cards.js": {
       "bytes": 20968,
@@ -2636,5 +2636,5 @@
   },
   "schema": "citrusscholar.linux-source/1",
   "source": "Git index",
-  "source_tree_excluding_manifest": "f631a1cfa4a840a116d9c03802d36a3f7b173020"
+  "source_tree_excluding_manifest": "36701c28206bcfe09e54d183cfed4352b9c0f1e3"
 }

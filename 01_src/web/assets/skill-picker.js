@@ -2,6 +2,8 @@
   'use strict';
   var titles = {'candidate-search':'科研检索', 'reference-verification':'文献核验',
     'data-audit':'数据审查', 'nature-figure':'科研绘图'};
+  var localizedDescriptions = {'nature-figure':
+    '使用明确的数据和最终文件，用 Matplotlib 创建、修改、打包与审计科研图。遵循指定版本的 Nature 绘图规范，逐项说明检查覆盖范围，提供可复现的源码与数据包，并保持已锁定的样式。'};
   var scenarioIds = Object.keys(titles);
   function create(options) {
     var selected = [], catalog = [], generation = 0, revision = 0;
@@ -40,7 +42,8 @@
           revision++; drawSummary(); closeMenu(true);
         });
         var text = document.createElement('span'), name = document.createElement('strong'), description = document.createElement('small');
-        name.textContent = title(item); description.textContent = item.description;
+        name.textContent = title(item);
+        description.textContent = localizedDescriptions[item.id] || item.description;
         text.appendChild(name); text.appendChild(description); label.appendChild(check); label.appendChild(text); list.appendChild(label);
       });
       drawSummary();

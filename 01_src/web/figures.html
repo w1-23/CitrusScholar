@@ -6,13 +6,13 @@
   <meta name="robots" content="noindex,nofollow">
   <title>图表工作台 · CitrusScholar</title>
   <link rel="stylesheet" href="/assets/app.css?v=32">
-  <link rel="stylesheet" href="/assets/figures.css?v=11">
+  <link rel="stylesheet" href="/assets/figures.css?v=12">
   <link rel="stylesheet" href="/assets/guide.css?v=3">
   <script src="/assets/figures/edit_model.js?v=2" defer></script>
   <script src="/assets/figures/scene_projection.js?v=2" defer></script>
   <script src="/assets/figures/hit_geometry.js?v=1" defer></script>
   <script src="/assets/xlsx.full.min.js?v=1" defer></script>
-  <script src="/assets/figures.js?v=16" defer></script>
+  <script src="/assets/figures.js?v=17" defer></script>
   <script src="/assets/guide.js?v=4" defer></script>
 </head>
 <body class="figure-app">
@@ -52,6 +52,7 @@
         <summary class="button secondary"><svg class="icon"><use href="#i-download"/></svg>导出</summary>
         <div class="export-options">
           <p class="hint">下载当前已保存图件</p>
+          <p class="hint export-status" id="exportStatus" role="status" hidden></p>
           <a id="downloadSvg" aria-disabled="true" download>SVG <span>矢量图</span></a>
           <a id="downloadPng" aria-disabled="true" download>PNG <span>图像</span></a>
           <a id="downloadPdf" aria-disabled="true" download>PDF <span>出版文件</span></a>

@@ -491,6 +491,27 @@
     notice.hidden = !messages.length;
   }
 
+  // A download that never leaves the browser looks like a broken button. Say
+  // when the origin cannot be reached instead of leaving the click silent.
+  function probeExportTransport() {
+    var status = el('exportStatus');
+    if (!status || !state.current) return;
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () { controller.abort(); }, 4000) : null;
+    var url = API + '/projects/' + encodeURIComponent(state.current.figure_id) +
+      '/preview.svg' + (state.current.render_version ? '?v=' + state.current.render_version : '');
+    fetch(url, {method: 'HEAD', credentials: 'same-origin', cache: 'no-store',
+                signal: controller ? controller.signal : undefined})
+      .then(function (response) {
+        if (timer) clearTimeout(timer);
+        status.hidden = response.ok || response.status === 405;
+        status.textContent = status.hidden ? '' : '服务器返回 ' + response.status + '，导出可能失败。';
+      }, function () {
+        if (timer) clearTimeout(timer);
+        status.hidden = false;
+        status.textContent = '当前无法连接服务器，导出会失败；恢复连接后再试。';
+      });
+  }
   function renderDownloads() {
     renderQa();
     var base = API + '/projects/' + encodeURIComponent(state.current.figure_id);
@@ -2192,6 +2213,9 @@
 
   function init() {
     el('refreshButton').addEventListener('click', function () { loadProjects(); });
+    el('exportMenu').addEventListener('toggle', function () {
+      if (el('exportMenu').open) probeExportTransport();
+    });
     el('saveButton').addEventListener('click', saveEdits);
     el('verifyFigureButton').addEventListener('click', function () { return verifyFigure(false); });
     el('bundleFigureButton').addEventListener('click', function () { return verifyFigure(true); });

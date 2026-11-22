@@ -279,3 +279,4 @@ button.editor-guide { padding: 0; border: 0; background: transparent; font: inhe
   .stage-status { min-height: 35px; padding: 7px 10px; }
 }
 @media (prefers-reduced-motion: reduce) { .toast, body.figure-app { transition: none; } }
+.export-options .export-status { color: var(--error); padding-top: 0; }

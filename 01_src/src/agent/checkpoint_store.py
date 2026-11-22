@@ -113,6 +113,12 @@ def _admission_stopped_type():
     return AdmissionStopped
 
 
+def _batch_observation_type():
+    """Closed allowlist: the journal refuses to store an observation once its
+    effects may have run, and LangGraph keeps that refusal in pending writes
+    so a resumed task re-raises it instead of replaying the work."""
+    from .batch_journal import BatchObservationNotStored
+    return BatchObservationNotStored
 def _admission_reason(value: Any) -> str:
     reason = getattr(value, "reason", None)
     if type(reason) is not str or not reason or len(reason) > 200 or any(ord(c) < 32 for c in reason):
@@ -236,6 +242,13 @@ class _PrivateMessages(SerializerProtocol):
                         raise CheckpointProtectionError("invalid_public_message")
                     self._check_public_field(public)
                     return cls(**public)
+                if (kind == "batch_observation_not_stored"
+                        and set(value) == {_TAG, "effects_uncertain"}):
+                    uncertain = value["effects_uncertain"]
+                    if type(uncertain) is not bool:
+                        raise CheckpointProtectionError("invalid_checkpoint_payload",
+                                                        structure="value.tag")
+                    return _batch_observation_type()(effects_uncertain=uncertain)
                 if kind == "admission_stopped" and set(value) == {_TAG, "reason"}:
                     reason = value["reason"]
                     if type(reason) is not str or not reason or len(reason) > 200:
@@ -281,6 +294,10 @@ class _PrivateMessages(SerializerProtocol):
             return {_TAG: "bytearray", "value": bytes(value)}
         if value is None or type(value) in (str, bool, int, float, bytes, bytearray):
             return value
+        if type(value) is _batch_observation_type():
+            uncertain = getattr(value, "effects_uncertain", None)
+            return {_TAG: "batch_observation_not_stored",
+                    "effects_uncertain": uncertain if type(uncertain) is bool else True}
         if type(value) is _admission_stopped_type():
             reason = _admission_reason(value)
             if reason:

@@ -55,6 +55,31 @@ def _report_failure(stage, reason, count):
                    stage, reason, count)
 
 
+def _json_safe(value):
+    """Return a JSON-native copy, converting only numeric and time scalars.
+
+    Tool observations routinely carry numpy scalars (``numpy.float64`` is not a
+    ``float``) or an array; the strict checker below rejects those and would
+    fail a whole turn after its side effects had already run. Only these
+    closed families are converted; every other object still fails ``check``, so
+    no provider message, custom class or host path can reach the journal.
+    """
+    if type(value) in (list, tuple):
+        return [_json_safe(item) for item in value]
+    if type(value) is dict:
+        return {key: _json_safe(item) for key, item in value.items()}
+    module = (type(value).__module__ or "").split(".")[0]
+    name = type(value).__name__
+    if module == "numpy":
+        if hasattr(value, "tolist"):
+            return _json_safe(value.tolist())
+        if hasattr(value, "item"):
+            return _json_safe(value.item())
+    if module == "pandas" and name in ("Timestamp", "Timedelta"):
+        return value.isoformat()
+    if module == "datetime" and name in ("datetime", "date", "time"):
+        return value.isoformat()
+    return value
 def _json(value):
     # No default encoder, model dumping, pickle, or import-based revival. Reject
     # objects (including private provider messages) even inside tool artifacts.
@@ -75,8 +100,11 @@ def _json(value):
             for child in item.values():
                 check(child)
             return
+        logger.warning("batch_journal_non_json_value kind=%s",
+                       type(item).__name__[:40])
         raise TypeError("batch_journal_requires_json_values")
 
+    value = _json_safe(value)
     check(value)
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), allow_nan=False)

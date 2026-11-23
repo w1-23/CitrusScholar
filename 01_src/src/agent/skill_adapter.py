@@ -37,12 +37,19 @@ def skill_catalog(available_tools: set[str] | None = None, *, scenarios_only: bo
 
 
 def scenario_catalog() -> list[dict]:
-    """Current four product scenarios; availability never grants execution rights."""
+    """Installed product methods; availability never grants execution rights."""
+    from .installed_skills import list_installed, release_path
+
+    try:
+        release = release_path()
+        rows = list_installed(release) if release is not None else research_catalog.list_skills()
+    except (OSError, ValueError, KeyError):
+        rows = []
     return [{key: row.get(key, [] if key in {"depends_on", "required_resources", "requires_any"} else "")
-             for key in _CATALOG_FIELDS} for row in research_catalog.list_skills()]
+             for key in _CATALOG_FIELDS} for row in rows]
 
 
-def validate_scenario_selection(value) -> list[dict[str, str]]:
+def validate_scenario_selection(value, *, catalog=None) -> list[dict[str, str]]:
     """Accept only exact current release identities for a new product request.
 
     Older identities remain readable through SkillSession, but are never silently
@@ -52,7 +59,7 @@ def validate_scenario_selection(value) -> list[dict[str, str]]:
         return []
     if type(value) is not list or len(value) > 4:
         raise ValueError("invalid_selected_skills")
-    rows = {row["id"]: row for row in scenario_catalog()}
+    rows = {row["id"]: row for row in (scenario_catalog() if catalog is None else catalog)}
     result, seen = [], set()
     for selected in value:
         if (type(selected) is not dict or set(selected) != set(_IDENTITY_FIELDS)

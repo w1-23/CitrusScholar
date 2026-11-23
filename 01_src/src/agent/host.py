@@ -100,6 +100,21 @@ async def _run(state, identity, ledger):
     else:
         native = native_supported and os.getenv("CITRUS_NATIVE_RUNTIME") == "1"
     summary_enabled = bool(settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True))
+    installed_rows = None
+    skill_root = None
+    if native:
+        from .installed_skills import list_installed, model_directory, release_path
+        from .research_skill_catalog import ROOT
+
+        saved_release = state.get("native_skill_release", "") if resume else None
+        if saved_release is None:
+            configured = release_path()
+        else:
+            configured = Path(saved_release) if saved_release else None
+        release = configured.resolve(strict=True) if configured is not None else None
+        state["native_skill_release"] = str(release) if release is not None else ""
+        installed_rows = list_installed(release) if release is not None else None
+        skill_root = model_directory(release) if release is not None else ROOT / "skills"
     # A fresh composer request is a new script task, even when the session still
     # carries an older task's assets. Only a durable question child can inherit
     # its parent's scope; same-job recovery restores it from the checkpoint below.
@@ -173,7 +188,7 @@ async def _run(state, identity, ledger):
     pinned_skills = []
     try:
         selected_metadata = await asyncio.to_thread(
-            validate_scenario_selection, state.get("selected_skills"))
+            validate_scenario_selection, state.get("selected_skills"), catalog=installed_rows)
         if native:
             pinned_skills = [row["id"] for row in selected_metadata]
     except (OSError, ValueError, KeyError):
@@ -585,10 +600,9 @@ async def _run(state, identity, ledger):
     projection = None
     native_options = None
     if native:
-        from .research_skill_catalog import ROOT
         summary_model = (_MeteredSummaryModel(transport=model, identity=identity,
                          deadline=deadline, max_attempts=1) if summary_enabled else None)
-        native_options = {"skill_root": ROOT / "skills", "system_prompt": prompt,
+        native_options = {"skill_root": skill_root, "system_prompt": prompt,
             "summary_model": summary_model,
             "summary_trigger": settings.CONTEXT_WORKING_SOFT_TOKENS,
             "summary_keep": min(settings.CONTEXT_WORKING_TARGET_TOKENS,

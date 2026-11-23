@@ -1,0 +1,32 @@
+{
+  "research-question-answering": {
+    "repository": "https://github.com/w1-23/research-question-answering.git",
+    "commit": "43e17a0cb1112cad0aedc8e63a529e54b296792d",
+    "dependencies": {
+      "requirements.lock": "e6c1144611ffee2a14e6f3bcf8417975e596ea80bd500967b0fe31d3dd1bfc5c"
+    }
+  },
+  "reference-verification": {
+    "repository": "https://github.com/w1-23/reference-verification.git",
+    "commit": "58faab0e1aa9a9de8cd9a587a8f991f2c77a5a75",
+    "dependencies": {
+      "requirements.lock": "cd20b991f67fe502e91121b1dbad17284a8a45ddac86383196d6f4a840e5da3e"
+    }
+  },
+  "data-audit": {
+    "repository": "https://github.com/w1-23/data-audit.git",
+    "commit": "854551d764398754e7daee27f9ad1f6c99f7c68b",
+    "dependencies": {
+      "requirements-linux-cp312.lock": "cf261ea3fbe5bbb068d8f7eece11e8a5910293daca884145fb03b11377ceab5d"
+    }
+  },
+  "nature-figure": {
+    "repository": "https://github.com/w1-23/nature-figure.git",
+    "commit": "3f61d9df0e34cac46adb37a34468c389a66bda8f",
+    "dependencies": {
+      "requirements.lock": "62ae43981affcb09e465ef6abefb5f122e3c34f71aef30258eb80ab300815506",
+      "requirements-dev.lock": "fe4a3e03e01c9d400603daa6012070233eb1eedf8524cf264039e583c6684eff",
+      "requirements-pdf.lock": "7012f5553e551e6442de6f1caabcae3548423748ef63a9ec1a6dbfb2802459b1"
+    }
+  }
+}

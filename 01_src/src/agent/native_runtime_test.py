@@ -13,6 +13,41 @@ def test_pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
     asyncio.run(_pinned_skill_and_read_file_survive_thread_reopen(tmp_path))
 
 
+def test_installed_skill_selection_uses_active_release_entries(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import pytest
+
+    from src.agent.installed_skills import list_installed, model_directory
+    from src.agent.skill_adapter import scenario_catalog, validate_scenario_selection
+
+    active = tmp_path / "first-release"
+    entry = active / "skills" / "additional-method" / "SKILL.md"
+    entry.parent.mkdir(parents=True)
+    raw = b"---\nname: additional-method\ndescription: One task-specific method.\n---\n\nMethod."
+    entry.write_bytes(raw)
+    sha = "2" * 40
+    (active / "release.json").write_text(json.dumps({"additional-method": sha}), encoding="utf-8")
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(active))
+    assert model_directory(active) == entry.parent.parent
+    assert [item["id"] for item in scenario_catalog()] == ["additional-method"]
+    selected = {"id": "additional-method", "version": sha, "sha256": hashlib.sha256(raw).hexdigest()}
+    assert validate_scenario_selection([selected]) == [selected]
+
+    empty = tmp_path / "empty-release"
+    (empty / "skills").mkdir(parents=True)
+    (empty / "release.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(empty))
+    assert scenario_catalog() == []
+    with pytest.raises(ValueError, match="selected_skill_identity_mismatch"):
+        validate_scenario_selection([selected])
+    assert validate_scenario_selection([selected], catalog=list_installed(active)) == [selected]
+
+    entry.write_text("---\nname: different-method\ndescription: Wrong path.\n---\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid_skill_frontmatter"):
+        list_installed(active)
+
+
 async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
     skill_root = tmp_path / "skills"
     demo = skill_root / "demo"

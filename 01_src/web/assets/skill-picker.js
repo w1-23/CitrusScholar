@@ -1,10 +1,7 @@
 (function (root) {
   'use strict';
-  var titles = {'candidate-search':'科研检索', 'reference-verification':'文献核验',
+  var titles = {'candidate-search':'科研检索', 'research-question-answering':'科研问答', 'reference-verification':'文献核验',
     'data-audit':'数据审查', 'nature-figure':'科研绘图'};
-  var localizedDescriptions = {'nature-figure':
-    '使用明确的数据和最终文件，用 Matplotlib 创建、修改、打包与审计科研图。遵循指定版本的 Nature 绘图规范，逐项说明检查覆盖范围，提供可复现的源码与数据包，并保持已锁定的样式。'};
-  var scenarioIds = Object.keys(titles);
   function create(options) {
     var selected = [], catalog = [], generation = 0, revision = 0;
     var list = options.list, status = options.status, summary = options.summary;
@@ -43,7 +40,7 @@
         });
         var text = document.createElement('span'), name = document.createElement('strong'), description = document.createElement('small');
         name.textContent = title(item);
-        description.textContent = localizedDescriptions[item.id] || item.description;
+        description.textContent = item.description;
         text.appendChild(name); text.appendChild(description); label.appendChild(check); label.appendChild(text); list.appendChild(label);
       });
       drawSummary();
@@ -65,12 +62,12 @@
         if (!body || !Array.isArray(body.skills) || body.skills.length > 100) throw new Error('invalid_catalog');
         var seen = Object.create(null);
         catalog = body.skills.filter(function (item) {
-          if (!item || scenarioIds.indexOf(item.id) < 0 || seen[item.id] ||
+          if (!item || typeof item.id !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(item.id) || seen[item.id] ||
               typeof item.version !== 'string' || !item.version || item.version.length > 100 ||
               typeof item.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(item.sha256) ||
               typeof item.description !== 'string' || item.description.length > 10000) return false;
           seen[item.id] = true; return true;
-        }).sort(function (a, b) { return scenarioIds.indexOf(a.id) - scenarioIds.indexOf(b.id); });
+        });
         var before = selected.length;
         selected = selected.filter(function (pick) { return catalog.some(function (item) { return same(pick, item); }); });
         if (before !== selected.length) revision++;

@@ -31,7 +31,7 @@ from .model import NON_SUCCESS_TERMINALS
 from .runtime import AdmissionStopped, RunResult, RunLimits
 from .deep_agent_runtime import (
     EXECUTOR_ID, MODEL_PROVIDER, NATIVE_EXECUTOR_ID, NATIVE_MODEL_PROVIDER,
-    NATIVE_READ_TOOLS, create_host_agent, create_native_agent,
+    NATIVE_READ_TOOLS, NATIVE_UNCOMPRESSED_PROVIDER, create_host_agent, create_native_agent,
 )
 
 
@@ -61,10 +61,14 @@ class _DriverModel(BaseChatModel):
     model_name: str = "citrus-host-main-loop"
     expected_tools: frozenset[str] = Field(default_factory=frozenset, exclude=True)
     native: bool = Field(default=False, exclude=True)
+    summarize: bool = Field(default=True, exclude=True)
 
     def _get_ls_params(self, stop=None, **kwargs):
+        provider = MODEL_PROVIDER
+        if self.native:
+            provider = NATIVE_MODEL_PROVIDER if self.summarize else NATIVE_UNCOMPRESSED_PROVIDER
         return {**super()._get_ls_params(stop=stop, **kwargs),
-                "ls_provider": NATIVE_MODEL_PROVIDER if self.native else MODEL_PROVIDER,
+                "ls_provider": provider,
                 "ls_model_name": self.model_name}
 
     @property
@@ -89,11 +93,14 @@ class _DriverModel(BaseChatModel):
         raise RuntimeError("async_model_required")
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        if self.native:
-            message = await self.driver(tuple(messages), self.identity,
-                                        native_schemas=kwargs.get("native_schemas", ()))
-        else:
-            message = await self.driver(tuple(messages), self.identity)
+        options = {"native_schemas": kwargs.get("native_schemas", ())} if self.native else {}
+        try:
+            message = await self.driver(tuple(messages), self.identity, **options)
+        except asyncio.CancelledError as exc:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            raise NodeCancelledError("model") from exc
         if not isinstance(message, AIMessage):
             raise TypeError("model_must_return_ai_message")
         message = message.model_copy(update={"additional_kwargs": {
@@ -186,6 +193,7 @@ class HarnessRuntime:
         latest = {"messages": list(messages), "model_steps": 0}
         batch_task = None
         batch_key = None
+        native_read_permits = asyncio.Semaphore(4)
 
         def control(text):
             return SystemMessage(content=text, additional_kwargs=identity.message_metadata("internal_control"))
@@ -340,11 +348,34 @@ class HarnessRuntime:
                 nonlocal batch_task, batch_key
                 response = next(m for m in reversed(request.state["messages"]) if isinstance(m, AIMessage))
                 if native and request.tool_call["name"] in NATIVE_READ_TOOLS:
-                    result = await handler(request)
-                    if not isinstance(result, ToolMessage):
-                        raise ValueError("native_read_must_return_tool_message")
-                    return result.model_copy(update={"additional_kwargs": {
-                        **result.additional_kwargs, **identity.message_metadata("tool")}})
+                    from .batch_journal import persistent_message
+
+                    call_id, name = request.tool_call["id"], request.tool_call["name"]
+                    async with native_read_permits:
+                        await admit(tuple(request.state["messages"]))
+                        if time.monotonic() >= adapter.limits.deadline:
+                            raise AdmissionStopped("deadline")
+                        if any(call["name"] == "request_user_input" for call in response.tool_calls):
+                            return persistent_message(ToolMessage(
+                                content="Tool was not executed: interaction_barrier",
+                                tool_call_id=call_id, name=name, status="error",
+                                additional_kwargs={**identity.message_metadata("tool"),
+                                                   "execution_dispatched": False},
+                                artifact={"_tool_outcome": {"status": "not_run",
+                                                            "reason_code": "interaction_barrier"}},
+                            ))
+                        await event("batch_started", request.state, (call_id,))
+                        result = await handler(request)
+                        if not isinstance(result, ToolMessage) or result.tool_call_id != call_id or (
+                            result.name and result.name != name
+                        ):
+                            raise ValueError("native_read_observation_pairing_mismatch")
+                        message = persistent_message(result.model_copy(update={
+                            "name": name, "additional_kwargs": {
+                                **result.additional_kwargs, **identity.message_metadata("tool")},
+                        }))
+                        await event("batch_finished", request.state, (call_id,))
+                        return message
                 calls = [call for call in response.tool_calls
                          if not native or call["name"] not in NATIVE_READ_TOOLS]
                 dispatch_response = response.model_copy(update={"tool_calls": calls}) if native else response
@@ -378,6 +409,7 @@ class HarnessRuntime:
         tools = [StructuredTool(name=s["function"]["name"], description=s["function"]["description"],
                                 args_schema=s["function"]["parameters"], func=_forbidden_tool) for s in self.schemas]
         model = _DriverModel(driver=self.model, identity=identity, native=native,
+                             summarize=(native_options or {}).get("summary_model") is not None,
                              expected_tools=frozenset(tool.name for tool in tools))
         if native:
             graph = create_native_agent(model, tools, Policy(), saver, HarnessState,
@@ -391,9 +423,18 @@ class HarnessRuntime:
                                  and snapshot.values.get("active_run_id") != identity.run_id)
         if continuing_thread:
             from .runtime import _pending_calls
-            if (snapshot.values.get("executor_id") != executor_id or snapshot.next
-                    or snapshot.values.get("stop_reason") != "answered"
-                    or _pending_calls(snapshot.values["messages"])):
+            previous = snapshot.values
+            closed = (not snapshot.next and previous.get("stop_status") in {"complete", "incomplete", "cancelled"})
+            stopped_before_tool = (
+                previous.get("stop_status") in {"incomplete", "cancelled"}
+                and previous.get("stop_reason") in {"cancelled", "deadline"}
+                and set(snapshot.next) <= {"model", "Policy.before_model"}
+            )
+            if (previous.get("executor_id") != executor_id or not (closed or stopped_before_tool)
+                    or previous.get("batch_status") in {"unknown", "waiting", "execution"}
+                    or previous.get("unknown_operations") or previous.get("execution_waits")
+                    or previous.get("execution_wake") or (previous.get("host_state") or {}).get("pending_question")
+                    or _pending_calls(previous["messages"])):
                 raise AdmissionStopped("native_thread_requires_reconciliation")
         if snapshot.values and not continuing_thread:
             if not resume:

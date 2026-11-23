@@ -88,6 +88,7 @@ def create_host_agent(model, tools, policy, saver, state_schema):
 
 NATIVE_EXECUTOR_ID = "citrus-deepagents-0.7.38-native-v1"
 NATIVE_MODEL_PROVIDER = "citrus_metered_native"
+NATIVE_UNCOMPRESSED_PROVIDER = "citrus_metered_native_uncompressed"
 NATIVE_READ_TOOLS = frozenset({"ls", "glob", "grep", "read_file"})
 
 
@@ -96,10 +97,16 @@ def configure_native_profile():
     import deepagents
     if deepagents.__version__ != SDK_VERSION:
         raise RuntimeError("unsupported_deepagents_version")
-    register_harness_profile(NATIVE_MODEL_PROVIDER, HarnessProfile(
-        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute"}),
-        excluded_middleware=frozenset({"PatchToolCallsMiddleware"})))
+    for provider, summary_enabled in (
+        (NATIVE_MODEL_PROVIDER, True), (NATIVE_UNCOMPRESSED_PROVIDER, False),
+    ):
+        exclusions = {"PatchToolCallsMiddleware"}
+        if not summary_enabled:
+            exclusions.add("SummarizationMiddleware")
+        register_harness_profile(provider, HarnessProfile(
+            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+            excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute"}),
+            excluded_middleware=frozenset(exclusions)))
 
 
 def create_native_agent(model, tools, policy, saver, state_schema, *,
@@ -115,9 +122,11 @@ def create_native_agent(model, tools, policy, saver, state_schema, *,
     })
     permissions = [FilesystemPermission(
         operations=["write", "edit", "delete"], paths=["/**"], mode="deny")]
-    summary = SummarizationMiddleware(summary_model, backend=backend,
-        trigger=("tokens", summary_trigger), keep=("tokens", summary_keep),
-        trim_tokens_to_summarize=4000)
+    middleware = []
+    if summary_model is not None:
+        middleware.append(SummarizationMiddleware(summary_model, backend=backend,
+            trigger=("tokens", summary_trigger), keep=("tokens", summary_keep),
+            trim_tokens_to_summarize=4000))
     from langchain.agents.middleware import ToolErrorMiddleware
 
     def read_error(error, request):
@@ -129,6 +138,6 @@ def create_native_agent(model, tools, policy, saver, state_schema, *,
 
     read_errors = ToolErrorMiddleware(on_error=read_error, tools=sorted(NATIVE_READ_TOOLS))
     return create_deep_agent(model=model, tools=tools,
-        middleware=[summary, policy, read_errors], system_prompt=system_prompt,
+        middleware=[*middleware, policy, read_errors], system_prompt=system_prompt,
         subagents=[], skills=["/skills/"], backend=backend, permissions=permissions,
         checkpointer=saver, state_schema=state_schema, name="citrus_native_loop")

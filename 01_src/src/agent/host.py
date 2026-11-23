@@ -98,8 +98,8 @@ async def _run(state, identity, ledger):
                   and not checkpoint_path(state_root, identity, provider_scope).is_file()
                   and native_checkpoint_path(state_root, identity, provider_scope).is_file())
     else:
-        native = (native_supported and os.getenv("CITRUS_NATIVE_RUNTIME") == "1"
-                  and settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True))
+        native = native_supported and os.getenv("CITRUS_NATIVE_RUNTIME") == "1"
+    summary_enabled = bool(settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True))
     # A fresh composer request is a new script task, even when the session still
     # carries an older task's assets. Only a durable question child can inherit
     # its parent's scope; same-job recovery restores it from the checkpoint below.
@@ -586,9 +586,10 @@ async def _run(state, identity, ledger):
     native_options = None
     if native:
         from .research_skill_catalog import ROOT
+        summary_model = (_MeteredSummaryModel(transport=model, identity=identity,
+                         deadline=deadline, max_attempts=1) if summary_enabled else None)
         native_options = {"skill_root": ROOT / "skills", "system_prompt": prompt,
-            "summary_model": _MeteredSummaryModel(transport=model, identity=identity,
-                                                  deadline=deadline, max_attempts=1),
+            "summary_model": summary_model,
             "summary_trigger": settings.CONTEXT_WORKING_SOFT_TOKENS,
             "summary_keep": min(settings.CONTEXT_WORKING_TARGET_TOKENS,
                                 settings.CONTEXT_WORKING_SOFT_TOKENS - 256)}
@@ -596,7 +597,7 @@ async def _run(state, identity, ledger):
         projection = WorkingContextProjection(
             archive=EncryptedContextArchive(state_root, identity, provider_scope),
             summary_model=model,
-            enabled=bool(settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True)),
+            enabled=summary_enabled,
             deadline=deadline, trigger_tokens=settings.CONTEXT_WORKING_SOFT_TOKENS,
             target_tokens=min(settings.CONTEXT_WORKING_TARGET_TOKENS, settings.CONTEXT_WORKING_SOFT_TOKENS),
             readback_available="read_context_evidence" in refresh_allowed(),

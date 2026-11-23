@@ -20,6 +20,8 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
     (demo / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\nRead-only demo",
                                  encoding="utf-8")
     histories = []
+    admissions = []
+    events = []
 
     async def model(history, identity, *, native_schemas):
         histories.append(history)
@@ -43,8 +45,15 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
     from src.agent.recovery import load_recovery_state
     from src.core.task_events import TaskConflict
 
+    async def admit(history, identity):
+        admissions.append(identity)
+
+    async def capture_event(value):
+        events.append(value)
+
     request = {}
-    runtime = HarnessRuntime(model, unexpected_dispatch, lambda *args: None, accept, RunLimits(), [],
+    runtime = HarnessRuntime(model, unexpected_dispatch, admit, accept, RunLimits(), [],
+                             on_event=capture_event,
                              export_host=lambda: {"original_request_state": dict(request)})
     provider = ("https://example.test", "example-model")
     options = {"skill_root": skill_root, "system_prompt": "fixture prompt",
@@ -67,7 +76,8 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
         async with open_native_checkpoint(root, identity, provider) as saver:
             result = await runtime.run(identity, history, saver=saver,
                 checkpoint_config=native_checkpoint_scope(identity, provider),
-                native_options=options, pinned_skills=["demo"] if not index else [])
+                native_options={**options, "summary_model": options["summary_model"] if index else None},
+                pinned_skills=["demo"] if not index else [])
         assert result.status == "complete"
         recovered = await load_recovery_state(root, identity, provider)
         assert recovered["agent_resume"] and recovered["agent_recovery_answered"]
@@ -77,6 +87,10 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
         await load_recovery_state(root, ExecutionIdentity(1, "thread", "turn-0", "job-0"), provider)
     with pytest.raises(TaskConflict, match="recovery_checkpoint_missing"):
         await load_recovery_state(root, ExecutionIdentity(2, "thread", "turn-1", "job-1"), provider)
+    assert [event.kind for event in events if event.tool_call_ids == ("read-1",)] == [
+        "model_finished", "batch_started", "batch_finished",
+    ]
+    assert [identity.run_id for identity in admissions] == ["job-0", "job-0", "job-0", "job-1"]
     assert len(histories) == 3
     assert [message.content for message in histories[-1] if message.type == "human"
             and message.additional_kwargs.get("context_origin") == "user"] == [
@@ -84,6 +98,41 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
     assert sum(message.content == "legacy answer" for message in histories[-1]) == 1
     assert all(message.content not in ("duplicate persisted history", "previous saved answer")
                for message in histories[-1])
+
+
+def test_native_thread_accepts_new_turn_after_cancelling_model(tmp_path):
+    async def scenario():
+        from src.agent.deep_agent_runtime import NATIVE_EXECUTOR_ID
+
+        skill_root = tmp_path / "skills"
+        skill_root.mkdir()
+        options = {"skill_root": skill_root, "system_prompt": "fixture prompt", "summary_model": None}
+        calls = []
+
+        async def model(history, identity, *, native_schemas):
+            calls.append(identity.run_id)
+            if identity.run_id == "cancelled":
+                raise asyncio.CancelledError()
+            return AIMessage(content="new answer")
+
+        async def accept(*args):
+            return FinalCheck()
+
+        runtime = HarnessRuntime(model, None, lambda *args: None, accept, RunLimits(), [])
+        provider = ("https://example.test", "fixture")
+        for index, (job_id, status) in enumerate((("cancelled", "cancelled"), ("next", "complete"))):
+            identity = ExecutionIdentity(1, "thread", f"turn-{index}", job_id)
+            human = HumanMessage(job_id, additional_kwargs=identity.message_metadata("user"))
+            config = native_checkpoint_scope(identity, provider)
+            async with open_native_checkpoint(tmp_path, identity, provider) as saver:
+                result = await runtime.run(identity, [human], saver=saver,
+                                           checkpoint_config=config, native_options=options)
+                saved = await saver.aget_tuple({"configurable": config})
+                assert saved.checkpoint["channel_values"]["executor_id"] == NATIVE_EXECUTOR_ID
+            assert result.status == status
+        assert calls == ["cancelled", "next"]
+
+    asyncio.run(scenario())
 
 
 def test_framework_notification_keeps_the_real_user_turn():

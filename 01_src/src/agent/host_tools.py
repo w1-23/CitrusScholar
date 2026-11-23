@@ -394,6 +394,10 @@ class HostTools:
             if isinstance(item, dict) and str(item.get("source_id") or "").endswith(":user")]
         working["constraints"] = [item for item in previous.get("constraints", [])
             if isinstance(item, dict) and not str(item.get("source_id") or "").endswith(":user")]
+        # Host-internal projection reuse metadata; it is filtered from the model
+        # prompt and must survive turn/recovery boundaries with the working state.
+        if isinstance(previous.get("projection_cache"), dict) and previous["projection_cache"]:
+            working["projection_cache"] = previous["projection_cache"]
         return working
 
     def question_context(self):

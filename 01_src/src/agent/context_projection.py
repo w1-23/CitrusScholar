@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import time
@@ -37,7 +38,7 @@ from langchain.agents.middleware import AgentMiddleware, SummarizationMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage,
-    messages_to_dict,
+    messages_from_dict, messages_to_dict,
 )
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.base import empty_checkpoint
@@ -243,6 +244,33 @@ def _units(messages):
     return units
 
 
+_CACHE_SCHEMA = "working_summary_cache/1"
+
+
+def _cache_ranges(indexes):
+    """Compress removed indices into inclusive ranges for a bounded descriptor."""
+    ranges = []
+    for index in sorted(indexes):
+        if ranges and index == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], index)
+        else:
+            ranges.append((index, index))
+    return [[start, stop] for start, stop in ranges]
+
+
+def _cache_expand(ranges, *, limit):
+    if type(ranges) is not list or not ranges:
+        return None
+    expanded = set()
+    for item in ranges:
+        if (type(item) is not list or len(item) != 2
+                or type(item[0]) is not int or type(item[1]) is not int
+                or not 0 <= item[0] <= item[1] < limit):
+            return None
+        expanded.update(range(item[0], item[1] + 1))
+    return frozenset(expanded)
+
+
 def _view(raw, removed, summary):
     first = min(removed)
     return tuple(message for index, original in enumerate(raw)
@@ -423,6 +451,9 @@ class WorkingContextProjection(AgentMiddleware):
         self.tool_schemas = tool_schemas if callable(tool_schemas) else list(tool_schemas or [])
         self._schemas = None if callable(tool_schemas) else self.tool_schemas
         self._cache = None
+        # Evidence for the task record: a reused summary means no identical
+        # summary call was paid for again on this turn.
+        self.reuse_count = 0
         self._summary_unavailable = False
         self._archive_unavailable = False
 
@@ -512,11 +543,12 @@ class WorkingContextProjection(AgentMiddleware):
         baseline = raw
         if self._cache is not None:
             trace.mark("estimate")
-            previous, previous_required, removed, summary = self._cache
-            if (required == previous_required and len(raw) >= len(previous)
-                    and all(type(a) is type(b) and a == b for a, b in zip(raw, previous))
+            previous_required, prefix_count, prefix_digest, removed, summary = self._cache
+            if (required == previous_required and prefix_digest and len(raw) >= prefix_count
+                    and self._prefix_digest(raw, prefix_count) == prefix_digest
                     and not set(tail).intersection(removed)):
                 baseline = _view(raw, removed, summary)
+                self.reuse_count += 1
                 if self._count(baseline) < self.trigger_tokens:
                     return baseline
                 if all(set(unit).issubset(removed) for unit in eligible):
@@ -657,8 +689,71 @@ class WorkingContextProjection(AgentMiddleware):
                 "protected_messages": len(protected), "retained_messages": keep,
                 "archive": ref.as_dict(), "message_indices": sorted(removed)})
         trace.mark("callback")
-        self._cache = (tuple(m.model_copy(deep=True) for m in raw), required, removed, summary)
+        # The descriptor keeps a prefix fingerprint plus the summary and its
+        # covered indices, never a second copy of the raw history. That makes it
+        # persistable so a later turn or a resume reuses the same summary instead
+        # of paying for an identical summary call again.
+        prefix_digest = self._prefix_digest(raw, len(raw))
+        self._cache = ((frozenset(required), len(raw), prefix_digest, removed, summary)
+                       if prefix_digest else None)
         return view
+
+    def _prefix_digest(self, raw, upto):
+        """Stable fingerprint of the first ``upto`` messages, "" when opaque."""
+        digest = hashlib.sha256()
+        try:
+            for message in raw[:upto]:
+                encoded = json.dumps(messages_to_dict([message])[0], sort_keys=True,
+                                     ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        except (TypeError, ValueError):
+            return ""
+        return digest.hexdigest()
+
+    def export_cache(self) -> dict | None:
+        """JSON-safe descriptor of the live summary; None when nothing applies."""
+        if self._cache is None:
+            return None
+        required, count, prefix_digest, removed, summary = self._cache
+        if not prefix_digest or not removed:
+            return None
+        try:
+            encoded = messages_to_dict([summary])[0]
+        except (TypeError, ValueError):
+            return None
+        return {"schema": _CACHE_SCHEMA, "count": int(count), "digest": prefix_digest,
+                "removed": _cache_ranges(removed), "summary": encoded,
+                "trigger_tokens": int(self.trigger_tokens),
+                "target_tokens": int(self.target_tokens),
+                "requirements": sorted(required),
+                "provider_scope": list(getattr(self.archive, "provider_scope", ()) or ())}
+
+    def import_cache(self, descriptor) -> bool:
+        """Adopt a persisted descriptor only when it exactly matches this run."""
+        if not isinstance(descriptor, dict) or descriptor.get("schema") != _CACHE_SCHEMA:
+            return False
+        if (descriptor.get("trigger_tokens") != int(self.trigger_tokens)
+                or descriptor.get("target_tokens") != int(self.target_tokens)
+                or descriptor.get("provider_scope") != list(getattr(self.archive, "provider_scope", ()) or ())):
+            return False
+        count, digest = descriptor.get("count"), descriptor.get("digest")
+        if type(count) is not int or count <= 0 or not isinstance(digest, str) or len(digest) != 64:
+            return False
+        removed = _cache_expand(descriptor.get("removed"), limit=count)
+        requirements = descriptor.get("requirements")
+        if (removed is None or not isinstance(requirements, list)
+                or any(type(item) is not str for item in requirements)):
+            return False
+        try:
+            summary = messages_from_dict([descriptor.get("summary")])[0]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (not isinstance(summary, SystemMessage)
+                or summary.additional_kwargs.get("context_projection") != "working_summary_v1"):
+            return False
+        self._cache = (frozenset(requirements), count, digest, removed, summary)
+        return True
 
     def _defer(self, view, *, reason, before, protected, eligible):
         # The callback is reserved for actual compression (hosts may announce

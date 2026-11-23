@@ -664,6 +664,12 @@ async def _run(state, identity, ledger):
             target_tokens=min(settings.CONTEXT_WORKING_TARGET_TOKENS, settings.CONTEXT_WORKING_SOFT_TOKENS),
             readback_available="read_context_evidence" in refresh_allowed(),
             tool_schemas=lambda: driver.schemas_for(identity), on_projection=context_projected)
+        # A summary produced for the same prefix, requirements and limits is
+        # reused instead of paying for an identical summary call on the next turn
+        # or after a resume. A mismatching descriptor is ignored, never trusted.
+        persisted_cache = (state.get("context_working_state") or {}).get("projection_cache")
+        if projection is not None and isinstance(persisted_cache, dict):
+            projection.import_cache(persisted_cache)
 
     announced_model_request = False
 
@@ -675,6 +681,19 @@ async def _run(state, identity, ledger):
         # before_model's host_state watermark is already synchronously committed.
         task_events.acknowledge_updates(identity.run_id, update_version)
         view = history if projection is None else await projection.project(history)
+        if projection is not None:
+            runtime = state.get("capability_runtime")
+            if isinstance(runtime, dict):
+                runtime["context_projection"] = {
+                    "schema": "working_summary_v1",
+                    "summary_reused": projection.reuse_count > 0,
+                    "reuse_events": int(projection.reuse_count),
+                }
+            descriptor = projection.export_cache()
+            if descriptor is not None:
+                working = dict(host.state.get("context_working_state") or {})
+                working["projection_cache"] = descriptor
+                host.state["context_working_state"] = working
         if skills is not None:
             await asyncio.to_thread(skills.verify_view, view)
         if not announced_model_request:

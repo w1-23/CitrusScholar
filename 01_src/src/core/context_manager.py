@@ -137,6 +137,16 @@ class LoadedContext:
         return bool(self.history_messages or self.history_summary)
 
 
+# Host-internal bookkeeping that must never become model context.
+_INTERNAL_WORKING_KEYS = frozenset({"projection_cache"})
+
+
+def prompt_working_state(working_state) -> dict:
+    """Model-visible working state: internal reuse metadata is filtered out."""
+    return {key: value for key, value in (working_state or {}).items()
+            if key not in _INTERNAL_WORKING_KEYS}
+
+
 class ContextManager:
     def __init__(
         self,
@@ -434,7 +444,7 @@ class ContextManager:
         if working_state:
             import json
             view_msgs.insert(0, SystemMessage(
-                content="<context_working_state>\n" + json.dumps(working_state, ensure_ascii=False)
+                content="<context_working_state>\n" + json.dumps(prompt_working_state(working_state), ensure_ascii=False)
                         + "\n</context_working_state>",
                 additional_kwargs={"context_origin": "working_state", "context_trusted": True}))
         # Raw history is loaded verbatim. No load-time model compaction runs;

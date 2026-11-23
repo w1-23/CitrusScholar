@@ -153,6 +153,16 @@ def merge_working_state(prior: dict | None, update: dict | None) -> dict:
         state["script_budget_scope"] = update["script_budget_scope"][:256]
     if isinstance(update.get("plot_intent"), dict) and update["plot_intent"]:
         state["plot_intent"] = {**(state.get("plot_intent") or {}), **update["plot_intent"]}
+    cache = update.get("projection_cache")
+    if isinstance(cache, dict) and cache:
+        try:
+            bounded = len(json.dumps(cache, ensure_ascii=False, allow_nan=False)) <= 24000
+        except (TypeError, ValueError):
+            bounded = False
+        if bounded:
+            state["projection_cache"] = cache
+        else:
+            logger.warning("[working_state] projection cache dropped (invalid or oversized)")
     if len(json.dumps(state, ensure_ascii=False)) > 64000:
         raise ValueError("working state size budget exceeded")
     return state

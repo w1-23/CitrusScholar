@@ -1,12 +1,12 @@
 {
   "schema": "citrusscholar.linux-source/1",
   "deployment": "linux-apptainer-research-growth-integrated",
-  "baseline_commit": "9130e336c863600c934d892913fbb7d6f04a3832",
-  "baseline_tree": "b8cbb7dfcb796df604c823fa81543a967e25d7a9",
-  "parent_candidate_commit": "9e58a97d8f961c103fc07cdb712599b8fc9ce6a0",
-  "integrated_branch_commit": "69b9c4d",
-  "source": "Remote integrated candidate: stability freeze 9e58a97 + review/linux-8042-verified backend features + dual-source retrieval prompt",
-  "inventory_scope": "Candidate source files excluding this manifest and transient Python bytecode.",
+  "baseline_commit": "a9d4cba7c1256b9d90443d2bf1e06254b919dfd6",
+  "baseline_tree": "74c766a9562264e8879897241df5929d0ac53ba0",
+  "parent_candidate_commit": "a9d4cba7c1256b9d90443d2bf1e06254b919dfd6",
+  "integrated_branch_commit": "b1c6b043c62a0e0125187c8b68fcb766b40a9971",
+  "source": "CitrusScholar native runtime and research delivery candidate",
+  "inventory_scope": "Tracked regular files in integrated_branch_commit excluding this manifest and transient Python bytecode.",
   "members": {
     ".dockerignore": {
       "bytes": 569,
@@ -18,55 +18,20 @@
       "executable": false,
       "sha256": "615b52aa5ba7cce67cec32fe493f29605cfed7b38a9ee41b41700492d6865b15"
     },
-    ".gitignore": {
-      "bytes": 3864,
-      "executable": false,
-      "sha256": "4a3d35bde8190a2f38f33358a940babcbf7afa765c4e6489f6bcdfc46b4cca04"
-    },
-    "LICENSE": {
-      "bytes": 1085,
-      "executable": false,
-      "sha256": "92f8d4c3a3ff286ccbcb83085eb81afb9b293fc3aca0b8a292e65c61641930dc"
-    },
-    "LINUX-SOURCE-MANIFEST.json": {
-      "bytes": 128114,
-      "executable": false,
-      "sha256": "6319b78f1bebe8e94d1e28acfe1a58329ef860d6f3f5e79861a70f1ca93460ad"
-    },
-    "README.md": {
-      "bytes": 10608,
-      "executable": false,
-      "sha256": "0c66a312ef6b298c93c73b4b6920e586857ad516b9c87a56f19b5c00fdf6b6c6"
-    },
-    "conftest.py": {
-      "bytes": 506,
-      "executable": false,
-      "sha256": "4142fece10c0fdbf600c9e191590351f5e963f699cf383406a82d2096e80b773"
-    },
-    "pyproject.toml": {
-      "bytes": 1295,
-      "executable": false,
-      "sha256": "3f58a31a16f00ab336130ab708c1e0ff99a41cfd57b1c92e53c8b5ec407491a0"
-    },
-    "requirements-base.txt": {
-      "bytes": 1044,
-      "executable": false,
-      "sha256": "0f77d78aa9a0d15a35037877529df50d78a58282bbc1ce5c51377eca52d15941"
-    },
-    "requirements-gpu.txt": {
-      "bytes": 464,
-      "executable": false,
-      "sha256": "f5f2a4a67abc10bcea053e31d912eea866770f4afa470596b993517c00309db4"
-    },
     ".github/regression-dependencies.txt": {
       "bytes": 904,
       "executable": false,
       "sha256": "c79a85d9456da589a403568e2c0852bb0d4176c8f5a7b64471a43df9b458adcb"
     },
     ".github/workflows/regression.yml": {
-      "bytes": 2776,
+      "bytes": 3270,
       "executable": false,
-      "sha256": "e7acf653fbb04e18cb1344b4bc7f0ceba04ecf9c78bf880ea1dae4f945c8bdeb"
+      "sha256": "e96406c6247e876032308261f7ab4cfb9f52925bdec691538c8af0ea1934986c"
+    },
+    ".gitignore": {
+      "bytes": 3864,
+      "executable": false,
+      "sha256": "4a3d35bde8190a2f38f33358a940babcbf7afa765c4e6489f6bcdfc46b4cca04"
     },
     "01_src/apptainer/Caddyfile.lan.example": {
       "bytes": 561,
@@ -208,6 +173,261 @@
       "executable": false,
       "sha256": "96f2e65f02ccba6ab137198e946d120dacbe23e5a0631b457d81055317e4cf1e"
     },
+    "01_src/src/agent/__init__.py": {
+      "bytes": 216,
+      "executable": false,
+      "sha256": "e4285a598c6b88a36697d1f97f39deea9410148b721cae1e4a9a0cff7a9f5de8"
+    },
+    "01_src/src/agent/batch_journal.py": {
+      "bytes": 17126,
+      "executable": false,
+      "sha256": "cb1117574f708833a865cefc10a89fc32980befd5c511c76238fc6e2e5f026e0"
+    },
+    "01_src/src/agent/capabilities.py": {
+      "bytes": 6795,
+      "executable": false,
+      "sha256": "a6d3f3a55f6c2b0c35cedf54432ff22ba3b82482bb9556ee1d48d8556dd2b0a1"
+    },
+    "01_src/src/agent/checkpoint_store.py": {
+      "bytes": 31320,
+      "executable": false,
+      "sha256": "324bfaadd10e1673846d38ac46cfcf5cc973cea469c7fd8efc7e0e150c5045c9"
+    },
+    "01_src/src/agent/code_tools.py": {
+      "bytes": 39829,
+      "executable": false,
+      "sha256": "7eb587cb9afa86b189ab6a92c40141d36a0018df7fd2958a4feb7108af882e8e"
+    },
+    "01_src/src/agent/context_projection.py": {
+      "bytes": 37171,
+      "executable": false,
+      "sha256": "ef9c7499a493987e7815e66f1848881ff00c12303c61f1a9788d7b540225f29c"
+    },
+    "01_src/src/agent/context_projection_regression_test.py": {
+      "bytes": 17891,
+      "executable": false,
+      "sha256": "9c198930fb5539caf0bc8fa49ff289ad21a390ce433ae3def1995e6937f69d72"
+    },
+    "01_src/src/agent/context_schema_budget_test.py": {
+      "bytes": 2422,
+      "executable": false,
+      "sha256": "b4149287d9041f14e37bc02b527a9dd7bf2c4df0144b27a0f2a1796b8c3b3920"
+    },
+    "01_src/src/agent/context_tools.py": {
+      "bytes": 3944,
+      "executable": false,
+      "sha256": "5d65e88e8e8f88e79eca824007ab01b5d27b325195023f50f192b6fbeb80c41f"
+    },
+    "01_src/src/agent/deep_agent_runtime.py": {
+      "bytes": 5988,
+      "executable": false,
+      "sha256": "931f4b853bff08859c29cd0211ec616040d2a48ac8f1330426622193b9a5fc1c"
+    },
+    "01_src/src/agent/events.py": {
+      "bytes": 1320,
+      "executable": false,
+      "sha256": "00b6ad17c1c53d7cf573ec38eddc17de554b20c4fe8636538b3c4a856efdf454"
+    },
+    "01_src/src/agent/execution.py": {
+      "bytes": 6744,
+      "executable": false,
+      "sha256": "3dcad3a48c77ef64ec1670d0833697e535d1093785278eee02f8828c2a7a6e68"
+    },
+    "01_src/src/agent/execution_coordinator.py": {
+      "bytes": 7831,
+      "executable": false,
+      "sha256": "f04d03fc565a2c8ba49a036c36f8a04944574caf0f6a5fc94edc23437f099d0b"
+    },
+    "01_src/src/agent/execution_outcome.py": {
+      "bytes": 1491,
+      "executable": false,
+      "sha256": "24f95e41f700c54cb71215f1f317704eba85a97e16ec91c5f18232ac3e035088"
+    },
+    "01_src/src/agent/execution_segments.py": {
+      "bytes": 20978,
+      "executable": false,
+      "sha256": "fb2e9d9ab0d1f4ec4f6bd297570c88eb2da105fd0774e8961cb2f4d0f0a1b6ed"
+    },
+    "01_src/src/agent/execution_waits.py": {
+      "bytes": 3353,
+      "executable": false,
+      "sha256": "fcbfe706fbe933f02e7ab85937a4097f3f5a4ba9c6b9e592e321b711b8c45a07"
+    },
+    "01_src/src/agent/harness.py": {
+      "bytes": 32161,
+      "executable": false,
+      "sha256": "b4b713653f930a3594f9d3903829248f282c059009cadc15144b77858e68cfbb"
+    },
+    "01_src/src/agent/host.py": {
+      "bytes": 60890,
+      "executable": false,
+      "sha256": "2bf81365cc6d5ee8daabfb37005b6ea6a503b14c882baf2be967e699eb046659"
+    },
+    "01_src/src/agent/host_policy.py": {
+      "bytes": 11911,
+      "executable": false,
+      "sha256": "507f34be644a6e11903a32d7be4372c7f4bf06c64c98eac334140b546bdeb093"
+    },
+    "01_src/src/agent/host_runtime_contract_test.py": {
+      "bytes": 18580,
+      "executable": false,
+      "sha256": "70469c2dee2d7da798b9cfe78828eb56647e82314ca6be43bbf32bcb5fc62bfc"
+    },
+    "01_src/src/agent/host_tool_identity_test.py": {
+      "bytes": 4819,
+      "executable": false,
+      "sha256": "3a83b4efb665f6e673fa8e8874117956d1bbf1c0ded4446d15c7293fa9ce2a6d"
+    },
+    "01_src/src/agent/host_tools.py": {
+      "bytes": 23374,
+      "executable": false,
+      "sha256": "c306d7919695112bd74f52e303a67762999081961620d40a73741b2b03399645"
+    },
+    "01_src/src/agent/identity.py": {
+      "bytes": 1476,
+      "executable": false,
+      "sha256": "d7feb64f3ce95061675b32ad8cff8d23611bd52cd587fd637356f37933312642"
+    },
+    "01_src/src/agent/model.py": {
+      "bytes": 6545,
+      "executable": false,
+      "sha256": "454605c2af0f0aa54959650de79ba0822bc41491907798bfcdb72e2c9d2844e5"
+    },
+    "01_src/src/agent/native_runtime_test.py": {
+      "bytes": 8480,
+      "executable": false,
+      "sha256": "a6248a25c6d946522a4ca6a7e53954d992946ee5dc016ca3a12b9fe7b51aa005"
+    },
+    "01_src/src/agent/nature_skill_resources_test.py": {
+      "bytes": 12546,
+      "executable": false,
+      "sha256": "2a698bd1d3af675a48c7ba5fe2a1fab08f7436c1163825e3bd36c5b6a7d09310"
+    },
+    "01_src/src/agent/plan_tools.py": {
+      "bytes": 3921,
+      "executable": false,
+      "sha256": "2923346e40947924ccd5f10ac7dc8f9987645454d3a353fc8ffb106cfe060315"
+    },
+    "01_src/src/agent/preset_catalog.py": {
+      "bytes": 12769,
+      "executable": false,
+      "sha256": "66ed0720174e19ac5b41fa40fd14a4a1139f976a356fd5842698974fab8e7f96"
+    },
+    "01_src/src/agent/preset_schema_manifest_test.py": {
+      "bytes": 1066,
+      "executable": false,
+      "sha256": "39e94f1618d781d0267317c7c5fe1a34af64c127a699c53077470643c3fa92f6"
+    },
+    "01_src/src/agent/preset_tool_schemas.json": {
+      "bytes": 87441,
+      "executable": false,
+      "sha256": "0f81384269306229784a5c0bb0ecf9b79d71ffc39adfbe79c73895fcdfa17200"
+    },
+    "01_src/src/agent/recovery.py": {
+      "bytes": 8695,
+      "executable": false,
+      "sha256": "b7c1fe8588969cceb454b88b2751482c3de9c3e6d7a845677332bde8bc1d1cdd"
+    },
+    "01_src/src/agent/research_skill_catalog.py": {
+      "bytes": 13622,
+      "executable": false,
+      "sha256": "c5ca2cf607d165e7d97cfaa07b6a88533fd27baf74429e0a97ea1698c5c6b62f"
+    },
+    "01_src/src/agent/runtime.py": {
+      "bytes": 15225,
+      "executable": false,
+      "sha256": "61777ab56849cc5828a93cd49e79b4852630b70208e2e88f61db2bd9b69bcce9"
+    },
+    "01_src/src/agent/skill_adapter.py": {
+      "bytes": 20479,
+      "executable": false,
+      "sha256": "97b72151bb38ed06947544933a1eb5437dc9467c851480501752096f5988d419"
+    },
+    "01_src/src/agent/skill_tools.py": {
+      "bytes": 4549,
+      "executable": false,
+      "sha256": "53b443ad1214091f156c7eb3c11b01ed56fba770e826b47e34679639f7909c07"
+    },
+    "01_src/src/agent/workspace_projection.py": {
+      "bytes": 5540,
+      "executable": false,
+      "sha256": "858891a3d34f118d2f10828eba1077585ab8a8d385213c13f6da782865880288"
+    },
+    "01_src/src/agent/workspace_reconciliation.py": {
+      "bytes": 3682,
+      "executable": false,
+      "sha256": "72154ecce009ee01ad657151a40ee8a3c9db70e33dcc76c0a6bf01ae216a5158"
+    },
+    "01_src/src/agent/workspace_storage.py": {
+      "bytes": 21482,
+      "executable": false,
+      "sha256": "b3db38f70184e3580fe315e4e1f07f7e74adc14939824e12b0b0c058c71876f2"
+    },
+    "01_src/src/agent/workspace_tools.py": {
+      "bytes": 10264,
+      "executable": false,
+      "sha256": "fccfc1d5c622ddf0b48878d802e7765ed366b9d241e6b7a9c76987ba22a93fdd"
+    },
+    "01_src/src/api/__init__.py": {
+      "bytes": 0,
+      "executable": false,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "01_src/src/api/chat_turn_queue_admission_test.py": {
+      "bytes": 12478,
+      "executable": false,
+      "sha256": "99753116ea871b81f7410087e56190d024fdadcb62d5e8a7084e834cb950989b"
+    },
+    "01_src/src/api/chat_turn_queue_http_test.py": {
+      "bytes": 15689,
+      "executable": false,
+      "sha256": "680d2cdfd66ab1e3129150e6bd41544441072c85499c393aa7b4534519a2ce5c"
+    },
+    "01_src/src/api/figure_router.py": {
+      "bytes": 21957,
+      "executable": false,
+      "sha256": "b97ce7a6ba6cc6768797e64e750fee921aaa190a02d0c4c2032895d67b7c15cd"
+    },
+    "01_src/src/api/integrity_router.py": {
+      "bytes": 13671,
+      "executable": false,
+      "sha256": "1591571b42d1dbc3b2334f3d513afafefe779145da9e8a050452405d72918b42"
+    },
+    "01_src/src/api/invite_auth_http_test.py": {
+      "bytes": 36299,
+      "executable": false,
+      "sha256": "81e3dcc7c73542554b30010de670c9e8de69d99d7ce09e566c59b08512743cd8"
+    },
+    "01_src/src/api/lan_ingress.py": {
+      "bytes": 4343,
+      "executable": false,
+      "sha256": "ddf8296a3c4ec3d0b2202efbeffe2ecab32c9942e1bd8921055705b1050dfb17"
+    },
+    "01_src/src/api/main.py": {
+      "bytes": 325094,
+      "executable": false,
+      "sha256": "3675a1077b5884faf250fa4e7e02b4b20559f066b2f53bc27d1409f30dfc5baf"
+    },
+    "01_src/src/api/navigation_task_rediscovery_test.py": {
+      "bytes": 10030,
+      "executable": false,
+      "sha256": "92bbe06a8c95349a27c71ecf6f6663a8905b203fde58284b17326a7ec7b8ec62"
+    },
+    "01_src/src/api/reference_router.py": {
+      "bytes": 10079,
+      "executable": false,
+      "sha256": "99ade005179d458c4c444577217bd3c1cadd1c4a965d15960a506edc19b24085"
+    },
+    "01_src/src/api/task_observation_regression_test.py": {
+      "bytes": 10938,
+      "executable": false,
+      "sha256": "9268b70336d276fdd2ec3d753f7ad3978c26972d76db0569eb14fcc9d304c4ec"
+    },
+    "01_src/src/api/turn_envelope.py": {
+      "bytes": 37978,
+      "executable": false,
+      "sha256": "64e6de89caafb39e4a712268b0431aa055569239b0d9d9f3c6d677e0e59caf23"
+    },
     "01_src/src/auth.py": {
       "bytes": 46756,
       "executable": false,
@@ -233,275 +453,15 @@
       "executable": false,
       "sha256": "a4d7b6cbab0b74be4f3bc7a341909681264e4c87c363017698d282102a7c9e88"
     },
-    "01_src/src/config.py": {
-      "bytes": 44831,
-      "executable": false,
-      "sha256": "6c39c77de6e436f69abc309eb0072c9886c3d8222d73260bd99f407cbad1f27e"
-    },
-    "01_src/src/logger.py": {
-      "bytes": 6340,
-      "executable": false,
-      "sha256": "c03d899784ff9fb454c75298c6e5008091049db9527d9812663de6312ad01ef0"
-    },
-    "01_src/src/runtime_paths.py": {
-      "bytes": 2310,
-      "executable": false,
-      "sha256": "630208c448b516bc39d089935bfdc39370de6f093c7c7953bcdbca7f1d29eabb"
-    },
-    "01_src/src/runtime_status.py": {
-      "bytes": 3217,
-      "executable": false,
-      "sha256": "9c4a19c8486666d64f4b5291a6a39760862521134f3a3969dccfa00ff4dd33e8"
-    },
-    "01_src/src/agent/workspace_tools.py": {
-      "bytes": 10173,
-      "executable": false,
-      "sha256": "0e1cfefd96e4812ede759239d73a3a97a49f9ab8af8eb18beac946188c7d1abb"
-    },
-    "01_src/src/agent/__init__.py": {
-      "bytes": 216,
-      "executable": false,
-      "sha256": "e4285a598c6b88a36697d1f97f39deea9410148b721cae1e4a9a0cff7a9f5de8"
-    },
-    "01_src/src/agent/batch_journal.py": {
-      "bytes": 12098,
-      "executable": false,
-      "sha256": "f59d23104e44b76095f01452492ead5faedf0780cc7cd8eb74015d7647eeceee"
-    },
-    "01_src/src/agent/capabilities.py": {
-      "bytes": 6795,
-      "executable": false,
-      "sha256": "a6d3f3a55f6c2b0c35cedf54432ff22ba3b82482bb9556ee1d48d8556dd2b0a1"
-    },
-    "01_src/src/agent/checkpoint_store.py": {
-      "bytes": 24248,
-      "executable": false,
-      "sha256": "a9e5b58e6b6f04af5e45a2a3e1047b97b004813fdc97f43028b2ec1c00273f32"
-    },
-    "01_src/src/agent/code_tools.py": {
-      "bytes": 39829,
-      "executable": false,
-      "sha256": "7eb587cb9afa86b189ab6a92c40141d36a0018df7fd2958a4feb7108af882e8e"
-    },
-    "01_src/src/agent/context_projection.py": {
-      "bytes": 34976,
-      "executable": false,
-      "sha256": "577ae118e105f88ae3cf161a4e081f8894044e2da364d63b6248bc73dd9f3f29"
-    },
-    "01_src/src/agent/context_projection_regression_test.py": {
-      "bytes": 14941,
-      "executable": false,
-      "sha256": "aedd275bcf6e7bd135c2e67a23e404acd6c907052bf891cadadc7af4848b9ec1"
-    },
-    "01_src/src/agent/context_schema_budget_test.py": {
-      "bytes": 2422,
-      "executable": false,
-      "sha256": "b4149287d9041f14e37bc02b527a9dd7bf2c4df0144b27a0f2a1796b8c3b3920"
-    },
-    "01_src/src/agent/context_tools.py": {
-      "bytes": 3944,
-      "executable": false,
-      "sha256": "5d65e88e8e8f88e79eca824007ab01b5d27b325195023f50f192b6fbeb80c41f"
-    },
-    "01_src/src/agent/deep_agent_runtime.py": {
-      "bytes": 3560,
-      "executable": false,
-      "sha256": "3ccbb1878a86a04a142ca0b28748f51435c156b924f0678b43e36bc05305bc47"
-    },
-    "01_src/src/agent/events.py": {
-      "bytes": 1320,
-      "executable": false,
-      "sha256": "00b6ad17c1c53d7cf573ec38eddc17de554b20c4fe8636538b3c4a856efdf454"
-    },
-    "01_src/src/agent/execution.py": {
-      "bytes": 6635,
-      "executable": false,
-      "sha256": "76bd1121f3752dbeb8df19562baf91e6c6762ee6f681a420de264bc8460ed2ed"
-    },
-    "01_src/src/agent/execution_coordinator.py": {
-      "bytes": 7831,
-      "executable": false,
-      "sha256": "f04d03fc565a2c8ba49a036c36f8a04944574caf0f6a5fc94edc23437f099d0b"
-    },
-    "01_src/src/agent/execution_outcome.py": {
-      "bytes": 1491,
-      "executable": false,
-      "sha256": "24f95e41f700c54cb71215f1f317704eba85a97e16ec91c5f18232ac3e035088"
-    },
-    "01_src/src/agent/execution_segments.py": {
-      "bytes": 20978,
-      "executable": false,
-      "sha256": "fb2e9d9ab0d1f4ec4f6bd297570c88eb2da105fd0774e8961cb2f4d0f0a1b6ed"
-    },
-    "01_src/src/agent/execution_waits.py": {
-      "bytes": 3353,
-      "executable": false,
-      "sha256": "fcbfe706fbe933f02e7ab85937a4097f3f5a4ba9c6b9e592e321b711b8c45a07"
-    },
-    "01_src/src/agent/harness.py": {
-      "bytes": 26403,
-      "executable": false,
-      "sha256": "ea4b5483f7b8c87125b10edf503d80831983bd3c1159b7135e64386fce0fcb91"
-    },
-    "01_src/src/agent/host.py": {
-      "bytes": 56995,
-      "executable": false,
-      "sha256": "f8048ec0cf431ef2b372befb27b85989ea33b6870ec051b1f5eb5b931a6cede7"
-    },
-    "01_src/src/agent/host_policy.py": {
-      "bytes": 10986,
-      "executable": false,
-      "sha256": "74022f4194bbd2ba80887aabeef0ffa7c1a28c007bae6f75ea539ed82191910d"
-    },
-    "01_src/src/agent/host_tool_identity_test.py": {
-      "bytes": 4819,
-      "executable": false,
-      "sha256": "3a83b4efb665f6e673fa8e8874117956d1bbf1c0ded4446d15c7293fa9ce2a6d"
-    },
-    "01_src/src/agent/host_tools.py": {
-      "bytes": 20313,
-      "executable": false,
-      "sha256": "621ce2c687aea03e7db6c7979d6d901ad4df4d4c08a4f74165a730fc3a42f84c"
-    },
-    "01_src/src/agent/identity.py": {
-      "bytes": 1476,
-      "executable": false,
-      "sha256": "d7feb64f3ce95061675b32ad8cff8d23611bd52cd587fd637356f37933312642"
-    },
-    "01_src/src/agent/model.py": {
-      "bytes": 3911,
-      "executable": false,
-      "sha256": "edf8453dcbe94e5c4d2f094abf4ec33bd8240ca21ee4816254d805f03e302b40"
-    },
-    "01_src/src/agent/nature_skill_resources_test.py": {
-      "bytes": 11497,
-      "executable": false,
-      "sha256": "8928e52560877cbbc8c291926c2eeec56f740ece88cef7fce2352f9d6ca31b9a"
-    },
-    "01_src/src/agent/plan_tools.py": {
-      "bytes": 3921,
-      "executable": false,
-      "sha256": "2923346e40947924ccd5f10ac7dc8f9987645454d3a353fc8ffb106cfe060315"
-    },
-    "01_src/src/agent/preset_catalog.py": {
-      "bytes": 12769,
-      "executable": false,
-      "sha256": "66ed0720174e19ac5b41fa40fd14a4a1139f976a356fd5842698974fab8e7f96"
-    },
-    "01_src/src/agent/preset_schema_manifest_test.py": {
-      "bytes": 1066,
-      "executable": false,
-      "sha256": "39e94f1618d781d0267317c7c5fe1a34af64c127a699c53077470643c3fa92f6"
-    },
-    "01_src/src/agent/preset_tool_schemas.json": {
-      "bytes": 88083,
-      "executable": false,
-      "sha256": "9b8eed5068f06faadb5bbe27de236e78760205a433041bf0c962dcf9092cc3fb"
-    },
-    "01_src/src/agent/recovery.py": {
-      "bytes": 8034,
-      "executable": false,
-      "sha256": "56d5df4f60c8a41b1d6382b2772147e25f1d16ca691043786b1797c2dfb99505"
-    },
-    "01_src/src/agent/research_skill_catalog.py": {
-      "bytes": 13322,
-      "executable": false,
-      "sha256": "3c2ce80274f8039d2b26c394b61e11c978658523869dbcbfdde1e701760a7bea"
-    },
-    "01_src/src/agent/runtime.py": {
-      "bytes": 15225,
-      "executable": false,
-      "sha256": "61777ab56849cc5828a93cd49e79b4852630b70208e2e88f61db2bd9b69bcce9"
-    },
-    "01_src/src/agent/skill_adapter.py": {
-      "bytes": 19662,
-      "executable": false,
-      "sha256": "35f559fe815c3bdd40680c61218aeee426358d0bb8f3b31bfbaa8712e4a0a100"
-    },
-    "01_src/src/agent/skill_tools.py": {
-      "bytes": 4549,
-      "executable": false,
-      "sha256": "53b443ad1214091f156c7eb3c11b01ed56fba770e826b47e34679639f7909c07"
-    },
-    "01_src/src/agent/workspace_projection.py": {
-      "bytes": 5540,
-      "executable": false,
-      "sha256": "858891a3d34f118d2f10828eba1077585ab8a8d385213c13f6da782865880288"
-    },
-    "01_src/src/agent/workspace_reconciliation.py": {
-      "bytes": 2198,
-      "executable": false,
-      "sha256": "68ac8be0747b2b0957f431b4435fdf0303d08511b5a826877063dd4725837f60"
-    },
-    "01_src/src/agent/workspace_storage.py": {
-      "bytes": 21482,
-      "executable": false,
-      "sha256": "b3db38f70184e3580fe315e4e1f07f7e74adc14939824e12b0b0c058c71876f2"
-    },
-    "01_src/src/api/__init__.py": {
-      "bytes": 0,
-      "executable": false,
-      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    },
-    "01_src/src/api/chat_turn_queue_admission_test.py": {
-      "bytes": 12000,
-      "executable": false,
-      "sha256": "04822d2960c2fbcc63662e3293280d050e9dd4ac6058420643c71720faab48c0"
-    },
-    "01_src/src/api/chat_turn_queue_http_test.py": {
-      "bytes": 14323,
-      "executable": false,
-      "sha256": "62415a305910868e756dbeb39b7328a78484a9245aef3b47ba0e3b90d15ac5e1"
-    },
-    "01_src/src/api/figure_router.py": {
-      "bytes": 21549,
-      "executable": false,
-      "sha256": "be0f8941cf66440bdeb2a18415da1c91fe417539877c187ad0a5b58605bcb53f"
-    },
-    "01_src/src/api/integrity_router.py": {
-      "bytes": 13671,
-      "executable": false,
-      "sha256": "1591571b42d1dbc3b2334f3d513afafefe779145da9e8a050452405d72918b42"
-    },
-    "01_src/src/api/invite_auth_http_test.py": {
-      "bytes": 36299,
-      "executable": false,
-      "sha256": "81e3dcc7c73542554b30010de670c9e8de69d99d7ce09e566c59b08512743cd8"
-    },
-    "01_src/src/api/lan_ingress.py": {
-      "bytes": 4343,
-      "executable": false,
-      "sha256": "ddf8296a3c4ec3d0b2202efbeffe2ecab32c9942e1bd8921055705b1050dfb17"
-    },
-    "01_src/src/api/main.py": {
-      "bytes": 321014,
-      "executable": false,
-      "sha256": "fa4dc33606eb5c964bd0d73d5ce549b291ebaeb7ad6e7434f245fae0c9d7541b"
-    },
-    "01_src/src/api/navigation_task_rediscovery_test.py": {
-      "bytes": 9968,
-      "executable": false,
-      "sha256": "34c376f613d38a9a5e2235dd29ecf3104168a5fd04994b66064cb394a5df7444"
-    },
-    "01_src/src/api/reference_router.py": {
-      "bytes": 10079,
-      "executable": false,
-      "sha256": "99ade005179d458c4c444577217bd3c1cadd1c4a965d15960a506edc19b24085"
-    },
-    "01_src/src/api/task_observation_regression_test.py": {
-      "bytes": 5365,
-      "executable": false,
-      "sha256": "5461104db22a2ec07a64464269c7e4c56ed93e9ec422ceee595185da77c21ca5"
-    },
-    "01_src/src/api/turn_envelope.py": {
-      "bytes": 37789,
-      "executable": false,
-      "sha256": "a3b7db1546c5109c9eea385d3e07617ed2b34acb90f87bfb25d3980a87b0ff04"
-    },
     "01_src/src/browse/__init__.py": {
       "bytes": 70,
       "executable": false,
       "sha256": "7c3a00ec5830bd7e0f54754fe13d18b1868fced6719014e5960c9ffc58914bf3"
+    },
+    "01_src/src/browse/integrity.py": {
+      "bytes": 16218,
+      "executable": false,
+      "sha256": "b780f60030147e2f0ae4dbd16cb5dabd68b3ce08e99fd28b79e4db1651e0b222"
     },
     "01_src/src/browse/relay.py": {
       "bytes": 13782,
@@ -517,11 +477,6 @@
       "bytes": 13716,
       "executable": false,
       "sha256": "2557e471c445146ec1a51f3aaeaa64bc9d9d95b91dab6fa8d088e04e0608443a"
-    },
-    "01_src/src/browse/integrity.py": {
-      "bytes": 16218,
-      "executable": false,
-      "sha256": "b780f60030147e2f0ae4dbd16cb5dabd68b3ce08e99fd28b79e4db1651e0b222"
     },
     "01_src/src/code_execution/__init__.py": {
       "bytes": 148,
@@ -572,6 +527,11 @@
       "bytes": 8817,
       "executable": false,
       "sha256": "f3ee77f4c18abfaca68127cc3e316c4ad83cd4ffef9f1c7926f3e47abe4bed44"
+    },
+    "01_src/src/code_execution/environment_service.py": {
+      "bytes": 8986,
+      "executable": false,
+      "sha256": "c34124bdc147b2e626ed0c3289ff9d6a28e5ebf0015d771214cc86f6f5e2d948"
     },
     "01_src/src/code_execution/environments.py": {
       "bytes": 21591,
@@ -638,10 +598,100 @@
       "executable": false,
       "sha256": "4586d955e229ecf92edc054b9e5b34169366c22a41c4c2584a01eb0d0f2f2db8"
     },
-    "01_src/src/code_execution/environment_service.py": {
-      "bytes": 8986,
+    "01_src/src/config.py": {
+      "bytes": 44831,
       "executable": false,
-      "sha256": "c34124bdc147b2e626ed0c3289ff9d6a28e5ebf0015d771214cc86f6f5e2d948"
+      "sha256": "6c39c77de6e436f69abc309eb0072c9886c3d8222d73260bd99f407cbad1f27e"
+    },
+    "01_src/src/core/__init__.py": {
+      "bytes": 73,
+      "executable": false,
+      "sha256": "7da65f69cb9587c799b5fd614f58a314f117ab616a2791f5afcaa22497ee173f"
+    },
+    "01_src/src/core/account_admission.py": {
+      "bytes": 12717,
+      "executable": false,
+      "sha256": "c210238b62c29a9f8c890517f43bfa5aec7bb0cca68d21e258d8597d5bc9db89"
+    },
+    "01_src/src/core/account_leases.py": {
+      "bytes": 8026,
+      "executable": false,
+      "sha256": "806a59b0bce440c42c9e264b7ef702d49f2c580c55bc9dfd97467cf7cd33bc23"
+    },
+    "01_src/src/core/artifact_kinds.py": {
+      "bytes": 776,
+      "executable": false,
+      "sha256": "4675f0210de5ed0647a1a6b7b7a6b491de7b4909ccbaf11d3d1ed503deeba1d1"
+    },
+    "01_src/src/core/background.py": {
+      "bytes": 1622,
+      "executable": false,
+      "sha256": "5f3d831371ed8801f2e74e8aeba79d99b6636145c418afc5a4dc3a1623dce000"
+    },
+    "01_src/src/core/business_logger.py": {
+      "bytes": 3318,
+      "executable": false,
+      "sha256": "9ae75ebe9613bfbf6a7764bf238b1531bc94c3c94b5ba6c06a13d1a3bc58ec2d"
+    },
+    "01_src/src/core/cache_metrics.py": {
+      "bytes": 6271,
+      "executable": false,
+      "sha256": "8c4f990ccd0d0038541b463e82fd267255db585ead1592dd3404644c526a2d96"
+    },
+    "01_src/src/core/cancel.py": {
+      "bytes": 4564,
+      "executable": false,
+      "sha256": "1d1dcba242cb45b0ebfbe15515ea7d28e6ac009d6acaba2fe5b2c3eabbd085fd"
+    },
+    "01_src/src/core/chat_capacity.py": {
+      "bytes": 7249,
+      "executable": false,
+      "sha256": "8dd5310260c862029d78107c63b6c39482e72fc3b925603ed8b4026399f3bdee"
+    },
+    "01_src/src/core/chat_turn_queue.py": {
+      "bytes": 59465,
+      "executable": false,
+      "sha256": "8b8c42e0efc43da40b12c7618c927ab6c73810afc53b42f9a9eb324fa108baa1"
+    },
+    "01_src/src/core/chat_turn_queue_test.py": {
+      "bytes": 34012,
+      "executable": false,
+      "sha256": "56e57a7571b56c508c1b63b555f1e5e9dbec503c37289251429f65950af3e81b"
+    },
+    "01_src/src/core/checkpoint_restore.py": {
+      "bytes": 9687,
+      "executable": false,
+      "sha256": "ce611de2e74472d3be3890f616a0583b5e96de114fd7897d2410c5b14bcc16aa"
+    },
+    "01_src/src/core/context_budget.py": {
+      "bytes": 16684,
+      "executable": false,
+      "sha256": "1c2f2dd6619e22c00bdf784c16ee6c7eff8697e1b6c5c5e9084b71ead2681afa"
+    },
+    "01_src/src/core/context_manager.py": {
+      "bytes": 32808,
+      "executable": false,
+      "sha256": "7172699777c79a61ce4b48f023838b257eb2491153e2ea90b189c984e021c52d"
+    },
+    "01_src/src/core/context_send_view_test.py": {
+      "bytes": 4289,
+      "executable": false,
+      "sha256": "99d941654523a5ebb4df62f6d3f3118ac1cea8c18c497bd2f9fbcc8bb857a508"
+    },
+    "01_src/src/core/context_snapshot.py": {
+      "bytes": 6546,
+      "executable": false,
+      "sha256": "5d9bb08b421bf0db45c4496d56f25b32362eaaec83f30b8f6e0f62ca034eb50b"
+    },
+    "01_src/src/core/corpus_review.py": {
+      "bytes": 41316,
+      "executable": false,
+      "sha256": "bbbb40e96031e4e03f4a34cf1a7e7bdf0b094024f6c2715bd5765705feb615f1"
+    },
+    "01_src/src/core/corpus_source.py": {
+      "bytes": 22480,
+      "executable": false,
+      "sha256": "a564a00d0930d04919876ebdc44df89cd969c37fea05a03e288e570106112db3"
     },
     "01_src/src/core/data_audit_xlsx.py": {
       "bytes": 20304,
@@ -699,9 +749,9 @@
       "sha256": "0467131de1a2fee9c74bdc78852cb1f9dc2f8afa5ada9df32f3b4bea6b9bf79d"
     },
     "01_src/src/core/jobs.py": {
-      "bytes": 31440,
+      "bytes": 31464,
       "executable": false,
-      "sha256": "f00c8cad88e321654ce407eda96e2a9cf6d5144b8da0e8fd14a6371774a9e730"
+      "sha256": "502cd92c10e317698f3d83d5c936f5c79692f1a54f099c2e31a19ce2cc4c5b54"
     },
     "01_src/src/core/jobs_rediscovery_test.py": {
       "bytes": 2821,
@@ -749,19 +799,19 @@
       "sha256": "6bd454d9a10954ff07cecc4a7bd4676c0592530d242e9a89bc97d5ae1b4e0d5e"
     },
     "01_src/src/core/progress_bus.py": {
-      "bytes": 37166,
+      "bytes": 37888,
       "executable": false,
-      "sha256": "c1476232c0f7a8a97a3cb48822a26c10898fa58bac57fd7d4c43d6d8c31e3ca9"
+      "sha256": "18f91acd05426616e449d28e7cdf17e354ee6e4c81f06a7c6888c40de6b4afcd"
     },
     "01_src/src/core/provider_protocol.py": {
-      "bytes": 7111,
+      "bytes": 7220,
       "executable": false,
-      "sha256": "0672b652c1266a97f41b2efc55c68c26e6e086d8e52f7ee8f4ba931a7fddd4d5"
+      "sha256": "3e643bebb3d05c2df842c3de144c507c03f37b2dee3057d9f71e3b2bb683ac9d"
     },
     "01_src/src/core/public_progress.py": {
-      "bytes": 7583,
+      "bytes": 9166,
       "executable": false,
-      "sha256": "68a09b76a89902a744aaf89dbd1276e9133c6473e8ee0182be2e2d005fa8f0fd"
+      "sha256": "29a8bd84e659fd787511c471f8c92c182473d1dfee8e0abed8081a68e255a443"
     },
     "01_src/src/core/publication_reconcile.py": {
       "bytes": 15616,
@@ -794,14 +844,14 @@
       "sha256": "623083bbbfeb99c6b84f5ab65ba485b36a93eb5fc8893044ec17ddf6745f3749"
     },
     "01_src/src/core/stream_llm.py": {
-      "bytes": 2319,
+      "bytes": 3499,
       "executable": false,
-      "sha256": "8a87243934cda7d1f5a487ab3439f2a1b089af19d55b1b9f2cfe2c7a82b3709f"
+      "sha256": "7701db7a1bf1d74ed5cf3daaf0c5baa32b6519d2f012ec0da9592348508b4cef"
     },
     "01_src/src/core/task_events.py": {
-      "bytes": 48391,
+      "bytes": 54666,
       "executable": false,
-      "sha256": "e6348228f5234f0c1657d70fdc498a14820ef61051d9880d760c814c0ae4663a"
+      "sha256": "ce8ff8235811309782f8037a643f3bb61b2b1f2c78ae096747d9d72f04bdcaa0"
     },
     "01_src/src/core/task_result.py": {
       "bytes": 18219,
@@ -824,19 +874,19 @@
       "sha256": "5285a5109b570c55c8e12fa36b385c62f17fabcf6082370847efd22a8347d1c6"
     },
     "01_src/src/core/tool_result_delivery_test.py": {
-      "bytes": 37717,
+      "bytes": 40847,
       "executable": false,
-      "sha256": "c8925127213677fa80d2a61cf4d6e334b588d5d7c284f537f1ced76012630c94"
+      "sha256": "26ae71515e942fc2da90f1f61d72f0fce5aecbfeee9a67bff7a09bc3b68c757c"
     },
     "01_src/src/core/tool_result_view.py": {
-      "bytes": 10151,
+      "bytes": 10467,
       "executable": false,
-      "sha256": "d52652e11d406bb15637763532884f2b5f6a3a3568c1eeb6d8060621f466f871"
+      "sha256": "39b3eb97def789f702c7f83f97e794b554deee154d9e953158993551bd2d5625"
     },
     "01_src/src/core/tool_results.py": {
-      "bytes": 18679,
+      "bytes": 20233,
       "executable": false,
-      "sha256": "d1aa2fc1ec506b5209bfc211dbdbb51d333667ddb937ba4377af3f8e2809837e"
+      "sha256": "bcd1a7d41de9926e0bf2b2f8f27228eba1f7270d0b1a6c16f9cd9c9b3d901f44"
     },
     "01_src/src/core/tracing.py": {
       "bytes": 5925,
@@ -859,9 +909,9 @@
       "sha256": "e0e12ea561042ba4ce2bcf075a142e09e06d26ba307cd305052362189bf21e95"
     },
     "01_src/src/core/turn_outcome.py": {
-      "bytes": 19745,
+      "bytes": 22577,
       "executable": false,
-      "sha256": "08c14b1210a30dc0308bcc59a16286506b8c568716c5ebfcc7b885634add0867"
+      "sha256": "09c74122513d429e0e6a639452776c896b399163733b201ebee2442ef706fb15"
     },
     "01_src/src/core/turn_source_ledger.py": {
       "bytes": 10686,
@@ -879,9 +929,9 @@
       "sha256": "40f1796bf5e7ad3ac8d01ffb9026857288b05c81d16f54bdf810115ab892550a"
     },
     "01_src/src/core/user_questions.py": {
-      "bytes": 28985,
+      "bytes": 29063,
       "executable": false,
-      "sha256": "2624e836897d42b28ff6d750df494132dd9e8d6c312383860b98d8a51d339d67"
+      "sha256": "f98573ecd42eed92477c0692df72648877e534370f9456feb72146997b8f7f4d"
     },
     "01_src/src/core/web_failure_ledger.py": {
       "bytes": 5789,
@@ -902,96 +952,6 @@
       "bytes": 31759,
       "executable": false,
       "sha256": "8902c2012ccd0ee1a9a7ff76a56befa6738ae8a58d452c7afe8ce3083ac20cb6"
-    },
-    "01_src/src/core/__init__.py": {
-      "bytes": 73,
-      "executable": false,
-      "sha256": "7da65f69cb9587c799b5fd614f58a314f117ab616a2791f5afcaa22497ee173f"
-    },
-    "01_src/src/core/account_admission.py": {
-      "bytes": 12717,
-      "executable": false,
-      "sha256": "c210238b62c29a9f8c890517f43bfa5aec7bb0cca68d21e258d8597d5bc9db89"
-    },
-    "01_src/src/core/account_leases.py": {
-      "bytes": 8026,
-      "executable": false,
-      "sha256": "806a59b0bce440c42c9e264b7ef702d49f2c580c55bc9dfd97467cf7cd33bc23"
-    },
-    "01_src/src/core/artifact_kinds.py": {
-      "bytes": 776,
-      "executable": false,
-      "sha256": "4675f0210de5ed0647a1a6b7b7a6b491de7b4909ccbaf11d3d1ed503deeba1d1"
-    },
-    "01_src/src/core/background.py": {
-      "bytes": 1622,
-      "executable": false,
-      "sha256": "5f3d831371ed8801f2e74e8aeba79d99b6636145c418afc5a4dc3a1623dce000"
-    },
-    "01_src/src/core/business_logger.py": {
-      "bytes": 3318,
-      "executable": false,
-      "sha256": "9ae75ebe9613bfbf6a7764bf238b1531bc94c3c94b5ba6c06a13d1a3bc58ec2d"
-    },
-    "01_src/src/core/cache_metrics.py": {
-      "bytes": 6271,
-      "executable": false,
-      "sha256": "8c4f990ccd0d0038541b463e82fd267255db585ead1592dd3404644c526a2d96"
-    },
-    "01_src/src/core/cancel.py": {
-      "bytes": 4564,
-      "executable": false,
-      "sha256": "1d1dcba242cb45b0ebfbe15515ea7d28e6ac009d6acaba2fe5b2c3eabbd085fd"
-    },
-    "01_src/src/core/chat_capacity.py": {
-      "bytes": 7249,
-      "executable": false,
-      "sha256": "8dd5310260c862029d78107c63b6c39482e72fc3b925603ed8b4026399f3bdee"
-    },
-    "01_src/src/core/chat_turn_queue.py": {
-      "bytes": 56841,
-      "executable": false,
-      "sha256": "c9ecd3a85aed229f965767ab946c92848d51a4d86a7e87a91dc2edf3770a3808"
-    },
-    "01_src/src/core/chat_turn_queue_test.py": {
-      "bytes": 32754,
-      "executable": false,
-      "sha256": "791b4be6805e673fabb5f8465c5ae29660101114f509da96bf583cf94f2c1d07"
-    },
-    "01_src/src/core/checkpoint_restore.py": {
-      "bytes": 9687,
-      "executable": false,
-      "sha256": "ce611de2e74472d3be3890f616a0583b5e96de114fd7897d2410c5b14bcc16aa"
-    },
-    "01_src/src/core/context_budget.py": {
-      "bytes": 16684,
-      "executable": false,
-      "sha256": "1c2f2dd6619e22c00bdf784c16ee6c7eff8697e1b6c5c5e9084b71ead2681afa"
-    },
-    "01_src/src/core/context_manager.py": {
-      "bytes": 32808,
-      "executable": false,
-      "sha256": "7172699777c79a61ce4b48f023838b257eb2491153e2ea90b189c984e021c52d"
-    },
-    "01_src/src/core/context_send_view_test.py": {
-      "bytes": 4289,
-      "executable": false,
-      "sha256": "99d941654523a5ebb4df62f6d3f3118ac1cea8c18c497bd2f9fbcc8bb857a508"
-    },
-    "01_src/src/core/context_snapshot.py": {
-      "bytes": 6546,
-      "executable": false,
-      "sha256": "5d9bb08b421bf0db45c4496d56f25b32362eaaec83f30b8f6e0f62ca034eb50b"
-    },
-    "01_src/src/core/corpus_review.py": {
-      "bytes": 41316,
-      "executable": false,
-      "sha256": "bbbb40e96031e4e03f4a34cf1a7e7bdf0b094024f6c2715bd5765705feb615f1"
-    },
-    "01_src/src/core/corpus_source.py": {
-      "bytes": 22480,
-      "executable": false,
-      "sha256": "a564a00d0930d04919876ebdc44df89cd969c37fea05a03e288e570106112db3"
     },
     "01_src/src/engine/embedder.py": {
       "bytes": 10186,
@@ -1024,14 +984,14 @@
       "sha256": "a747067a44d8dbfd68db4dd8aa07050f3a07ca97e2a09a16b30d71d1718e9f9a"
     },
     "01_src/src/figures/core.py": {
-      "bytes": 11865,
+      "bytes": 12615,
       "executable": false,
-      "sha256": "3bfc8214e21fc9e7a4eb8f7b684dc94e690a9a34886221f1291fe85a0d2bb61e"
+      "sha256": "ee79af44ea17679b9da99cc88ae084ca66e3f1be7ea4d05451b3a82a7a156090"
     },
     "01_src/src/figures/current_artifact_api.py": {
-      "bytes": 24455,
+      "bytes": 24625,
       "executable": false,
-      "sha256": "245fff57abb07ba6105f7c7e656700fe81fcdbdda7b481f98e858ecb8f611268"
+      "sha256": "fc0a17be1df96d4111071d8a04b2915a36f48b36c2b63f878324532a89d82687"
     },
     "01_src/src/figures/dataset_codec.py": {
       "bytes": 369,
@@ -1069,19 +1029,19 @@
       "sha256": "a7feb33f7366811c248525c53b1f00ea067141e9365e339bf29de70b5c3b744d"
     },
     "01_src/src/figures/nature_current_qa_test.py": {
-      "bytes": 28002,
+      "bytes": 34795,
       "executable": false,
-      "sha256": "9621c4b03bf5bd94821ccf6540dce30ac78140687e21b02e6917a8aefaf7bb85"
+      "sha256": "3179707f52cd64e161e2c084a77817ce46adc6bd0843c2bdcf0576a9e19530b8"
     },
     "01_src/src/figures/nature_receipts.py": {
-      "bytes": 6182,
+      "bytes": 7003,
       "executable": false,
-      "sha256": "5c1bea9cad11094a8f6a3e272bc6dd2466185e9448e2e1b46aa4bb4b20123bf6"
+      "sha256": "561834b797c2efc211ae53bf4945016b024687a3def668393ea6822ce81dc67d"
     },
     "01_src/src/figures/nature_runtime.py": {
-      "bytes": 16646,
+      "bytes": 16098,
       "executable": false,
-      "sha256": "458225cfc7f8520ac6946cf95c5cf81fdbba04358c5a756a60d049b63f927e90"
+      "sha256": "6fecf484b9f427b28f75e19d7d787939d122ab5d806697522bbc4d741fbbb2e0"
     },
     "01_src/src/figures/overrides.py": {
       "bytes": 1304,
@@ -1094,9 +1054,9 @@
       "sha256": "49586fb9dd879db174ae04759ea78cc65c3467010e0e1ef9f036bbc319eda15a"
     },
     "01_src/src/figures/projects.py": {
-      "bytes": 65944,
+      "bytes": 66298,
       "executable": false,
-      "sha256": "4fff5c201c1b2fe10b02a50d1e1102ede3c8a2180fe27ac579e65e247686c89f"
+      "sha256": "dd9ee4b184c51a717169a55c944aa72b5011c062966d0b15bcafe03ef38e0ad0"
     },
     "01_src/src/figures/readiness.py": {
       "bytes": 12931,
@@ -1104,9 +1064,9 @@
       "sha256": "3742b63558773b0bff6bf3484f74a5016b0c63ab62d6759d12ff7fb3fdc4dae6"
     },
     "01_src/src/figures/render_policy.py": {
-      "bytes": 4843,
+      "bytes": 5054,
       "executable": false,
-      "sha256": "4db845be4144043512c4434fbc26705ce5521f84648485ddd15dd1be97ded83a"
+      "sha256": "63ee94d86727564f54fe50c6906c936b34f063349e78259665a9f5e0470517bf"
     },
     "01_src/src/figures/resolve.py": {
       "bytes": 6234,
@@ -1119,14 +1079,14 @@
       "sha256": "01e05544b6f866216196eadcab5b918ca90966bebbce7d79482cc22352e09aaf"
     },
     "01_src/src/figures/sandbox.py": {
-      "bytes": 40965,
+      "bytes": 41767,
       "executable": false,
-      "sha256": "34ab271d52c7677ddcdb7702689408da34504e9f463b95083b8ef0706a1d6685"
+      "sha256": "bdff474b3f0a4a32bbf8c35554fac6a25135b2cc7c6eee33342e7e6b9ba5d182"
     },
     "01_src/src/figures/script_outputs.py": {
-      "bytes": 16258,
+      "bytes": 17127,
       "executable": false,
-      "sha256": "17f3965bd573c3775139af838c18289ac01c0a6347f48c15a8b30c4927347b38"
+      "sha256": "de15f4a4eace8c064773570cc7b439596172ec41bd965d35fa050392175736da"
     },
     "01_src/src/figures/spec.py": {
       "bytes": 898,
@@ -1169,9 +1129,9 @@
       "sha256": "829ce2ed5ea934b525af4edcf3f6d3cb77dffd956c2507e48a5d684a715e2316"
     },
     "01_src/src/figures/worker.py": {
-      "bytes": 42720,
+      "bytes": 45015,
       "executable": false,
-      "sha256": "c046539aa1ff08f0afe30e568044dc95b70868b6962c413b1515d40a1ec3a1fb"
+      "sha256": "9d9a9e0d748d1bef39bb3a80b0974a9201a9c69e98ac0481c2c69178373d8cc2"
     },
     "01_src/src/figures/wsl_docker.py": {
       "bytes": 13611,
@@ -1179,19 +1139,19 @@
       "sha256": "fbaf563dd1c0a18eeda1090118e7b26573f1240b33772b5c074df12e2416a47d"
     },
     "01_src/src/graph/agent_operations.py": {
-      "bytes": 89268,
+      "bytes": 89289,
       "executable": false,
-      "sha256": "fa3169097c4d8059140bf1524710af246cf9eed563277e906a79c1a529f62a4d"
+      "sha256": "867c7b4d25e0d85aec303468fead0ff197152fb1506e9d34ec186f3da6d336e3"
     },
     "01_src/src/graph/candidate_prefetch.py": {
-      "bytes": 19403,
+      "bytes": 19806,
       "executable": false,
-      "sha256": "a0e5b0800d1e33044aeaf2ca72d3b7cf8c90da5466902c8368bc406dac3ffd14"
+      "sha256": "d2365f5b8287954215265a753465e8f307618a26ea6991e422dec524d95afaa1"
     },
     "01_src/src/graph/coverage.py": {
-      "bytes": 24880,
+      "bytes": 25613,
       "executable": false,
-      "sha256": "b74984b74141e3282357539c73bb5a6056d7eaf0661244c87efd7a9d6f74026a"
+      "sha256": "de964fcfb61127ee25c4f25555975d1e19e53d1612d33b028e130621b6a27dd8"
     },
     "01_src/src/graph/document_delivery.py": {
       "bytes": 1120,
@@ -1202,6 +1162,11 @@
       "bytes": 55120,
       "executable": false,
       "sha256": "b2935677d74eae86a0454c6163947860b65d15f9f9a11fc659a92f7c8571ccc5"
+    },
+    "01_src/src/graph/export_contract_delivery_test.py": {
+      "bytes": 2924,
+      "executable": false,
+      "sha256": "6ccd704d5ff6f39856eca138dbc72f4405f3ca937f9677634457c482b3db7f09"
     },
     "01_src/src/graph/general_agent_graph.py": {
       "bytes": 2753,
@@ -1229,9 +1194,9 @@
       "sha256": "54c661be9e9a93195229dc3b366813352d8832bd0804c77967fc2f99d0200a86"
     },
     "01_src/src/graph/retrieval_router.py": {
-      "bytes": 15917,
+      "bytes": 17050,
       "executable": false,
-      "sha256": "eb67ffff6ebc89cb2e91b3981108a58d6b499157c7dc7d2b474605483604574f"
+      "sha256": "58bfea4972f8f4feff793f7c45df52bdfc52e06d379faa5719870e47b58bface"
     },
     "01_src/src/graph/scene_skills.py": {
       "bytes": 4776,
@@ -1239,9 +1204,9 @@
       "sha256": "3253722d959426b746c79da18a95b26be33f7bf46bccd323878761a83d540ef2"
     },
     "01_src/src/graph/session_nodes.py": {
-      "bytes": 6953,
+      "bytes": 7197,
       "executable": false,
-      "sha256": "61cd5b67f6b3bb6e9be0e749d330822364df798f10098498b4a9d69bf302ce5c"
+      "sha256": "7fb3b2a19c57a33b5317d85752ec8c5e37c9072907e49c166bbafe2bc1855cbc"
     },
     "01_src/src/graph/session_persistence.py": {
       "bytes": 8095,
@@ -1249,9 +1214,9 @@
       "sha256": "2488db8bcdd227bef0a95dc9cad6f8aa86773c9918812622d11e377653ea30ae"
     },
     "01_src/src/graph/state.py": {
-      "bytes": 5430,
+      "bytes": 5458,
       "executable": false,
-      "sha256": "168099db61dd773e3265997842d50022e6ee3bc5f1099d60c4802b97cc96818f"
+      "sha256": "f1147ccad3852c3eb9077972fc68fdf34ac1916a0d6c63cf34b1ccf280d119d4"
     },
     "01_src/src/graph/task_continuation.py": {
       "bytes": 3987,
@@ -1259,9 +1224,9 @@
       "sha256": "da64021949152a714158eb0652be59a0e68cea519aea87b3f0e9586a3d1664b2"
     },
     "01_src/src/graph/task_contract.py": {
-      "bytes": 12530,
+      "bytes": 12822,
       "executable": false,
-      "sha256": "9929abf81df02c7f92e9ab98d073332b1defaf50b6b09552c7b4813493e60954"
+      "sha256": "bb29189df719e939e94485eda4b1fb684a58350acf896b97de636f1f0bc9b2bc"
     },
     "01_src/src/graph/tool_availability.py": {
       "bytes": 16410,
@@ -1303,6 +1268,16 @@
       "executable": false,
       "sha256": "0bf18aeef606b0166bb742053c9f8a512bf556ca1ddf878c78de8edf1a87b2b2"
     },
+    "01_src/src/logger.py": {
+      "bytes": 6340,
+      "executable": false,
+      "sha256": "c03d899784ff9fb454c75298c6e5008091049db9527d9812663de6312ad01ef0"
+    },
+    "01_src/src/prompts/builds/supervisor_system.md": {
+      "bytes": 25317,
+      "executable": false,
+      "sha256": "175f4d58762a96ea13994d3bff1ccc21d77dc4b9e1ed6c723483210bb09cd623"
+    },
     "01_src/src/prompts/loader.py": {
       "bytes": 13766,
       "executable": false,
@@ -1318,20 +1293,15 @@
       "executable": false,
       "sha256": "e8f66ded08833fd82e08e0ae2d97edeaaa0de77b10e7a1232e00bf7bf76d6944"
     },
-    "01_src/src/prompts/builds/supervisor_system.md": {
-      "bytes": 25248,
+    "01_src/src/prompts/skills/candidate-search/SKILL.md": {
+      "bytes": 3087,
       "executable": false,
-      "sha256": "a07d06b05c19787a46eab01aeac85d562ea783284984a2d5941387150c7af516"
+      "sha256": "037edbd987c4260ae09895d212ffcf70d0c5fa950ce7e2cd86456b969d123ad0"
     },
     "01_src/src/prompts/skills/catalog.json": {
       "bytes": 8520,
       "executable": false,
       "sha256": "6050ab0c328cf736c1adebcc2ea15f35af5609645be228a196f7f73d5b502f46"
-    },
-    "01_src/src/prompts/skills/candidate-search/SKILL.md": {
-      "bytes": 3087,
-      "executable": false,
-      "sha256": "037edbd987c4260ae09895d212ffcf70d0c5fa950ce7e2cd86456b969d123ad0"
     },
     "01_src/src/prompts/skills/data-audit/SKILL.md": {
       "bytes": 8518,
@@ -1383,20 +1353,15 @@
       "executable": false,
       "sha256": "5aefe708a2531c5ddaa8ee74d5155d747e96c0f21a33143d38316b7c5c88ffc4"
     },
-    "01_src/src/prompts/skills/vendor/nature-skills/skills/nature-figure/manifest.yaml": {
-      "bytes": 7782,
-      "executable": false,
-      "sha256": "f6cf1e50f55c74e159134edb8ca5a57fd5097b72b37463c7b2612757e01c24be"
-    },
-    "01_src/src/prompts/skills/vendor/nature-skills/skills/nature-figure/requirements.txt": {
-      "bytes": 23,
-      "executable": false,
-      "sha256": "e2596dd9f3381fb6280bd18added6c3d0025d954c99a132e3d0bc8d3e8a24d00"
-    },
     "01_src/src/prompts/skills/vendor/nature-skills/skills/nature-figure/assets/figures4papers/THIRD_PARTY_NOTICES.md": {
       "bytes": 982,
       "executable": false,
       "sha256": "b0ef9d2fe959468fce4f45472b12ff4d4fc9450201caa42d394823cd4a5e20d5"
+    },
+    "01_src/src/prompts/skills/vendor/nature-skills/skills/nature-figure/manifest.yaml": {
+      "bytes": 7782,
+      "executable": false,
+      "sha256": "f6cf1e50f55c74e159134edb8ca5a57fd5097b72b37463c7b2612757e01c24be"
     },
     "01_src/src/prompts/skills/vendor/nature-skills/skills/nature-figure/references/ai-graphical-abstract-workflow.md": {
       "bytes": 6263,
@@ -1503,6 +1468,11 @@
       "executable": false,
       "sha256": "9f96fa703bbe29581e50ddac9756900553b5617f46b4a0b31e8978278fffa329"
     },
+    "01_src/src/prompts/skills/vendor/nature-skills/skills/nature-figure/requirements.txt": {
+      "bytes": 23,
+      "executable": false,
+      "sha256": "e2596dd9f3381fb6280bd18added6c3d0025d954c99a132e3d0bc8d3e8a24d00"
+    },
     "01_src/src/prompts/skills/vendor/nature-skills/skills/nature-figure/scripts/audit_figure_collisions.py": {
       "bytes": 27709,
       "executable": false,
@@ -1594,9 +1564,9 @@
       "sha256": "26b49fac64e2bfa8a6b7bf0108213acd052415eb62e638f762beaf19dae04c8d"
     },
     "01_src/src/prompts/source/16_tool_usage_file_rules.md": {
-      "bytes": 14410,
+      "bytes": 14479,
       "executable": false,
-      "sha256": "072a64319e8a14e62816af63a8280a59b05ddd95e3dcbcff0946765cb2b72afd"
+      "sha256": "5323a6bccd429d1f38ab291701f6bd11a94a24885f4aad6f80a13a0d27425bcf"
     },
     "01_src/src/prompts/source/20_terminology_domain.md": {
       "bytes": 1949,
@@ -1638,6 +1608,16 @@
       "executable": false,
       "sha256": "f99583fcaf11a246636b4cdb714ebaeceb935df31f475c0338c735c060da67bc"
     },
+    "01_src/src/research/audit_projection.py": {
+      "bytes": 9892,
+      "executable": false,
+      "sha256": "7aec3d78c14f549ccf26e7042c52e511c8a3d824d8e571986bdfd03364751b12"
+    },
+    "01_src/src/research/audit_projection_test.py": {
+      "bytes": 5436,
+      "executable": false,
+      "sha256": "98a6af73b993d54a208e74f765e879e1c4951cd928a110d600794037e8cda0e8"
+    },
     "01_src/src/research/audit_release_test.py": {
       "bytes": 5639,
       "executable": false,
@@ -1649,9 +1629,9 @@
       "sha256": "2af8ce72635e430369895baeebbef4c46ec2a2203dccaeff87eb778a4e379a12"
     },
     "01_src/src/research/custom_audit.py": {
-      "bytes": 18764,
+      "bytes": 18778,
       "executable": false,
-      "sha256": "e9375e27bad198ecc40c3959bb2800f2af67692fda5e8d8b199b3984675fc146"
+      "sha256": "13c511fd41fa471d2766b40a40a08b6b6dbb5a2d11e8c0c1b8bfe452ea7a36de"
     },
     "01_src/src/research/data_audit_rules.py": {
       "bytes": 212,
@@ -1659,14 +1639,14 @@
       "sha256": "540b1b049474bf9dcfeb6118ade7961d774819b41f631693d4bc3db699d718f3"
     },
     "01_src/src/research/delivery_tools.py": {
-      "bytes": 27611,
+      "bytes": 30539,
       "executable": false,
-      "sha256": "c5cf033361cc5184339830e39198346961b2436b8b850e66ceb7e25ae2af71ab"
+      "sha256": "0c4c314f5b6ee085e999208904da31cf5aede089d0e32b42ad60919ec77bcb36"
     },
     "01_src/src/research/figure_tools.py": {
-      "bytes": 40164,
+      "bytes": 40875,
       "executable": false,
-      "sha256": "fe99471926f383b53e3b947535a778f13bd03f3b3a74c49b163b76291f4f996f"
+      "sha256": "eac787215c1d2436ae1ed0f0e1717579d91c536305063999d377f051ac3ea658"
     },
     "01_src/src/research/image_integrity.py": {
       "bytes": 47626,
@@ -1684,14 +1664,14 @@
       "sha256": "e9e2f5efd02e4c2d0b52401e83b9609e0a626f3e977f08d4b60ddbfaf6167936"
     },
     "01_src/src/research/integrity_review.py": {
-      "bytes": 17824,
+      "bytes": 18040,
       "executable": false,
-      "sha256": "4ab3561f8271500fd4d8693c1b2fdf77b2089a0e98a8892df09419593d54a894"
+      "sha256": "1f0c350db66fcf071ebfa741bbd5884698bf1c0e06d4d12e26dbb71a0d163640"
     },
     "01_src/src/research/literature.py": {
-      "bytes": 26672,
+      "bytes": 28546,
       "executable": false,
-      "sha256": "0dac2dc748f60ba8d7b21caf74e85dd55850ee7da430e7d007c9865dd97cdfe6"
+      "sha256": "cf759955bcb43062a9e453909e2cc9f76ddaa0f0f6a62429e458f347f78d4510"
     },
     "01_src/src/research/nature_composition_test.py": {
       "bytes": 21589,
@@ -1699,24 +1679,59 @@
       "sha256": "882305d59b497d8ad35b9628a93143bc9350848ed32825012dee3edb1b9939b0"
     },
     "01_src/src/research/nature_presets_test.py": {
-      "bytes": 36588,
+      "bytes": 36685,
       "executable": false,
-      "sha256": "9c9a2cb94b467b1a07f23b169126c6cb9242646951127a0bfed0e65d5092b31c"
+      "sha256": "c0e81e4744d15da432be938fabb17f932f04230f02969d1e2f5e4de54bf6a21b"
     },
     "01_src/src/research/p0c_regression_test.py": {
-      "bytes": 9982,
+      "bytes": 17773,
       "executable": false,
-      "sha256": "cc5bdb285cf2034fdc330f5673136bb8bc77399948aea61a7f3138b7cd95ee2b"
+      "sha256": "84a7fa26e35228f1c62c7c0d1789f88a0030080a9858ebeaea7ff92abe0f2a4e"
     },
     "01_src/src/research/pdf_citations.py": {
       "bytes": 10323,
       "executable": false,
       "sha256": "590b5eb036559adf46c3a5163019c79b9543d3999eb3bed3ba32c32071658b85"
     },
-    "01_src/src/research/reference_audit.py": {
-      "bytes": 41171,
+    "01_src/src/research/presets/nature_dotplot.py": {
+      "bytes": 5450,
       "executable": false,
-      "sha256": "d3de4fc5a3a218bc3835660e36ff48d2f0583d88353b0dc149392103fa8bca72"
+      "sha256": "23674ea01602c6f63c10067a5928cdef833283ff3fca93d876782f9cfaa5fd0f"
+    },
+    "01_src/src/research/presets/nature_marginal.py": {
+      "bytes": 4021,
+      "executable": false,
+      "sha256": "d7eb17a5a09f4e2d8727d421c3ef8a0b73cb98ed0a2ea5a41d73e69d8777dda2"
+    },
+    "01_src/src/research/presets/nature_paired.py": {
+      "bytes": 7684,
+      "executable": false,
+      "sha256": "79f63234df161e2480dfa0558166294f95b798c721ca01547c98c228f9267b54"
+    },
+    "01_src/src/research/presets/nature_roc.py": {
+      "bytes": 3807,
+      "executable": false,
+      "sha256": "edfa49a398f9ad09b089ff59c5a0d14730ca8de8a070192cb26e9a234a6d4341"
+    },
+    "01_src/src/research/presets/nature_volcano.py": {
+      "bytes": 5524,
+      "executable": false,
+      "sha256": "51e09da80e9b51e9c7ccbf283f9bb003b1d2504e4778ef73a9a10ece99c8133d"
+    },
+    "01_src/src/research/presets/relationship_panels.py": {
+      "bytes": 1801,
+      "executable": false,
+      "sha256": "bff33662f81e53a5fe4e5d5d58d14354189d322252c17f9a5129dd8e323ff897"
+    },
+    "01_src/src/research/presets/wide_to_long.py": {
+      "bytes": 1524,
+      "executable": false,
+      "sha256": "98788a87dfd110897de10ab6c3dae652fe7430bccf08f510fea4ebe96cfbeba2"
+    },
+    "01_src/src/research/reference_audit.py": {
+      "bytes": 44678,
+      "executable": false,
+      "sha256": "3fe5a5c7f327402f1639f7d02e8d79bbd842fd596e660b095c31e6307d575057"
     },
     "01_src/src/research/reference_extraction.py": {
       "bytes": 566,
@@ -1724,19 +1739,19 @@
       "sha256": "8b879779b2a3e61896d5768fe3e1d21aea8a6737bc438742f2a0bcacb73b63a1"
     },
     "01_src/src/research/reference_tools.py": {
-      "bytes": 13509,
+      "bytes": 13696,
       "executable": false,
-      "sha256": "e4c4120c0938c9ac8ce7a8d661fcc9492cd639b76a74e5483b2ddcc086b2ee58"
+      "sha256": "a884e13fe9d0c12b46a678e299feca0f493b3c58d5eb557df04d7c95fe8c7919"
     },
     "01_src/src/research/render_script_contract_test.py": {
-      "bytes": 10373,
+      "bytes": 14347,
       "executable": false,
-      "sha256": "35170add3decc53044a114052a7eaee091445b57eb5608c96a70608736c82ad5"
+      "sha256": "1dc35d9fa95a6a44c498f874f7467b2ec144848ed8833e2864db48f828aa657e"
     },
     "01_src/src/research/result_tools.py": {
-      "bytes": 10461,
+      "bytes": 11916,
       "executable": false,
-      "sha256": "a33026724deb93b136953c8d31625575eac199bfbf8b57cc1d0cc7c17918dad0"
+      "sha256": "9687f1c206bf04495d3174cd1b9e66f8ac3e871e1124aa5e0764b21f8c9c4632"
     },
     "01_src/src/research/script_assets.py": {
       "bytes": 29088,
@@ -1774,9 +1789,9 @@
       "sha256": "3da1476349071970b4e92427d2d79a3457dac567d0ddb941ad5b56042ca68e15"
     },
     "01_src/src/research/tools.py": {
-      "bytes": 227014,
+      "bytes": 229482,
       "executable": false,
-      "sha256": "83961025a9024c4e6b809848076885d4b3650279e51be32d868a58c60e1efad5"
+      "sha256": "9c41a4ff93d5d60a2377f593d6a98cccfe01ba3f28664de9bf11857a2f135719"
     },
     "01_src/src/research/word_tools.py": {
       "bytes": 9003,
@@ -1787,41 +1802,6 @@
       "bytes": 15460,
       "executable": false,
       "sha256": "ad3e63016c5e423b1eeaaec002faac1357d6cd34f7612a62ac5b64eb7674d8f3"
-    },
-    "01_src/src/research/presets/nature_dotplot.py": {
-      "bytes": 5450,
-      "executable": false,
-      "sha256": "23674ea01602c6f63c10067a5928cdef833283ff3fca93d876782f9cfaa5fd0f"
-    },
-    "01_src/src/research/presets/nature_marginal.py": {
-      "bytes": 4021,
-      "executable": false,
-      "sha256": "d7eb17a5a09f4e2d8727d421c3ef8a0b73cb98ed0a2ea5a41d73e69d8777dda2"
-    },
-    "01_src/src/research/presets/nature_paired.py": {
-      "bytes": 7684,
-      "executable": false,
-      "sha256": "79f63234df161e2480dfa0558166294f95b798c721ca01547c98c228f9267b54"
-    },
-    "01_src/src/research/presets/nature_roc.py": {
-      "bytes": 3807,
-      "executable": false,
-      "sha256": "edfa49a398f9ad09b089ff59c5a0d14730ca8de8a070192cb26e9a234a6d4341"
-    },
-    "01_src/src/research/presets/nature_volcano.py": {
-      "bytes": 5524,
-      "executable": false,
-      "sha256": "51e09da80e9b51e9c7ccbf283f9bb003b1d2504e4778ef73a9a10ece99c8133d"
-    },
-    "01_src/src/research/presets/relationship_panels.py": {
-      "bytes": 1801,
-      "executable": false,
-      "sha256": "bff33662f81e53a5fe4e5d5d58d14354189d322252c17f9a5129dd8e323ff897"
-    },
-    "01_src/src/research/presets/wide_to_long.py": {
-      "bytes": 1524,
-      "executable": false,
-      "sha256": "98788a87dfd110897de10ab6c3dae652fe7430bccf08f510fea4ebe96cfbeba2"
     },
     "01_src/src/retrieval/CORPUS_OPERATIONS.md": {
       "bytes": 5573,
@@ -1897,6 +1877,16 @@
       "bytes": 2274,
       "executable": false,
       "sha256": "1af25fa1f5b3b187207e54ef7d90a2462a751102dcb49e7770a074b18acba1db"
+    },
+    "01_src/src/runtime_paths.py": {
+      "bytes": 2310,
+      "executable": false,
+      "sha256": "630208c448b516bc39d089935bfdc39370de6f093c7c7953bcdbca7f1d29eabb"
+    },
+    "01_src/src/runtime_status.py": {
+      "bytes": 3217,
+      "executable": false,
+      "sha256": "9c4a19c8486666d64f4b5291a6a39760862521134f3a3969dccfa00ff4dd33e8"
     },
     "01_src/src/session/__init__.py": {
       "bytes": 0,
@@ -2029,9 +2019,9 @@
       "sha256": "6cf11070c9dfd8df8af265e607afa9ef4e4021822fca6c4c39e9d67ce183364d"
     },
     "01_src/src/tools/deepseek_search_fetch.py": {
-      "bytes": 69494,
+      "bytes": 69509,
       "executable": false,
-      "sha256": "09302b7e73472b2cd90927b167228463c9797224438c13fdc7747fd90b89e108"
+      "sha256": "62f6b59d324a29ff7a7bb931dd9f28777ef585811b8ae39458fd80aa8942d159"
     },
     "01_src/src/tools/disease_diagnose.py": {
       "bytes": 4250,
@@ -2064,9 +2054,9 @@
       "sha256": "b36dc2e7c8c5387787970fde9f9d70a01da1bbfa8ff40f640b0baea2d84c7dc8"
     },
     "01_src/src/tools/registry.py": {
-      "bytes": 45231,
+      "bytes": 45117,
       "executable": false,
-      "sha256": "9c932b4850a3436ff2245c1a4476e2aca87aeaa38522818aa0e799cc40abf1c9"
+      "sha256": "943e13431f902ef5e87927d5dc1af91ee52fe59ca63f2a685ddb7ccd5161c0f6"
     },
     "01_src/src/vision/__init__.py": {
       "bytes": 898,
@@ -2118,21 +2108,6 @@
       "executable": false,
       "sha256": "2432f73475cdcf97aed393a75af8395930673e442e7925ea2e343dab9c02b20e"
     },
-    "01_src/web/figures.html": {
-      "bytes": 16419,
-      "executable": false,
-      "sha256": "c19df9851a04168631f0ff9eb0477ae15a1bf588be5b1843921b5d0ba3f69ce1"
-    },
-    "01_src/web/index.html": {
-      "bytes": 41905,
-      "executable": false,
-      "sha256": "39f08cb59529a4aa96c3f27309deaf7b252b90e8f41390c50fcd65b1605c60e5"
-    },
-    "01_src/web/integrity-review.html": {
-      "bytes": 2165,
-      "executable": false,
-      "sha256": "63490939f36fe925e8bea51e11fcd57aa5f14a4876f9cfec6fbd3760218a3306"
-    },
     "01_src/web/assets/admin.css": {
       "bytes": 10544,
       "executable": false,
@@ -2144,139 +2119,14 @@
       "sha256": "2b13349560abde08a75417aa36968782b4f49ce0c9bea7687a35b15ea08d9c39"
     },
     "01_src/web/assets/app.css": {
-      "bytes": 133075,
+      "bytes": 133175,
       "executable": false,
-      "sha256": "6656c96a171ed309a467e89276acfef396462a0fd5b8123dca2031fc43c6c1ad"
+      "sha256": "52593641a96afd8a98f147bbb78a8dadc34a54cdd2576738a98cef6cf51c9532"
     },
     "01_src/web/assets/app.js": {
-      "bytes": 333526,
+      "bytes": 352370,
       "executable": false,
-      "sha256": "6d37a770ae1eb97b7a4052f1015ebb0ba4ef21bcded918a8c96c6c793dc9916b"
-    },
-    "01_src/web/assets/citrus-sprout-loading.svg": {
-      "bytes": 1217,
-      "executable": false,
-      "sha256": "159de8f8a90587b389e791864b22c222d7fc4a09e25b11fc27b30f28af8e338a"
-    },
-    "01_src/web/assets/citrusscholar-mascot.png": {
-      "bytes": 1310625,
-      "executable": false,
-      "sha256": "a197f6b84852555515405d00de2584d978d9030b3351a52b1af35e6f3dde6bd5"
-    },
-    "01_src/web/assets/corpus_reader.css": {
-      "bytes": 9597,
-      "executable": false,
-      "sha256": "c9c137894736276d1f15b3fdad3a90379b2cd19ada079936f7b6a12649993090"
-    },
-    "01_src/web/assets/corpus_reader.js": {
-      "bytes": 22788,
-      "executable": false,
-      "sha256": "0d85ba9a3563e23824e29ed9a578c5a80f55b1459c67e2c6e1610117cb7dd6a0"
-    },
-    "01_src/web/assets/figures.css": {
-      "bytes": 26289,
-      "executable": false,
-      "sha256": "e73d153186dbf6ea686e9026ea63bd8df96920b507584da203b5f8b837eef15e"
-    },
-    "01_src/web/assets/figures.js": {
-      "bytes": 132755,
-      "executable": false,
-      "sha256": "5de2fe5f64e462b5f800e064ad4241702edccef34b39dec1280088ee250b8c0d"
-    },
-    "01_src/web/assets/guide-workspace.svg": {
-      "bytes": 3261,
-      "executable": false,
-      "sha256": "19dd75c2d8a9c83bb8e26a22532ce40d8b03f6e1201ac90d1f6130181bbde267"
-    },
-    "01_src/web/assets/guide.css": {
-      "bytes": 7970,
-      "executable": false,
-      "sha256": "81b7196d391df82f9b7c1a425c24287d185e75d9f3c98bd56d50b6dae99c8ec4"
-    },
-    "01_src/web/assets/guide.html": {
-      "bytes": 1019,
-      "executable": false,
-      "sha256": "8e7a578ecc4bc38900cca495f7b86d261c7411aea9ac159ad08879fca4282353"
-    },
-    "01_src/web/assets/guide.js": {
-      "bytes": 22091,
-      "executable": false,
-      "sha256": "428ac3d3cf4a66eb5aa35bebad62ca8c9271a0fe409a981bbc47d39f40d1ff54"
-    },
-    "01_src/web/assets/integrity-review.css": {
-      "bytes": 3690,
-      "executable": false,
-      "sha256": "3194e5bc43bcfebcf41d61de438714a05e04cfe38e1959ec8c54966640d6f6a0"
-    },
-    "01_src/web/assets/integrity-review.js": {
-      "bytes": 9464,
-      "executable": false,
-      "sha256": "092f9c4031c98198dd12ebc6418ae7eaee9fae6f6143c447812f3ad248fda90e"
-    },
-    "01_src/web/assets/loading-sprout.css": {
-      "bytes": 8529,
-      "executable": false,
-      "sha256": "2103d514f84ed710ab8a243547d9a42706b69b2342f99d586c903eda1c6c539e"
-    },
-    "01_src/web/assets/mascot.css": {
-      "bytes": 11338,
-      "executable": false,
-      "sha256": "fddedec937a1fcaabb1ddfc590b7db1681537efac75def4d1c24a0052180a893"
-    },
-    "01_src/web/assets/mascot.js": {
-      "bytes": 51002,
-      "executable": false,
-      "sha256": "edd9d59752fad99ffba8cfb5782adb7dcd3ff307d0661f720b64b2746854c3d8"
-    },
-    "01_src/web/assets/session_files.css": {
-      "bytes": 16290,
-      "executable": false,
-      "sha256": "a214b0dd24dff3bd2d63d79656661eb64397d8327d9fefe7cb16f1c986a03f46"
-    },
-    "01_src/web/assets/session_files.js": {
-      "bytes": 92951,
-      "executable": false,
-      "sha256": "7fed7c4402472123ab2c746c419e9ff3a0c1ef5ed9938311d152250ffc9d5e34"
-    },
-    "01_src/web/assets/skill-picker.css": {
-      "bytes": 1688,
-      "executable": false,
-      "sha256": "c31b60a47ce200fa1e91b50eee4456f28e722999eb6c8375a19969acc4fafa57"
-    },
-    "01_src/web/assets/skill-picker.js": {
-      "bytes": 6131,
-      "executable": false,
-      "sha256": "4b26cbd21629bd176d452541eddc26a7de184b61dd5799969034f816832ec4ea"
-    },
-    "01_src/web/assets/task-cards.js": {
-      "bytes": 20968,
-      "executable": false,
-      "sha256": "21d89b672cf0bf886b500caecb6452a1bca7d61e404ebfe200149585ac0532e0"
-    },
-    "01_src/web/assets/task-controls.js": {
-      "bytes": 14609,
-      "executable": false,
-      "sha256": "2094957ac73adcf815482d3dcf77f68a464a75a5bb3d43ea47f07a5bf374d4c4"
-    },
-    "01_src/web/assets/task-state.js": {
-      "bytes": 27923,
-      "executable": false,
-      "sha256": "4b0f00e4c944e422d076dbea33404e6fb7db516f02b16d31aa28d650b9a61295"
-    },
-    "01_src/web/assets/task-transport.js": {
-      "bytes": 8855,
-      "executable": false,
-      "sha256": "87e7b570b5a98f3b9851e4d669e3b8fbfbc39a506cd85379e3e5d46bad663c9b"
-    },
-    "01_src/web/assets/turn_rail.js": {
-      "bytes": 17822,
-      "executable": false,
-      "sha256": "55f78a012396cdd86f44fca60cfcae34c043494645ef88fe616504e2b0384d5d"
-    },
-    "01_src/web/assets/xlsx.full.min.js": {
-      "bytes": 951928,
-      "executable": false,
-      "sha256": "ac8d774d39bb05a527f87912e2c283e237e3633120b31acf20bc6eef0e19eede"
+      "sha256": "d869d9f1a27fe0d2e08303c224c747d0929884951aa0364d872f951368d2019f"
     },
     "01_src/web/assets/avatars/01.webp": {
       "bytes": 9024,
@@ -2378,6 +2228,36 @@
       "executable": false,
       "sha256": "6d16bc9877f5b487fb1fe1e17f6e42c94f23b8d22d72878c59c31685c09d37ee"
     },
+    "01_src/web/assets/citrus-sprout-loading.svg": {
+      "bytes": 1217,
+      "executable": false,
+      "sha256": "159de8f8a90587b389e791864b22c222d7fc4a09e25b11fc27b30f28af8e338a"
+    },
+    "01_src/web/assets/citrusscholar-mascot.png": {
+      "bytes": 1310625,
+      "executable": false,
+      "sha256": "a197f6b84852555515405d00de2584d978d9030b3351a52b1af35e6f3dde6bd5"
+    },
+    "01_src/web/assets/corpus_reader.css": {
+      "bytes": 9789,
+      "executable": false,
+      "sha256": "8a076f1c699fcaff2ee2d9f070342c341c79c3d3e423bbfc0ba05ef15ff64d40"
+    },
+    "01_src/web/assets/corpus_reader.js": {
+      "bytes": 24341,
+      "executable": false,
+      "sha256": "cae1c637f944708e4c9712ea39e155fe13e567e95f74b316ccb3dc4237c200b3"
+    },
+    "01_src/web/assets/figures.css": {
+      "bytes": 26969,
+      "executable": false,
+      "sha256": "0b0aa03b66c6a65267bbb95a082329eb9ceb4638d1e3e1ede6872442da35f95e"
+    },
+    "01_src/web/assets/figures.js": {
+      "bytes": 138816,
+      "executable": false,
+      "sha256": "dea014777a1d42b98a2f422d6046cbd8d0af3fc2c4d4ec240b68845c07278ef1"
+    },
     "01_src/web/assets/figures/edit_model.js": {
       "bytes": 1917,
       "executable": false,
@@ -2392,6 +2272,51 @@
       "bytes": 18888,
       "executable": false,
       "sha256": "7e82efc2f261235086056fecfab1e3554d3134fe107c94c94c5be1da93174b58"
+    },
+    "01_src/web/assets/guide-workspace.svg": {
+      "bytes": 3261,
+      "executable": false,
+      "sha256": "19dd75c2d8a9c83bb8e26a22532ce40d8b03f6e1201ac90d1f6130181bbde267"
+    },
+    "01_src/web/assets/guide.css": {
+      "bytes": 7970,
+      "executable": false,
+      "sha256": "81b7196d391df82f9b7c1a425c24287d185e75d9f3c98bd56d50b6dae99c8ec4"
+    },
+    "01_src/web/assets/guide.html": {
+      "bytes": 1019,
+      "executable": false,
+      "sha256": "8e7a578ecc4bc38900cca495f7b86d261c7411aea9ac159ad08879fca4282353"
+    },
+    "01_src/web/assets/guide.js": {
+      "bytes": 22091,
+      "executable": false,
+      "sha256": "428ac3d3cf4a66eb5aa35bebad62ca8c9271a0fe409a981bbc47d39f40d1ff54"
+    },
+    "01_src/web/assets/integrity-review.css": {
+      "bytes": 3690,
+      "executable": false,
+      "sha256": "3194e5bc43bcfebcf41d61de438714a05e04cfe38e1959ec8c54966640d6f6a0"
+    },
+    "01_src/web/assets/integrity-review.js": {
+      "bytes": 9464,
+      "executable": false,
+      "sha256": "092f9c4031c98198dd12ebc6418ae7eaee9fae6f6143c447812f3ad248fda90e"
+    },
+    "01_src/web/assets/loading-sprout.css": {
+      "bytes": 8529,
+      "executable": false,
+      "sha256": "2103d514f84ed710ab8a243547d9a42706b69b2342f99d586c903eda1c6c539e"
+    },
+    "01_src/web/assets/mascot.css": {
+      "bytes": 11338,
+      "executable": false,
+      "sha256": "fddedec937a1fcaabb1ddfc590b7db1681537efac75def4d1c24a0052180a893"
+    },
+    "01_src/web/assets/mascot.js": {
+      "bytes": 51002,
+      "executable": false,
+      "sha256": "edd9d59752fad99ffba8cfb5782adb7dcd3ff307d0661f720b64b2746854c3d8"
     },
     "01_src/web/assets/mascot/completed.png": {
       "bytes": 180892,
@@ -2433,6 +2358,46 @@
       "executable": false,
       "sha256": "e03dd807c8e466c4d1d3c1ccaa031a41cdd2174544b41c83d206ab4969e66c5c"
     },
+    "01_src/web/assets/session_files.css": {
+      "bytes": 16290,
+      "executable": false,
+      "sha256": "a214b0dd24dff3bd2d63d79656661eb64397d8327d9fefe7cb16f1c986a03f46"
+    },
+    "01_src/web/assets/session_files.js": {
+      "bytes": 93446,
+      "executable": false,
+      "sha256": "349d5f963b17efde5e927425e97e88a37909d6c660796f80490f20f064e63c17"
+    },
+    "01_src/web/assets/skill-picker.css": {
+      "bytes": 1688,
+      "executable": false,
+      "sha256": "c31b60a47ce200fa1e91b50eee4456f28e722999eb6c8375a19969acc4fafa57"
+    },
+    "01_src/web/assets/skill-picker.js": {
+      "bytes": 6220,
+      "executable": false,
+      "sha256": "341b520e7580d8a33d29f418a723d03e7f798d2647dea515a9baf6a75f43b083"
+    },
+    "01_src/web/assets/task-cards.js": {
+      "bytes": 20968,
+      "executable": false,
+      "sha256": "21d89b672cf0bf886b500caecb6452a1bca7d61e404ebfe200149585ac0532e0"
+    },
+    "01_src/web/assets/task-controls.js": {
+      "bytes": 16850,
+      "executable": false,
+      "sha256": "c46ecfe0bd993f70971a32966d62ba60f7365a1b423646b313df606135a5d10b"
+    },
+    "01_src/web/assets/task-state.js": {
+      "bytes": 27979,
+      "executable": false,
+      "sha256": "c1ebbfaf9c2225a3d177c8fd569582926e6b131f38ebea8184961af33aadb200"
+    },
+    "01_src/web/assets/task-transport.js": {
+      "bytes": 9034,
+      "executable": false,
+      "sha256": "de657174f64c05733c9ce2a1fb1a706c8cd4df9b73cce62980f4256160a8f7a2"
+    },
     "01_src/web/assets/themes/cartoon.png": {
       "bytes": 1637708,
       "executable": false,
@@ -2447,6 +2412,11 @@
       "bytes": 1624908,
       "executable": false,
       "sha256": "985ca126464b03ae7f224282b67038acd341df1c23dd2a63270f52021c0dbf0e"
+    },
+    "01_src/web/assets/turn_rail.js": {
+      "bytes": 17822,
+      "executable": false,
+      "sha256": "55f78a012396cdd86f44fca60cfcae34c043494645ef88fe616504e2b0384d5d"
     },
     "01_src/web/assets/vendor/marked-4.3.0.LICENSE.md": {
       "bytes": 2986,
@@ -2463,10 +2433,30 @@
       "executable": false,
       "sha256": "a57075b9b54acd00d89d77e1c0935e442135945ff9142a29f58307485e9051b3"
     },
-    "01_src/web/tests/chat-queue.test.cjs": {
-      "bytes": 21008,
+    "01_src/web/assets/xlsx.full.min.js": {
+      "bytes": 951928,
       "executable": false,
-      "sha256": "147ed5dff26880d13adaa12d6d9018b4a890d03bed3ccb648eb58244faa629a4"
+      "sha256": "ac8d774d39bb05a527f87912e2c283e237e3633120b31acf20bc6eef0e19eede"
+    },
+    "01_src/web/figures.html": {
+      "bytes": 16752,
+      "executable": false,
+      "sha256": "0290f7ffeac2a1c0be63376cc6b219fa6e5059c5c28187e411ecfca6c1deb5ae"
+    },
+    "01_src/web/index.html": {
+      "bytes": 42466,
+      "executable": false,
+      "sha256": "9c38eb0da2480df4199dc36a1f332e4242486ce387597f9bfe9d4b46a7ba936e"
+    },
+    "01_src/web/integrity-review.html": {
+      "bytes": 2165,
+      "executable": false,
+      "sha256": "63490939f36fe925e8bea51e11fcd57aa5f14a4876f9cfec6fbd3760218a3306"
+    },
+    "01_src/web/tests/chat-queue.test.cjs": {
+      "bytes": 32838,
+      "executable": false,
+      "sha256": "13a7d5e25d59a8fd6927d992d490638f80e48dca52a3d4ef5fd8831e5765d9f8"
     },
     "01_src/web/tests/clipboard-attachments.test.cjs": {
       "bytes": 4764,
@@ -2479,14 +2469,14 @@
       "sha256": "5a8adf71640e2a92bde5980c802c609176c471b100e892ad83cfdfa95895bca9"
     },
     "01_src/web/tests/experience-chromium.py": {
-      "bytes": 17173,
+      "bytes": 28879,
       "executable": false,
-      "sha256": "a8281f34fbd5c28992dade223873d72ceaa5ee6f29a5fd7eef69b8783a7525c2"
+      "sha256": "94cfb5870de52f2804c128f07fa7c88b4f430002d07fdf09d3ad0f19e744c6f2"
     },
     "01_src/web/tests/experience-fixture.js": {
-      "bytes": 8684,
+      "bytes": 13177,
       "executable": false,
-      "sha256": "9cdb5651e1453e533231515528cc8d263df9acccd6239e2858205817dc35c3fd"
+      "sha256": "d6c48045975f3e5b0d52bc1bc1ae3d1e1ce5f198c0a00c93569d8ecb0e5ceb14"
     },
     "01_src/web/tests/figures-focus.test.cjs": {
       "bytes": 5901,
@@ -2509,9 +2499,9 @@
       "sha256": "11dea31a0d1fde6f3d1350178aaca694e2b3ee92ef9547a511dbeb34129a3106"
     },
     "01_src/web/tests/session-files-preview.test.cjs": {
-      "bytes": 19856,
+      "bytes": 20230,
       "executable": false,
-      "sha256": "034a1e8feae9b65476c93b85f13f79f77db075e2c723509181b5f9ec5be20fe6"
+      "sha256": "782b401ba93bf17c4e12beea3ab48044cc7a3490bb08e19acefd32161924ff44"
     },
     "01_src/web/tests/session-recovery.test.cjs": {
       "bytes": 7869,
@@ -2533,10 +2523,55 @@
       "executable": false,
       "sha256": "f0b39fb6a9fe966db42adaabb0a4fa8766a54ec4b0b22c9314c01a39bbcfb5f8"
     },
-    "02_config/skills.catalog.json": {
-      "bytes": 20007,
+    "02_config/skill-history/candidate-search/2.0.0/PROVENANCE.md": {
+      "bytes": 498,
       "executable": false,
-      "sha256": "d2f30e1c9accc35530e835f3ebc389cf50b22dc822b8db5c732064584f0aad87"
+      "sha256": "fa8e473dac7e8bf4cac36d94df31d9e326a3743f54e468d8d84e7393eba3c067"
+    },
+    "02_config/skill-history/candidate-search/2.0.0/SKILL.md": {
+      "bytes": 2966,
+      "executable": false,
+      "sha256": "bc208ef356f3f158174576d14f2de57cd1a22f954717d3439f9191c52f4d7ab3"
+    },
+    "02_config/skill-history/candidate-search/2.0.0/manifest.json": {
+      "bytes": 1392,
+      "executable": false,
+      "sha256": "b6e1c4bc27e3765d2c4d8c96aaea66d4adf0904cffd797467767979fe8d7b4ee"
+    },
+    "02_config/skill-history/candidate-search/2.0.0/references/evidence-and-fetch.md": {
+      "bytes": 1484,
+      "executable": false,
+      "sha256": "e1ef48e2392aab543361f358a5738094b711e5e0e52df1826f8d3db52918af77"
+    },
+    "02_config/skill-history/candidate-search/2.0.0/references/retrieval-and-parameters.md": {
+      "bytes": 1739,
+      "executable": false,
+      "sha256": "ae64a0f54779f7bfc699646fc7a03c447e637550aadcd2c6abcf4d5fc2c521eb"
+    },
+    "02_config/skill-history/candidate-search/2.0.0/scripts/read_evidence.py": {
+      "bytes": 125,
+      "executable": false,
+      "sha256": "691f25e06e51def15c29def6fd933162f70c4543271760822abbc51b74dfbaf6"
+    },
+    "02_config/skill-history/candidate-search/2.0.0/scripts/search_local.py": {
+      "bytes": 126,
+      "executable": false,
+      "sha256": "4617c1a4e420ef9efe89aa0d534c3c28a5691974167d9a45dd26c1c8b23e20cb"
+    },
+    "02_config/skill-history/candidate-search/2.0.1/SKILL.md": {
+      "bytes": 3346,
+      "executable": false,
+      "sha256": "d8db0f60b7e56cf528a83aa2cba8e68101c09dcf2e9db74536696d46c9691b9f"
+    },
+    "02_config/skill-history/candidate-search/2.0.1/manifest.json": {
+      "bytes": 1241,
+      "executable": false,
+      "sha256": "4ebdc0dd328a6a0b10202c309eea8579ab02380429b7851542c034eac016ce94"
+    },
+    "02_config/skill-history/data-audit/2.0.0/PROVENANCE.md": {
+      "bytes": 564,
+      "executable": false,
+      "sha256": "b5d0af7e0b4c998e40888bc9a49e6d4ec595b2c097ed84cfe4c677500e023080"
     },
     "02_config/skill-history/data-audit/2.0.0/SKILL.md": {
       "bytes": 2819,
@@ -2548,6 +2583,41 @@
       "executable": false,
       "sha256": "d3b3f104f2252128059e1abcfd96295893e87ac7fdf155076641d52564a29e66"
     },
+    "02_config/skill-history/data-audit/2.0.0/references/marking.md": {
+      "bytes": 1401,
+      "executable": false,
+      "sha256": "7ad43b6f47d5f43bfcc4a16a98157d1b4df7a30c8e5001543130f5ab772b9b85"
+    },
+    "02_config/skill-history/data-audit/2.0.0/references/methods.md": {
+      "bytes": 2813,
+      "executable": false,
+      "sha256": "39c1b26a15128698f1f2108eaf34e613a2ad2cb1938aaeaad4df544307ab9e03"
+    },
+    "02_config/skill-history/data-audit/2.0.0/references/precision-and-coverage.md": {
+      "bytes": 1217,
+      "executable": false,
+      "sha256": "a6679502f66fe5a3a86fd741984b37b7e533745afd7efd5be2f91944ed543c8c"
+    },
+    "02_config/skill-history/data-audit/2.0.0/scripts/annotate_workbook.py": {
+      "bytes": 185,
+      "executable": false,
+      "sha256": "7dd76aebac5a6ae2a0e6afab141905d9ce483d900130437fb17efe08ff97d841"
+    },
+    "02_config/skill-history/data-audit/2.0.0/scripts/audit_table.py": {
+      "bytes": 184,
+      "executable": false,
+      "sha256": "6d6dae9b9e99c5e7836403bc1ce53814ddfe7ab2ea36513cf8b4e0f311a3528a"
+    },
+    "02_config/skill-history/data-audit/2.0.0/scripts/catalog.py": {
+      "bytes": 99,
+      "executable": false,
+      "sha256": "5bd67927dc1554115c6eb9be8103981e1209d3afc2d4fa182d235ebd5f459b12"
+    },
+    "02_config/skill-history/data-audit/2.1.0/PROVENANCE.md": {
+      "bytes": 564,
+      "executable": false,
+      "sha256": "b5d0af7e0b4c998e40888bc9a49e6d4ec595b2c097ed84cfe4c677500e023080"
+    },
     "02_config/skill-history/data-audit/2.1.0/SKILL.md": {
       "bytes": 5408,
       "executable": false,
@@ -2557,6 +2627,141 @@
       "bytes": 1667,
       "executable": false,
       "sha256": "f499cf2bc1721bf426592c37f23bcc1b10b32e3a19d936d769c44cb8b88e36d8"
+    },
+    "02_config/skill-history/data-audit/2.1.0/references/marking.md": {
+      "bytes": 1401,
+      "executable": false,
+      "sha256": "7ad43b6f47d5f43bfcc4a16a98157d1b4df7a30c8e5001543130f5ab772b9b85"
+    },
+    "02_config/skill-history/data-audit/2.1.0/references/methods.md": {
+      "bytes": 2813,
+      "executable": false,
+      "sha256": "39c1b26a15128698f1f2108eaf34e613a2ad2cb1938aaeaad4df544307ab9e03"
+    },
+    "02_config/skill-history/data-audit/2.1.0/references/precision-and-coverage.md": {
+      "bytes": 1217,
+      "executable": false,
+      "sha256": "a6679502f66fe5a3a86fd741984b37b7e533745afd7efd5be2f91944ed543c8c"
+    },
+    "02_config/skill-history/data-audit/2.1.0/scripts/annotate_workbook.py": {
+      "bytes": 185,
+      "executable": false,
+      "sha256": "7dd76aebac5a6ae2a0e6afab141905d9ce483d900130437fb17efe08ff97d841"
+    },
+    "02_config/skill-history/data-audit/2.1.0/scripts/audit_table.py": {
+      "bytes": 184,
+      "executable": false,
+      "sha256": "6d6dae9b9e99c5e7836403bc1ce53814ddfe7ab2ea36513cf8b4e0f311a3528a"
+    },
+    "02_config/skill-history/data-audit/2.1.0/scripts/catalog.py": {
+      "bytes": 99,
+      "executable": false,
+      "sha256": "5bd67927dc1554115c6eb9be8103981e1209d3afc2d4fa182d235ebd5f459b12"
+    },
+    "02_config/skill-history/data-audit/2.1.1/PROVENANCE.md": {
+      "bytes": 564,
+      "executable": false,
+      "sha256": "b5d0af7e0b4c998e40888bc9a49e6d4ec595b2c097ed84cfe4c677500e023080"
+    },
+    "02_config/skill-history/data-audit/2.1.1/SKILL.md": {
+      "bytes": 6278,
+      "executable": false,
+      "sha256": "da012b6d61fc5ae48c8db4f190a702f99442ebaeabed4325fda338b40ce8e6ee"
+    },
+    "02_config/skill-history/data-audit/2.1.1/manifest.json": {
+      "bytes": 1667,
+      "executable": false,
+      "sha256": "36aaabe2d82e081f37ebc4367269da7dc6d64e2876f12c7a99239deb5c7513d6"
+    },
+    "02_config/skill-history/data-audit/2.1.1/references/marking.md": {
+      "bytes": 1401,
+      "executable": false,
+      "sha256": "7ad43b6f47d5f43bfcc4a16a98157d1b4df7a30c8e5001543130f5ab772b9b85"
+    },
+    "02_config/skill-history/data-audit/2.1.1/references/methods.md": {
+      "bytes": 2813,
+      "executable": false,
+      "sha256": "39c1b26a15128698f1f2108eaf34e613a2ad2cb1938aaeaad4df544307ab9e03"
+    },
+    "02_config/skill-history/data-audit/2.1.1/references/precision-and-coverage.md": {
+      "bytes": 1217,
+      "executable": false,
+      "sha256": "a6679502f66fe5a3a86fd741984b37b7e533745afd7efd5be2f91944ed543c8c"
+    },
+    "02_config/skill-history/data-audit/2.1.1/scripts/annotate_workbook.py": {
+      "bytes": 185,
+      "executable": false,
+      "sha256": "7dd76aebac5a6ae2a0e6afab141905d9ce483d900130437fb17efe08ff97d841"
+    },
+    "02_config/skill-history/data-audit/2.1.1/scripts/audit_table.py": {
+      "bytes": 184,
+      "executable": false,
+      "sha256": "6d6dae9b9e99c5e7836403bc1ce53814ddfe7ab2ea36513cf8b4e0f311a3528a"
+    },
+    "02_config/skill-history/data-audit/2.1.1/scripts/catalog.py": {
+      "bytes": 99,
+      "executable": false,
+      "sha256": "5bd67927dc1554115c6eb9be8103981e1209d3afc2d4fa182d235ebd5f459b12"
+    },
+    "02_config/skill-history/data-audit/2.1.2/PROVENANCE.md": {
+      "bytes": 564,
+      "executable": false,
+      "sha256": "b5d0af7e0b4c998e40888bc9a49e6d4ec595b2c097ed84cfe4c677500e023080"
+    },
+    "02_config/skill-history/data-audit/2.1.2/SKILL.md": {
+      "bytes": 6594,
+      "executable": false,
+      "sha256": "57213483ac30425dfcdc258e80ecbf31417b4419af571438d1ea45777046677c"
+    },
+    "02_config/skill-history/data-audit/2.1.2/manifest.json": {
+      "bytes": 1516,
+      "executable": false,
+      "sha256": "911e32f8e8a4b4fa0e34c61ebde9b9bb368dc7872389e43c898828cdf87f9235"
+    },
+    "02_config/skill-history/data-audit/2.1.2/references/marking.md": {
+      "bytes": 1401,
+      "executable": false,
+      "sha256": "7ad43b6f47d5f43bfcc4a16a98157d1b4df7a30c8e5001543130f5ab772b9b85"
+    },
+    "02_config/skill-history/data-audit/2.1.2/references/methods.md": {
+      "bytes": 2813,
+      "executable": false,
+      "sha256": "39c1b26a15128698f1f2108eaf34e613a2ad2cb1938aaeaad4df544307ab9e03"
+    },
+    "02_config/skill-history/data-audit/2.1.2/references/precision-and-coverage.md": {
+      "bytes": 1217,
+      "executable": false,
+      "sha256": "a6679502f66fe5a3a86fd741984b37b7e533745afd7efd5be2f91944ed543c8c"
+    },
+    "02_config/skill-history/data-audit/2.1.2/scripts/annotate_workbook.py": {
+      "bytes": 185,
+      "executable": false,
+      "sha256": "7dd76aebac5a6ae2a0e6afab141905d9ce483d900130437fb17efe08ff97d841"
+    },
+    "02_config/skill-history/data-audit/2.1.2/scripts/audit_table.py": {
+      "bytes": 184,
+      "executable": false,
+      "sha256": "6d6dae9b9e99c5e7836403bc1ce53814ddfe7ab2ea36513cf8b4e0f311a3528a"
+    },
+    "02_config/skill-history/data-audit/2.1.2/scripts/catalog.py": {
+      "bytes": 99,
+      "executable": false,
+      "sha256": "5bd67927dc1554115c6eb9be8103981e1209d3afc2d4fa182d235ebd5f459b12"
+    },
+    "02_config/skill-history/data-audit/2.2.0/SKILL.md": {
+      "bytes": 7987,
+      "executable": false,
+      "sha256": "ec5a9fa8c10b720c4fcee663f8c8bdb495d02ef52674efd79b842f80f9784ad7"
+    },
+    "02_config/skill-history/data-audit/2.2.0/manifest.json": {
+      "bytes": 1516,
+      "executable": false,
+      "sha256": "ebb82194ff40543452b853253b1f70260ca2d4297cc59b7c83425aab7ad793cb"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/RELEASE.md": {
+      "bytes": 2784,
+      "executable": false,
+      "sha256": "6bf7ae55b78f1aa22a3d44f36999a51f27e16d32d828475faadd24e5bc83bdb8"
     },
     "02_config/skill-history/nature-figure/2.0.0/SKILL.md": {
       "bytes": 4670,
@@ -2583,10 +2788,265 @@
       "executable": false,
       "sha256": "84d1263b12d64b02787c5fa11c57d1dfa8ca7618247aeadef8ca6050ff615d63"
     },
+    "02_config/skill-history/nature-figure/2.0.0/scripts/citrus/bundle_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "67adff94195ebff0cf4bd5ae6eacd6172e0c6a0188bbeec467cee86397b5f6b2"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/scripts/citrus/render_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "2e19fedfa7622448aafd69908359b29369d65443194c388db1bdcedf45d39ba1"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/scripts/citrus/revise_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "74f534dedec3be326dc75ac810f3dc8d72447a33b212b1dd9085804ee0759cc3"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/scripts/citrus/verify_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "c124ab366305210ffe5036e65978cbd997168d03bfe8128d2741f042f5dc4cb0"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/INTEGRATION.md": {
+      "bytes": 8945,
+      "executable": false,
+      "sha256": "319bfab0ce13e390a12d9e9df3640c42ddd9caac38cda3562d18a75dbcc54f3b"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/LICENSE": {
+      "bytes": 11357,
+      "executable": false,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/provenance.json": {
+      "bytes": 7984,
+      "executable": false,
+      "sha256": "43f5229b5052ecfc77b5fc86bf0c6fc390a5b5a118a7d2e3e73cfcb1f74da013"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/SKILL.md": {
+      "bytes": 12367,
+      "executable": false,
+      "sha256": "5aefe708a2531c5ddaa8ee74d5155d747e96c0f21a33143d38316b7c5c88ffc4"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/assets/figures4papers/THIRD_PARTY_NOTICES.md": {
+      "bytes": 982,
+      "executable": false,
+      "sha256": "b0ef9d2fe959468fce4f45472b12ff4d4fc9450201caa42d394823cd4a5e20d5"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/manifest.yaml": {
+      "bytes": 7782,
+      "executable": false,
+      "sha256": "f6cf1e50f55c74e159134edb8ca5a57fd5097b72b37463c7b2612757e01c24be"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/ai-graphical-abstract-workflow.md": {
+      "bytes": 6263,
+      "executable": false,
+      "sha256": "258c59085ef3eaf28dcda8bf00bab5d3235f0736be1af652911de1af8aa14c4f"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/api.md": {
+      "bytes": 20759,
+      "executable": false,
+      "sha256": "1ec51840fdc45017735511b1275cada5e09f5d3e7dc44f35b2d8ba052809a4bc"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/asset-adaptation.md": {
+      "bytes": 5149,
+      "executable": false,
+      "sha256": "64c4f788962d73beba1bbd919255dffe620de3090579e7ec811e88e557ac4c3d"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/backend-selection.md": {
+      "bytes": 5937,
+      "executable": false,
+      "sha256": "9ff023b8103da861f2c6e4b8b244a0003120d180ab4fb004c346af5a12343dca"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/chart-types.md": {
+      "bytes": 11883,
+      "executable": false,
+      "sha256": "68008a60e0285e840a34973db5f945e88051280ac4dcad8a7eb97882c5384dfa"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/common-patterns.md": {
+      "bytes": 11668,
+      "executable": false,
+      "sha256": "5f176c70bb846744374a27a342d03761ff9c0a0c7844f87867add3a66c448581"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/demos.md": {
+      "bytes": 3282,
+      "executable": false,
+      "sha256": "dc34ab2d1600265f7e03af51afa0d4bda7b235f4cf3d2f73ac791dca8c605cec"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/design-theory.md": {
+      "bytes": 18102,
+      "executable": false,
+      "sha256": "e8b31da9dec01f552acca6aeffbd06c8dbf53e737d7138075d1f97619c43a47e"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/figure-contract.md": {
+      "bytes": 5703,
+      "executable": false,
+      "sha256": "db08b51fb080c5fe37f61140a1b7fd31247f90810f3a80cdcf58429a699879df"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/figure-legend-conventions.md": {
+      "bytes": 5165,
+      "executable": false,
+      "sha256": "7d00fc1839d5b152b289c8d892e723549be06c38ea75761763108a5ac34303fd"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/multipanel-evidence-architecture.md": {
+      "bytes": 12732,
+      "executable": false,
+      "sha256": "79ca617cc05088d6fcfb065140d0ee036eb849738bb79306964eb9aa3a4ed274"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/nature-2026-observations.md": {
+      "bytes": 6270,
+      "executable": false,
+      "sha256": "1af8250733da77f1d82cc370e2e8d61266352517b1d1ab82ed6c834de8c98272"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/nature-article-requirements.md": {
+      "bytes": 5822,
+      "executable": false,
+      "sha256": "d59ebd80a99b2a91d9b0861529044f6242e1430b37fa4d7c73935a40a6a6be33"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/openrouter-image-generation.md": {
+      "bytes": 5928,
+      "executable": false,
+      "sha256": "52a26512c9eabd040c95c5c97f6fba9b110cd4be5b41d667d372c489d11526c6"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/qa-contract.md": {
+      "bytes": 24785,
+      "executable": false,
+      "sha256": "4f31375cdb614d74eddb8aa7691c0bdfc8a8f20defcca27ce4a36192308748a8"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/r-template-index.md": {
+      "bytes": 3903,
+      "executable": false,
+      "sha256": "0ebbbd4171896b61639d7969a010401d0aa257bafb99783026a1ba32c91ce19e"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/r-workflow.md": {
+      "bytes": 8070,
+      "executable": false,
+      "sha256": "ad5403b890801d8e350976d65462babcab2dc1f525351d20bc6136b92900d9d6"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/template-catalog.md": {
+      "bytes": 2227,
+      "executable": false,
+      "sha256": "f3dfe03d7ad6d004d17cb1f576e39020f55d1aa6d26f115a3be9ce6279e7d244"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/tutorials.md": {
+      "bytes": 8728,
+      "executable": false,
+      "sha256": "0fbd92cedc8da312ec4b8655127d61ce2ba68f218b70a346d6716977ab4861d6"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/vector-schematic-style-rules.md": {
+      "bytes": 7230,
+      "executable": false,
+      "sha256": "fa96f0452b67deded2ce0437dc6bde7bedeae9dd438f18e22525d61953b32ee5"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/references/vector-schematic-workflow.md": {
+      "bytes": 6629,
+      "executable": false,
+      "sha256": "9f96fa703bbe29581e50ddac9756900553b5617f46b4a0b31e8978278fffa329"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/requirements.txt": {
+      "bytes": 23,
+      "executable": false,
+      "sha256": "e2596dd9f3381fb6280bd18added6c3d0025d954c99a132e3d0bc8d3e8a24d00"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/audit_figure_collisions.py": {
+      "bytes": 27709,
+      "executable": false,
+      "sha256": "4bd020238a9f207c8a67c61d7209cef5959f2995a1d9cd95911d6fa93de7aa36"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/audit_panel_alignment.py": {
+      "bytes": 39469,
+      "executable": false,
+      "sha256": "4ed2d6afe9db45aaf6ca26aeb264cfc251ae92b49ee9fbf117d926e1956acf56"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/audit_pdf_text.py": {
+      "bytes": 8586,
+      "executable": false,
+      "sha256": "0b3d3e30ce9ec7191b8ba6dd053226487ab41594297005afcd127acda3b08281"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/audit_svg_schematic.py": {
+      "bytes": 12722,
+      "executable": false,
+      "sha256": "8776cb9da07dc2ef6edf65c1ad23184567172b03685b880c78f3ef74d7241db8"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/figure_safety.py": {
+      "bytes": 2216,
+      "executable": false,
+      "sha256": "0e3e9601aacdafca32ef5fbf1967bdeec0abbf7f564edfd711875432bd47c212"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/generate_openrouter_schematic.py": {
+      "bytes": 10586,
+      "executable": false,
+      "sha256": "0b8a9ac399be326fa1b575e800f5d7541516a7f1d0d7696dcc81096a3f4edb4b"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/nature_figure_backend.py": {
+      "bytes": 2737,
+      "executable": false,
+      "sha256": "ae15bc3f19217250edbbb8bfcb33227d185469f67e81071780369224e63d0dca"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/panel_alignment.R": {
+      "bytes": 6233,
+      "executable": false,
+      "sha256": "aeb2db8355e2026e2f2640d25bf18edfa57fb0165ec2c7811f97bb75ba53d26b"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/plot_templates.py": {
+      "bytes": 29761,
+      "executable": false,
+      "sha256": "c5c042bc09464d58cc0363bc8542db946acb4c7efb53360a70386e1a6704691a"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/scripts/validate_figure.py": {
+      "bytes": 33447,
+      "executable": false,
+      "sha256": "b9800e93dfa289eddd2e9438af755fcc6dd4a5f0f1da7778e4f999a91b69b042"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/static/core/contract.md": {
+      "bytes": 6274,
+      "executable": false,
+      "sha256": "a2b6523a48192cf1dff0d194264c5662c832f4d1da6e9e4763ccd98cc0664d4c"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/static/core/stance.md": {
+      "bytes": 4595,
+      "executable": false,
+      "sha256": "c7e6860e955a2ee9c24a30dbe88e28741da4eef8290c019e849c6b220ea0f07a"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/static/fragments/backend/python.md": {
+      "bytes": 3535,
+      "executable": false,
+      "sha256": "1d4809e4ec4ed2d40995d74828732012a6a72c941dfec341745a3118e9312865"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-figure/static/fragments/backend/r.md": {
+      "bytes": 3299,
+      "executable": false,
+      "sha256": "4839a77846f0f71a7a44f077ee8fc665460033e7006cb18a884562712d667e2d"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-shared/core/ethics.md": {
+      "bytes": 3424,
+      "executable": false,
+      "sha256": "065db5761d72c295eb1ed5c231deb0b0bcbb0f1065d530f994c044398bd75056"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-shared/core/nature-results-discussion.md": {
+      "bytes": 10288,
+      "executable": false,
+      "sha256": "16f1ce1ed6d2aad7853eabf304cdbd661530931747bce4cf3f10b3dfb655adc1"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-shared/core/research-compliance.md": {
+      "bytes": 7717,
+      "executable": false,
+      "sha256": "0ac172d2af0c2089acd7280712a89b23a5f232d4e436e9ae78dd501ff30cd855"
+    },
+    "02_config/skill-history/nature-figure/2.0.0/vendor/nature-skills/skills/nature-shared/journal-formats/nature-machine-intelligence.md": {
+      "bytes": 18975,
+      "executable": false,
+      "sha256": "d62a418fbd67841e745f553b98a267b5a01c9445457a07a0121095ce76fad0af"
+    },
     "02_config/skill-history/nature-figure/2.1.0/ADAPTER.md": {
       "bytes": 4958,
       "executable": false,
       "sha256": "1847f2f9541667b5abe9278a0c620a4d0808c86b6fd4a7644071ffb72de5f09f"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/RELEASE.md": {
+      "bytes": 2784,
+      "executable": false,
+      "sha256": "6bf7ae55b78f1aa22a3d44f36999a51f27e16d32d828475faadd24e5bc83bdb8"
     },
     "02_config/skill-history/nature-figure/2.1.0/SKILL.md": {
       "bytes": 5177,
@@ -2598,6 +3058,11 @@
       "executable": false,
       "sha256": "54e976619cf3eb711a8129b5ba0704eb0d144d98e260e85f6b79b4a698702397"
     },
+    "02_config/skill-history/nature-figure/2.1.0/provenance.extra.json": {
+      "bytes": 1491,
+      "executable": false,
+      "sha256": "6308decbc8b820e48ff47d923f75868a9169c232538e7dbef58e5a42c8017f81"
+    },
     "02_config/skill-history/nature-figure/2.1.0/provenance.json": {
       "bytes": 12408,
       "executable": false,
@@ -2608,10 +3073,750 @@
       "executable": false,
       "sha256": "20d9aa14ab17374315d3002d8b599ff20919522abce7a6658465326f2c00a1a9"
     },
+    "02_config/skill-history/nature-figure/2.1.0/references/figure-methods.md": {
+      "bytes": 7038,
+      "executable": false,
+      "sha256": "df985b96cfbac9f04d6931c536cb70f42993d930e91309d8749da309c6a2b8b6"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/scripts/citrus/bundle_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "67adff94195ebff0cf4bd5ae6eacd6172e0c6a0188bbeec467cee86397b5f6b2"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/scripts/citrus/render_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "2e19fedfa7622448aafd69908359b29369d65443194c388db1bdcedf45d39ba1"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/scripts/citrus/revise_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "74f534dedec3be326dc75ac810f3dc8d72447a33b212b1dd9085804ee0759cc3"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/scripts/citrus/verify_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "c124ab366305210ffe5036e65978cbd997168d03bfe8128d2741f042f5dc4cb0"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/INTEGRATION.md": {
+      "bytes": 8945,
+      "executable": false,
+      "sha256": "319bfab0ce13e390a12d9e9df3640c42ddd9caac38cda3562d18a75dbcc54f3b"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/LICENSE": {
+      "bytes": 11357,
+      "executable": false,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/provenance.json": {
+      "bytes": 7984,
+      "executable": false,
+      "sha256": "43f5229b5052ecfc77b5fc86bf0c6fc390a5b5a118a7d2e3e73cfcb1f74da013"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/SKILL.md": {
+      "bytes": 12367,
+      "executable": false,
+      "sha256": "5aefe708a2531c5ddaa8ee74d5155d747e96c0f21a33143d38316b7c5c88ffc4"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/assets/figures4papers/THIRD_PARTY_NOTICES.md": {
+      "bytes": 982,
+      "executable": false,
+      "sha256": "b0ef9d2fe959468fce4f45472b12ff4d4fc9450201caa42d394823cd4a5e20d5"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/manifest.yaml": {
+      "bytes": 7782,
+      "executable": false,
+      "sha256": "f6cf1e50f55c74e159134edb8ca5a57fd5097b72b37463c7b2612757e01c24be"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/ai-graphical-abstract-workflow.md": {
+      "bytes": 6263,
+      "executable": false,
+      "sha256": "258c59085ef3eaf28dcda8bf00bab5d3235f0736be1af652911de1af8aa14c4f"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/api.md": {
+      "bytes": 20759,
+      "executable": false,
+      "sha256": "1ec51840fdc45017735511b1275cada5e09f5d3e7dc44f35b2d8ba052809a4bc"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/asset-adaptation.md": {
+      "bytes": 5149,
+      "executable": false,
+      "sha256": "64c4f788962d73beba1bbd919255dffe620de3090579e7ec811e88e557ac4c3d"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/backend-selection.md": {
+      "bytes": 5937,
+      "executable": false,
+      "sha256": "9ff023b8103da861f2c6e4b8b244a0003120d180ab4fb004c346af5a12343dca"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/chart-types.md": {
+      "bytes": 11883,
+      "executable": false,
+      "sha256": "68008a60e0285e840a34973db5f945e88051280ac4dcad8a7eb97882c5384dfa"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/common-patterns.md": {
+      "bytes": 11668,
+      "executable": false,
+      "sha256": "5f176c70bb846744374a27a342d03761ff9c0a0c7844f87867add3a66c448581"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/demos.md": {
+      "bytes": 3282,
+      "executable": false,
+      "sha256": "dc34ab2d1600265f7e03af51afa0d4bda7b235f4cf3d2f73ac791dca8c605cec"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/design-theory.md": {
+      "bytes": 18102,
+      "executable": false,
+      "sha256": "e8b31da9dec01f552acca6aeffbd06c8dbf53e737d7138075d1f97619c43a47e"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/figure-contract.md": {
+      "bytes": 5703,
+      "executable": false,
+      "sha256": "db08b51fb080c5fe37f61140a1b7fd31247f90810f3a80cdcf58429a699879df"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/figure-legend-conventions.md": {
+      "bytes": 5165,
+      "executable": false,
+      "sha256": "7d00fc1839d5b152b289c8d892e723549be06c38ea75761763108a5ac34303fd"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/multipanel-evidence-architecture.md": {
+      "bytes": 12732,
+      "executable": false,
+      "sha256": "79ca617cc05088d6fcfb065140d0ee036eb849738bb79306964eb9aa3a4ed274"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/nature-2026-observations.md": {
+      "bytes": 6270,
+      "executable": false,
+      "sha256": "1af8250733da77f1d82cc370e2e8d61266352517b1d1ab82ed6c834de8c98272"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/nature-article-requirements.md": {
+      "bytes": 5822,
+      "executable": false,
+      "sha256": "d59ebd80a99b2a91d9b0861529044f6242e1430b37fa4d7c73935a40a6a6be33"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/openrouter-image-generation.md": {
+      "bytes": 5928,
+      "executable": false,
+      "sha256": "52a26512c9eabd040c95c5c97f6fba9b110cd4be5b41d667d372c489d11526c6"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/qa-contract.md": {
+      "bytes": 24785,
+      "executable": false,
+      "sha256": "4f31375cdb614d74eddb8aa7691c0bdfc8a8f20defcca27ce4a36192308748a8"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/r-template-index.md": {
+      "bytes": 3903,
+      "executable": false,
+      "sha256": "0ebbbd4171896b61639d7969a010401d0aa257bafb99783026a1ba32c91ce19e"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/r-workflow.md": {
+      "bytes": 8070,
+      "executable": false,
+      "sha256": "ad5403b890801d8e350976d65462babcab2dc1f525351d20bc6136b92900d9d6"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/template-catalog.md": {
+      "bytes": 2227,
+      "executable": false,
+      "sha256": "f3dfe03d7ad6d004d17cb1f576e39020f55d1aa6d26f115a3be9ce6279e7d244"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/tutorials.md": {
+      "bytes": 8728,
+      "executable": false,
+      "sha256": "0fbd92cedc8da312ec4b8655127d61ce2ba68f218b70a346d6716977ab4861d6"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/vector-schematic-style-rules.md": {
+      "bytes": 7230,
+      "executable": false,
+      "sha256": "fa96f0452b67deded2ce0437dc6bde7bedeae9dd438f18e22525d61953b32ee5"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/references/vector-schematic-workflow.md": {
+      "bytes": 6629,
+      "executable": false,
+      "sha256": "9f96fa703bbe29581e50ddac9756900553b5617f46b4a0b31e8978278fffa329"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/requirements.txt": {
+      "bytes": 23,
+      "executable": false,
+      "sha256": "e2596dd9f3381fb6280bd18added6c3d0025d954c99a132e3d0bc8d3e8a24d00"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/audit_figure_collisions.py": {
+      "bytes": 27709,
+      "executable": false,
+      "sha256": "4bd020238a9f207c8a67c61d7209cef5959f2995a1d9cd95911d6fa93de7aa36"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/audit_panel_alignment.py": {
+      "bytes": 39469,
+      "executable": false,
+      "sha256": "4ed2d6afe9db45aaf6ca26aeb264cfc251ae92b49ee9fbf117d926e1956acf56"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/audit_pdf_text.py": {
+      "bytes": 8586,
+      "executable": false,
+      "sha256": "0b3d3e30ce9ec7191b8ba6dd053226487ab41594297005afcd127acda3b08281"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/audit_svg_schematic.py": {
+      "bytes": 12722,
+      "executable": false,
+      "sha256": "8776cb9da07dc2ef6edf65c1ad23184567172b03685b880c78f3ef74d7241db8"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/figure_safety.py": {
+      "bytes": 2216,
+      "executable": false,
+      "sha256": "0e3e9601aacdafca32ef5fbf1967bdeec0abbf7f564edfd711875432bd47c212"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/generate_openrouter_schematic.py": {
+      "bytes": 10586,
+      "executable": false,
+      "sha256": "0b8a9ac399be326fa1b575e800f5d7541516a7f1d0d7696dcc81096a3f4edb4b"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/nature_figure_backend.py": {
+      "bytes": 2737,
+      "executable": false,
+      "sha256": "ae15bc3f19217250edbbb8bfcb33227d185469f67e81071780369224e63d0dca"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/panel_alignment.R": {
+      "bytes": 6233,
+      "executable": false,
+      "sha256": "aeb2db8355e2026e2f2640d25bf18edfa57fb0165ec2c7811f97bb75ba53d26b"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/plot_templates.py": {
+      "bytes": 29761,
+      "executable": false,
+      "sha256": "c5c042bc09464d58cc0363bc8542db946acb4c7efb53360a70386e1a6704691a"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/scripts/validate_figure.py": {
+      "bytes": 33447,
+      "executable": false,
+      "sha256": "b9800e93dfa289eddd2e9438af755fcc6dd4a5f0f1da7778e4f999a91b69b042"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/static/core/contract.md": {
+      "bytes": 6274,
+      "executable": false,
+      "sha256": "a2b6523a48192cf1dff0d194264c5662c832f4d1da6e9e4763ccd98cc0664d4c"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/static/core/stance.md": {
+      "bytes": 4595,
+      "executable": false,
+      "sha256": "c7e6860e955a2ee9c24a30dbe88e28741da4eef8290c019e849c6b220ea0f07a"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/static/fragments/backend/python.md": {
+      "bytes": 3535,
+      "executable": false,
+      "sha256": "1d4809e4ec4ed2d40995d74828732012a6a72c941dfec341745a3118e9312865"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-figure/static/fragments/backend/r.md": {
+      "bytes": 3299,
+      "executable": false,
+      "sha256": "4839a77846f0f71a7a44f077ee8fc665460033e7006cb18a884562712d667e2d"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-shared/core/ethics.md": {
+      "bytes": 3424,
+      "executable": false,
+      "sha256": "065db5761d72c295eb1ed5c231deb0b0bcbb0f1065d530f994c044398bd75056"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-shared/core/nature-results-discussion.md": {
+      "bytes": 10288,
+      "executable": false,
+      "sha256": "16f1ce1ed6d2aad7853eabf304cdbd661530931747bce4cf3f10b3dfb655adc1"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-shared/core/research-compliance.md": {
+      "bytes": 7717,
+      "executable": false,
+      "sha256": "0ac172d2af0c2089acd7280712a89b23a5f232d4e436e9ae78dd501ff30cd855"
+    },
+    "02_config/skill-history/nature-figure/2.1.0/vendor/nature-skills/skills/nature-shared/journal-formats/nature-machine-intelligence.md": {
+      "bytes": 18975,
+      "executable": false,
+      "sha256": "d62a418fbd67841e745f553b98a267b5a01c9445457a07a0121095ce76fad0af"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/ADAPTER.md": {
+      "bytes": 7228,
+      "executable": false,
+      "sha256": "c0e708e274a0ac94b45c45b845ab0da396a5376920b92caa14b517e798e73f09"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/RELEASE.md": {
+      "bytes": 2784,
+      "executable": false,
+      "sha256": "6bf7ae55b78f1aa22a3d44f36999a51f27e16d32d828475faadd24e5bc83bdb8"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/SKILL.md": {
+      "bytes": 5304,
+      "executable": false,
+      "sha256": "5fd5fe22b50915995f0ed1dab3e83cdef22be275a6e73270d4950aef3f313a87"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/manifest.json": {
+      "bytes": 11606,
+      "executable": false,
+      "sha256": "a895d7fe9ad5116bcf361247cd38e4f68f949906bacd2c642fcb214de72763dc"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/provenance.extra.json": {
+      "bytes": 1491,
+      "executable": false,
+      "sha256": "6308decbc8b820e48ff47d923f75868a9169c232538e7dbef58e5a42c8017f81"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/provenance.json": {
+      "bytes": 12408,
+      "executable": false,
+      "sha256": "b6ba9070c52cb88ac799bc082bdc6bf6d3f9e065b5b9ce9dbca724dcbfa30cf0"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/references/bridge.md": {
+      "bytes": 6948,
+      "executable": false,
+      "sha256": "61b89e70eecdbc8e26b29232b3f28fc2fa16e6b5a979b16dc6a0b4781812d11d"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/references/figure-methods.md": {
+      "bytes": 7038,
+      "executable": false,
+      "sha256": "df985b96cfbac9f04d6931c536cb70f42993d930e91309d8749da309c6a2b8b6"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/scripts/citrus/bundle_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "67adff94195ebff0cf4bd5ae6eacd6172e0c6a0188bbeec467cee86397b5f6b2"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/scripts/citrus/render_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "2e19fedfa7622448aafd69908359b29369d65443194c388db1bdcedf45d39ba1"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/scripts/citrus/revise_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "74f534dedec3be326dc75ac810f3dc8d72447a33b212b1dd9085804ee0759cc3"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/scripts/citrus/verify_figure.py": {
+      "bytes": 430,
+      "executable": false,
+      "sha256": "c124ab366305210ffe5036e65978cbd997168d03bfe8128d2741f042f5dc4cb0"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/INTEGRATION.md": {
+      "bytes": 8945,
+      "executable": false,
+      "sha256": "319bfab0ce13e390a12d9e9df3640c42ddd9caac38cda3562d18a75dbcc54f3b"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/LICENSE": {
+      "bytes": 11357,
+      "executable": false,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/provenance.json": {
+      "bytes": 7984,
+      "executable": false,
+      "sha256": "43f5229b5052ecfc77b5fc86bf0c6fc390a5b5a118a7d2e3e73cfcb1f74da013"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/SKILL.md": {
+      "bytes": 12367,
+      "executable": false,
+      "sha256": "5aefe708a2531c5ddaa8ee74d5155d747e96c0f21a33143d38316b7c5c88ffc4"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/assets/figures4papers/THIRD_PARTY_NOTICES.md": {
+      "bytes": 982,
+      "executable": false,
+      "sha256": "b0ef9d2fe959468fce4f45472b12ff4d4fc9450201caa42d394823cd4a5e20d5"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/manifest.yaml": {
+      "bytes": 7782,
+      "executable": false,
+      "sha256": "f6cf1e50f55c74e159134edb8ca5a57fd5097b72b37463c7b2612757e01c24be"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/ai-graphical-abstract-workflow.md": {
+      "bytes": 6263,
+      "executable": false,
+      "sha256": "258c59085ef3eaf28dcda8bf00bab5d3235f0736be1af652911de1af8aa14c4f"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/api.md": {
+      "bytes": 20759,
+      "executable": false,
+      "sha256": "1ec51840fdc45017735511b1275cada5e09f5d3e7dc44f35b2d8ba052809a4bc"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/asset-adaptation.md": {
+      "bytes": 5149,
+      "executable": false,
+      "sha256": "64c4f788962d73beba1bbd919255dffe620de3090579e7ec811e88e557ac4c3d"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/backend-selection.md": {
+      "bytes": 5937,
+      "executable": false,
+      "sha256": "9ff023b8103da861f2c6e4b8b244a0003120d180ab4fb004c346af5a12343dca"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/chart-types.md": {
+      "bytes": 11883,
+      "executable": false,
+      "sha256": "68008a60e0285e840a34973db5f945e88051280ac4dcad8a7eb97882c5384dfa"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/common-patterns.md": {
+      "bytes": 11668,
+      "executable": false,
+      "sha256": "5f176c70bb846744374a27a342d03761ff9c0a0c7844f87867add3a66c448581"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/demos.md": {
+      "bytes": 3282,
+      "executable": false,
+      "sha256": "dc34ab2d1600265f7e03af51afa0d4bda7b235f4cf3d2f73ac791dca8c605cec"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/design-theory.md": {
+      "bytes": 18102,
+      "executable": false,
+      "sha256": "e8b31da9dec01f552acca6aeffbd06c8dbf53e737d7138075d1f97619c43a47e"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/figure-contract.md": {
+      "bytes": 5703,
+      "executable": false,
+      "sha256": "db08b51fb080c5fe37f61140a1b7fd31247f90810f3a80cdcf58429a699879df"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/figure-legend-conventions.md": {
+      "bytes": 5165,
+      "executable": false,
+      "sha256": "7d00fc1839d5b152b289c8d892e723549be06c38ea75761763108a5ac34303fd"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/multipanel-evidence-architecture.md": {
+      "bytes": 12732,
+      "executable": false,
+      "sha256": "79ca617cc05088d6fcfb065140d0ee036eb849738bb79306964eb9aa3a4ed274"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/nature-2026-observations.md": {
+      "bytes": 6270,
+      "executable": false,
+      "sha256": "1af8250733da77f1d82cc370e2e8d61266352517b1d1ab82ed6c834de8c98272"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/nature-article-requirements.md": {
+      "bytes": 5822,
+      "executable": false,
+      "sha256": "d59ebd80a99b2a91d9b0861529044f6242e1430b37fa4d7c73935a40a6a6be33"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/openrouter-image-generation.md": {
+      "bytes": 5928,
+      "executable": false,
+      "sha256": "52a26512c9eabd040c95c5c97f6fba9b110cd4be5b41d667d372c489d11526c6"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/qa-contract.md": {
+      "bytes": 24785,
+      "executable": false,
+      "sha256": "4f31375cdb614d74eddb8aa7691c0bdfc8a8f20defcca27ce4a36192308748a8"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/r-template-index.md": {
+      "bytes": 3903,
+      "executable": false,
+      "sha256": "0ebbbd4171896b61639d7969a010401d0aa257bafb99783026a1ba32c91ce19e"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/r-workflow.md": {
+      "bytes": 8070,
+      "executable": false,
+      "sha256": "ad5403b890801d8e350976d65462babcab2dc1f525351d20bc6136b92900d9d6"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/template-catalog.md": {
+      "bytes": 2227,
+      "executable": false,
+      "sha256": "f3dfe03d7ad6d004d17cb1f576e39020f55d1aa6d26f115a3be9ce6279e7d244"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/tutorials.md": {
+      "bytes": 8728,
+      "executable": false,
+      "sha256": "0fbd92cedc8da312ec4b8655127d61ce2ba68f218b70a346d6716977ab4861d6"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/vector-schematic-style-rules.md": {
+      "bytes": 7230,
+      "executable": false,
+      "sha256": "fa96f0452b67deded2ce0437dc6bde7bedeae9dd438f18e22525d61953b32ee5"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/references/vector-schematic-workflow.md": {
+      "bytes": 6629,
+      "executable": false,
+      "sha256": "9f96fa703bbe29581e50ddac9756900553b5617f46b4a0b31e8978278fffa329"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/requirements.txt": {
+      "bytes": 23,
+      "executable": false,
+      "sha256": "e2596dd9f3381fb6280bd18added6c3d0025d954c99a132e3d0bc8d3e8a24d00"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/audit_figure_collisions.py": {
+      "bytes": 27709,
+      "executable": false,
+      "sha256": "4bd020238a9f207c8a67c61d7209cef5959f2995a1d9cd95911d6fa93de7aa36"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/audit_panel_alignment.py": {
+      "bytes": 39469,
+      "executable": false,
+      "sha256": "4ed2d6afe9db45aaf6ca26aeb264cfc251ae92b49ee9fbf117d926e1956acf56"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/audit_pdf_text.py": {
+      "bytes": 8586,
+      "executable": false,
+      "sha256": "0b3d3e30ce9ec7191b8ba6dd053226487ab41594297005afcd127acda3b08281"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/audit_svg_schematic.py": {
+      "bytes": 12722,
+      "executable": false,
+      "sha256": "8776cb9da07dc2ef6edf65c1ad23184567172b03685b880c78f3ef74d7241db8"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/figure_safety.py": {
+      "bytes": 2216,
+      "executable": false,
+      "sha256": "0e3e9601aacdafca32ef5fbf1967bdeec0abbf7f564edfd711875432bd47c212"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/generate_openrouter_schematic.py": {
+      "bytes": 10586,
+      "executable": false,
+      "sha256": "0b8a9ac399be326fa1b575e800f5d7541516a7f1d0d7696dcc81096a3f4edb4b"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/nature_figure_backend.py": {
+      "bytes": 2737,
+      "executable": false,
+      "sha256": "ae15bc3f19217250edbbb8bfcb33227d185469f67e81071780369224e63d0dca"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/panel_alignment.R": {
+      "bytes": 6233,
+      "executable": false,
+      "sha256": "aeb2db8355e2026e2f2640d25bf18edfa57fb0165ec2c7811f97bb75ba53d26b"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/plot_templates.py": {
+      "bytes": 29761,
+      "executable": false,
+      "sha256": "c5c042bc09464d58cc0363bc8542db946acb4c7efb53360a70386e1a6704691a"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/scripts/validate_figure.py": {
+      "bytes": 33447,
+      "executable": false,
+      "sha256": "b9800e93dfa289eddd2e9438af755fcc6dd4a5f0f1da7778e4f999a91b69b042"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/static/core/contract.md": {
+      "bytes": 6274,
+      "executable": false,
+      "sha256": "a2b6523a48192cf1dff0d194264c5662c832f4d1da6e9e4763ccd98cc0664d4c"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/static/core/stance.md": {
+      "bytes": 4595,
+      "executable": false,
+      "sha256": "c7e6860e955a2ee9c24a30dbe88e28741da4eef8290c019e849c6b220ea0f07a"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/static/fragments/backend/python.md": {
+      "bytes": 3535,
+      "executable": false,
+      "sha256": "1d4809e4ec4ed2d40995d74828732012a6a72c941dfec341745a3118e9312865"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-figure/static/fragments/backend/r.md": {
+      "bytes": 3299,
+      "executable": false,
+      "sha256": "4839a77846f0f71a7a44f077ee8fc665460033e7006cb18a884562712d667e2d"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-shared/core/ethics.md": {
+      "bytes": 3424,
+      "executable": false,
+      "sha256": "065db5761d72c295eb1ed5c231deb0b0bcbb0f1065d530f994c044398bd75056"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-shared/core/nature-results-discussion.md": {
+      "bytes": 10288,
+      "executable": false,
+      "sha256": "16f1ce1ed6d2aad7853eabf304cdbd661530931747bce4cf3f10b3dfb655adc1"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-shared/core/research-compliance.md": {
+      "bytes": 7717,
+      "executable": false,
+      "sha256": "0ac172d2af0c2089acd7280712a89b23a5f232d4e436e9ae78dd501ff30cd855"
+    },
+    "02_config/skill-history/nature-figure/2.1.1/vendor/nature-skills/skills/nature-shared/journal-formats/nature-machine-intelligence.md": {
+      "bytes": 18975,
+      "executable": false,
+      "sha256": "d62a418fbd67841e745f553b98a267b5a01c9445457a07a0121095ce76fad0af"
+    },
+    "02_config/skill-history/nature-figure/2.1.2/SKILL.md": {
+      "bytes": 2218,
+      "executable": false,
+      "sha256": "d74e8d7661bfaa9b0d5ea120f56655c8bee2fe32dfdd6b32673806a0afcfa35d"
+    },
+    "02_config/skill-history/nature-figure/2.1.2/manifest.json": {
+      "bytes": 11650,
+      "executable": false,
+      "sha256": "e52e0e8307cba54d1f85d4fef93910c50da2be6f8f6231a3eae4e52fbc0a57e5"
+    },
+    "02_config/skill-history/nature-figure/2.1.2/provenance.json": {
+      "bytes": 12445,
+      "executable": false,
+      "sha256": "82a3fe2cdb2aa05a574b9eab6a8ba9517459f981ec5cb381a7b91ea5eb09d9e1"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/PROVENANCE.md": {
+      "bytes": 646,
+      "executable": false,
+      "sha256": "b7cde9604f037076d4a74f2eb38c9e448c4296e1d9515a05ed77b354e2c5367f"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/SKILL.md": {
+      "bytes": 1606,
+      "executable": false,
+      "sha256": "843b9e500076c3aa79a9816d548682cee9bd5e8b03643f9908b22e125df46962"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/assets/status-vocabulary.json": {
+      "bytes": 257,
+      "executable": false,
+      "sha256": "346b67aa554b72ce97f46c5b030ea265dc2277a438280dba30ad2d7b2497d320"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/manifest.json": {
+      "bytes": 2703,
+      "executable": false,
+      "sha256": "1dc9156ad59f7d9eebe0c9c2273974355d6531c39bd405bc1aca1c5dba54f6ab"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/references/01-identity-and-evidence.md": {
+      "bytes": 244,
+      "executable": false,
+      "sha256": "3281e3ece773c1a70846de3af949ac59d7da685cc042387c1e0d61f6ebffc5a1"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/references/02-sources-and-routes.md": {
+      "bytes": 392,
+      "executable": false,
+      "sha256": "55f4a2d4909a9c16c1a94ccdfbef191c65ef9e36766dceb695756755b3895a20"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/references/03-source-types.md": {
+      "bytes": 378,
+      "executable": false,
+      "sha256": "8031953809997dd36a46e80f1f98915f7c7be07836254d83e3095c693ed9c1fa"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/references/04-fields-and-differences.md": {
+      "bytes": 372,
+      "executable": false,
+      "sha256": "6c4a7f8f47b1f16b27a5c7f4f0543287e997e86dba35c67d8c5a3056446d2393"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/references/05-batch-cache-resume.md": {
+      "bytes": 610,
+      "executable": false,
+      "sha256": "d2d2c20dd160c7e1c2ce5b80f3d8d7e53a466dca048580d2e5a1c0a0dca6bc94"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/references/06-output-and-export.md": {
+      "bytes": 563,
+      "executable": false,
+      "sha256": "1abbe4c767ee935478c0fc45a4fde172ffa2ab948a808452f2023e90f7d89803"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/scripts/extract.py": {
+      "bytes": 200,
+      "executable": false,
+      "sha256": "bd915886fab938ebb32cf469bbf94c874f5b20cd26bbb1f32d582e79fab20f40"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/scripts/render_report.py": {
+      "bytes": 199,
+      "executable": false,
+      "sha256": "04a7306aab1029d30fec6a377733b383a977a05d374cdb094a4f3b4789a69a44"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/scripts/verify_batch.py": {
+      "bytes": 198,
+      "executable": false,
+      "sha256": "f121216ff80f4a30b1713698fb922b8de10603119080690a78114c3ee29b4386"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/scripts/verify_one.py": {
+      "bytes": 199,
+      "executable": false,
+      "sha256": "a086adb3ca8deb6d12ee51ee40d4dd971f4185be595846c3a5b159080fe0a71d"
+    },
+    "02_config/skill-history/reference-verification/2.0.0/templates/correction-table.md": {
+      "bytes": 114,
+      "executable": false,
+      "sha256": "babf1a2e2784d116337bc9539d806e5fff291f096832812603683ef9509236d5"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/PROVENANCE.md": {
+      "bytes": 646,
+      "executable": false,
+      "sha256": "b7cde9604f037076d4a74f2eb38c9e448c4296e1d9515a05ed77b354e2c5367f"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/SKILL.md": {
+      "bytes": 1880,
+      "executable": false,
+      "sha256": "f84ef58f5f963f66bb4193fdf4476133884032439d5366f67f6f900218b5d672"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/assets/status-vocabulary.json": {
+      "bytes": 257,
+      "executable": false,
+      "sha256": "346b67aa554b72ce97f46c5b030ea265dc2277a438280dba30ad2d7b2497d320"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/manifest.json": {
+      "bytes": 2550,
+      "executable": false,
+      "sha256": "20163b1ed079414fc9febdbb69d0ccc423ddc0f12462acf5e4769c9ef1984a1f"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/references/01-identity-and-evidence.md": {
+      "bytes": 244,
+      "executable": false,
+      "sha256": "3281e3ece773c1a70846de3af949ac59d7da685cc042387c1e0d61f6ebffc5a1"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/references/02-sources-and-routes.md": {
+      "bytes": 392,
+      "executable": false,
+      "sha256": "55f4a2d4909a9c16c1a94ccdfbef191c65ef9e36766dceb695756755b3895a20"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/references/03-source-types.md": {
+      "bytes": 378,
+      "executable": false,
+      "sha256": "8031953809997dd36a46e80f1f98915f7c7be07836254d83e3095c693ed9c1fa"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/references/04-fields-and-differences.md": {
+      "bytes": 372,
+      "executable": false,
+      "sha256": "6c4a7f8f47b1f16b27a5c7f4f0543287e997e86dba35c67d8c5a3056446d2393"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/references/05-batch-cache-resume.md": {
+      "bytes": 610,
+      "executable": false,
+      "sha256": "d2d2c20dd160c7e1c2ce5b80f3d8d7e53a466dca048580d2e5a1c0a0dca6bc94"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/references/06-output-and-export.md": {
+      "bytes": 563,
+      "executable": false,
+      "sha256": "1abbe4c767ee935478c0fc45a4fde172ffa2ab948a808452f2023e90f7d89803"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/scripts/extract.py": {
+      "bytes": 200,
+      "executable": false,
+      "sha256": "bd915886fab938ebb32cf469bbf94c874f5b20cd26bbb1f32d582e79fab20f40"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/scripts/render_report.py": {
+      "bytes": 199,
+      "executable": false,
+      "sha256": "04a7306aab1029d30fec6a377733b383a977a05d374cdb094a4f3b4789a69a44"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/scripts/verify_batch.py": {
+      "bytes": 198,
+      "executable": false,
+      "sha256": "f121216ff80f4a30b1713698fb922b8de10603119080690a78114c3ee29b4386"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/scripts/verify_one.py": {
+      "bytes": 199,
+      "executable": false,
+      "sha256": "a086adb3ca8deb6d12ee51ee40d4dd971f4185be595846c3a5b159080fe0a71d"
+    },
+    "02_config/skill-history/reference-verification/2.0.1/templates/correction-table.md": {
+      "bytes": 114,
+      "executable": false,
+      "sha256": "babf1a2e2784d116337bc9539d806e5fff291f096832812603683ef9509236d5"
+    },
+    "02_config/skill-history/reference-verification/2.0.2/SKILL.md": {
+      "bytes": 2237,
+      "executable": false,
+      "sha256": "44de59cc7e05b558132ad3043bb70c80d3431ac9b288aa45f6e7ded0f9e4eb81"
+    },
+    "02_config/skill-history/reference-verification/2.0.2/manifest.json": {
+      "bytes": 2550,
+      "executable": false,
+      "sha256": "d95e97f3b6deb1071b6c4968e808ba1e771c7268c37686d84bb7ba5e7d1031e3"
+    },
+    "02_config/skills.catalog.json": {
+      "bytes": 19997,
+      "executable": false,
+      "sha256": "790852bd534179bd1dbe4281c2447ea7d11ecfac205b9f2d6dd3eba40fdbc77a"
+    },
     "04_scripts/build_worker_bundle.py": {
       "bytes": 1259,
       "executable": false,
       "sha256": "09ff45bc094784bb582b461eb0660f90fb0d4f6b53c7f1f3f0e88137768e9b0d"
+    },
+    "LICENSE": {
+      "bytes": 1085,
+      "executable": false,
+      "sha256": "92f8d4c3a3ff286ccbcb83085eb81afb9b293fc3aca0b8a292e65c61641930dc"
+    },
+    "README.md": {
+      "bytes": 10608,
+      "executable": false,
+      "sha256": "0c66a312ef6b298c93c73b4b6920e586857ad516b9c87a56f19b5c00fdf6b6c6"
+    },
+    "conftest.py": {
+      "bytes": 506,
+      "executable": false,
+      "sha256": "4142fece10c0fdbf600c9e191590351f5e963f699cf383406a82d2096e80b773"
     },
     "docs/audits/8043-interaction-root-cause.md": {
       "bytes": 3608,
@@ -2659,9 +3864,9 @@
       "sha256": "0467131de1a2fee9c74bdc78852cb1f9dc2f8afa5ada9df32f3b4bea6b9bf79d"
     },
     "packages/citrus_audit/api.py": {
-      "bytes": 5008,
+      "bytes": 4812,
       "executable": false,
-      "sha256": "be52a46ac538bdd31575f5f6c39687a6e345e1f06ced29915f09085852f958fe"
+      "sha256": "0ea4d1d63c52dd1b4b851992eb42f1b5becd5ac899d057a57143ff3afb09f5f9"
     },
     "packages/citrus_audit/cli.py": {
       "bytes": 3853,
@@ -2684,9 +3889,9 @@
       "sha256": "92a00b6bf06936c044c8ec408cc08f60d55a6e6003373874af38b83123f8a279"
     },
     "packages/citrus_audit/inspection.py": {
-      "bytes": 24402,
+      "bytes": 25181,
       "executable": false,
-      "sha256": "99f031826756f837705982df07be431cc5e4c577ba2c371fe90c0990c2b94a83"
+      "sha256": "2d73f0b8db8f17b11fcb834f479489de7999267cf1dc314004b755e2e840bd1c"
     },
     "packages/citrus_audit/integrity.py": {
       "bytes": 42047,
@@ -2694,14 +3899,14 @@
       "sha256": "f519396b6a4a72f863d43deada02a0487bd0a214431e650a3f6a7a9e0801c0d9"
     },
     "packages/citrus_audit/methods.py": {
-      "bytes": 55078,
+      "bytes": 55631,
       "executable": false,
-      "sha256": "5bb194fe5846453289d0ab46dac3e66e50a514879822efd2f200294df6eff03f"
+      "sha256": "071e7c96cd1b7077ee9e6888d3829c422310ccd7d5c293271186111c7074730e"
     },
     "packages/citrus_audit/plan.py": {
-      "bytes": 26528,
+      "bytes": 26804,
       "executable": false,
-      "sha256": "e8ca0b6d1df9f6e1374fef2c6a442dcb36c34cf5599585fa64e304fb1c3aceca"
+      "sha256": "896d33d8edf790a3da5d16ab525a589185a21c8939db5957059158a81932724b"
     },
     "packages/citrus_audit/plan_test.py": {
       "bytes": 6356,
@@ -2709,9 +3914,14 @@
       "sha256": "32a5d9aa463eff96eb0ef0a3e9ed7fdc695d614a9516afdc923f1b1e3ce746fb"
     },
     "packages/citrus_audit/readers.py": {
-      "bytes": 47821,
+      "bytes": 48292,
       "executable": false,
-      "sha256": "dcf54936b3517b92e3ff3a6337d375e9a6c7a6d5cecddc556fdade738b3419b7"
+      "sha256": "fe0c463e64af246bc3a490649d45d55eb83a4fa308576141240756c0208f8646"
+    },
+    "packages/citrus_audit/region_workbook_test.py": {
+      "bytes": 5820,
+      "executable": false,
+      "sha256": "b2015cfccee991109c68110b54117a8cd8ad66c8760eac013bb48d64a1a370b0"
     },
     "packages/citrus_audit/summary_consistency.py": {
       "bytes": 13992,
@@ -2719,9 +3929,9 @@
       "sha256": "b50b3a721422501645c2777c75cf80c0f6c101deba8b76cf86ba697f6a2c21b1"
     },
     "packages/citrus_audit/workbook.py": {
-      "bytes": 19303,
+      "bytes": 23922,
       "executable": false,
-      "sha256": "fc27f73c843cd64add6609312c352dad301500883a1b590c71d377109f6d0a29"
+      "sha256": "564f052a6634f9083d5bdd98c5038adb02c228e56fa1bb0669e4dd5c502e77b4"
     },
     "packages/citrus_figures/__init__.py": {
       "bytes": 733,
@@ -2744,9 +3954,9 @@
       "sha256": "7b5c051708e01aaff32b154c951f14d4248d0482665ff7f749ca61711d00362a"
     },
     "packages/citrus_figures/core.py": {
-      "bytes": 41913,
+      "bytes": 41984,
       "executable": false,
-      "sha256": "bf1c8afe2dc86d477baf15cc0eabdeb512e61d7294b16f10a06dba02174a84a6"
+      "sha256": "80c7d43245ed1cdfde114626ec2f30feaf95bf1229bf77d6ddf73f258d31334d"
     },
     "packages/citrus_figures/dataset_codec.py": {
       "bytes": 16234,
@@ -2769,9 +3979,9 @@
       "sha256": "693a231f5a7e5801f622ebe8d1d57dde25daef36df448afb7f35eb002a789651"
     },
     "packages/citrus_figures/manifest.py": {
-      "bytes": 53474,
+      "bytes": 54252,
       "executable": false,
-      "sha256": "0e6651afb1ef31a19180b2d28c53fe30fa23e43bd529febb766f59aa6eb52af2"
+      "sha256": "26279cf1d69f8976b9fe58920bd5ebb4cc5b30b9b1016d2090e54b95f0ff5c14"
     },
     "packages/citrus_figures/nature_receipts.py": {
       "bytes": 1628,
@@ -2804,9 +4014,14 @@
       "sha256": "01e05544b6f866216196eadcab5b918ca90966bebbce7d79482cc22352e09aaf"
     },
     "packages/citrus_figures/spec.py": {
-      "bytes": 26452,
+      "bytes": 26699,
       "executable": false,
-      "sha256": "731284174794231bad179ced81cb3a8bafa91ed326a432f0de1e857f1f482265"
+      "sha256": "1c720d021e2a6c0085d88a4d6b5f1f9197bd5a8d3765e3bbd0015e61f7a08244"
+    },
+    "packages/citrus_figures/style_replay.py": {
+      "bytes": 10098,
+      "executable": false,
+      "sha256": "97551d99a7c4314621d1896dfa4dac511a0baa05cb2a66ec77818153c7395917"
     },
     "packages/citrus_figures/styling.py": {
       "bytes": 15349,
@@ -2819,9 +4034,9 @@
       "sha256": "a010d3b50c8e3c59830a0da8ffa02b706fc1e8e1691d5113be881b7ada289d6e"
     },
     "packages/citrus_figures/verification.py": {
-      "bytes": 12748,
+      "bytes": 13075,
       "executable": false,
-      "sha256": "e4914097f26bf98819c22f5c532157aae30a5d864f4393be411350f4cc179cfa"
+      "sha256": "1403345aa2c37eff053eec98546fc6e4f8f4429671e10596b6e1a274eb843dc4"
     },
     "packages/citrus_refcheck/__init__.py": {
       "bytes": 634,
@@ -2874,9 +4089,9 @@
       "sha256": "4ddc08917b1d4af132c3bdde4196674c0bb187d887ee51c61fe79fd324bcb62f"
     },
     "packages/citrus_refcheck/verdict.py": {
-      "bytes": 9456,
+      "bytes": 9710,
       "executable": false,
-      "sha256": "9dcafd2ecd098bc46bd4019262bb6da5d028b4c2276e5654dbd7f93e2f9ae63f"
+      "sha256": "8803c6fb88bbeabdcffd78b34ba73a64cdf8426a81956e45f4f26d19a62880b8"
     },
     "packages/citrus_retrieval/__init__.py": {
       "bytes": 525,
@@ -2923,15 +4138,30 @@
       "executable": false,
       "sha256": "6a85695fb01fc5163f950ae4fb730a574a235cc776e16f37067314337bc2433c"
     },
+    "pyproject.toml": {
+      "bytes": 1295,
+      "executable": false,
+      "sha256": "3f58a31a16f00ab336130ab708c1e0ff99a41cfd57b1c92e53c8b5ec407491a0"
+    },
+    "requirements-base.txt": {
+      "bytes": 1044,
+      "executable": false,
+      "sha256": "0f77d78aa9a0d15a35037877529df50d78a58282bbc1ce5c51377eca52d15941"
+    },
+    "requirements-gpu.txt": {
+      "bytes": 464,
+      "executable": false,
+      "sha256": "f5f2a4a67abc10bcea053e31d912eea866770f4afa470596b993517c00309db4"
+    },
     "skills/candidate-search/PROVENANCE.md": {
       "bytes": 498,
       "executable": false,
       "sha256": "fa8e473dac7e8bf4cac36d94df31d9e326a3743f54e468d8d84e7393eba3c067"
     },
     "skills/candidate-search/SKILL.md": {
-      "bytes": 2966,
+      "bytes": 2381,
       "executable": false,
-      "sha256": "bc208ef356f3f158174576d14f2de57cd1a22f954717d3439f9191c52f4d7ab3"
+      "sha256": "4fa967ddff97e59fa09589771f5ca6a4348d9c2fc00163a2ad10cc70810a066b"
     },
     "skills/candidate-search/references/evidence-and-fetch.md": {
       "bytes": 1484,
@@ -2959,14 +4189,14 @@
       "sha256": "b5d0af7e0b4c998e40888bc9a49e6d4ec595b2c097ed84cfe4c677500e023080"
     },
     "skills/data-audit/SKILL.md": {
-      "bytes": 6278,
+      "bytes": 2584,
       "executable": false,
-      "sha256": "da012b6d61fc5ae48c8db4f190a702f99442ebaeabed4325fda338b40ce8e6ee"
+      "sha256": "01aaab0d01f1a94b509fd3ef64299cefe40f0c5f55139b3aea32bf48a0d9afdd"
     },
     "skills/data-audit/references/marking.md": {
-      "bytes": 1401,
+      "bytes": 2143,
       "executable": false,
-      "sha256": "7ad43b6f47d5f43bfcc4a16a98157d1b4df7a30c8e5001543130f5ab772b9b85"
+      "sha256": "8f836c63273fc64358259fc421772864404e17f1ab972c968ad883c6a9fc9eb9"
     },
     "skills/data-audit/references/methods.md": {
       "bytes": 2813,
@@ -2974,9 +4204,9 @@
       "sha256": "39c1b26a15128698f1f2108eaf34e613a2ad2cb1938aaeaad4df544307ab9e03"
     },
     "skills/data-audit/references/precision-and-coverage.md": {
-      "bytes": 1217,
+      "bytes": 1618,
       "executable": false,
-      "sha256": "a6679502f66fe5a3a86fd741984b37b7e533745afd7efd5be2f91944ed543c8c"
+      "sha256": "0d0a146e2502c258ccfa79490ad76e8bb0bae158bd681e59ae0195355f806f56"
     },
     "skills/data-audit/scripts/annotate_workbook.py": {
       "bytes": 185,
@@ -3004,9 +4234,9 @@
       "sha256": "6bf7ae55b78f1aa22a3d44f36999a51f27e16d32d828475faadd24e5bc83bdb8"
     },
     "skills/nature-figure/SKILL.md": {
-      "bytes": 5304,
+      "bytes": 2878,
       "executable": false,
-      "sha256": "5fd5fe22b50915995f0ed1dab3e83cdef22be275a6e73270d4950aef3f313a87"
+      "sha256": "ce75f184a81d67cbfe53efc7728251a6a4f0bbbab6ba87f7bd7d839cf3ed3246"
     },
     "skills/nature-figure/provenance.extra.json": {
       "bytes": 1491,
@@ -3014,19 +4244,24 @@
       "sha256": "6308decbc8b820e48ff47d923f75868a9169c232538e7dbef58e5a42c8017f81"
     },
     "skills/nature-figure/provenance.json": {
-      "bytes": 12408,
+      "bytes": 12445,
       "executable": false,
-      "sha256": "b6ba9070c52cb88ac799bc082bdc6bf6d3f9e065b5b9ce9dbca724dcbfa30cf0"
+      "sha256": "ca41cd631869602fc87e2e6a03a596e2a1989ec73aa8326b7ec643be8b038f2f"
     },
     "skills/nature-figure/references/bridge.md": {
       "bytes": 6948,
       "executable": false,
-      "sha256": "61b89e70eecdbc8e26b29232b3f28fc2fa16e6b5a979b16dc6a0b4781812d11d"
+      "sha256": "a968acb6cbea2d234e6b89f5946388e03d80db998ac3a136a4012302e66cb73c"
     },
     "skills/nature-figure/references/figure-methods.md": {
       "bytes": 7038,
       "executable": false,
       "sha256": "df985b96cfbac9f04d6931c536cb70f42993d930e91309d8749da309c6a2b8b6"
+    },
+    "skills/nature-figure/references/standalone-cli.md": {
+      "bytes": 3915,
+      "executable": false,
+      "sha256": "482dba6da354612c09ed728118e2bacfab1eb3ca07a557d8851496b5e5cb7473"
     },
     "skills/nature-figure/scripts/citrus/bundle_figure.py": {
       "bytes": 430,
@@ -3068,20 +4303,15 @@
       "executable": false,
       "sha256": "5aefe708a2531c5ddaa8ee74d5155d747e96c0f21a33143d38316b7c5c88ffc4"
     },
-    "skills/nature-figure/vendor/nature-skills/skills/nature-figure/manifest.yaml": {
-      "bytes": 7782,
-      "executable": false,
-      "sha256": "f6cf1e50f55c74e159134edb8ca5a57fd5097b72b37463c7b2612757e01c24be"
-    },
-    "skills/nature-figure/vendor/nature-skills/skills/nature-figure/requirements.txt": {
-      "bytes": 23,
-      "executable": false,
-      "sha256": "e2596dd9f3381fb6280bd18added6c3d0025d954c99a132e3d0bc8d3e8a24d00"
-    },
     "skills/nature-figure/vendor/nature-skills/skills/nature-figure/assets/figures4papers/THIRD_PARTY_NOTICES.md": {
       "bytes": 982,
       "executable": false,
       "sha256": "b0ef9d2fe959468fce4f45472b12ff4d4fc9450201caa42d394823cd4a5e20d5"
+    },
+    "skills/nature-figure/vendor/nature-skills/skills/nature-figure/manifest.yaml": {
+      "bytes": 7782,
+      "executable": false,
+      "sha256": "f6cf1e50f55c74e159134edb8ca5a57fd5097b72b37463c7b2612757e01c24be"
     },
     "skills/nature-figure/vendor/nature-skills/skills/nature-figure/references/ai-graphical-abstract-workflow.md": {
       "bytes": 6263,
@@ -3188,6 +4418,11 @@
       "executable": false,
       "sha256": "9f96fa703bbe29581e50ddac9756900553b5617f46b4a0b31e8978278fffa329"
     },
+    "skills/nature-figure/vendor/nature-skills/skills/nature-figure/requirements.txt": {
+      "bytes": 23,
+      "executable": false,
+      "sha256": "e2596dd9f3381fb6280bd18added6c3d0025d954c99a132e3d0bc8d3e8a24d00"
+    },
     "skills/nature-figure/vendor/nature-skills/skills/nature-figure/scripts/audit_figure_collisions.py": {
       "bytes": 27709,
       "executable": false,
@@ -3284,9 +4519,9 @@
       "sha256": "b7cde9604f037076d4a74f2eb38c9e448c4296e1d9515a05ed77b354e2c5367f"
     },
     "skills/reference-verification/SKILL.md": {
-      "bytes": 1606,
+      "bytes": 2534,
       "executable": false,
-      "sha256": "843b9e500076c3aa79a9816d548682cee9bd5e8b03643f9908b22e125df46962"
+      "sha256": "825452882f4a8a0fac816fddceb887c71beb046e645029d0b7d76b24bb43df28"
     },
     "skills/reference-verification/assets/status-vocabulary.json": {
       "bytes": 257,
@@ -3347,11 +4582,6 @@
       "bytes": 114,
       "executable": false,
       "sha256": "babf1a2e2784d116337bc9539d806e5fff291f096832812603683ef9509236d5"
-    },
-    "01_src/src/graph/export_contract_delivery_test.py": {
-      "bytes": 2924,
-      "executable": false,
-      "sha256": "6ccd704d5ff6f39856eca138dbc72f4405f3ca937f9677634457c482b3db7f09"
     }
   }
 }

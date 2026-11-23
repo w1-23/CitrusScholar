@@ -191,7 +191,7 @@ for index, item in enumerate((ax, ax2)):
 
 
 def _run_worker(tmp_path, analysis, tables, render_script, *, figure=_FIGURE,
-                formats=("svg", "png"), title="Composite"):
+                formats=("svg", "png", "pdf"), title="Composite"):
     contract = normalize_output_contract({
         "version": 2,
         "tables": [{"name": name, "parents": ["data"]} for name in tables],

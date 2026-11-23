@@ -151,11 +151,23 @@ class CoverageLedger:
                     nature_ok = True
                 except ValueError:
                     nature_ok = False
+                current = item.get("current_qa") or {}
+                measured = {
+                    (artifact.get("format"), artifact.get("sha256"))
+                    for check in current.get("checks", [])
+                    if isinstance(check, dict) and check.get("check") == "format_integrity"
+                    and check.get("executed") == "executed" and check.get("conclusion") == "pass"
+                    and isinstance(artifact := check.get("artifact"), dict)
+                }
+                current_ok = (bool(current.get("receipt_id")) and bool(exports)
+                              and not (current.get("overall") or {}).get("blocking")
+                              and all(entry.get("sha256") and (entry["format"], entry["sha256"]) in measured
+                                      for entry in exports))
                 checks = (item.get("qa_receipt") or {}).get("checks", {})
                 qa_ok = not item.get("qa_failures") and not any(
                     isinstance(v, dict) and v.get("status") == "fail" for v in checks.values())
                 edited = tool_name == "research_workspace" and bool(item.get("edit_provenance"))
-                complete = (edited or nature_ok) and qa_ok and not item.get("failures")
+                complete = (edited or nature_ok or current_ok) and qa_ok and not item.get("failures")
                 previous = self.figures.get(fid)
                 self.figures[fid] = {"figure_id": fid, "edited": edited, "title": str(item.get("title") or ""),
                     "exports": exports, "complete": complete, "nature_ok": nature_ok,

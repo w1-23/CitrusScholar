@@ -553,8 +553,7 @@ def _run_research_figure_script(
         manifest = json.loads(manifest_bytes.decode("utf-8"))
         if not isinstance(manifest, dict) or not isinstance(manifest.get("objects"), list):
             raise ValueError("invalid manifest")
-        from src.figures.nature_receipts import accept_current_render_qa, validate_nature_receipt
-        validate_nature_receipt(manifest, pdf=result.outputs.get("pdf"))
+        from src.figures.nature_receipts import accept_current_render_qa
         accept_current_render_qa(manifest, {fmt: result.outputs[fmt] for fmt in formats
                                            if fmt in result.outputs}, "initial")
         receipt = manifest.get("qa_receipt") or {}

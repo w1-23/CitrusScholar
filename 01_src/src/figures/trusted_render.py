@@ -255,12 +255,6 @@ def render_resolved(resolved, *, overrides=None, existing=None, formats=("svg", 
                         accept_current_render_qa(manifest, {fmt: data[fmt] for fmt in formats}, render_mode)
                     except ValueError as exc:
                         raise TrustedRenderError("worker_protocol_invalid", str(exc)) from exc
-                if render_mode == "initial":
-                    from src.figures.nature_receipts import validate_nature_receipt
-                    try:
-                        validate_nature_receipt(manifest, pdf=data.get("pdf"))
-                    except ValueError as exc:
-                        raise TrustedRenderError("nature_audit_failed", str(exc)) from exc
                 raise_if_cancelled("figure_render_return")
                 if time.monotonic() >= deadline:
                     raise TrustedRenderError("render_timeout", "绘图输出采集超过时间上限。")

@@ -16,13 +16,12 @@ def _current_qa(*, mode, pdf, layout, blobs, source, journal_strict):
     """Audit this export's exact bytes; never re-export to certify them."""
     from .nature_runtime import (CurrentQaError, current_security_findings,
                                  layout_evidence, run_current_qa)
-    artifacts = [{"format": "pdf", "bytes": pdf,
-                  "role": "figure" if "pdf" in blobs else "internal_qa"}]
-    artifacts.extend({"format": fmt, "bytes": blob, "role": "figure"}
-                     for fmt, blob in blobs.items() if fmt != "pdf")
+    artifacts = [{"format": fmt, "bytes": blob, "role": "figure"} for fmt, blob in blobs.items()]
+    if pdf is not None and "pdf" not in blobs:
+        artifacts.append({"format": "pdf", "bytes": pdf, "role": "internal_qa"})
     receipt = run_current_qa(artifacts=artifacts, mode=mode,
                              source=source or None, layout_manifest=layout, journal_strict=journal_strict)
-    evidence = layout_evidence(layout, hashlib.sha256(pdf).hexdigest())
+    evidence = layout_evidence(layout, hashlib.sha256(pdf).hexdigest()) if pdf is not None else None
     security = current_security_findings(receipt)
     blocked = list(receipt.get("overall", {}).get("blocking") or ())
     if security or blocked:
@@ -33,6 +32,7 @@ def _current_qa(*, mode, pdf, layout, blobs, source, journal_strict):
 def export_figure(rendered, *, mode, exporter, formats, dpi=300, source="",
                   allow_format_failure=False):
     mode = render_mode(mode)
+    formats = tuple(formats)
     journal_strict = rendered.qa_profile.get("journal_strict", False)
     receipt = None
     current_receipt = None
@@ -57,29 +57,17 @@ def export_figure(rendered, *, mode, exporter, formats, dpi=300, source="",
 
     pdf = layout = None
     if mode in {"initial", "edit"}:
-        # One PDF is exported and its draw-time geometry captured. Those same
-        # bytes are audited and, when requested, published for download.
-        from citrus_figures.render_policy import export_with_layout
-        pdf, layout = export_with_layout(rendered, exporter=exporter, dpi=dpi)
-    if mode == "initial":
-        if __package__ == "figures":
-            from figures.nature_runtime import audit_fig
-        else:
-            from src.figures.nature_runtime import audit_fig
-        # The legacy v1 receipt is preserved; the pinned PDF above is audited
-        # rather than exporting a second one.
-        receipt, pdf = audit_fig(rendered.figure, source, pdf_factory=lambda: pdf, journal_strict=journal_strict)
+        if "pdf" in formats or journal_strict:
+            from citrus_figures.render_policy import export_with_layout
+            pdf, layout = export_with_layout(rendered, exporter=exporter, dpi=dpi)
+            if mode == "initial":
+                from .nature_runtime import audit_fig
+                receipt, pdf = audit_fig(rendered.figure, source, pdf_factory=lambda: pdf, journal_strict=journal_strict)
         blobs = export_formats(fmt for fmt in formats if fmt != "pdf")
         if "pdf" in formats:
             blobs["pdf"] = pdf
         current_receipt, current_layout = _current_qa(
-            mode="initial", pdf=pdf, layout=layout, blobs=blobs, source=source, journal_strict=journal_strict)
-    elif mode == "edit":
-        blobs = export_formats(fmt for fmt in formats if fmt != "pdf")
-        if "pdf" in formats:
-            blobs["pdf"] = pdf
-        current_receipt, current_layout = _current_qa(
-            mode="edit", pdf=pdf, layout=layout, blobs=blobs, source=source, journal_strict=journal_strict)
+            mode=mode, pdf=pdf, layout=layout, blobs=blobs, source=source, journal_strict=journal_strict)
     else:
         blobs = export_formats(formats)
     signatures = {"svg": b"<?xml", "png": b"\x89PNG\r\n\x1a\n", "pdf": b"%PDF-",
@@ -91,7 +79,8 @@ def export_figure(rendered, *, mode, exporter, formats, dpi=300, source="",
                        "checks": {fmt: {"sha256": hashlib.sha256(blob).hexdigest(),
                                         "size_bytes": len(blob), "format": "pass"}
                                   for fmt, blob in blobs.items()},
-                       "nature_audit": "performed" if mode == "initial" else "not_repeated_manual_edit"}
+                       "nature_audit": ("performed" if receipt is not None else "not_requested")
+                           if mode == "initial" else "not_repeated_manual_edit"}
     if export_errors:
         acknowledgement["export_errors"] = export_errors
     if current_receipt is not None:

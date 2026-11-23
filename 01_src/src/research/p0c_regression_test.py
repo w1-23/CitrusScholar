@@ -287,7 +287,7 @@ class P0CRegressionTests(unittest.TestCase):
                    "coverage": {"total": 10, "pending": 0, "retryable": 1}, "rows": [
                        {"record_id": f"ref-{index}", "record_index": index, "status": "metadata_matched",
                         "claims": {"title": "A long bibliographic title with authors and necessary distinguishing information " +
-                                  str(index)},
+                                  "for a study with a sufficiently descriptive subtitle " + str(index)},
                         "source_url": f"https://doi.org/10.1234/fixture-{index}", "provider": "Crossref"}
                        for index in range(10)]}
         compact = _compact_audit(payload)

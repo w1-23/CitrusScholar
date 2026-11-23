@@ -143,25 +143,22 @@ emit.figure("main", fig)
 '''
 
 
-def test_svg_only_v2_outputs_keep_one_internal_audit_pdf():
-    """New presets declare SVG only; the audited PDF stays the same export."""
+def test_svg_only_v2_outputs_do_not_render_or_audit_pdf():
+    """An explicit PDF request audits the exact exported PDF."""
     contract = {"version": 2, "tables": [],
                 "figures": [{"name": "main", "title": "main", "formats": ["svg"]}]}
     result = _run(script=V2_SCRIPT, contract=contract, outputs=output_slots(contract))
     assert "figure:main:pdf" not in result.outputs
     manifest = json.loads(result.outputs["figure:main:manifest"])
-    qa, layout = manifest["current_qa_receipt"], manifest["current_qa_layout"]
+    qa = manifest["current_qa_receipt"]
+    assert not manifest.get("current_qa_layout")
+    assert not manifest.get("nature_skill_receipt")
+    assert set(item["format"] for item in qa["artifacts"]) == {"svg"}
     _assert_measured(qa)
-    internal = set()
     for check in qa["checks"]:
         if check["check"] in {"pdf_text", "pdf_collisions"}:
-            assert check["executed"] == "executed"
-            assert check["artifact"]["format"] == "pdf"
-            internal.add(check["artifact"]["sha256"])
-    assert len(internal) == 1
-    internal_sha = internal.pop()
-    assert layout["artifact_sha256"] == internal_sha
-    assert internal_sha in _artifact_sha(qa, "format_integrity", "pdf")
+            assert (check["executed"], check["artifact"], check["reason_code"]) == (
+                "not_run", None, "format_absent")
     assert _artifact_sha(qa, "svg_schematic", "svg") == [
         _sha(result.outputs["figure:main:svg"])]
     assert set(manifest["render_receipt"]["checks"]) == {"svg"}
@@ -381,11 +378,11 @@ def test_svg_only_saved_bytes_never_reuse_internal_pdf_audit():
     manifest = json.loads(result.outputs["manifest"])
     svg = result.outputs["svg"]
     render = accept_current_render_qa(manifest, {"svg": svg}, "initial")
-    assert next(a for a in render["artifacts"] if a["format"] == "pdf")["role"] == "internal_qa"
+    assert {item["format"] for item in render["artifacts"]} == {"svg"}
     receipt = current_artifact_api.audit_current_bytes(
         artifacts=[{"format": "svg", "bytes": svg}], source=SCRIPT,
         stored_layout=manifest["current_qa_layout"], mode="reaudit", supersedes=render["receipt_id"])
-    assert receipt["layout"]["binding"] == "unbound"
+    assert receipt["layout"]["binding"] == "absent"
     checks = {c["check"]: c for c in receipt["checks"]}
     assert set(checks) == SEVEN
     for name in ("panel_alignment", "pdf_text", "pdf_collisions", "visual"):
@@ -554,13 +551,13 @@ def test_categorical_bar_keeps_layout_evidence_from_pdf_export():
         "x": {"kind": "inline", "column": "Group", "values": ["A", "A", "B", "B", "C", "C"]},
         "y": {"kind": "inline", "column": "Value", "values": [3.1, 4.2, 4.9, 5.4, 6.0, 7.25]},
     }))
-    result = render_resolved(resolved, formats=("svg",))
-    assert set(result.blobs) == {"svg"}
+    result = render_resolved(resolved, formats=("svg", "pdf"))
+    assert set(result.blobs) == {"svg", "pdf"}
     receipt = result.manifest["current_qa_receipt"]
     layout = result.manifest["current_qa_layout"]
     assert len(layout["layout"]["panels"]) == 1
     pdf = next(row for row in receipt["artifacts"] if row["format"] == "pdf")
-    assert pdf["role"] == "internal_qa" and layout["artifact_sha256"] == pdf["sha256"]
+    assert pdf["role"] == "figure" and layout["artifact_sha256"] == _sha(result.blobs["pdf"]) == pdf["sha256"]
     alignment = next(check for check in receipt["checks"] if check["check"] == "panel_alignment")
     assert alignment["executed"] == "executed" and alignment["artifact"] == pdf
 

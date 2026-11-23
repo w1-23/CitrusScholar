@@ -61,14 +61,18 @@ def preview(document_id: str, request: Request,
             start: int = Query(default=0, ge=0), length: int = Query(default=12000, ge=1, le=12000),
             md_sha256: str | None = Query(default=None, pattern=r"^[a-f0-9]{64}$")):
     _actor(request)
+    identity = (index_generation, version_id, md_sha256)
+    if any(value is not None for value in identity) and not all(identity):
+        raise HTTPException(422, "引用需要完整的索引代次、版本和内容校验值。")
     try:
         result = _runtime().preview(document_id, generation=index_generation, version=version_id,
                                     start=start, length=length, digest=md_sha256)
     except MaintenanceBusy as error:
         raise HTTPException(503, {"code": "knowledge_base_updating", "message": MAINTENANCE_MESSAGE},
                             headers={"Retry-After": str(RETRY_AFTER)}) from error
-    except (LookupError, ValueError, OSError) as error:
-        raise HTTPException(404, "文献版本不存在或无权访问。") from error
+    except (LookupError, ValueError, OSError):
+        return JSONResponse({"code": "citation_unavailable", "message": "该文献版本已过期或不可访问。"},
+                            status_code=404, headers=_PRIVATE)
     return JSONResponse(result, headers=_PRIVATE)
 
 

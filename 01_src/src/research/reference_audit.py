@@ -255,7 +255,11 @@ def cancel_audit(owner, session_id, audit_id):
 
 
 def _lookup_cached(owner, session_id, key, call, context):
-    cache_key = (owner, session_id, digest(key))
+    from src.core.capability_policy import allows, current_policy
+    capability = 'web_search' if key['provider'] == 'DeepSeek Search' else 'bibliographic_lookup'
+    if not allows(capability):
+        return 0, [], capability + '_disabled'
+    cache_key = (owner, session_id, current_policy().history_key, digest(key))
     now = time.time()
     with _CACHE_LOCK:
         cached = _CACHE.get(cache_key)
@@ -305,8 +309,8 @@ def verify_record(claims, *, owner=0, session_id='', uncertain_fields=(), deadli
     Uses existing registry adapters, original language queries and no LLM/web
     fallback. Returns every provider candidate and actual HTTP receipt.
     """
-    from src.core.tracing import web_search_enabled
-    if not web_search_enabled():
+    from src.core.capability_policy import allows
+    if not (allows('bibliographic_lookup') or allows('web_search')):
         return {'status': 'not_checked', 'reason': 'network_disabled', 'retryable': True,
                 'existence': 'not_checked', 'identity': 'not_checked', 'rule_version': RULE_VERSION,
                 'fields': compare_fields(claims, None), 'evidence': [], 'candidates': [],
@@ -509,13 +513,13 @@ def _project_verification(claims, facts, *, uncertain_fields=(), stopped=''):
 
 def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resume=False, progress=None):
     from src.core.cancel import is_cancelled
-    from src.core.tracing import web_search_enabled
+    from src.core.capability_policy import allows
     _scope(owner, session_id)
     if type(max_rows) is not int or not 1 <= max_rows <= 100:
         raise ValueError('max_rows must be 1..100')
     if not isinstance(time_budget, (int, float)) or not math.isfinite(time_budget) or not 0 < time_budget <= 120:
         raise ValueError('time_budget must be >0 and <=120 seconds')
-    if not web_search_enabled():
+    if not (allows('bibliographic_lookup') or allows('web_search')):
         result = get_audit(owner, session_id, audit_id)
         result['run_reason'] = 'network_disabled'
         return result
@@ -571,7 +575,7 @@ def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resum
                 raise AuditStopped('cancelled')
             if time.monotonic() >= deadline:
                 raise AuditStopped('deadline')
-            if not web_search_enabled():
+            if not (allows('bibliographic_lookup') or allows('web_search')):
                 raise AuditStopped('network_disabled')
             with _connect() as conn:
                 audit = _load(conn, owner, session_id, audit_id)

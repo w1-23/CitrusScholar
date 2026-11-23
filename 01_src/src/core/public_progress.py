@@ -199,11 +199,7 @@ def emit_public_progress(text: str, *, step_id: str = "",
     except Exception as exc:
         logger.warning("public_progress_failed stage=emit kind=%s", type(exc).__name__)
         return False
-    _persist_last_note(note, job_id=job_id)
     return True
-
-
-_PROGRESS_SUMMARY_MAX = 200
 
 
 def emit_tool_milestone(category: str, *, job_id: str, tool_call_id: str) -> bool:
@@ -211,25 +207,6 @@ def emit_tool_milestone(category: str, *, job_id: str, tool_call_id: str) -> boo
         return False
     return emit_public_progress("", note_id=f"{job_id}:{category}:{tool_call_id}",
                                 tool_call_ids=(tool_call_id,), job_id=job_id, category=category)
-
-
-def _persist_last_note(note: str, *, job_id: str | None = None) -> None:
-    """Persist the last public note; an explicit empty host scope stays empty.
-
-    Direct legacy callers may omit job_id and use their current bound request.
-    The event emitter always passes its resolved identity, including an empty
-    value, so a late context change cannot redirect an already classified note.
-    """
-    try:
-        if job_id is None:
-            from src.core.tracing import get_job_id
-            job_id = str(get_job_id() or "")
-        if not job_id:
-            return
-        from src.core import jobs as jobs_mod
-        jobs_mod.update_job(job_id, progress_summary=note[:_PROGRESS_SUMMARY_MAX])
-    except Exception as exc:
-        logger.warning("public_progress_failed stage=summary kind=%s", type(exc).__name__)
 
 
 def reset_emitted() -> None:

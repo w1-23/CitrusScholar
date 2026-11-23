@@ -36,13 +36,14 @@ def _adjacent_decay_band(rows: list[dict], *, score_key: str,
     return adjacent_decay_band(rows, score_key=score_key, ratio=ratio)
 
 
-def _enabled() -> bool:
-    """Web tools are available by default; the Agent chooses when to use them."""
-    try:
-        from src.core.tracing import web_search_enabled
-        return bool(web_search_enabled())
-    except Exception:
-        return True
+def _enabled(capability: str = "web_search") -> bool:
+    from src.core.capability_policy import allows
+    return allows(capability)
+
+
+def _disabled(capability: str, result_key: str = "web_results"):
+    from src.core.capability_policy import not_run
+    return f"[{capability.upper()}_DISABLED]", {result_key: [], "_tool_outcome": not_run(capability)}
 
 
 def _headers() -> dict[str, str]:
@@ -150,6 +151,8 @@ def _post_json(url: str, payload: dict, timeout: float, attempts: int = 2):
     """POST with one retry for transient gateway failures (never for 402)."""
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
+        if not _enabled("web_fetch"):
+            raise PermissionError("web_fetch_disabled")
         try:
             response = requests.post(url, headers=_headers(), json=payload, timeout=timeout)
         except requests.RequestException as exc:
@@ -168,6 +171,8 @@ def _post_json(url: str, payload: dict, timeout: float, attempts: int = 2):
 
 
 def _fetch_url(url: str, timeout: float | None = None) -> dict:
+    if not _enabled("web_fetch"):
+        return {"url": url, "ok": False, "error": "web_fetch_disabled"}
     response = _post_json("https://api.deepseek.com/v1/tools/fetch",
                           {"url": url}, timeout or _timeout())
     if response.status_code != 200:
@@ -236,7 +241,8 @@ def deepseek_search(query: str, count: int = 8,
     except (TypeError, ValueError):
         count = 8
     if not _enabled():
-        return "[WEB_DISABLED] Web search is disabled for this request.", {"web_results": []}
+        return _disabled("web_search")
+    need_content = bool(need_content and _enabled("web_fetch"))
 
     # Only the English local index requires translation. Public-web queries,
     # including Chinese titles and exact identifiers, retain their original text.
@@ -327,8 +333,8 @@ def deepseek_fetch(url: str) -> Tuple[str, dict]:
     instructions.
     """
     url = str(url or "").strip()
-    if not _enabled():
-        return "[WEB_DISABLED] Web fetch is disabled for this request.", {"web_results": []}
+    if not _enabled("web_fetch"):
+        return _disabled("web_fetch")
     target_error = _public_http_url_error(url)
     if target_error:
         return f"[WEB_FETCH_BLOCKED] {target_error}.", {"web_results": []}
@@ -460,6 +466,8 @@ def _local_paper_exists(doi: str, title: str) -> bool:
 def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "",
                   official: tuple[dict, str, str] | None = None) -> dict | None:
     """Deduplicate a complete online paper before enqueuing its full text."""
+    if not _enabled("local_rag"):
+        return None
     try:
         from src.core import corpus_review
         from src.core.progress_bus import get_turn_scope
@@ -479,7 +487,7 @@ def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "
             return {"retention_status": "already_local"}
         session_id, request_id = get_turn_scope()
         licence, evidence_url = "", ""
-        if runtime is not None:
+        if runtime is not None and _enabled("web_fetch") and _enabled("bibliographic_lookup"):
             official = official or licensed_full_text(str(winner.get("url") or ""), doi=doi, pmid=pmid,
                                                       max_bytes=corpus_review.MAX_ARCHIVE_BYTES)
             if official is not None:
@@ -508,6 +516,8 @@ def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "
 
 
 def _retain_missing_paper(*, doi: str, pmid: str, title: str, url: str) -> dict | None:
+    if not _enabled("local_rag"):
+        return None
     from citrus_refcheck.providers import normalize_doi
     from src.core import corpus_review
     from src.core.tracing import get_user_id
@@ -623,6 +633,7 @@ def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
     passes ``_classify_fetch_page`` the remaining requests are cancelled and
     their late results are never read, so exactly one body can reach the caller.
     """
+    from contextvars import copy_context
     from src.core.executors import WEB_FETCH_EXECUTOR
     queue = list(candidates)
     inflight: dict = {}
@@ -637,7 +648,9 @@ def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
         while queue and len(inflight) < _RACE_PARALLEL and time.monotonic() < deadline:
             url, kind = queue.pop(0)
             budget = min(_fetch_timeout(), max(0.1, deadline - time.monotonic()))
-            future = WEB_FETCH_EXECUTOR.submit(_fetch_url, url, budget)
+            if not _enabled("web_fetch") or (kind == "identifier_metadata" and not _enabled("bibliographic_lookup")):
+                continue
+            future = WEB_FETCH_EXECUTOR.submit(copy_context().run, _fetch_url, url, budget)
             future.add_done_callback(_swallow)
             inflight[future] = (url, kind)
             timings[(url, kind)] = time.monotonic()
@@ -725,8 +738,8 @@ def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
     DOI/PMID identify papers; they are not document formats. Never supply private
     local text.
     """
-    if not _enabled():
-        return "[WEB_DISABLED] Web fetch is disabled for this request.", {"web_results": []}
+    if not _enabled("web_fetch"):
+        return _disabled("web_fetch")
     candidates: list[tuple[str, str]] = []
     attempts: list[dict] = []
     for url in (urls or [])[:5]:
@@ -743,7 +756,7 @@ def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
     if doi_value and re.fullmatch(r"10\.\d{4,9}/[^\s<>\[\]]+", doi_value):
         from urllib.parse import quote
         candidates.append((f"https://doi.org/{quote(doi_value, safe='/.-_:()')}", "publisher_html"))
-    if doi_value or pmid_value or title.strip():
+    if _enabled("bibliographic_lookup") and (doi_value or pmid_value or title.strip()):
         # Europe PMC exposes full-text availability and stable PMCID routes.
         term = f'EXT_ID:"{pmid_value}"' if pmid_value else f'DOI:"{doi_value}"' if doi_value else f'TITLE:"{title.strip()}"'
         metadata_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=" + requests.utils.quote(term) + "&format=json"
@@ -773,7 +786,7 @@ def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
     record_fetch_failures(attempts, doi=doi_value, title=title)
     abstract_only = [a for a in attempts if a.get("validity") == "abstract_only"]
     official = None
-    if winner is None:
+    if winner is None and _enabled("web_fetch") and _enabled("bibliographic_lookup"):
         # If the web provider could not read PMC, try the official text object directly.
         from citrus_refcheck.providers import normalize_doi
         from src.core.corpus_review import MAX_ARCHIVE_BYTES, MIN_CONTENT_CHARS
@@ -892,6 +905,9 @@ def local_hybrid_search(query: str, corpus_types: list[str], limit: int = 6,
 def _local_hybrid_search_impl(query: str, corpus_types: list[str], limit: int = 6,
                              l1_categories: list[str] | None = None, *,
                              render: bool = True, progress: bool = True) -> Tuple[str, dict]:
+    if not _enabled("local_rag"):
+        message, artifact = _disabled("local_rag", "main_results")
+        return message, {**artifact, "local_status": "disabled"}
     from src.shared_corpus.runtime import FAMILY_ID, current_runtime, retrieval_reader
     from src.shared_corpus.activity import MaintenanceBusy
     try:
@@ -1300,6 +1316,8 @@ def read_local_evidence(ref: str, turn_id: str, generation: str,
     Use the ref, turn_id and generation returned with that observation. Missing
     evidence expires explicitly; this operation never re-runs retrieval.
     """
+    if not _enabled("local_rag"):
+        return _disabled("local_rag", "main_results")
     from src.retrieval.evidence_adapter import read_evidence
     try:
         result = read_evidence(ref, turn_id=turn_id, generation=generation,
@@ -1318,8 +1336,11 @@ def read_local_evidence(ref: str, turn_id: str, generation: str,
     row = {**result["source"], **result["source"]["locator"], "text": result["text"]}
     row["record_key"] = row.get("paper_id") or row.get("chunk_id") or row.get("document_key")
     row["corpus_family"] = row.get("corpus_family_id") or ""
+    from src.core.tracing import get_job_id
+    read_ref = {"ref": result["ref"], "turn_id": turn_id or get_job_id(),
+                "generation": generation, **result["range"]}
     return ("<untrusted_local_evidence>\n" + result["text"] + "\n</untrusted_local_evidence>",
-            {**result, "main_results": [row], "_tool_outcome": {"status": "complete",
+            {**result, "main_results": [row], "read_ref": read_ref, "_tool_outcome": {"status": "complete",
                 "reason_code": "evidence_read", "artifacts": []}})
 
 

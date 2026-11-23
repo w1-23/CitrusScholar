@@ -86,6 +86,23 @@ def _shared_result_accessible(row, text, fetch_result) -> bool:
         text = str(row.get("result_text") or "")
 
     name = row.get("tool_name")
+    if name in {"inspect_candidates", "search_candidates", "read_candidate", "read_local_evidence",
+                "search_agent_corpus", "local_hybrid_search"}:
+        from src.core.capability_policy import allows
+
+        if not allows("local_rag"):
+            return False
+    if name in {"read_candidate", "read_local_evidence"} and "<untrusted_local_evidence>" in text:
+        from src.core.turn_source_ledger import local_read_reference
+        from src.retrieval.evidence_adapter import read_evidence
+
+        ref = local_read_reference(json.loads(row.get("evidence_ref") or "null"))
+        if ref:
+            evidence = read_evidence(ref["ref"], turn_id=ref["turn_id"], generation=ref["generation"],
+                                     offset=ref["start"], max_chars=ref["end"] - ref["start"])
+            if evidence["status"] == "ok" and evidence["range"]["end"] == ref["end"]:
+                return text == "<untrusted_local_evidence>\n" + evidence["text"] + "\n</untrusted_local_evidence>"
+        return False
     if name not in {"search_agent_corpus", "local_hybrid_search"}:
         return True
     try:
@@ -157,10 +174,10 @@ def read_tool_result(tool_call_id: str, start_char: int = 0,
     text = str(row.get("result_text") or "")
     try:
         accessible = _shared_result_accessible(row, text, fetch_for_current_request)
-    except (PermissionError, sqlite3.Error, OSError):
+    except (PermissionError, sqlite3.Error, OSError, ValueError):
         accessible = False
     if not accessible:
-        return _read_rejected("unavailable", "shared_document_unavailable", "回执含当前不可读取的共享文献。")
+        return _read_rejected("unavailable", "evidence_unavailable", "回执所引用的原始证据已过期或不可访问。")
     source = {"tool_call_id": row["tool_call_id"], "full_sha256": storage["full_sha256"],
               "original_chars": storage["original_chars"], "stored_chars": storage["stored_chars"]}
     missing_fields = []

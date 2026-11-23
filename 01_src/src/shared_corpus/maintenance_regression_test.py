@@ -1,5 +1,6 @@
 """Shared literature publication and global maintenance regressions."""
 import asyncio
+import json
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
@@ -187,6 +188,55 @@ def test_load_failure_interrupted_switch_and_revocation(corpus, isolated):
             restarted.preview(document['document_id'], version=document['version_id'], generation=previous)
     finally:
         restarted.handle.close()
+
+
+def test_shared_citations_keep_exact_delivered_spans_and_revocation(corpus, isolated, monkeypatch):
+    from src.core import tool_results, turn_source_ledger, turn_sources
+
+    monkeypatch.setattr(tool_results, '_schema_ready', False)
+    monkeypatch.setattr(turn_source_ledger, '_schema_ready', False)
+    document = stage(corpus, 13, isolated.owner)
+    corpus.activity.quiet_sec = 0
+    corpus.request_build(isolated.owner)
+    step(corpus)
+    step(corpus)
+    rows = [row for row in corpus.search('synthetic', limit=12) if row['read_ref']['document_id'] == document['document_id']]
+    assert len(rows) >= 2
+    first, second = rows[:2]
+    ref = first['read_ref']
+    assert ref != second['read_ref']
+    metadata_only = {key: value for key, value in rows[-1].items() if key != 'excerpt'}
+    body = json.dumps({'candidates': [first, first, second, metadata_only]})
+    receipt = tool_results.record_with_reference(tool_call_id='shared-fixture', session_id=isolated.sid,
+        request_id='shared-turn', tool_name='local_hybrid_search', status='complete', result_text=body)
+    user = {'user_id': isolated.owner, 'active': True, 'approval_status': 'approved'}
+
+    def sources():
+        return turn_sources.sources_payload(isolated.sid, 'shared-turn', user=user)['sources']
+
+    prior = sources()
+    assert [row['read_ref'] for row in prior] == [ref, second['read_ref']]
+    assert [row['source_status'] for row in prior] == ['available', 'available']
+    assert turn_source_ledger.record_tool_sources(isolated.sid, 'shared-turn', artifact={'shared_results': rows},
+        reference=receipt, tool_name='local_hybrid_search', result_text=body) == 2
+    assert sources() == prior
+
+    path = f"/api/v2/shared-corpus/documents/{ref['document_id']}"
+    params = {key: ref[key] for key in ('version_id', 'index_generation', 'start', 'md_sha256')}
+    params['length'] = ref['end'] - ref['start']
+    page = isolated.client.get(path, params=params)
+    assert page.status_code == 200, page.text
+    assert page.json()['markdown'] == first['excerpt']
+    assert isolated.client.get(path, params={**params, 'md_sha256': '0' * 64}).status_code == 404
+    assert isolated.client.get(path, params={'index_generation': ref['index_generation']}).status_code == 422
+    assert not corpus.reference_visible({**ref, 'end': ref['end'] + 1_000_000})
+    corpus.catalog.revoke(ref['document_id'], ref['version_id'], isolated.owner, reason='fixture')
+    rejected = isolated.client.get(path, params=params)
+    assert rejected.status_code == 404 and rejected.json()['code'] == 'citation_unavailable'
+    expired = sources()
+    assert [row['source_ref'] for row in expired] == [row['source_ref'] for row in prior]
+    assert [row['source_status'] for row in expired] == ['unavailable', 'unavailable']
+    assert first['title'] not in str(expired)
 
 
 def test_preparation_capacity_persists_and_preserves_license_upgrade(corpus, monkeypatch):

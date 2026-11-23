@@ -138,7 +138,9 @@ def _run_search(query: str, families: list[str], limit: int) -> dict:
 async def prefetch_candidates(state: AgentState) -> dict:
     """Run the request-scoped local prefetch. Never raises."""
     try:
-        return await _prefetch(state)
+        from src.core.capability_policy import bind_policy, policy_for_state
+        with bind_policy(policy_for_state(state)):
+            return await _prefetch(state)
     except Exception as exc:  # noqa: BLE001 - prefetch must never fail a turn
         _diag(status=STATUS_ERROR, error=f"{type(exc).__name__}: {exc}")
         return _response(_snapshot(STATUS_ERROR, reason="exception",
@@ -152,6 +154,9 @@ async def _prefetch(state: AgentState) -> dict:
     if state.get("agent_resume") is True:
         return {}
     clear_current_candidate_pool()
+    from src.core.capability_policy import allows
+    if not allows("local_rag"):
+        return _response(_snapshot(STATUS_DISABLED, reason="local_rag_disabled"))
     query = str(state.get("query") or "").strip()
     if not bool(getattr(settings, "CANDIDATE_PREFETCH_ENABLED", True)):
         return _response(_snapshot(STATUS_DISABLED, reason="setting_disabled"))

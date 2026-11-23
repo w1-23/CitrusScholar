@@ -121,6 +121,9 @@ def verify_reference(doi: str = "", title: str = "", citation_text: str = "") ->
 
 def fetch_open_access_pdf(doi: str, session_id: str) -> dict[str, Any]:
     """Find and download only a PDF exposed by Europe PMC's OA service."""
+    from src.core.capability_policy import allows
+    if not (allows("web_fetch") and allows("bibliographic_lookup")):
+        return {"status": "unavailable", "message": "当前任务未开放书目与全文获取。"}
     import requests
     from xml.etree import ElementTree as ET
     from urllib.parse import urljoin
@@ -135,6 +138,8 @@ def fetch_open_access_pdf(doi: str, session_id: str) -> dict[str, Any]:
         pmcid = next((str(row.get("pmcid") or "") for row in rows if row.get("pmcid")), "")
         if not pmcid:
             return {"status": "not_open_access", "message": "未找到 Europe PMC 开放全文；可能是付费文献或尚未收录。"}
+        if not (allows("web_fetch") and allows("bibliographic_lookup")):
+            return {"status": "unavailable", "message": "当前任务未开放书目与全文获取。"}
         metadata = requests.get(f"https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={pmcid}", timeout=12)
         metadata.raise_for_status()
         root = ET.fromstring(metadata.content)
@@ -152,6 +157,8 @@ def fetch_open_access_pdf(doi: str, session_id: str) -> dict[str, Any]:
             parsed = __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit(pdf_url)
             if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
                 return {"status": "unavailable", "message": "开放全文重定向到未允许的域名，已停止下载。"}
+            if not allows("web_fetch"):
+                return {"status": "unavailable", "message": "当前任务未开放全文获取。"}
             response = requests.get(pdf_url, timeout=30, stream=True, allow_redirects=False)
             if response.is_redirect or response.is_permanent_redirect:
                 target = response.headers.get("Location", "")

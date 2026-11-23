@@ -20,6 +20,14 @@ def source_rows(tool_name, text):
         if isinstance(rows, list) else []
 
 
+def evidence_rows(tool_name, text):
+    """Yield exact references for returned passages with actual stored excerpt text."""
+    for row in source_rows(tool_name, text):
+        excerpt = row.get("excerpt")
+        if isinstance(excerpt, str) and excerpt.strip() and (ref := read_reference(row)):
+            yield row, ref
+
+
 def read_reference(row):
     ref = row.get("read_ref")
     if not isinstance(ref, dict):

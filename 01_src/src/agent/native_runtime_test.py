@@ -216,6 +216,68 @@ async def _native_summary_is_reused_across_encrypted_connections(tmp_path):
     assert all(count_tokens_approximately(history) < 36000 for history in histories)
 
 
+def test_native_experiment_scope_discards_prior_context_and_summary(tmp_path, monkeypatch):
+    from langchain_core.messages.utils import count_tokens_approximately
+
+    from src.agent.recovery import load_recovery_state
+    from src.core import jobs
+    from src.core.capability_policy import CapabilityPolicy
+
+    monkeypatch.setattr(jobs, "_DB_PATH", tmp_path / "jobs.sqlite3")
+
+    async def scenario():
+        skill_root = tmp_path / "skills"
+        skill_root.mkdir()
+        provider = ("https://example.test", "example-model")
+        root = tmp_path / "state"
+        histories = []
+        request = {}
+
+        async def model(history, identity, **kwargs):
+            histories.append(str([message.content for message in history]))
+            return AIMessage(content="fixture answer")
+
+        async def accept(*args):
+            return FinalCheck()
+
+        runtime = HarnessRuntime(model, None, lambda *args: None, accept, RunLimits(), [],
+                                 export_host=lambda: {"original_request_state": dict(request)})
+        summary = FakeListChatModel(responses=["unique-local-summary", "unexpected second summary"])
+        local_history = [message for index in range(42) for message in (
+            HumanMessage(f"question {index} " + "context-value " * 180),
+            AIMessage(f"unique-local-only {index} " + "result-value " * 180))]
+        assert count_tokens_approximately(local_history) > 48000
+        experiment = CapabilityPolicy(local_rag=False, experiment_group="without-rag")
+        for index, policy in enumerate((CapabilityPolicy(), experiment, experiment)):
+            turn_id = f"turn-{index}"
+            job = jobs.claim_job("one-session", turn_id, owner_user_id=1, client_request_id=turn_id, payload={})
+            identity = ExecutionIdentity(1, "one-session", turn_id, job.job_id)
+            if policy.history_key:
+                assert jobs.bind_native_context_scope(identity, policy.history_key)
+                assert not jobs.bind_native_context_scope(identity, "f" * 64)
+            question = f"question now {index}"
+            request.update(request_id=turn_id, capability_snapshot=policy.snapshot(), query=question,
+                           session_id=identity.session_id, job_id=identity.run_id, user_id=1,
+                           client_request_id=turn_id, idempotency_key=turn_id)
+            human = HumanMessage(question, additional_kwargs=identity.message_metadata("user"))
+            scope = {"context_scope": policy.history_key}
+            async with open_native_checkpoint(root, identity, provider, **scope) as saver:
+                result = await runtime.run(identity, [*(local_history if index == 0 else []), human], saver=saver,
+                    checkpoint_config=native_checkpoint_scope(identity, provider, **scope),
+                    native_options={"skill_root": skill_root, "system_prompt": "fixture prompt",
+                                    "summary_model": summary, "capability_policy": policy})
+            assert result.status == "complete"
+            recovered = await load_recovery_state(root, identity, provider)
+            assert recovered["capability_snapshot"] == policy.snapshot()
+            assert recovered["job_id"] == job.job_id
+        assert "unique-local-summary" in histories[0]
+        assert summary.i == 1
+        assert all("unique-local" not in history for history in histories[1:])
+        assert "question now 1" in histories[-1] and "question now 2" in histories[-1]
+
+    asyncio.run(scenario())
+
+
 def test_native_encryption_rejects_cross_account_and_tampering():
     from src.agent.checkpoint_store import (CheckpointProtectionError, _NativeEncryptedSerializer,
                                             _native_binding)

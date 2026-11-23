@@ -1180,6 +1180,7 @@ var composerNewTaskJob = '';
 var composerTaskViewDisposing = false;
 var queueSyncUnavailable = false;
 var browseCheckbox = document.getElementById('browse-requested');
+if (browseCheckbox) browseCheckbox.addEventListener('change', refreshTaskComposer);
 
 function composerDraftKey(jobId) {
   return currentAccount && sessionId && !accountDocumentRetired
@@ -1207,6 +1208,10 @@ function writeComposerDraft(key, text) {
   if (draft.text === text) return;
   draft.text = text;
   draft.revision++;
+  if (draft.pending && !draft.pending.edited) {
+    draft.pending.edited = true;
+    savePendingUpdate(key, draft.pending);
+  }
   try {
     if (text) sessionStorage.setItem(key, text);
     else sessionStorage.removeItem(key);
@@ -1381,7 +1386,7 @@ async function settleComposerUpdate(target, action) {
     saveReceivedUpdates(target.key, draft.received);
   }
   savePendingUpdate(target.key, null);
-  if (outcome.version && outcome.status !== 'not_applied' && draft.text === pending.text) {
+  if (outcome.version && outcome.status !== 'not_applied' && !pending.edited && draft.text === pending.text) {
     writeComposerDraft(target.key, '');
     if (composerSupplement && composerSupplement.key === target.key) userInput.value = '';
   }
@@ -2737,12 +2742,10 @@ function refreshTaskComposer() {
   var activeJob = available ? available.store.state.job_id : '';
   var currentTarget = composerSupplement && available && composerSupplement.controller === available.controls && composerSupplement.jobId === activeJob;
   if (composerSupplement && !currentTarget && !userInput.value && !composerDraft(composerSupplement.key).pending) leaveComposerSupplement();
-  if (!composerSupplement && activeJob && composerNewTaskJob !== activeJob) {
-    if (userInput.value || composerHasNewTaskOptions()) composerNewTaskJob = activeJob;
-    else {
-      selectComposerSupplement(available);
-      currentTarget = !!composerSupplement;
-    }
+  if (!composerSupplement && activeJob && composerNewTaskJob !== activeJob &&
+      !userInput.value && !composerHasNewTaskOptions()) {
+    selectComposerSupplement(available);
+    currentTarget = !!composerSupplement;
   }
   var supplement = composerSupplement;
   var pendingUpdate = supplement && composerDraft(supplement.key).pending;

@@ -7,6 +7,7 @@ sources reused from the recent session-evidence ledger.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -31,6 +32,7 @@ def ensure_schema() -> None:
     if _schema_ready:
         return
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS turn_source_ledger (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,7 +45,8 @@ def ensure_schema() -> None:
                 url TEXT,
                 snippet TEXT,
                 source_turn_seq INTEGER,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                read_ref TEXT NOT NULL DEFAULT ''
             )
         """)
         conn.execute(
@@ -54,6 +57,10 @@ def ensure_schema() -> None:
             "CREATE INDEX IF NOT EXISTS idx_turn_source_request "
             "ON turn_source_ledger(session_id, request_id, origin, id)"
         )
+        if "read_ref" not in {row[1] for row in conn.execute("PRAGMA table_info(turn_source_ledger)")}:
+            conn.execute("ALTER TABLE turn_source_ledger ADD COLUMN read_ref TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_turn_source_read "
+                     "ON turn_source_ledger(kind,source_key)")
         conn.commit()
     _schema_ready = True
 
@@ -66,7 +73,8 @@ def safe_http_url(value: object) -> str:
         parsed = urlsplit(raw)
     except ValueError:
         return ""
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    if (parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None):
         return ""
     return raw
 
@@ -90,22 +98,22 @@ def _insert(row: dict[str, Any]) -> bool:
         ensure_schema()
         stamp = datetime.now(timezone.utc).isoformat()
         with _connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT OR IGNORE INTO turn_source_ledger
                    (session_id,request_id,origin,kind,source_key,title,url,
-                    snippet,source_turn_seq,created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    snippet,source_turn_seq,created_at,read_ref)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(row["session_id"]), str(row["request_id"]),
                     str(row["origin"]), str(row["kind"]),
                     str(row["source_key"]), _safe_text(row.get("title"), 200),
                     safe_http_url(row.get("url")) if row["kind"] == "web" else "",
                     _safe_text(row.get("snippet"), 320),
-                    row.get("source_turn_seq"), stamp,
+                    row.get("source_turn_seq"), stamp, json.dumps(row["read_ref"]) if row.get("read_ref") else "",
                 ),
             )
             conn.commit()
-        return True
+        return cursor.rowcount == 1
     except Exception:
         return False
 
@@ -131,69 +139,72 @@ def _local_title(row: dict, record_key: str) -> str:
     return "本地文献"
 
 
-def record_tool_sources(session_id: str, request_id: str, *,
-                        artifact: dict | None,
-                        result_text: str = "",
+def reference_key(kind: str, ref: dict) -> str:
+    identity = json.dumps(ref, sort_keys=True, separators=(",", ":"))
+    return kind + ":" + hashlib.sha256(identity.encode()).hexdigest()
+
+
+def local_read_reference(ref: object) -> dict | None:
+    if not isinstance(ref, dict):
+        return None
+    value, turn, generation = (ref.get(key) for key in ("ref", "turn_id", "generation"))
+    start, end = ref.get("start"), ref.get("end")
+    if (not isinstance(value, str) or not re.fullmatch(r"ev:[a-f0-9]{32}", value)
+            or not isinstance(turn, str) or not 1 <= len(turn) <= 160
+            or not isinstance(generation, str) or not 1 <= len(generation) <= 240
+            or type(start) is not int or type(end) is not int or not 0 <= start < end
+            or end - start > 30_000):
+        return None
+    return {"ref": value, "turn_id": turn, "generation": generation, "start": start, "end": end}
+
+
+def record_tool_sources(session_id: str, request_id: str, *, artifact: dict | None,
+                        reference: dict | None, tool_name: str, result_text: str = "",
                         limit: int = 12) -> int:
-    """Register successful current-turn sources produced by a real tool."""
-    sid, rid = str(session_id or ""), str(request_id or "")
-    if not sid or not rid:
+    """Register evidence actually delivered by successful, retained tool calls."""
+    from src.core.tracing import get_job_id
+    from src.shared_corpus.references import evidence_rows
+
+    if (not session_id or not request_id or not reference or reference.get("tool_name") != tool_name
+            or reference.get("request_id") != request_id or not reference.get("storage", {}).get("complete")):
         return 0
     data = artifact if isinstance(artifact, dict) else {}
-    rows: list[tuple[str, dict]] = []
-    for row in (data.get("main_results") or []):
-        if isinstance(row, dict):
-            rows.append(("local", row))
-    for row in (data.get("web_results") or []):
-        if isinstance(row, dict):
-            rows.append(("web", row))
+    receipt = {"tool_call_id": reference["tool_call_id"], "full_sha256": reference["full_sha256"]}
+    common = {"session_id": session_id, "request_id": request_id, "origin": "current"}
+    if tool_name in {"read_candidate", "read_local_evidence"}:
+        ref = local_read_reference(data.get("read_ref"))
+        rows = data.get("main_results") or []
+        if not ref or len(rows) != 1 or rows[0].get("source_ref") != ref["ref"]:
+            return 0
+        row = rows[0]
+        return int(_insert({**common, "kind": "local", "source_key": reference_key("cite", ref),
+                            "origin": "current" if ref["turn_id"] == get_job_id() else "history",
+                            "title": _local_title(row, _local_source_key(row)), "read_ref": ref}))
 
-    # Older tools may return text only. Reuse the existing parser as a fallback.
-    if not rows and result_text:
-        from src.core.turn_sources import parse_sources
-        for item in parse_sources(result_text, limit=limit):
-            key = item.get("record_key") or item.get("url") or ""
-            rows.append((str(item.get("kind") or ""), {
-                "record_key": key, "url": item.get("url") or "",
-                "title": item.get("title") or "", "snippet": item.get("snippet") or "",
-            }))
+    if tool_name in {"deepseek_fetch", "deepseek_fetch_paper", "browse_web"}:
+        if tool_name == "browse_web" and not data.get("_browse_evidence"):
+            return 0
+        from src.core.web_output_separator import clean_web_title
+        added = 0
+        for row in (data.get("web_results") or [])[:limit]:
+            url = safe_http_url(row.get("url"))
+            excerpt = row.get("text") or row.get("snippet")
+            if url and excerpt:
+                added += _insert({**common, "kind": "web", "source_key": url, "url": url,
+                                  "title": clean_web_title(row.get("title"), url), "snippet": excerpt,
+                                  "read_ref": receipt})
+        return added
 
     added = 0
-    seen: set[str] = set()
-    for kind, row in rows:
-        if len(seen) >= max(1, int(limit or 12)):
-            break
-        if kind == "local":
-            key = _local_source_key(row)
-            if not key or key in seen:
-                continue
+    seen = set()
+    for row, ref in evidence_rows(tool_name, result_text):
+        key = reference_key("shared", ref)
+        if key not in seen:
+            added += _insert({**common, "kind": "shared", "source_key": key,
+                              "title": row.get("title"), "read_ref": ref})
             seen.add(key)
-            item = {
-                "session_id": sid, "request_id": rid, "origin": "current",
-                "kind": "local", "source_key": key,
-                "title": _local_title(row, key),
-                "snippet": row.get("text") or row.get("snippet") or "",
-                "url": "",
-            }
-        elif kind == "web":
-            url = safe_http_url(row.get("url") or row.get("link"))
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            from src.core.web_output_separator import clean_web_title
-            item = {
-                "session_id": sid, "request_id": rid, "origin": "current",
-                "kind": "web", "source_key": url,
-                "title": clean_web_title(
-                    row.get("title"), url, row.get("site_name") or row.get("media") or ""),
-                "url": url,
-                "snippet": row.get("summary") or row.get("snippet")
-                or row.get("abstract") or row.get("text") or "",
-            }
-        else:
-            continue
-        if _insert(item):
-            added += 1
+        if len(seen) >= limit:
+            break
     return added
 
 
@@ -270,7 +281,7 @@ def fetch_rows(session_id: str, request_id: str) -> list[dict]:
         with _connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT origin,kind,source_key,title,url,snippet,source_turn_seq "
+                "SELECT origin,kind,source_key,title,url,snippet,source_turn_seq,read_ref "
                 "FROM turn_source_ledger WHERE session_id=? AND request_id=? "
                 "ORDER BY CASE origin WHEN 'current' THEN 0 ELSE 1 END, "
                 "CASE kind WHEN 'local' THEN 0 ELSE 1 END, id",
@@ -279,3 +290,17 @@ def fetch_rows(session_id: str, request_id: str) -> list[dict]:
         return [dict(row) for row in rows]
     except Exception:
         return []
+
+
+def find_local_citation(source_key: str) -> dict | None:
+    if not re.fullmatch(r"cite:[a-f0-9]{64}", source_key):
+        return None
+    ensure_schema()
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT session_id, title, read_ref FROM turn_source_ledger "
+            "WHERE kind='local' AND source_key=? AND read_ref<>'' ORDER BY id LIMIT 1",
+            (source_key,),
+        ).fetchone()
+    return dict(row) if row else None

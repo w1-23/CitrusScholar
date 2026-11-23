@@ -53,6 +53,7 @@ _MIGRATIONS = (
     ("payload_hash", "TEXT NOT NULL DEFAULT ''"),
     ("parent_job_id", "TEXT NOT NULL DEFAULT ''"),
     ("question_id", "TEXT NOT NULL DEFAULT ''"),
+    ("native_context_scope", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -497,6 +498,15 @@ def get_job(job_id: str) -> Optional[dict]:
     except Exception as e:
         logger.warning(f"[Jobs] get_job failed: {e}")
         return None
+
+
+def bind_native_context_scope(identity, scope: str) -> bool:
+    with closing(_connect()) as conn, conn:
+        updated = conn.execute(
+            "UPDATE task_jobs SET native_context_scope=? WHERE job_id=? AND owner_user_id=? "
+            "AND session_id=? AND request_id=? AND native_context_scope IN ('',?)",
+            (scope, identity.run_id, identity.owner_user_id, identity.session_id, identity.user_turn_id, scope))
+        return updated.rowcount == 1
 
 
 def save_terminal_snapshot(job_id: str, snapshot: dict) -> bool:

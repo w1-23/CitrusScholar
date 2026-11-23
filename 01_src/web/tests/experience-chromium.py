@@ -19,12 +19,31 @@ from PIL import Image
 import websocket
 
 
+EXPORT_PATH = '/api/v2/figures/projects/imported-project/export/svg?v=2'
+SAVED_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="360" height="180" viewBox="0 0 360 180">'
+             '<text id="fixture-title" x="20" y="40">已更新标题</text></svg>').encode('utf-8')
+
+
 class Browser:
     def __init__(self, ws):
         self.ws = ws
         self.next_id = 0
         self.errors = []
         self.frames = []
+        self.export_requests = []
+
+    def respond_to_export(self, event):
+        request = event['request']
+        method = request['method']
+        self.export_requests.append((method, request['url']))
+        if method not in {'HEAD', 'GET'}:
+            self.send('Fetch.fulfillRequest', requestId=event['requestId'], responseCode=405)
+            return
+        self.send('Fetch.fulfillRequest', requestId=event['requestId'], responseCode=200,
+                  responseHeaders=[{'name': 'Content-Type', 'value': 'image/svg+xml'},
+                                   {'name': 'Content-Disposition', 'value': 'attachment; filename="fixture.svg"'},
+                                   {'name': 'Content-Length', 'value': str(len(SAVED_SVG))}],
+                  body=base64.b64encode(SAVED_SVG if method == 'GET' else b'').decode('ascii'))
 
     def send(self, method, **params):
         self.next_id += 1
@@ -40,6 +59,8 @@ class Browser:
             if event == 'Page.screencastFrame':
                 self.frames.append((data['metadata']['timestamp'], base64.b64decode(data['data'])))
                 self.send('Page.screencastFrameAck', sessionId=data['sessionId'])
+            if event == 'Fetch.requestPaused':
+                self.respond_to_export(data)
             if event == 'Runtime.exceptionThrown':
                 self.errors.append(data['exceptionDetails'].get('exception', {}).get('description', data))
             if event == 'Runtime.consoleAPICalled' and data['type'] == 'error':
@@ -102,6 +123,8 @@ def run(browser, origin, output):
     browser.call('Page.enable')
     browser.call('Network.enable')
     browser.call('Page.setDownloadBehavior', behavior='allow', downloadPath=str(output.resolve()))
+    export_url = origin + EXPORT_PATH
+    browser.call('Fetch.enable', patterns=[{'urlPattern': export_url}])
     browser.call('Emulation.setDeviceMetricsOverride', width=1360, height=900, deviceScaleFactor=1, mobile=False)
     browser.call('Page.addScriptToEvaluateOnNewDocument', source=script)
     browser.call('Page.startScreencast', format='jpeg', quality=82, maxWidth=1100, everyNthFrame=2)
@@ -364,8 +387,17 @@ def run(browser, origin, output):
               "experienceRequests().saves.length === 1 && experienceRequests().saves[0].expected_revision === 1 && experienceRequests().saves[0].overrides.some(edit => edit.gid === 'fixture-title' && edit.value === '已更新标题') && document.querySelector('#downloadSvg').href.endsWith('/export/svg?v=2')")
         browser.click('#exportMenu summary')
         browser.click('#downloadSvg')
-        check('Export verifies the saved revision', "experienceRequests().exports[0] === '2'")
-        until(lambda: (output / 'fixture.svg').is_file(), 'The fixture SVG did not download')
+        downloaded = output / 'fixture.svg'
+
+        def download_completed():
+            evaluate('true')
+            return downloaded.is_file()
+
+        until(download_completed, 'The fixture SVG did not download')
+        assert browser.export_requests == [('HEAD', export_url), ('GET', export_url)], browser.export_requests
+        assert downloaded.read_bytes() == SAVED_SVG, 'Downloaded SVG does not match the saved revision bytes'
+        results.append({'check': 'Export verifies and downloads the saved SVG revision', 'status': 'PASS',
+                        'observed': {'revision': 2, 'methods': ['HEAD', 'GET'], 'bytes': len(SAVED_SVG)}})
     except Exception:
         capture('failure')
         diagnostic = evaluate("({ url: location.href, queue: document.querySelector('.turn-queue-state')?.textContent, body: document.body.innerText.slice(-5000), states:[...document.querySelectorAll('[data-state]')].map(x=>x.dataset.state) })")

@@ -586,6 +586,9 @@ class SessionManager:
                         if diagnostics is not None and not diagnostics:
                             diagnostics.append("raw_history_incomplete")
                         continue
+                    for key in ("citrus_capability_history", "citrus_task_snapshot"):
+                        if key in context_meta:
+                            messages[-1].response_metadata[key] = context_meta.pop(key)
                     messages[-1].additional_kwargs = context_meta
                     messages[-1].additional_kwargs["source_id"] = str(row["id"])
                     row_ids.append(row["id"])
@@ -999,6 +1002,10 @@ class SessionManager:
                    "context_projection_version", "result_storage", "result_reference")
         source_meta = getattr(msg, "additional_kwargs", {}) or {}
         context_meta = {key: source_meta[key] for key in allowed if key in source_meta}
+        if isinstance(metadata, dict):
+            for key in ("citrus_capability_history", "citrus_task_snapshot"):
+                if key in metadata:
+                    context_meta[key] = metadata[key]
         if isinstance(getattr(msg, "content", None), list):
             context_meta["_content_format"] = "blocks"
         context_json = json.dumps(context_meta, ensure_ascii=False)

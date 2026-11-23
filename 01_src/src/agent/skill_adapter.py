@@ -131,6 +131,8 @@ def directory_prompt(available_tools: set[str]) -> str:
             rows.append(registry.skill_info(sid))
         except (OSError, ValueError, KeyError, TypeError):
             continue  # One archived method failure does not disable other guidance.
+    from src.core.capability_policy import allows
+    rows = [row for row in rows if allows("skill:" + row["id"])]
     if not rows:
         return "No verified skills are available; generic authorized tools remain usable."
     metadata = [{"name": row["id"], "description": row["description"] + " " + row["applicability"],
@@ -171,6 +173,9 @@ class SkillSession:
         return selected
 
     def page(self, skill_id, version, sha256, resource="", start_char=0, max_chars=3000):
+        from src.core.capability_policy import allows
+        if not allows("skill:" + str(skill_id)):
+            raise ValueError("skill_disabled")
         selected = self._validate_identity({"id": skill_id, "version": version, "sha256": sha256})
         if (type(start_char) is not int or start_char < 0
                 or type(max_chars) is not int or not 1 <= max_chars <= 20000):

@@ -5,6 +5,7 @@ account lease and worker lifecycle; the jobs transaction owns the dispatch CAS.
 """
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 import math
 from pathlib import Path
@@ -27,7 +28,7 @@ _REQUEST_FIELDS = frozenset({
     "long_term_memory", "resident_cards", "user_preferences", "account_files",
     "history_evidence_block", "history_load_status", "history_load_reason", "history_load_error", "format_hint",
     "candidate_pool", "candidate_pool_notice", "request_plan", "task_contract",
-    "native_skill_release",
+    "native_skill_release", "capability_snapshot", "capability_runtime",
 })
 
 
@@ -63,16 +64,24 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
     The wait argument is never accepted from an HTTP body. Its values come from
     the Host suspension or the durable parked segment, under the original fence.
     """
+    from src.core.jobs import get_job
     from .deep_agent_runtime import EXECUTOR_ID, NATIVE_EXECUTOR_ID
 
     native = not checkpoint_path(root, identity, provider_scope).is_file()
-    if native and not native_checkpoint_path(root, identity, provider_scope).is_file():
-        raise TaskConflict("recovery_checkpoint_missing")
+    options = {}
+    if native:
+        job = await asyncio.to_thread(get_job, identity.run_id)
+        if job and (job["owner_user_id"], job["session_id"], job["request_id"]) != (
+                identity.owner_user_id, identity.session_id, identity.user_turn_id):
+            raise TaskConflict("recovery_identity_mismatch")
+        options["context_scope"] = (job or {}).get("native_context_scope", "")
+        if not native_checkpoint_path(root, identity, provider_scope, **options).is_file():
+            raise TaskConflict("recovery_checkpoint_missing")
     opener = open_native_checkpoint if native else open_checkpoint
     scope = native_checkpoint_scope if native else checkpoint_scope
     executor_id = NATIVE_EXECUTOR_ID if native else EXECUTOR_ID
-    async with opener(root, identity, provider_scope) as saver:
-        saved = await saver.aget_tuple({"configurable": scope(identity, provider_scope)})
+    async with opener(root, identity, provider_scope, **options) as saver:
+        saved = await saver.aget_tuple({"configurable": scope(identity, provider_scope, **options)})
         if saved is None:
             raise TaskConflict("recovery_checkpoint_missing")
         raw_values = saved.checkpoint.get("channel_values", {})
@@ -119,6 +128,13 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
     if not isinstance(host_state, dict):
         raise TaskConflict("recovery_original_request_missing")
     state = validate_original_request_state(host_state.get("original_request_state"), identity)
+    if native:
+        from src.core.capability_policy import CapabilityPolicy
+        snapshot = state.get("capability_snapshot")
+        policy = CapabilityPolicy.restore(snapshot) if snapshot is not None else CapabilityPolicy()
+        if options["context_scope"] != policy.history_key:
+            raise TaskConflict("recovery_context_scope_mismatch")
+        state["capability_snapshot"] = policy.snapshot()
     # Candidate bytes were process-local and are not present in the protected
     # snapshot. Never pretend those search handles survived a restart.
     pool_id = (state.get("candidate_pool") or {}).get("pool_id")

@@ -5083,7 +5083,7 @@ async def citation_open_pdf(session_id: str, req: CitationCheckRequest, request:
 
 
 @app.get("/api/v2/session/{session_id}/citations")
-async def session_citations(session_id: str):
+async def session_citations(session_id: str, request: Request):
     """v9.2: 会话历史文献引用恢复——按来源分组（RAG/UCR/Web/历史 + 动态批次组）。
 
     替代 v8.10k 每轮列表结构（ref_id=R{turn}-{i} 与正文 [n]/[Wn]/[Hn] 体系
@@ -5098,12 +5098,15 @@ async def session_citations(session_id: str):
     import sqlite3
     import json as _json
     from src.core.evidence import normalize_source_key, clean_doi
+    from src.session.manager import DB_PATH
+
+    require_owned_session(session_id, current_user(request))
     groups: dict[str, list] = {"rag": [], "ucr": [], "web": [], "historical": []}
     seen: dict[str, set] = {"rag": set(), "ucr": set(), "web": set()}
     num_i = 0
     web_i = 0
     try:
-        with sqlite3.connect(str(PROJECT_ROOT / "state" / "sessions.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row
             # v9.6.3: 不再 LIMIT 10、不再只读 evidence_json。
             # 优先读 cited_refs_json（本轮"按正文过滤 + 重编号"后的引用集，与实时
@@ -5650,9 +5653,8 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
         except Exception as exc:
             logger.warning("public_progress_failed stage=history kind=%s", type(exc).__name__)
             notes = []
-        if any(item["data"].get("origin") == "model" for item in notes):
-            turn["trace"] = [item for item in turn["trace"]
-                             if not (item.get("kind") == "note" and item.get("origin") == "model")]
+        turn["trace"] = [item for item in turn["trace"]
+                         if not (item.get("kind") == "note" and item.get("origin") == "model")]
         turn["trace"].extend(notes)
         return questions
 
@@ -5746,6 +5748,8 @@ async def session_messages(session_id: str, request: Request, limit: int = 60,
     turns = await asyncio.to_thread(
         _history_with_jobs, turns, session_id, int(user["user_id"]),
         saved_request_ids=request_ids, include_pending=not before)
+    durable_turns = {turn["turn_request_id"] for turn in turns if turn.get("job_id")}
+    window = [item for item in window if not (item.get("progress") and item.get("turn_request_id") in durable_turns)]
     return {"session_id": session_id, "messages": window, "count": len(window),
             "has_more": has_more, "next_before": next_before,
             "turns": turns,
@@ -6224,6 +6228,13 @@ async def corpus_source_endpoint(request: Request, record: str = ""):
     except HTTPException:
         return JSONResponse({"ok": False, "reason": "unauthenticated"}, status_code=401)
     not_found = {"ok": False, "reason": "not_found", "message": "本地原文不可用"}
+    if record.startswith("cite:"):
+        from src.core.turn_sources import read_local_citation
+        headers = {"Cache-Control": "private, no-store"}
+        evidence = await asyncio.to_thread(read_local_citation, record, user)
+        if evidence is None:
+            return JSONResponse({**not_found, "reason": "citation_unavailable"}, status_code=404, headers=headers)
+        return JSONResponse(evidence, headers=headers)
     if not corpus_source.is_valid_record_key(record):
         return JSONResponse(not_found, status_code=404)
     corpus_id = await asyncio.to_thread(corpus_source.locate_record, record)
@@ -6249,9 +6260,7 @@ async def session_turn_sources(session_id: str, request: Request,
                                request_id: str = ""):
     """Return current and reused sources for one owned session turn.
 
-    The source ledger is authoritative. Older turns fall back to the complete
-    ``tool_results`` record for compatibility. Missing sources return an empty
-    list rather than an invented citation.
+    The ledger retains delivered evidence and its original read identity.
     """
     try:
         user = current_user(request)
@@ -6263,16 +6272,18 @@ async def session_turn_sources(session_id: str, request: Request,
     if not rid:
         return JSONResponse({"ok": False, "reason": "missing_request_id",
                              "message": "缺少 request_id"}, status_code=400)
-    from src.core import turn_sources
+    from src.core import jobs, turn_sources
 
-    payload = await asyncio.to_thread(
-        turn_sources.sources_payload, session_id, rid)
+    matches = await asyncio.to_thread(jobs.jobs_for_turns, session_id, int(user["user_id"]), [rid])
+    job = matches.get(rid) or {}
+    scope_id = job.get("client_request_id") or rid
+    payload = await asyncio.to_thread(turn_sources.sources_payload, session_id, scope_id, user=user)
     return JSONResponse({
         "ok": True,
         "request_id": rid,
         "status": payload.get("status", "none"),
         "sources": payload.get("sources", []),
-    })
+    }, headers={"Cache-Control": "private, no-store"})
 
 
 # Added last so body length is checked before auth middleware and FastAPI body parsing.

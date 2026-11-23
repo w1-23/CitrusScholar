@@ -76,7 +76,10 @@ def resources(scope):
             return
     except (OSError, ValueError, TypeError, KeyError):
         return  # Release availability must not gate generic private workspace use.
+    from src.core.capability_policy import allows
     for row in rows:
+        if not allows("skill:" + row["id"]):
+            continue
         if scope != "/" and not within(scope, "/skills/" + row["id"]) and not within("/skills/" + row["id"], scope):
             continue
         try:
@@ -104,6 +107,9 @@ def read(key, descriptor):
             raise PermissionError("workspace_projection_denied")
         root = ROOT
     else:
+        from src.core.capability_policy import allows
+        if not allows("skill:" + descriptor["skill_id"]):
+            raise PermissionError("skill_disabled")
         from . import research_skill_catalog as catalog
         root = catalog.ROOT
     path = root.joinpath(*key[1:].split("/"))

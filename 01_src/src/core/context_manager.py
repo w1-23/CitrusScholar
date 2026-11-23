@@ -209,6 +209,7 @@ class ContextManager:
         *,
         user_id: int = 0,
         generate_hints: bool = True,
+        capability_policy=None,
     ) -> LoadedContext:
         ctx = LoadedContext(
             session_id=session_id,
@@ -246,6 +247,15 @@ class ContextManager:
                 except Exception:
                     checkpoint = {}
                     diagnostics.append("history_load_failed")
+                if capability_policy is not None:
+                    from src.core.capability_policy import history_rows
+                    original_count = len(raw_messages)
+                    raw_messages, row_ids = history_rows(raw_messages, row_ids, capability_policy)
+                    working_state = checkpoint.get("working_state") or {}
+                    if working_state.get("capability_history", "") != capability_policy.history_key:
+                        checkpoint = {}
+                    elif not capability_policy.allows("summarization") or original_count != len(raw_messages):
+                        checkpoint = {"working_state": working_state}
                 view_msgs, compacted = await self._build_send_view(
                     session_id, raw_messages, row_ids, query, checkpoint=checkpoint,
                     diagnostics=diagnostics)
@@ -286,7 +296,7 @@ class ContextManager:
         hints_task = (asyncio.create_task(self._generate_hints(query, session_id, mode))
                       if generate_hints else None)
         _t_ltm0 = time.perf_counter()
-        if self._memory:
+        if self._memory and (capability_policy is None or not capability_policy.history_key):
             try:
                 # v8.4.5: LTM 语义召回含 embed 推理（≤500 条事实），走线程池防阻塞事件循环
                 # 账号记忆可跨该账号的会话共享，不跨账号召回。
@@ -606,6 +616,7 @@ def finalize_load_result(
     budget,
     node_label: str,
     log_prefix: str,
+    load_evidence: bool = True,
 ) -> dict:
     """v8.4: expert/light 两图共用的 load 节点收尾装配（消除重复实现）。
 
@@ -633,7 +644,7 @@ def finalize_load_result(
     # 历史检索证据块（跨轮复用）——supervisor 装配时注入
     try:
         block = (session_manager.build_evidence_block(session_id, limit=2)
-                 if ctx.history_scope_authorized else None)
+                 if load_evidence and ctx.history_scope_authorized else None)
         if block:
             result["history_evidence_block"] = block
     except Exception as e:

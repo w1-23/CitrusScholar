@@ -20,6 +20,9 @@ PMC_CLOUD_METADATA_URL = re.compile(rf"{re.escape(_BASE)}/metadata/PMC[0-9]+\.[1
 
 
 def _read(path: str, max_bytes: int, *, params=None) -> bytes:
+    from src.core.capability_policy import allows
+    if not (allows("web_fetch") and allows("bibliographic_lookup")):
+        raise PermissionError("licensed_full_text_disabled")
     with requests.get(_BASE + path, params=params, timeout=(2, 3), stream=True,
                       allow_redirects=False) as response:
         if response.status_code != 200:

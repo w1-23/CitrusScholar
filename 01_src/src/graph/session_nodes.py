@@ -17,6 +17,8 @@ async def load_session_context(state: AgentState) -> dict:
     query = state.get("query", "")
     session_id = state.get("session_id", "default")
     mode = "general_agent"
+    from src.core.capability_policy import policy_for_state
+    capability_policy = policy_for_state(state)
     result: dict = {}
     from src.core.progress_bus import emit_encoded
     from src.core.public_progress import emit_public_progress
@@ -40,7 +42,8 @@ async def load_session_context(state: AgentState) -> dict:
         load_coro = ctx_mgr.load(
             session_id, query, mode,
             user_id=int(state.get("user_id") or 0),
-            generate_hints=not bool(state.get("agent_no_prefetch_hints")))
+            generate_hints=not bool(state.get("agent_no_prefetch_hints")) and not capability_policy.history_key,
+            capability_policy=capability_policy)
         deadline = float(state.get("request_deadline") or 0.0)
         if (state.get("agent_no_prefetch_hints") and deadline
                 and math.isfinite(deadline)):
@@ -57,10 +60,12 @@ async def load_session_context(state: AgentState) -> dict:
             budget=budget,
             node_label="session_load",
             log_prefix="GeneralAgent",
+            load_evidence=not capability_policy.history_key and capability_policy.allows("local_rag"),
         )
         # A durable answer carries newer working refs than a possibly interrupted
         # parent session save. Keep that host-owned state across context loading.
-        if ctx.history_scope_authorized and state.get("continuation_context"):
+        if (ctx.history_scope_authorized and state.get("continuation_context")
+                and capability_policy.history_key == (state.get("context_working_state") or {}).get("capability_history", "")):
             carried = state.get("context_working_state") or {}
             working = dict(result.get("context_working_state") or {})
             for key in ("dataset_refs", "source_refs", "script_refs", "run_refs"):

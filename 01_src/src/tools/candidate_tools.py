@@ -89,6 +89,9 @@ def inspect_candidates(gap: str = "", limit: int = 6, lang: str = "",
     family id. Returns id, title, year, DOI, language, family, score, and a
     short excerpt — never the full text.
     """
+    from src.core.capability_policy import allows, not_run
+    if not allows("local_rag"):
+        return "[LOCAL_RAG_DISABLED]", {"main_results": [], "_tool_outcome": not_run("local_rag")}
     pool = _resolve_pool()
     if pool is None:
         return (
@@ -160,6 +163,9 @@ def read_candidate(candidate_id: str, offset: int = 0,
         from src.tools.deepseek_search_fetch import read_local_evidence
         return read_local_evidence.func(candidate_id, turn_id, generation,
                                         offset=offset, max_chars=max_chars)
+    from src.core.capability_policy import allows, not_run
+    if not allows("local_rag"):
+        return "[LOCAL_RAG_DISABLED]", {"main_results": [], "_tool_outcome": not_run("local_rag")}
     pool = _resolve_pool()
     if pool is None:
         return (
@@ -236,6 +242,9 @@ def search_candidates(query: str, limit: int = 6) -> Tuple[str, dict]:
             "[CANDIDATE_SEARCH_SKIPPED] 缺少 query；请给出要补充检索的简短关键词。",
             {"main_results": [], "_tool_outcome": _outcome("not_run", "candidate_query_empty")},
         )
+    from src.core.capability_policy import allows, not_run
+    if not allows("local_rag"):
+        return "[LOCAL_RAG_DISABLED]", {"main_results": [], "_tool_outcome": not_run("local_rag")}
     pool = _resolve_pool()
     families: set[str] = set(pool.families) if pool is not None else set()
     try:

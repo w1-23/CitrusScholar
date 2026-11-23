@@ -13,7 +13,7 @@
   const dataFiles = [file('fixture-file-0', 'Measurements.csv'), file('workbook', 'Measurements.xlsx')];
   const svgId = 'imported-project';
   window.experienceRequests = () => ({posts: state().posts || [], imports: state().imports || [], saves: state().saves || [],
-    exports: state().exports || [], updates: state().updates || [], lookups: state().lookups || []});
+    updates: state().updates || [], lookups: state().lookups || []});
   window.experienceUpdateMode = (mode, hold = false) => save({updateMode: mode, lookupHeld: hold});
   window.experienceApplyUpdates = () => save({appliedVersion: 1 + Object.keys(state().receipts || {}).length});
   window.experienceQueueAvailability = available => save({queueUnavailable: !available});
@@ -67,6 +67,7 @@
     if (settings?.signal?.aborted || !navigator.onLine) throw new TypeError('Fixture transport offline');
     let body = {}, status = 200;
     const figureBase = '/api/v2/figures/projects/' + svgId;
+    if (p === figureBase + '/export/svg') return nativeFetch(input, settings);
     const figure = (overrides = [], version = 1) => ({figure_id: svgId, title: '隔离夹具新建图件', editable: true,
       render_version: version, exports: {svg: {size_bytes: 200}}, overrides,
       manifest: {figure_size_px: [360, 180], objects: [{gid: 'fixture-title', role: 'title', label: '示例标题', text: '示例标题', editable: ['text']}]}});
@@ -101,8 +102,7 @@
     } else if (p === figureBase + '/overrides' && settings?.method === 'POST') {
       save({saves: [...(state().saves || []), JSON.parse(settings.body)]});
       body = rendering();
-    } else if (p === figureBase + '/preview.svg' || p === figureBase + '/export/svg') {
-      if (p.endsWith('/export/svg')) save({exports: [...(state().exports || []), url.searchParams.get('v')]});
+    } else if (p === figureBase + '/preview.svg') {
       const svg = asSvg();
       return new Response(svg, {headers: {'Content-Type': 'image/svg+xml', 'Content-Disposition': 'attachment; filename=fixture.svg', 'Content-Length': String(new TextEncoder().encode(svg).length)}});
     } else if (p.endsWith('/messages')) body = {messages: [], turns: Array.from({length: state().turns || 0}, (_, i) => ({turn_request_id: 'saved-' + i, user: {content: '历史问题 ' + i}, answer: {content: '历史回答 ' + i}, display_status: 'completed'})), has_more: false};

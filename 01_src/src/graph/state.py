@@ -17,6 +17,8 @@ class AgentState(TypedDict, total=False):
     agent_resume: bool
     agent_recovery_answered: bool
     context_compression: bool
+    capability_snapshot: dict
+    capability_runtime: dict
     selected_skills: list[dict]
     request_tables: list[dict]
     request_deadline: float

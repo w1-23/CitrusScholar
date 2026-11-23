@@ -59,7 +59,12 @@ class EvidenceStore:
         if len(text)>2_000_000:raise ValueError('evidence_text_limit')
         key=str(record.get('chunk_id') or record.get('paper_id') or record.get('url') or '')
         if not key:raise ValueError('stable_document_identity_required')
-        ref='ev:'+hashlib.sha256(json.dumps([self.scope,key,text],sort_keys=True,ensure_ascii=False).encode()).hexdigest()[:32]
+        locator = record.get('locator')
+        corpus_id = locator.get('corpus_id') if isinstance(locator, dict) else None
+        identity = [self.scope, key, text]
+        if corpus_id:
+            identity.append(corpus_id)
+        ref = 'ev:' + hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:32]
         stamp=datetime.now(timezone.utc).isoformat()
         level=str(record.get('evidence_level') or 'passage')
         source={name:record.get(name) for name in SOURCE_FIELDS}

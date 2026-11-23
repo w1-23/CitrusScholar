@@ -47,7 +47,11 @@ async def general_agent_node(state: dict) -> dict:
     output = None
     preserve_pool = False
     try:
-        output = await _run(state, identity, ledger)
+        from src.core.capability_policy import bind_policy, policy_for_state
+        policy = policy_for_state(state)
+        state["capability_snapshot"] = policy.snapshot()
+        with bind_policy(policy):
+            output = await _run(state, identity, ledger)
         if output.get("execution_suspension"):
             from .execution_outcome import validate_execution_suspension
             validate_execution_suspension(output["execution_suspension"], identity)
@@ -71,6 +75,7 @@ async def general_agent_node(state: dict) -> dict:
 
 async def _run(state, identity, ledger):
     from src.config import settings, get_deepseek_model
+    from src.core.capability_policy import digest, policy_for_state
     from src.core import figures, task_events, tracing
     from src.core.cancel import is_cancelled
     from src.core.context_manager import assemble_supervisor_messages, build_human_message, build_loaded_context
@@ -92,14 +97,20 @@ async def _run(state, identity, ledger):
     provider_scope = (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())
     state_root = PROJECT_ROOT / "state"
     resume = state.get("agent_resume") is True
+    policy = policy_for_state(state)
+    context_scope = policy.history_key
     native_supported = not uses_deepseek_protocol(provider_scope[1], provider_scope[0])
     if resume:
         native = (native_supported
                   and not checkpoint_path(state_root, identity, provider_scope).is_file()
-                  and native_checkpoint_path(state_root, identity, provider_scope).is_file())
+                  and native_checkpoint_path(state_root, identity, provider_scope, context_scope=context_scope).is_file())
     else:
         native = native_supported and os.getenv("CITRUS_NATIVE_RUNTIME") == "1"
-    summary_enabled = bool(settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True))
+        if native and context_scope:
+            from src.core.jobs import bind_native_context_scope
+            if not await asyncio.to_thread(bind_native_context_scope, identity, context_scope):
+                raise task_events.TaskConflict("recovery_identity_mismatch")
+    summary_enabled = policy.allows("summarization")
     installed_rows = None
     skill_root = None
     if native:
@@ -145,7 +156,10 @@ async def _run(state, identity, ledger):
     register_code_tools(catalog)
     host = HostTools(identity, state)
     host.assert_context()
-    pool = ops._bind_request_candidate_pool(state)
+    pool = ops._bind_request_candidate_pool(state) if policy.allows("local_rag") else None
+    if not policy.allows("local_rag"):
+        state.pop("history_evidence_block", None)
+        state.pop("candidate_pool_notice", None)
     # A table attachment is a runtime fact; no scientific module is needed to
     # offer the catalogue or answer an unrelated question.
     try:
@@ -163,7 +177,7 @@ async def _run(state, identity, ledger):
     def refresh_allowed():
         host.allowed_names = allowed_presets(state, has_tables=bool(tables), has_pool=pool is not None)
         host.allowed_names.add("read_context_evidence")
-        if not native:
+        if not native and policy.enabled_skills != () and policy.has_skill_access():
             host.allowed_names.update({"read_skill", "load_skill"})
         host.allowed_names.update(WORKSPACE_TOOL_NAMES)
         host.allowed_names.update(PLAN_TOOL_NAMES)
@@ -185,12 +199,9 @@ async def _run(state, identity, ledger):
     # registered by the application must not inherit a scientific allowlist.
     loaded = build_loaded_context(state, mode="general_agent", format_hint=state.get("format_hint"))
     human = build_human_message(loaded, retrieval_context=str(state.get("candidate_pool_notice") or "") if pool else "")
-    pinned_skills = []
     try:
         selected_metadata = await asyncio.to_thread(
             validate_scenario_selection, state.get("selected_skills"), catalog=installed_rows)
-        if native:
-            pinned_skills = [row["id"] for row in selected_metadata]
     except (OSError, ValueError, KeyError):
         # The API validates its own selection contract. A package becoming
         # unavailable afterwards must not disable this request's other tools.
@@ -202,6 +213,8 @@ async def _run(state, identity, ledger):
         except (OSError, ValueError, KeyError):
             selected_metadata = []
         human.content = str(human.content) + "\n所选历史技能不是当前场景发行物；可继续使用其他已授权能力，不得声称已加载该方法。"
+    selected_metadata = [row for row in selected_metadata if policy.allows("skill:" + row["id"])]
+    pinned_skills = [row["id"] for row in selected_metadata] if native else []
     human.additional_kwargs.update(identity.message_metadata("user"), user_text=str(state.get("query") or ""),
         attachment_refs=state.get("attachment_refs") or [], selected_skills=selected_metadata)
     if state.get("attachment_context"):
@@ -273,6 +286,40 @@ async def _run(state, identity, ledger):
         completion_digest, completion_errors, parse_completion, reviewed_turn_outcome,
     )
     from .recovery import capture_original_request_state
+    from .deep_agent_runtime import EXECUTOR_ID, NATIVE_EXECUTOR_ID, NATIVE_READ_TOOLS
+
+    if not resume or not state.get("capability_runtime"):
+        if native:
+            skill_rows = (installed_rows if installed_rows is not None else
+                          [row for row in selected_metadata])
+        else:
+            from .skill_adapter import skill_catalog
+            try:
+                skill_rows = await asyncio.to_thread(skill_catalog, host.allowed_names)
+            except (OSError, ValueError, KeyError):
+                skill_rows = selected_metadata
+        state["capability_runtime"] = {
+            "schema": 1,
+            "executor": NATIVE_EXECUTOR_ID if native else EXECUTOR_ID,
+            "model": provider_scope[1], "provider_protocol": "deepseek" if not native_supported else "openai",
+            "search_provider": settings.RESOLVED_WEB_SEARCH_PROVIDER,
+            "summary_enabled": summary_enabled,
+            "skills": [{key: row[key] for key in ("id", "version", "sha256")}
+                       for row in skill_rows if policy.allows("skill:" + row["id"])],
+            "selected_skills": selected_metadata,
+            "attachments": [{"file_id": ref["file_id"], "sha256": ref["sha256"]}
+                            for ref in (state.get("attachment_refs") or [])
+                            if isinstance(ref, dict) and ref.get("file_id") and ref.get("sha256")],
+            "host_prompt_sha256": digest(prompt),
+            "host_tool_schema_sha256": digest(catalog.schemas(host.allowed_names)),
+            "native_read_tools": sorted(NATIVE_READ_TOOLS) if native else [],
+            "budget": {"max_output_tokens": settings.MAX_TOKENS,
+                       "working_max_input_tokens": settings.CONTEXT_WORKING_MAX_INPUT_TOKENS,
+                       "working_soft_tokens": settings.CONTEXT_WORKING_SOFT_TOKENS},
+            "retrieval": {"candidate_prefetch": bool(settings.CANDIDATE_PREFETCH_ENABLED and policy.allows("local_rag")),
+                          "rrf_k": settings.RRF_K, "candidate_window": settings.CANDIDATE_WINDOW,
+                          "top_k_vector": settings.TOP_K_VECTOR, "query_cache": bool(settings.RAG_CACHE_ENABLED)},
+        }
     original_request_state = capture_original_request_state(state)
 
     asset_fields = ("dataset_refs", "source_refs", "script_refs", "run_refs", "plot_intent")
@@ -603,6 +650,7 @@ async def _run(state, identity, ledger):
         summary_model = (_MeteredSummaryModel(transport=model, identity=identity,
                          deadline=deadline, max_attempts=1) if summary_enabled else None)
         native_options = {"skill_root": skill_root, "system_prompt": prompt,
+            "capability_policy": policy,
             "summary_model": summary_model,
             "summary_trigger": settings.CONTEXT_WORKING_SOFT_TOKENS,
             "summary_keep": min(settings.CONTEXT_WORKING_TARGET_TOKENS,
@@ -685,12 +733,14 @@ async def _run(state, identity, ledger):
         export_host=export_host, restore_host=restore_host, validate_resume=validate_resume,
         recover_output=True, resolve_execution_waits=resolve_execution_waits,
         acknowledge_execution_waits=acknowledge_execution_waits, record_rejected=rejected)
-    checkpoint_config = (native_checkpoint_scope if native else checkpoint_scope)(identity, provider_scope)
+    checkpoint_options = {"context_scope": context_scope} if native else {}
+    checkpoint_config = (native_checkpoint_scope if native else checkpoint_scope)(
+        identity, provider_scope, **checkpoint_options)
     checkpoint_open = open_native_checkpoint if native else open_checkpoint
     lock_identity = (identity.owner_user_id, identity.session_id) if native else identity
     try:
         with execution_lock(state_root / "agent_locks", lock_identity):
-            async with checkpoint_open(state_root, identity, provider_scope) as saver:
+            async with checkpoint_open(state_root, identity, provider_scope, **checkpoint_options) as saver:
                 result = await runtime.run(identity, messages, saver=saver, resume=resume,
                     checkpoint_config=checkpoint_config, native_options=native_options,
                     pinned_skills=pinned_skills)
@@ -960,7 +1010,14 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
     emit_answer_start()
     emit_text(answer)
     elapsed = (time.monotonic() - started) * 1000
+    capability_snapshot = state.get("capability_snapshot")
+    capability_runtime = dict(state.get("capability_runtime") or {})
+    local_generations = {generation for item in host.main_results if isinstance(item, dict)
+                         if (generation := (item.get("read_entry") or {}).get("generation") or item.get("generation"))}
+    capability_runtime["observed_index_generations"] = sorted(local_generations)
     return {"query": state["query"], "answer": answer, "gen_time_ms": elapsed,
+        **({"capability_snapshot": capability_snapshot} if capability_snapshot is not None else {}),
+        "capability_runtime": capability_runtime,
         "execution_suspension": {},
         "main_results": host.main_results, "web_results": host.web_results,
         "tools_called": list(dict.fromkeys(r["name"] for r in host.records)),

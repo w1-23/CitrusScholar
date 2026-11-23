@@ -26,10 +26,11 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
-from src.core import corpus_source, tool_results, turn_source_ledger
+from src.core import tool_results, turn_source_ledger
 
 __all__ = ["parse_sources", "sources_for_request", "MAX_SOURCES",
            "sources_payload", "MAX_LOCAL", "MAX_WEB"]
@@ -134,144 +135,126 @@ MAX_LOCAL = 8
 MAX_WEB = 6
 
 
-def sources_for_request(session_id: str, request_id: str,
-                        limit: int = MAX_SOURCES) -> list[dict[str, Any]]:
-    """本轮可点开的来源：本地优先（≤8），联网补位（≤6），总数 ≤ limit。"""
-    cap = max(1, min(int(limit or MAX_SOURCES), MAX_SOURCES))
-    ledger_rows = turn_source_ledger.fetch_rows(session_id, request_id)
-    if ledger_rows:
-        out: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for row in ledger_rows:
-            kind = str(row.get("kind") or "")
-            origin = str(row.get("origin") or "current")
-            if kind == "local":
-                key = str(row.get("source_key") or "")
-                if not corpus_source.is_valid_record_key(key) or key in seen:
-                    continue
-                meta = corpus_source.describe(key)
-                if not meta:
-                    continue
-                item = {
-                    "origin": origin, "kind": "local",
-                    "record_key": key,
-                    "title": turn_source_ledger.safe_text(
-                        meta.get("title_label") or row.get("title") or "", 200),
-                    "snippet": turn_source_ledger.safe_text(row.get("snippet") or "", 320),
-                    "year": meta.get("year") or "",
-                    "journal": meta.get("journal") or "",
-                    "variety": meta.get("variety") or "",
-                    "registry": meta.get("registry") or "",
-                    "species": meta.get("species") or "",
-                    "doi": meta.get("doi") or "",
-                    "url": meta.get("url") or "",
-                    "corpus": meta.get("corpus") or "",
-                    "source_turn_seq": row.get("source_turn_seq"),
-                }
-                marker = key
-            elif kind == "web":
-                url = turn_source_ledger.safe_http_url(row.get("url"))
-                if not url or url in seen:
-                    continue
-                from src.core.web_output_separator import clean_web_title
-                item = {
-                    "origin": origin, "kind": "web", "url": url,
-                    "title": clean_web_title(row.get("title"), url),
-                    "snippet": turn_source_ledger.safe_text(
-                        row.get("snippet") or "", 320),
-                    "source_turn_seq": row.get("source_turn_seq"),
-                }
-                marker = url
-            else:
-                continue
-            seen.add(marker)
-            out.append(item)
-        locals_ = [i for i in out if i.get("kind") == "local"][:MAX_LOCAL]
-        webs_ = [i for i in out if i.get("kind") == "web"][:MAX_WEB]
-        return (locals_ + webs_)[:cap]
-
-    rows = tool_results.fetch_by_request(session_id, request_id)
-    if not rows:
-        return []
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for row in rows:
-        if row.get('tool_name') == 'browse_web':
-            continue  # Browse sources require a trusted navigation receipt.
-        for item in parse_sources(row.get("result_text") or "", limit=MAX_SOURCES):
-            marker = item.get("record_key") or item.get("url") or ""
-            if not marker or marker in seen:
-                continue
-            if item.get("kind") == "local":
-                meta = corpus_source.describe(item.get("record_key") or "")
-                if not meta:
-                    continue
-                merged = dict(item)
-                merged.update({
-                    "title": meta.get("title_label") or "",
-                    "year": meta.get("year") or "",
-                    "journal": meta.get("journal") or "",
-                    "variety": meta.get("variety") or "",
-                    "registry": meta.get("registry") or "",
-                    "species": meta.get("species") or "",
-                    "doi": meta.get("doi") or "",
-                    "url": meta.get("url") or "",
-                    "corpus": meta.get("corpus") or "",
-                })
-                item = merged
-            item["origin"] = "current"
-            seen.add(marker)
-            out.append(item)
-
-    locals_ = [i for i in out if i.get("kind") == "local"][:MAX_LOCAL]
-    webs_ = [i for i in out if i.get("kind") == "web"][:MAX_WEB]
-    merged = (locals_ + webs_)[:cap]
-    for item in merged:
-        item.pop("kind_local", None)
-    return merged
+def _read_ref(row: dict) -> dict | None:
+    try:
+        ref = json.loads(row.get("read_ref") or "null")
+    except (ValueError, RecursionError):
+        return None
+    return ref if isinstance(ref, dict) else None
 
 
-def _shared_sources(session_id: str, request_id: str, *, limit: int) -> list[dict]:
-    from src.shared_corpus.references import read_reference, source_rows
+def _local_evidence(ref: dict, session_id: str, user: dict, *, preview: bool = False) -> dict | None:
+    from src.retrieval.evidence_adapter import read_evidence
+    width = ref["end"] - ref["start"]
+    try:
+        result = read_evidence(ref["ref"], turn_id=ref["turn_id"], generation=ref["generation"],
+                               offset=ref["start"], max_chars=width if preview else min(width, SNIPPET_CHARS),
+                               user=user, session_id=session_id)
+    except (ValueError, OSError):
+        return None
+    expected_end = ref["end"] if preview else min(ref["end"], ref["start"] + SNIPPET_CHARS)
+    return result if result["status"] == "ok" and result["range"]["end"] == expected_end else None
+
+
+def read_local_citation(key: str, user: dict) -> dict | None:
+    row = turn_source_ledger.find_local_citation(key)
+    ref = turn_source_ledger.local_read_reference(_read_ref(row)) if row else None
+    if not ref or turn_source_ledger.reference_key("cite", ref) != key:
+        return None
+    result = _local_evidence(ref, row["session_id"], user, preview=True)
+    if not result:
+        return None
+    return {"ok": True, "kind": "stored_evidence", "record_key": key,
+            "source_ref": ref["ref"], "read_ref": ref, "title_label": row["title"],
+            "corpus": result["source"]["locator"]["corpus_id"], "markdown": result["text"],
+            "chars": len(result["text"])}
+
+
+def _retained_shared_rows(records):
+    from src.shared_corpus.references import evidence_rows
+    for stored in records:
+        name = stored.get("tool_name")
+        if name not in {"search_agent_corpus", "local_hybrid_search"}:
+            continue
+        if not tool_results.storage_integrity(stored)["complete"]:
+            continue
+        for row, ref in evidence_rows(name, stored.get("result_text") or ""):
+            yield {"origin": "current", "kind": "shared", "title": row.get("title"),
+                   "source_key": turn_source_ledger.reference_key("shared", ref), "read_ref": json.dumps(ref)}
+
+
+def _project_sources(session_id: str, request_id: str, user: dict, cap: int) -> tuple[list[dict], bool]:
+    from itertools import chain
+    from src.shared_corpus.references import read_reference
     from src.shared_corpus.runtime import current_runtime
 
+    ledger = turn_source_ledger.fetch_rows(session_id, request_id)
+    records = tool_results.fetch_by_request(session_id, request_id)
+    stored = {row["tool_call_id"]: row for row in records}
     runtime = current_runtime()
-    if runtime is None or not runtime.generation or runtime.unavailable:
-        return []
-    seen = set()
-    sources = []
-    for stored in tool_results.fetch_by_request(session_id, request_id):
-        rows = source_rows(stored.get("tool_name"), stored.get("result_text") or "")
-        if not rows or not tool_results.storage_integrity(stored)["complete"]:
+    sources, seen = [], set()
+    counts = {"local": 0, "web": 0, "shared": 0}
+    limits = {"local": MAX_LOCAL, "web": MAX_WEB, "shared": 4}
+    unverified_legacy = False
+    shared = (row for row in ledger if row["kind"] == "shared")
+    other = (row for row in ledger if row["kind"] != "shared")
+    for row in chain(shared, _retained_shared_rows(records), other):
+        kind, key = row["kind"], row["source_key"]
+        if kind not in counts or counts[kind] >= limits[kind] or (kind, key) in seen:
             continue
-        for row in rows:
-            ref = read_reference(row)
-            if not ref:
+        ref = _read_ref(row)
+        if not ref:
+            unverified_legacy = True
+            continue
+        item = {"kind": kind, "origin": row["origin"], "read_ref": ref, "source_status": "unavailable"}
+        if kind == "local":
+            ref = turn_source_ledger.local_read_reference(ref)
+            if not ref or turn_source_ledger.reference_key("cite", ref) != key:
                 continue
-            key = (ref["document_id"], ref["version_id"], ref["index_generation"])
-            if key in seen or not runtime.reference_visible(ref):
+            item.update(record_key=key, source_ref=ref["ref"], title="本地引用不可用")
+            evidence = _local_evidence(ref, session_id, user)
+            if evidence:
+                locator = evidence["source"]["locator"]
+                item.update(source_status="available", title=row["title"], corpus=locator["corpus_id"],
+                            year=locator.get("year"), doi=locator.get("doi"),
+                            document_key=evidence["source"]["document_key"],
+                            snippet=turn_source_ledger.safe_text(evidence["text"], SNIPPET_CHARS))
+        elif kind == "shared":
+            ref = read_reference({"read_ref": ref})
+            if not ref or turn_source_ledger.reference_key("shared", ref) != key:
                 continue
-            sources.append({"kind": "shared", "origin": "current", "read_ref": ref,
-                            "title": turn_source_ledger.safe_text(row.get("title"), 200)})
-            seen.add(key)
-            if len(sources) >= limit:
-                return sources
-    return sources
+            item.update(source_ref=key, title="共享引用不可用")
+            if (user.get("active") and user.get("approval_status") == "approved"
+                    and runtime is not None and runtime.reference_visible(ref)):
+                item.update(source_status="available", title=turn_source_ledger.safe_text(row["title"], 200))
+        else:
+            url = turn_source_ledger.safe_http_url(row.get("url"))
+            if not url:
+                continue
+            call = stored.get(ref.get("tool_call_id"))
+            item.update(source_ref=turn_source_ledger.reference_key("web", ref | {"url": url}),
+                        title="网页引用不可用")
+            if (call and call["full_sha256"] == ref.get("full_sha256")
+                    and tool_results.storage_integrity(call)["complete"]):
+                item.update(source_status="available", url=url, title=row["title"], snippet=row["snippet"])
+        seen.add((kind, key))
+        counts[kind] += 1
+        sources.append(item)
+        if len(sources) >= cap:
+            break
+    return sources, unverified_legacy
 
 
-def sources_payload(session_id: str, request_id: str,
-                    limit: int = MAX_SOURCES) -> dict[str, Any]:
-    """Compatibility payload with an explicit current/history/mixed status."""
+def sources_for_request(session_id: str, request_id: str, *, user: dict,
+                        limit: int = MAX_SOURCES) -> list[dict[str, Any]]:
     cap = max(1, min(int(limit or MAX_SOURCES), MAX_SOURCES))
-    shared = _shared_sources(session_id, request_id, limit=min(4, cap))
-    sources = (shared + sources_for_request(session_id, request_id, limit=cap))[:cap]
-    origins = {str(item.get("origin") or "current") for item in sources}
-    if origins == {"current"}:
-        status = "current"
-    elif origins == {"history"}:
-        status = "history"
-    elif {"current", "history"}.issubset(origins):
-        status = "mixed"
-    else:
-        status = "none"
+    return _project_sources(session_id, request_id, user, cap)[0]
+
+
+def sources_payload(session_id: str, request_id: str, *, user: dict,
+                    limit: int = MAX_SOURCES) -> dict[str, Any]:
+    cap = max(1, min(int(limit or MAX_SOURCES), MAX_SOURCES))
+    sources, legacy = _project_sources(session_id, request_id, user, cap)
+    origins = {item["origin"] for item in sources}
+    status = "mixed" if len(origins) > 1 else next(iter(origins), "unavailable" if legacy else "none")
     return {"status": status, "sources": sources}

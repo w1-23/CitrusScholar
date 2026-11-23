@@ -13,7 +13,7 @@ import sqlite3
 from threading import Thread
 import time
 
-from .activity import ActivityTracker, MAINTENANCE_MESSAGE, RETRY_AFTER
+from .activity import ActivityTracker, MaintenanceBusy, MAINTENANCE_MESSAGE, RETRY_AFTER
 from .journal import Journal, _ACTIVATING, read_pointer, write_pointer
 
 logger = logging.getLogger(__name__)
@@ -165,11 +165,14 @@ class SharedCorpusRuntime:
                 for row in self.search_candidates(query, limit=limit)]
 
     def reference_visible(self, reference):
-        document = reference["document_id"]
-        version = reference["version_id"]
-        return (not self.unavailable and self.generation is not None
-                and version in self.journal.active_versions(reference["index_generation"], document)
-                and self.catalog.is_visible(document, version))
+        try:
+            start, end = reference["start"], reference["end"]
+            page = self.preview(reference["document_id"], generation=reference["index_generation"],
+                                version=reference["version_id"], start=start, length=end - start,
+                                digest=reference["md_sha256"])
+        except (MaintenanceBusy, LookupError, ValueError, OSError):
+            return False
+        return page["end"] == end
 
     def indexing_status(self, document, version):
         inactive = {"indexing_status": "unindexed", "index_generation": None}
@@ -200,7 +203,7 @@ class SharedCorpusRuntime:
             actual_digest = _digest(text)
             if digest is not None and digest != actual_digest:
                 raise LookupError("shared_document_unavailable")
-            if start > len(text):
+            if start < 0 or start >= len(text) or length < 1:
                 raise ValueError("shared_preview_offset_out_of_range")
             stop = min(start + length, len(text))
             return {"document_id": document, "version_id": version, "index_generation": generation,

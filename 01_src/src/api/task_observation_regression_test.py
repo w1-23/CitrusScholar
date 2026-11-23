@@ -1,5 +1,6 @@
 """Task observation with real routes and disposable SQLite state."""
 import asyncio
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -93,7 +94,8 @@ class TaskObservationTests(unittest.TestCase):
         self.assertNotIn("private fixture input", str(live) + str(saved))
 
     def test_model_public_note_survives_delivery_replay_and_history(self):
-        from src.core.public_progress import emit_public_progress, public_progress_text
+        from src.core import progress_bus
+        from src.core.public_progress import emit_public_progress, public_progress_text, reset_emitted
 
         job_id = self.claim.job_id
         public_note = "我已识别两块数据，接下来用第二块绘图。"
@@ -106,17 +108,51 @@ class TaskObservationTests(unittest.TestCase):
                         'Bearer fixture-token', '密码：fixture-password'):
             self.assertEqual(public_progress_text(private, has_tool_calls=True), "")
 
-        with patch('src.core.public_progress.emit_progress') as publish:
-            self.assertTrue(emit_public_progress(public_note, note_id="model-note", job_id=job_id))
-        event, payload = publish.call_args.args
-        observed = task_events.append_event(job_id, event, payload)
+        queue = task_events.DurableEventQueue(job_id)
+        reset_emitted()
+        self.addCleanup(reset_emitted)
+        notify = queue._notify
+
+        def check_notification(frame):
+            data = json.loads(frame['data'])
+            stored = task_events.public_working_notes(job_id)
+            self.assertEqual([(row['seq'], row['data']) for row in stored], [(int(frame['id']), data)])
+            self.assertEqual(jobs.get_job(job_id)['progress_summary'], data['text'])
+            notify(frame)
+
+        with patch.object(progress_bus, 'get_progress_queue', return_value=queue), \
+                patch.object(queue, '_notify', side_effect=check_notification):
+            self.assertTrue(emit_public_progress(public_note, note_id="model-note", job_id='caller-claimed-id'))
+        frame = queue.get_nowait()
+        asyncio.run(self.sessions.save_messages(self.sid, [HumanMessage(content='Question'),
+            AIMessage(content='Unidentified checkpoint narration', tool_calls=[{
+                'id': 'fixture-tool', 'name': 'fixture_tool', 'args': {}}]), AIMessage(content='Saved answer')],
+            idempotency_key='crid:original-client-request'))
         replay = self.client.get(f'/jobs/{job_id}/events').json()
         history = self.client.get(f'/sessions/{self.sid}/messages').json()
-        saved = next(row for row in history['turns'][0]['trace'] if row['event'] == 'assistant_progress')
-        self.assertEqual((saved['seq'], saved['data']['text']), (observed['seq'], public_note))
-        self.assertIn('model-note', str(replay))
-        self.assertIn(public_note, str(replay))
+        saved = next(row for row in history['turns'][0]['trace'] if row.get('event') == 'assistant_progress')
+        replayed = next(row for row in replay['events'] if row.get('event') == 'assistant_progress')
+        self.assertEqual(saved['seq'], int(frame['id']))
+        self.assertEqual(saved['data'], replayed['data'])
+        self.assertEqual(saved['data'], json.loads(frame['data']))
+        self.assertEqual(saved['data']['job_id'], job_id)
+        self.assertEqual(saved['data']['note_id'], 'model-note')
+        self.assertNotIn('Unidentified checkpoint narration', str(history))
         self.assertNotIn('private fixture', str(replay) + str(history))
+
+    def test_rejected_progress_is_absent_from_queue_storage_replay_and_history(self):
+        from src.core.progress_bus import _encode_event
+        job_id = self.claim.job_id
+        queue = task_events.DurableEventQueue(job_id)
+        for text in ('<analysis>private fixture</analysis>', 'Bearer fixture-secret', '{"args": "private"}'):
+            payload = {'origin': 'model', 'category': 'table_processed', 'text': text}
+            self.assertIsNone(task_events.append_event(job_id, 'assistant_progress', payload))
+            queue.put_nowait(_encode_event('assistant_progress', payload))
+        self.assertTrue(queue.empty())
+        self.assertEqual(task_events.public_working_notes(job_id), [])
+        self.assertEqual(self.client.get(f'/jobs/{job_id}/events').json()['events'], [])
+        history = self.client.get(f'/sessions/{self.sid}/messages').json()
+        self.assertNotIn('assistant_progress', str(history))
 
     def test_terminal_snapshot_and_event_cursor_share_a_view(self):
         job_id = self.claim.job_id

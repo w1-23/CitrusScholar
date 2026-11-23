@@ -33,11 +33,18 @@ def _after_supervisor(state):
     return "session_save"
 
 
+def _snapshot_capabilities(state):
+    from src.core.capability_policy import new_policy, policy_for_state
+    policy = policy_for_state(state) if state.get("agent_resume") else new_policy(state)
+    return {"capability_snapshot": policy.snapshot()}
+
+
 def build_general_agent_graph():
     from src.graph.session_nodes import load_session_context, save_session_context
     from src.graph.candidate_prefetch import prefetch_candidates
 
     graph = StateGraph(AgentState)
+    graph.add_node("capability_admission", _snapshot_capabilities)
     graph.add_node("session_load", load_session_context)
     # Prepare local candidates once, behind the existing source/task gates.
     # Only metadata reaches the supervisor; reading evidence remains on demand.
@@ -46,7 +53,8 @@ def build_general_agent_graph():
     graph.add_node("session_save", save_session_context)
     # Recovery has server-saved original context and a protected inner graph.
     # Loading history again could add a turn or perform fresh compaction.
-    graph.set_conditional_entry_point(
+    graph.set_entry_point("capability_admission")
+    graph.add_conditional_edges("capability_admission",
         lambda state: "supervisor" if state.get("agent_resume") is True else "session_load",
         {"supervisor": "supervisor", "session_load": "session_load"})
     graph.add_edge("session_load", "candidate_prefetch")

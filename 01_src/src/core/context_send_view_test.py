@@ -95,5 +95,37 @@ class SendViewTests(unittest.TestCase):
         self.assertEqual([m.content for m in messages[1:]], ["u1", "a1", "u2", "a2"])
 
 
+def test_experiment_turns_keep_scope_and_task_snapshot_after_sqlite_readback(tmp_path):
+    from src.core.capability_policy import CapabilityPolicy, history_rows
+    from src.graph.session_persistence import persist_agent_turn
+    from src.session import manager
+
+    async def scenario():
+        store = object.__new__(manager.SessionManager)
+        store.db_path = str(tmp_path / "history.sqlite3")
+        store._init_db_sync()
+        session = await store.get_or_create_session("shared-fixture", owner_user_id=5)
+        assert await store.save_messages(session, [HumanMessage("legacy question"), AIMessage("local evidence")])
+        isolated = CapabilityPolicy(local_rag=False, experiment_group="without-rag")
+        state = {"session_id": session, "query": "experiment question", "answer": "network result",
+                 "turn_trace": [HumanMessage("experiment question")],
+                 "capability_snapshot": isolated.snapshot()}
+        with patch.object(manager, "session_manager", store):
+            saved = await persist_agent_turn(state)
+        assert saved["_trace"]["history_saved"]
+        reopened = object.__new__(manager.SessionManager)
+        reopened.db_path = store.db_path
+        messages, row_ids = await reopened.get_messages_with_ids(session)
+        assert [message.content for message in messages] == [
+            "legacy question", "local evidence", "experiment question", "network result"]
+        isolated_rows, _ = history_rows(messages, row_ids, isolated)
+        assert [message.content for message in isolated_rows] == ["experiment question", "network result"]
+        assert isolated_rows[-1].response_metadata["citrus_task_snapshot"]["capability_snapshot"] == isolated.snapshot()
+        ordinary_rows, _ = history_rows(messages, row_ids, CapabilityPolicy(summarization=False))
+        assert [message.content for message in ordinary_rows] == ["legacy question", "local evidence"]
+
+    asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()

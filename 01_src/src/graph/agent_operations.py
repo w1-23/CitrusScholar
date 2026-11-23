@@ -1242,6 +1242,8 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
                 session_id=_sid, request_id=_rid, tool_name=name,
                 status=str(trace_record.get("status") or ""),
                 args=call.get("args") or {}, result_text=content,
+                evidence_ref=_source_ledger.local_read_reference(artifact.get("read_ref"))
+                if name in {"read_candidate", "read_local_evidence"} else None,
                 error_text=(content if step.get("status") == "failed" else ""),
                 elapsed_ms=int(trace_record.get("elapsed_ms") or 0),
                 summary=str(trace_record.get("summary") or ""))
@@ -1249,13 +1251,9 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
                 reference["storage"] if reference else {"state": "unavailable"})
             if reference:
                 message.additional_kwargs["result_reference"] = reference
-            if isinstance(artifact, dict) and step.get("status") in {
-                    "complete", "partial", "no_results"}:
-                if name != 'browse_web':
-                    _source_ledger.record_tool_sources(_sid, _rid, artifact=artifact, result_text=content)
-                elif (reference and reference['storage'].get('complete')
-                      and step['status'] == 'complete' and artifact.get('_browse_evidence')):
-                    _source_ledger.record_tool_sources(_sid, _rid, artifact=artifact)
+            if step.get("status") in {"complete", "partial"}:
+                _source_ledger.record_tool_sources(_sid, _rid, artifact=artifact,
+                    reference=reference, tool_name=name, result_text=content)
         except Exception:
             logger.debug("persist full tool result failed", exc_info=True)
         # ToolMessage.artifact is deliberately excluded from model-visible

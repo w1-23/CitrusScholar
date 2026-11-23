@@ -23,6 +23,8 @@ import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextvars import copy_context
+from src.core.capability_policy import allows, not_run
 from typing import Any, Iterable
 
 import httpx
@@ -101,6 +103,10 @@ def _bounded_get(context, url, params, source, *, post_json=None, headers=None):
     evidence = {'provider': source, 'url': url, 'query': params or {},
                 'checked_at': started, 'status': 'not_checked'}
     context.evidence.append(evidence)
+    capability = 'web_search' if source == 'deepseek_search' else 'bibliographic_lookup'
+    if not allows(capability):
+        evidence.update(status='not_checked', error=capability + '_disabled')
+        return 0, None, capability + '_disabled'
     try:
         if context.check:
             context.check()
@@ -133,6 +139,9 @@ def _bounded_get(context, url, params, source, *, post_json=None, headers=None):
         chunks, size = [], 0
         evidence['status'] = 'dispatched'
         method = 'POST' if post_json is not None else 'GET'
+        if not allows(capability):
+            evidence.update(status='not_checked', error=capability + '_disabled')
+            return 0, None, capability + '_disabled'
         with httpx.stream(method, url, params=params, json=post_json, follow_redirects=False,
                           timeout=min(3.0, remaining), headers=headers or _headers()) as response:
             evidence['http_status'] = response.status_code
@@ -177,12 +186,16 @@ def _bounded_get(context, url, params, source, *, post_json=None, headers=None):
 def _get(url: str, params: dict | None = None, timeout: float = TIMEOUT,
          source: str = "") -> tuple[int | str, Any, str]:
     """Return (status, payload, error). ``status`` is 200 or an error token."""
+    if not allows("bibliographic_lookup"):
+        return 0, None, "bibliographic_lookup_disabled"
     context = _LOOKUP_CONTEXT.get()
     if context is not None:
         return _bounded_get(context, url, params, source)
     _throttle(source)
     last_error = ""
     for attempt in range(RETRIES + 1):
+        if not allows("bibliographic_lookup"):
+            return 0, None, "bibliographic_lookup_disabled"
         try:
             response = httpx.get(url, params=params, timeout=timeout,
                                  follow_redirects=True, headers=_headers())
@@ -442,6 +455,9 @@ def search_literature(query: str = "", doi: str = "", arxiv_id: str = "",
     record whose title differs after normalisation is a rewritten title, and
     that must show up as a conflict instead of a clean match.
     """
+    if not allows("bibliographic_lookup"):
+        return {"candidates": [], "errors": {"capability": "bibliographic_lookup_disabled"},
+                "_tool_outcome": not_run("bibliographic_lookup"), "elapsed_ms": 0}
     started = time.time()
     doi = normalize_doi(doi or (query if _DOI_PATTERN.fullmatch(str(query or "").strip()) else ""))
     arxiv_id = arxiv_id or ""
@@ -500,7 +516,7 @@ def search_literature(query: str = "", doi: str = "", arxiv_id: str = "",
     records: list[dict] = []
     if tasks:
         pool = ThreadPoolExecutor(max_workers=min(POOL, len(tasks)))
-        futures = [(name, pool.submit(fn)) for name, fn in tasks]
+        futures = [(name, pool.submit(copy_context().run, fn)) for name, fn in tasks]
         pending = {future: name for name, future in futures}
         deadline = time.time() + DEADLINE
         resolved = False
@@ -559,7 +575,7 @@ def search_literature(query: str = "", doi: str = "", arxiv_id: str = "",
     merged = _dedupe(records)
     annotated = [_annotate(record, query, doi, arxiv_id, authors, year,
                                  claimed_title=claimed_title) for record in merged]
-    if (not annotated and web_fallback and not doi and not arxiv_id
+    if (not annotated and web_fallback and allows("web_search") and not doi and not arxiv_id
             and source_allowed("Crossref") and len(norm_title(search_query)) >= 20):
         # The fallback confirms DOIs at Crossref, so a narrower registry scope
         # cannot acquire that source implicitly. Never reuse native query here.

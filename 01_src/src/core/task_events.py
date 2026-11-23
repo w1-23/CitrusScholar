@@ -103,8 +103,14 @@ def current_terminal_event(conn, job_id):
 
 def _append(conn, job_id, event, data):
     _job(conn, job_id)
-    terminal = current_terminal_event(conn, job_id)
     from src.core.progress_bus import public_progress_payload, stamp_sse_event, _encode_event
+    if event != "task_state":
+        data = public_progress_payload(event, data)
+    if event == "assistant_progress":
+        if not data.get("text"):
+            return None
+        data["job_id"] = job_id
+    terminal = current_terminal_event(conn, job_id)
     if terminal is not None and event not in {"operation", "agent_recovery"}:
         # One terminal frame per explicitly admitted event generation. Earlier
         # terminal facts remain unchanged; safe-step recovery emits operation facts.
@@ -112,12 +118,12 @@ def _append(conn, job_id, event, data):
     seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM task_events WHERE job_id=?", (job_id,)).fetchone()[0]
     # task_state is also the model's private durable snapshot. Only its
     # public event view is reduced, without changing the event or sequence.
-    if event != "task_state":
-        data = public_progress_payload(event, data)
     frame = stamp_sse_event(_encode_event(event, data), seq)
     payload = json.loads(frame["data"])
     now = time.time()
     conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", (job_id, seq, event, canonical(payload), now))
+    if event == "assistant_progress":
+        conn.execute("UPDATE task_jobs SET progress_summary=? WHERE job_id=?", (payload["text"][:200], job_id))
     if event == "done" and isinstance(payload.get("turn_envelope"), dict):
         conn.execute("UPDATE task_jobs SET terminal_snapshot=? WHERE job_id=?", (canonical(payload["turn_envelope"]), job_id))
     return {"seq": seq, "event": event,
@@ -130,9 +136,12 @@ def public_working_notes(job_id):
     with transaction() as conn:
         rows = conn.execute("SELECT seq,data FROM task_events WHERE job_id=? AND event='assistant_progress' "
                             "ORDER BY seq DESC LIMIT ?", (job_id, LIVE_QUEUE_SIZE)).fetchall()
-    return [{"seq": row["seq"], "event": "assistant_progress",
-             "data": public_progress_payload("assistant_progress", json.loads(row["data"]))}
-            for row in reversed(rows)]
+    notes = []
+    for row in reversed(rows):
+        data = public_progress_payload("assistant_progress", json.loads(row["data"]))
+        if data.get("text"):
+            notes.append({"seq": row["seq"], "event": "assistant_progress", "data": data | {"seq": row["seq"]}})
+    return notes
 
 
 def append_event(job_id, event, data):
@@ -583,6 +592,8 @@ class DurableEventQueue(asyncio.Queue):
             if isinstance(data, str):
                 data = json.loads(data)
             record = append_event(self.job_id, str(item.get("event") or "message"), data)
+            if record is None:
+                return
             from src.core.progress_bus import _encode_event
             item = _encode_event(record["event"], record["data"]) | {"id": str(record["seq"])}
         try:

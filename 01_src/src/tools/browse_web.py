@@ -89,9 +89,10 @@ async def browse_web(action: Literal['open', 'observe', 'scroll', 'click', 'down
     retry = _navigation_retry.get()
     if retry_of and (not retry or retry_of != retry['operation_id']):
         return _output({'error': 'browse_retry_rejected'}, error='browse_retry_rejected', error_status='not_run')
+    from src.core.capability_policy import allows
     publication_started = False
     identity = (int(tracing.get_user_id() or 0), tracing.get_session_id(), tracing.get_job_id())
-    if not all(identity) or not tracing.web_search_enabled() or not enabled():
+    if not all(identity) or not allows("browser") or not enabled():
         return _output({'error': 'browse_not_authorized'}, error='browse_not_authorized', error_status='not_run')
     raise_if_cancelled('browse')
     try:
@@ -114,6 +115,8 @@ async def browse_web(action: Literal['open', 'observe', 'scroll', 'click', 'down
                     or renderer.unit != retry['renderer'] or (tab_id and tab_id != retry['tab_id'])):
                 raise BrowseError('browse_retry_rejected')
             tab_id = retry['tab_id']
+        if not allows('browser'):
+            raise BrowseError('browse_not_authorized')
         emit_progress('browse_phase', {'phase': 'navigating' if navigation else 'interacting'})
         result = await renderer.exchange({'action': action, 'url': url if navigation else '',
                                           'ref': element_ref, 'delta': scroll_pixels, 'tab_id': tab_id},

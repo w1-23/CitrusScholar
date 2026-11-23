@@ -109,17 +109,73 @@ def configure_native_profile():
             excluded_middleware=frozenset(exclusions)))
 
 
+class EmptySkillBackend(HostOnlyBackend):
+    def ls(self, path):
+        from deepagents.backends.protocol import LsResult
+        return LsResult(entries=[])
+
+    def read(self, file_path, offset=0, limit=2000):
+        from deepagents.backends.protocol import ReadResult
+        return ReadResult(error="Skill resource unavailable")
+
+    def grep(self, *args, **kwargs):
+        from deepagents.backends.protocol import GrepResult
+        return GrepResult(matches=[])
+
+    def glob(self, *args, **kwargs):
+        from deepagents.backends.protocol import GlobResult
+        return GlobResult(matches=[])
+
+    def download_files(self, paths):
+        from deepagents.backends.protocol import FileDownloadResponse
+        return [FileDownloadResponse(path, error="file_not_found") for path in paths]
+
+
+class ScopedSkillBackend(HostOnlyBackend):
+    def __init__(self, root, policy):
+        from deepagents.backends import FilesystemBackend
+        from pathlib import Path
+
+        self.policy = policy
+        self.routes = {}
+        for entrypoint in sorted(Path(root).glob("*/SKILL.md")):
+            directory = entrypoint.parent
+            if not directory.is_symlink() and not entrypoint.is_symlink():
+                self.routes[directory.name] = FilesystemBackend(root_dir=directory, virtual_mode=True)
+
+    def _backend(self):
+        from deepagents.backends import CompositeBackend
+        return CompositeBackend(default=EmptySkillBackend(None), routes={
+            f"/{name}/": backend for name, backend in self.routes.items()
+            if self.policy.allows("skill:" + name)})
+
+    def ls(self, path):
+        return self._backend().ls(path)
+
+    def read(self, file_path, offset=0, limit=2000):
+        return self._backend().read(file_path, offset, limit)
+
+    def grep(self, *args, **kwargs):
+        return self._backend().grep(*args, **kwargs)
+
+    def glob(self, *args, **kwargs):
+        return self._backend().glob(*args, **kwargs)
+
+    def download_files(self, paths):
+        return self._backend().download_files(paths)
+
+
 def create_native_agent(model, tools, policy, saver, state_schema, *,
                         skill_root, system_prompt, summary_model,
-                        summary_trigger=48000, summary_keep=32000):
+                        summary_trigger=48000, summary_keep=32000, capability_policy=None):
     from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
     from deepagents.middleware.filesystem import FilesystemPermission
     from deepagents.middleware.summarization import SummarizationMiddleware
 
     configure_native_profile()
-    backend = CompositeBackend(default=StateBackend(), routes={
-        "/skills/": FilesystemBackend(root_dir=skill_root, virtual_mode=True),
-    })
+    skill_backend = (ScopedSkillBackend(skill_root, capability_policy) if capability_policy is not None
+                     else FilesystemBackend(root_dir=skill_root, virtual_mode=True))
+    backend = CompositeBackend(default=StateBackend(), routes={"/skills/": skill_backend})
     permissions = [FilesystemPermission(
         operations=["write", "edit", "delete"], paths=["/**"], mode="deny")]
     middleware = []

@@ -554,20 +554,25 @@ async def open_checkpoint(root: Path, identity: ExecutionIdentity,
 _NATIVE_NAMESPACE = "native-session-v1"
 
 
-def _native_binding(identity: ExecutionIdentity, provider_scope: tuple[str, str]) -> dict:
+def _native_binding(identity: ExecutionIdentity, provider_scope: tuple[str, str], context_scope: str = "") -> dict:
     binding = _binding(identity, provider_scope)
     del binding["run_id"], binding["user_turn_id"]
+    if context_scope:
+        if not re.fullmatch(r"[a-f0-9]{64}", context_scope):
+            raise CheckpointProtectionError("invalid_checkpoint_context_scope")
+        binding["context_scope"] = context_scope
     return {**binding, "namespace": _NATIVE_NAMESPACE}
 
 
-def native_checkpoint_scope(identity: ExecutionIdentity, provider_scope: tuple[str, str]) -> dict:
-    digest = hashlib.sha256(_canonical(_native_binding(identity, provider_scope))).hexdigest()
+def native_checkpoint_scope(identity: ExecutionIdentity, provider_scope: tuple[str, str], *,
+                            context_scope: str = "") -> dict:
+    digest = hashlib.sha256(_canonical(_native_binding(identity, provider_scope, context_scope))).hexdigest()
     return {"thread_id": digest, "checkpoint_ns": ""}
 
 
 def native_checkpoint_path(root: Path, identity: ExecutionIdentity,
-                           provider_scope: tuple[str, str]) -> Path:
-    thread_id = native_checkpoint_scope(identity, provider_scope)["thread_id"]
+                           provider_scope: tuple[str, str], *, context_scope: str = "") -> Path:
+    thread_id = native_checkpoint_scope(identity, provider_scope, context_scope=context_scope)["thread_id"]
     return Path(root) / _NATIVE_NAMESPACE / thread_id / "checkpoint.sqlite3"
 
 
@@ -590,10 +595,11 @@ class _NativeEncryptedSerializer(EncryptedSerializer):
 
 @asynccontextmanager
 async def open_native_checkpoint(root: Path, identity: ExecutionIdentity,
-                                 provider_scope: tuple[str, str]) -> AsyncIterator[AsyncSqliteSaver]:
-    binding = _native_binding(identity, provider_scope)
+                                 provider_scope: tuple[str, str], *,
+                                 context_scope: str = "") -> AsyncIterator[AsyncSqliteSaver]:
+    binding = _native_binding(identity, provider_scope, context_scope)
     with _checkpoint_operation("prepare"):
         path, key = await asyncio.to_thread(_prepare_database,
-            native_checkpoint_path(root, identity, provider_scope))
+            native_checkpoint_path(root, identity, provider_scope, context_scope=context_scope))
     async with aiosqlite.connect(str(path)) as connection:
         yield _ProtectedSqliteSaver(connection, serde=_NativeEncryptedSerializer(key, binding))

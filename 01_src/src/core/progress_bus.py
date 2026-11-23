@@ -169,7 +169,9 @@ def emit_progress(event_type: str, data: dict) -> None:
     """Push a progress event to the current request's SSE queue (non-blocking)."""
     q = get_progress_queue()
     try:
-        q.put_nowait(_encode_event(event_type, public_progress_payload(event_type, data)))
+        payload = public_progress_payload(event_type, data)
+        if event_type != "assistant_progress" or payload.get("text"):
+            q.put_nowait(_encode_event(event_type, payload))
     except asyncio.QueueFull:
         pass
 
@@ -350,7 +352,6 @@ def tool_action_hint(tool_name: str, args: dict | None) -> str:
     return tool_display_name(tool_name)
 
 
-_PUBLIC_WORK_NOTE = "正在调用工具"
 _TOOL_STATUSES = {"complete", "partial", "no_results", "failed", "not_run", "skipped",
                   "cancelled", "unknown", "running", "resuming"}
 _REASON_CLASSES = {"input_missing", "source_unavailable", "transient", "coverage_incomplete",
@@ -525,19 +526,23 @@ def public_progress_payload(event: str, data: dict) -> dict:
             if isinstance(data.get("outcome"), dict):
                 public["outcome"] = public_tool_outcome(data["outcome"])
     elif event == "assistant_progress":
+        if data.get("visibility", "public") != "public":
+            return cursor
         category = data.get("category")
-        text = PUBLIC_WORK_NOTES.get(category) if isinstance(category, str) else None
+        origin = data.get("origin")
+        label = PUBLIC_WORK_NOTES.get(category) if origin == "host" and isinstance(category, str) else None
+        from src.core.public_progress import sanitize
+        text = label or (sanitize(data.get("text")) if origin == "model" else "")
+        if not text:
+            return cursor
         public = _fields(data, tokens=("job_id", "note_id", "step_id"), numbers=("model_step",))
         # Note IDs include ':' in both graph and agent producers.
         if note_id := _token(data.get("note_id"), r"[A-Za-z0-9_:-]{1,160}"):
             public["note_id"] = note_id
         call_ids = data.get("tool_call_ids")
-        if text:
+        if label:
             public["category"] = category
-        from src.core.public_progress import sanitize
-        note = sanitize(data.get("text")) if data.get("origin") == "model" else ""
-        text = text or note or _PUBLIC_WORK_NOTE
-        public.update(visibility="public", origin="host" if "category" in public else "model", phase="working",
+        public.update(visibility="public", origin=origin, phase="working",
                       text=text, chars=len(text),
                       tool_call_ids=[cid for item in call_ids if (cid := _token(item))]
                       if isinstance(call_ids, (list, tuple)) else [])

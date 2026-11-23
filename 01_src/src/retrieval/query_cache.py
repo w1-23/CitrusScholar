@@ -54,7 +54,9 @@ class QueryResultCache:
 def build_cache_key(query: str, families: list[str], categories: list[str], limit: int,
                     rag_identity: int, settings, corpus_generation: str = "",
                     allowed_corpus_ids: list[str] | None = None) -> str:
+    from src.core.capability_policy import current_policy
     payload = {
+        "capability_history": current_policy().history_key,
         "query": " ".join(str(query or "").casefold().split()),
         "families": sorted(set(families)), "categories": sorted(set(categories)),
         "allowed_corpus_ids": (None if allowed_corpus_ids is None
@@ -77,7 +79,8 @@ def build_cache_key(query: str, families: list[str], categories: list[str], limi
 
 
 def get_query_cache(settings) -> QueryResultCache | None:
-    if not bool(getattr(settings, "RAG_CACHE_ENABLED", False)):
+    from src.core.capability_policy import allows
+    if not allows("local_rag") or not bool(getattr(settings, "RAG_CACHE_ENABLED", False)):
         return None
     max_entries = min(max(int(getattr(settings, "RAG_CACHE_SIZE", 300) or 300), 1), 1000)
     ttl = min(max(int(getattr(settings, "RAG_CACHE_TTL_HOURS", 24) or 24), 1), 24 * 30)

@@ -515,6 +515,11 @@ class HarnessRuntime:
             if native:
                 if continuing_thread:
                     prior_request = (snapshot.values.get("host_state") or {}).get("original_request_state") or {}
+                    from src.core.capability_policy import CapabilityPolicy
+                    previous_policy = CapabilityPolicy.restore(prior_request["capability_snapshot"]) if prior_request.get("capability_snapshot") else CapabilityPolicy()
+                    policy = (native_options or {}).get("capability_policy") or CapabilityPolicy()
+                    if previous_policy.history_key != policy.history_key:
+                        raise AdmissionStopped("native_context_scope_mismatch")
                     request_id = prior_request.get("request_id")
                     anchor = next((index for index in range(len(messages) - 2, -1, -1)
                                    if request_id and isinstance(messages[index], AIMessage)
@@ -525,6 +530,7 @@ class HarnessRuntime:
                                   len(messages) - 2)
                     initial["messages"] = [message for message in messages[anchor + 1:]
                                            if message.additional_kwargs.get("context_origin") != "historical_evidence"]
+                initial["skills_metadata"] = None
                 initial.update(active_run_id=identity.run_id, pinned_skills=list(pinned_skills),
                     final_answer_recovery=False, batch_notes=[], batch_status="",
                     unknown_operations=[], execution_waits=[], execution_wake=[],

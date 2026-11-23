@@ -3551,6 +3551,10 @@ def fetch_and_audit_open_supplements(doi: str) -> str:
     doi = _normalize_doi(doi)
     if not re.fullmatch(r"10\.\d{4,9}/[^\s<>\[\]]+", doi):
         return "DOI 格式无效；未发起下载。"
+    from src.core.capability_policy import allows, not_run
+    if not (allows("web_fetch") and allows("bibliographic_lookup")):
+        capability = "web_fetch" if not allows("web_fetch") else "bibliographic_lookup"
+        return json.dumps({"_tool_outcome": not_run(capability)})
     import httpx
     try:
         response = httpx.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
@@ -3563,6 +3567,8 @@ def fetch_and_audit_open_supplements(doi: str) -> str:
         if not re.fullmatch(r"PMC\d+", pmcid, re.I):
             return ("Europe PMC 未找到该 DOI 对应的开放全文补充材料入口；"
                     "这不代表论文没有补充数据，其他仓储未在本次查询范围内。")
+        if not (allows("web_fetch") and allows("bibliographic_lookup")):
+            return "当前任务未开放书目与全文获取。"
         oa = httpx.get("https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi",
                        params={"id": pmcid}, timeout=10, follow_redirects=True)
         oa.raise_for_status()
@@ -3577,6 +3583,8 @@ def fetch_and_audit_open_supplements(doi: str) -> str:
         parsed = urlsplit(package_url)
         if parsed.scheme != "https" or parsed.hostname not in {"ftp.ncbi.nlm.nih.gov", "www.ncbi.nlm.nih.gov"}:
             return "补充材料下载地址不在可信 PMC OA 主机白名单中，已停止下载。"
+        if not allows("web_fetch"):
+            return "当前任务未开放公开文件下载。"
         with httpx.stream("GET", package_url, timeout=30, follow_redirects=False) as stream:
             stream.raise_for_status()
             size_header = int(stream.headers.get("content-length") or 0)

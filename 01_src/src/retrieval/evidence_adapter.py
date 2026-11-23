@@ -65,9 +65,13 @@ def purge_session_evidence(owner_user_id: int, session_id: str, *,
     shutil.rmtree(root)
 
 
-def _scope(turn_id: str = "", *, writing: bool = False):
+def _scope(turn_id: str = "", *, writing: bool = False, user: dict | None = None,
+           session_id: str = ""):
     from src.core import jobs, tracing
-    owner, session = tracing.get_user_id(), str(tracing.get_session_id() or "")
+    if user is None:
+        owner, session = tracing.get_user_id(), str(tracing.get_session_id() or "")
+    else:
+        owner, session = user.get("user_id"), session_id
     turn = str(turn_id or tracing.get_job_id() or "")
     if type(owner) is not int or owner <= 0 or not session or not turn:
         raise PermissionError("evidence_scope_unavailable")
@@ -81,8 +85,9 @@ def _scope(turn_id: str = "", *, writing: bool = False):
     return owner, session, turn
 
 
-def _store(generation: str, *, turn_id: str = "", writing: bool = False):
-    owner, session, turn = _scope(turn_id, writing=writing)
+def _store(generation: str, *, turn_id: str = "", writing: bool = False,
+           user: dict | None = None, session_id: str = ""):
+    owner, session, turn = _scope(turn_id, writing=writing, user=user, session_id=session_id)
     if not isinstance(generation, str) or not generation.strip() or len(generation) > 240:
         raise ValueError("evidence_generation_required")
     # Raw caller IDs never become filesystem path components.
@@ -94,19 +99,21 @@ def _store(generation: str, *, turn_id: str = "", writing: bool = False):
                          turn_id=turn, generation=generation)
 
 
-def _authorize_corpus(corpus_id: str) -> None:
+def _authorize_corpus(corpus_id: str, *, user: dict | None = None) -> None:
     from src.core.resource_access import PUBLIC_CORPUS, authorize_resource
     from src.core import tracing
     from src.retrieval.corpus_registry import load_corpus_registry, CorpusAccessScope
-    registry = load_corpus_registry()
-    if not CorpusAccessScope.from_registry(registry).permits(corpus_id):
-        raise PermissionError("evidence_corpus_unavailable")
     try:
+        registry = load_corpus_registry()
+        scope = CorpusAccessScope.from_registry(registry)
         level = registry.access_level_for_corpus(corpus_id)
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         raise PermissionError("evidence_corpus_unavailable") from exc
-    decision = authorize_resource(PUBLIC_CORPUS,
-        {"user_id": tracing.get_user_id(), "role": tracing.get_user_role()}, access_level=level)
+    if not scope.permits(corpus_id):
+        raise PermissionError("evidence_corpus_unavailable")
+    if user is None:
+        user = {"user_id": tracing.get_user_id(), "role": tracing.get_user_role()}
+    decision = authorize_resource(PUBLIC_CORPUS, user, access_level=level)
     if not decision.allowed:
         raise PermissionError("evidence_corpus_forbidden")
 
@@ -149,11 +156,12 @@ def persist_local_rows(rows: list[dict], *, query: str, generation: str) -> tupl
 
 
 def read_evidence(ref: str, *, turn_id: str, generation: str,
-                  offset: int = 0, max_chars: int = 4000) -> dict:
-    """Read newly saved evidence under the current principal; never search on miss."""
+                  offset: int = 0, max_chars: int = 4000,
+                  user: dict | None = None, session_id: str = "") -> dict:
+    """Read stored evidence under the authenticated tool or API principal."""
     if not isinstance(ref, str) or not ref.startswith("ev:"):
         raise ValueError("invalid_evidence_reference")
-    store = _store(generation, turn_id=turn_id)
+    store = _store(generation, turn_id=turn_id, user=user, session_id=session_id)
     if store is None:
         return {"status": "evidence_expired", "ref": ref, "text": "", "next_offset": None}
     result = store.read(ref=ref, offset=offset, max_chars=max_chars)
@@ -161,6 +169,6 @@ def read_evidence(ref: str, *, turn_id: str, generation: str,
         locator = result["source"].get("locator")
         if not isinstance(locator, dict):
             raise PermissionError("evidence_corpus_unavailable")
-        _authorize_corpus(str(locator.get("corpus_id") or ""))
-    _scope(turn_id)
+        _authorize_corpus(str(locator.get("corpus_id") or ""), user=user)
+    _scope(turn_id, user=user, session_id=session_id)
     return result

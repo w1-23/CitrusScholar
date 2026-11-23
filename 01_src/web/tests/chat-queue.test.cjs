@@ -423,6 +423,76 @@ function observedTask(b, job, transport, taskVersion = 1) {
   return {store, controls};
 }
 
+test('clearing a preserved new-task draft restores the active-task default', async () => {
+  const b = browser(), job = 'active-with-existing-draft';
+  const updates = [];
+  b.userInput.value = '正在写的独立草稿';
+  observedTask(b, job, {post: async (target, path, payload) => {
+    updates.push({target, path, payload});
+    return {job_id: job, version: 2, status: 'applied'};
+  }});
+  assert.equal(b.userInput.value, '正在写的独立草稿');
+  assert.equal(b.get('composer-new-message').textContent, '补充当前任务');
+  b.userInput.value = '';
+  b.userInput.listeners.input[0]();
+  assert.equal(b.get('composer-new-message').textContent, '作为新任务');
+  assert.equal(b.get('composer-task-target').title, job);
+  assert.equal(b.chatContainer.querySelector('.task-update-toggle'), null);
+  b.userInput.value = '补充检查单位';
+  b.userInput.listeners.keydown[0]({key: 'Enter', preventDefault() {}});
+  await flush();
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].target, job);
+  assert.equal(updates[0].path, 'updates');
+  assert.equal(updates[0].payload.instruction, '补充检查单位');
+  assert.equal(b.requests.filter(r => r.opts.method === 'POST').length, 0);
+});
+
+test('clearing the last new-task option restores the active-task default', () => {
+  const b = browser(), job = 'active-with-browse-draft';
+  const browse = b.get('browse-requested');
+  browse.checked = true;
+  observedTask(b, job, {});
+  assert.equal(b.get('composer-new-message').textContent, '补充当前任务');
+  assert.equal(browse.checked, true);
+  browse.checked = false;
+  browse.listeners.change[0]();
+  assert.equal(b.get('composer-new-message').textContent, '作为新任务');
+  assert.equal(b.get('composer-task-target').title, job);
+});
+
+test('the explicit new-task override stays selected when its draft is empty', async () => {
+  const b = browser(), job = 'active-with-explicit-override';
+  observedTask(b, job, {post: () => assert.fail('new-task send must not update the running task')});
+  clickComposerMode(b);
+  b.userInput.listeners.input[0]();
+  assert.equal(b.userInput.value, '');
+  assert.equal(b.get('composer-new-message').textContent, '补充当前任务');
+  b.userInput.value = '独立问题';
+  b.userInput.listeners.keydown[0]({key: 'Enter', preventDefault() {}});
+  await flush();
+  const post = b.last(r => r.opts.method === 'POST');
+  assert.equal(post.url, '/api/v2/session/session/turn-queue');
+  assert.equal(JSON.parse(post.opts.body).query, '独立问题');
+});
+
+test('an update receipt keeps a draft edited back to the same text', async () => {
+  const b = browser(), job = 'active-with-retyped-draft', response = deferred();
+  observedTask(b, job, {post: () => response.promise});
+  b.userInput.value = '核对单位';
+  const sending = b.context.sendMsg();
+  b.userInput.value = '';
+  b.userInput.listeners.input[0]();
+  b.userInput.value = '核对单位';
+  b.userInput.listeners.input[0]();
+  response.resolve({job_id: job, version: 2, status: 'applied'});
+  await sending;
+  assert.equal(b.userInput.value, '核对单位');
+  const key = b.context.composerDraftKey(job);
+  assert.equal(b.context.sessionStorage.getItem(key), '核对单位');
+  assert.equal(b.context.sessionStorage.getItem(key + '.update'), null);
+});
+
 test('a lost update reuses its ID and preserves edits made since the first submission', async () => {
   const b = browser(), job = 'job-update';
   const posts = [], lookups = [];

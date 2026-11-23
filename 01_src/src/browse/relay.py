@@ -235,6 +235,9 @@ class Relay:
             raise BrowseError('browse_url_denied') from exc
 
     def _check_active(self):
+        from src.core.capability_policy import allows
+        if not allows("browser"):
+            raise BrowseError('browse_not_authorized')
         raise_if_cancelled('browse_network')
         if self._closed:
             raise BrowseError('browse_session_expired')

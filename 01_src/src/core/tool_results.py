@@ -51,6 +51,7 @@ def ensure_schema() -> None:
     if _schema_ready:
         return
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS tool_results (
                 tool_call_id TEXT PRIMARY KEY,
@@ -66,7 +67,8 @@ def ensure_schema() -> None:
                 error_text TEXT,
                 elapsed_ms INTEGER,
                 summary TEXT,
-                created_at TEXT
+                created_at TEXT,
+                evidence_ref TEXT NOT NULL DEFAULT ''
             )
         """)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tool_results)")}
@@ -74,6 +76,8 @@ def ensure_schema() -> None:
             conn.execute("ALTER TABLE tool_results ADD COLUMN retained INTEGER NOT NULL DEFAULT 1")
         if "pinned" not in columns:
             conn.execute("ALTER TABLE tool_results ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        if "evidence_ref" not in columns:
+            conn.execute("ALTER TABLE tool_results ADD COLUMN evidence_ref TEXT NOT NULL DEFAULT ''")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tr_session "
             "ON tool_results(session_id, created_at)")
@@ -150,7 +154,7 @@ def clamp_for_model(text: str, tool_name: str = "",
 def record(*, tool_call_id: str, session_id: str = "", request_id: str = "",
            tool_name: str = "", status: str = "", args: Any = None,
            result_text: str = "", error_text: str = "",
-           elapsed_ms: int = 0, summary: str = "") -> bool:
+           elapsed_ms: int = 0, summary: str = "", evidence_ref: dict | None = None) -> bool:
     """Persist complete evidence once; conflicting or expired IDs cannot be reused.
 
     Identical retries do not update timestamps or extend retention. Elapsed time
@@ -169,6 +173,7 @@ def record(*, tool_call_id: str, session_id: str = "", request_id: str = "",
             "tool_name": tool_name, "status": status, "args_json": args_json,
             "result_text": stored, "result_chars": len(stored),
             "truncated": 0, "full_sha256": digest, "error_text": str(error_text or ""),
+            "evidence_ref": json.dumps(evidence_ref, sort_keys=True) if evidence_ref else "",
         }
         from datetime import datetime, timezone
         stamp = datetime.now(timezone.utc).isoformat()
@@ -185,11 +190,11 @@ def record(*, tool_call_id: str, session_id: str = "", request_id: str = "",
                 "INSERT INTO tool_results "
                 "(tool_call_id, session_id, request_id, tool_name, status, "
                 " args_json, result_text, result_chars, truncated, full_sha256, "
-                " error_text, elapsed_ms, summary, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " error_text, elapsed_ms, summary, created_at, evidence_ref) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (cid, session_id, request_id, tool_name, status, args_json,
                  stored, len(stored), 0, digest, identity["error_text"],
-                 int(elapsed_ms or 0), str(summary or "")[:2_000], stamp))
+                 int(elapsed_ms or 0), str(summary or "")[:2_000], stamp, identity["evidence_ref"]))
             if session_id:
                 conn.execute(
                     "UPDATE tool_results SET retained=0, result_text=NULL, args_json=NULL, "

@@ -39,6 +39,9 @@ async def persist_agent_turn(state: dict) -> dict:
                          or (state.get("turn_envelope") or {}).get("request_id")
                          or state.get("idempotency_key") or "")
         turn_id = str((state.get("turn_envelope") or {}).get("turn_id") or request_id)
+        from src.core.capability_policy import policy_for_state
+        policy = policy_for_state(state)
+        history_key = policy.history_key
         prepared = []
         for message in trace:
             meta = dict(getattr(message, "additional_kwargs", {}) or {})
@@ -49,7 +52,8 @@ async def persist_agent_turn(state: dict) -> dict:
             if getattr(message, "type", "") in ("ai", "AIMessageChunk", "tool"):
                 meta.setdefault("context_origin", "tool" if message.type == "tool" else "assistant")
                 meta.setdefault("context_trusted", True)
-            prepared.append(message.model_copy(update={"additional_kwargs": meta}))
+            prepared.append(message.model_copy(update={"additional_kwargs": meta,
+                "response_metadata": {**message.response_metadata, "citrus_capability_history": history_key}}))
         trace = prepared
         # The last assistant text is the final synthesis message. Delivery-gate
         # work and finalization can change the answer after that message was
@@ -71,10 +75,11 @@ async def persist_agent_turn(state: dict) -> dict:
         except (TypeError, ValueError):
             generation_ms = int(max(0, state.get("gen_time_ms") or 0))
         metadata = dict(getattr(trace[-1], "response_metadata", {}) or {})
+        metadata["citrus_capability_history"] = history_key
         if generation_ms > 0:
             metadata["citrus_generation_ms"] = generation_ms
         metadata["citrus_task_snapshot"] = {key: state[key] for key in
-            ("task_contract", "coverage", "turn_outcome") if key in state}
+            ("task_contract", "coverage", "turn_outcome", "capability_snapshot", "capability_runtime") if key in state}
         trace[-1] = trace[-1].model_copy(update={"response_metadata": metadata})
 
         from src.core.account_leases import (
@@ -95,11 +100,11 @@ async def persist_agent_turn(state: dict) -> dict:
                            if key in ledger}
             if working:
                 accepted = await asyncio.to_thread(
-                    session_manager.save_working_state, session_id, working)
+                    session_manager.save_working_state, session_id, {**working, "capability_history": history_key})
                 if not accepted:
                     logger.warning("[GeneralAgent:save] working state was not accepted")
 
-        if saved:
+        if saved and not history_key and policy.allows("summarization"):
             # Completion maintenance is detached only after answer and trace commit.
             # Its own account lease keeps deletion from racing source publication.
             from src.guardrails.turn_checkpoint import schedule_checkpoint
@@ -107,7 +112,7 @@ async def persist_agent_turn(state: dict) -> dict:
 
         main_results = state.get("main_results") or []
         web_results = state.get("web_results") or []
-        if main_results or web_results:
+        if not history_key and (main_results or web_results):
             evidence = [
                 {
                     "doi": clean_doi(result.get("doi")),

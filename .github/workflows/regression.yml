@@ -55,6 +55,7 @@ jobs:
             01_src/src/core/tool_result_delivery_test.py \
             01_src/src/guardrails/turn_checkpoint_deterministic_test.py \
             01_src/src/api/task_observation_regression_test.py \
+            01_src/src/api/citation_identity_regression_test.py \
             01_src/src/research/render_script_contract_test.py \
             01_src/src/research/audit_release_test.py \
             01_src/src/research/audit_projection_test.py \

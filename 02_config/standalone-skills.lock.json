@@ -24,7 +24,7 @@
   },
   "nature-figure": {
     "repository": "https://github.com/w1-23/nature-figure.git",
-    "commit": "3f61d9df0e34cac46adb37a34468c389a66bda8f",
+    "commit": "cbf7ad4385cd430298b18b0e3c9ed624d81a73e6",
     "dependencies": {
       "requirements.lock": "62ae43981affcb09e465ef6abefb5f122e3c34f71aef30258eb80ab300815506",
       "requirements-dev.lock": "fe4a3e03e01c9d400603daa6012070233eb1eedf8524cf264039e583c6684eff",

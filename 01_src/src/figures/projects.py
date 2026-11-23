@@ -44,7 +44,7 @@ from src.figures.overrides import (
 )
 from src.figures.store import (
     create_project, delete_project, get_project, list_projects,
-    update_project, update_project_committed,
+    get_revision_export, list_revision_exports, record_revision_export, update_project, update_project_committed,
 )
 
 # The formats a figure project carries.
@@ -511,7 +511,7 @@ def _normalise_manifest(manifest: Any) -> dict[str, Any]:
 # ── Publishing ────────────────────────────────────────────────────────────
 
 def _publish_bytes(owner: int, session_id: str, filename: str,
-                   payload: bytes, mime: str) -> dict[str, Any]:
+                   payload: bytes, mime: str, *, request_id: str = "") -> dict[str, Any]:
     """Publish one rendered file into the account's file library.
 
     The file library is the service's own storage for a user's material, so
@@ -529,7 +529,7 @@ def _publish_bytes(owner: int, session_id: str, filename: str,
         return publish_artifact(
             owner=owner, session_id=session_id, filename=filename,
             content=payload, mime=mime, producer_tool="figure_workspace",
-            request_id=str(get_client_request_id() or ""))
+            request_id=request_id or str(get_client_request_id() or ""))
     except Exception as exc:
         raise ProjectError("publish_failed", f"图件登记失败：{exc}") from exc
 
@@ -659,6 +659,9 @@ def detail_for_owner(figure_id: str, owner: int, *, upgrade_manifest: bool = Fal
     project = get_for_owner(figure_id, owner)
     manifest = _normalise_manifest(project.get("manifest_json"))
     public = _public(project)
+    public["exports"] = {
+        **list_revision_exports(figure_id, owner, public["render_version"]), **public["exports"],
+    }
     from src.figures.manifest import MANIFEST_VERSION
     svg_detail = {}
     if public["source_kind"] == "svg":
@@ -678,6 +681,7 @@ def detail_for_owner(figure_id: str, owner: int, *, upgrade_manifest: bool = Fal
         **edit_context(project),
         **public,
         **svg_detail,
+        "generatable_formats": ["png", "pdf"] if public["editable"] and public["source_kind"] != "svg" else [],
         "manifest": manifest,
         # A disposable legacy-inventory upgrade has not been accepted by the
         # project CAS; do not attach bindings for the stored manifest to it.
@@ -764,12 +768,14 @@ def _verify_sources(project: dict[str, Any], owner: int) -> None:
 
 
 def _render_edits(project: dict[str, Any], owner: int, raw_overrides: Any,
-                  *, formats: tuple[str, ...] = DEFAULT_FORMATS, render_mode: str = "edit"
+                  *, formats: tuple[str, ...] = DEFAULT_FORMATS, render_mode: str = "edit",
+                  require_current: bool = True
                   ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any], dict[str, bytes]]:
     """The one preview/save path; all outputs remain in memory until commit."""
     from src.figures.trusted_render import render_resolved, TrustedRenderError
 
-    _assert_current(project, owner)
+    if require_current:
+        _assert_current(project, owner)
     _verify_sources(project, owner)
     source = project.get("source_json") or {}
     if _is_script(project):
@@ -807,7 +813,8 @@ def _render_edits(project: dict[str, Any], owner: int, raw_overrides: Any,
             or manifest_size > MAX_MANIFEST_BYTES):
         raise ProjectError("render_too_large", "图件预览或对象清单超过体积上限。")
     _verify_sources(project, owner)
-    _assert_current(project, owner)
+    if require_current:
+        _assert_current(project, owner)
     return merged, changed, new_manifest, blobs
 
 
@@ -867,6 +874,53 @@ def _load_revision(figure_id: str, owner: int, expected_revision: int | None) ->
     if expected_revision is not None and int(expected_revision) != int(project.get("render_version") or 0):
         raise ProjectError("revision_conflict", "图件已在其他页面更新，请重新加载后合并修改。", status=409)
     return project
+
+
+def generate_export(figure_id: str, owner: int, fmt: str, *, expected_revision: int) -> dict:
+    """Render and register a missing PNG or PDF from a bound saved revision."""
+    from src.figures.nature_receipts import current_qa_summary
+    from src.session.files import get_account_file
+
+    if fmt not in {"png", "pdf"}:
+        raise ProjectError("format_unsupported", "仅支持生成 PNG 或 PDF。")
+    project = get_for_owner(figure_id, owner)
+    restored = get_revision_export(figure_id, owner, expected_revision, fmt)
+    if restored is not None:
+        entry = restored["export"]
+        registered = get_account_file(entry["file_id"], owner)
+        if (not registered or registered["sha256"] != entry["sha256"]
+                or not Path(registered["path"]).is_file()):
+            raise ProjectError("artifact_unavailable", "该版本的已登记文件不可读取。", status=404)
+        return restored
+    if project["render_version"] != expected_revision:
+        raise ProjectError("revision_conflict", "图件版本已更新，请重新打开。", status=409)
+    existing = (project.get("exports_json") or {}).get(fmt)
+    if isinstance(existing, dict) and existing.get("file_id"):
+        return {"figure_id": figure_id, "render_version": expected_revision, "format": fmt,
+                "export": existing}
+    if project.get("source_kind") == "svg" or not _can_edit(project):
+        raise ProjectError("render_unavailable", "当前图件没有可重放的冻结工程。", status=409)
+    session_id = project.get("session_id")
+    if not session_id:
+        raise ProjectError("no_session", "当前图件没有已授权的登记会话。", status=409)
+
+    _, _, manifest, blobs = _render_edits(project, owner, [], formats=(fmt,), require_current=False)
+    get_for_owner(figure_id, owner)
+    restored = get_revision_export(figure_id, owner, expected_revision, fmt)
+    if restored is not None:
+        return restored
+    filename = f"{_safe_stem(project.get('title'))}.{fmt}"
+    artifact = _publish_bytes(owner, session_id, filename, blobs[fmt], MIME_BY_FORMAT[fmt],
+                              request_id=f"figure-export:{figure_id}:{expected_revision}:{fmt}")
+    summary = current_qa_summary(manifest)
+    checks = [check for check in summary.get("checks", [])
+              if (check.get("artifact") or {}).get("format") == fmt]
+    payload = {"figure_id": figure_id, "render_version": expected_revision, "format": fmt,
+               "export": artifact, "checks": checks, "qa_receipt_id": summary.get("receipt_id")}
+    committed = record_revision_export(figure_id, owner, expected_revision, fmt, payload)
+    if committed is None:
+        raise ProjectError("not_found", "图件不存在或无权访问。", status=404)
+    return committed
 
 
 def _resolve_edit_targets(project: dict[str, Any], raw_overrides: Any,

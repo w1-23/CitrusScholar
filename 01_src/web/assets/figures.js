@@ -529,8 +529,43 @@
     notice.hidden = !messages.length;
   }
 
+  function startDownload(url) {
+    var download = document.createElement('a');
+    download.href = url;
+    download.download = '';
+    document.body.appendChild(download);
+    download.click();
+    download.remove();
+  }
+
+  async function generateSavedExport(link) {
+    if (link.dataset.exportPending || !state.current) return;
+    var project = state.current, epoch = state.epoch, status = el('exportStatus');
+    var format = link.dataset.exportFormat;
+    var url = API + '/projects/' + encodeURIComponent(project.figure_id) + '/export/' + format;
+    link.dataset.exportPending = 'true';
+    status.hidden = false;
+    status.textContent = '正在生成已保存版本的 ' + format.toUpperCase() + '…';
+    try {
+      var response = await fetch(url, {method:'POST', credentials:'same-origin', redirect:'error',
+        headers:{'Content-Type':'application/json'}, body:JSON.stringify({expected_revision:project.render_version})});
+      var body = await response.json();
+      if (!ownsProject(project.figure_id, epoch)) return;
+      if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : '导出失败（HTTP ' + response.status + '）。');
+      var fileId = body.export && body.export.file_id;
+      if (body.figure_id !== project.figure_id || body.render_version !== project.render_version ||
+          body.format !== format || !/^[a-f0-9]{32}$/.test(fileId || '')) throw new Error('导出回执无效。');
+      status.hidden = true;
+      startDownload('/api/v2/files/' + fileId + '/download');
+    } catch (error) {
+      if (ownsProject(project.figure_id, epoch)) status.textContent = error instanceof TypeError ?
+        '无法连接服务器。再次点击可查询同版本导出。' : error.message;
+    } finally { delete link.dataset.exportPending; }
+  }
+
   async function downloadSavedFigure(event) {
     var link = event.currentTarget, url = link.getAttribute('href');
+    if (link.dataset.exportFormat) { event.preventDefault(); return generateSavedExport(link); }
     if (!url || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
     event.preventDefault();
     var status = el('exportStatus'), epoch = state.epoch;
@@ -547,12 +582,7 @@
           response.status === 401 || response.status === 403 ? '无法访问此文件，请检查登录和权限。' :
           '无法下载当前文件（HTTP ' + response.status + '）。');
       }
-      var download = document.createElement('a');
-      download.href = url;
-      download.download = '';
-      document.body.appendChild(download);
-      download.click();
-      download.remove();
+      startDownload(url);
     } catch (error) {
       if (epoch !== state.epoch || link.getAttribute('href') !== url) return;
       status.hidden = false;
@@ -566,8 +596,13 @@
     ['svg', 'png', 'pdf', 'tiff'].forEach(function (format) {
       var link = el('download' + format.charAt(0).toUpperCase() + format.slice(1));
       var available = !!(state.current.exports || {})[format];
-      link.setAttribute('aria-disabled', available ? 'false' : 'true');
+      var generatable = !available && (state.current.generatable_formats || []).indexOf(format) >= 0;
+      link.setAttribute('aria-disabled', available || generatable ? 'false' : 'true');
+      delete link.dataset.exportFormat;
       if (available) link.href = base + '/export/' + format + '?v=' + encodeURIComponent(state.current.render_version);
+      else if (generatable) {
+        link.href = '#exportStatus'; link.dataset.exportFormat = format;
+      }
       else link.removeAttribute('href');
     });
   }

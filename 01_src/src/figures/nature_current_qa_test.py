@@ -668,6 +668,57 @@ ax.set_title('Mixed artists')
             projects._frozen_render_state(changed)
         assert raised.value.code == code
 
+    previous = store._STATE_DIR
+    store.set_state_dir(tmp_path / "state")
+    try:
+        entries, add = _fake_session_registry(tmp_path, monkeypatch)
+        monkeypatch.setattr(session_files, "get_account_file", lambda file_id, owner, **kwargs: (
+            {"path": table} if file_id == "frozen" and owner == 7
+            else entries.get(file_id) if owner == 7 else None))
+        from src.config import settings
+        monkeypatch.setattr(settings, "FIGURES_SANDBOX_BACKEND", "local")
+        monkeypatch.setattr(settings, "FIGURES_SANDBOX_ALLOW_LOCAL", True)
+        figure_id = store.create_project(
+            owner_user_id=7, title="Frozen figure", source_kind="script", source=source,
+            session_id="session1234")["figure_id"]
+        svg = add(initial.outputs["figure:main:svg"])
+        exports = {"svg": {key: value for key, value in svg.items() if key != "path"}}
+        assert store.update_project(figure_id, 7, expected_revision=0,
+                                    manifest_json=manifest, exports_json=exports, render_version=1,
+                                    data_refs_json=[{"file_id": "frozen", "sha256": digest}])
+        assert set(projects.detail_for_owner(figure_id, 7)["exports"]) == {"svg"}
+
+        png = projects.generate_export(figure_id, 7, "png", expected_revision=1)
+        assert projects.detail_for_owner(figure_id, 7)["exports"]["png"] == png["export"]
+        render_edits = projects._render_edits
+
+        def edit_during_export(bound, owner, overrides, **options):
+            assert bound["render_version"] == 1 and not bound["overrides_json"]
+            assert store.update_project(figure_id, 7, expected_revision=1,
+                                        overrides_json=[override], render_version=2)
+            return render_edits(bound, owner, overrides, **options)
+
+        monkeypatch.setattr(projects, "_render_edits", edit_during_export)
+        pdf = projects.generate_export(figure_id, 7, "pdf", expected_revision=1)
+        assert set(projects.detail_for_owner(figure_id, 7)["exports"]) == {"svg"}
+        assert store.get_project(figure_id, 7)["render_version"] == 2
+        assert store.get_project(figure_id, 7)["overrides_json"] == [override]
+        for output, signature in ((png, b"\x89PNG\r\n\x1a\n"), (pdf, b"%PDF-")):
+            artifact = output["export"]
+            payload = entries[artifact["file_id"]]["path"].read_bytes()
+            assert payload.startswith(signature) and _sha(payload) == artifact["sha256"]
+            assert output["render_version"] == 1
+            assert output["checks"]
+            assert all(check["artifact"]["sha256"] == artifact["sha256"] for check in output["checks"])
+            assert projects.generate_export(figure_id, 7, output["format"], expected_revision=1) == output
+            with pytest.raises(projects.ProjectError) as denied:
+                projects.generate_export(figure_id, 8, output["format"], expected_revision=1)
+            assert denied.value.code == "not_found"
+        assert len(entries) == 3
+        assert store.delete_project(figure_id, 7)
+        assert store.list_revision_exports(figure_id, 7, 1) == {}
+    finally:
+        store.set_state_dir(previous)
 
 def test_raw_line_coordinates_distinguish_integers_with_identical_rendered_paths():
     import numpy as np

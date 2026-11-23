@@ -97,6 +97,11 @@ class CurrentArtifactRequest(BaseModel):
     journal_strict: bool = Field(default=False, strict=True)
 
 
+class GenerateExportRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_revision: int = Field(ge=0, strict=True)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 def _current_user(request: Request) -> dict:
@@ -401,6 +406,20 @@ async def _preview_image(figure_id: str, request: Request, fmt: str, version: in
     return FileResponse(path=info["path"], media_type=projects.MIME_BY_FORMAT[fmt],
                         headers={**_SVG_HEADERS,
                                  "Content-Disposition": "inline"})
+
+
+@router.post("/projects/{figure_id}/export/{fmt}")
+async def generate_project_export(figure_id: str, fmt: str, body: GenerateExportRequest, request: Request):
+    from src.figures import projects
+
+    owner = _owner(request)
+    with _write_scope(owner) as lease:
+        try:
+            payload = await run_account_thread(lease, projects.generate_export, figure_id, owner, fmt,
+                                               expected_revision=body.expected_revision)
+        except projects.ProjectError as exc:
+            return _fail(exc)
+    return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
 
 
 @router.api_route("/projects/{figure_id}/export/{fmt}", methods=["GET", "HEAD"])

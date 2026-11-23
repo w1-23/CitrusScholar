@@ -109,6 +109,14 @@ def _connect() -> sqlite3.Connection:
                 # Another connection may have completed this additive migration.
                 if name not in {row[1] for row in conn.execute("PRAGMA table_info(figure_project_pins)")}:
                     raise
+    conn.execute("""CREATE TABLE IF NOT EXISTS figure_revision_exports (
+        figure_id TEXT NOT NULL,
+        owner_user_id INTEGER NOT NULL,
+        render_version INTEGER NOT NULL,
+        format TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        PRIMARY KEY (figure_id, owner_user_id, render_version, format)
+    )""")
     return conn
 
 
@@ -246,6 +254,41 @@ def get_project(figure_id: str, owner_user_id: int) -> dict[str, Any] | None:
             "SELECT * FROM figure_projects WHERE figure_id=? AND owner_user_id=?",
             (str(figure_id), int(owner_user_id))).fetchone()
     return _row_to_project(row)
+
+
+def get_revision_export(figure_id: str, owner: int, version: int, fmt: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT e.payload FROM figure_revision_exports e JOIN figure_projects p "
+            "ON p.figure_id=e.figure_id AND p.owner_user_id=e.owner_user_id "
+            "WHERE e.figure_id=? AND e.owner_user_id=? AND e.render_version=? AND e.format=?",
+            (figure_id, owner, version, fmt),
+        ).fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def list_revision_exports(figure_id: str, owner: int, version: int) -> dict[str, dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT format, payload FROM figure_revision_exports "
+            "WHERE figure_id=? AND owner_user_id=? AND render_version=?",
+            (figure_id, owner, version),
+        ).fetchall()
+    return {row["format"]: json.loads(row["payload"])["export"] for row in rows}
+
+
+def record_revision_export(figure_id: str, owner: int, version: int, fmt: str,
+                           payload: dict) -> dict | None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO figure_revision_exports "
+            "(figure_id, owner_user_id, render_version, format, payload) "
+            "SELECT figure_id, owner_user_id, ?, ?, ? FROM figure_projects "
+            "WHERE figure_id=? AND owner_user_id=? "
+            "ON CONFLICT (figure_id, owner_user_id, render_version, format) DO NOTHING",
+            (version, fmt, json.dumps(payload, ensure_ascii=False, allow_nan=False), figure_id, owner),
+        )
+    return get_revision_export(figure_id, owner, version, fmt)
 
 
 def list_projects(owner_user_id: int, *, limit: int = 100,
@@ -428,6 +471,8 @@ def delete_project(figure_id: str, owner_user_id: int) -> bool:
             (str(figure_id), int(owner_user_id)))
         removed = cursor.rowcount > 0
         _delete_revisions(conn, str(figure_id), int(owner_user_id))
+        conn.execute("DELETE FROM figure_revision_exports WHERE figure_id=? AND owner_user_id=?",
+                     (str(figure_id), int(owner_user_id)))
     _release_recorded_pins(int(owner_user_id), pins)
     return removed
 
@@ -457,6 +502,8 @@ def purge_account(owner_user_id: int) -> int:
             "DELETE FROM figure_projects WHERE owner_user_id=?",
             (int(owner_user_id),))
         removed = int(cursor.rowcount or 0)
+        conn.execute("DELETE FROM figure_revision_exports WHERE owner_user_id=?",
+                     (int(owner_user_id),))
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='figure_revisions'").fetchone():
             conn.execute("DELETE FROM figure_revisions WHERE owner_user_id=?", (int(owner_user_id),))
     _release_recorded_pins(int(owner_user_id), pins)

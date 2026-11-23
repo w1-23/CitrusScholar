@@ -9,6 +9,7 @@
   "reference-verification": {
     "repository": "https://github.com/w1-23/reference-verification.git",
     "commit": "58faab0e1aa9a9de8cd9a587a8f991f2c77a5a75",
+    "python_package": "packages/citrus_refcheck",
     "dependencies": {
       "requirements.lock": "cd20b991f67fe502e91121b1dbad17284a8a45ddac86383196d6f4a840e5da3e"
     }
@@ -16,6 +17,7 @@
   "data-audit": {
     "repository": "https://github.com/w1-23/data-audit.git",
     "commit": "854551d764398754e7daee27f9ad1f6c99f7c68b",
+    "python_package": "citrus_audit",
     "dependencies": {
       "requirements-linux-cp312.lock": "cf261ea3fbe5bbb068d8f7eece11e8a5910293daca884145fb03b11377ceab5d"
     }

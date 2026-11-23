@@ -46,6 +46,20 @@ application.sif 实际安装 requirements-gpu.txt 与非 editable 支持 wheel�
 
 当前受信应用依赖固定于 application SIF，活跃入口来自只读绑定的版本源码；须同时记录上传基线与远程修订来源。Apptainer 的 /environment 为保留路径，Code 依赖 overlay 使用 /code-environment/site.zip，宿主持久协议和 OCI 路线不变。Web 单独只读绑定宿主现有 resolv.conf；Worker/用户 Code 不继承该挂载或 GPU。
 
+## 固定独立 Skill 版本
+
+在受信构建区预先准备 `02_config/standalone-skills.lock.json` 指定的仓库与提交。构建命令读取 Git 对象并核验依赖锁，不使用仓库工作区的未提交文件。
+
+```bash
+python3 04_scripts/stage_skill_release.py --repositories /absolute/source-checkouts \
+  --output /absolute/release/standalone-skills --include-runtime
+sha256sum /absolute/release/standalone-skills/inventory.json
+```
+
+部署配置的 `skill_release` 使用该绝对目录，`skill_release_sha256` 使用上面的清单摘要。启动器逐文件核验，校验通过后以只读方式挂载，并使可信服务优先导入该发行的计算包。`native_runtime` 单独控制是否选择原生运行时。可用 `--enable` 指定曝光的方法，空清单用于基线，`--include-runtime` 使这些条件共用相同的执行库。
+
+图件或 Code Worker 继续使用各自的固定镜像。构建 Code 镜像时，从同一数据审查提交构建 wheel 并预装所需锁定依赖，避免与兼容用支持包重复拥有 `citrus_audit`。仅 staging 文件不会改变 Worker 镜像，也不会给用户脚本添加外网或宿主目录。将主仓 SHA、Skill SHA、依赖和实际镜像摘要一起记录，首次启动先验证 Worker 内对应导入和脚本。运行中的发布目录保持只读且保留已接纳任务使用的旧发行物。
+
 ## 隔离验收启动
 
 共享文献库由 `shared_literature_single_web` 控制。启用时预建同一 `corpus_root` 下服务账号拥有的私有 `shared_agent_literature/` 和 `_review_queue/`。Web 单独将这两个目录挂载为可写，基础语料根仍为只读。运行时只允许一个 Web 持有共享库锁，沿用受控 Worker。候审通过与全站索引更新分别核对。

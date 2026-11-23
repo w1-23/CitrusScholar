@@ -59,6 +59,35 @@ def release_identity(config):
     return hashlib.sha256(hashlib.sha256(manifest).digest() + configuration).hexdigest()
 
 
+def verified_skill_release(config, binds):
+    path = config.get('skill_release')
+    expected = config.get('skill_release_sha256')
+    if path is None and expected is None:
+        return None
+    root = Path(absolute(path))
+    if (root.resolve(strict=True) != root or not root.is_dir()
+            or not isinstance(expected, str) or not re.fullmatch('[a-f0-9]{64}', expected)
+            or any(root.is_relative_to(writable) or writable.is_relative_to(root)
+                   for item, mode in binds if mode == 'rw' for writable in (Path(item).resolve(),))):
+        raise ValueError('Skill release must be pinned and outside writable deployment binds')
+    inventory_path = root / 'inventory.json'
+    if inventory_path.is_symlink():
+        raise ValueError('Skill release inventory must be a regular file')
+    raw = inventory_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError('Skill release inventory SHA-256 mismatch')
+    inventory = json.loads(raw)
+    actual = {}
+    for member in root.rglob('*'):
+        if member.is_symlink() or (not member.is_dir() and not member.is_file()):
+            raise ValueError('Invalid Skill release member')
+        if member.is_file() and member != inventory_path:
+            actual[member.relative_to(root).as_posix()] = hashlib.sha256(member.read_bytes()).hexdigest()
+    if inventory != actual or not (root / 'skills').is_dir():
+        raise ValueError('Skill release content mismatch')
+    return root
+
+
 def command(config, role):
     if role not in {'web', 'worker', 'prepare'}:
         raise ValueError('Unknown deployment role')
@@ -150,6 +179,19 @@ def command(config, role):
         result += ['--env', 'CITRUS_BROWSE_CONFIG=' + str(bundle.config_path),
                    '--env', 'CITRUS_BROWSE_CONFIG_SHA256=' + bundle.config_sha256,
                    '--env', 'CITRUS_BROWSE_APPTAINER=1']
+    skill_release = verified_skill_release(config, binds)
+    native_runtime = config.get('native_runtime', False)
+    if type(native_runtime) is not bool:
+        raise ValueError('Invalid native runtime setting')
+    if skill_release is not None:
+        binds.append((str(skill_release), 'ro'))
+        result += ['--env', 'CITRUS_SKILL_RELEASE=' + str(skill_release)]
+        if (skill_release / 'python').is_dir():
+            result += ['--env', f'PYTHONPATH={skill_release}/python:{source}/01_src']
+    if native_runtime:
+        if skill_release is None:
+            raise ValueError('Native runtime requires a pinned Skill release; an empty method set is supported')
+        result += ['--env', 'CITRUS_NATIVE_RUNTIME=1']
     for path, mode in dict(binds).items():
         result += ['--bind', f'{path}:{path}:{mode}']
     result += [app, '/usr/local/bin/python']

@@ -112,8 +112,10 @@ def _verify_render(manifest: dict, blobs: dict[str, bytes], mode: str) -> None:
     checks = receipt.get('checks') or {}
     if receipt.get('version') != RENDER_PROTOCOL or receipt.get('mode') != mode:
         raise ValueError('Drawing image has an incompatible render mode protocol.')
-    expected_audit = 'performed' if mode == 'initial' else 'not_repeated_manual_edit'
-    if receipt.get('nature_audit') != expected_audit:
+    audit = receipt.get('nature_audit')
+    allowed_audit = ({'performed', 'not_requested'} if mode == 'initial'
+                     else {'not_repeated_manual_edit'})
+    if audit not in allowed_audit:
         raise ValueError('Drawing image did not follow the render mode audit policy.')
     signatures = {'svg': b'<?xml', 'png': b'\x89PNG\r\n\x1a\n', 'pdf': b'%PDF-'}
     for fmt, data in blobs.items():
@@ -123,9 +125,13 @@ def _verify_render(manifest: dict, blobs: dict[str, bytes], mode: str) -> None:
                 or check.get('sha256') != hashlib.sha256(data).hexdigest()):
             raise ValueError('Drawing export does not match its render integrity receipt.')
     if mode == 'initial':
-        from .nature_runtime import expected_vendor_commit
+        if audit == 'performed':
+            from .nature_runtime import expected_vendor_commit
 
-        validate_nature_receipt(manifest, pdf=blobs.get('pdf'), expected_commit=expected_vendor_commit())
+            validate_nature_receipt(manifest, pdf=blobs.get('pdf'),
+                                    expected_commit=expected_vendor_commit())
+        elif blobs.get('pdf') is not None:
+            raise ValueError('Drawing export claims no Nature audit but includes a PDF.')
     elif manifest.get('nature_skill_receipt') is not None:
         raise ValueError('Manual rendering incorrectly claims a repeated Nature audit.')
 

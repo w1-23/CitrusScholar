@@ -33,6 +33,13 @@ Path = Annotated[str, Field(min_length=1, max_length=240)]
 Argument = Annotated[str, Field(max_length=4096)]
 
 
+def _rooted(value: str, root: str) -> str:
+    """Resolve a workspace-relative proposal inside its declared root."""
+    if value.startswith("/"):
+        return value
+    return f"/{root}/" + (value[2:] if value.startswith("./") else value)
+
+
 @contextmanager
 def code_execution_context(identity, tool_call_id):
     """Host-only binding, propagated through registry's copied ContextVars."""
@@ -68,7 +75,7 @@ class WriteArgs(_Args):
     @field_validator("path")
     @classmethod
     def writable_path(cls, value):
-        return logical_path(value, writable=True)
+        return logical_path(_rooted(value, "workspace"), writable=True)
 
     @field_validator("content")
     @classmethod
@@ -89,6 +96,7 @@ class BindInputArgs(_Args):
     @field_validator("path")
     @classmethod
     def input_path(cls, value):
+        value = _rooted(value, "input")
         logical_path(value)
         if not value.startswith("/input/"):
             raise ValueError("execution_input_path_required")
@@ -109,6 +117,7 @@ class ExecuteArgs(_Args):
     @field_validator("script_path")
     @classmethod
     def script(cls, value):
+        value = _rooted(value, "workspace")
         logical_path(value, writable=True)
         if not value.endswith(".py"):
             raise ValueError("execution_python_script_required")
@@ -117,6 +126,8 @@ class ExecuteArgs(_Args):
     @field_validator("inputs", "outputs")
     @classmethod
     def paths(cls, values, info):
+        root = "outputs" if info.field_name == "outputs" else "input"
+        values = [_rooted(value, root) for value in values]
         for value in values:
             logical_path(value, writable=info.field_name == "outputs")
         if len(values) != len(set(values)):

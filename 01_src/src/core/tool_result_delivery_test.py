@@ -555,3 +555,35 @@ class TaskDeliveryContractTests(unittest.TestCase):
         self.assertTrue(_same_repair_target(original, correction))
         self.assertFalse(_same_repair_target(original, {**correction, "args": {**correction["args"], "file_id": "another"}}))
         self.assertFalse(_same_repair_target(original, {"name": "read", "args": correction["args"]}))
+        rooted = {**correction, "args": {**correction["args"], "path": "/input/table.csv"}}
+        self.assertTrue(_same_repair_target(
+            {**original, "args": {**original["args"], "path": "table.csv"}}, rooted))
+
+    def test_relative_write_repair_matches_the_same_workspace_file(self):
+        from src.agent.host import _same_repair_target
+
+        original = {"name": "code_write", "args": {"workspace_id": "ws", "task_id": "task",
+                    "path": "figure.py", "expected_revision": 2, "content": "x"}}
+        correction = {"name": "code_write", "args": {"workspace_id": "ws", "task_id": "task",
+                      "path": "/workspace/figure.py", "expected_revision": 2, "content": "x"}}
+        self.assertTrue(_same_repair_target(original, correction))
+        self.assertFalse(_same_repair_target(original, {"name": "code_write",
+            "args": {**correction["args"], "workspace_id": "other"}}))
+
+    def test_relative_code_paths_are_rooted_in_their_namespace(self):
+        from src.agent.code_tools import BindInputArgs, ExecuteArgs, WriteArgs
+
+        write = WriteArgs(task_id="task", workspace_id="0" * 32, expected_revision=1,
+                          path="figure.py", content="print(1)")
+        self.assertEqual(write.path, "/workspace/figure.py")
+        bind = BindInputArgs(task_id="task", workspace_id="0" * 32, expected_revision=1,
+                             path="./table.csv", file_id="1" * 32, sha256="a" * 64)
+        self.assertEqual(bind.path, "/input/table.csv")
+        execute = ExecuteArgs(task_id="task", workspace_id="0" * 32, expected_revision=1,
+                              script_path="run.py", inputs=["table.csv"], outputs=["plot.png"])
+        self.assertEqual(execute.script_path, "/workspace/run.py")
+        self.assertEqual(execute.inputs, ["/input/table.csv"])
+        self.assertEqual(execute.outputs, ["/outputs/plot.png"])
+        with self.assertRaises(ValueError):
+            WriteArgs(task_id="task", workspace_id="0" * 32, expected_revision=1,
+                      path="../escape.py", content="x")

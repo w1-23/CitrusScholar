@@ -674,11 +674,15 @@ def _same_repair_target(rejected, corrected):
         return False
     name = rejected["name"]
     original, replacement = rejected.get("args") or {}, corrected.get("args") or {}
-    if name in {"code_bind_input", "code_write"}:
-        keys = ("workspace_id", "task_id", "path")
-        if name == "code_bind_input":
-            keys += ("file_id", "sha256")
+    if name == "code_bind_input":
+        # The file identity, not the proposed mount spelling, is the target.
+        keys = ("workspace_id", "task_id", "file_id", "sha256")
         return all(original.get(key) and original[key] == replacement.get(key) for key in keys)
+    if name == "code_write":
+        # Relative and absolute spellings of one workspace file are the same
+        # target; a pre-dispatch rejection is repaired by the later write.
+        return all(original.get(key) and original[key] == replacement.get(key)
+                   for key in ("workspace_id", "task_id"))
     if name == "research_workspace":
         previous = original.get("script_ref") or {}
         current = replacement.get("script_ref") or {}

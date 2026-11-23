@@ -14,7 +14,7 @@ from .sandbox import SandboxJob, SandboxUnavailable
 
 _LOCK = threading.RLock()
 _EVIDENCE: dict = {}
-PROBE_VERSION = 5
+PROBE_VERSION = 6
 
 _COMMON_PROBE = '''import os
 from pathlib import Path
@@ -184,52 +184,81 @@ def verify_worker(settings, runner) -> dict:
                           for name, data in result.outputs.items()}
     from .script_outputs import normalize_output_contract, output_slots, validate_receipt
     from .dataset_codec import decode_frame
+    render_first = ("fig, ax = plt.subplots(figsize=(4, 3), constrained_layout=True)\n"
+                    "ax.plot(data['values']['id'], [1])\n"
+                    "ax.set_title('SYNTHETIC first')\n"
+                    "ax.set_xlabel('Synthetic x'); ax.set_ylabel('Synthetic y')\n")
+    render_second = ("fig, ax = plt.subplots(figsize=(4, 3), constrained_layout=True)\n"
+                     "ax.plot([1, 2], [3, 4])\n"
+                     "ax.set_title('SYNTHETIC second')\n"
+                     "ax.set_xlabel('Synthetic x'); ax.set_ylabel('Synthetic y')\n")
     contract = normalize_output_contract({'version': 2, 'tables': [{'name': 'values'}],
-        'figures': [{'name': 'first', 'formats': ['png']}, {'name': 'second', 'formats': ['png']}]})
+        'figures': [
+            {'name': 'first', 'formats': ['png'], 'parents': ['values'], 'render_script': render_first},
+            {'name': 'second', 'formats': ['png'], 'parents': ['values'], 'render_script': render_second}]})
     script = probe_script + '''
 import pandas as pd
 emit.table('values', pd.DataFrame({'id': pd.Series([2**53+1], dtype='Int64')}))
-emit.figure('first', fig)
-second, ax2 = plt.subplots(figsize=(4, 3), constrained_layout=True)
-ax2.plot([1, 2], [3, 4])
-ax2.set_title('SYNTHETIC second')
-ax2.set_xlabel('Synthetic x'); ax2.set_ylabel('Synthetic y')
-emit.figure('second', second)
 '''
-    for mode, target in [('initial', ''), ('edit', 'second'), ('preview', 'second')]:
-        edits = [{'gid': 'axes_0.title', 'prop': 'text', 'value': 'SYNTHETIC protocol edited'}] if target else []
-        job = SandboxJob(script=script, output_contract=contract, output_key=target,
-                         outputs=output_slots(contract, output_key=target), overrides=edits,
-                         replay_overrides=bool(target), render_mode=mode, dpi=100, timeout_sec=45)
-        result = runner.run(job)
-        try:
+    frozen = {}
+    frozen_path = root / 'synthetic-frozen-values.json'
+    try:
+        job = SandboxJob(script=script, output_contract=contract, output_key='',
+                         outputs=output_slots(contract), render_mode='initial',
+                         dpi=100, timeout_sec=45)
+        initial = runner.run(job)
+        if not initial.ok:
+            raise ValueError(f'initial: {initial.describe()}; {initial.stderr[-1500:]} {initial.stdout[-500:]}')
+        receipt = validate_receipt(initial.outputs['result'], contract, job_id=job.job_id, output_key='')
+        if receipt['status'] != 'ok':
+            errors = {key: state for key, state in receipt['slots'].items() if state['status'] == 'error'}
+            raise ValueError(f'incomplete v2 output receipt: {json.dumps(errors, ensure_ascii=False)[:2000]}')
+        frame = decode_frame(json.loads(initial.outputs['table:values']))
+        if int(frame.iloc[0, 0]) != 2**53+1:
+            raise ValueError('typed intermediate table lost precision')
+        for entry in contract['figures']:
+            prefix = f"figure:{entry['name']}:"
+            manifest = json.loads(initial.outputs[prefix + 'manifest'])
+            _verify_render(manifest, {fmt: initial.outputs[prefix + fmt] for fmt in entry['formats']}, 'initial')
+            if not isinstance(manifest.get('frozen_render_receipt'), dict):
+                raise ValueError('initial render did not produce frozen replay evidence')
+            frozen[entry['name']] = manifest['frozen_render_receipt']
+        exports['outputs_v2'] = {
+            key: {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+            for key, data in initial.outputs.items()}
+        frozen_path.write_bytes(initial.outputs['table:values'])
+        replay_contract = {**contract, 'input_contract': {'version': 1, 'raw': [], 'tables': [],
+                                                          'frozen': [],
+                                                          'render': {'values': 'values'}}}
+        edits = [{'gid': 'axes_0.title', 'prop': 'text', 'value': 'SYNTHETIC protocol edited'}]
+        for mode in ('edit', 'preview'):
+            job = SandboxJob(script=script, inputs={'values': 'frozen-values.json'},
+                             sources={'values': str(frozen_path)},
+                             output_contract=replay_contract, output_key='second',
+                             outputs=output_slots(replay_contract, output_key='second'),
+                             overrides=edits, replay_overrides=True, render_mode=mode,
+                             dpi=100, timeout_sec=45,
+                             expected_frozen_receipt=frozen['second'])
+            result = runner.run(job)
             if not result.ok:
-                raise ValueError(f'{result.describe()}; {result.stderr[-1500:]} {result.stdout[-500:]}')
-            receipt = validate_receipt(result.outputs['result'], contract, job_id=job.job_id, output_key=target)
+                raise ValueError(f'{mode}: {result.describe()}; {result.stderr[-1500:]} {result.stdout[-500:]}')
+            receipt = validate_receipt(result.outputs['result'], replay_contract,
+                                       job_id=job.job_id, output_key='second')
             if receipt['status'] != 'ok' or receipt['applied_count'] != len(edits):
                 errors = {key: state for key, state in receipt['slots'].items() if state['status'] == 'error'}
-                raise ValueError(f'incomplete v2 output/edit receipt: {json.dumps(errors, ensure_ascii=False)[:2000]}')
-            if target:
-                title = next(item for item in json.loads(result.outputs['figure:second:manifest'])['objects']
-                             if item['gid'] == 'axes_0.title')
-                if title.get('text') != 'SYNTHETIC protocol edited' or 'figure:first:png' in result.outputs:
-                    raise ValueError('targeted replay did not select the requested figure')
-            else:
-                frame = decode_frame(json.loads(result.outputs['table:values']))
-                if int(frame.iloc[0, 0]) != 2**53+1:
-                    raise ValueError('typed intermediate table lost precision')
-            for entry in contract['figures']:
-                if target and entry['name'] != target:
-                    continue
-                prefix = f"figure:{entry['name']}:"
-                _verify_render(json.loads(result.outputs[prefix + 'manifest']),
-                               {fmt: result.outputs[prefix + fmt] for fmt in entry['formats']}, mode)
-            label = 'outputs_v2' if mode == 'initial' else 'outputs_v2_' + mode
-            exports[label] = {
+                raise ValueError(f'incomplete v2 {mode} receipt: {json.dumps(errors, ensure_ascii=False)[:2000]}')
+            manifest = json.loads(result.outputs['figure:second:manifest'])
+            title = next(item for item in manifest['objects'] if item['gid'] == 'axes_0.title')
+            if title.get('text') != 'SYNTHETIC protocol edited' or 'figure:first:png' in result.outputs:
+                raise ValueError('targeted replay did not select the requested figure')
+            _verify_render(manifest, {'png': result.outputs['figure:second:png']}, mode)
+            exports['outputs_v2_' + mode] = {
                 key: {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
                 for key, data in result.outputs.items()}
-        except (ValueError, KeyError, TypeError, AttributeError, StopIteration) as exc:
-            raise SandboxUnavailable(f'Drawing worker output protocol v2 verification failed: {exc}') from exc
+    except (ValueError, KeyError, TypeError, AttributeError, StopIteration) as exc:
+        raise SandboxUnavailable(f'Drawing worker output protocol v2 verification failed: {exc}') from exc
+    finally:
+        frozen_path.unlink(missing_ok=True)
     if {path.name for path in root.iterdir()} != baseline:
         raise SandboxUnavailable('Drawing startup left job staging directories behind.')
     evidence = dict(backend=runner.name, status='ready', verified=True,

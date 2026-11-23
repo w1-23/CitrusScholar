@@ -80,6 +80,11 @@ _KIND_INTENTS = (
     ("report_html", re.compile(
         r"报告|简报|report|brief|文档|document|实验方案|实验设计", re.I)),
 )
+# The General Agent's own Code pipeline delivers bytes it produced itself. It
+# declares no output kinds, so the registry's byte inspection plus the format
+# the user explicitly asked for is the only honest evidence available.
+GENERIC_DELIVERY_PRODUCERS = frozenset({"code_deliver"})
+
 _KIND_FORMATS = {
     "annotation_table": {"xlsx"},
     "verification_sheet": {"xlsx"},
@@ -423,6 +428,20 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
             if "figure" in kinds:
                 normalized["_explicit_formats"] = bool(formats)
             requirements.append(normalized)
+    stated_figure_formats = {fmt for requirement in requirements
+                             if "figure" in requirement["kinds"]
+                             and requirement.get("_explicit_formats")
+                             for fmt in requirement["formats"]}
+    if stated_figure_formats:
+        # A figure segment with no stated format only received its single
+        # implied format (svg). When the same turn states the formats it wants,
+        # that implied entry restates the same deliverable instead of adding a
+        # new one, so it must not become a host-invented obligation.
+        requirements = [requirement for requirement in requirements
+                        if not ("figure" in requirement["kinds"]
+                                and not requirement.get("_explicit_formats")
+                                and set(requirement["formats"] or ()) == {"svg"})]
+    requirements = _consolidate_figure_restatements(requirements)
     for requirement in requirements:
         requirement.pop("_explicit_formats", None)
     return _expand_product_identity(
@@ -686,6 +705,43 @@ def deliverable_export_requested(query: str) -> bool:
     return bool(deliverable_contract(query))
 
 
+def _format_only_label(label: str) -> bool:
+    """True when a segment names only formats/filenames, not a new product."""
+    text = _FORMAT_TOKEN_RE.sub("", str(label or ""))
+    text = re.sub("[A-Za-z0-9_./()（） :：,，、-]+", "", text)
+    for word in ("文件名", "文件", "两个", "个"):
+        text = text.replace(word, "")
+    return not text.strip()
+
+
+def _consolidate_figure_restatements(requirements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One figure delivered in several formats is one product, not many.
+
+    The legacy parser splits "输出 PNG 与 PDF 两个文件" into per-format
+    statements. When every figure entry in the turn is such a statement, they
+    describe the same drawing and must not compete for distinct artifact
+    identities.
+    """
+    figures = [r for r in requirements if "figure" in (r.get("kinds") or ())]
+    if len(figures) < 2 or not all(_format_only_label(r.get("label")) for r in figures):
+        return requirements
+    formats: list[str] = []
+    for requirement in figures:
+        for fmt in requirement.get("formats") or ():
+            if fmt not in formats:
+                formats.append(fmt)
+    first = figures[0]
+    first["formats"] = formats
+    first["_explicit_formats"] = True
+    keep = [r for r in requirements if all(r is not figure for figure in figures)]
+    keep.insert(requirements.index(figures[0]) - sum(
+        1 for r in requirements[:requirements.index(figures[0])]
+        if any(r is figure for figure in figures)), first)
+    covered = set(formats)
+    return [r for r in keep if not (
+        not (r.get("kinds") or ()) and set(r.get("formats") or ()) and set(r["formats"]) <= covered)]
+
+
 def artifact_matches_requirement(validation: dict[str, Any],
                                  requirement: dict[str, list[str]]) -> bool:
     if (not validation.get("valid")
@@ -707,7 +763,13 @@ def artifact_matches_requirement(validation: dict[str, Any],
             # bibliography. New publications store the concrete renderer.
             produced = set()
         if not (produced & matching_producer_kinds(required_kinds)):
-            return False
+            # A generic delivery tool claims nothing about the bytes it hands
+            # over. Its evidence is the registry's own byte inspection plus the
+            # explicit requested format checked below; without a stated format
+            # there is nothing to verify, so the requirement stays unmet.
+            if (producer not in GENERIC_DELIVERY_PRODUCERS
+                    or not (requirement.get("formats") or ())):
+                return False
     required_formats = set(requirement.get("formats") or ())
     if required_formats:
         filename = str(validation.get("filename") or "").casefold()

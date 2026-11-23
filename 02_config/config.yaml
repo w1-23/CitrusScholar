@@ -115,6 +115,10 @@ agent:
   # 只保留工具内部的网络 I/O 超时（requests timeout）。
   tool_timeouts: {}
   search_fetch_timeout_sec: 45
+  # 一次完整科研回合（多工作表审查、绘图纠错）实测约需 28 次模型调用，
+  # 按约 35k/次计，1M 聚合上限会在收尾前耗尽并误报“未完成”。默认 2M，
+  # 管理员仍可在 02_config/config.yaml 下调；调用次数上限 max_model_calls 独立生效。
+  max_model_tokens: 2000000
 
 # ── Write Pipeline (Plan-Execute 长文写作流水线, v8.3.2) ──
 pipeline:

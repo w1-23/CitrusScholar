@@ -133,8 +133,9 @@ class IntegrityTable:
     region_bounds: str = ""
 
     @property
-    def key(self) -> tuple[str, str]:
-        return self.source_id, self.sheet
+    def key(self) -> tuple[str, ...]:
+        base = (self.source_id, self.sheet)
+        return (*base, self.region_id or self.region_bounds) if self.region_id or self.region_bounds else base
 
     def coverage(self) -> dict[str, Any]:
         reasons = Counter(reason for row in self.exclusions for reason in row if reason)
@@ -397,7 +398,7 @@ def audit_numeric_reuse(tables: Sequence[IntegrityTable], *,
     config.validate()
     ordered = sorted(tables, key=lambda table: table.key)
     if len({table.key for table in ordered}) != len(ordered):
-        raise ValueError("Each (source_id, sheet) must identify a unique parsed table")
+        raise ValueError("Each source, sheet and region must identify a unique parsed table")
     source_hashes: dict[str, str] = {}
     for table in ordered:
         if table.source_id in source_hashes and source_hashes[table.source_id] != table.source_sha256:
@@ -681,7 +682,8 @@ def audit_numeric_reuse(tables: Sequence[IntegrityTable], *,
             reason='; '.join(limits) if limits else '' if receipt['tested'] or receipt['windows_scanned'] else 'no_eligible_comparisons',
             limits=limits, parameters=asdict(config), tested_unit='eligible_comparison_attempts',
             source_scope=[{'source_id': t.source_id, 'sheet': t.sheet,
-                           'rows': len(t.values), 'columns': len(t.column_names)} for t in ordered])
+                           'rows': len(t.values), 'columns': len(t.column_names),
+                           'region_id': t.region_id, 'region_bounds': t.region_bounds} for t in ordered])
     from .evidence import finding as common_finding
     common = [common_finding(
         rule=item["method"], version=METHOD_VERSION,

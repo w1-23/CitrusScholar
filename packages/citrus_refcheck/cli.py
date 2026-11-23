@@ -8,6 +8,9 @@ import time
 from . import extract_inventory, hint_differences, lookup_evidence, FixtureTransport, LookupLimits
 
 
+from .commands import add_verification_commands
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message):
         raise ValueError('invalid_arguments')
@@ -16,6 +19,7 @@ class _Parser(argparse.ArgumentParser):
 def _execute(argv=None):
     parser=_Parser(description=__doc__)
     sub=parser.add_subparsers(dest='action',required=True)
+    add_verification_commands(sub)
     extract=sub.add_parser('extract');extract.add_argument('input',type=Path)
     one=sub.add_parser('lookup');one.add_argument('--claims',required=True)
     one.add_argument('--fixture',type=Path);one.add_argument('--allow-network',action='store_true')
@@ -34,6 +38,8 @@ def _execute(argv=None):
     render.add_argument('--format',choices=['json','xlsx','ris','bibtex'],default='json')
     render.add_argument('--output',type=Path,required=True)
     args=parser.parse_args(argv)
+    if hasattr(args, 'handler'):
+        return args.handler(args)
     if args.action in {'batch','export'}:
         from . import AuditRepository, export_snapshot
         repo=AuditRepository(args.repository,owner=args.owner,session_id=args.session)

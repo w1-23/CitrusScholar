@@ -6,7 +6,7 @@ import logging
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 logger=logging.getLogger(__name__)
 _MAX_TABLE_ROWS=100000
@@ -136,7 +136,7 @@ def _missing_sheet_message(requested: str, available, *, kind: str = "工作表"
             f"{listing or '（无）'}。请从上述名称中选择，或先调用 "
             "inspect_uploaded_table 查看结构。")
 
-def _decode_csv(data: bytes, header_row: int = 1, header_rows: list[int] | None = None):
+def _decode_csv(data: bytes, header_row: int = 1, header_rows: list[int] | None = None, *, tsv=False):
     text = None
     encoding = ""
     for candidate in ("utf-8-sig", "utf-8", "gb18030", "big5"):
@@ -152,7 +152,7 @@ def _decode_csv(data: bytes, header_row: int = 1, header_rows: list[int] | None 
         dialect = csv.Sniffer().sniff(text[:8192], delimiters=",\t;|")
         delimiter = dialect.delimiter
     except csv.Error:
-        delimiter = ","
+        delimiter = "\t" if tsv else ","
     header_rows = sorted(set(header_rows or [header_row]))
     if not header_rows or any(row < 1 or row > 20 for row in header_rows):
         raise ValueError("header_row 必须在 1 到 20 之间")
@@ -225,7 +225,7 @@ def _load_frame_from_bytes(data: bytes, name: str = "table", sheet_name: str = "
     if not used_header_rows or any(type(row) is not int or not 1 <= row <= 20 for row in used_header_rows):
         raise ValueError("header_row 必须在 1 到 20 之间")
     if suffix in {".csv", ".tsv"}:
-        frame, encoding, raw_preview, used_header_rows, truncated = _decode_csv(data, header_row, used_header_rows)
+        frame, encoding, raw_preview, used_header_rows, truncated = _decode_csv(data, header_row, used_header_rows, tsv=suffix == ".tsv")
         meta = {"name": name, "sheet": "", "encoding": encoding, "delimiter": "auto",
                 "raw_preview": raw_preview, "header_row": max(used_header_rows),
                 "header_rows": used_header_rows, "truncated": truncated,
@@ -253,8 +253,8 @@ def _load_frame_from_bytes(data: bytes, name: str = "table", sheet_name: str = "
                     if not chosen:
                         raise ValueError("工作簿中没有可读取的工作表")
                     sheet = reader.get_sheet_by_name(chosen)
-                    width = getattr(sheet, "width", None)
-                    height = getattr(sheet, "height", None)
+                    width = getattr(sheet, "total_width", None)
+                    height = getattr(sheet, "total_height", None)
                     width = width() if callable(width) else width
                     height = height() if callable(height) else height
                     if not isinstance(width, int) or not isinstance(height, int):
@@ -267,7 +267,7 @@ def _load_frame_from_bytes(data: bytes, name: str = "table", sheet_name: str = "
                         raise ValueError(
                             f"工作表有 {height:,} 行，当前 XLS/XLSB 安全解析上限为 {row_limit:,} 行；"
                             "请先拆分工作表后重试，未对该表执行审查")
-                    data_rows = sheet.to_python()
+                    data_rows = sheet.to_python(skip_empty_area=False)
                     if len(data_rows) > row_limit:
                         raise ValueError("工作表实际行数超出安全解析范围，未执行审查")
                 except ImportError as exc:
@@ -577,8 +577,8 @@ def _region_header_rows(header_rows, top, bottom):
     if len(set(raw)) != len(raw):
         raise ValueError("区域表头行必须唯一")
     rows = sorted(raw)
-    if rows[0] < top or rows[-1] >= bottom:
-        raise ValueError("区域表头行必须位于区域内且至少保留一行数据")
+    if rows[0] < top or rows[-1] > bottom:
+        raise ValueError("区域表头行必须位于区域内")
     return rows
 
 
@@ -628,6 +628,10 @@ def normalize_regions(regions, *, default_sheet='', limit=20):
 
 
 def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id=''):
+    return _read_region(data, name, bounds=bounds, header_rows=header_rows, sheet_name=sheet_name, region_id=region_id)
+
+
+def _read_region(data, name, *, bounds, header_rows, sheet_name='', region_id='', cached_workbook=None):
     """Read one explicit absolute XLSX rectangle with true source coordinates.
 
     ``bounds`` and ``header_rows`` are absolute 1-based sheet coordinates.
@@ -656,7 +660,9 @@ def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id='')
     import hashlib
     from .envelope import TableEnvelope
     from .integrity import _number
-    with closing(open_xlsx_readonly(data, name, data_only=True)) as workbook:
+    context = (nullcontext(cached_workbook) if cached_workbook is not None
+               else closing(open_xlsx_readonly(data, name, data_only=True)))
+    with context as workbook:
         names = list(workbook.sheetnames)
         chosen = sheet_name.strip() or next(
             (item for item in names if workbook[item].sheet_state == 'visible'), '')
@@ -681,9 +687,10 @@ def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id='')
     values = tuple(tuple(row) for row in raw[header_bottom - top + 1:])
     row_numbers = tuple(range(header_bottom + 1, bottom + 1))
     column_numbers = tuple(range(left, right + 1))
-    if not values or len(values) != len(row_numbers) or len(header) != width:
+    if len(values) != len(row_numbers) or len(header) != width:
         raise ValueError("区域解析结果与显式矩形不一致")
     evidence = []
+    evidence_by_column = {column: [] for column in column_numbers}
     for row, cell_values in zip(row_numbers, values):
         for column, value in zip(column_numbers, cell_values):
             if not isinstance(value, str) or len(value) > 256:
@@ -697,7 +704,7 @@ def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id='')
     by_column = {}
     for offset, (column, label) in enumerate(zip(column_numbers, header)):
         actual = sum(_number(row[offset])[0] is not None for row in values)
-        tokens = [item for item in evidence if item['column'] == column]
+        tokens = evidence_by_column[column]
         status = ('not_applicable' if not actual else 'preserved' if len(tokens) == actual
                   else 'partial' if tokens else 'unavailable')
         by_column[str(label)] = {'status': status, 'numeric_values': actual,
@@ -707,7 +714,7 @@ def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id='')
                 else f"{chosen}!{normalized}")
     if len(identity) > 160:
         raise ValueError("区域ID不能超过160字符")
-    data_bounds = _a1(left, header_bottom + 1, right, bottom)
+    data_bounds = _a1(left, header_bottom + 1, right, bottom) if values else ''
     header_bounds = _a1(left, first_header, right, header_bottom)
     title_rows = list(range(top, first_header))
     detection = 'requested' if absolute_headers == rows else 'auto'
@@ -748,9 +755,17 @@ def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id='')
 def read_regions(data, name, *, regions, sheet_name=''):
     """Read a bounded set of explicit, non-overlapping absolute regions."""
     normalized = normalize_regions(regions, default_sheet=sheet_name)
-    tables = [read_region(data, name, bounds=item['bounds'], header_rows=item['header_rows'],
-                          sheet_name=item['sheet'], region_id=item['region_id'])
-              for item in normalized]
+    if not isinstance(data, bytes) or not data or len(data) > 30 * 1024 * 1024:
+        raise ValueError('Source exceeds 30 MiB byte budget')
+    if Path(name).suffix.lower() not in {'.xlsx', '.xlsm'}:
+        raise ValueError('Explicit absolute regions require XLSX or XLSM')
+    boxes = [_region_box(item['bounds']) for item in normalized]
+    if sum((right-left+1)*(bottom-top+1) for left,top,right,bottom in boxes) > _MAX_TABLE_CELLS:
+        raise ValueError('Total selected area exceeds the 2000000-cell budget')
+    with closing(open_xlsx_readonly(data, name, data_only=True)) as workbook:
+        tables = [_read_region(data, name, bounds=item['bounds'], header_rows=item['header_rows'],
+                               sheet_name=item['sheet'], region_id=item['region_id'], cached_workbook=workbook)
+                  for item in normalized]
     normalize_regions([{'sheet': table.sheet, 'bounds': table.region_bounds,
                         'header_rows': table.header_rows, 'region_id': table.region_id}
                        for table in tables])
@@ -792,6 +807,7 @@ def read_table(data: bytes, name: str, *, sheet_name='', header_row=1, header_ro
     return TableEnvelope(columns=tuple(frame.columns),values=tuple(frame.itertuples(index=False,name=None)),
         row_numbers=rows,column_numbers=cols,source_sha256=hashlib.sha256(data).hexdigest(),
         source_name=name,sheet=meta.get('sheet',''),header_row=int(meta['header_row']),
+        header_rows=tuple(meta.get('header_rows', [meta['header_row']])),
         precision_evidence=tuple(evidence),lexical_coverage={'columns':by_column,'tokens':len(evidence)},
         parser_limits={'max_rows':_MAX_TABLE_ROWS,'max_columns':_MAX_TABLE_COLUMNS,'max_cells':_MAX_TABLE_CELLS,
                        'max_bytes':30*1024*1024,'max_extracted_tables':_MAX_EXTRACTED_TABLES},coverage=meta)
@@ -801,6 +817,8 @@ def read_tables(data: bytes, name: str, *, sheet_name='', header_row=1, header_r
     """Discover every bounded sheet/table; source-loading failures stay explicit."""
     if not isinstance(data,bytes) or len(data)>30*1024*1024:
         raise ValueError('Source exceeds 30 MiB byte budget')
+    if Path(name).suffix.lower() in {'.csv', '.tsv'}:
+        return [read_table(data,name,sheet_name=sheet_name,header_row=header_row,header_rows=header_rows)], []
     _,inventory=_load_frame_from_bytes(data,name,sheet_name=sheet_name,header_row=header_row,
                                      header_rows=header_rows,discover_only=True)
     names=[sheet_name] if sheet_name else inventory.get('sheets') or [inventory.get('sheet','')]

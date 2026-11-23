@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import time
@@ -73,13 +74,15 @@ class HttpTransport:
         'www.ebi.ac.uk','eutils.ncbi.nlm.nih.gov','export.arxiv.org','api.semanticscholar.org'})
     def __init__(self, *, client, deadline, check, headers=None, cache_namespace=''):
         self.client, self.deadline, self.check = client, deadline, check
-        self.headers = dict(headers or {'User-Agent':'CitrusScholar/2.0 (reference evidence)'})
+        self.headers = dict(headers or {'User-Agent':'reference-verification/1.0 (bibliographic metadata)'})
         self._cache_namespace = cache_namespace
+        self.retry_after = None
     @property
     def cache_namespace(self):
         return hashlib.sha256(json.dumps(
             [self.headers, self._cache_namespace], sort_keys=True).encode()).hexdigest()
     def get(self, url, *, params=None, source=''):
+        self.retry_after = None
         parsed = urlsplit(url)
         if (parsed.scheme != 'https' or parsed.hostname not in self.HOSTS
                 or parsed.username or parsed.password or parsed.port not in (None,443)):
@@ -93,6 +96,15 @@ class HttpTransport:
         try:
             with self.client.stream('GET',url,params=params,headers=self.headers,
                     timeout=min(3.0,remaining),follow_redirects=False) as response:
+                if response.status_code == 429 and (retry_after := response.headers.get('Retry-After')):
+                    try:
+                        if retry_after.strip().isdigit():
+                            self.retry_after = int(retry_after)
+                        else:
+                            retry_at = parsedate_to_datetime(retry_after)
+                            self.retry_after = max(0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                    except (TypeError, ValueError, OverflowError):
+                        self.retry_after = None
                 if response.status_code != 200:
                     return response.status_code,None,'' if response.status_code == 404 else 'http_'+str(response.status_code)
                 chunks, size = [],0

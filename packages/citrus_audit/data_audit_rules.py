@@ -54,6 +54,19 @@ RULES: dict[str, dict[str, str]] = {
 }
 
 
+ROW_RULE_METADATA = {
+    "identical_rows": {**RULES["identical_columns"], "trigger": "同量纲测量行在共同有效的列上完全相同"},
+    "constant_offset_rows": {**RULES["constant_offset_columns"], "trigger": "同量纲测量行差值恒定"},
+    "constant_ratio_rows": {**RULES["constant_ratio_columns"], "trigger": "同量纲测量行比值恒定"},
+    "exact_linear_rows": {**RULES["exact_linear_columns"], "trigger": "同量纲测量行满足仿射关系"},
+}
+for metadata in ROW_RULE_METADATA.values():
+    metadata.update(applies_to="显式确认同量纲的测量行", sample="至少5个共同有效测量列且覆盖至少80%",
+                    location="两行的原始成对单元格")
+BASELINE_RULES = tuple(RULES)
+RULES.update(ROW_RULE_METADATA)
+
+
 def describe_rule(check: str) -> dict[str, str]:
     """Return display-safe rule metadata; unknown future rules remain visible."""
     key = str(check or "").strip()

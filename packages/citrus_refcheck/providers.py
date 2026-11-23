@@ -438,4 +438,3 @@ def _name_tokens(value: list[str] | str) -> set[str]:
     text = _fold(text)
     tokens = {t for t in re.split(r"[^a-z0-9]+", text.lower()) if len(t) >= 3}
     return tokens
-

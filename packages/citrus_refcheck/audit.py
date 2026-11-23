@@ -5,6 +5,7 @@ import io
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 import time
 import uuid
@@ -295,6 +296,10 @@ def export_snapshot(snapshot, *, format='json'):
     keyed by reference_row, field and part (the References cell is part 1).
     Every submitted text cell is a literal string, including continuation chunks.
     """
+    verification = snapshot.get('schema_version') == 'reference-verification/1'
+    if verification and format == 'markdown':
+        from .report import report_markdown
+        return report_markdown(snapshot).encode('utf-8')
     if format == 'json':
         return json.dumps(snapshot, ensure_ascii=False, indent=2).encode('utf-8')
     if format == 'xlsx':
@@ -303,13 +308,23 @@ def export_snapshot(snapshot, *, format='json'):
         ws = wb.active
         ws.title = 'References'
         fields = ['record_id', 'original', 'claims', 'evidence']
+        if verification:
+            fields += ['record_index', 'processing_status', 'match_status', 'reason', 'positions']
         ws.append(fields)
         overflow = None
         for row_number, entry in enumerate(snapshot['entries'], 2):
             values = [entry['record_id'], entry['citation'], json.dumps(entry['claims'], ensure_ascii=False),
                       json.dumps(entry.get('evidence'), ensure_ascii=False)]
+            if verification:
+                result = entry['evidence']
+                values += [entry['record_index'], result['processing_status'], result['match_status'],
+                           result['reason'], json.dumps(entry.get('positions', []), ensure_ascii=False)]
             for col, (field, value) in enumerate(zip(fields, values), 1):
-                for part, chunk in enumerate(_text_chunks(str(value)), 1):
+                if type(value) is int:
+                    ws.cell(row_number, col, value)
+                    continue
+                text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', lambda match: repr(match[0])[1:-1], str(value))
+                for part, chunk in enumerate(_text_chunks(text), 1):
                     if part == 1:
                         cell = ws.cell(row_number, col, chunk)
                     else:
@@ -324,6 +339,9 @@ def export_snapshot(snapshot, *, format='json'):
         return out.getvalue()
     if format not in {'ris', 'bibtex'}:
         raise ValueError('unsupported_export_format')
+    if verification:
+        from .report import bibliography_projection
+        return bibliography_projection(snapshot['entries'], format)
     parts = []
     for i, entry in enumerate(snapshot['entries'], 1):
         claims = entry['claims']

@@ -8,6 +8,7 @@ All coordinates are absolute 1-based sheet rows/columns.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, replace
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 import hashlib
 import json
@@ -33,8 +34,10 @@ def _scalar(value):
             return {'float':repr(value)}
     if type(value) in {str,int,float,bool}:
         return value
-    if hasattr(value,'isoformat'):
-        return {'datetime':value.isoformat()}
+    if isinstance(value, (date, time)):
+        return {'datetime': value.isoformat()}
+    if isinstance(value, timedelta):
+        return {'duration': [value.days, value.seconds, value.microseconds]}
     raise ValueError('Unsupported table cell type')
 
 
@@ -44,8 +47,13 @@ def _restore(value):
     if set(value)=={'decimal'}:return Decimal(value['decimal'])
     if set(value)=={'float'} and value['float'] in {'nan','inf','-inf'}:return float(value['float'])
     if set(value)=={'datetime'}:
-        from datetime import datetime
-        return datetime.fromisoformat(value['datetime'])
+        stamp = value['datetime']
+        if 'T' in stamp:
+            return datetime.fromisoformat(stamp)
+        return time.fromisoformat(stamp) if ':' in stamp else date.fromisoformat(stamp)
+    if set(value) == {'duration'}:
+        days, seconds, micros = value['duration']
+        return timedelta(days=days, seconds=seconds, microseconds=micros)
     raise ValueError('Unsupported serialized cell')
 
 

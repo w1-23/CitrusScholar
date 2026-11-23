@@ -10,6 +10,8 @@ def _json_default(value):
     """Encode known scalar types without inventing string identities."""
     if isinstance(value, (datetime.date, datetime.datetime, datetime.time)):
         return value.isoformat()
+    if isinstance(value, datetime.timedelta):
+        return {"duration": [value.days, value.seconds, value.microseconds]}
     if isinstance(value, decimal.Decimal):
         return float(value) if value.is_finite() else str(value)
     if isinstance(value, bytes):
@@ -194,6 +196,8 @@ def export_snapshot(snapshot, *, explain_visible=False, issue_list=False, overvi
     report=snapshot.report
     suffix=Path(snapshot.source_name).suffix.lower()
     if suffix in {'.xlsx','.xlsm'}:
+        from ._zip_safety import validate_zip_bytes
+        validate_zip_bytes(snapshot.source_bytes)
         wb=load_workbook(io.BytesIO(snapshot.source_bytes),keep_vba=suffix=='.xlsm',rich_text=True)
     else:
         from .envelope import TableEnvelope
@@ -309,7 +313,9 @@ def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, origin
         cell=ws.cell(row,col,value)
         if isinstance(value,str):cell.data_type='s'
     if explain_visible:
-        for name,(height,width) in bounds.items():
+        reviewed_sheets = {entry.get('output_sheet', entry['table']['sheet']) for entry in entries}
+        for name in sorted(reviewed_sheets):
+            height, width = bounds[name]
             ws=wb[name];start=width+2
             put(ws,1,start,'审查解释（自动生成，非数据）')
             local=sorted((x for x in all_findings if x['sheet']==name and not x.get('coverage_only')),key=_sort)
@@ -377,5 +383,5 @@ def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, origin
     return blob,{'version':'2.0.0','source_sha256':source_sha256,'export_sha256':hashlib.sha256(blob).hexdigest(),
         'original_sheets':original_names,'added_sheets':added,'explanation_blocks':explanations,
         'original_data_sha256':before,'exported_data_sha256':after,'data_region_unchanged':True,
-        'marked_locations':len(references),'findings_references':references,'scan_reused':True,
+        'marked_locations':len(references),'marked_cells':len(marks),'findings_references':references,'scan_reused':True,
         'source_representation':'original_workbook' if original else 'table_snapshot_conversion'}

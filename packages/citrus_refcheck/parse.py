@@ -25,4 +25,3 @@ def _parse_reference_line(line: str, doi: str) -> dict:
     else:
         title = text[:400]
     return {"title": title, "authors": authors[:200], "year": year}
-

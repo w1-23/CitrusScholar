@@ -8,10 +8,12 @@ import re
 from typing import Any
 
 from collections import Counter
+from functools import partial
 
 from fractions import Fraction
 
 from .integrity import _number, _rational, _transform, IntegrityConfig
+from .row_patterns import check_rows
 
 METHOD_VERSION = "table-audit/2"
 COVERAGE_CHECKS = frozenset({
@@ -160,26 +162,26 @@ def _duplicate_checks(frame, key_columns, add, *, checks, receipts=None):
         for idx in frame.index[duplicate_mask][:10000]:
             add("review", "duplicate_row", "", "存在完全重复行，请确认是否为重复录入或合法重复测量", idx)
 
-def _group_outlier_column(frame, col, numeric, groups, values, add, receipts=None):
+def _group_outlier_column(frame, col, groups, values, add, receipts=None):
     series = frame[col]
+    numeric = _exact_series(series)
     valid = numeric.dropna()
     valid_groups = [c for c in groups if c in frame.columns]
     measurement_fields = {str(value) for value in values if str(value)}
     if (str(col) in measurement_fields and valid_groups and len(valid_groups) == len(groups)
-            and len(valid) >= 8
             and len(valid) / max(1, len(series.dropna())) >= 0.8):
         if valid_groups:
             grouped = frame.groupby(valid_groups[0] if len(valid_groups) == 1 else valid_groups,
                                     dropna=False, sort=False)
             partitions = [(_group_label(valid_groups, key), sub.index) for key, sub in grouped]
         skipped: list[str] = []
+        _record(receipts, 'iqr_insufficient', tested=len(partitions), scope={'column': str(col), 'unit': 'groups'})
         for label, partition in partitions:
-            local = _exact_series(series.loc[list(partition)]).dropna()
+            local = numeric.loc[partition].dropna()
             if len(local) < 8:
                 _record(receipts, 'iqr_outlier', skipped=1, reason='group_n_below_8',
                         scope={'column': str(col), 'group': label, 'n': len(local)})
-                if len(local):
-                    skipped.append(f"{label} n={len(local)}")
+                skipped.append(f"{label} n={len(local)}")
                 continue
             # NumPy selects quartile neighbors; Fraction performs the standard
             # linear interpolation without rounding a large integer baseline.
@@ -237,7 +239,7 @@ def audit_duplicates(frame, *, key_columns=None, row_offset=2,
 def audit_group_outliers(frame, *, groups, values, row_offset=2):
     """Execute only group IQR checks; no ungrouped fallback or other scans.
 
-    Keeps the original >=8 total/partition and >=80% numeric gates, 1.5*IQR,
+    Keeps the >=8 per-partition and >=80% numeric gates, 1.5*IQR,
     zero-IQR skip, 10000 outliers/partition bound and insufficient-group notice.
     No finding can mean prerequisites were absent, not that a check passed.
     """
@@ -246,9 +248,14 @@ def audit_group_outliers(frame, *, groups, values, row_offset=2):
     for col in frame.columns:
         if str(col) not in measurement_fields or int(frame[col].notna().sum()) == 0:
             continue
-        numeric = _pd().to_numeric(frame[col], errors='coerce')
-        _group_outlier_column(frame, col, numeric, groups, values, add)
+        _group_outlier_column(frame, col, groups, values, add)
     return findings, issue_rows
+
+def _row_cells(frame, row, columns, row_offset):
+    physical = frame.attrs.get('_column_numbers', {})
+    return [{'row': int(row) + row_offset, 'column_index': int(physical.get(column, frame.columns.get_loc(column) + 1))}
+            for column in columns]
+
 
 def _optional_checks(frame, values, groups, mapping, composite_keys, patterns,
                      structure, row_offset, add, findings, receipts):
@@ -267,8 +274,9 @@ def _optional_checks(frame, values, groups, mapping, composite_keys, patterns,
                 scope={'columns': columns, 'unit': 'complete_keys'}, finding_limit=10000,
                 status='truncated' if duplicate.sum() > 10000 else '', findings_omitted=max(0, int(duplicate.sum())-10000))
         for idx in frame.index[duplicate][:10000]:
-            add('error', 'duplicate_composite_key', ','.join(columns),
+            signal = add('error', 'duplicate_composite_key', ','.join(columns),
                 '显式复合唯一键重复，违反声明的唯一性约束；请核对原始记录或修正键定义。', idx)
+            signal['evidence'] = {'cells': _row_cells(frame, idx, columns, row_offset)}
     if 'expected_experiment_structure' in receipts.selected:
         _structure_checks(frame, structure, row_offset, add, findings, receipts)
     names = ('raw_numeric_tail', 'adjacent_equal_differences', 'sliding_equal_differences',
@@ -331,11 +339,12 @@ def _optional_checks(frame, values, groups, mapping, composite_keys, patterns,
                     value = frame.attrs.get('_validated_precision_tokens', {}).get((int(idx), str(col)))
                     # No synthesized digits or exponent expansion. A literal mantissa
                     # ending is compared only within the same precision/exponent stratum.
-                    if not isinstance(value, str) or _number(value)[0] is None:
+                    parsed = _number(value)[0] if isinstance(value, str) else None
+                    if parsed is None:
                         continue
                     match = re.fullmatch(r'[+-]?(\d*)\.(\d+)(?:[eE]([+-]?\d+))?', value.strip())
                     if match and len(match[2]) >= digits:
-                        tokens.append((len(match[2]), int(match[3] or 0), match[2][-digits:], value.strip()))
+                        tokens.append((len(match[2]), int(match[3] or 0), match[2][-digits:], parsed))
                         positions.append(int(idx)+row_offset)
                 strata = {}
                 for token, pos in zip(tokens, positions):
@@ -369,7 +378,8 @@ def _optional_checks(frame, values, groups, mapping, composite_keys, patterns,
                  if axis == 'rows' else [(row, [(rows[i], c) for c in physical_cols]) for i, row in enumerate(matrix)])
     def emit(name, coords, evidence):
         signal = add('review', name, '', '原始顺序中的结构信号；计划剂量、时间网格、舍入、共享对照或合法重复可产生相同模式。')
-        signal['evidence'] = {'cells': [{'row': r, 'column_index': c} for r,c in coords], **evidence}
+        signal['evidence'] = {'cells': [{'row': r, 'column_index': c} for r,c in coords],
+                              'direction': 'down_rows' if axis == 'rows' else 'across_columns', **evidence}
     for name in ordered:
         tested = 0
         omitted = 0
@@ -400,22 +410,33 @@ def _optional_checks(frame, values, groups, mapping, composite_keys, patterns,
                     if len(set(part)) >= 3 and max(differences)-min(differences) <= tolerance:
                         emit(name, loc, {'difference': _rational(differences[0]), 'tolerance': _rational(tolerance), 'length': width})
         if name == 'repeated_blocks':
+            across = axis == 'columns'
+            grid = list(zip(*matrix)) if across else matrix
+            major, minor = (physical_cols, rows) if across else (rows, physical_cols)
             seen = {}
-            for c in range(max(0, view.shape[1]-1)):
-                for start in range(max(0, len(matrix)-window+1)):
+            for left in range(max(0, len(minor)-1)):
+                for top in range(max(0, len(major)-window+1)):
                     if tested >= 100000:
-                        omitted += len(matrix)-window+1-start
+                        omitted += len(major)-window+1-top
                         break
-                    block = tuple(tuple(row[c:c+2]) for row in matrix[start:start+window])
-                    if (physical_cols[c+1] != physical_cols[c]+1 or any(b != a+1 for a,b in zip(rows[start:start+window], rows[start+1:start+window]))
-                            or any(None in row for row in block) or any(len({row[j] for row in block}) < 3 for j in range(2))):
+                    block = tuple(tuple(line[left:left+2]) for line in grid[top:top+window])
+                    contiguous = (minor[left+1] == minor[left]+1
+                                  and major[top+window-1] == major[top]+window-1)
+                    if (not contiguous or any(None in line for line in block)
+                            or any(len({line[index] for line in block}) < 3 for index in range(2))):
                         _record(receipts, name, skipped=1, reason='incomplete_noncontiguous_or_low_distinct_block')
                         continue
                     tested += 1
-                    prev = seen.setdefault(block, (start, c))
-                    if prev != (start, c) and (abs(start-prev[0]) >= window or abs(c-prev[1]) >= 2):
-                        loc = [(rows[r], physical_cols[k]) for top,col in (prev, (start,c)) for r in range(top, top+window) for k in (col,col+1)]
-                        emit(name, loc, {'shape': [window,2], 'exact': True})
+                    previous = seen.setdefault(block, (top, left))
+                    if abs(top-previous[0]) < window and abs(left-previous[1]) < 2:
+                        continue
+                    coordinates = [(major[major_index], minor[minor_index])
+                                   for block_top, block_left in (previous, (top, left))
+                                   for major_index in range(block_top, block_top+window)
+                                   for minor_index in (block_left, block_left+1)]
+                    if across:
+                        coordinates = [(row, col) for col, row in coordinates]
+                    emit(name, coordinates, {'shape': [2, window] if across else [window, 2], 'exact': True})
         _record(receipts, name, tested=tested, scope={'unit': 'eligible_windows'},
                 status='truncated' if clipped or omitted else '', windows_omitted=omitted,
                 reason='search_or_input_limit' if clipped or omitted else ('no_eligible_windows' if not tested else ''))
@@ -492,7 +513,7 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
                 ranges=None, relations=None, key_columns=None, required_fields=None,
                 mean_decimals=None, sd_decimals=None, execution_receipt=None,
                 composite_keys=None, pattern_checks=None, expected_structure=None,
-                source_coverage=None, checks=None):
+                source_coverage=None, checks=None, row_relationships=None):
     """Execute requested rules only; indexes name original rows minus offset."""
     mapping, groups, values = mapping or {}, groups or [], values or []
     chosen = set(RULES)-{'decimal_ending_concentration'} if checks is None else _selected(checks, RULES)
@@ -535,6 +556,10 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
                     or relation.get('op', '<=') not in allowed_operators):
                 _record(receipts, 'logic_conflict', status='invalid_input',
                         reason='invalid_operator_config')
+    required = _name_set(required_fields)
+    _record(receipts, 'required_field_absent', tested=len(required), scope={'unit': 'declared_fields'})
+    for column in sorted(required - {str(column) for column in frame.columns}):
+        add('error', 'required_field_absent', column, '显式声明的必填字段不在表格中，未能检查其内容')
     if frame.empty:
         if 'empty_table' in chosen:
             _record(receipts,'empty_table',tested=1,scope={'rows':len(frame),'columns':len(frame.columns)})
@@ -543,16 +568,12 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
     if 'empty_table' in chosen:
         _record(receipts,'empty_table',tested=1,scope={'rows':len(frame),'columns':len(frame.columns)})
     optional = _name_set(optional_fields)
-    required = _name_set(required_fields)
     # Required declarations win over optional/default empty-column handling.
     empty_columns = {col for col in frame.columns if int(frame[col].notna().sum()) == 0}
     _record(receipts, 'empty_column', tested=len(frame.columns), scope={'unit': 'columns', 'rows': len(frame)})
-    _record(receipts, 'required_field_absent', tested=len(required), scope={'unit': 'declared_fields'})
-    for col in empty_columns if 'empty_column' in chosen else []:
-        if str(col) not in required:
+    for col in frame.columns if 'empty_column' in chosen else []:
+        if col in empty_columns and str(col) not in required:
             add("info", "empty_column", col, "整列为空（可能是公式未缓存或预留空白列），未执行该列数值检查")
-    for col in (required - {str(column) for column in frame.columns}) if 'required_field_absent' in chosen else []:
-        add("error", "required_field_absent", col, "显式声明的必填字段不在表格中，未能检查其内容")
     optional -= required
     covered = _name_set(list((ranges or {}).keys())) | _name_set(key_columns or [])
     covered |= _name_set(values or []) | _name_set(groups or [])
@@ -569,6 +590,7 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
         and _is_annotation_column(str(col))
     }
     optional_columns = optional | annotation_columns
+    _record(receipts, 'optional_column', tested=len(frame.columns), scope={'unit': 'columns'})
     for col in sorted(annotation_columns) if 'optional_column' in chosen else []:
         add("info", "optional_column", col,
             f"「{col}」是备注/说明类自由文本列，未对其配置任何规则，已按可选字段处理，"
@@ -592,8 +614,8 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
             failed = int(series.notna().sum()) - int(numeric.notna().sum())
             if numeric.notna().any() and failed:
                 add('review','mixed_numeric_text',col,f'{failed} 个非空值无法解析为数值；可能混有单位、符号或文本类别')
-        if 'iqr_outlier' in chosen:
-            _group_outlier_column(frame,col,_pd().to_numeric(series,errors='coerce'),groups,values,add,receipts)
+        if chosen & {'iqr_outlier', 'iqr_insufficient'}:
+            _group_outlier_column(frame,col,groups,values,add,receipts)
     if 'missing_cell' in chosen:
         for col in frame.columns:
             if str(col) in optional_columns or (col in empty_columns and str(col) not in required):
@@ -613,35 +635,38 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
             series = frame[col]
             numeric = _pd().to_numeric(series, errors="coerce")
             nonempty = int(series.notna().sum())
-            if nonempty < 5 or int(numeric.notna().sum()) / max(1, nonempty) < 0.8:
+            declared_numeric = col in values or col in (ranges or {})
+            if not declared_numeric and (nonempty < 5 or int(numeric.notna().sum()) / max(1, nonempty) < 0.8):
                 _record(receipts, 'non_numeric_cell', skipped=1, reason='numeric_gate', scope={'column': str(col)})
                 continue
             _record(receipts, 'non_numeric_cell', tested=nonempty, scope={'column': str(col), 'unit': 'cells'},
-                    minimum_nonempty=5, minimum_numeric_fraction=0.8)
-            for idx in series.index[series.notna() & numeric.isna()]:
+                    minimum_nonempty=1 if declared_numeric else 5,
+                    minimum_numeric_fraction=0 if declared_numeric else 0.8)
+            for idx in series.index[series.notna() & _exact_series(series).isna()]:
                 bad_cells.setdefault(int(idx), []).append(str(col))
         _record(receipts, 'multi_header_suspected', tested=1, scope={'unit': 'first_data_row', 'row': int(frame.index.min()) + row_offset})
         header_like: set[int] = set()
-        if len(bad_cells) and frame.index.min() is not None:
+        if bad_cells:
             first_row = int(frame.index.min())
             for idx, cols in bad_cells.items():
                 if idx == first_row and len(cols) >= 2:
                     header_like.add(idx)
             if header_like:
                 cols = bad_cells[int(frame.index.min())]
-                add("info", "multi_header_suspected", "",
+                signal = add("info", "multi_header_suspected", "",
                     f"第 {first_row + row_offset} 行有 {len(cols)} 列是文本（{('、'.join(cols[:6]))}），"
                     f"疑似二级表头或单位行，已跳过该行的逐格标注；如确实存在多行表头，"
-                    f"请用 header_rows_json 指定后重新审查")
+                    f"请指定原始表头行后重新审查", first_row)
+                signal['evidence'] = {'cells': _row_cells(frame, first_row, cols, row_offset)}
         for idx in sorted(bad_cells) if 'non_numeric_cell' in chosen else []:
-            if idx in header_like:
+            if idx in header_like and not set(bad_cells[idx]).intersection(set(values) | set(ranges or {})):
                 continue
             row_values = frame.loc[idx]
             for col in bad_cells[idx]:
+                if idx in header_like and col not in values and col not in (ranges or {}):
+                    continue
                 add("error" if col in (ranges or {}) else "review", "non_numeric_cell", col,
                     f"「{col}」本应是数值，但值是 {str(row_values[col])[:40]!r}", idx)
-    bad_cells = locals().get("bad_cells", {})
-    header_like = locals().get("header_like", set())
     if 'out_of_range' in chosen:
         for col, bound in (ranges or {}).items():
             if not isinstance(bound, dict) or not set(bound).intersection({'min', 'max'}):
@@ -660,9 +685,6 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
                     skipped=int(numeric.isna().sum()), scope={'column': col, 'unit': 'cells', 'bounds': bound})
             for idx, number in numeric.items():
                 if number is None:
-                    if _pd().notna(frame[col].loc[idx]) and (idx in header_like or col not in bad_cells.get(int(idx), [])):
-                        add('error', 'non_numeric_cell', col,
-                            f'显式数值范围要求可解析的数值，实际为 {str(frame[col].loc[idx])[:40]!r}', idx)
                     continue
                 if (low is not None and number < low) or (high is not None and number > high):
                     add('error', 'out_of_range', col,
@@ -688,15 +710,16 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
         for idx in positions:
             x, y = a.loc[idx], b.loc[idx]
             if not operators[op](x, y):
-                add('review', 'logic_conflict', left,
+                signal = add('review', 'logic_conflict', left,
                     f'「{left}」={_rational(x)} 与「{right}」={_rational(y)} 不满足 {left} {op} {right}', idx)
+                signal['evidence'] = {'cells': _row_cells(frame, idx, [left, right], row_offset)}
     if chosen & {'duplicate_key','duplicate_row'}:
         _duplicate_checks(frame,key_columns,add,checks=chosen,receipts=receipts)
     if bool(chosen & {'identical_columns','constant_offset_columns','constant_ratio_columns','exact_linear_columns','decimal_ending_concentration'}):
         numeric_cols = []
         unscanned_numeric_columns = []
         for col in frame.columns:
-            numeric = _pd().to_numeric(frame[col], errors="coerce")
+            numeric = _pd().to_numeric(frame[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
             if int(numeric.notna().sum()) >= 5 and numeric.notna().mean() >= .8:
                 # Bound quadratic pair comparisons by eligible numeric columns;
                 # identifiers and text labels do not consume this budget.
@@ -751,12 +774,18 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
                         signal = add('review', check, f'{left_name} ↔ {right_name}',
                             f'{len(a)} 个共同位置的数值关系 {relation}；可能来自换算、归一化、公式或共享对照，需结合方法学确认',
                             column_index=column_index_by_name.get(str(left_name)))
-                        signal['evidence'] = {'relationship': relation, 'rows': [int(x)+row_offset for x in positions]}
+                        physical = frame.attrs.get('_column_numbers', column_index_by_name)
+                        signal['evidence'] = {'direction': 'down_rows', 'relationship': relation,
+                            'rows': [int(x)+row_offset for x in positions],
+                            'cells': [{'row': int(x)+row_offset, 'column_index': int(physical[str(name)])}
+                                      for x in positions for name in (left_name, right_name)]}
                         matched = True
         if numeric_coverage['rows_truncated'] or unscanned_numeric_columns:
             for check in pair_rules:
                 _record(receipts, check, status='truncated', reason='numeric_pair_search_limit',
                         unscanned_columns=unscanned_numeric_columns)
+        if unscanned_numeric_columns:
+            _record(receipts, 'decimal_ending_concentration', status='truncated', reason='numeric_column_limit')
         for col, numeric in numeric_cols if 'decimal_ending_concentration' in chosen else []:
             vals = numeric.dropna().astype(float)
             precise = vals[(vals - vals.round(2)).abs() > 1e-6]
@@ -773,9 +802,11 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
                 add("review", "decimal_ending_concentration", col,
                     "六位浮点格式化末两位集中（非原始尾数；" + ", ".join(f".{k}: {v:.0%}" for k, v in common.head(4).items()) +
                     "）；均值、比例、舍入、固定分母及仪器精度也会产生此现象")
-    if groups and chosen & {'unequal_group_size','invalid_group_mapping'}:
+    if groups and chosen & {'unequal_group_size','unequal_replicates','iqr_outlier','invalid_group_mapping'}:
         absent = [c for c in groups if c not in frame.columns]
         if absent:
+            for dependent in ('unequal_group_size', 'unequal_replicates', 'iqr_outlier'):
+                _record(receipts, dependent, status='invalid_input', reason='group_column_absent')
             _record(receipts, 'invalid_group_mapping', status='invalid_input', reason='column_absent', scope={'columns': absent})
             add("warning", "invalid_group_mapping", ",".join(absent), "指定的分组字段不在表格中；未执行分组平衡或组内IQR检查，请修正 groups")
         elif 'unequal_group_size' in chosen:
@@ -787,9 +818,11 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
                     "分组样本数不一致（这可能是有意设计）；" + distribution,
                     column_index=column_index_by_name.get(str(groups[0])))
     valid_values = [c for c in values if c in frame.columns]
-    if 'invalid_value_mapping' in chosen and values and len(valid_values) != len(values):
+    if values and len(valid_values) != len(values):
+        for dependent in ('iqr_outlier', 'non_numeric_cell'):
+            _record(receipts, dependent, status='invalid_input', reason='measurement_column_absent')
         _record(receipts, 'invalid_value_mapping', status='invalid_input', reason='column_absent', scope={'columns': sorted(set(values) - set(valid_values))})
-        add("warning", "invalid_value_mapping", ",".join(set(values) - set(valid_values)),
+        add("warning", "invalid_value_mapping", ",".join(sorted(set(values) - set(valid_values))),
             "指定的测量字段未全部匹配列名")
     role_cols = {str(role): str(column) for role, column in mapping.items()
                  if column in frame.columns}
@@ -807,7 +840,7 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
         if len(rep_counts) > 1 and rep_counts.nunique() > 1:
             add("review", "unequal_replicates", rep,
                 "不同实验组的重复编号数不一致；尚不能判断为设计问题，请核对生物学/技术重复定义")
-    if chosen & {'integer_mean_inconsistent','integer_summary_inconsistent'} and integer_data_confirmed and {"mean", "n"}.issubset(role_cols):
+    if chosen & {'integer_mean_inconsistent','integer_summary_inconsistent', 'integer_summary_not_checked', 'grim_sd_skipped'} and integer_data_confirmed and {"mean", "n"}.issubset(role_cols):
         if "sd" in role_cols and sd_kind not in {"sample", "population"}:
             add("info", "grim_sd_skipped", role_cols["sd"],
                 "SD一致性检查未执行：请先确认报告的是样本SD还是总体SD；均值与样本量检查仍可执行")
@@ -817,7 +850,7 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
                 frame[role_cols["mean"]].loc[idx], frame[role_cols["n"]].loc[idx],
                 frame[role_cols["sd"]].loc[idx] if "sd" in role_cols and "integer_summary_inconsistent" in chosen else None,
                 mean_decimals=mean_decimals, sd_decimals=sd_decimals, sd_kind=sd_kind)
-            for result in (r for r in checks if r['check'] in chosen):
+            for result in (r for r in checks if r['check'] in chosen or (r['status'] == 'not_checked' and 'integer_summary_not_checked' in chosen)):
                 counts = receipt.setdefault(result['check'], {'checked_rows': 0, 'skipped_rows': 0})
                 counts['checked_rows' if result['status'] == 'checked' else 'skipped_rows'] += 1
                 _record(receipts, result['check'], tested=int(result['status'] == 'checked'),
@@ -842,11 +875,15 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
     if chosen & optional_names:
         _optional_checks(frame,values,groups,mapping,composite_keys,pattern_checks,
                          expected_structure,row_offset,add,findings,receipts)
+    check_rows(frame, config=row_relationships, values=values, groups=groups, mapping=mapping,
+               row_offset=row_offset, selected=chosen, record=partial(_record, receipts), add=add)
     if omitted:
         dropped = sum(omitted.values())
         for key, count in omitted.items():
             _record(receipts, key, status='truncated', reason='output_finding_limit',
                     findings_omitted=receipts[key].get('findings_omitted', 0) + count)
+        if 'findings_truncated' in chosen:
+            _record(receipts, 'findings_truncated', tested=1, scope={'unit': 'diagnostic'})
         findings.append({
             "severity": "info", "check": "findings_truncated", "field": "",
             "column_index": "", "row": "",

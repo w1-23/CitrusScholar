@@ -26,6 +26,7 @@ From: public.ecr.aws/docker/library/python@sha256:0f086103b026048cc50cb5da25ec43
     python -m pip install --no-cache-dir 'setuptools>=68' wheel
     python -m pip wheel --no-deps --no-build-isolation --wheel-dir /opt/support-wheels /opt/citrusscholar
     python -m pip install --no-deps /opt/support-wheels/citrusscholar_support-2.0.0-py3-none-any.whl
+    python -I -c 'from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT, RELEASE_VENDOR_PATH; assert RELEASE_VENDOR_COMMIT == "c6701dbea29afa7c596d029b957b7edc92130ea5" and RELEASE_VENDOR_PATH == "nature-qa"'
     python -m pip check
     python -m pip freeze --all > /opt/citrusscholar/installed-requirements.txt
     python -I - <<'PY'
@@ -65,3 +66,4 @@ PY
 
 %test
     python -I -c 'import fastapi, deepagents, langgraph, citrus_figures; from importlib.metadata import version; assert version("citrusscholar-support")=="2.0.0"'
+    python -I -c 'from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT; assert RELEASE_VENDOR_COMMIT == "c6701dbea29afa7c596d029b957b7edc92130ea5"'

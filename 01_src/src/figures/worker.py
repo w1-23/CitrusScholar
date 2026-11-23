@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import keyword
 import os
@@ -227,16 +228,17 @@ def _contract_namespace(job: dict, contract: dict, paths: dict) -> dict:
     return namespace
 
 
-def _bootstrap_engine_path() -> None:
-    """Make the figure engine importable however this file was laid out.
+def _bootstrap_engine_path() -> tuple[Path, Path | None]:
+    """Make the staged figure engine importable and return its roots.
 
-    In the service the engine lives at ``src/figures`` and the service root
-    is already on the path. In the sandbox image it lives beside this file
-    under ``figures/``. The local backend runs a *copy* of this file, so the
-    copy cannot find the engine by looking around itself; it passes the
-    location in the environment instead.
+    A sandbox image also contains an older ``citrus_figures`` distribution in
+    site-packages.  ``python -I`` deliberately ignores ``PYTHONPATH``, so the
+    staged directory has to be placed on ``sys.path`` explicitly.  Returns
+    ``(engine_root, support_root)`` and fails closed when no staged engine is
+    present instead of silently importing the image's copy.
     """
     candidates = []
+    support_root = None
     root = os.environ.get("CITRUS_FIGURES_ROOT", "").strip()
     if root:
         source = Path(root)
@@ -246,6 +248,9 @@ def _bootstrap_engine_path() -> None:
         packages = source.parent / "packages"
         if (packages / "citrus_figures" / "__init__.py").is_file():
             sys.path.insert(0, str(packages))
+            support_root = packages
+        elif (source / "citrus_figures" / "__init__.py").is_file():
+            support_root = source
     here = Path(__file__).resolve().parent
     candidates.extend([here.parent, here])
     for candidate in candidates:
@@ -254,7 +259,37 @@ def _bootstrap_engine_path() -> None:
             text = str(candidate)
             if text not in sys.path:
                 sys.path.insert(0, text)
-            return
+            if support_root is None and (candidate / "citrus_figures" / "__init__.py").is_file():
+                support_root = candidate
+            if not root and support_root is None:
+                raise RuntimeError("figure_support_root_not_found")
+            return candidate, support_root
+    raise RuntimeError("figure_engine_root_not_found")
+
+
+def _verify_support_origin(engine_root: Path, support_root: Path | None) -> None:
+    """Reject a worker that would execute an image's stale support package."""
+    if support_root is None:
+        return
+    import citrus_figures  # noqa: PLC0415
+
+    origin = Path(citrus_figures.__file__).resolve()
+    if not origin.is_relative_to(support_root.resolve()):
+        raise RuntimeError(
+            "figure_support_origin_mismatch: expected staged support under "
+            + str(support_root) + ", got " + str(origin))
+    manifest = engine_root / "support-manifest.json"
+    if os.environ.get("CITRUS_FIGURES_ROOT", "").strip() or not manifest.is_file():
+        return
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    members = record.get("members")
+    if not isinstance(members, dict) or not members:
+        raise RuntimeError("figure_support_manifest_invalid")
+    for name, digest in members.items():
+        path = engine_root / name
+        if (not path.is_file()
+                or hashlib.sha256(path.read_bytes()).hexdigest() != digest):
+            raise RuntimeError("figure_support_manifest_mismatch: " + name)
 
 
 def _engine():
@@ -388,7 +423,8 @@ def _resolve(base: Path, relative: str) -> Path:
 
 
 def run(job_path: Path) -> int:
-    _bootstrap_engine_path()
+    engine_root, support_root = _bootstrap_engine_path()
+    _verify_support_origin(engine_root, support_root)
     try:
         job = json.loads(job_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

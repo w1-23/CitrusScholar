@@ -29,6 +29,7 @@ From: public.ecr.aws/docker/library/python@sha256:0f086103b026048cc50cb5da25ec43
     # credentials, database or retrieval models cross into the sandbox.
     python -I /opt/support-build/04_scripts/build_worker_bundle.py --output /tmp/worker-bundle
     cp -a /tmp/worker-bundle/. /opt/citrusfig/
+    python -I -c 'import sys; sys.path.insert(0, "/opt/citrusfig"); import worker; roots=worker._bootstrap_engine_path(); worker._verify_support_origin(*roots); from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT, RELEASE_VENDOR_PATH; assert RELEASE_VENDOR_COMMIT == "c6701dbea29afa7c596d029b957b7edc92130ea5" and RELEASE_VENDOR_PATH == "nature-qa"'
     rm -rf /opt/support-build /tmp/support-wheel /tmp/worker-bundle
     mkdir -p /input /workspace /outputs /work/in /work/out /code-environment /snapshot/input /snapshot/workspace /snapshot/outputs
     python -m pip check
@@ -58,4 +59,4 @@ PY
     exec python -I /opt/citrusfig/worker.py "$@"
 
 %test
-    python -I -c 'import numpy, pandas, scipy, matplotlib, citrus_figures'
+    python -I -c 'import sys; sys.path.insert(0, "/opt/citrusfig"); import numpy, pandas, scipy, matplotlib, citrus_figures, worker; roots=worker._bootstrap_engine_path(); worker._verify_support_origin(*roots); from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT; assert RELEASE_VENDOR_COMMIT == "c6701dbea29afa7c596d029b957b7edc92130ea5"'

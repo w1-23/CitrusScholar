@@ -23,6 +23,8 @@ async def stream_llm_response(
     messages: list,
     on_text: Optional[Callable[[str], None]] = None,
     on_reasoning: Optional[Callable[[str], None]] = None,
+    *,
+    verify_terminal: bool = False,
 ):
     """流式调用 LLM 并聚合完整响应，返回 AIMessage（与 ainvoke 同构）。
 
@@ -31,9 +33,23 @@ async def stream_llm_response(
         messages: langchain 消息列表
         on_text: content 增量回调（回答区逐 token）
         on_reasoning: deprecated compatibility argument; never invoked
+        verify_terminal: track finish reasons on physical chunks before merging
     """
     full = None
+    terminal = None
+    terminal_conflict = False
     async for chunk in llm.astream(messages):
+        if verify_terminal:
+            reason = chunk.response_metadata.get("finish_reason")
+            private = getattr(chunk, "provider_protocol", None)
+            if terminal is not None and (chunk.content or getattr(chunk, "tool_call_chunks", ())
+                                         or getattr(private, "reasoning", "")):
+                terminal_conflict = True
+            if reason is not None:
+                if not isinstance(reason, str) or (terminal is not None and reason != terminal):
+                    terminal_conflict = True
+                else:
+                    terminal = reason
         if full is None:
             full = chunk
         else:
@@ -55,4 +71,11 @@ async def stream_llm_response(
         full.additional_kwargs.pop("reasoning_content", None)
     except Exception:
         pass
+    if verify_terminal:
+        full.response_metadata.pop("citrus_stream_terminal_unconfirmed", None)
+        if terminal_conflict or terminal is None:
+            full.response_metadata.pop("finish_reason", None)
+            full.response_metadata["citrus_stream_terminal_unconfirmed"] = True
+        else:
+            full.response_metadata["finish_reason"] = terminal
     return full

@@ -385,14 +385,6 @@ def _resume_hint(tool_name: str, args: dict) -> str:
         except (TypeError, ValueError):
             return 0
 
-    if tool_name == "verify_uploaded_references":
-        start = _int("start_index")
-        limit = _int("max_rows")
-        window = limit or 10
-        return (f"续跑方式：再次调用 verify_uploaded_references，"
-                f"传 start_index={start}、max_rows={window}，从同一窗口重试。"
-                f"超时不代表该窗口已完成，不能跳过；已核验条目在 6 小时内有服务端记忆。"
-                f"请沿用同一 file_index/references_json；取得成功回执后再按返回的位置继续。")
     if tool_name == "read_account_file":
         start = _int("start_char")
         size = _int("max_chars") or 9000
@@ -408,7 +400,8 @@ def _resume_hint(tool_name: str, args: dict) -> str:
 def _timeout_message(tool_name: str, exec_timeout, args: dict) -> str:
     return (f"[ERR_TIMEOUT] 工具 {tool_name} 等待超过 {exec_timeout}s；"
             f"请求已停止等待，后台执行仍受限资源池管理。"
-            + _resume_hint(tool_name, args))
+            + (_resume_hint(tool_name, args) if is_readonly_call(tool_name, args)
+               else "操作结果尚未确认，请先核对已保存的执行记录。"))
 
 
 def _cancelled_result(tool_name: str, tool_call_id: str, where: str) -> ToolMessage:
@@ -484,21 +477,20 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
         tool_call_id=tool_call["id"], attempt=attempt, retry_of=retry_of, logical_key=logical_key)
     try:
         from contextlib import nullcontext
+        from src.agent.workspace_reconciliation import ZERO_WRITE_TOOL_NAMES, capture_zero_write
         reconciliation_scope = nullcontext()
         if name == "run_research_figure_script":
             from src.research.script_reconciliation import capture_script_failure
             reconciliation_scope = capture_script_failure(owner, job["session_id"])
-        elif name in {"workspace_write", "workspace_edit"}:
-            from src.agent.workspace_reconciliation import capture_write_conflict
-            reconciliation_scope = capture_write_conflict(owner, job["session_id"])
+        elif name in ZERO_WRITE_TOOL_NAMES:
+            reconciliation_scope = capture_zero_write(owner, job["session_id"], job_id, name, tool_call["id"])
         with reconciliation_scope as reconciliation:
             message = await _execute_single_tool(tool, tool_call, lease_seconds=600, on_dispatch=on_dispatch)
         message.additional_kwargs["operation_id"] = operation_id
-        # Only this runner may attest a first-party, zero-write preflight.
-        # Strip anything a tool supplied before checking invocation-private proof.
+        # Only this runner can attest first-party evidence bound to the invocation.
         message.additional_kwargs.pop("host_preflight_reconciled", None)
-        if (reconciliation is not None and reconciliation.preflight_digest
-                and reconciliation.matches(message)):
+        reconciled = reconciliation is not None and reconciliation.matches(message)
+        if reconciled and reconciliation.preflight_digest:
             import hashlib
             message.additional_kwargs["host_preflight_reconciled"] = {
                 "schema_version": 1, "operation_id": operation_id,
@@ -510,21 +502,24 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
             if (not readonly
                     and message.additional_kwargs.get("execution_dispatched")
                     and (outcome["status"] in {"failed", "cancelled", "unknown"}
+                         or (outcome["status"] == "not_run" and name in ZERO_WRITE_TOOL_NAMES)
                          or outcome.get("reason_code") in {"timeout", "network", "request_deadline"})
-                    and not (outcome["status"] in {"failed", "not_run"} and reconciliation is not None
-                             and reconciliation.matches(message))):
+                    and not (outcome["status"] in {"failed", "not_run"} and reconciled)):
                 # A failed observation of a dispatched write is not evidence
                 # that no side effect occurred. Only the owning adapter can
                 # reconcile it; the generic loop must not automatically retry.
                 artifact = dict(message.artifact or {})
                 artifact["_tool_outcome"] = {
                     "status": "unknown", "reason_code": "write_requires_reconciliation"}
-                message = message.model_copy(update={"artifact": artifact})
+                from src.core.op_receipt import make_receipt
+                artifact["op_receipt"] = make_receipt(name, tool_call["id"], message.content, artifact)
+                message = message.model_copy(update={"artifact": artifact, "status": "error"})
                 message.additional_kwargs["operation_uncertain"] = True
         if token is not None and token.cancelled():
             task_events.abandon_operation(operation_id, lease)
             cancelled = _cancelled_result(name, tool_call["id"], "after_checkpoint_wait")
             cancelled.additional_kwargs.update(message.additional_kwargs)
+            cancelled.additional_kwargs.pop("host_preflight_reconciled", None)
             if require_durable and not readonly:
                 cancelled.additional_kwargs["operation_uncertain"] = bool(
                     message.additional_kwargs.get("execution_dispatched"))
@@ -617,6 +612,7 @@ async def _execute_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fa
     with bound_token(child):
         try:
             message = await _invoke_single_tool(tool, tool_call, recovering=recovering)
+            message.additional_kwargs.pop("host_preflight_reconciled", None)
             message.additional_kwargs["execution_dispatched"] = child.dispatched
             return message
         finally:

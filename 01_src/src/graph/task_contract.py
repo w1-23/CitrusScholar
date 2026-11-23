@@ -57,6 +57,12 @@ def _products(requirements):
             else "validated_artifact") for i, r in enumerate(requirements)]
 
 
+def contract_for_explicit_outputs(query: str) -> TaskContract:
+    from src.graph.export_contract import deliverable_contract
+    requirements = [dict(item, all_formats=True) for item in deliverable_contract(query)]
+    return TaskContract(obligations=tuple(_products(requirements)))
+
+
 def build_task_contract(*, query="", request_plan=None, request_constraints=None,
                         table_count=0, explicit_reference_check=False, has_paper_attachment=False):
     """Conservative migration fallback; never silently declare its scope certain."""

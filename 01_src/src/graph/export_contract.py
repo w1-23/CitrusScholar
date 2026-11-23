@@ -70,11 +70,11 @@ _KIND_INTENTS = (
     # Migration compatibility only: a user who writes "绘制图像" must not fall
     # out of delivery detection while TaskContract takes over the real decision.
     ("figure", re.compile(
-        r"流程图|示意图|图表|图像|图片|插图|可视化|绘图|曲线图|柱状图|折线图|散点图|"
+        r"科研图|图件|流程图|示意图|图表|图像|图片|插图|可视化|绘图|曲线图|柱状图|折线图|散点图|"
         r"箱线图|直方图|误差棒图|热图|"
         r"SVG|PNG|figure|chart|diagram|plot|illustration|visuali[sz]ation|image", re.I)),
     ("figure", re.compile(
-        r"流程图|示意图|图表|图像|图片|插图|可视化|绘图|曲线图|柱状图|折线图|散点图|"
+        r"科研图|图件|流程图|示意图|图表|图像|图片|插图|可视化|绘图|曲线图|柱状图|折线图|散点图|"
         r"箱线图|直方图|误差棒图|热图|"
         r"SVG|PNG|figure|chart|diagram|plot|illustration|visuali[sz]ation|image", re.I)),
     ("report_html", re.compile(
@@ -117,8 +117,8 @@ _ENGLISH_NUMBERS = {
 # an Arabic/English numeral may stand directly before the product noun. The
 # modifier gap is bounded and never crosses a sentence boundary.
 _QUANTITY_NOUNS = (
-    r"(?:报告|简报|文档|文件|工作簿|表格|清单|核验表|审查表"
-    r"|reports?\b|documents?\b|files?\b|workbooks?\b|briefs?\b|tables?\b)")
+    r"(?:报告|简报|文档|文件|工作簿|表格|清单|核验表|审查表|科研图|图表|图件|图"
+    r"|reports?\b|documents?\b|files?\b|workbooks?\b|briefs?\b|tables?\b|figures?\b|charts?\b|plots?\b)")
 _QUANTITY_RE = re.compile(
     r"(?i)(?:"
     r"(?P<cjk>[一二两三四五六七八九十]+)\s*(?:份|篇|套|个|张)\s*"
@@ -355,8 +355,6 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
                 r"^(?:请|帮我|麻烦|分别|各自|另外|再|同时|please\s+)?"
                 r"(?:[一二两三四五六七八九十]+|\d+)\s*(?:份|个|篇|张|套)?\s*",
                 "", tail, flags=re.I).strip() or tail.strip()
-            if not (_EXPORT_FORMAT_RE.search(tail) or deliverable_segment_has_output(tail)):
-                continue
             formats = list(dict.fromkeys(_FORMAT_ALIASES[m.group(0).casefold()]
                                          for m in _FORMAT_TOKEN_RE.finditer(tail)))
             # A term used as the subject of an audit/verification is not a
@@ -364,6 +362,8 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
             # must remain a report rather than silently becoming a drawing.
             kinds = list(dict.fromkeys(kind for kind, pattern in _KIND_INTENTS
                                        if pattern.search(_mask_audit_subject(kind_text))))
+            if (not kinds and re.search(r"(?:绘制|画)\s*(?:[一二两三四五六七八九十]+|\d+)\s*张\s*图", kind_text)):
+                kinds = ["figure"]
             # Scene names are not file requests. A review/report/evidence table
             # can be a copyable answer. Check the output tail so an uploaded
             # Excel/PDF mentioned earlier does not authorize a new file.
@@ -372,6 +372,16 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
                 r"\b(?:export|download(?:able)?|save|file|attachment|archive)\b", tail, re.I)
                 or re.match(r"\s*(?:请|帮我)?\s*(?:导出|下载|另存|保存为|export\b|download\b|save\b)", segment, re.I))
             if not file_requested and "figure" not in kinds:
+                continue
+            if (requirements and "figure" in requirements[-1]["kinds"] and formats
+                    and not _DELIVERABLE_OUTPUT_NOUN_RE.search(tail)
+                    and re.match(r"(?i)^(?:分别|各自|分别将其)?\s*(?:导出|另存为|保存为|export\b|save\b)", segment)):
+                previous = requirements[-1]
+                stated = previous["formats"] if previous.pop("_explicit_formats", False) else []
+                previous["formats"] = list(dict.fromkeys([*stated, *formats]))
+                previous["_explicit_formats"] = True
+                continue
+            if "figure" not in kinds and not (_EXPORT_FORMAT_RE.search(tail) or deliverable_segment_has_output(tail)):
                 continue
             active = True
             if len(kinds) > 1 and "report_html" in kinds:
@@ -410,7 +420,11 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
                     and _CONTINUATION_TARGET_RE.search(segment)):
                 # Content to write *into* an already requested file.
                 continue
+            if "figure" in kinds:
+                normalized["_explicit_formats"] = bool(formats)
             requirements.append(normalized)
+    for requirement in requirements:
+        requirement.pop("_explicit_formats", None)
     return _expand_product_identity(
         _assign_report_body_ownership(
             _explicit_carrier_requirements(
@@ -681,8 +695,9 @@ def artifact_matches_requirement(validation: dict[str, Any],
     required_kinds = set(requirement.get("kinds") or ())
     if required_kinds == {"generic_output"}:
         # "Just give me a file" — any verified artifact satisfies it.
-        return bool(str(validation.get("filename") or "").strip())
-    if required_kinds:
+        if not str(validation.get("filename") or "").strip():
+            return False
+    elif required_kinds:
         from src.graph.tool_availability import declarations, matching_producer_kinds
         from src.core.artifact_kinds import RENDERER_OUTPUT_KINDS
         produced = set(RENDERER_OUTPUT_KINDS.get(producer,
@@ -707,6 +722,12 @@ def deliverable_match_map(
     requirements: list[dict[str, list[str]]],
 ) -> dict[int, int]:
     """A structured product is satisfied only after every requested format exists."""
+    return {index: members[0] for index, members in
+            deliverable_match_groups(validations, requirements).items()}
+
+
+def deliverable_match_groups(validations, requirements):
+    """Return all matched artifact indices for each fully satisfied product."""
     expanded, groups = [], []
     for requirement in requirements:
         formats = requirement.get("formats") or []
@@ -715,8 +736,8 @@ def deliverable_match_map(
         groups.append(list(range(len(expanded), len(expanded) + len(variants))))
         expanded.extend(variants)
     matches = _single_format_match_map(validations, expanded)
-    return {index: matches[group[0]] for index, group in enumerate(groups)
-            if all(member in matches for member in group)}
+    return {index: tuple(matches[member] for member in group)
+            for index, group in enumerate(groups) if all(member in matches for member in group)}
 
 
 def _single_format_match_map(

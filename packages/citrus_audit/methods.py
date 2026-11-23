@@ -14,6 +14,11 @@ from fractions import Fraction
 from .integrity import _number, _rational, _transform, IntegrityConfig
 
 METHOD_VERSION = "table-audit/2"
+COVERAGE_CHECKS = frozenset({
+    'iqr_insufficient', 'design_checks_skipped', 'invalid_group_mapping',
+    'invalid_value_mapping', 'grim_sd_skipped', 'integer_summary_not_checked',
+    'findings_truncated',
+})
 
 def _record(receipts, check, *, tested=0, skipped=0, reason="", status="", scope=None, **bounds):
     """Update only from an executed branch; counts describe units in scope."""
@@ -55,7 +60,8 @@ def _finish_receipts(receipt, findings, source_coverage):
         entry["source_coverage"] = {key: value for key, value in (source_coverage or {}).items()
                                     if key in {'name', 'sheet', 'source_rows', 'source_columns', 'processed_rows',
                                                'processed_columns', 'truncated', 'truncation_reasons',
-                                               'source_rows_exact', 'lexical_precision_preserved', 'formula_evaluation'}}
+                                               'source_rows_exact', 'lexical_precision_preserved', 'formula_evaluation',
+                                               'region_id', 'region_bounds', 'header_rows'}}
         if (source_coverage or {}).get("truncated") and entry["tested"]:
             _record(rules, key, status="truncated", reason="source_not_fully_loaded")
     receipt["method_version"] = METHOD_VERSION
@@ -500,8 +506,10 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
     omitted = Counter()
     findings, issue_rows, column_index_by_name, collect = _collector(frame, row_offset, max_findings=20000, omitted=omitted)
     def add(*args, **kwargs):
+        if args[1] not in chosen:
+            return {}
         result = collect(*args, **kwargs)
-        if args[1] not in receipts and args[1] in chosen:
+        if args[1] not in receipts:
             _record(receipts, args[1], tested=1, scope={'unit':'diagnostic'})
         return result
     def finish():
@@ -514,6 +522,7 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
         receipt['requested'] = sorted(chosen)
         receipt['actual'] = sorted(k for k,r in receipts.items() if r['tested'])
         receipt['gap'] = sorted(k for k in chosen if receipts[k]['status'] != 'executed')
+        receipt['findings_omitted'] = sum(r.get('findings_omitted', 0) for r in receipts.values())
         return findings, issue_rows
     # Invalid requested configuration remains invalid even when no rows exist.
     # Unrequested rules neither validate nor execute their configurations.
@@ -835,7 +844,8 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
     if omitted:
         dropped = sum(omitted.values())
         for key, count in omitted.items():
-            _record(receipts, key, status='truncated', reason='output_finding_limit', findings_omitted=count)
+            _record(receipts, key, status='truncated', reason='output_finding_limit',
+                    findings_omitted=receipts[key].get('findings_omitted', 0) + count)
         findings.append({
             "severity": "info", "check": "findings_truncated", "field": "",
             "column_index": "", "row": "",

@@ -19,7 +19,7 @@ from src.core.task_events import TaskConflict
 _REQUEST_FIELDS = frozenset({
     "query", "request_id", "client_request_id", "session_id", "user_id", "job_id",
     "idempotency_key", "visualization_enabled", "context_compression", "selected_skills", "attachment_refs", "attachment_context",
-    "image_attachments", "has_paper_attachment", "request_tables", "mode",
+    "browse_requested", "image_attachments", "has_paper_attachment", "request_tables", "mode",
     "agent_no_prefetch_hints", "parent_job_id", "question_answer", "continuation_context",
     "no_replay", "script_budget_scope", "context_working_state", "history_summary",
     "long_term_memory", "resident_cards", "user_preferences", "account_files",
@@ -30,7 +30,8 @@ _REQUEST_FIELDS = frozenset({
 
 def capture_original_request_state(state: dict) -> dict:
     """Called once by the host before mutable task updates are restored/applied."""
-    return deepcopy({key: value for key, value in state.items() if key in _REQUEST_FIELDS})
+    return deepcopy({key: value for key, value in state.items() if key in _REQUEST_FIELDS
+                     and (key != "browse_requested" or value is True)})
 
 
 def validate_original_request_state(value, identity: ExecutionIdentity) -> dict:

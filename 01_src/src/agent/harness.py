@@ -27,6 +27,7 @@ from pydantic import Field
 from typing_extensions import NotRequired
 
 from .events import LoopCheckpoint, LoopEvent
+from .model import NON_SUCCESS_TERMINALS
 from .runtime import AdmissionStopped, RunResult, RunLimits
 from .deep_agent_runtime import create_host_agent, EXECUTOR_ID, MODEL_PROVIDER
 
@@ -144,6 +145,7 @@ class HarnessRuntime:
     # called only after a synchronous checkpoint commit, before another model.
     resolve_execution_waits: Any = None
     acknowledge_execution_waits: Any = None
+    record_rejected: Any = None
 
     async def _publish_working_note(self, response, identity, model_step):
         try:
@@ -235,18 +237,20 @@ class HarnessRuntime:
                 reason = response.response_metadata.get("finish_reason")
                 reason = "length" if reason in {"max_tokens", "max_output_tokens"} else reason
                 invalid = "invalid_tool_call" if response.invalid_tool_calls else ""
-                if reason in {"length", "content_filter", "error", "unknown", "aborted"}:
+                if reason == "length" or reason in NON_SUCCESS_TERMINALS:
                     invalid = "model_" + reason
                 ids = [call.get("id") for call in response.tool_calls]
                 previous = {call.get("id") for message in state["messages"][:-1]
                     if isinstance(message, AIMessage)
                     and message.additional_kwargs.get("context_turn_id") == identity.user_turn_id
                     for call in message.tool_calls}
-                if ids and (any(not isinstance(cid, str) or not cid for cid in ids)
+                if ids and (any(not isinstance(cid, str) or not cid.strip() or cid != cid.strip()
+                                or any(ord(char) < 32 for char in cid) for cid in ids)
                             or len(set(ids)) != len(ids) or previous.intersection(ids)):
                     invalid = "invalid_or_reused_tool_call_id"
                 await event("model_finished", state, ids)
                 if response.response_metadata.get("citrus_stream_terminal_unconfirmed"):
+                    await event("model_output_rejected", {**state, "stop_reason": "model_stream_unconfirmed"}, ids)
                     return {"stop_status": "incomplete", "stop_reason": "model_stream_unconfirmed", "jump_to": "end"}
                 if state.get("final_answer_recovery") and (invalid or ids):
                     return {"stop_status": "incomplete", "stop_reason": "final_answer_recovery_incomplete", "jump_to": "end"}
@@ -270,11 +274,28 @@ class HarnessRuntime:
                     feedback = ("模型输出达到单次输出上限" if invalid == "model_length" else
                                 "工具参数不是完整合法的JSON，无法解析")
                     additions = [cleaned]
-                    additions.extend(ToolMessage(content=f"调用未执行：{feedback}。请按schema重新生成完整参数。",
-                        tool_call_id=call["id"], name=call["name"], status="error",
-                        additional_kwargs={**identity.message_metadata("tool"), "execution_dispatched": False},
-                        artifact={"_tool_outcome": {"status": "not_run", "reason_code": feedback_reason}})
-                        for call in response.tool_calls)
+                    if adapter.record_rejected is not None and cleaned.tool_calls:
+                        batch = await adapter.record_rejected(cleaned, feedback_reason)
+                        if (batch.unknown_operations or batch.pending_question or batch.execution_waits
+                                or len(batch.messages) != len(cleaned.tool_calls)):
+                            raise ValueError("invalid_rejected_batch_observation")
+                        for call, observation in zip(cleaned.tool_calls, batch.messages):
+                            artifact = observation.artifact or {}
+                            outcome = artifact.get("_tool_outcome", {})
+                            if (observation.status != "error" or observation.tool_call_id != call["id"]
+                                    or observation.name != call["name"]
+                                    or observation.additional_kwargs.get("execution_dispatched") is not False
+                                    or observation.additional_kwargs.get("operation_uncertain")
+                                    or outcome.get("status") != "not_run" or outcome.get("reason_code") != feedback_reason):
+                                raise ValueError("invalid_rejected_tool_observation")
+                            additions.append(observation.model_copy(update={"additional_kwargs": {
+                                **observation.additional_kwargs, **identity.message_metadata("tool")}}))
+                    else:
+                        additions.extend(ToolMessage(content=f"调用未执行：{feedback}。请按schema重新生成完整参数。",
+                            tool_call_id=call["id"], name=call["name"], status="error",
+                            additional_kwargs={**identity.message_metadata("tool"), "execution_dispatched": False},
+                            artifact={"_tool_outcome": {"status": "not_run", "reason_code": feedback_reason}})
+                            for call in cleaned.tool_calls)
                     additions.append(control(f"上一条提议被拒绝：{feedback}，所有提议调用均未执行。"
                         "请利用已保存的结果继续本轮任务：缩短说明，按需拆分长代码/文件操作，"
                         "重新生成完整参数或精简的最终答复；不要把截断文本当成已完成结果。"))

@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from src.code_execution.protocol import ExecutionLimits, logical_path
 from .identity import ExecutionIdentity
+from .workspace_reconciliation import observe_code_rejection
 
 __all__ = ["CODE_TOOL_NAMES", "EXECUTION_WAIT_TOOL_NAMES", "register_code_tools", "code_execution_context"]
 
@@ -323,6 +324,11 @@ def _dispatch(operation, **args):
     from src.core.account_leases import account_lease
     from src.workspaces import WorkspaceConflict
     from src.code_execution.repository import ExecutionConflict, QueueFull
+
+    def reject(reason, **details):
+        result = _result({"error": reason, **details}, reason=reason, status="not_run")
+        observe_code_rejection(identity, call_id, operation, result[1])
+        return result
     try:
         identity, call_id = _identity()  # Fresh tracing/job check before any service/store.
         with account_lease(identity.owner_user_id):
@@ -345,11 +351,7 @@ def _dispatch(operation, **args):
                 if current["task_id"] != args["task_id"]:
                     raise PermissionError("execution_task_scope_mismatch")
                 if current["revision"] != args["expected_revision"]:
-                    # This refusal precedes file registration. A later CAS
-                    # conflict follows the generic reconciliation path.
-                    return _result({"error": "workspace_revision_conflict",
-                                    "latest_revision": current["revision"]},
-                                   reason="workspace_revision_conflict", status="not_run")
+                    return reject("workspace_revision_conflict", latest_revision=current["revision"])
                 from src.session import files
                 file = files.register_file(owner_user_id=identity.owner_user_id,
                     session_id=identity.session_id, filename=args["path"].rsplit("/", 1)[-1],
@@ -369,17 +371,20 @@ def _dispatch(operation, **args):
                 if current["task_id"] != args["task_id"]:
                     raise PermissionError("execution_task_scope_mismatch")
                 if current["revision"] != args["expected_revision"]:
-                    raise WorkspaceConflict(current["revision"])
+                    return reject("workspace_revision_conflict", latest_revision=current["revision"])
                 from src.session import files
                 source = files.get_file(identity.session_id, args["file_id"],
                                         owner_user_id=identity.owner_user_id)
                 if (source is None or source.get("visibility") != "public"
                         or source.get("origin") not in files.ORIGINS
                         or source.get("sha256") != args["sha256"]):
-                    raise PermissionError("code_input_source_denied")
-                result = workspace.bind(args["workspace_id"], path=args["path"],
-                    file_id=args["file_id"], expected_revision=args["expected_revision"],
-                    expected_sha256=args["sha256"], source={"tool": "code_bind_input"})
+                    return reject("code_input_source_denied")
+                try:
+                    result = workspace.bind(args["workspace_id"], path=args["path"],
+                        file_id=args["file_id"], expected_revision=args["expected_revision"],
+                        expected_sha256=args["sha256"], source={"tool": "code_bind_input"})
+                except WorkspaceConflict as exc:
+                    return reject("workspace_revision_conflict", latest_revision=exc.latest_revision)
                 ref = result["ref"]
                 return _result({"task_id": args["task_id"], "workspace_id": args["workspace_id"],
                     "revision": result["revision"], **{k: ref[k] for k in ("path", "file_id", "version", "sha256", "size_bytes")}},
@@ -387,8 +392,7 @@ def _dispatch(operation, **args):
             if operation == "execute":
                 from src.code_execution.presence import worker_available
                 if not worker_available(service.repository.path):
-                    return _result({"error": "code_worker_unavailable"},
-                                   reason="code_worker_unavailable", status="not_run")
+                    return reject("code_worker_unavailable")
                 environment_id = args.get("environment_id") or "base"
                 environment_revision = args.get("environment_revision") or 1
                 try:
@@ -407,12 +411,11 @@ def _dispatch(operation, **args):
                                 or manifest.get("revision") != environment_revision):
                             raise ValueError("environment_selection_scope_mismatch")
                 except LookupError:
-                    return _result({"error": "environment_revision_not_found"},
-                                   reason="environment_revision_not_found", status="not_run")
+                    return reject("environment_revision_not_found")
                 except ValueError as exc:
                     if str(exc) in {"execution_base_environment_revision_must_be_1",
                                     "environment_selection_scope_mismatch"}:
-                        return _result({"error": str(exc)}, reason=str(exc), status="not_run")
+                        return reject(str(exc))
                     raise
                 key = "code_" + _key(identity.run_id, call_id)
                 row = service.submit(task_id=args["task_id"], workspace_id=args["workspace_id"],
@@ -430,24 +433,21 @@ def _dispatch(operation, **args):
                 from src.code_execution.environment_service import OfflineEnvironmentService
                 from src.code_execution.presence import worker_available
                 if not worker_available(service.repository.path):
-                    return _result({"error": "code_worker_unavailable"},
-                                   reason="code_worker_unavailable", status="not_run")
+                    return reject("code_worker_unavailable")
                 current = workspace.open(args["workspace_id"])
                 if current["task_id"] != args["task_id"]:
                     raise PermissionError("execution_task_scope_mismatch")
                 if current["revision"] != args["expected_revision"]:
-                    # Reconcile the prepare/submit crash window: the installer
-                    # binding advances the workspace revision exactly once.
-                    return _result({"error": "workspace_revision_conflict",
-                                    "latest_revision": current["revision"]},
-                                   reason="workspace_revision_conflict", status="not_run")
-                snapshot = workspace.snapshot(args["workspace_id"],
-                    task_id=args["task_id"], expected_revision=args["expected_revision"])
+                    return reject("workspace_revision_conflict", latest_revision=current["revision"])
+                try:
+                    snapshot = workspace.snapshot(args["workspace_id"],
+                        task_id=args["task_id"], expected_revision=args["expected_revision"])
+                except WorkspaceConflict as exc:
+                    return reject("workspace_revision_conflict", latest_revision=exc.latest_revision)
                 lock = next((item for item in snapshot["files"]
                              if item["path"] == args["lock_path"]), None)
                 if lock is None:
-                    return _result({"error": "environment_lock_not_bound"},
-                                   reason="environment_lock_not_bound", status="not_run")
+                    return reject("environment_lock_not_bound")
                 # Reconcile the same lock within a run. A later run has its
                 # own deadline and may intentionally request a new attempt.
                 key = "codeenv_" + _key(identity.run_id, args["workspace_id"], args["task_id"],
@@ -474,16 +474,16 @@ def _dispatch(operation, **args):
                         environment_id=args["environment_id"],
                         expected_revision=args["expected_revision"])
                 except EnvironmentConflict:
-                    return _result({"error": "environment_publication_conflict"},
-                                   reason="environment_publication_conflict", status="not_run")
-                except LookupError:
-                    return _result({"error": "environment_execution_not_found"},
-                                   reason="environment_execution_not_found", status="not_run")
+                    return reject("environment_publication_conflict")
+                except LookupError as exc:
+                    if exc.args == ("execution_not_found",):
+                        return reject("environment_execution_not_found")
+                    raise
                 except ValueError as exc:
                     text = str(exc)
                     if text in {"environment_successful_installer_required",
                                 "environment_base_is_immutable"}:
-                        return _result({"error": text}, reason=text, status="not_run")
+                        return reject(text)
                     raise
                 return _result({"environment": manifest,
                                 "completion_scope": "published_environment_revision"},

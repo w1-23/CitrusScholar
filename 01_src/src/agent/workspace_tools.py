@@ -73,6 +73,7 @@ def _result(data, *, failed=False, reason="workspace_complete", status=None):
 
 def _call(operation, **kwargs):
     from .workspace_storage import WorkspaceConflict, virtual_path
+    storage = None
     try:
         storage = _storage()
         if operation in {"read", "save"}:
@@ -110,6 +111,8 @@ def _call(operation, **kwargs):
         return _result({"entries": entries, "total_entries": len(rows),
                         "next_offset": end if end < len(rows) else None})
     except WorkspaceConflict as exc:
+        if storage is None or operation != "save":
+            raise
         result = _result({"error": "workspace_version_conflict", "write_applied": False,
                          "latest_ref": exc.latest_ref}, status="not_run", reason="workspace_version_conflict")
         from .workspace_reconciliation import observe_write_conflict

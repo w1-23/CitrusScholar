@@ -177,6 +177,9 @@
       post: function (jobId, path, payload) { return json('/api/v2/chat/jobs/' + encodeURIComponent(jobId) + '/' + path, {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
       }); },
+      lookupUpdate: function (jobId, requestId) {
+        return json('/api/v2/chat/jobs/' + encodeURIComponent(jobId) + '/updates/' + encodeURIComponent(requestId));
+      },
       stop: function () { stopped = true; reads.abort(); if (timer) clearTimeout(timer); timer = null; }};
   }
   root.CitrusTaskTransport = {parser: parser, create: create};

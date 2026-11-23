@@ -35,20 +35,6 @@ class HostTools:
         from src.core.task_result import resolved_tool_attempts
         from src.core.progress_bus import emit_encoded
         resolutions = {item['tool_call_id']: item for item in resolved_tool_attempts(self.records, outcome)}
-        # Pure admission rejections can also resolve before a final answer, e.g.
-        # a corrected request_user_input that intentionally pauses the loop.
-        for index, row in enumerate(self.records):
-            cid = row.get('tool_call_id')
-            if (row.get('status') != 'not_run' or not cid
-                    or (row.get('reason') or row.get('reason_code')) not in {
-                        'invalid_tool_arguments', 'required_skill_not_loaded', 'script_execution_rejected',
-                        'workspace_version_conflict'}
-                    or not self.proven_no_dispatch(cid)):
-                continue
-            target = next((later.get('tool_call_id') for later in self.records[index + 1:]
-                if later.get('name') == row.get('name') and later.get('status') == 'complete'), None)
-            if target:
-                resolutions[cid] = {'tool_call_id': cid, 'resolved_by_tool_call_id': target, 'resolution': 'repaired'}
         changes = []
         for item in resolutions.values():
             cid, target = item["tool_call_id"], item["resolved_by_tool_call_id"]
@@ -78,14 +64,26 @@ class HostTools:
         marker = observation.additional_kwargs.get('host_preflight_reconciled')
         if not isinstance(marker, dict):
             return False
-        import hashlib
-        from src.core import tool_results
+        from src.core import task_events, tool_results
+        operation_id = marker.get('operation_id')
+        if (marker.get('schema_version') != 1 or not operation_id
+                or operation_id != observation.additional_kwargs.get('operation_id')):
+            return False
+        with task_events.transaction() as conn:
+            row = conn.execute("SELECT input_hash, inputs, input_refs, status, result FROM task_operations "
+                "WHERE operation_id=? AND job_id=? AND owner_user_id=? AND tool_name=? AND tool_call_id=?",
+                (operation_id, self.identity.run_id, self.identity.owner_user_id, observation.name, cid)).fetchone()
+        if row is None or row['status'] != 'not_run' or not row['result']:
+            return False
+        args, refs = json.loads(row['inputs']), json.loads(row['input_refs'])
+        if row['input_hash'] != task_events.input_hash({'tool': observation.name, 'args': args, 'refs': refs}):
+            return False
+        result = json.loads(row['result'])
         stored = tool_results.fetch(cid)
-        return bool(marker.get('schema_version') == 1 and marker.get('operation_id')
-            and marker['operation_id'] == observation.additional_kwargs.get('operation_id')
-            and stored and stored.get('session_id') == self.identity.session_id
+        return bool(stored and stored.get('session_id') == self.identity.session_id
             and stored.get('request_id') == self._result_request_id()
             and tool_results.storage_integrity(stored)['complete']
+            and result.get('content') == stored['result_text']
             and marker.get('result_sha256') == hashlib.sha256(stored['result_text'].encode('utf-8')).hexdigest())
 
     def assert_context(self):
@@ -399,6 +397,7 @@ class HostTools:
             **{key: working.get(key, []) for key in ("source_refs", "dataset_refs", "script_refs", "run_refs")},
             "attachment_refs": self.state.get("attachment_refs") or [],
             "visualization_enabled": bool(self.state.get("visualization_enabled")),
+            "browse_requested": self.state.get("browse_requested") is True,
             "selected_skills": list(self.state.get("selected_skills") or []),
             "context_compression": bool(self.state.get("context_compression", True)),
             "tool_status": [dict(r) for r in self.records], "no_replay": True}

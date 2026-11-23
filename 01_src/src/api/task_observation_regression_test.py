@@ -104,3 +104,25 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual(status.headers['Cache-Control'], 'no-store')
         self.assertEqual(status.json()['event_cursor'], done['seq'])
         self.assertEqual(status.json()['terminal_snapshot']['display_status'], 'completed')
+
+    def test_update_request_is_idempotent_and_finalization_fences_the_version(self):
+        from src.agent.identity import ExecutionIdentity
+
+        identity = ExecutionIdentity(self.owner, self.sid, 'original-server-request', self.claim.job_id)
+        job_id = identity.run_id
+        self.client.app.add_api_route('/jobs/{job_id}/updates', main.update_chat_task, methods=['POST'])
+        self.client.app.add_api_route('/jobs/{job_id}/updates/{update_request_id}', main.chat_task_update_status)
+        route = f'/jobs/{job_id}/updates'
+        payload = {'expected_version': 0, 'instruction': 'Add PDF', 'update_request_id': 'update-1'}
+        first = self.client.post(route, json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertFalse(task_events.fence_final_answer(identity, 0))
+        self.assertTrue(task_events.fence_final_answer(identity, 1))
+        self.assertEqual(self.client.post(route, json=payload).json(), first.json())
+        self.assertEqual(self.client.post(route, json={**payload, 'instruction': 'Add XLSX'}).status_code, 409)
+        self.assertEqual(self.client.post(route, json={**payload, 'expected_version': 1,
+                                                       'update_request_id': 'update-2'}).status_code, 409)
+        self.assertEqual(self.client.get(f'{route}/update-1').json(), first.json())
+        self.assertEqual(self.client.get(f'{route}/update-2').status_code, 404)
+        self.owner += 1
+        self.assertEqual(self.client.get(f'{route}/update-1').status_code, 404)

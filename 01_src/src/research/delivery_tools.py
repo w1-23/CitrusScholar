@@ -191,48 +191,116 @@ def legacy_delivery_call(name: str, args: dict) -> tuple[str, dict]:
 
 
 def _data_audit_payload(review: dict) -> dict:
-    """Project persisted findings into machine-readable original coordinates."""
-    from openpyxl.utils import get_column_letter
-    from src.core.data_audit_xlsx import _kind, _FINDING_SEVERITIES, _ANNOTATION_SEVERITIES
+    """Keep legacy table issues and expose the shared review projection."""
+    from citrus_audit.workbook import _kind
+    from src.core.data_audit_xlsx import _FINDING_SEVERITIES, _ANNOTATION_SEVERITIES
+    from .audit_projection import location_cells, project_findings, table_location, table_targets
+
     report = review['report']
     issues = []
-    for result in report.get('table_results', []):
-        for signal in result.get('findings', []):
-            row, col = signal.get('row'), signal.get('column_index')
-            metadata = next((entry for entry in result.get('table_metadata', [])
-                             if entry['sheet_name'] == signal.get('sheet', '')), {})
-            evidence = signal.get('evidence') or {}
-            cells = [f"{get_column_letter(cell['column_index'])}{cell['row']}"
-                     for cell in evidence.get('cells', []) if isinstance(cell, dict)
-                     and type(cell.get('row')) is int and cell['row'] > 0
-                     and type(cell.get('column_index')) is int and 0 < cell['column_index'] <= 16384]
-            if not cells and type(row) is int and row > 0:
-                if type(col) is int and 0 < col <= 16384:
-                    cells = [f'{get_column_letter(col)}{row}']
-                elif signal.get('check') == 'row_annotation' and signal.get('field'):
-                    # Older annotation records did not carry a physical column.
-                    cells = []
-                else:
-                    cells = [f'{get_column_letter(c)}{row}' for c in
-                             range(1, int(metadata.get('column_count') or result.get('columns') or 0) + 1)]
-            label, fallback, _ = _kind(signal.get('check', ''))
+    for target in table_targets(report):
+        for signal in target['signals']:
+            location = table_location(target, signal)
+            cells = list(location_cells(location).values())
+            label, fallback, _ = _kind(signal['check'])
             severity = signal.get('severity') or signal.get('level') or ''
-            issues.append({**signal, 'file': result['file'], 'file_index': result.get('file_index'),
-                'source_file_id': result.get('source_file_id', ''), 'source_sha256': result.get('source_sha256', ''),
-                'sheet': signal.get('sheet', ''), 'cell': cells[0] if len(cells) == 1 else '',
-                'cells': list(dict.fromkeys(cells)), 'category': signal.get('check', ''), 'category_label': label,
-                'severity': severity, 'severity_label': _FINDING_SEVERITIES.get(severity,
-                    _ANNOTATION_SEVERITIES.get(severity, fallback)),
-                'location_scope': 'cells' if cells else 'column' if col else 'table'})
+            issues.append({**signal, 'file': target['source_name'], 'file_index': target['file_index'],
+                'source_file_id': target['source_file_id'], 'source_sha256': target['source_sha256'],
+                'sheet': target['sheet'], 'region_id': target['region_id'], 'region_bounds': target['region_bounds'],
+                'cell': cells[0] if len(cells) == 1 else '', 'cells': cells,
+                'category': signal['check'], 'category_label': label, 'severity': severity,
+                'severity_label': _FINDING_SEVERITIES.get(severity, _ANNOTATION_SEVERITIES.get(severity, fallback)),
+                'location_scope': 'cells' if cells else 'column' if signal.get('column_index') else 'table'})
     return {'schema_version': 'data-audit-export/1', 'review_id': review['review_id'],
-            'session_id': review['session_id'], 'created_at': review['created_at'],
-            'issues': issues, **report,
-            'interpretation': '错误表示违反显式数据规则；review/info 为探索性复核线索，不代表科研不端。原始文件未修改。'}
+            'session_id': review['session_id'], 'created_at': review['created_at'], **report,
+            'issues': issues, 'finding_projection': report.get('finding_projection') or project_findings(report),
+            'interpretation': '错误表示违反显式数据规则。探索性发现属于人工复核线索。原始文件未修改。'}
+
+
+def publish_audit_workbooks(report, *, load_source, title='', review_id=''):
+    """Publish one annotated copy per reviewed source using the recorded findings."""
+    from collections import defaultdict
+    from hashlib import sha256
+    from io import BytesIO
+    from pathlib import Path
+    from zipfile import ZipFile
+    from citrus_audit.workbook import export_reviewed_workbook
+    from src.core.cancel import ToolCancelled, raise_if_cancelled
+    from src.core.ooxml_determinism import normalize_ooxml_bytes
+    from . import tools
+    from .audit_projection import iter_findings, location_cells, source_key, table_targets
+
+    groups, targets_by_location = defaultdict(list), defaultdict(list)
+    errors = []
+    targets = list(table_targets(report))
+    for result in report['table_results']:
+        if result.get('ok') and not result.get('table_metadata'):
+            errors.append(f"{result['file']}: 审查记录缺少工作表渲染元数据")
+    for target in targets:
+        key = source_key(target)
+        if key is None or (target['region_id'] and (not target['column_numbers'] or not target['row_numbers'])):
+            errors.append(f"{target['source_name']}: 无法唯一绑定已审查的来源坐标")
+            continue
+        target['findings'] = []
+        groups[key].append(target)
+        targets_by_location[key, target['sheet'], target['region_id']].append(target)
+    for finding in iter_findings(report, targets):
+        per_target = {}
+        for location in finding['locations']:
+            key = (source_key(location), location.get('sheet', ''), location.get('region_id') or '')
+            matches = targets_by_location.get(key, ())
+            if len(matches) == 1:
+                target, cells = per_target.setdefault(key, (matches[0], {}))
+                cells.update(location_cells(location))
+        for target, cells in per_target.values():
+            target['findings'].append({'check': finding['rule'], 'severity': finding['severity'],
+                'detail': finding['detail'], 'region_id': target['region_id'],
+                'finding_id': finding.get('finding_id', ''), 'layer': finding['kind'],
+                'coverage_only': finding['kind'] == 'coverage_diagnostic',
+                'evidence': {'cells': [{'row': row, 'column_index': column} for row, column in cells]}})
+    receipts = {}
+    for key, group in groups.items():
+        raise_if_cancelled('data_audit_workbook')
+        source = group[0]
+        file_name, digest = source['source_name'], source['source_sha256']
+        try:
+            data = load_source(source)
+            if sha256(data).hexdigest() != digest:
+                raise ValueError('审查原件哈希已变化')
+            suffix = Path(file_name).suffix.lower()
+            original = suffix in {'.xlsx', '.xlsm'}
+            if suffix == '.xlsm':
+                with ZipFile(BytesIO(data)) as archive:
+                    if any('vbaproject' in name.lower() or '/macrosheets/' in name.lower() for name in archive.namelist()):
+                        raise ValueError('含宏工作簿不能发布为 XLSX，可交付 HTML/JSON')
+            if not original:
+                frames = [tools._load_frame_from_bytes(data, file_name, sheet_name=target['sheet'],
+                    header_row=target['header_row'], header_rows=target['header_rows']) for target in group]
+                data, names = tools._frames_to_workbook_bytes(frames)
+                group = [{**target, 'sheet_name': name} for target, name in zip(group, names)]
+            content, stats = export_reviewed_workbook(data, targets=group, source_sha256=digest, original=original)
+            content = normalize_ooxml_bytes(content)
+            stem = tools._short_stem(file_name)
+            index = source['file_index']
+            label = tools._safe_name(title) + '_' if title else ''
+            filename = f'{label}{index}_{stem}_数据审查.xlsx'
+            url = tools._save_artifact(filename, content, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                source_file_id=source['source_file_id'], source_sha256=digest,
+                logical_task_id='data_audit:' + review_id if review_id else '')
+            if not url:
+                raise ValueError('审查交付未获得发布回执')
+            receipts[key] = {'url': url, 'filename': filename, 'sha256': sha256(content).hexdigest(),
+                             'size_bytes': len(content), 'source_file_id': source['source_file_id'],
+                             'source_sha256': digest, 'file_index': index, 'cells': stats['marked_locations']}
+        except ToolCancelled:
+            raise
+        except Exception as exc:
+            errors.append(f'{file_name} [{source["file_index"]}]: {type(exc).__name__}: {exc}')
+    return receipts, errors
 
 
 def _publish_data_audit(review_id: str, output_format: str, title: str = '') -> str:
     """Render an existing account/session review; never invoke an audit rule."""
-    import hashlib
     from html import escape
     from pathlib import Path
     from src.core.tracing import get_user_id, get_session_id
@@ -258,50 +326,38 @@ def _publish_data_audit(review_id: str, output_format: str, title: str = '') -> 
         if output_format == 'json':
             content, mime = encoded.encode('utf-8'), 'application/json'
         else:
-            rows = ''.join('<tr>' + ''.join('<td>' + escape(str(item.get(key, ''))) + '</td>'
-                for key in ('file', 'sheet', 'cells', 'category', 'severity', 'detail')) + '</tr>'
-                for item in payload['issues'])
+            from .audit_projection import location_cells
+            rows = ''.join('<tr>' + ''.join('<td>' + escape(str(value)) + '</td>' for value in (
+                loc.get('source_name', ''), loc.get('sheet', ''), loc.get('region_id', ''),
+                ', '.join(location_cells(loc).values()), item['rule'], item['severity'], item['detail'])) + '</tr>'
+                for item in payload['finding_projection']['findings'] for loc in item['locations'])
             content = ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>' +
                 escape(title or '数据审查') + '</title></head><body><h1>' + escape(title or '数据审查') +
                 '</h1><p>' + escape(payload['interpretation']) + '</p><p>复核记录：' + escape(review_id) +
-                '</p><table><thead><tr><th>文件</th><th>工作表</th><th>单元格</th><th>类别</th>' +
+                '</p><table><thead><tr><th>文件</th><th>工作表</th><th>区域</th><th>单元格</th><th>类别</th>' +
                 '<th>严重程度</th><th>说明</th></tr></thead><tbody>' + rows +
                 '</tbody></table><details><summary>完整结果、覆盖与规则执行凭证</summary><pre>' +
                 escape(encoded) + '</pre></details></body></html>').encode('utf-8')
             mime = 'text/html'
         prepared.append((stem + '.' + output_format, content, mime, {}))
     else:
-        from src.core.data_audit_xlsx import annotate_workbook_multi
-        for result in report['table_results']:
-            if not result.get('ok'):
-                continue
-            metadata = result.get('table_metadata')
-            if not metadata:
-                raise ValueError('旧审查记录缺少表头/工作表渲染元数据，不能可靠生成标注 XLSX；可导出已有 HTML/JSON')
-            source = files.get_account_file(result.get('source_file_id', ''), owner, touch=False)
-            if not source or source.get('sha256') != result.get('source_sha256'):
-                raise ValueError('审查原件不可用或已变化，未重新扫描')
-            data = Path(source['path']).read_bytes()
-            if hashlib.sha256(data).hexdigest() != result['source_sha256']:
-                raise ValueError('审查原件哈希已变化，未重新扫描')
-            targets = [{**entry, 'findings': [signal for signal in result['findings']
-                       if signal.get('sheet', '') == entry['sheet_name']]} for entry in metadata]
-            if Path(result['file']).suffix.lower() not in {'.xlsx', '.xlsm'}:
-                # Parsing for workbook conversion only; original scan stays authoritative.
-                tables = [tools._load_frame_from_bytes(data, result['file'],
-                    sheet_name=entry['sheet_name'], header_row=entry['header_row'],
-                    header_rows=result.get('header_rows')) for entry in metadata]
-                data, names = tools._frames_to_workbook_bytes(tables)
-                for target, name in zip(targets, names):
-                    target['sheet_name'] = name
-            content, _ = annotate_workbook_multi(data, targets=targets,
-                notes=result.get('review_notes', []) + [f'审查结果引用：{review_id}；复用原扫描，未重新执行检查。'],
-                rule_catalog=result.get('rule_catalog', []), source_name=result['file'],
-                source_sha256=result['source_sha256'])
-            filename = f"{stem}_{result.get('file_index', 0)}_{tools._short_stem(result['file'])}.xlsx"
-            prepared.append((filename, content,
-                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                {'source_file_id': result['source_file_id'], 'source_sha256': result['source_sha256']}))
+        def load_source(target):
+            source = files.get_account_file(target['source_file_id'], owner, touch=False)
+            if not source or source.get('sha256') != target['source_sha256']:
+                raise ValueError('审查原件不可用或已变化')
+            limit = 30 * 1024 * 1024
+            with Path(source['path']).open('rb') as handle:
+                data = handle.read(limit + 1)
+            if len(data) > limit or len(data) != source.get('size_bytes', len(data)):
+                raise ValueError('审查原件超过读取上限或大小不符')
+            return data
+
+        receipts, errors = publish_audit_workbooks(report, load_source=load_source, title=title, review_id=review_id)
+        links = [receipt['url'] for receipt in receipts.values()]
+        if not links and not errors:
+            raise ValueError('审查记录没有可交付的数据表')
+        error_text = '[ERR_DATA_AUDIT_EXPORT] ' + '；'.join(errors) + '\n' if errors else ''
+        return error_text + '同一次扫描的标注工作簿（含原始坐标）：\n' + '\n'.join(links)
     links, errors = [], []
     for filename, content, mime, source_args in prepared:
         try:

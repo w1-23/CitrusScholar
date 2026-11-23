@@ -10,7 +10,7 @@
 <script src="/assets/vendor/marked-4.3.0.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/assets/app.css?v=40">
+<link rel="stylesheet" href="/assets/app.css?v=41">
 <link rel="stylesheet" href="/assets/skill-picker.css?v=3">
 <link rel="stylesheet" href="/assets/guide.css?v=4">
   <link rel="stylesheet" href="/assets/mascot.css?v=4">
@@ -296,7 +296,14 @@
         <div id="attachment-list" class="attachment-list" aria-live="polite"></div>
         <textarea id="user-input" rows="2" placeholder="有什么想做的？(Enter 发送 / Shift+Enter 换行)"></textarea>
         <div class="input-bottom">
+          <div class="composer-mode" id="composer-supplement" hidden>
+            <span>补充本轮要求</span>
+            <button type="button" class="attach-btn" id="composer-new-message">返回新消息</button>
+          </div>
           <div class="input-actions">
+            <label class="composer-browse" id="composer-browse" title="仅请求本次联网浏览，仍按服务权限处理。">
+              <input type="checkbox" id="browse-requested" autocomplete="off"> 联网浏览
+            </label>
             <input id="attachment-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif,.pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb" multiple hidden onchange="handleAttachmentSelection(this.files)">
             <details class="input-tools" id="input-tools-menu">
               <summary class="attach-btn" aria-label="添加附件或选择场景">＋</summary>
@@ -587,15 +594,15 @@
 </template>
 <script src="/assets/guide.js?v=4"></script>
 <script src="/assets/task-state.js?v=10"></script>
-<script src="/assets/task-transport.js?v=5"></script>
+<script src="/assets/task-transport.js?v=6"></script>
 <script src="/assets/task-cards.js?v=8"></script>
-<script src="/assets/task-controls.js?v=3"></script>
-<script src="/assets/skill-picker.js?v=4"></script>
-<script src="/assets/app.js?v=61"></script>
+<script src="/assets/task-controls.js?v=4"></script>
+<script src="/assets/skill-picker.js?v=5"></script>
+<script src="/assets/app.js?v=62"></script>
 <script src="/assets/corpus_reader.js?v=8"></script>
 <script src="/assets/turn_rail.js?v=3"></script>
   <script src="/assets/mascot.js?v=4"></script>
 <script src="/assets/xlsx.full.min.js?v=1"></script>
-<script src="/assets/session_files.js?v=8"></script>
+<script src="/assets/session_files.js?v=9"></script>
 </body>
 </html>

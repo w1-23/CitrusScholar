@@ -1316,6 +1316,7 @@
   }
 
   function queueAccountFileReference(fileId) {
+    if (window.composerSupplement) { if (window.showBanner) window.showBanner('请返回新消息后添加资料库文件。'); return; }
     var file = fileCache[String(fileId || '')];
     if (!file) return;
     var refs = window._selectedAccountFileRefs || (window._selectedAccountFileRefs = []);

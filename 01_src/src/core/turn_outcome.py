@@ -68,7 +68,7 @@ class CompletionEnvelope(_FinalModel):
 
 def completion_digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
-        separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+        separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
 def parse_completion(text: str) -> CompletionEnvelope:
@@ -90,7 +90,10 @@ def repairable_proposal_reason(reason: str) -> bool:
     """
     return reason in {"invalid_tool_arguments", "required_skill_not_loaded",
                       "preparation_required", "script_execution_rejected",
-                      "workspace_version_conflict"} or reason.startswith("load_failed:")
+                      "workspace_version_conflict", "workspace_revision_conflict",
+                      "script_patch_target_missing", "script_patch_empty",
+                      "script_patch_match_count", "script_patch_no_match",
+                      "script_patch_multiple_matches"} or reason.startswith("load_failed:")
 
 
 def completion_from_answer(answer: str, records) -> CompletionEnvelope:
@@ -110,6 +113,30 @@ def completion_from_answer(answer: str, records) -> CompletionEnvelope:
         incidental_partials=[], proposal_repairs=[],
         review=FinalReview(**{key: "宿主仅校验实际执行和交付回执；未执行额外模型科学复核。"
             for key in ("facts", "sources", "numbers", "conditions", "delivery")}))
+
+
+def artifact_goal_evidence(requirements, rows, verified_links):
+    from src.graph.export_contract import deliverable_match_groups
+    assets = [(row["tool_call_id"], item) for row in rows
+              if row.get("tool_call_id") and row.get("status") == "complete"
+              for item in row.get("artifact_validations", ())
+              if (item.get("valid") and item.get("request_matches") is True
+                  and item.get("link") in verified_links)]
+    matches = deliverable_match_groups([item for _, item in assets], requirements)
+    goals, gaps = [], []
+    for index, requirement in enumerate(requirements):
+        label = str(requirement.get("label") or f"交付件 {index + 1}")
+        members = matches.get(index)
+        if members:
+            goals.append(CompletionGoal(goal=label, kind="deliverable",
+                evidence_call_ids=list(dict.fromkeys(assets[member][0] for member in members)),
+                artifact_links=list(dict.fromkeys(assets[member][1]["link"] for member in members))))
+        else:
+            gaps.append({"obligation_id": "deliverable:" + str(requirement.get("product_id") or index),
+                         "reason_code": "required_deliverable_missing", "kind": "deliverable",
+                         "subject": {"label": label, "formats": requirement.get("formats") or []},
+                         "detail": f"尚未核验交付件：{label}"})
+    return goals, gaps
 
 
 def completion_errors(statement: CompletionEnvelope, records, missing=(), *, verified_repairs=(), superseded_proposals=()) -> tuple[str, ...]:
@@ -213,19 +240,34 @@ def reviewed_completion_valid(outcome, records, *, answer=None) -> bool:
                 superseded_proposals=proof.get("superseded_proposal_ids", ()))
                 or proof.get("answer_hash") != completion_digest(statement.answer)):
             return False
+        contract = proof.get("artifact_contract")
+        if contract is not None:
+            if (contract.get("schema_version") != 1
+                    or contract.get("request_version") != proof.get("request_version")):
+                return False
+            from src.core.task_result import effective_tool_records
+            goals, gaps = artifact_goal_evidence(contract["requirements"],
+                effective_tool_records(records), set(contract["verified_links"]))
+            if (goals != [goal for goal in statement.goals if goal.kind == "deliverable"]
+                    or (gaps and statement.status == "completed")
+                    or tuple(gaps) != tuple(gap for gap in data.get("gaps", ())
+                                           if gap.get("kind") == "deliverable")):
+                return False
         expected = tuple(claim.tool_call_id for claim in statement.incidental_partials)
         return tuple(data.get("incidental_partial_call_ids") or ()) == expected
-    except (ValueError, KeyError, TypeError):
+    except (AttributeError, ValueError, KeyError, TypeError):
         return False
 
 
-def reviewed_turn_outcome(statement, records, *, identity, request_version, request_hash, verified_repairs=(), superseded_proposals=()):
+def reviewed_turn_outcome(statement, records, *, identity, request_version, request_hash,
+                          verified_repairs=(), superseded_proposals=(), artifact_contract=None,
+                          delivery_gaps=()):
     """Called by the host only, after schema/reference/link and request checks."""
     complete = statement.status == "completed"
     return TurnOutcome(statement.status,
         "reviewed_completion" if complete else "reviewed_incomplete", "answered",
-        gaps=tuple({"reason_code": "agent_reported_unmet", "detail": text}
-                   for text in statement.remaining),
+        gaps=tuple(delivery_gaps) + tuple({"reason_code": "agent_reported_unmet", "detail": text}
+                   for text in statement.remaining if text not in {gap["detail"] for gap in delivery_gaps}),
         incidental_partial_call_ids=tuple(c.tool_call_id for c in statement.incidental_partials),
         operation_notices=tuple(f"辅助操作 {c.tool_call_id} 未完整完成：{c.reason}" for c in statement.incidental_partials),
         completion={"schema_version": 1, "identity": dict(identity),
@@ -233,7 +275,8 @@ def reviewed_turn_outcome(statement, records, *, identity, request_version, requ
             "records_hash": completion_digest(list(records)),
             "verified_proposal_repairs": list(verified_repairs),
             "superseded_proposal_ids": list(superseded_proposals),
-            "answer_hash": completion_digest(statement.answer), "statement": statement.model_dump()})
+            "answer_hash": completion_digest(statement.answer), "statement": statement.model_dump(),
+            **({"artifact_contract": artifact_contract} if artifact_contract is not None else {})})
 
 VALID_STATUSES = frozenset({"completed", "partial", "failed", "cancelled", "awaiting_input"})
 

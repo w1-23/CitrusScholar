@@ -1,6 +1,26 @@
 """Annotated source copies, without implicit appendices or rescanning."""
 from __future__ import annotations
 import hashlib
+import base64
+import datetime
+import decimal
+
+
+def _json_default(value):
+    """Encode known scalar types without inventing string identities."""
+    if isinstance(value, (datetime.date, datetime.datetime, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return float(value) if value.is_finite() else str(value)
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if isinstance(value, (set, frozenset)):
+        return sorted(value, key=lambda item: repr(item))
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    raise TypeError("unsupported_audit_json_type:" + type(value).__name__)
 import io
 import json
 import re
@@ -10,6 +30,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Border, PatternFill, Side
 from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import get_column_letter
+from .methods import COVERAGE_CHECKS
 def _unique_sheet_title(wb, desired: str) -> str:
     """Choose a workbook metadata title without replacing an uploaded sheet."""
     base = re.sub(r"[\\/*?:\[\]]", "_", str(desired or "审查信息")).strip() or "审查信息"
@@ -70,8 +91,7 @@ def _kind(check: str) -> tuple[str, str, str]:
 
 
 _RANK={'error':0,'warning':1,'review':1,'info':2,'ok':3}
-_COVERAGE={'iqr_insufficient','design_checks_skipped','invalid_group_mapping','invalid_value_mapping',
-           'grim_sd_skipped','integer_summary_not_checked','findings_truncated'}
+_ANNOTATION_COLORS = {'ok': ('E7F4EA', '1F6B33'), 'review': ('FDF1D6', '8A5A00')}
 
 
 def _sort(f):
@@ -81,7 +101,7 @@ def _sort(f):
 
 def _comment(findings, previous=''):
     ordered=sorted(findings,key=_sort)
-    ref='findings:sha256:'+hashlib.sha256(json.dumps(ordered,ensure_ascii=False,sort_keys=True,default=str).encode()).hexdigest()
+    ref='findings:sha256:'+hashlib.sha256(json.dumps(ordered,ensure_ascii=False,sort_keys=True,default=_json_default).encode()).hexdigest()
     lines=[]
     if previous:lines.append('已有批注：'+' '.join(previous.split())[:250])
     for item in ordered[:10-len(lines)]:
@@ -100,7 +120,7 @@ def _data_signature(wb,bounds):
         ws=wb[name]
         state.append([name,[str(x) for x in ws.merged_cells.ranges],
             [[c.coordinate,c.value,c.data_type,c.number_format] for row in ws.iter_rows(max_row=height,max_col=width) for c in row]])
-    return hashlib.sha256(json.dumps(state,ensure_ascii=False,default=str,sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(state,ensure_ascii=False,default=_json_default,sort_keys=True).encode()).hexdigest()
 
 
 def _restore_original_cells(original, exported):
@@ -174,7 +194,7 @@ def export_snapshot(snapshot, *, explain_visible=False, issue_list=False, overvi
     report=snapshot.report
     suffix=Path(snapshot.source_name).suffix.lower()
     if suffix in {'.xlsx','.xlsm'}:
-        wb=load_workbook(io.BytesIO(snapshot.source_bytes),keep_vba=suffix=='.xlsm')
+        wb=load_workbook(io.BytesIO(snapshot.source_bytes),keep_vba=suffix=='.xlsm',rich_text=True)
     else:
         from .envelope import TableEnvelope
         wb=Workbook(); wb.remove(wb.active)
@@ -190,57 +210,100 @@ def export_snapshot(snapshot, *, explain_visible=False, issue_list=False, overvi
                     cell=ws.cell(row,col);cell.value=value
                     if isinstance(value,str):cell.data_type='s'
         if not wb.sheetnames:raise ValueError('No table snapshot available for workbook export')
+    return _render_workbook(wb, report['tables'], source_bytes=snapshot.source_bytes,
+                            source_sha256=snapshot.source_sha256, status=report['status'],
+                            original=suffix in {'.xlsx', '.xlsm'}, keep_vba=suffix == '.xlsm',
+                            explain_visible=explain_visible, issue_list=issue_list, overview=overview, rules=rules)
+
+
+def export_reviewed_workbook(data, *, targets, source_sha256, original=True,
+                             status='complete', issue_list=False, overview=False, rules=False):
+    """Render absolute coordinates from an existing review on verified workbook bytes."""
+    if original and hashlib.sha256(data).hexdigest() != source_sha256:
+        raise ValueError('Reviewed workbook hash mismatch')
+    wb = load_workbook(io.BytesIO(data), rich_text=True)
+    entries = [{'table': {**target, 'sheet': target['sheet_name']},
+                'result': {'data': {'findings': target['findings'],
+                                    'rule_execution': target.get('rule_execution') or {}}}}
+               for target in targets]
+    return _render_workbook(wb, entries, source_bytes=data, source_sha256=source_sha256,
+                            status=status, original=original, issue_list=issue_list, overview=overview, rules=rules)
+
+
+def finding_coordinates(item, columns):
+    """Return exact cells, with a scoped fallback for row-level issues."""
+    evidence = item.get('evidence') or {}
+    if 'cells' in evidence:
+        return [(cell.get('row'), cell.get('column_index')) for cell in evidence['cells']]
+    row, column = item.get('row'), item.get('column_index')
+    if type(row) is int:
+        return [(row, index) for index in ([column] if type(column) is int else columns)]
+    if type(column) is int:
+        return [(index, column) for index in evidence.get('rows', [])]
+    return []
+
+
+def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, original,
+                     keep_vba=False, explain_visible=False, issue_list=False, overview=False, rules=False):
     original_names=list(wb.sheetnames)
     bounds={ws.title:(ws.max_row,ws.max_column) for ws in wb.worksheets}
     if sum(height*width for height,width in bounds.values()) > 2_000_000:
         raise ValueError('Workbook export exceeds 2000000-cell verification budget')
     before=_data_signature(wb,bounds)
-    marks={}; all_findings=[]; full_refs={}
-    for entry in report['tables']:
-        table=entry['table']; name=entry.get('output_sheet',table['sheet'])
-        if name not in bounds:raise ValueError('Snapshot worksheet missing')
-        height,width=bounds[name]; header=table['header_row']
-        for original in entry['result']['data']['findings']:
-            item=dict(original); item['sheet']=name; all_findings.append(item)
-            row=item.get('row'); col=item.get('column_index')
-            if row not in (None,'') and (type(row)is not int or not header<row<=height):
-                raise ValueError('Finding row outside reviewed source')
-            if col not in (None,'') and (type(col)is not int or not 1<=col<=width):
-                raise ValueError('Finding column outside reviewed source')
-            coords=[];evidence=item.get('evidence') or {}
-            for coord in evidence.get('cells',[]) if isinstance(evidence,dict) else []:
-                r,c=coord.get('row'),coord.get('column_index')
-                if type(r)is not int or type(c)is not int or not header<r<=height or not 1<=c<=width:
-                    raise ValueError('Evidence cell outside reviewed source')
-                coords.append((r,c,True))
-            if item.get('coverage_only') or item.get('check') in _COVERAGE:continue
-            if not coords:
-                if row and col:coords=[(row,col,True)]
-                elif row:coords=[(row,c,True) for c in range(1,width+1)]
-                elif col:coords=[(header,col,False)]
-                else:coords=[(1,1,False)]
-            for r,c,color in coords:
-                key=(name,r,c);bucket=marks.setdefault(key,{'findings':[],'color':False})
-                bucket['findings'].append(item);bucket['color']|=color
-    for (name,row,col),bucket in sorted(marks.items()):
-        ws=wb[name];cell=ws.cell(row,col)
-        if isinstance(cell,MergedCell):
-            for region in ws.merged_cells.ranges:
-                if cell.coordinate in region:
-                    cell=ws.cell(region.min_row,region.min_col);break
-        key=(name,cell.row,cell.column)
-        full_refs.setdefault(key,{'findings':[],'color':False})
-        full_refs[key]['findings'].extend(bucket['findings']);full_refs[key]['color']|=bucket['color']
-    references={}
-    for (name,row,col),bucket in sorted(full_refs.items()):
-        cell=wb[name].cell(row,col)
-        unique={json.dumps(x,ensure_ascii=False,sort_keys=True,default=str):x for x in bucket['findings']}
-        text,ref=_comment(list(unique.values()),cell.comment.text if cell.comment else '')
-        references[ref]=sorted(unique.values(),key=_sort)
-        cell.comment=Comment(text,'Citrus Audit')
-        if bucket['color']:
-            cell.fill=PatternFill('solid',fgColor='FDE2E1')
-            side=Side(style='thin',color='E06666');cell.border=Border(left=side,right=side,top=side,bottom=side)
+    all_findings, marks = [], {}
+    for entry in entries:
+        table = entry['table']
+        name = entry.get('output_sheet', table['sheet'])
+        if name not in bounds:
+            raise ValueError('Snapshot worksheet missing')
+        ws = wb[name]
+        height, width = bounds[name]
+        header = table['header_row']
+        columns = table.get('column_numbers')
+        if columns is None:
+            columns = range(1, min(width, table.get('column_count', width)) + 1)
+        columns = set(columns)
+        rows = table.get('row_numbers')
+        if rows is None:
+            rows = range(header + 1, header + 1 + table.get('row_count', height - header))
+        elif not isinstance(rows, range):
+            rows = set(rows)
+        for original_item in entry['result']['data']['findings']:
+            item = {**original_item, 'sheet': name, 'reviewed_columns': sorted(columns),
+                    'columns': {int(number): title for number, title in zip(
+                        table.get('column_numbers') or (), table.get('columns') or ())}}
+            item.setdefault('region_id', table.get('region_id') or '')
+            all_findings.append(item)
+            if item.get('coverage_only') or item.get('check') in COVERAGE_CHECKS:
+                continue
+            coords = finding_coordinates(item, sorted(columns))
+            for row, column in coords:
+                if type(row) is not int or row not in rows or type(column) is not int or column not in columns:
+                    raise ValueError('Evidence cell outside reviewed table')
+                if row > height or column > width:
+                    continue
+                cell = ws.cell(row, column)
+                if isinstance(cell, MergedCell):
+                    merged = next((area for area in ws.merged_cells.ranges if cell.coordinate in area), None)
+                    if merged is None or merged.min_row not in rows or merged.min_col not in columns:
+                        continue
+                    row, column = merged.min_row, merged.min_col
+                marks.setdefault((name, row, column), []).append(item)
+    references = {}
+    for (name, row, column), findings in sorted(marks.items()):
+        cell = wb[name].cell(row, column)
+        unique = {json.dumps(item, ensure_ascii=False, sort_keys=True, default=_json_default): item for item in findings}
+        ordered = sorted(unique.values(), key=_sort)
+        previous = cell.comment.text if cell.comment else ''
+        text, ref = _comment(ordered)
+        references[ref] = ordered
+        cell.comment = Comment(previous + '\n\n' + text if previous else text, 'Citrus Audit')
+        fill_color, line_color = 'FDE2E1', 'E06666'
+        if all(item.get('check') == 'row_annotation' for item in ordered):
+            fill_color, line_color = _ANNOTATION_COLORS.get(ordered[0].get('severity'), (fill_color, line_color))
+        cell.fill = PatternFill('solid', fgColor=fill_color)
+        side = Side(style='thin', color=line_color)
+        cell.border = Border(left=side, right=side, top=side, bottom=side)
     explanations=[]
     def put(ws,row,col,value):
         cell=ws.cell(row,col,value)
@@ -265,29 +328,54 @@ def export_snapshot(snapshot, *, explain_visible=False, issue_list=False, overvi
         for r,values in enumerate([headers,*rows],start=1):
             for c,value in enumerate(values,start=1):put(ws,r,c,value)
     if issue_list:
-        appendix('问题清单',['工作表','行','列','规则','严重程度','说明'],
-            [[x['sheet'],x.get('row') or '',x.get('column_index') or '',x.get('check',''),x.get('severity',''),str(x.get('detail',''))[:32000]]
-             for x in sorted(all_findings,key=lambda x:(x['sheet'],*_sort(x)))])
+        issue_rows=[]
+        for index,x in enumerate(sorted(all_findings,key=lambda x:(x['sheet'],*_sort(x))),start=1):
+            coords=[(r,c) for r,c in finding_coordinates(x,x.get('reviewed_columns') or ())
+                    if type(r) is int and type(c) is int and 0<r<=1048576 and 0<c<=16384]
+            cells=[f'{get_column_letter(c)}{r}' for r,c in coords]
+            values=[]
+            for r,c in coords:
+                value=wb[x['sheet']].cell(r,c).value
+                text='' if value is None else str(value)
+                if text not in values:values.append(text)
+            column_names=[str((x.get('columns') or {}).get(c) or c) for c in
+                          dict.fromkeys(c for _,c in coords)]
+            label,_,action=_kind(str(x.get('check','')))
+            evidence=x.get('evidence') or {}
+            issue_rows.append([index,x['sheet'],x.get('region_id',''),','.join(cells)[:32000],
+                ','.join(str(v) for v in dict.fromkeys(r for r,_ in coords)),
+                ','.join(column_names)[:32000],','.join(str(c) for c in dict.fromkeys(c for _,c in coords)),
+                label,x.get('severity',''),' | '.join(values)[:32000],x.get('check',''),
+                str(x.get('detail',''))[:32000],action,x.get('layer') or
+                ('manual_or_model_annotation' if x.get('check')=='row_annotation' else 'table_rule'),
+                json.dumps(evidence,ensure_ascii=False,default=_json_default)[:32000]])
+        appendix('问题清单',['序号','工作表','区域','单元格','行','列','列索引','问题类型',
+            '严重程度','原值','检测规则','说明','建议核查动作','结果层','计算/定位证据（长内容需读完整结果）'],
+            issue_rows)
     if overview:
-        appendix('审查概览',['项目','值'],[['原始 SHA-256',snapshot.source_sha256],['状态',report['status']],
-            ['已解析表',len(report['tables'])],['发现',len(all_findings)],['限制','发现仅为复核线索，不是科研不端判定']])
+        appendix('审查概览',['项目','值'],[['原始 SHA-256',source_sha256],['状态',status],
+            ['已解析表',len(entries)],['发现',len(all_findings)],['限制','发现仅为复核线索，不是科研不端判定']])
     if rules:
-        appendix('审查规则',['工作表','规则','状态','方法版本','已检查','跳过','原因/范围'],
-            [[entry['table']['sheet'],key,rule['status'],rule.get('method_version',''),rule.get('tested',0),rule.get('skipped',0),
-              json.dumps(rule,ensure_ascii=False,default=str)[:32000]]
-             for entry in report['tables'] for key,rule in entry['result']['data']['rule_execution']['rules'].items()])
+        appendix('审查规则',['工作表','区域','规则','状态','方法版本','已检查','跳过','原因/范围'],
+            [[entry['table']['sheet'],entry['table'].get('region_id',''),key,rule['status'],rule.get('method_version',''),rule.get('tested',0),rule.get('skipped',0),
+              json.dumps(rule,ensure_ascii=False,default=_json_default)[:32000]]
+             for entry in entries for key,rule in entry['result']['data']['rule_execution'].get('rules', {}).items()])
     after=_data_signature(wb,bounds)
     if after!=before:raise ValueError('Export changed original values, types, formats or merges')
     output=io.BytesIO();wb.save(output);blob=output.getvalue()
-    if suffix in {'.xlsx','.xlsm'}:
-        blob=_restore_original_cells(snapshot.source_bytes,blob)
-    reopened=load_workbook(io.BytesIO(blob),keep_vba=suffix=='.xlsm')
-    if _data_signature(reopened,bounds) != before:
-        raise ValueError('Serialized export changed original data')
-    if not explain_visible and any((reopened[name].max_row,reopened[name].max_column)!=extent for name,extent in bounds.items()):
-        raise ValueError('Serialized export expanded original data region')
-    return blob,{'version':'2.0.0','source_sha256':snapshot.source_sha256,'export_sha256':hashlib.sha256(blob).hexdigest(),
+    if original:
+        blob=_restore_original_cells(source_bytes,blob)
+    reopened=load_workbook(io.BytesIO(blob),keep_vba=keep_vba,rich_text=True)
+    try:
+        if _data_signature(reopened,bounds) != before or reopened.sheetnames[:len(original_names)] != original_names:
+            raise ValueError('Serialized export changed original data')
+        if not explain_visible and any((reopened[name].max_row,reopened[name].max_column)!=extent for name,extent in bounds.items()):
+            raise ValueError('Serialized export expanded original data region')
+    finally:
+        reopened.close()
+        wb.close()
+    return blob,{'version':'2.0.0','source_sha256':source_sha256,'export_sha256':hashlib.sha256(blob).hexdigest(),
         'original_sheets':original_names,'added_sheets':added,'explanation_blocks':explanations,
         'original_data_sha256':before,'exported_data_sha256':after,'data_region_unchanged':True,
         'marked_locations':len(references),'findings_references':references,'scan_reused':True,
-        'source_representation':'original_workbook' if suffix in {'.xlsx','.xlsm'} else 'table_snapshot_conversion'}
+        'source_representation':'original_workbook' if original else 'table_snapshot_conversion'}

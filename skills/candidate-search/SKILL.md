@@ -3,7 +3,7 @@ name: candidate-search
 description: 组合本地混合召回、网页来源和同篇多路获取，先返回少量候选，再以持久证据引用直接读取原文。
 license: MIT
 metadata:
-  version: "2.0.0"
+  version: "2.0.1"
 ---
 
 # 候选检索与证据回读
@@ -35,3 +35,7 @@ GPU 默认使用 Windows DirectML。Linux 可用 `--provider CUDAExecutionProvid
 逐项区分候选、已获取、已交付模型和已引用。passage/abstract/full_text 等 evidence_level 原样保留；摘要不能称全文。来源包含十个键；引用气泡应使用持久记录，不能现搜补全缺项。
 
 竞速响应中的 cancelled_after_success/not_awaited_after_success 表示停止等待的事实；Future.cancel 不保证 HTTP 已中止。timeout/error/no_match 分开说明。失败历史不能被一次成功抹除。
+
+## 与其他证据链的边界
+
+候选检索只给出检索证据和可回读定位。文献身份核对使用 reference-verification 自己的 audit_id，不把候选命中写成已确认引文。表格数据审查使用 data-audit 的 review_id 和 data-audit-findings/1 投影；候选检索结果不充当数据审查发现，也不得声称已得到合并审查工作簿。

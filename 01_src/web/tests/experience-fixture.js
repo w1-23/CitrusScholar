@@ -1,6 +1,7 @@
 // Injected only by the isolated Chromium test. No production scripts load this.
 (() => {
   const sid = 'browser-fixture-session', rid = 'browser-fixture-request', job = 'browser-fixture-job';
+  const otherSid = 'browser-fixture-other';
   const state = () => JSON.parse(sessionStorage.getItem('experience-test-state') || '{"phase":"queued"}');
   const save = patch => sessionStorage.setItem('experience-test-state', JSON.stringify({...state(), ...patch}));
   const has = (...phases) => phases.includes(state().phase);
@@ -11,10 +12,13 @@
     download_url: '/api/v2/files/' + id + '/download', last_accessed_at: 1700000000});
   const dataFiles = [file('fixture-file-0', 'Measurements.csv'), file('workbook', 'Measurements.xlsx')];
   const svgId = 'imported-project';
-  window.experienceRequests = () => ({posts: state().posts || [], imports: state().imports || []});
+  window.experienceRequests = () => ({posts: state().posts || [], imports: state().imports || [], saves: state().saves || [],
+    exports: state().exports || [], updates: state().updates || [], lookups: state().lookups || []});
+  window.experienceUpdateMode = (mode, hold = false) => save({updateMode: mode, lookupHeld: hold});
+  window.experienceQueueAvailability = available => save({queueUnavailable: !available});
   window.experienceStep = phase => save({phase, start: phase === 'start' ? Date.now() / 1000 - 10 : start()});
   window.experienceScale = (turns, files) => save({turns, files});
-  localStorage.setItem('citrus_session_id_browser-fixture-user', sid);
+  if (!localStorage.getItem('citrus_session_id_browser-fixture-user')) localStorage.setItem('citrus_session_id_browser-fixture-user', sid);
   const frame = (seq, event, data) => ({seq, event, data: {...data, job_id: job, request_id: rid, session_id: sid}});
   const estimate = (attempt, count, options = {}) => {
     const components = {messages: count - 1000, system: 480, tool_arguments: 70, tool_schemas: 350, images: 0, protocol: 100};
@@ -40,6 +44,8 @@
       result.push(frame(result.length + 1, 'tool_call_start', {...tool, status: 'running'}));
       result.push(frame(result.length + 1, 'tool_result', {...tool, status: 'complete'}));
     }
+    result.push(frame(result.length + 1, 'assistant_progress', {text: '公开进度：正在核查列名', visibility: 'public', origin: 'model', note_id: 'public-fixture'}));
+    result.push(frame(result.length + 1, 'assistant_progress', {text: 'INTERNAL_FIXTURE_MARKER', visibility: 'private', origin: 'model', note_id: 'private-fixture'}));
     result.push(frame(result.length + 1, 'answer_start', {}));
     result.push(frame(result.length + 1, 'text', {content: '  \n'}));
     if (has('whitespace')) return result;
@@ -58,9 +64,18 @@
     const url = new URL(typeof input === 'string' ? input : input.url, location.href), p = url.pathname;
     if (url.origin !== location.origin || !p.startsWith('/api/') && !p.startsWith('/jobs/')) return nativeFetch(input, settings);
     if (settings?.signal?.aborted || !navigator.onLine) throw new TypeError('Fixture transport offline');
-    let body = {};
+    let body = {}, status = 200;
+    const figureBase = '/api/v2/figures/projects/' + svgId;
+    const figure = (overrides = [], version = 1) => ({figure_id: svgId, title: '隔离夹具新建图件', editable: true,
+      render_version: version, exports: {svg: {size_bytes: 200}}, overrides,
+      manifest: {figure_size_px: [360, 180], objects: [{gid: 'fixture-title', role: 'title', label: '示例标题', text: '示例标题', editable: ['text']}]}});
+    const rendering = () => figure(state().saves?.at(-1)?.overrides || [], 1 + (state().saves || []).length);
+    const asSvg = () => '<svg xmlns="http://www.w3.org/2000/svg" width="360" height="180" viewBox="0 0 360 180"><text id="fixture-title" x="20" y="40">示例标题</text></svg>';
     if (p === '/api/v2/auth/me') body = {user: {user_id: 'browser-fixture-user', username: '本地验收', role: 'user'}};
-    else if (p === '/api/v2/sessions') body = {sessions: [{session_id: sid, title: '表格核对', updated_at: new Date().toISOString()}]};
+    else if (p === '/api/v2/sessions') body = {sessions: [
+      {session_id: sid, title: '表格核对', msg_count: 1, updated_at: new Date().toISOString()},
+      {session_id: otherSid, title: '另一个会话', msg_count: 1, updated_at: new Date().toISOString()}]};
+    else if (p === '/api/v2/skills') body = {skills: [{id: 'data-audit', version: 'fixture-v1', sha256: 'a'.repeat(64), description: '核查表格'}]};
     else if (p === '/api/v2/files') body = {retention_idle_days: 30, generated: [], uploaded: Array.from({length: state().files || 0}, (_, i) =>
       i === 0 ? dataFiles[0] : file('fixture-file-' + i, '文件 ' + (i + 1) + '.csv'))};
     else if (p === dataFiles[0].download_url) return new Response(csv, {headers: {'Content-Type': 'text/csv'}});
@@ -80,26 +95,62 @@
       const projects = Array.from({length: 122}, (_, i) => ({figure_id: 'old-project-' + i, title: '历史图件 ' + i, editable: false}));
       const offset = +(url.searchParams.get('offset') || 0), limit = +(url.searchParams.get('limit') || 31);
       body = {projects: projects.slice(offset, offset + limit)};
-    } else if (p === '/api/v2/figures/projects/' + svgId) {
-      body = {figure_id: svgId, title: '隔离夹具新建图件', editable: false, exports: {}};
+    } else if (p === figureBase) {
+      body = rendering();
+    } else if (p === figureBase + '/overrides' && settings?.method === 'POST') {
+      save({saves: [...(state().saves || []), JSON.parse(settings.body)]});
+      body = rendering();
+    } else if (p === figureBase + '/preview.svg' || p === figureBase + '/export/svg') {
+      if (p.endsWith('/export/svg')) save({exports: [...(state().exports || []), url.searchParams.get('v')]});
+      const svg = asSvg();
+      return new Response(svg, {headers: {'Content-Type': 'image/svg+xml', 'Content-Disposition': 'attachment; filename=fixture.svg', 'Content-Length': String(new TextEncoder().encode(svg).length)}});
     } else if (p.endsWith('/messages')) body = {messages: [], turns: Array.from({length: state().turns || 0}, (_, i) => ({turn_request_id: 'saved-' + i, user: {content: '历史问题 ' + i}, answer: {content: '历史回答 ' + i}, display_status: 'completed'})), has_more: false};
-    else if (p.endsWith('/turn-queue')) {
+    else if (p.startsWith('/api/v2/session/' + otherSid + '/')) body = {turns: []};
+    else if (p.startsWith('/api/v2/chat/jobs/' + job + '/updates/')) {
+      const id = p.split('/').at(-1);
+      save({lookups: [...(state().lookups || []), id]});
+      const receipt = (state().receipts || {})[id];
+      status = state().lookupHeld ? 503 : receipt ? 200 : 404;
+      body = status === 200 ? receipt : {};
+    } else if (p === '/api/v2/chat/jobs/' + job + '/updates' && settings?.method === 'POST') {
+      const payload = JSON.parse(settings.body);
+      const receipts = state().receipts || {};
+      save({updates: [...(state().updates || []), payload]});
+      if (state().updateMode === 'conflict') status = 409;
+      else {
+        const id = payload.update_request_id;
+        body = receipts[id] || {version: 2 + Object.keys(receipts).length, instruction: payload.instruction};
+        save({receipts: {...receipts, [id]: body}});
+        if (state().updateMode === 'lost') throw new TypeError('Fixture dropped update receipt');
+      }
+    } else if (p.includes('/turn-queue/') && settings?.method === 'DELETE') {
+      const id = p.split('/').at(-1);
+      const row = (state().posts || []).find(entry => entry.client_request_id === id);
+      if (!row) status = 404;
+      else {
+        save({cancelled: [...(state().cancelled || []), id]});
+        body = {...row, state: 'terminal', clear_reason: 'cancelled'};
+      }
+    } else if (p.endsWith('/turn-queue')) {
+      if (state().queueUnavailable && settings?.method !== 'POST') return new Response('{}', {status: 503});
       let admissions = state().posts || [];
       if (settings?.method === 'POST') {
         admissions = [...admissions, JSON.parse(settings.body)];
         save({posts: admissions});
       }
       const entries = admissions.map((entry, i) => ({...entry, session_id: sid, job_id: 'new-job-' + i, queue_seq: i + 10,
-        queue_position: i + 1, state: 'queued', accepted_at: Date.now() / 1000}));
+        queue_position: i + 1, state: 'queued', accepted_at: Date.now() / 1000,
+        ...((state().cancelled || []).includes(entry.client_request_id) ? {state: 'terminal', clear_reason: 'cancelled'} : {})}));
       body = settings?.method === 'POST' ? entries.at(-1) : {turns: [queue(), ...entries]};
     }
     else if (p === '/jobs/' + job || p === '/jobs/' + job + '/events') {
       const events = frames(), after = +(url.searchParams.get('after') || 0);
       body = {job_id: job, protocol: 'citrus-task/1', status: has('done') ? 'completed' : 'running',
         terminal_snapshot: envelope(), context_snapshot: events.filter(x => x.event === 'context_snapshot').at(-1)?.data,
+        task_version: 1 + Object.keys(state().receipts || {}).length,
         event_cursor: events.length, next_cursor: events.length, has_more: false, events: events.filter(x => x.seq > after)};
       if (body.context_snapshot) body.context_snapshot = {...body.context_snapshot, seq: events.filter(x => x.event === 'context_snapshot').at(-1).seq};
     }
-    return new Response(JSON.stringify(body), {headers: {'Content-Type': 'application/json'}});
+    return new Response(JSON.stringify(body), {status, headers: {'Content-Type': 'application/json'}});
   };
 })();

@@ -307,3 +307,13 @@ def test_to_http_exception_maps_queue_facts():
         turn_queue.TurnPayloadConflict("conflict")).status_code == 409
     assert turn_envelope.to_http_exception(
         turn_queue.TurnNotFound("missing")).status_code == 404
+
+
+def test_browse_opt_in_is_persisted_and_changes_request_identity():
+    base = _request()
+    original = _admit(base)
+    assert not turn_envelope.load_dispatch_input(original)[0]["browse_requested"]
+    with pytest.raises(turn_queue.TurnPayloadConflict):
+        _admit({**base, "browse_requested": True})
+    requested = _admit({**_request(cid="browse-turn"), "browse_requested": True})
+    assert turn_envelope.load_dispatch_input(requested)[0]["browse_requested"] is True

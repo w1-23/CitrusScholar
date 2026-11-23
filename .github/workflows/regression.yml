@@ -46,6 +46,7 @@ jobs:
             01_src/src/core/chat_turn_queue_test.py \
             01_src/src/agent/context_projection_regression_test.py \
             01_src/src/agent/context_schema_budget_test.py \
+            01_src/src/agent/host_runtime_contract_test.py \
             01_src/src/agent/nature_skill_resources_test.py \
             01_src/src/agent/preset_schema_manifest_test.py \
             01_src/src/core/context_send_view_test.py \
@@ -54,6 +55,8 @@ jobs:
             01_src/src/api/task_observation_regression_test.py \
             01_src/src/research/render_script_contract_test.py \
             01_src/src/research/audit_release_test.py \
+            01_src/src/research/audit_projection_test.py \
+            packages/citrus_audit/region_workbook_test.py \
             01_src/src/shared_corpus/maintenance_regression_test.py \
             01_src/src/shared_corpus/pmc_intake_test.py \
             01_src/src/research/nature_composition_test.py \

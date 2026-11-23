@@ -357,26 +357,51 @@ test('a pending question leaves the ordinary send available for the next turn', 
   assert.equal(b.userInput.value, '');
 });
 
-test('only the explicit task card form posts /updates', async () => {
+test('the explicit task card reuses the composer and reconciles a lost update using its original ID', async () => {
   const b = browser();
   const store = b.context.CitrusTaskState.create({});
-  store.hydrate({job_id: 'job-update', status: 'running'});
-  const calls = [];
+  store.hydrate({job_id: 'job-update', status: 'running', task_version: 1});
+  const posts = [], lookups = [];
   const container = new Element('div');
-  b.context.CitrusTaskControls.create({container, store, owns: () => true,
-    transport: {post: async (job, path, payload) => { calls.push([job, path, payload]); return {version: 2}; },
-      refresh: async () => ({job_id: 'job-update', status: 'running'}), stop() {}}});
-  const input = container.querySelector('.task-update-input');
-  assert.ok(input, 'explicit update form exists');
-  input.value = '换一个角度补充';
-  await container.querySelector('.task-update-submit').onclick();
-  await flush();
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][0], 'job-update');
-  assert.equal(calls[0][1], 'updates');
-  assert.equal(calls[0][2].instruction, '换一个角度补充');
+  const controls = b.context.CitrusTaskControls.create({container, store, owns: () => true,
+    onUpdate: b.context.openComposerSupplement, isUpdateSelected: b.context.isSupplementSelected,
+    readDraft: b.context.readSupplementDraft,
+    transport: {
+      post: async (job, path, payload) => {
+        posts.push([job, path, {...payload}]);
+        if (posts.length === 1) throw new TypeError('lost response');
+        return {version: 2};
+      },
+      lookupUpdate: async (job, id) => { lookups.push([job, id]); throw Object.assign(new Error('not found'), {status: 404}); },
+      refresh: async () => ({job_id: 'job-update', status: 'running'}), stop() {}
+    }});
+  b.userInput.value = '先保留新消息';
+  assert.equal(container.querySelector('.task-update-input'), null);
+  container.querySelector('.task-update-toggle').onclick();
+  assert.equal(b.userInput.value, '');
+  b.userInput.value = '换一个角度补充';
+  await b.context.sendMsg();
+  assert.equal(b.userInput.value, '换一个角度补充');
+  assert.equal(posts.length, 1);
+  const [job, path, payload] = posts[0];
+  assert.equal(job, 'job-update');
+  assert.equal(path, 'updates');
+  assert.equal(payload.expected_version, 1);
+  assert.equal(payload.instruction, '换一个角度补充');
+  assert.match(payload.update_request_id, /^update-/);
+  assert.deepEqual(lookups, [[job, payload.update_request_id]]);
+  b.userInput.value = '核对期间的另一份补充草稿';
+  await b.context.sendMsg();
+  assert.deepEqual(lookups, [[job, payload.update_request_id], [job, payload.update_request_id]]);
+  assert.deepEqual(posts[1], posts[0]);
+  assert.equal(b.userInput.value, '核对期间的另一份补充草稿');
+  assert.equal(b.context.readSupplementDraft(job).pending, null);
+  store.hydrate({job_id: job, terminal_snapshot: {display_status: 'partial'}});
+  b.context.refreshTaskComposer();
+  assert.equal(b.userInput.value, '先保留新消息');
+  assert.equal(controls.element.querySelector('.task-update-recovery').hidden, false);
+  assert.equal(b.requests.filter(request => request.opts.method === 'POST').length, 0);
 });
-
 
 test('history groups the latest continuation under its original user turn', () => {
   const {context} = browser();

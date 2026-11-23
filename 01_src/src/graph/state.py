@@ -9,6 +9,7 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     query: str
     visualization_enabled: bool
+    browse_requested: bool
     attachment_context: str
     has_paper_attachment: bool
     image_attachments: list[dict]

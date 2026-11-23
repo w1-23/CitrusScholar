@@ -1,0 +1,46 @@
+{
+  "id": "candidate-search",
+  "version": "2.0.0",
+  "path": "skills/candidate-search",
+  "entry": "SKILL.md",
+  "package": "citrus_retrieval",
+  "dependency": "citrusscholar-support[retrieval]==2.0.0",
+  "sha256": "0c216b5803a20b50290a72b44d4e019f3f5cf4c256fd3b3549fd844465ae4d50",
+  "files": [
+    {
+      "path": "PROVENANCE.md",
+      "sha256": "fa8e473dac7e8bf4cac36d94df31d9e326a3743f54e468d8d84e7393eba3c067",
+      "size": 498
+    },
+    {
+      "path": "references/evidence-and-fetch.md",
+      "sha256": "e1ef48e2392aab543361f358a5738094b711e5e0e52df1826f8d3db52918af77",
+      "size": 1484
+    },
+    {
+      "path": "references/retrieval-and-parameters.md",
+      "sha256": "ae64a0f54779f7bfc699646fc7a03c447e637550aadcd2c6abcf4d5fc2c521eb",
+      "size": 1739
+    },
+    {
+      "path": "scripts/read_evidence.py",
+      "sha256": "691f25e06e51def15c29def6fd933162f70c4543271760822abbc51b74dfbaf6",
+      "size": 125
+    },
+    {
+      "path": "scripts/search_local.py",
+      "sha256": "4617c1a4e420ef9efe89aa0d534c3c28a5691974167d9a45dd26c1c8b23e20cb",
+      "size": 126
+    },
+    {
+      "path": "SKILL.md",
+      "sha256": "bc208ef356f3f158174576d14f2de57cd1a22f954717d3439f9191c52f4d7ab3",
+      "size": 2966
+    },
+    {
+      "path": "tests/read_test.py",
+      "sha256": "b774ca18fe4f1d412bf67f08e73128c8d66a5e2754dc706f3bd5c3ef396a1802",
+      "size": 806
+    }
+  ]
+}

@@ -2213,15 +2213,84 @@ def _frames_to_workbook_bytes(tables: list[tuple[Any, dict[str, Any]]]) -> tuple
 
 
 
+def _record_data_audit_report(report):
+    from src.core.cancel import ToolCancelled
+    from src.research.integrity_review import record_report
+
+    owner, session = int(get_user_id() or 0), str(get_session_id() or '')
+    if not owner or not session:
+        return {'status': 'unavailable', 'reason': 'authenticated_session_required'}
+    try:
+        for finding in report['common_findings']:
+            for location in finding['locations']:
+                candidate = str(location.get('source_id') or '').rsplit(':', 1)[-1]
+                if re.fullmatch(r'[a-f0-9]{32}', candidate):
+                    location.setdefault('file_id', candidate)
+        return {'status': 'complete', **record_report(owner, session, report)}
+    except ToolCancelled:
+        raise
+    except Exception:
+        return {'status': 'failed', 'reason': 'review_persistence_failed'}
+
+
+def _audit_publications(report, formats, review_receipt, tables):
+    from src.core.cancel import ToolCancelled
+    from src.research.audit_projection import source_key
+    from src.research.delivery_tools import deliver_research_artifact, publish_audit_workbooks
+
+    receipts, errors = [], []
+    review_id = review_receipt.get('review_id', '')
+    if 'xlsx' in formats:
+        books, errors = publish_audit_workbooks(report, review_id=review_id,
+            load_source=lambda target: tables[target['file_index']]['data'])
+        for result in report['table_results']:
+            if not result.get('ok'):
+                continue
+            key = source_key(result)
+            receipt = books.get(key)
+            result['publish_status'] = 'complete' if receipt else 'failed'
+            result['publish_error'] = '' if receipt else next(
+                (error for error in errors if str(result.get('file', '')) in error), '审查工作簿未发布')
+            if receipt:
+                result.update(artifact=receipt['url'], artifact_sha256=receipt['sha256'],
+                              artifact_bytes=receipt['size_bytes'], cells=receipt['cells'])
+        receipts.extend(books.values())
+    for fmt in formats:
+        if fmt == 'xlsx':
+            continue
+        if not review_id:
+            errors.append(f'{fmt}: 缺少已持久保存的真实 review_id，扫描结果保留。')
+            continue
+        try:
+            _, delivered = deliver_research_artifact.func(kind='data_audit', review_id=review_id, output_format=fmt)
+            receipts.extend(delivered.get('receipts', []))
+            if delivered['_tool_outcome']['status'] != 'complete':
+                errors.append(f'{fmt}: {delivered["_tool_outcome"].get("reason_code", "delivery_failed")}')
+        except ToolCancelled:
+            raise
+        except Exception as exc:
+            errors.append(f'{fmt}: {type(exc).__name__}: {exc}')
+    return receipts, errors
+
+
+def _audit_projection_summary(report):
+    from src.research.audit_projection import project_findings
+
+    projection = project_findings(report)
+    return {key: value for key, value in projection.items() if key != 'findings'}
+
+
 def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_reference,
-                            *, sheet_name, formats, note, source_selection):
+                            *, sheet_name, formats, note, source_selection, annotations_requested=False, unassigned=()):
     """Audit explicit absolute regions without changing whole-sheet calls."""
     import hashlib
     from src.core.cancel import ToolCancelled
     from citrus_audit.api import audit_table
     from citrus_audit.integrity import table_from_rows
     from citrus_audit.plan import compare_bound, key_columns
-    from citrus_audit.readers import read_regions
+    from citrus_audit.methods import COVERAGE_CHECKS, METHOD_VERSION
+    from citrus_audit.readers import normalize_regions, read_region
+    from src.research.audit_projection import source_fields, table_location
     from src.core.data_audit_xlsx import _kind
     from src.research.data_audit_rules import describe_rule
     from src.research.integrity_review import finding as common_finding
@@ -2258,6 +2327,7 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
                for side in (comparison['left'], comparison['right'])}
     results, common_findings, review_envelopes = [], [], []
     bound_tables, custom_tables = {}, {}
+    common_omitted = scan_omitted = 0
     for index in requested:
         specs = grouped.get(index)
         if not specs:
@@ -2266,22 +2336,28 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
         name = str(item.get('name') or f'附件 {index + 1}')
         raw_bytes = item.get('data') or b''
         digest = hashlib.sha256(raw_bytes).hexdigest()
-        source_file_id = str(item.get('file_id') or f'upload:{digest}')
-        if Path(name).suffix.lower() not in {'.xlsx', '.xlsm'}:
-            for spec in specs:
-                results.append({'file': name, 'ok': False, 'reason_code': 'region_format_unsupported',
-                    'error': '显式区域审查仅支持 XLSX/XLSM 原始坐标；未读取该区域。',
-                    'region_id': spec.get('region_id') or '', 'region_bounds': spec.get('bounds') or ''})
-            continue
-        try:
-            envelopes = read_regions(raw_bytes, name, regions=specs, sheet_name=sheet_name)
-        except (TypeError, ValueError) as exc:
-            for spec in specs:
-                results.append({'file': name, 'ok': False, 'reason_code': 'region_read_failed',
-                    'error': f'{type(exc).__name__}: {exc}',
-                    'region_id': spec.get('region_id') or '', 'region_bounds': spec.get('bounds') or ''})
-            continue
-        for envelope in envelopes:
+        source_file_id = str(item.get('file_id') or '')
+        source = source_fields(index, source_file_id, name, digest)
+        actual_regions = []
+        for spec in specs:
+            result_identity = {'file': name, **source, 'source_selection': source_selection,
+                               'region_id': spec['region_id'], 'region_bounds': spec['bounds'],
+                               'sheet_name': spec['sheet'] or sheet_name, 'header_rows': spec['header_rows']}
+            if Path(name).suffix.lower() not in {'.xlsx', '.xlsm'}:
+                results.append({**result_identity, 'ok': False, 'reason_code': 'region_format_unsupported',
+                    'error': '显式区域审查仅支持 XLSX/XLSM 原始坐标。'})
+                continue
+            try:
+                envelope = read_region(raw_bytes, name, bounds=spec['bounds'], header_rows=spec['header_rows'],
+                                       sheet_name=spec['sheet'] or sheet_name, region_id=spec['region_id'])
+                resolved = {'sheet': envelope.sheet, 'bounds': envelope.region_bounds,
+                            'header_rows': envelope.header_rows, 'region_id': envelope.region_id}
+                normalize_regions([*actual_regions, resolved])
+                actual_regions.append(resolved)
+            except (TypeError, ValueError) as exc:
+                results.append({**result_identity, 'ok': False, 'reason_code': 'region_read_failed',
+                                'error': f'{type(exc).__name__}: {exc}'})
+                continue
             try:
                 audit = audit_table(envelope, **options())
                 findings = audit['data']['findings']
@@ -2290,18 +2366,36 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
                                  'region_id': envelope.region_id,
                                  'reason': '; '.join(entry.get('reasons', {}))}
                                 for key, entry in receipt.get('rules', {}).items()]
+                scan_omitted += receipt['findings_omitted']
+                narrowed = {**source, 'sheet': envelope.sheet, 'header_row': envelope.header_row,
+                            'region_id': envelope.region_id, 'region_bounds': envelope.region_bounds,
+                            'column_numbers': envelope.column_numbers}
+                if (plan and plan['comparisons']) or custom_reference:
+                    from citrus_audit.integrity import IntegrityInputLimitError
+                    try:
+                        snapshot = table_from_rows(
+                            envelope.values, envelope.columns, source_id=source['source_id'], source_name=name,
+                            source_bytes=raw_bytes, sheet=envelope.sheet, row_numbers=envelope.row_numbers,
+                            column_numbers=envelope.column_numbers, source_rows=len(envelope.row_numbers),
+                            source_columns=len(envelope.columns), region_id=envelope.region_id,
+                            region_bounds=envelope.region_bounds)
+                    except IntegrityInputLimitError:
+                        snapshot = None
+                    if snapshot is not None:
+                        bound_tables[index, envelope.sheet, envelope.region_id] = (
+                            snapshot, {keys: key_columns(envelope.to_frame(), keys) for keys in keysets})
+                        if source_file_id:
+                            custom_tables[source_file_id, envelope.sheet, envelope.region_id] = snapshot
+                review_envelopes.append({'source_file_id': source_file_id, 'file_index': index,
+                                         'table': envelope.to_dict()})
                 for signal in findings:
-                    location = {'source_id': f'attachment:{index}:{source_file_id}',
-                                'source_name': name, 'source_sha256': digest,
-                                'sheet': envelope.sheet, 'header_row': envelope.header_row,
-                                'region_id': envelope.region_id, 'region_bounds': envelope.region_bounds,
-                                'rows': [signal['row']] if signal.get('row') else [],
-                                'columns': [{'index': signal['column_index'], 'name': signal.get('field')}]
-                                           if signal.get('column_index') else []}
-                    if re.fullmatch(r'[a-f0-9]{32}', source_file_id):
-                        location['file_id'] = source_file_id
+                    if signal['check'] in COVERAGE_CHECKS:
+                        continue
+                    if len(common_findings) >= 200:
+                        common_omitted += 1
+                        continue
                     common_findings.append(common_finding(
-                        rule=signal['check'], version='table-audit/2', locations=[location],
+                        rule=signal['check'], version=METHOD_VERSION, locations=[table_location(narrowed, signal)],
                         evidence={'detail': signal.get('detail', ''), 'rule': signal.get('rule_metadata'),
                                   'calculation': signal.get('evidence', {})},
                         applicability=['Declared deterministic table rule; explicit absolute region'],
@@ -2309,28 +2403,15 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
                                          'Legitimate outliers, shared controls and declared transformations'],
                         coverage={'processed_rows': len(envelope.row_numbers),
                                   'processed_columns': len(envelope.columns),
-                                  'region_id': envelope.region_id,
-                                  'region_bounds': envelope.region_bounds,
-                                  'truncation_reasons': []},
+                                  'region_id': envelope.region_id, 'region_bounds': envelope.region_bounds,
+                                  'truncation_reasons': envelope.coverage['truncation_reasons']},
                         summary=signal.get('detail', '')))
-                snapshot = table_from_rows(
-                    envelope.values, envelope.columns,
-                    source_id=f'attachment:{index}:{source_file_id}', source_name=name,
-                    source_bytes=raw_bytes, sheet=envelope.sheet,
-                    row_numbers=envelope.row_numbers, column_numbers=envelope.column_numbers,
-                    source_rows=len(envelope.row_numbers), source_columns=len(envelope.columns),
-                    region_id=envelope.region_id, region_bounds=envelope.region_bounds)
-                bound_tables[index, envelope.sheet, envelope.region_id] = (
-                    snapshot, {keys: key_columns(envelope.to_frame(), keys) for keys in keysets})
-                custom_tables[source_file_id, envelope.sheet, envelope.region_id] = snapshot
-                review_envelopes.append({'source_file_id': source_file_id, 'file_index': index,
-                                         'table': envelope.to_dict()})
                 kinds = {}
                 for signal in findings:
                     label = _kind(str(signal.get('check') or ''))[0]
                     kinds[label] = kinds.get(label, 0) + 1
                 results.append({
-                    'file': name, 'ok': True, 'artifact': '', 'artifact_sha256': '',
+                    **result_identity, 'ok': True, 'artifact': '', 'artifact_sha256': '',
                     'artifact_bytes': 0, 'publish_status': 'not_requested', 'publish_error': '',
                     'findings': findings, 'rule_catalog': rule_catalog,
                     'table_metadata': [{'sheet_name': envelope.sheet,
@@ -2343,7 +2424,7 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
                         'coverage': audit['coverage']}],
                     'header_rows': list(envelope.header_rows), 'header_row': envelope.header_row,
                     'review_notes': [note] if note else [], 'checks': checks,
-                    'deterministic_checks_executed': True, 'annotations': [],
+                    'deterministic_checks_executed': bool(receipt['actual']), 'annotations': [],
                     'annotation_coverage': {'annotated_rows': 0, 'unannotated_rows': len(envelope.row_numbers),
                                             'scope': 'explicit_region_without_annotations'},
                     'annotation_errors': [], 'sheets': [envelope.sheet],
@@ -2356,7 +2437,7 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
             except ToolCancelled:
                 raise
             except Exception as exc:
-                results.append({'file': name, 'ok': False, 'reason_code': 'region_audit_failed',
+                results.append({**result_identity, 'ok': False, 'reason_code': 'region_audit_failed',
                     'error': f'{type(exc).__name__}: {exc}',
                     'region_id': envelope.region_id, 'region_bounds': envelope.region_bounds,
                     'sheet_name': envelope.sheet})
@@ -2405,35 +2486,22 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
             'budgets': {'max_account_source_bytes': _AUDIT_SOURCE_MAX_BYTES},
             'execution': [{'file': row.get('file'),
                            'methods': row.get('rule_execution', [])} for row in results]}
-    review_receipt = {'status': 'unavailable', 'reason': 'authenticated_session_required'}
-    if int(get_user_id() or 0) > 0 and get_session_id():
-        try:
-            from src.research.integrity_review import record_report
-            for common in common_findings:
-                for location in common['locations']:
-                    candidate_id = str(location.get('source_id', '')).rsplit(':', 1)[-1]
-                    if re.fullmatch(r'[a-f0-9]{32}', candidate_id):
-                        location['file_id'] = candidate_id
-            review_report = {'common_findings': common_findings,
-                             'source_envelopes': review_envelopes,
-                             'table_results': results, 'cross_file_report': None,
-                             'audit_plan': plan_receipt, 'bound_comparisons': bound_results,
-                             'custom_findings': custom_receipt,
-                             'summary_consistency': {'status': 'not_requested'},
-                             'region_selection': {'mode': 'explicit_absolute_regions', 'regions': regions},
-                             'coverage': {'findings_omitted': 0,
-                                          'unbound_text_captions_and_p_values': 'not_checked',
-                                          'metadata_authenticity': 'not_checked'}}
-            review_receipt = {'status': 'complete', **record_report(
-                int(get_user_id()), str(get_session_id()), review_report)}
-        except Exception as exc:
-            if isinstance(exc, ToolCancelled):
-                raise
-            review_receipt = {'status': 'failed', 'reason': 'review_persistence_failed'}
-    publication_errors = []
-    if formats:
-        publication_errors.append('显式区域审查暂不支持发布标注工作簿或独立报告；'
-                                  '本次证据保留，可按 region_id/region_bounds 复核。')
+    summary_status = 'not_run' if checks.get('reported_summaries') else 'not_requested'
+    summary_consistency = {'status': summary_status, 'coverage': {'report_text_captions': 'not_checked'}}
+    if summary_status == 'not_run':
+        summary_consistency['reason_code'] = 'explicit_region_mode'
+    region_selection = {'mode': 'explicit_absolute_regions', 'regions': regions,
+                        'unassigned_file_indexes': list(unassigned), 'annotations_requested': annotations_requested}
+    review_report = {'common_findings': common_findings, 'source_envelopes': review_envelopes,
+                     'table_results': results, 'cross_file_report': None,
+                     'audit_plan': plan_receipt, 'bound_comparisons': bound_results, 'custom_findings': custom_receipt,
+                     'summary_consistency': summary_consistency, 'region_selection': region_selection,
+                     'coverage': {'findings_omitted': common_omitted, 'scan_findings_omitted': scan_omitted,
+                                  'unbound_text_captions_and_p_values': 'not_checked',
+                                  'metadata_authenticity': 'not_checked'}}
+    review_receipt = _record_data_audit_report(review_report) if any(item.get('ok') for item in results) else {'status': 'unavailable'}
+    projection = _audit_projection_summary(review_report)
+    publications, publication_errors = _audit_publications(review_report, formats, review_receipt, tables)
     ok_items = [item for item in results if item.get('ok')]
     failed_items = [item for item in results if not item.get('ok')]
     total_issues = sum(int(item.get('issues') or 0) for item in ok_items)
@@ -2448,10 +2516,17 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
         partial_reasons.append('区域模式未执行整表跨文件方法')
     if publication_errors:
         partial_reasons.append('部分请求格式未发布')
+    if summary_status == 'not_run' or annotations_requested:
+        partial_reasons.append('区域模式未执行请求的报告汇总或按行注释')
+    if unassigned:
+        partial_reasons.append('部分选中文件未指定区域')
+    if projection['status'] == 'partial' or any(item.get('audit_status') == 'partial' for item in ok_items):
+        partial_reasons.append('部分规则执行或发现投影不完整')
     if review_receipt['status'] == 'failed':
         partial_reasons.append('人工复核记录未持久保存')
-    status = 'partial' if partial_reasons else 'complete'
-    reason_code = 'coverage_incomplete' if partial_reasons else 'region_audit_completed'
+    status = 'failed' if not ok_items else 'partial' if partial_reasons else 'complete'
+    reason_code = {'failed': 'region_audit_failed', 'partial': 'coverage_incomplete',
+                   'complete': 'region_audit_completed'}[status]
     coverage_text = (f'{len(ok_items)}/{len(results)} 个显式区域完成；'
                      f'{total_issues} 条待核查信号')
     lines = [f'按显式绝对区域完成 {len(ok_items)}/{len(results)} 个区域审查：共 {total_issues} 条待核查信号。']
@@ -2468,10 +2543,12 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
     lines.append('检测命中属于待核查信号，不代表数据造假；原始文件未修改。')
     for message in publication_errors:
         lines.append('未完成交付：' + message)
-    artifact_links = []
+    artifact_links = [receipt['url'] for receipt in publications]
+    lines.extend(f'审查交付文件：{url}' for url in artifact_links)
     result_refs = ([{'kind': 'integrity_review', 'review_id': review_receipt['review_id'],
                      'url': review_receipt['review_url']}] if review_receipt.get('review_id') else [])
-    facts = {'findings_count': len(common_findings), 'findings_omitted': 0,
+    facts = {'findings_count': sum(projection['counts'].values()), 'findings_omitted': scan_omitted,
+             'finding_projection': projection,
              'coverage': coverage_text, 'review_url': review_receipt.get('review_url', '')}
     artifact = {
         '_tool_outcome': {'status': status, 'reason_code': reason_code,
@@ -2483,13 +2560,12 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
         'cross_file_integrity': {'status': 'not_run', 'reason_code': 'explicit_region_mode'},
         'cross_file_report': None,
         'publish_status': 'requested' if formats else 'not_requested',
-        'publish_formats': formats, 'publication_receipts': [],
+        'publish_formats': formats, 'publication_receipts': publications,
         'publication_errors': publication_errors, 'integrity_review': review_receipt,
-        'summary_consistency': {'status': 'not_requested',
-                                'coverage': {'report_text_captions': 'not_checked'}},
+        'summary_consistency': summary_consistency,
         'custom_findings': custom_receipt, 'common_finding_count': len(common_findings),
-        'common_findings_omitted': 0,
-        'region_selection': {'mode': 'explicit_absolute_regions', 'regions': regions},
+        'common_findings_omitted': common_omitted, 'finding_projection': projection,
+        'region_selection': region_selection,
     }
     artifact.update(facts=facts, result_refs=result_refs)
     artifact['_tool_outcome'].update(facts=facts, result_refs=result_refs)
@@ -2614,6 +2690,13 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
         from citrus_audit.readers import normalize_regions
         try:
             regions = normalize_regions(checks['regions'])
+            if any('file_index' not in spec for spec in regions):
+                raise ValueError('托管审查的每个区域必须包含 file_index')
+            region_indexes = {spec['file_index'] for spec in regions}
+            if indexes is not None and not region_indexes <= set(indexes):
+                raise ValueError('区域 file_index 必须在明确选择的文件范围内')
+            if ids and any(index >= len(ids) for index in region_indexes):
+                raise ValueError('区域 file_index 超出账号文件列表')
         except (TypeError, ValueError) as exc:
             raise ToolArgumentError(f'{exc}；invalid_input') from None
     return {'checks': checks, 'formats': formats, 'header_rows': header_rows, 'plan': plan,
@@ -2700,10 +2783,11 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         header_rows_json=header_rows_json, file_indexes_json=file_indexes_json,
         file_ids_json=file_ids_json)
     formats = validated['formats']
-    publish_xlsx = 'xlsx' in formats
     requested = validated['file_indexes']
+    regions = validated['regions']
+    region_indexes = sorted({spec['file_index'] for spec in regions}) if regions else []
     try:
-        tables = _audit_source_tables(validated['file_ids'], indexes=requested)
+        tables = _audit_source_tables(validated['file_ids'], indexes=region_indexes if regions else requested)
     except _AuditSourceUnavailable as exc:
         artifact = _audit_source_not_run(exc.reason_code, str(exc))
         artifact['audit_results'] = []
@@ -2715,18 +2799,19 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         artifact = _audit_source_not_run('no_selected_attachment', text)
         artifact['audit_results'] = []
         return text, artifact
-    regions = validated['regions']
     if regions:
-        unknown = sorted({spec['file_index'] for spec in regions} - set(requested))
+        unknown = sorted(set(region_indexes) - set(range(len(tables))))
         if unknown:
             raise ToolArgumentError(
                 f'区域 file_index {unknown} 不在本次选中的文件列表中；invalid_input')
         text, artifact = _audit_explicit_regions(
-            tables, requested, regions, validated['checks'], validated['plan'],
+            tables, region_indexes, regions, validated['checks'], validated['plan'],
             validated['custom_findings'],
             sheet_name=sheet_name, formats=formats, note=note,
             source_selection=('account_file_ids' if validated['file_ids']
-                              else 'current_turn_attachments'))
+                              else 'current_turn_attachments'),
+            annotations_requested=bool(_json_arg(annotations_json, (list, dict), [], shape=_ANNOTATION_SHAPE)),
+            unassigned=sorted(set(requested) - set(region_indexes)))
         return text, artifact
     annotation_errors: list[str] = []
     annotations = _normalize_annotations(_json_arg(
@@ -2749,7 +2834,9 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
     # Private persisted evidence; never place source tables in the model's
     # observation. The repository enforces its existing bounded report limit.
     review_envelopes: list[dict[str, Any]] = []
-    common_omitted = 0
+    common_omitted = scan_omitted = 0
+    from citrus_audit.methods import COVERAGE_CHECKS, METHOD_VERSION
+    from src.research.audit_projection import source_fields, table_location
     cross_summary: dict[str, Any] = {
         "status": "not_run",
         "reason_code": ("not_requested" if plan and not plan["cross_file_methods"] else
@@ -2810,10 +2897,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
             })
             continue
 
-        stem = _short_stem(name)
-        # 默认路径：把这份文件里所有可读工作表一次性标注进**同一个**输出文件
         targets: list[dict[str, Any]] = []
-        source_tables: list[tuple[Any, dict[str, Any]]] = []
         skipped: list[dict[str, Any]] = []
         local_annotation_errors = list(annotation_errors)
         annotation_results = []
@@ -2836,7 +2920,6 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
                                 "rule_execution": {"status": "skipped", "reason": "empty_table", "tested": 0}})
                 continue
             header_rows_used = int(max(meta.get("header_rows") or [meta.get("header_row") or 1]))
-            source_tables.append((frame, meta))
             if meta.get('table_envelope'):
                 review_envelopes.append({'source_file_id': source_file_id,
                                          'file_index': index,
@@ -2911,29 +2994,25 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
                 expected_structure=checks.get('expected_structure'), source_coverage=meta,
                 selected_checks=checks.get('selected_checks'))
             from src.research.integrity_review import finding as common_finding
+            scan_omitted += execution_receipt['findings_omitted']
+            target_identity = {**source_fields(index, str(item.get('file_id') or ''), name, source_sha256),
+                               'sheet': str(meta.get('sheet') or sheet or ''), 'header_row': header_rows_used,
+                               'column_numbers': range(1, frame.shape[1] + 1)}
             for signal in findings:
+                if signal['check'] in COVERAGE_CHECKS:
+                    continue
                 if len(common_findings) >= 200:
                     common_omitted += 1
                     continue
-                # Locations always describe the original file, before export
-                # renames sheets or appends review annotations.
-                location = {"source_id": f"attachment:{index}:{source_file_id}",
-                            "source_name": name, "source_sha256": source_sha256,
-                            "sheet": str(meta.get("sheet") or sheet or ""),
-                            "header_row": header_rows_used,
-                            "rows": [signal["row"]] if signal.get("row") else [],
-                            "columns": [{"index": signal["column_index"], "name": signal["field"]}]
-                            if signal.get("column_index") else []}
-                if re.fullmatch(r"[a-f0-9]{32}", source_file_id):
-                    location["file_id"] = source_file_id
                 common_findings.append(common_finding(
-                    rule=signal["check"], version="table-audit/2",
-                    locations=[location], evidence={"detail": signal["detail"], "rule": signal["rule_metadata"],
-                                                   "calculation": signal.get('evidence', {})},
-                    applicability=["Declared deterministic table rule; verify field meaning and sample design"],
-                    counterexamples=["Missing cached formula values or optional fields", "Legitimate outliers, shared controls and declared transformations"],
-                    coverage={"processed_rows": int(frame.shape[0]), "processed_columns": int(frame.shape[1]),
-                              "truncation_reasons": meta.get("truncation_reasons") or []}, summary=signal["detail"]))
+                    rule=signal['check'], version=METHOD_VERSION, locations=[table_location(target_identity, signal)],
+                    evidence={'detail': signal['detail'], 'rule': signal['rule_metadata'],
+                              'calculation': signal.get('evidence', {})},
+                    applicability=['Declared deterministic table rule; verify field meaning and sample design'],
+                    counterexamples=['Missing cached formula values or optional fields',
+                                     'Legitimate outliers, shared controls and declared transformations'],
+                    coverage={'processed_rows': int(frame.shape[0]), 'processed_columns': int(frame.shape[1]),
+                              'truncation_reasons': meta.get('truncation_reasons') or []}, summary=signal['detail']))
             for annotation in annotations:
                 label = str(meta.get('sheet') or '')
                 if not (annotation['sheet'] == label or (not annotation['sheet'] and len(sheet_names) == 1)):
@@ -2954,6 +3033,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
                 "rule_execution": execution_receipt,
                 "sheet_name": str(meta.get("sheet") or ""),
                 "header_row": header_rows_used,
+                "header_rows": meta.get("header_rows") or [header_rows_used],
                 "findings": findings,
                 "row_count": int(frame.shape[0]),
                 "column_count": int(frame.shape[1]),
@@ -2983,15 +3063,6 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
                                 f"{item['sheet']} {item['error']}" for item in skipped)})
             continue
 
-        render_targets = [dict(target) for target in targets]
-        if publish_xlsx:
-            if suffix in {".xlsx", ".xlsm"} and raw_bytes:
-                source_bytes = raw_bytes
-            else:
-                source_bytes, output_sheet_names = _frames_to_workbook_bytes(source_tables)
-                for target, output_name in zip(render_targets, output_sheet_names):
-                    target["sheet_name"] = output_name
-        from src.core.data_audit_xlsx import annotate_workbook_multi
         from src.research.data_audit_rules import describe_rule
         # One receipt per actual sheet/rule. Never infer execution from configured fields.
         rule_catalog = [
@@ -2999,47 +3070,21 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
              'reason': '; '.join(entry.get('reasons', {}))}
             for target in targets for key, entry in target['rule_execution'].get('rules', {}).items()
         ]
-        content, artifact_path, publish_error = b"", "", ""
         stats = summarize_findings(targets, source_sha256)
-        if publish_xlsx:
-            try:
-                content, stats = annotate_workbook_multi(
-                    source_bytes, targets=render_targets,
-                    notes=([note] if note else []) + local_annotation_errors +
-                          (["人工/模型注释与确定性扫描分层显示，注释不能改写规则执行凭证。"] if annotations else []),
-                    rule_catalog=rule_catalog, source_name=name,
-                    source_sha256=source_sha256)
-                content = normalize_ooxml_bytes(content)
-                artifact_path = _save_artifact(
-                    f"{stem}_数据审查.xlsx", content,
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    source_file_id=source_file_id,
-                    source_sha256=source_sha256)
-                if not artifact_path:
-                    raise ValueError('标注工作簿未获得发布回执')
-            except Exception as exc:
-                from src.core.cancel import ToolCancelled
-                if isinstance(exc, ToolCancelled):
-                    raise
-                # Preserve the completed scan so publication can be retried by reference.
-                publish_error = f'{type(exc).__name__}: {exc}'
         results.append({
             "file": name,
             "ok": True,
-            "artifact": artifact_path,
-            "artifact_sha256": hashlib.sha256(content).hexdigest() if content else "",
-            "artifact_bytes": len(content),
-            "publish_status": "complete" if artifact_path else "failed" if publish_error else "not_requested",
-            "publish_error": publish_error,
+            "artifact": "", "artifact_sha256": "", "artifact_bytes": 0,
+            "publish_status": "not_requested", "publish_error": "",
             "findings": [{"sheet": target["sheet_name"], **signal}
                          for target in targets for signal in target["findings"]],
             "rule_catalog": rule_catalog,
             "table_metadata": [{key: target[key] for key in
-                ('sheet_name', 'header_row', 'row_count', 'column_count', 'coverage')} for target in targets],
+                ('sheet_name', 'header_row', 'header_rows', 'row_count', 'column_count', 'coverage')} for target in targets],
             "header_rows": header_rows,
             "review_notes": ([note] if note else []) + local_annotation_errors,
             "checks": checks,
-            "deterministic_checks_executed": True,
+            "deterministic_checks_executed": any(target["rule_execution"]["actual"] for target in targets),
             "annotations": annotation_results,
             "annotation_coverage": {
                 "annotated_rows": len({(entry['sheet'], entry['row']) for entry in annotation_results}),
@@ -3242,52 +3287,19 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
             "budgets": {"max_account_source_bytes": _AUDIT_SOURCE_MAX_BYTES, **cross_limits},
             "execution": [{"file": row["file"], "methods": row.get("rule_execution", [])} for row in results],
         }
-    review_receipt = {"status": "unavailable", "reason": "authenticated_session_required"}
-    if int(get_user_id() or 0) > 0 and get_session_id():
-        try:
-            from src.research.integrity_review import record_report
-            for common in common_findings:
-                for location in common["locations"]:
-                    candidate_id = str(location.get("source_id", "")).rsplit(":", 1)[-1]
-                    if re.fullmatch(r"[a-f0-9]{32}", candidate_id):
-                        location["file_id"] = candidate_id
-            review_report = {"common_findings": common_findings,
-                             "source_envelopes": review_envelopes,
-                             "table_results": results, "cross_file_report": cross_report,
-                             "audit_plan": plan_receipt, "bound_comparisons": bound_results,
-                             "custom_findings": custom_receipt,
-                             "summary_consistency": summary_consistency,
-                             "coverage": {"findings_omitted": common_omitted, "cross_file": cross_summary.get("status"),
-                                          "summary_consistency": summary_consistency.get("coverage", {}),
-                                          "unbound_text_captions_and_p_values": "not_checked",
-                                          "metadata_authenticity": "not_checked"}}
-            review_receipt = {"status": "complete", **record_report(
-                int(get_user_id()), str(get_session_id()), review_report)}
-        except Exception as exc:
-            from src.core.cancel import ToolCancelled
-            if isinstance(exc, ToolCancelled):
-                raise
-            review_receipt = {"status": "failed", "reason": "review_persistence_failed"}
-    published_formats = []
-    publication_errors = []
-    for fmt in formats:
-        if fmt == 'xlsx':
-            continue  # Already rendered directly from this scan, preserving legacy behavior.
-        if not review_receipt.get('review_id'):
-            publication_errors.append(f'{fmt}: 缺少已持久保存的真实 review_id，扫描结果保留但未发布')
-            continue
-        try:
-            from src.research.delivery_tools import deliver_research_artifact
-            _, delivered = deliver_research_artifact.func(kind='data_audit',
-                review_id=review_receipt['review_id'], output_format=fmt)
-            published_formats.extend(delivered.get('receipts', []))
-            if delivered['_tool_outcome']['status'] != 'complete':
-                publication_errors.append(f'{fmt}: {delivered["_tool_outcome"].get("reason_code", "delivery_failed")}')
-        except Exception as exc:
-            from src.core.cancel import ToolCancelled
-            if isinstance(exc, ToolCancelled):
-                raise
-            publication_errors.append(f'{fmt}: {type(exc).__name__}: {exc}')
+    review_report = {"common_findings": common_findings, "source_envelopes": review_envelopes,
+                     "table_results": results, "cross_file_report": cross_report,
+                     "audit_plan": plan_receipt, "bound_comparisons": bound_results,
+                     "custom_findings": custom_receipt, "summary_consistency": summary_consistency,
+                     "coverage": {"findings_omitted": common_omitted,
+                                  "scan_findings_omitted": scan_omitted + int(cross_summary.get('findings_omitted', 0)),
+                                  "cross_file": cross_summary.get("status"),
+                                  "summary_consistency": summary_consistency.get("coverage", {}),
+                                  "unbound_text_captions_and_p_values": "not_checked",
+                                  "metadata_authenticity": "not_checked"}}
+    review_receipt = _record_data_audit_report(review_report)
+    projection = _audit_projection_summary(review_report)
+    published_formats, publication_errors = _audit_publications(review_report, formats, review_receipt, tables)
     total_issues = sum(int(item.get("issues") or 0) for item in ok_items)
     kind_totals: dict[str, int] = {}
     for item in ok_items:
@@ -3323,7 +3335,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         lines.append(f"跨文件数值复核：{cross_summary['status']}，"
                      f"{cross_summary.get('findings_count', 0)} 条关系线索，均待人工核查。")
         if cross_summary.get("artifact"):
-            lines.append(f"独立跨文件证据报告（不回写逐文件工作簿）：{cross_summary['artifact']}")
+            lines.append(f"独立跨文件证据报告：{cross_summary['artifact']}")
         if cross_summary["status"] == "partial":
             lines.append("跨文件覆盖/报告未完整完成：" + str(cross_summary.get("error") or cross_summary["reason_code"]))
     if review_receipt.get("review_url"):
@@ -3342,6 +3354,8 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         partial_reasons.append('部分请求格式未成功发布；扫描结果保留，可按真实 review_id 重试交付')
     if review_receipt["status"] == "failed":
         partial_reasons.append("人工复核记录未持久保存")
+    if projection["status"] == "partial":
+        partial_reasons.append("部分发现超出扫描、复核或投影上限")
     if summary_consistency["status"] == "partial":
         partial_reasons.append("部分报告汇总缺少可核对的证据或口径")
     if custom_reference and custom_receipt["status"] != "complete":
@@ -3386,7 +3400,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
     reason_code = ("coverage_incomplete" if partial_reasons else
                    "scope_limited" if scope_notes else "audit_completed")
     artifact_links = [item["artifact"] for item in ok_items if item.get("artifact")]
-    artifact_links.extend(receipt['url'] for receipt in published_formats)
+    artifact_links = list(dict.fromkeys([*artifact_links, *(receipt['url'] for receipt in published_formats)]))
     if cross_summary.get("artifact"):
         artifact_links.append(cross_summary["artifact"])
     coverage_text = (
@@ -3417,9 +3431,10 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         "summary_consistency": summary_consistency,
         "custom_findings": custom_receipt,
         "common_finding_count": len(common_findings),
-        "common_findings_omitted": common_omitted,
+        "common_findings_omitted": common_omitted, "finding_projection": projection,
     }
-    facts = {"findings_count": len(common_findings), "findings_omitted": common_omitted,
+    facts = {"findings_count": sum(projection["counts"].values()),
+             "findings_omitted": projection["scan_findings_omitted"], "finding_projection": projection,
              "coverage": coverage_text, "review_url": review_receipt.get("review_url", "")}
     result_refs = ([{"kind": "integrity_review", "review_id": review_receipt["review_id"],
                      "url": review_receipt["review_url"]}] if review_receipt.get("review_id") else [])

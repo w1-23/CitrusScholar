@@ -218,6 +218,8 @@ async def _run(state, identity, ledger):
     # Selection remains pinned metadata. The main loop reads applicable method
     # pages as needed; no mandatory preload can block unrelated capabilities.
     update_version = 0
+    from src.graph.task_contract import contract_for_explicit_outputs
+    requirements = contract_for_explicit_outputs(state["query"]).deliverables
     # Private, identity-bound checkpoint state. Raw final envelopes stay in the
     # graph; only the extracted, validated answer crosses the user boundary.
     final_review = {}
@@ -237,6 +239,7 @@ async def _run(state, identity, ledger):
                 "script_budget_scope": state["script_budget_scope"],
                 "query": state["query"], "skills": skills.export(),
                 "update_version": update_version, "final_review": deepcopy(final_review),
+                "artifact_requirements": deepcopy(requirements),
                 "records": host.records,
                 "main_results": host.main_results, "web_results": host.web_results,
                 "pending_question": host.pending_question,
@@ -244,7 +247,7 @@ async def _run(state, identity, ledger):
                 "model_output_tokens": getattr(driver, "output_tokens", None)}
 
     def restore_host(saved):
-        nonlocal update_version, original_request_state, trace_start
+        nonlocal update_version, original_request_state, trace_start, requirements
         original = saved["original_request_state"]
         binding = {"user_id": identity.owner_user_id, "session_id": identity.session_id,
                    "request_id": identity.user_turn_id, "job_id": identity.run_id}
@@ -285,6 +288,8 @@ async def _run(state, identity, ledger):
         state["query"] = saved["query"]
         skills.restore(saved.get("skills"))
         update_version = int(saved.get("update_version", 0))
+        requirements = deepcopy(saved["artifact_requirements"]) if "artifact_requirements" in saved else (
+            contract_for_explicit_outputs(state["query"]).deliverables)
         final_review.clear()
         final_review.update(deepcopy(saved.get("final_review") or {}))
         if final_review and (final_review.get("request_version") != update_version
@@ -317,17 +322,31 @@ async def _run(state, identity, ledger):
         _epoch.get().working_state = host.working_state()
 
     async def prepare(_):
-        nonlocal update_version
+        nonlocal update_version, requirements
         updates = task_events.updates_after(identity.run_id, update_version)
         if not updates:
             return ()
         state["query"] = merge_task_instructions(str(state.get("query") or ""), updates)
         update_version = max(row["version"] for row in updates)
+        requirements = contract_for_explicit_outputs(state["query"]).deliverables
         final_review.clear()  # A previous candidate cannot accept new requirements.
         tracing.set_original_query(state["query"])
         refresh_allowed()
         return ("用户在本轮补充的要求（保留已完成事实，调整未完成工作）：\n" +
                 "\n".join(row["instruction"] for row in updates),)
+
+    async def rejected(response, reason):
+        observations = []
+        for call in response.tool_calls:
+            if call["id"] in host.messages:
+                observations.append(host.messages[call["id"]])
+                continue
+            observation = ToolMessage(content=reason, tool_call_id=call["id"], name=call["name"],
+                status="error", additional_kwargs={"execution_dispatched": False,
+                    "operation_uncertain": False},
+                artifact={"_tool_outcome": {"status": "not_run", "reason_code": reason}})
+            observations.append(await host.publish(call, ToolExecution(observation), identity))
+        return BatchObservation(tuple(observations))
 
     async def not_run(response, reason, notes=()):
         observations = []
@@ -375,12 +394,37 @@ async def _run(state, identity, ledger):
             from src.core.progress_bus import emit_progress
             emit_progress('browse_phase', {'phase': 'organizing'})
         public_answer = statement.answer
+        delivery_gaps, artifact_contract = [], None
+        if requirements and not legacy_review:
+            from src.core.task_result import effective_tool_records
+            from src.core.turn_outcome import artifact_goal_evidence
+            from src.research.tools import validate_artifact_links
+            effective = effective_tool_records(host.records)
+            links = list(dict.fromkeys(item["link"] for row in effective
+                for item in row.get("artifact_validations", []) if item.get("valid") and item.get("link")))
+            verified = await asyncio.to_thread(validate_artifact_links, links, session_id=identity.session_id,
+                         owner_user_id=identity.owner_user_id, request_id=host._result_request_id()) if links else []
+            verified_links = sorted(item["link"] for item in verified if item.get("valid"))
+            goals, delivery_gaps = artifact_goal_evidence(requirements, effective, set(verified_links))
+            artifact_contract = {"schema_version": 1, "request_version": update_version,
+                                 "requirements": requirements, "verified_links": verified_links}
+            delivery_links = list(dict.fromkeys(link for goal in goals for link in goal.artifact_links
+                                                if link not in public_answer))
+            if delivery_links:
+                public_answer += "\n\n已核验的交付文件\n" + "\n".join(
+                    f"- [下载文件 {index}]({link})" for index, link in enumerate(delivery_links, start=1))
+            if delivery_gaps:
+                public_answer += "\n\n" + "\n".join(gap["detail"] for gap in delivery_gaps)
+            statement = statement.model_copy(update={"answer": public_answer,
+                "status": "partial" if delivery_gaps else statement.status,
+                "goals": [*statement.goals, *goals], "remaining": [gap["detail"] for gap in delivery_gaps]})
         if "[[FIGURE:" in public_answer:
             public_answer = figures.expand(public_answer)
             statement = statement.model_copy(update={"answer": public_answer})
         native_calls = [call for message in history if isinstance(message, AIMessage)
                         for call in message.tool_calls]
         positions = {call["id"]: index for index, call in enumerate(native_calls)}
+        calls = {call["id"]: call for call in native_calls}
         # A rejected proposal is not an executed obligation. The agent may fix
         # parameters OR select a different appropriate tool. Bind that repair to
         # later successful goal evidence only after proving zero dispatch.
@@ -408,7 +452,8 @@ async def _run(state, identity, ledger):
                     continue
                 corrected = next((r.get("tool_call_id") for r in host.records
                     if r.get("status") == "complete" and r.get("tool_call_id") in goal_refs
-                    and positions.get(cid, float("inf")) < positions.get(r.get("tool_call_id"), -1)), None)
+                    and positions.get(cid, float("inf")) < positions.get(r.get("tool_call_id"), -1)
+                    and _same_repair_target(calls.get(cid), calls.get(r.get("tool_call_id")))), None)
                 if corrected:
                     repairs.append(ProposalRepair(rejected_call_id=cid, corrected_call_id=corrected,
                         reason="提案在执行前被拒绝；本轮随后使用成功操作满足了所声明的目标。"))
@@ -423,7 +468,8 @@ async def _run(state, identity, ledger):
                 continue
             no_dispatch = host.proven_no_dispatch(claim.rejected_call_id)
             if (no_dispatch and positions.get(claim.rejected_call_id, float("inf")) <
-                    positions.get(claim.corrected_call_id, -1)):
+                    positions.get(claim.corrected_call_id, -1)
+                    and _same_repair_target(calls.get(claim.rejected_call_id), calls.get(claim.corrected_call_id))):
                 verified_repairs.append(claim.rejected_call_id)
         # Exploratory read receipts describe individual attempts, not additional
         # user obligations. Once the agent cites successful evidence for its
@@ -433,7 +479,6 @@ async def _run(state, identity, ledger):
         from src.core.task_result import effective_tool_records, incidental_partial_candidate
         from src.core.turn_outcome import IncidentalClaim
         from src.tools.registry import is_readonly_call
-        calls = {call["id"]: call for call in native_calls}
         rows = effective_tool_records(host.records)
         referenced = {cid for goal in statement.goals for cid in goal.evidence_call_ids}
         replacement_ids = [row["tool_call_id"] for row in rows
@@ -479,12 +524,16 @@ async def _run(state, identity, ledger):
             limits = "\n\n执行限制：部分操作或必需范围未完成，不能视为整项任务已完成。"
             public_answer += limits
             statement = statement.model_copy(update={"answer": public_answer, "status": "partial",
-                "remaining": errors, "goals": statement.goals if goal_refs else [],
+                "remaining": [*statement.remaining, *errors],
+                "goals": [goal for goal in statement.goals if goal.evidence_call_ids],
                 "proposal_repairs": [claim for claim in statement.proposal_repairs
                                      if claim.rejected_call_id in verified_repairs]})
+        if not task_events.fence_final_answer(identity, update_version):
+            return FinalCheck(False, await prepare(identity))
         outcome = reviewed_turn_outcome(statement, host.records, identity=asdict(identity),
             request_version=update_version, request_hash=completion_digest(state["query"]),
-            verified_repairs=verified_repairs, superseded_proposals=superseded)
+            verified_repairs=verified_repairs, superseded_proposals=superseded,
+            artifact_contract=artifact_contract, delivery_gaps=delivery_gaps)
         host.publish_resolutions(outcome)
         final_review.update(phase="accepted", answer=public_answer, outcome=outcome.as_dict(),
             request_version=update_version, request_hash=completion_digest(state["query"]))
@@ -559,7 +608,7 @@ async def _run(state, identity, ledger):
         on_event=event, checkpoint=checkpoint, prepare=prepare,
         export_host=export_host, restore_host=restore_host, validate_resume=validate_resume,
         recover_output=True, resolve_execution_waits=resolve_execution_waits,
-        acknowledge_execution_waits=acknowledge_execution_waits)
+        acknowledge_execution_waits=acknowledge_execution_waits, record_rejected=rejected)
     try:
         with execution_lock(PROJECT_ROOT / "state" / "agent_locks", identity):
             async with open_checkpoint(PROJECT_ROOT / "state", identity,
@@ -618,6 +667,31 @@ async def _run(state, identity, ledger):
             pending_tool_calls=latest.pending_tool_calls if latest else ())
     return await _finish(state, identity, ledger, host, result, trace_start, started,
                          final_review=final_review)
+
+
+def _same_repair_target(rejected, corrected):
+    if not rejected or not corrected or rejected["name"] != corrected["name"]:
+        return False
+    name = rejected["name"]
+    original, replacement = rejected.get("args") or {}, corrected.get("args") or {}
+    if name in {"code_bind_input", "code_write"}:
+        keys = ("workspace_id", "task_id", "path")
+        if name == "code_bind_input":
+            keys += ("file_id", "sha256")
+        return all(original.get(key) and original[key] == replacement.get(key) for key in keys)
+    if name == "research_workspace":
+        previous = original.get("script_ref") or {}
+        current = replacement.get("script_ref") or {}
+        return (original.get("operation") in {"save", "patch"}
+                and replacement.get("operation") in {"save", "patch"}
+                and bool(previous.get("id")) and previous["id"] == current.get("id")
+                and previous.get("kind") == current.get("kind"))
+    if name in {"workspace_write", "workspace_edit"}:
+        return bool(original.get("path")) and original["path"] == replacement.get("path")
+    from src.tools.registry import is_readonly_call
+    return (is_readonly_call(name, original) and is_readonly_call(name, replacement)
+            and bool(original) and all(key in replacement and value == replacement[key]
+                                       for key, value in original.items()))
 
 
 def _settled_trace(messages, host, result):

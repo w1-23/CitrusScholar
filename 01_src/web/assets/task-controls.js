@@ -7,46 +7,16 @@
     var recover = document.createElement('div'); recover.className = 'task-recovery'; host.appendChild(recover);
     options.container.appendChild(host);
     var updateToggle = document.createElement('button'); updateToggle.type = 'button';
-    updateToggle.textContent = '补充本轮要求'; updateToggle.hidden = true;
-    updateToggle.setAttribute('aria-expanded', 'false'); host.appendChild(updateToggle);
-    var expanded = false, draftJob = '';
-    var updateForm = document.createElement('div'); updateForm.className = 'task-update-form'; updateForm.hidden = true;
-    updateToggle.onclick = function () {
-      expanded = !expanded;
-      render(options.store.state);
-      if (expanded) updateInput.focus();
-    };
-    var updateInput = document.createElement('textarea'); updateInput.className = 'task-update-input';
-    updateInput.rows = 2; updateInput.maxLength = 8000;
-    updateInput.setAttribute('aria-label', '补充本轮要求');
-    updateInput.placeholder = '补充本轮要求（仅作用于当前任务）';
-    function draft(value) {
-      if (!draftJob) return '';
-      var key = 'citrus.task-draft.' + draftJob;
-      try {
-        if (value === undefined) return root.sessionStorage.getItem(key) || '';
-        if (value) root.sessionStorage.setItem(key, value);
-        else root.sessionStorage.removeItem(key);
-      } catch (_) {}
-      return '';
-    }
-    updateInput.addEventListener('input', function () { draft(updateInput.value); });
-    var updateSubmit = document.createElement('button'); updateSubmit.type = 'button';
-    updateSubmit.className = 'task-update-submit'; updateSubmit.textContent = '添加要求';
-    updateForm.appendChild(updateInput); updateForm.appendChild(updateSubmit); host.appendChild(updateForm);
-    updateSubmit.onclick = async function () {
-      if (updateSubmit.disabled) return;
-      var instruction = updateInput.value;
-      if (!String(instruction || '').trim()) return;
-      updateSubmit.disabled = true;
-      var accepted = await submitUpdate(instruction);
-      if (accepted && alive() && updateInput.value === instruction) {
-        updateInput.value = '';
-        draft('');
-      }
-      updateSubmit.disabled = false;
-      if (alive()) render(options.store.state);
-    };
+    updateToggle.className = 'task-update-toggle'; updateToggle.textContent = '补充本轮要求';
+    updateToggle.setAttribute('aria-controls', 'user-input'); host.appendChild(updateToggle);
+    updateToggle.onclick = function () { if (canUpdate() && options.onUpdate) options.onUpdate(controller); };
+    var recovery = document.createElement('details'); recovery.className = 'task-update-recovery';
+    var recoveryTitle = document.createElement('summary'); recoveryTitle.textContent = '查看未提交的补充';
+    var recoveryText = document.createElement('p'); recovery.appendChild(recoveryTitle); recovery.appendChild(recoveryText);
+    var checkUpdate = document.createElement('button'); checkUpdate.type = 'button';
+    checkUpdate.textContent = '核对上次补充';
+    checkUpdate.onclick = function () { if (!busy && options.onReconcile) options.onReconcile(controller); };
+    recovery.appendChild(checkUpdate); host.appendChild(recovery);
     var busy = false, recoveryKey = '', requestNote = '', acceptedVersion = 0;
     function alive() { return options.owns(); }
     function render(state) {
@@ -90,57 +60,87 @@
         }
       }
       var updatable = canUpdate();
-      if (draftJob !== state.job_id) {
-        draftJob = state.job_id;
-        updateInput.value = draft();
-      }
-      if (root.CitrusTaskState.isTerminal(state)) draft('');
-      updateToggle.hidden = !updatable;
-      updateToggle.setAttribute('aria-expanded', String(updatable && expanded));
-      updateForm.hidden = !updatable || !expanded;
-      updateSubmit.disabled = !updatable;
-      updateInput.disabled = !updatable;
-      host.hidden = !state.job_id || (!message.textContent && !eligible.length && !updatable);
+      var selected = options.isUpdateSelected && options.isUpdateSelected(options.store);
+      var terminal = root.CitrusTaskState.isTerminal(state);
+      updateToggle.hidden = !options.onUpdate || terminal || (!updatable && !selected);
+      updateToggle.disabled = !updatable;
+      updateToggle.setAttribute('aria-pressed', String(!!selected && !terminal));
+      var draft = terminal && options.readDraft ? options.readDraft(state.job_id) : null;
+      var remaining = draft ? draft.text : '';
+      if (recoveryText.textContent !== remaining) recoveryText.textContent = remaining;
+      checkUpdate.hidden = !draft || !draft.pending || !options.onReconcile;
+      checkUpdate.disabled = busy;
+      recovery.hidden = !remaining && checkUpdate.hidden;
+      host.hidden = !state.job_id || (!message.textContent && !eligible.length && updateToggle.hidden && recovery.hidden);
       if (options.onChange) options.onChange(state);
     }
-    function canUpdate() {
-      var state = options.store.state;
-      return alive() && !busy && !!state.job_id && ['running', 'detached'].indexOf(state.status) >= 0
-        && !root.CitrusTaskState.isTerminal(state) && !(state.question && state.question.status === 'pending');
+    function eligible(state) {
+      return !!state.job_id && ['running', 'detached'].indexOf(state.status) >= 0 && !root.CitrusTaskState.isTerminal(state)
+        && !(state.question && state.question.status === 'pending')
+        && !state.approvals.some(function (item) { return item.status === 'pending'; });
     }
-    async function submitUpdate(instruction) {
-      instruction = String(instruction || '').trim();
-      var state = options.store.state;
-      if (!canUpdate() || !instruction) return false;
-      if (instruction.length > 8000) {
-        requestNote = '本轮补充最多 8000 个字符。'; render(state); return false;
+    function canUpdate() { return alive() && !busy && eligible(options.store.state); }
+    async function submitUpdate(payload, action) {
+      var state = options.store.state, jobId = state.job_id;
+      if (!alive() || !jobId || busy) return 'pending';
+      var maySubmit = canUpdate();
+      if (action === 'submit' && !maySubmit) return 'rejected';
+      if (!payload.instruction || payload.instruction.length > 8000) {
+        requestNote = '本轮补充最多 8000 个字符。'; render(state); return 'rejected';
+      }
+      function ownsJob() { return alive() && options.store.state.job_id === jobId; }
+      function receipt(result) { return !!result && Number.isSafeInteger(result.version) && result.version > 0; }
+      async function lookup() {
+        try { return {result: await options.transport.lookupUpdate(jobId, payload.update_request_id)}; }
+        catch (error) { return {missing: error.status === 404}; }
+      }
+      async function accept(result) {
+        if (!ownsJob()) return 'accepted';
+        requestNote = '补充已提交，等待后续步骤应用。';
+        acceptedVersion = result.version;
+        var latest = options.store.state;
+        var known = result.version <= latest.applied_version || (latest.not_applied_updates || []).some(function (item) { return item.version === result.version; });
+        if (!known && !root.CitrusTaskState.isTerminal(latest)) {
+          options.store.hydrate({job_id: jobId, task_version: Math.max(latest.task_version, result.version),
+            pending_updates: latest.pending_updates.filter(function (item) { return item.version !== result.version; }).concat([result])});
+        }
+        try { await options.transport.refresh(jobId); }
+        catch (_) { if (ownsJob() && acceptedVersion > 0) requestNote = '补充已提交；暂时无法刷新应用状态。'; }
+        return 'accepted';
+      }
+      function pending() {
+        if (ownsJob()) requestNote = '上次补充的提交状态待确认。';
+        return 'pending';
       }
       busy = true; requestNote = ''; render(state);
       try {
-        var result = await options.transport.post(state.job_id, 'updates', {expected_version: state.task_version, instruction: instruction});
-        if (!alive() || !result) return false;
-        requestNote = '补充已提交，等待后续步骤应用。';
-        if (Number.isSafeInteger(result.version)) {
-          acceptedVersion = result.version;
-          var latest = options.store.state;
-          options.store.hydrate({job_id: state.job_id, task_version: result.version,
-            pending_updates: latest.pending_updates.filter(function (item) { return item.version !== result.version; }).concat(result.version > latest.applied_version ? [result] : [])});
+        if (action !== 'submit') {
+          var prior = await lookup();
+          if (receipt(prior.result)) return await accept(prior.result);
+          if (action === 'lookup' || !prior.missing || !ownsJob() || !eligible(options.store.state)) return pending();
         }
-        try { await options.transport.refresh(state.job_id); }
-        catch (_) { if (alive() && acceptedVersion > 0) requestNote = '补充已提交；暂时无法刷新应用状态。'; }
-        return true;
-      } catch (error) {
-        if (!alive()) return false;
-        requestNote = error.message;
-        if (error.status === 409) {
-          try { await options.transport.refresh(state.job_id); } catch (_) { /* preserve the composer draft and conflict explanation */ }
+        try {
+          var result = await options.transport.post(jobId, 'updates', payload);
+          if (receipt(result)) return await accept(result);
+        } catch (error) {
+          if (!ownsJob()) return 'pending';
+          if (error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 499) {
+            requestNote = error.message;
+            if (error.status === 409) {
+              try { await options.transport.refresh(jobId); } catch (_) {}
+            }
+            return 'rejected';
+          }
         }
-        return false;
-      } finally { if (alive()) { busy = false; render(options.store.state); } }
+        var found = await lookup();
+        return receipt(found.result) ? await accept(found.result) : pending();
+      } finally { busy = false; if (alive()) render(options.store.state); }
     }
-    var unsubscribe = options.store.subscribe(render); render(options.store.state);
-    return {element: host, render: render, dispose: unsubscribe, canUpdate: canUpdate,
-      submitUpdate: submitUpdate, isBusy: function () { return busy; }};
+    var controller = {element: host, render: render, store: options.store, owns: alive, canUpdate: canUpdate,
+      submitUpdate: submitUpdate, isBusy: function () { return busy; }, updateNotice: function () { return requestNote; }};
+    controller.dispose = options.store.subscribe(render);
+    render(options.store.state);
+    return controller;
   }
   function createQuestion(options) {
     var host = document.createElement('section'); host.className = 'task-question'; host.hidden = true;

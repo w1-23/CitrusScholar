@@ -604,7 +604,7 @@ def purge_protocol_for_owner(owner_user_id: int) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(task_jobs)")}
         if "owner_user_id" not in columns:
             return
-        for table in ("task_events", "task_updates", "task_approvals", "task_operations",
+        for table in ("task_events", "task_update_requests", "task_updates", "task_approvals", "task_operations",
                       "task_model_attempts", "task_budgets", "task_questions",
                       "agent_execution_segments"):
             if table in tables:

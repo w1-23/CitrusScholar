@@ -44,26 +44,22 @@ def _source_refs(value, inputs):
 _CELL_FIELDS = {"file_id", "sheet", "row", "column", "region_id", "region_bounds"}
 
 
-def _cell_region(cell):
-    return cell.get("region_id") or cell.get("region_bounds") or ""
-
-
-def _resolve_snapshot(fid, sheet, region, snapshots):
+def _resolve_snapshot(fid, sheet, region_id, region_bounds, snapshots):
     """Resolve a whole-sheet snapshot or one explicit region identity.
 
     Existing callers keep using ``(file_id, sheet)``. When several logical
     regions share a sheet, cells must name one; an unqualified cell that
     matches multiple regions is rejected instead of guessed.
     """
-    if region:
-        key = (fid, sheet, region)
-        if key in snapshots:
-            return snapshots[key]
-        for candidate, value in snapshots.items():
-            if (isinstance(candidate, tuple) and len(candidate) >= 3
-                    and candidate[0] == fid and candidate[1] == sheet
-                    and getattr(value, "region_bounds", "") == region):
-                return value
+    if region_id or region_bounds:
+        matches = [value for key, value in snapshots.items()
+                   if len(key) == 3 and key[:2] == (fid, sheet)
+                   and (not region_id or key[2] == region_id)
+                   and (not region_bounds or value.region_bounds == region_bounds.strip().upper())]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise ValueError("custom_audit_region_ambiguous")
         raise ValueError("custom_audit_source_not_selected")
     table = snapshots.get((fid, sheet))
     if table is not None:
@@ -93,7 +89,7 @@ def _verified_locations(cells, refs, snapshots):
                        for key in ("region_id", "region_bounds"))):
             raise ValueError("custom_audit_cells_invalid")
         fid, sheet = cell["file_id"], cell["sheet"]
-        table = _resolve_snapshot(fid, sheet, _cell_region(cell), snapshots)
+        table = _resolve_snapshot(fid, sheet, cell.get('region_id'), cell.get('region_bounds'), snapshots)
         if refs.get(fid) != table.source_sha256:
             raise ValueError("custom_audit_source_not_selected")
         try:

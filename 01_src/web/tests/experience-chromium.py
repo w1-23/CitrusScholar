@@ -56,14 +56,32 @@ class Browser:
         return response['result'].get('value')
 
     def click(self, selector):
-        point = until(lambda: self.evaluate(f'''(() => {{
-          const target = document.querySelector({json.dumps(selector)});
-          if (!target) return null;
-          target.scrollIntoView({{block:'nearest'}});
-          const box = target.getBoundingClientRect();
-          const x = box.x + box.width / 2, y = box.y + box.height / 2;
-          return target.contains(document.elementFromPoint(x, y)) ? {{x,y}} : null;
-        }})()'''), f'Click target is hidden or covered: {selector}')
+        deadline = time.monotonic() + 12
+        diagnostic = None
+        while time.monotonic() < deadline:
+            diagnostic = self.evaluate(f'''(() => {{
+              const target = document.querySelector({json.dumps(selector)});
+              if (!target) return {{missing:true}};
+              target.scrollIntoView({{block:'nearest'}});
+              const box = target.getBoundingClientRect();
+              const x = box.x + box.width / 2, y = box.y + box.height / 2;
+              const at = document.elementFromPoint(x, y);
+              const style = getComputedStyle(target);
+              return {{
+                x, y,
+                rect: {{x:box.x, y:box.y, width:box.width, height:box.height}},
+                viewport: {{width:innerWidth, height:innerHeight, scrollX, scrollY}},
+                visible: style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0,
+                at: at ? `${{at.tagName.toLowerCase()}}#${{at.id}}.${{at.className}}` : null,
+                hit: !!at && target.contains(at)
+              }};
+            }})()''')
+            if diagnostic and diagnostic.get('hit'):
+                point = {'x': diagnostic['x'], 'y': diagnostic['y']}
+                break
+            time.sleep(0.15)
+        else:
+            raise AssertionError(f'Click target is hidden or covered: {selector}: {diagnostic}')
         for event in ('mousePressed', 'mouseReleased'):
             self.call('Input.dispatchMouseEvent', type=event, button='left', clickCount=1, **point)
 
@@ -83,6 +101,7 @@ def run(browser, origin, output):
     browser.call('Runtime.enable')
     browser.call('Page.enable')
     browser.call('Network.enable')
+    browser.call('Page.setDownloadBehavior', behavior='allow', downloadPath=str(output.resolve()))
     browser.call('Emulation.setDeviceMetricsOverride', width=1360, height=900, deviceScaleFactor=1, mobile=False)
     browser.call('Page.addScriptToEvaluateOnNewDocument', source=script)
     browser.call('Page.startScreencast', format='jpeg', quality=82, maxWidth=1100, everyNthFrame=2)
@@ -105,6 +124,18 @@ def run(browser, origin, output):
 
     def phase(name):
         evaluate(f'experienceStep({json.dumps(name)})')
+
+    def fill(value):
+        evaluate(f"""(() => {{
+          const input = document.querySelector('#user-input');
+          input.value = {json.dumps(value, ensure_ascii=False)};
+          input.dispatchEvent(new Event('input', {{bubbles: true}}));
+        }})()""")
+
+    def switch_session(title):
+        selector = f'.session-title[title="{title}"]'
+        check(f'Session listed: {title}', f'document.querySelector({json.dumps(selector)})')
+        evaluate(f'document.querySelector({json.dumps(selector)}).click()')
 
     def offline(value):
         browser.call('Network.emulateNetworkConditions', offline=value, latency=0, downloadThroughput=-1, uploadThroughput=-1)
@@ -151,13 +182,53 @@ def run(browser, origin, output):
         browser.click('#ctxDrawer button')
         phase('whitespace')
         check('Thirty completed tools preserve metrics and whitespace keeps waiting',
-              f"({text('.research-process-body')}).includes('30 项') && ({text('#ctxCacheNote')}).includes('25%') && document.querySelector('[data-state=waiting]')")
+              f"({text('.research-process-body')}).includes('共 30 次尝试') && ({text('#ctxCacheNote')}).includes('25%') && document.querySelector('[data-state=waiting]')")
         phase('answer')
         check('First visible answer stops dots', f"([...document.querySelectorAll('.turn-answer')].some(node => node.textContent.includes('表格核对结果'))) && !document.querySelector('[data-state=waiting]')")
         capture('answer')
+        check('Only explicitly public progress is rendered',
+              "document.querySelector('.research-process').textContent.includes('公开进度：正在核查列名') && !document.querySelector('#chat-container').textContent.includes('INTERNAL_FIXTURE_MARKER')")
+        check('Browse defaults off', "document.querySelector('#browse-requested').checked === false")
+        fill('待发送的新消息草稿')
+        browser.click('.task-update-toggle')
+        check('Task update reuses the single composer and locks new-request controls',
+              "document.querySelectorAll('.input-box textarea, .task-controls textarea').length === 1 && !document.querySelector('#composer-supplement').hidden && document.querySelector('#input-tools-menu').hidden && document.querySelector('#composer-browse').hidden && document.activeElement.id === 'user-input'")
+        fill('被拒绝的补充')
+        evaluate("experienceUpdateMode('conflict')")
+        browser.click('#send-btn')
+        check('Conflict preserves the update draft without queueing a new turn',
+              "experienceRequests().updates.length === 1 && experienceRequests().posts.length === 0 && document.querySelector('#user-input').value === '被拒绝的补充' && document.querySelector('#composer-task-status').textContent.includes('核对最新状态')")
+        fill('回执会丢失的补充')
+        evaluate("experienceUpdateMode('lost', true)")
+        browser.click('#send-btn')
+        check('Lost update receipt uses its own ID and preserves the draft',
+              "experienceRequests().updates.length === 2 && experienceRequests().lookups[0] === experienceRequests().updates[1].update_request_id && document.querySelector('#user-input').value === '回执会丢失的补充' && !document.querySelector('#send-btn').disabled")
+        browser.call('Page.reload', ignoreCache=True)
+        check('Reload resumes in new-message mode and keeps that draft',
+              "document.querySelector('#user-input')?.value === '待发送的新消息草稿' && document.querySelector('#composer-supplement').hidden && document.querySelector('.task-update-toggle:not([hidden])')")
+        evaluate("experienceUpdateMode('lost', false)")
+        browser.click('.task-update-toggle')
+        check('Lookup after reload confirms the original update without reposting',
+              "experienceRequests().updates.length === 2 && experienceRequests().lookups.at(-1) === experienceRequests().updates[1].update_request_id && document.querySelector('#user-input').value === '' && !document.querySelector('#send-btn').disabled")
+        fill('终态保留的补充草稿')
+        switch_session('另一个会话')
+        check('Different session receives an independent new-message draft',
+              "document.querySelector('#user-input').value === '' && document.querySelector('#composer-supplement').hidden")
+        fill('另一个会话的草稿')
+        switch_session('表格核对')
+        check('Returning restores only the original new-message draft',
+              "document.querySelector('#user-input').value === '待发送的新消息草稿' && document.querySelector('.task-update-toggle:not([hidden])')")
+        browser.click('.task-update-toggle')
+        check('The same job restores its own update draft', "document.querySelector('#user-input').value === '终态保留的补充草稿'")
         phase('done')
         check('Terminal state displays completion', "document.querySelector('.turn-answer[data-display-status=completed]') && !document.querySelector('.is-running') && true")
         capture('completed')
+        check('Terminal job restores new-message mode and makes the unsubmitted update readable',
+              "document.querySelector('#composer-supplement').hidden && document.querySelector('#user-input').value === '待发送的新消息草稿' && document.querySelector('.task-update-recovery:not([hidden]) p').textContent === '终态保留的补充草稿'")
+        browser.click('#input-tools-menu summary')
+        check('The plus menu exposes attachment selection and the real methods catalog',
+              "document.querySelector('#attachment-btn') && document.querySelector('[data-skill-id=data-audit]')")
+        browser.click('[data-skill-id=data-audit]')
         evaluate('''(() => {
           const input = document.querySelector('#user-input');
           const buffer = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRzsAAAAASUVORK5CYII='), c => c.charCodeAt(0));
@@ -170,15 +241,31 @@ def run(browser, origin, output):
         check('Synthetic image paste shows a thumbnail and composing Enter does not send',
               "document.querySelector('#attachment-list img') && experienceRequests().posts.length === 0")
         browser.click('#send-btn')
-        check('Send associates the screenshot with the queued request',
-              "experienceRequests().posts[0]?.attachments[0]?.name.endsWith('.png') && document.querySelector('.sent-attachment-gallery img')")
-        evaluate("document.querySelector('#user-input').value = '第二条独立消息'")
+        check('Send associates the screenshot and a frozen method with only its queue entry',
+              "experienceRequests().posts[0]?.attachments[0]?.name.endsWith('.png') && experienceRequests().posts[0].selected_skills[0]?.id === 'data-audit' && !('browse_requested' in experienceRequests().posts[0]) && document.querySelector('.sent-attachment-gallery img') && document.querySelector('#selected-skills').hidden")
+        browser.click('#browse-requested')
+        fill('第二条独立消息')
         browser.click('#send-btn')
         check('Separate FIFO admissions keep their request identity',
               "experienceRequests().posts.length === 2 && experienceRequests().posts[0].client_request_id !== experienceRequests().posts[1].client_request_id && experienceRequests().posts[1].query === '第二条独立消息'")
+        check('Browse opt-in is sent only for the explicitly selected request',
+              "experienceRequests().posts[1].browse_requested === true && document.querySelector('#browse-requested').checked === false")
+        fill('第三条独立消息')
+        browser.click('#send-btn')
+        check('Subsequent new request omits the Browse flag',
+              "experienceRequests().posts.length === 3 && !('browse_requested' in experienceRequests().posts[2])")
+        evaluate('experienceQueueAvailability(false)')
+        check('Unavailable queue retains known rows and reports the sync gap',
+              "document.querySelector('#composer-task-status').textContent.includes('队列状态待同步') && document.querySelectorAll('.turn-queue-cancel').length === 3")
+        evaluate('experienceQueueAvailability(true)')
+        browser.click('.turn-queue-cancel')
+        check('A single queue cancellation preserves other queued requests',
+              "document.querySelector('#chat-container').textContent.includes('已取消，这条消息不会执行') && document.querySelectorAll('.turn-queue-cancel').length === 2")
         evaluate('experienceScale(100, 10000)')
         started = time.monotonic()
         browser.call('Page.reload', ignoreCache=True)
+        check('Reload restores a cancellation before dispatch',
+              "document.querySelector('.turn-answer[data-display-status=cancelled]')?.textContent.includes('不会执行') && document.querySelectorAll('.turn-queue-cancel').length === 2")
         count = check('Long fixture renders its supplied history',
                       "document.querySelectorAll('.message').length >= 200 && document.querySelectorAll('.message').length",
                       timeout=30)
@@ -206,10 +293,14 @@ def run(browser, origin, output):
         check('Library CSV preview preserves quoted commas and newlines',
               "[...document.querySelectorAll('.sf-table td')].some(cell => cell.textContent === 'north, south') && [...document.querySelectorAll('.sf-table td')].some(cell => cell.textContent.includes('two\\r\\nlines') || cell.textContent.includes('two\\nlines'))")
         capture('library-preview')
-        browser.call('Page.navigate', url=origin + '/figures.html')
-        check('Figure opens with both drawers collapsed', "document.querySelector('#leftSidebar')?.hidden && document.querySelector('#rightSidebar')?.hidden")
-        browser.click('#toggleLeft')
-        check('Existing project page loads thirty entries', "document.querySelectorAll('#projectList [data-open]').length === 30")
+        browser.click('#sessionFilePreviewOverlay .overlay-close')
+        check('The preview modal closes before navigating to the workbench', "document.querySelector('#sessionFilePreviewOverlay').hidden")
+        browser.click('#figureRailBtn')
+        check('The real workbench entry navigates to /figures', "location.pathname === '/figures' && document.querySelector('#workbench')")
+        check('The workbench opens with its inspector collapsed', "document.querySelector('#rightSidebar')?.hidden")
+        evaluate("if (document.querySelector('#leftSidebar').hidden) document.querySelector('#toggleLeft').click()")
+        check('The figure drawer opens through its real toolbar control',
+              "!document.querySelector('#leftSidebar').hidden && document.querySelector('#toggleLeft').getAttribute('aria-expanded') === 'true' && document.querySelectorAll('#projectList [data-open]').length === 30")
         for expected in (60, 90, 120, 122):
             browser.click('#loadMoreProjects')
             check(f'Project paging reaches {expected} entries', f"document.querySelectorAll('#projectList [data-open]').length === {expected}")
@@ -226,6 +317,16 @@ def run(browser, origin, output):
               "experienceRequests().imports.length === 1 && experienceRequests().imports[0].file_id === 'workbook' && experienceRequests().imports[0].mapping.y === 'Value' && document.querySelector('#projectTitle').textContent.includes('隔离夹具')")
         check('Project creation closes the import drawer', "document.querySelector('#leftSidebar')?.hidden")
         capture('figure-created')
+        browser.click('#toggleLeft')
+        browser.click('#objectTree [data-gid=fixture-title]')
+        evaluate("const editor = document.querySelector('#propertyPanel [data-prop=text]'); editor.value = '已更新标题'; editor.dispatchEvent(new Event('input', {bubbles: true})); editor.dispatchEvent(new Event('change', {bubbles: true}));")
+        browser.click('#saveButton')
+        check('The workbench saves edits against the current revision',
+              "experienceRequests().saves.length === 1 && experienceRequests().saves[0].expected_revision === 1 && experienceRequests().saves[0].overrides.some(edit => edit.gid === 'fixture-title' && edit.value === '已更新标题') && document.querySelector('#downloadSvg').href.endsWith('/export/svg?v=2')")
+        browser.click('#exportMenu summary')
+        browser.click('#downloadSvg')
+        check('Export verifies the saved revision', "experienceRequests().exports[0] === '2'")
+        until(lambda: (output / 'fixture.svg').is_file(), 'The fixture SVG did not download')
     except Exception:
         capture('failure')
         diagnostic = evaluate("({ url: location.href, queue: document.querySelector('.turn-queue-state')?.textContent, body: document.body.innerText.slice(-5000), states:[...document.querySelectorAll('[data-state]')].map(x=>x.dataset.state) })")

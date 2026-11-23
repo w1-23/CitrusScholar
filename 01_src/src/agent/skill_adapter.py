@@ -354,11 +354,14 @@ class SkillSession:
                         or page["sha256"] != receipt["resource_sha256"]
                         or hashlib.sha256(page["text"].encode()).hexdigest() != receipt["page_sha256"]):
                     raise ValueError("skill_receipt_bytes_mismatch")
+                valid[key] = receipt
+                if content is None:
+                    self.diagnostics.append("skill_receipt_outside_send_view")
+                    continue
                 identity = tuple(p["skill"][field] for field in _IDENTITY_FIELDS)
                 covered.setdefault((identity, page["resource"]), []).append(
                     (page["start_char"], page["start_char"] + len(page["text"]), page["total_chars"]))
                 packages[identity] = p
-                valid[key] = receipt
             except (ValueError, KeyError, TypeError, OSError, AttributeError):
                 self.diagnostics.append("skill_receipt_stale_or_invalid")
         loaded = set()
@@ -375,9 +378,15 @@ class SkillSession:
                     complete = False
             if complete:
                 loaded.add(identity)
-        self.active = {identity[0] for identity in loaded
-                       if all(tuple(dep[field] for field in _IDENTITY_FIELDS) in loaded
-                              for dep in packages[identity]["dependencies"])}
+        active = set()
+        while True:
+            ready = {identity for identity in loaded - active
+                     if all(tuple(dep[field] for field in _IDENTITY_FIELDS) in active
+                            for dep in packages[identity]["dependencies"])}
+            if not ready:
+                break
+            active.update(ready)
+        self.active = {identity[0] for identity in active}
         self.receipts = valid
         return set(self.active)
 

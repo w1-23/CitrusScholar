@@ -90,6 +90,7 @@
     if (options.menu) options.menu.addEventListener('toggle', function () { if (options.menu.open) load(); });
     if (options.retry) options.retry.addEventListener('click', load);
     return {load:load, reset:reset,
+      restore:function (items) { selected = items.map(identity); revision++; draw(); },
       capture:function () { return {items:selected.map(identity), revision:revision, scope:options.scope()}; },
       acknowledge:function (snapshot) {
         if (snapshot.scope === options.scope() && snapshot.revision === revision) {

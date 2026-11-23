@@ -5,7 +5,7 @@ import base64
 import hashlib
 import json
 from .envelope import TableEnvelope
-from .methods import audit_frame
+from .methods import COVERAGE_CHECKS, audit_frame
 from .readers import read_tables, read_regions
 from .data_audit_rules import RULES
 
@@ -18,9 +18,6 @@ def audit_table(table: TableEnvelope, *, checks=None, **options):
     receipt={}
     findings,_=audit_frame(table.to_frame(),row_offset=0,source_coverage=table.coverage,
                            execution_receipt=receipt,checks=checks,**options)
-    diagnostics={'iqr_insufficient','design_checks_skipped',
-                 'invalid_group_mapping','invalid_value_mapping','grim_sd_skipped',
-                 'integer_summary_not_checked','findings_truncated'}
     for item in findings:
         local=item.get('column_index')
         if type(local)is int:
@@ -29,7 +26,7 @@ def audit_table(table: TableEnvelope, *, checks=None, **options):
             item['scope']='cell'
         else:
             item['scope']='cell' if item.get('row') else 'column' if item.get('column_index') else 'table'
-        item['coverage_only']=item['check'] in diagnostics
+        item['coverage_only']=item['check'] in COVERAGE_CHECKS
         item['sheet']=table.sheet
     rules=receipt['rules']
     partial=bool(table.coverage.get('truncated')) or any(r['status'] in {'invalid_input','failed','truncated'} for r in rules.values())

@@ -105,6 +105,8 @@ def record_report(owner: int, session_id: str, report: dict) -> dict:
     # Zero-finding and truncated-location reports still depend on all scanned
     # originals for later export. Pin the authoritative source refs as well.
     for table in report.get("table_results", []):
+        if table.get('ok') is False:
+            continue
         fid, digest = table.get("source_file_id"), table.get("source_sha256")
         if fid:
             entry = files.get_account_file(fid, owner, touch=False)
@@ -155,6 +157,9 @@ def get_review(owner: int, review_id: str) -> dict | None:
             if entry and entry.get("sha256") == (loc.get("sha256") or loc.get("source_sha256")):
                 loc["source_download_url"] = entry.get("download_url", "")
                 loc["source_filename"] = entry.get("filename", "")
+    if 'table_results' in report:
+        from .audit_projection import project_findings
+        report['finding_projection'] = project_findings(report)
     return {"review_id": review_id, "session_id": row["session_id"],
             "created_at": row["created_at"], "report": report}
 

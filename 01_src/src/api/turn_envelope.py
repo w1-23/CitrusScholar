@@ -229,6 +229,8 @@ def _validate_request(*, request, owner_user_id, session_id,
         "context_compression": _bool_or(
             request.get("context_compression"), "context_compression", True),
     }
+    if _bool_or(request.get("browse_requested"), "browse_requested", False):
+        options["browse_requested"] = True
     selected_skills = _validated_selected_skills(request.get("selected_skills"))
 
     attachments = request.get("attachments") or []
@@ -719,6 +721,7 @@ def load_dispatch_input(turn: dict) -> tuple[dict, list[dict]]:
         "web_search_enabled": options.get("web_search_enabled"),
         "visualization_enabled": bool(options.get("visualization_enabled", False)),
         "context_compression": bool(options.get("context_compression", True)),
+        "browse_requested": options.get("browse_requested") is True,
         "selected_skills": selected_skills,
         "attachments": [],
         "file_refs": file_ids,

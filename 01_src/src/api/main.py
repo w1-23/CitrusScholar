@@ -646,6 +646,7 @@ class ChatRequest(BaseModel):
     light_mode: Optional[bool] = None
     web_search_enabled: Optional[bool] = None
     visualization_enabled: bool = False
+    browse_requested: bool = Field(default=False, strict=True)
     context_compression: bool = True
     selected_skills: list[SelectedSkill] = Field(default_factory=list, max_length=4)
     # Per-request attachments. Payloads are processed in memory and are never
@@ -2646,6 +2647,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
         "attachment_context": "",
         "image_attachments": [],
         "visualization_enabled": bool(req.visualization_enabled),
+        "browse_requested": req.browse_requested,
         "context_compression": bool(req.context_compression),
         "selected_skills": [item.model_dump() for item in req.selected_skills],
         # Same source as the graph's own budget: a disabled request timeout
@@ -3772,6 +3774,7 @@ async def _dispatch_question_child(child_job_id: str, user: dict, *, queued_turn
         req = ChatRequest(query=state["query"], session_id=sid,
                           client_request_id=state["client_request_id"], file_refs=file_ids,
                           visualization_enabled=state.get("visualization_enabled", False),
+                          browse_requested=state.get("browse_requested") is True,
                           selected_skills=state.get("selected_skills") or [],
                           context_compression=state.get("context_compression", True))
         if queued_turn is not None:
@@ -3863,6 +3866,7 @@ async def answer_task_question(job_id: str, question_id: str, req: QuestionAnswe
 class TaskUpdateRequest(BaseModel):
     expected_version: int
     instruction: str
+    update_request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.:-]{1,64}$")
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -3887,11 +3891,22 @@ async def update_chat_task(job_id: str, req: TaskUpdateRequest, request: Request
     _owned_protocol_job(job_id, request)
     from src.core import task_events
     try:
-        return task_events.submit_update(job_id, req.expected_version, req.instruction)
+        return task_events.submit_update(job_id, req.expected_version, req.instruction,
+                                         request_id=req.update_request_id)
     except task_events.TaskConflict as exc:
         raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v2/chat/jobs/{job_id}/updates/{update_request_id}")
+async def chat_task_update_status(job_id: str, update_request_id: str, request: Request):
+    _owned_protocol_job(job_id, request)
+    from src.core.task_events import update_request_status
+    result = update_request_status(job_id, update_request_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"code": "task_update_not_found"})
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/v2/chat/jobs/{job_id}/approvals/{approval_id}")
@@ -3945,6 +3960,7 @@ async def _resume_execution_segment(identity, state, admission, lease):
         req = ChatRequest(query=state["query"], session_id=identity.session_id,
             client_request_id=state["client_request_id"], file_refs=file_ids,
             visualization_enabled=bool(state.get("visualization_enabled")),
+            browse_requested=state.get("browse_requested") is True,
             context_compression=bool(state.get("context_compression", True)),
             selected_skills=state.get("selected_skills") or [])
         token = CancelToken()
@@ -4017,6 +4033,7 @@ async def recover_chat_agent(job_id: str, req: RecoverAgentRequest, request: Req
         recovered_req = ChatRequest(query=state["query"], session_id=sid,
             client_request_id=state["client_request_id"], file_refs=file_ids,
             visualization_enabled=bool(state.get("visualization_enabled")),
+            browse_requested=state.get("browse_requested") is True,
             context_compression=bool(state.get("context_compression", True)),
             selected_skills=state.get("selected_skills") or [])
         # No awaits separate the durable CAS and the in-process admission fence.

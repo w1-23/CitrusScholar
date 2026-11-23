@@ -72,8 +72,13 @@ def _snapshot_entry(ref, snapshots):
     base = (ref["file_index"], ref["sheet"])
     region = _region_key(ref)
     if region:
-        key = (base[0], base[1], region)
-        return (snapshots.get(key), "") if key in snapshots else (None, "bound_region_unavailable")
+        matches = [entry for key, entry in snapshots.items()
+                   if len(key) == 3 and key[:2] == base
+                   and (not ref.get('region_id') or key[2] == ref['region_id'])
+                   and (not ref.get('region_bounds') or entry[0].region_bounds == ref['region_bounds'].strip().upper())]
+        if len(matches) == 1:
+            return matches[0], ""
+        return None, "bound_region_ambiguous" if matches else "bound_region_unavailable"
     if base in snapshots:
         return snapshots[base], ""
     matches = [key for key in snapshots
@@ -436,6 +441,9 @@ def compare_bound(plan, snapshots):
             receipt["reason"] = "bound_sheet_unavailable"
             continue
         (left, left_keys), (right, right_keys) = found
+        if left is right:
+            receipt["reason"] = "bound_same_selection"
+            continue
         if method == "window_search":
             _compare_window_search(receipt, binding, sides, (left, right))
             continue

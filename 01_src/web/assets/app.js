@@ -114,7 +114,6 @@ var skillPicker = window.CitrusSkillPicker ? window.CitrusSkillPicker.create({
   retry: document.getElementById('skill-picker-refresh'), input: document.getElementById('user-input'), fetch: accountFetch,
   scope: function () { return currentAccount && sessionId && !accountDocumentRetired ? authEpoch + ':' + sessionId : ''; }
 }) : null;
-window.addEventListener('citrus:session-changed', function () { if (skillPicker) skillPicker.reset(); });
 function advanceAuthEpoch() {
   if (skillPicker) skillPicker.reset();
   authEpoch += 1;
@@ -138,6 +137,7 @@ function resetAccountState() {
   }
   localStorage.removeItem('citrus_session_id');
   sessionStorage.removeItem('citrus_session_id');
+  clearComposerDrafts();
   currentAccount = null; sessionId = null;
   _selectedAttachments.length = 0;
   window._selectedAccountFileRefs.length = 0;
@@ -1120,6 +1120,7 @@ async function startAuthenticatedApp() {
   var epoch = authEpoch;
   showAuthGate(false);
   sessionId = localStorage.getItem(sessionStorageKey());
+  restoreComposerSession();
   var configReady;
   if (currentAccount && currentAccount.role === 'admin') configReady = loadRuntimeConfig();
   else configReady = accountFetch('/api/v2/config').then(function(r) { if (epoch !== authEpoch) return; return r.json(); }).then(function(cfg) { if (epoch !== authEpoch) return;
@@ -1171,8 +1172,175 @@ var _agentTokenName = '';
 
 if (typeof marked === 'undefined') window.marked = { parse: function(t) { return t; } };
 
+var composerDraftPrefix = 'citrus.composer.';
+var composerDrafts = new Map();
+var composerSelections = new Map();
+var composerSupplement = null;
+var queueSyncUnavailable = false;
+var browseCheckbox = document.getElementById('browse-requested');
+
+function composerDraftKey(jobId) {
+  return currentAccount && sessionId && !accountDocumentRetired
+    ? composerDraftPrefix + JSON.stringify([currentAccount.user_id, sessionId, jobId || '']) : '';
+}
+
+function composerDraft(key) {
+  if (!composerDrafts.has(key)) {
+    var text = '', pending = null;
+    try {
+      if (key) {
+        text = sessionStorage.getItem(key) || '';
+        pending = JSON.parse(sessionStorage.getItem(key + '.update') || 'null');
+      }
+    } catch (_) {}
+    composerDrafts.set(key, {text: text, revision: 0, pending: pending});
+  }
+  return composerDrafts.get(key);
+}
+
+function writeComposerDraft(key, text) {
+  if (!key) return;
+  var draft = composerDraft(key);
+  if (draft.text === text) return;
+  draft.text = text;
+  draft.revision++;
+  try {
+    if (text) sessionStorage.setItem(key, text);
+    else sessionStorage.removeItem(key);
+  } catch (_) {}
+}
+
+function savePendingUpdate(key, pending) {
+  composerDraft(key).pending = pending;
+  try {
+    if (pending) sessionStorage.setItem(key + '.update', JSON.stringify(pending));
+    else sessionStorage.removeItem(key + '.update');
+  } catch (_) {}
+}
+
+function saveComposerInput() {
+  writeComposerDraft(composerSupplement ? composerSupplement.key : composerDraftKey(), userInput.value);
+}
+
+function clearComposerDrafts() {
+  composerSupplement = null;
+  composerDrafts.clear();
+  composerSelections.clear();
+  queueSyncUnavailable = false;
+  if (browseCheckbox) browseCheckbox.checked = false;
+  try {
+    for (var index = sessionStorage.length - 1; index >= 0; index--) {
+      var key = sessionStorage.key(index);
+      if (key && (key.indexOf(composerDraftPrefix) === 0 || key.indexOf('citrus.task-draft.') === 0)) sessionStorage.removeItem(key);
+    }
+  } catch (_) {}
+}
+
+function rememberComposerSession() {
+  var key = composerDraftKey();
+  if (!key) return;
+  saveComposerInput();
+  composerSelections.set(key, {files: _selectedAttachments, refs: window._selectedAccountFileRefs,
+    skills: skillPicker ? skillPicker.capture() : null});
+}
+
+function restoreComposerSession(preserve) {
+  var key = composerDraftKey();
+  var saved = composerSelections.get(key);
+  _composerNotice = '';
+  queueSyncUnavailable = false;
+  if (browseCheckbox) browseCheckbox.checked = false;
+  if (preserve) saveComposerInput();
+  else {
+    userInput.value = composerDraft(key).text;
+    _selectedAttachments = saved ? saved.files : [];
+    window._selectedAccountFileRefs = saved ? saved.refs : [];
+    if (skillPicker) {
+      skillPicker.reset();
+      if (saved && saved.skills) skillPicker.restore(saved.skills.items);
+    }
+  }
+  renderAttachmentSelection();
+}
+
+function readSupplementDraft(jobId) {
+  return jobId ? composerDraft(composerDraftKey(jobId)) : null;
+}
+
+function isSupplementSelected(store) {
+  return !!composerSupplement && composerSupplement.controller.store === store && composerSupplement.jobId === store.state.job_id;
+}
+
+function leaveComposerSupplement() {
+  var previous = composerSupplement;
+  if (!previous) return null;
+  saveComposerInput();
+  composerSupplement = null;
+  userInput.value = composerDraft(composerDraftKey()).text;
+  return previous;
+}
+
+function openComposerSupplement(controller) {
+  if (!controller.canUpdate()) return;
+  var jobId = controller.store.state.job_id, key = composerDraftKey(jobId);
+  if (!key) return;
+  if (!isSupplementSelected(controller.store)) {
+    saveComposerInput();
+    var previous = composerSupplement;
+    composerSupplement = {controller: controller, jobId: jobId, key: key, epoch: authEpoch};
+    userInput.value = readSupplementDraft(jobId).text;
+    if (previous) previous.controller.render(previous.controller.store.state);
+    controller.render(controller.store.state);
+  }
+  refreshTaskComposer();
+  userInput.focus();
+  if (composerDraft(key).pending && !controller.isBusy()) void settleComposerUpdate(composerSupplement, 'lookup');
+}
+
+function reconcileSupplement(controller) {
+  var jobId = controller.store.state.job_id, key = composerDraftKey(jobId);
+  if (key && composerDraft(key).pending) void settleComposerUpdate({controller: controller, jobId: jobId, key: key, epoch: authEpoch}, 'lookup');
+}
+
+function submitComposerSupplement() {
+  var target = composerSupplement, controller = target.controller;
+  if (controller.isBusy() || controller.store.state.job_id !== target.jobId) return;
+  saveComposerInput();
+  var draft = composerDraft(target.key);
+  if (draft.pending) return settleComposerUpdate(target, controller.canUpdate() ? 'retry' : 'lookup');
+  if (!controller.canUpdate() || !draft.text.trim()) return;
+  var requestId = 'update-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  savePendingUpdate(target.key, {text: draft.text, payload: {update_request_id: requestId,
+    expected_version: controller.store.state.task_version, instruction: draft.text.trim()}});
+  return settleComposerUpdate(target, 'submit');
+}
+
+async function settleComposerUpdate(target, action) {
+  var controller = target.controller;
+  var draft = composerDraft(target.key), pending = draft.pending;
+  if (!pending || controller.isBusy() || controller.store.state.job_id !== target.jobId) return;
+  var outcome = await controller.submitUpdate(pending.payload, action);
+  if (outcome === 'pending' || target.epoch !== authEpoch || draft.pending !== pending) return;
+  if (composerSupplement && composerSupplement.key === target.key) saveComposerInput();
+  savePendingUpdate(target.key, null);
+  if (outcome === 'accepted' && draft.text === pending.text) {
+    writeComposerDraft(target.key, '');
+    if (composerSupplement && composerSupplement.key === target.key) userInput.value = '';
+  }
+  if (controller.owns()) controller.render(controller.store.state);
+  refreshTaskComposer();
+}
+
+var newMessageModeButton = document.getElementById('composer-new-message');
+if (newMessageModeButton) newMessageModeButton.addEventListener('click', function () {
+  var previous = leaveComposerSupplement();
+  if (previous) previous.controller.render(previous.controller.store.state);
+  refreshTaskComposer();
+  userInput.focus();
+});
+
 function handleAttachmentSelection(fileList) {
-  if (!currentAccount || accountDocumentRetired) return;
+  if (!currentAccount || accountDocumentRetired || composerSupplement) return;
   var dropped = Array.from(fileList || []);
   var allowed = dropped.filter(function(file) {
     var name = String(file.name || '').toLowerCase();
@@ -1198,7 +1366,7 @@ function handleAttachmentSelection(fileList) {
 }
 
 function handleAttachmentPaste(event) {
-  if (!currentAccount || accountDocumentRetired || event.defaultPrevented) return;
+  if (!currentAccount || accountDocumentRetired || composerSupplement || event.defaultPrevented) return;
   var clipboard = event.clipboardData;
   if (!clipboard) return;
   // files and items usually describe the same payload. Read only one of them.
@@ -1242,6 +1410,7 @@ if (userInput) {
   userInput.addEventListener('keydown', handleComposerKeydown);
   userInput.addEventListener('input', function () {
     if (String(userInput.value || '').trim()) _composerNotice = '';
+    saveComposerInput();
     refreshTaskComposer();
   });
 }
@@ -1259,12 +1428,12 @@ function hasDraggedFiles(event) {
     if (!hasDraggedFiles(event)) return;
     event.preventDefault();
     dragDepth += 1;
-    panel.classList.add('file-drag-over');
+    if (!composerSupplement) panel.classList.add('file-drag-over');
   });
   panel.addEventListener('dragover', function(event) {
     if (!hasDraggedFiles(event)) return;
     event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    if (event.dataTransfer) event.dataTransfer.dropEffect = composerSupplement ? 'none' : 'copy';
   });
   panel.addEventListener('dragleave', function(event) {
     if (!hasDraggedFiles(event)) return;
@@ -2411,6 +2580,7 @@ function findTurnQueueEntry(turns, requestId) {
 
 // Retire observers and view controls only. Navigation never sends cancellation.
 function disposeTaskView() {
+  leaveComposerSupplement();
   historyRestoreVersion += 1;
   abortHistoryRequests();
   abortTurnQueueReads();
@@ -2456,7 +2626,7 @@ function queuedTurnCount() {
     var binding = turnQueueBindings[i];
     if (!binding || !binding.owns || !binding.owns()) continue;
     if (CitrusTaskState.isTerminal(binding.store.state)) continue;
-    if (!turnQueueIsExecuting(binding.store.state)) count++;
+    if (binding.queueEntry && binding.queueEntry.state === 'queued') count++;
   }
   return count;
 }
@@ -2496,6 +2666,21 @@ function unregisterTurnBinding(binding) {
 }
 
 function refreshTaskComposer() {
+  if (composerSupplement) {
+    var targetController = composerSupplement.controller;
+    var targetState = targetController.store.state;
+    if (!targetController.owns() || targetState.job_id !== composerSupplement.jobId || CitrusTaskState.isTerminal(targetState)) leaveComposerSupplement();
+  }
+  var supplement = composerSupplement;
+  var pendingUpdate = supplement && composerDraft(supplement.key).pending;
+  var mode = document.getElementById('composer-supplement');
+  if (mode) mode.hidden = !supplement;
+  ['composer-browse', 'input-tools-menu', 'attachment-list', 'selected-skills'].forEach(function (id) {
+    var element = document.getElementById(id);
+    if (!element) return;
+    if (id === 'input-tools-menu' && supplement) element.open = false;
+    element.hidden = !!supplement || (id === 'selected-skills' && !element.textContent);
+  });
   var binding = activeTurnComposer && activeTurnComposer.owns() ? activeTurnComposer : null;
   var state = binding && binding.store.state;
   var terminal = state && CitrusTaskState.isTerminal(state);
@@ -2508,20 +2693,25 @@ function refreshTaskComposer() {
   var composerHasAttachments = !!((_selectedAttachments && _selectedAttachments.length) ||
     (window._selectedAccountFileRefs && window._selectedAccountFileRefs.length));
   if (button) {
-    button.disabled = !!historyRequest;
-    button.style.display = composerHasText ? 'flex' : 'none';
-    button.title = '发送 (Enter)';
-    button.setAttribute('aria-label', '发送消息');
+    button.disabled = !!historyRequest || !!(supplement && (supplement.controller.isBusy() || !pendingUpdate && !supplement.controller.canUpdate()));
+    button.style.display = composerHasText || pendingUpdate ? 'flex' : 'none';
+    var sendLabel = pendingUpdate ? '核对并重试上次补充' : supplement ? '提交补充' : '发送消息';
+    button.title = sendLabel + ' (Enter)';
+    button.setAttribute('aria-label', sendLabel);
   }
   if (stop) {
     stop.style.display = executing ? 'flex' : 'none';
     stop.title = '停止执行中的任务；排队中的消息不会被取消';
   }
-  if (userInput) userInput.placeholder = awaitingQuestion
-    ? '可发送新消息，答复请使用选择卡片'
-    : executing ? '有新要求？发送后会排在当前任务之后'
-    : queued ? '可继续发送，消息会按发送顺序排队'
-    : '有什么想做的？(Enter 发送 / Shift+Enter 换行)';
+  if (userInput) {
+    if (supplement) userInput.maxLength = 8000;
+    else userInput.removeAttribute('maxlength');
+    userInput.placeholder = supplement ? '补充本轮要求（仅正文）' : awaitingQuestion
+      ? '可发送新消息，答复请使用选择卡片'
+      : executing ? '有新要求？发送后会排在当前任务之后'
+      : queued ? '可继续发送，消息会按发送顺序排队'
+      : '有什么想做的？(Enter 发送 / Shift+Enter 换行)';
+  }
   var hint = document.getElementById('composer-task-status');
   if (!hint && userInput && userInput.parentNode) {
     hint = document.createElement('p'); hint.id = 'composer-task-status'; hint.className = 'composer-task-status';
@@ -2529,7 +2719,10 @@ function refreshTaskComposer() {
     userInput.parentNode.appendChild(hint);
   }
   if (hint) {
-    hint.textContent = _composerNotice && (composerHasText || composerHasAttachments) ? _composerNotice
+    hint.textContent = supplement ? (supplement.controller.updateNotice() ||
+      (supplement.controller.isBusy() ? '正在处理补充…' : pendingUpdate ? '上次补充的提交状态待确认。' : supplement.controller.canUpdate() ? '补充仅发送给选中的任务。' : '当前任务暂时无法接收补充。'))
+      : queueSyncUnavailable ? '队列状态待同步。可刷新重试。'
+      : _composerNotice && (composerHasText || composerHasAttachments) ? _composerNotice
       : !composerHasText && composerHasAttachments ? '已选择附件；请填写正文后再发送。'
       : awaitingQuestion ? '当前任务等待选择。新消息会排在它之后。'
       : stopping ? '停止请求待确认，已完成的结果会保留。'
@@ -2837,7 +3030,9 @@ function switchSession(sid) {
   if (!sid || sid === sessionId) return;
   disposeTaskView();
   setSendDisabled(false);
+  rememberComposerSession();
   sessionId = sid;
+  restoreComposerSession();
   localStorage.setItem(sessionStorageKey(), sid);
   window.dispatchEvent(new CustomEvent('citrus:session-changed', {detail:{session_id:sid}}));
   clearSentAttachmentPreviewUrls();
@@ -3946,7 +4141,9 @@ async function newSession() {
     var resp = await accountFetch('/api/v1/session/new', { method: 'POST' });
     var data = await resp.json(); if (epoch !== authEpoch) return;
     disposeTaskView();
+    rememberComposerSession();
     sessionId = data.session_id;
+    restoreComposerSession();
     localStorage.setItem(sessionStorageKey(), sessionId);
     window.dispatchEvent(new CustomEvent('citrus:session-changed', {detail:{session_id:sessionId}}));
     // v8.10: 静默清空旧会话界面（不弹"确定清空"确认——新建会话语义，勿误导用户）
@@ -4098,6 +4295,7 @@ function toolStatusText(status, reason) {
 
 async function sendMsg(isFollowUp) {
   if (!currentAccount || !sessionId || accountDocumentRetired || historyRequest) return;
+  if (composerSupplement) return submitComposerSupplement();
   var epoch = authEpoch, requestSessionId = sessionId;
   function ownsTurn() { return epoch === authEpoch && requestSessionId === sessionId && (!botContent || chatContainer.contains(botContent)); }
   function ownsControls() {
@@ -4106,7 +4304,8 @@ async function sendMsg(isFollowUp) {
   if (isFollowUp === undefined) isFollowUp = false;
   var sendBtnEl = document.getElementById('send-btn');
   if (sendBtnEl && sendBtnEl.disabled) return;
-  var query = String(userInput.value || '').trim();
+  var rawDraft = String(userInput.value || '');
+  var query = rawDraft.trim();
   if (!query) {
     if (_selectedAttachments.length || window._selectedAccountFileRefs.length) {
       _composerNotice = '已选择附件；请填写正文后再发送，附件会保留。';
@@ -4119,13 +4318,14 @@ async function sendMsg(isFollowUp) {
   mascotSay('planning');
   var _firstTokenElapsedMs = null;
   var visualizeForRequest = visualizationEnabled;
+  var browseForRequest = !!(browseCheckbox && browseCheckbox.checked);
+  if (browseCheckbox) browseCheckbox.checked = false;
+  var draftKey = composerDraftKey();
   var filesForRequest = _selectedAttachments.slice();
   var fileRefsForRequest = window._selectedAccountFileRefs.slice();
   // Freeze the exact skills snapshot; later picker edits must not alter this turn.
   var capturedSkills = skillPicker ? skillPicker.capture() : {items: []};
-  var skillsForRequest = {items: (capturedSkills.items || []).map(function (item) {
-    return Object.assign({}, item);
-  })};
+  var skillsForRequest = (capturedSkills.items || []).map(function (item) { return Object.assign({}, item); });
 
   // v8.3.7 M1: 每次点击生成稳定幂等 ID，重试复用（防重发重复写历史）
   var clientRequestId = 'crid-' + Date.now().toString(36) + '-' +
@@ -4150,7 +4350,10 @@ async function sendMsg(isFollowUp) {
   appendMessageActions(userMessageContent, 'user', query);
   // P0: 提交瞬间先给导航一个临时刻度，服务端确认后换成正式 message_id
   if (window.turnRail && window.turnRail.addPending) window.turnRail.addPending(clientRequestId, query);
+  saveComposerInput();
   userInput.value = '';
+  writeComposerDraft(draftKey, '');
+  var sentDraftRevision = composerDraft(draftKey).revision;
 
   var botContent = addMessage('bot', '', null, true);
   // P0-A: 实时气泡带与历史恢复相同的轮次锚点（同一套归属规则，文件/跳转可定位）
@@ -4306,7 +4509,8 @@ async function sendMsg(isFollowUp) {
     onError: function () { if (ownsTurn()) { _turnDisconnected = true; syncWaiting(); } }
   });
   var taskControls = CitrusTaskControls.create({container: botContent, store: taskStore, transport: taskTransport, owns: ownsTurn,
-    onChange: function () { if (ownsControls()) refreshTaskComposer(); }});
+    onUpdate: openComposerSupplement, isUpdateSelected: isSupplementSelected, readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
+    onChange: function () { if (ownsControls() || composerSupplement && composerSupplement.controller.store === taskStore) refreshTaskComposer(); }});
   var myBinding = {
     requestId: clientRequestId, sessionId: requestSessionId, owns: ownsTurn,
     store: taskStore, controls: taskControls, cancel: stopCurrentTurn,
@@ -4867,14 +5071,20 @@ async function sendMsg(isFollowUp) {
     if (!node) return;
     var entry = queueEntry;
     if (!['queued', 'claimed', 'reconcile_required'].includes(entry.state)) {
-      node.hidden = true; return;
+      node.replaceChildren();
+      if (entry.state !== 'terminal' || !entry.clear_reason) { node.hidden = true; return; }
+      node.hidden = false;
+      var settled = document.createElement('span');
+      settled.className = 'turn-queue-status';
+      settled.textContent = entry.clear_reason === 'cancelled' ? '已取消' : '未开始执行';
+      node.appendChild(settled);
+      return;
     }
     node.hidden = false;
     node.replaceChildren();
     var text = document.createElement('span');
     text.className = 'turn-queue-status';
-    text.textContent = entry.state === 'terminal' && entry.clear_reason === 'cancelled'
-      ? '已取消' : queueStateLabel(entry);
+    text.textContent = queueStateLabel(entry);
     node.appendChild(text);
     if (entry.state === 'queued') {
       var cancel = document.createElement('button');
@@ -4904,10 +5114,11 @@ async function sendMsg(isFollowUp) {
       if (!ownsTurn() || !queueEntry || queueEntry.state === 'terminal') return;
       readTurnQueue(requestSessionId, function (error, result) {
         if (!ownsTurn()) return;
-        if (!error && result && result.ok && result.body) {
-          var found = findTurnQueueEntry(result.body.turns || [], clientRequestId);
-          if (found) { adoptTurnEntry(found, true); return; }
-        }
+        var entries = !error && result && result.ok && result.body && result.body.turns;
+        var found = Array.isArray(entries) && findTurnQueueEntry(entries, clientRequestId);
+        queueSyncUnavailable = !found;
+        if (found) { adoptTurnEntry(found, true); return; }
+        refreshTaskComposer();
         scheduleQueuePoll();
       });
     }, 2000);
@@ -4961,10 +5172,11 @@ async function sendMsg(isFollowUp) {
     if (!ownsTurn() || !entry || entry.client_request_id !== clientRequestId) return false;
     if (queueEntry && queueEntry.state === 'terminal' && entry.state !== 'terminal') return false;
     queueEntry = entry;
+    queueSyncUnavailable = false;
     myBinding.queueEntry = entry;
     if (entry.job_id) botContent.dataset.jobId = String(entry.active_child_job_id || entry.job_id);
     if (!silent) {
-      if (skillPicker && skillsForRequest) skillPicker.acknowledge(skillsForRequest);
+      if (skillPicker) skillPicker.acknowledge(capturedSkills);
       if (filesForRequest.length || fileRefsForRequest.length) {
         window.dispatchEvent(new Event('citrus-turn-finished'));
         _selectedAttachments = _selectedAttachments.filter(function (f) { return filesForRequest.indexOf(f) < 0; });
@@ -4981,14 +5193,21 @@ async function sendMsg(isFollowUp) {
     return true;
   }
 
+  function restoreNewDraft() {
+    if (!composerSupplement && userInput.value) saveComposerInput();
+    if (requestRoundId !== currentRoundId || composerDraft(draftKey).revision !== sentDraftRevision) return;
+    writeComposerDraft(draftKey, rawDraft);
+    if (!composerSupplement) userInput.value = rawDraft;
+  }
+
   function restoreDraft(message) {
     clearTimeout(spinnerTimeout); clearStatus();
     isCancelled = true; hasTerminalEvent = true;
-    if (requestRoundId === currentRoundId && !userInput.value) userInput.value = query;
+    restoreNewDraft();
     answerDiv.style.display = ''; answerDiv.textContent = '';
     showBanner(message);
     setSendDisabled(false);
-    if (requestRoundId === currentRoundId) userInput.focus();
+    if (!composerSupplement && requestRoundId === currentRoundId) userInput.focus();
   }
 
   // A timeout or server-side error cannot prove the POST did not commit,
@@ -5121,15 +5340,16 @@ async function sendMsg(isFollowUp) {
         }));
         if (!ownsAdmission()) return;
         requestSubmitted = true;
+        var payload = {
+          session_id: requestSessionId, query: query, client_request_id: clientRequestId,
+          visualization_enabled: visualizeForRequest,
+          selected_skills: skillsForRequest, attachments: attachments,
+          file_refs: fileRefsForRequest.map(function (file) { return file.file_id; })
+        };
+        if (browseForRequest) payload.browse_requested = true;
         var response = await accountFetch(turnQueueURL(requestSessionId), {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          signal: streamAbortController.signal,
-          body: JSON.stringify({
-            session_id: requestSessionId, query: query, client_request_id: clientRequestId,
-            visualization_enabled: visualizeForRequest,
-            selected_skills: skillsForRequest.items, attachments: attachments,
-            file_refs: fileRefsForRequest.map(function (f) { return f.file_id; })
-          })
+          signal: streamAbortController.signal, body: JSON.stringify(payload)
         });
         if (!ownsTurn() || streamAbortController.signal.aborted) return;
         var body = null;
@@ -5141,7 +5361,7 @@ async function sendMsg(isFollowUp) {
         if (!ownsTurn() || requestAbortController !== streamAbortController || streamAbortController.signal.aborted) return;
         if (!requestSubmitted) {
           clearTimeout(spinnerTimeout); clearStatus();
-          if (requestRoundId === currentRoundId && !userInput.value) userInput.value = query;
+          restoreNewDraft();
           showBanner('发送未完成，内容已保留，请重试。');
           stopCurrentTurn('switch');
           removeOptimisticTurn();
@@ -5570,8 +5790,10 @@ async function restoreSessionHistory() {
     _historyMsgs = data.messages || [];
     var queueTurns = await loadQueueTurns(sid);
     if (!ownsRestore()) return false;
+    queueSyncUnavailable = queueTurns === null;
+    if (queueSyncUnavailable && turnQueueBindings.length) return false;
     var savedTurns = normalizeHistoryTurns(data.turns);
-    _historyTurns = mergeQueuedHistory(savedTurns.length ? savedTurns : groupHistoryTurns(_historyMsgs), queueTurns);
+    _historyTurns = mergeQueuedHistory(savedTurns.length ? savedTurns : groupHistoryTurns(_historyMsgs), queueTurns || []);
     if (!_historyTurns.length) _historyTurns = null;
     _historyHasMore = !!data.has_more;
     renderHistoryMessages(_historyMsgs, _historyTurns);
@@ -5942,7 +6164,8 @@ function observeQueuedJob(turn) {
 function loadQueueTurns(sid) {
   return new Promise(function (resolve) {
     readTurnQueue(sid, function (error, result) {
-      resolve(!error && result && result.ok && result.body ? result.body.turns || [] : []);
+      var entries = !error && result && result.ok && result.body && result.body.turns;
+      resolve(Array.isArray(entries) ? entries : null);
     });
   });
 }
@@ -5958,7 +6181,7 @@ function mergeQueuedHistory(history, entries) {
     var observed = observeQueuedJob(entry);
     var segment = observed && byJob.get(observed);
     if (!root) {
-      if (entry.state === 'terminal' && !segment) return;
+      if (entry.state === 'terminal' && !segment && (!entry.clear_reason || entry.dispatch_at)) return;
       root = normalizeHistoryTurn({turn_request_id: entry.client_request_id});
       missing.push(root);
     }
@@ -6095,7 +6318,11 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
   var transport = CitrusTaskTransport.create({store: store, fetch: accountFetch, owns: owns, onSnapshot: snapshot,
     onError: function () { if (owns()) { disconnected = true; syncWaiting(); } }});
   var controls = CitrusTaskControls.create({container: content, store: store, transport: transport, owns: owns,
-    onChange: function() { if (binding) reconcileControls(); }});
+    onUpdate: openComposerSupplement, isUpdateSelected: isSupplementSelected, readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
+    onChange: function() {
+      if (binding) reconcileControls();
+      else if (composerSupplement && composerSupplement.controller.store === store) refreshTaskComposer();
+    }});
   var questionCard = CitrusTaskControls.createQuestion({container: content, store: store, transport: transport, owns: owns,
     onContinue: function (result) { if (!entry) refreshQuestionContinuation(result, owns, questionCard.element); }});
   store.hydrate({job_id: turn.jobId, status: turn.jobStatus, terminal_snapshot: turn.terminalSnapshot,
@@ -6118,6 +6345,11 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     var label = document.createElement('span');
     label.textContent = entry.state === 'terminal' && entry.clear_reason === 'cancelled' ? '已取消' : queueStateLabel(entry);
     queueStatus.appendChild(label);
+    if (entry.state === 'terminal' && !entry.dispatch_at && entry.clear_reason && !hasSavedAnswer) {
+      var cancelled = entry.clear_reason === 'cancelled';
+      answer.dataset.displayStatus = cancelled ? 'cancelled' : 'failed';
+      answer.textContent = cancelled ? '已取消，这条消息不会执行。' : '这条消息未能开始执行，请重新发送。';
+    }
     if (entry.state === 'queued') {
       var button = document.createElement('button');
       button.type = 'button'; button.className = 'turn-queue-cancel'; button.textContent = '取消这条';
@@ -6165,7 +6397,9 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (!owns() || entry.state === 'terminal') return;
     var next = findTurnQueueEntry(await loadQueueTurns(sid), entry.client_request_id);
     if (!owns()) return;
+    queueSyncUnavailable = !next;
     if (next) adopt(next);
+    else refreshTaskComposer();
     if (entry.state !== 'terminal') queuePoll = setTimeout(pollQueue, 2000);
   }
   if (entry) {
@@ -6262,7 +6496,7 @@ function createElapsedBadge(milliseconds) {
 }
 
 var _sessionCreation = null;
-async function createDefaultSession(epoch) {
+async function createDefaultSession(epoch, preserveComposer) {
   if (epoch !== authEpoch || sessionId) return;
   if (_sessionCreation && _sessionCreation.epoch === epoch) return _sessionCreation.promise;
   var creation = {epoch: epoch};
@@ -6274,6 +6508,7 @@ async function createDefaultSession(epoch) {
       var data = await resp.json();
       if (epoch !== authEpoch || sessionId || !data || typeof data.session_id !== 'string' || !data.session_id) return;
       sessionId = data.session_id;
+      restoreComposerSession(preserveComposer);
       localStorage.setItem(sessionStorageKey(), sessionId);
       window.dispatchEvent(new CustomEvent('citrus:session-changed', {detail:{session_id:sessionId}}));
     } catch (e) { /* Leave creation retryable on the next explicit initialization. */ }
@@ -6300,7 +6535,7 @@ async function recoverMissingSession(epoch, sid) {
   renderContextPanel({estimated_tokens: 0, max_tokens: _ctxMaxTokens(), history_msgs: 0,
                       soft_threshold: 0.75, hard_threshold: 0.93});
   // One creation attempt; do not recursively reload a replacement's history.
-  await createDefaultSession(epoch);
+  await createDefaultSession(epoch, true);
   if (epoch !== authEpoch) return;
   loadSessions();
   if (window.turnRail && window.turnRail.reload) window.turnRail.reload();

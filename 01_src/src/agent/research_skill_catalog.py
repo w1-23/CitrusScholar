@@ -20,9 +20,9 @@ ROOT = Path(__file__).resolve().parents[3]
 CATALOG_PATH = "02_config/skills.catalog.json"
 HISTORY_ROOT = "02_config/skill-history"
 PINNED = {
-    "candidate-search": ("2.0.0", "0c216b5803a20b50290a72b44d4e019f3f5cf4c256fd3b3549fd844465ae4d50"),
-    "reference-verification": ("2.0.1", "303849896abdf947b3555f416fbf4408bf05bd2691588c2d109e2bc2e4ab0d00"),
-    "data-audit": ("2.1.2", "9466c9b6ff7b13ec09d598a35d51d4559481105df92fd262da33d8e579b054a5"),
+    "candidate-search": ("2.0.1", "3d400fbdfebbb55e05f78e56cb2c6d569280fa4a42e20ea4e6afae2970ee12cf"),
+    "reference-verification": ("2.0.2", "e7c4763c9322d63bf6dfd646b4cae31f31d5db939c1c2e113484b6a91ed98943"),
+    "data-audit": ("2.2.0", "2ba1186ae3ae3db8dcaccb70ec5ad07beb7f1dbb508c463b587b1471596937e0"),
     "nature-figure": ("2.1.2", "d8a629298048632590fc58b3e00030bf06a439cb79324ed7a9615bef2a7e174e"),
 }
 # Compatibility aliases naming the known prior releases that remain readable.

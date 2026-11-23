@@ -3,7 +3,7 @@ name: reference-verification
 description: 核对科研引文对应对象，提取原始引文、查询登记记录、比较字段并按需导出证据。保留中文原题名、条目与覆盖，不将技术状态等同文献真假。
 license: MIT
 metadata:
-  version: "2.0.1"
+  version: "2.0.2"
 ---
 
 # 文献证据核验
@@ -20,3 +20,7 @@ metadata:
 - `scripts/render_report.py --repository PATH --owner ID --session ID --audit-id ID --format json|xlsx|ris|bibtex --output NEW_PATH`：只用已存证据。
 
 读取 references/ 下相关方法。主 Agent 自主决定下一步，不受技能限制其他合法工具；专业步骤不新建另一个 Agent。
+
+## 与数据审计的边界
+
+本技能使用自己的 `audit_id` 记录文献身份与字段证据，不复用 data-audit 的 `review_id`，也不声称 `data-audit-findings/1`、合并审查工作簿或表格审查发现。候选检索证据亦不自动成为已确认书目；两者可在同一研究流程中并列引用，但不能混写为同一审计结果。

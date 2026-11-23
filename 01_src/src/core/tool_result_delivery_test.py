@@ -497,3 +497,61 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(wire_requests), 1)
             budget = task_events.projection(claim.job_id)["budget"]
             self.assertEqual((budget["calls"], budget["tokens"]), (1, 116))
+
+
+class TaskDeliveryContractTests(unittest.TestCase):
+    def test_successful_inspect_does_not_fulfill_requested_files_or_count(self):
+        from src.core.turn_outcome import artifact_goal_evidence
+        from src.graph.task_contract import contract_for_explicit_outputs
+
+        requirements = contract_for_explicit_outputs("请生成两张科研图，导出 PDF。").deliverables
+        self.assertEqual(len(requirements), 2)
+        asset = {"valid": True, "request_matches": True, "filename": "plot.svg",
+                 "producer_tool": "figure_workspace", "artifact_id": "figure-one", "link": "/plot"}
+        records = [{"status": "complete", "tool_call_id": "inspect"},
+                   {"status": "complete", "tool_call_id": "produce", "artifact_validations": [asset]}]
+        goals, gaps = artifact_goal_evidence(requirements, records, {"/plot"})
+        self.assertEqual(goals, [])
+        self.assertEqual(len(gaps), 2)
+        asset["filename"] = "plot.pdf"
+        goals, gaps = artifact_goal_evidence(requirements, records, {"/plot"})
+        self.assertEqual(len(goals), 1)
+        self.assertEqual(goals[0].evidence_call_ids, ["produce"])
+        self.assertEqual(len(gaps), 1)
+        asset["request_matches"] = False
+        self.assertEqual(artifact_goal_evidence(requirements, records, {"/plot"})[0], [])
+
+    def test_artifact_contract_tampering_is_rejected(self):
+        from src.core.turn_outcome import (CompletionEnvelope, CompletionGoal, FinalReview,
+            reviewed_completion_valid, reviewed_turn_outcome)
+        from src.graph.task_contract import contract_for_explicit_outputs
+
+        requirements = contract_for_explicit_outputs("请生成一张科研图并导出 PDF。").deliverables
+        asset = {"valid": True, "request_matches": True, "filename": "plot.pdf",
+                 "producer_tool": "figure_workspace", "artifact_id": "figure-one", "link": "/plot"}
+        records = [{"status": "complete", "tool_call_id": "produce",
+                    "artifact_validations": [asset]}]
+        goal = CompletionGoal(goal=str(requirements[0]["label"]), kind="deliverable",
+                              evidence_call_ids=["produce"], artifact_links=["/plot"])
+        statement = CompletionEnvelope(schema_version=1, answer="done /plot", status="completed",
+            goals=[goal], remaining=[], incidental_partials=[], proposal_repairs=[],
+            review=FinalReview(**{key: "fixture" for key in
+                ("facts", "sources", "numbers", "conditions", "delivery")}))
+        outcome = reviewed_turn_outcome(statement, records,
+            identity={"owner_user_id": 7, "session_id": "s", "job_id": "j"},
+            request_version=0, request_hash="h",
+            artifact_contract={"schema_version": 1, "request_version": 0,
+                "requirements": requirements, "verified_links": ["/plot"]})
+        self.assertTrue(reviewed_completion_valid(outcome, records, answer="done /plot"))
+        outcome.completion["artifact_contract"]["verified_links"] = []
+        self.assertFalse(reviewed_completion_valid(outcome, records, answer="done /plot"))
+
+    def test_repair_only_matches_the_original_bind_target(self):
+        from src.agent.host import _same_repair_target
+
+        original = {"name": "code_bind_input", "args": {"workspace_id": "ws", "task_id": "task",
+                    "file_id": "file", "sha256": "digest", "path": "/input/table.csv", "expected_revision": 3}}
+        correction = {**original, "args": {**original["args"], "expected_revision": 4}}
+        self.assertTrue(_same_repair_target(original, correction))
+        self.assertFalse(_same_repair_target(original, {**correction, "args": {**correction["args"], "file_id": "another"}}))
+        self.assertFalse(_same_repair_target(original, {"name": "read", "args": correction["args"]}))

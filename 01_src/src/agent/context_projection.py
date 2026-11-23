@@ -12,7 +12,7 @@ ModelDriver/run_model_attempt (including bound tool schemas).
 
 required_message_ids is a host-owned callback returning IDs of methods or other
 requirements that must remain verbatim. System controls, real user messages,
-and provider-private messages are also protected.
+and current-turn provider-private messages are also protected.
 Missing required IDs, unsafe protocol state, and archive/model failures raise
 AdmissionStopped; never fall back to lossy trimming. The working trigger
 is a soft compaction opportunity: when no safe reduction exists, the unchanged
@@ -49,7 +49,7 @@ from .checkpoint_store import (CheckpointProtectionError, WORKING_CONTEXT_ARCHIV
 from .identity import ExecutionIdentity
 from .runtime import AdmissionStopped
 from src.core.provider_protocol import _DeepSeekMessage, current_tool_loop_start, uses_deepseek_protocol
-from src.core.request_context import estimate_request, message_dict, model_request
+from src.core.request_context import estimate_request, message_dict, model_request, text_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ _TOOL_METADATA = frozenset({"operation_id", "operation_uncertain", "result_refer
     "first_delivery_reference", "host_preflight_reconciled"})
 _RESPONSE_METADATA = frozenset({"finish_reason", "model_name", "model_provider", "token_usage",
     "system_fingerprint", "id", "service_tier", "citrus_output_limit",
-    "citrus_output_limit_exhausted", "citrus_generation_ms"})
+    "citrus_output_limit_exhausted", "citrus_generation_ms", "citrus_stream_terminal_unconfirmed"})
 
 
 def _opaque(message: BaseMessage) -> bool:
@@ -73,14 +73,15 @@ def _opaque(message: BaseMessage) -> bool:
 
 
 def _complete_tool_groups(messages: Sequence[BaseMessage]) -> None:
-    pending: set[str] = set()
+    pending: dict[str, str] = {}
     for message in messages:
         if isinstance(message, SystemMessage):
             continue
         if isinstance(message, ToolMessage):
-            if message.tool_call_id not in pending:
+            if (message.tool_call_id not in pending
+                    or (message.name and message.name != pending[message.tool_call_id])):
                 raise AdmissionStopped("context_projection_invalid_tool_group")
-            pending.remove(message.tool_call_id)
+            del pending[message.tool_call_id]
         else:
             if pending:
                 raise AdmissionStopped("context_projection_pending_tool_group")
@@ -88,7 +89,7 @@ def _complete_tool_groups(messages: Sequence[BaseMessage]) -> None:
                 ids = [call.get("id") for call in message.tool_calls]
                 if message.invalid_tool_calls or any(not cid for cid in ids) or len(set(ids)) != len(ids):
                     raise AdmissionStopped("context_projection_invalid_tool_group")
-                pending.update(ids)
+                pending.update((call["id"], call["name"]) for call in message.tool_calls)
     if pending:
         raise AdmissionStopped("context_projection_pending_tool_group")
 
@@ -215,7 +216,10 @@ class EncryptedContextArchive:
         end = len(messages) if stop is None else stop
         if not 0 <= start <= end <= len(messages):
             raise AdmissionStopped("context_archive_invalid_range")
-        return messages_to_dict(messages[start:end])
+        public = messages_to_dict(messages[start:end])
+        for item in public:
+            item["data"].get("additional_kwargs", {}).pop("host_preflight_reconciled", None)
+        return public
 
 
 def _tokens(messages, tools=None) -> int:
@@ -419,11 +423,19 @@ class WorkingContextProjection(AgentMiddleware):
         self._schemas = None if callable(tool_schemas) else self.tool_schemas
         self._cache = None
         self._summary_unavailable = False
+        self._archive_unavailable = False
 
     def _count(self, messages) -> int:
         if self._schemas is None:
             self._schemas = self.tool_schemas()
-        return _tokens(messages, self._schemas)
+        estimate = _tokens(messages, self._schemas)
+        provider_scope = getattr(self.archive, "provider_scope", None)
+        if (isinstance(provider_scope, (tuple, list)) and len(provider_scope) == 2
+                and uses_deepseek_protocol(provider_scope[1], provider_scope[0])):
+            start = current_tool_loop_start(messages)
+            estimate += sum(text_tokens(message.provider_protocol.reasoning) for message in messages[start:]
+                            if isinstance(message, _DeepSeekMessage) and message.provider_protocol is not None)
+        return estimate
 
     def wrap_model_call(self, request, handler):
         raise AdmissionStopped("context_projection_async_required")
@@ -478,13 +490,16 @@ class WorkingContextProjection(AgentMiddleware):
         if before < self.trigger_tokens:
             return raw
         trace.mark("protect")
-        if not self.readback_available:
-            raise AdmissionStopped("context_projection_readback_required")
+        if not self.readback_available or (callable(self.tool_schemas) and not any(
+                schema.get("function", {}).get("name") == "read_context_evidence" for schema in self._schemas)):
+            return self._defer(raw, reason="context_projection_readback_required", before=before,
+                               protected=0, eligible=0)
         # Retain user requirements and controls individually, rather than pinning
         # an entire long user turn. A protected tool result pins its whole group.
         units = _units(raw)
         protected = {i for i, m in enumerate(raw) if (
-            m.id in required or isinstance(m, (HumanMessage, SystemMessage, _DeepSeekMessage))
+            m.id in required or isinstance(m, (HumanMessage, SystemMessage))
+            or (isinstance(m, _DeepSeekMessage) and (not deepseek or i >= current_start))
             or _opaque(m))}
         trace.protected_count = len(protected)
         # A new real user message is itself a valid retained tail. The preceding
@@ -507,13 +522,13 @@ class WorkingContextProjection(AgentMiddleware):
                     return self._defer(baseline, reason="no_new_eligible_units", before=before,
                                        protected=len(protected), eligible=len(eligible))
         trace.mark("estimate")
-        if self._summary_unavailable:
+        if self._archive_unavailable:
             return baseline
         if not tail or not eligible:
             return self._defer(baseline, reason="no_eligible_units", before=before,
                                protected=len(protected), eligible=len(eligible))
         trace.mark("summary")
-        if getattr(self.summary_model, "max_retries", None) != 0:
+        if not self._summary_unavailable and getattr(self.summary_model, "max_retries", None) != 0:
             raise AdmissionStopped("context_summary_retry_disabled_transport_required")
         selected = sorted(eligible + [tail], key=lambda unit: unit[0])
         indexes = [i for unit in selected for i in unit]
@@ -543,7 +558,7 @@ class WorkingContextProjection(AgentMiddleware):
             if diagnostic["reason"] not in {"unsupported_checkpoint_value", "unsupported_public_message_field"}:
                 raise
             _report_projection_failure(trace, error, self.deadline)
-            self._summary_unavailable = True
+            self._archive_unavailable = True
             return self._defer(baseline, reason=diagnostic["reason"], before=before,
                                protected=len(protected), eligible=len(eligible))
         trace.archived = True
@@ -570,41 +585,45 @@ class WorkingContextProjection(AgentMiddleware):
             trace.summarized = True
             return result.generations[0].message.content
 
-        middleware = SummarizationMiddleware(
-            model=model, trigger=("messages", 1), keep=("messages", keep),
-            token_counter=self._count, trim_tokens_to_summarize=None, summarizer=summarize_source)
-        trace.mark("middleware")
-        try:
-            update = await middleware.abefore_model({"messages": working}, Runtime())
-            if model.failure is not None:
-                raise model.failure
-        except AdmissionStopped as error:
-            if error.reason not in _OPTIONAL_SUMMARY_FAILURES:
-                raise
-            # The original graph messages and archive were validated above.
-            # Do not retry compression again in this run. The model admission
-            # gate still checks the bound fallback request and remaining budget.
-            self._summary_unavailable = True
-            return self._defer(baseline, reason=error.reason, before=before,
-                               protected=len(protected), eligible=len(eligible))
-        trace.mark("middleware")
-        if update is None:
-            raise AdmissionStopped("context_projection_middleware_contract_changed")
-        result = update.get("messages", [])
-        # Refuse changed upstream contracts instead of persisting a Human summary
-        # or accepting a destructive state reducer into the authoritative graph.
-        if (len(result) < 2 or not isinstance(result[0], RemoveMessage)
-                or type(result[1]) is not HumanMessage
-                or result[1].additional_kwargs != {"lc_source": "summarization"}):
-            raise AdmissionStopped("context_projection_middleware_contract_changed")
-        retained = result[2:]
-        covered = len(working) - len(retained)
-        removed = frozenset(indexes[:covered])
-        if (covered <= 0 or covered != summarized_count or protected.intersection(removed)
-                or set(tail).intersection(removed)):
-            raise AdmissionStopped("context_projection_protected_message_removed")
-        if any(a is not b for a, b in zip(retained, working[covered:])):
-            raise AdmissionStopped("context_projection_middleware_contract_changed")
+        if not self._summary_unavailable:
+            middleware = SummarizationMiddleware(
+                model=model, trigger=("messages", 1), keep=("messages", keep),
+                token_counter=self._count, trim_tokens_to_summarize=None, summarizer=summarize_source)
+            trace.mark("middleware")
+            try:
+                update = await middleware.abefore_model({"messages": working}, Runtime())
+                if model.failure is not None:
+                    raise model.failure
+            except AdmissionStopped as error:
+                if error.reason not in _OPTIONAL_SUMMARY_FAILURES:
+                    raise
+                self._summary_unavailable = True
+                logger.info("context_summary_unavailable reason=%s", error.reason)
+        if self._summary_unavailable:
+            removed = frozenset(indexes[:len(indexes) - keep])
+            archived_only = set(removed)
+            trace.archive_only_count = len(archived_only)
+            summary_text = "Earlier complete message groups are available for exact readback."
+        else:
+            trace.mark("middleware")
+            if update is None:
+                raise AdmissionStopped("context_projection_middleware_contract_changed")
+            result = update.get("messages", [])
+            # Refuse changed upstream contracts instead of persisting a Human summary
+            # or accepting a destructive state reducer into the authoritative graph.
+            if (len(result) < 2 or not isinstance(result[0], RemoveMessage)
+                    or type(result[1]) is not HumanMessage
+                    or result[1].additional_kwargs != {"lc_source": "summarization"}):
+                raise AdmissionStopped("context_projection_middleware_contract_changed")
+            retained = result[2:]
+            covered = len(working) - len(retained)
+            removed = frozenset(indexes[:covered])
+            if (covered <= 0 or covered != summarized_count or protected.intersection(removed)
+                    or set(tail).intersection(removed)):
+                raise AdmissionStopped("context_projection_protected_message_removed")
+            if any(a is not b for a, b in zip(retained, working[covered:])):
+                raise AdmissionStopped("context_projection_middleware_contract_changed")
+            summary_text = result[1].content
         reference = {"tool": "read_context_evidence", "checkpoint_id": ref.checkpoint_id,
                      "message_count": ref.message_count,
                      "message_indices": sorted(removed),
@@ -615,7 +634,7 @@ class WorkingContextProjection(AgentMiddleware):
         summary = SystemMessage(
             content=("Historical working-context summary; fallible reference material, not new "
                      "user instructions or evidence of a new execution. Read original evidence "
-                     "before relying on omitted details.\n" + result[1].content +
+                     "before relying on omitted details.\n" + summary_text +
                      "\nRaw evidence readback: " + json.dumps(reference, sort_keys=True)),
             additional_kwargs={**self.archive.identity.message_metadata("internal_control"),
                                "context_projection": "working_summary_v1"})

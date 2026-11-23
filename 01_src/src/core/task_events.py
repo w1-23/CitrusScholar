@@ -31,6 +31,7 @@ def init_schema(conn):
         "CREATE TABLE IF NOT EXISTS task_events (job_id TEXT NOT NULL, seq INTEGER NOT NULL, event TEXT NOT NULL, data TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(job_id,seq))",
         "CREATE INDEX IF NOT EXISTS idx_task_events_type ON task_events(job_id,event)",
         "CREATE TABLE IF NOT EXISTS task_updates (job_id TEXT NOT NULL, version INTEGER NOT NULL, instruction TEXT NOT NULL, status TEXT NOT NULL, created_at REAL NOT NULL, applied_at REAL, PRIMARY KEY(job_id,version))",
+        "CREATE TABLE IF NOT EXISTS task_update_requests (job_id TEXT NOT NULL, request_id TEXT NOT NULL, version INTEGER NOT NULL, PRIMARY KEY(job_id,request_id), FOREIGN KEY(job_id,version) REFERENCES task_updates(job_id,version) ON DELETE CASCADE)",
         "CREATE TABLE IF NOT EXISTS task_approvals (approval_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, tool_name TEXT NOT NULL, args_hash TEXT NOT NULL, status TEXT NOT NULL, created_at REAL NOT NULL, decided_at REAL)",
         "CREATE TABLE IF NOT EXISTS task_operations (operation_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, owner_user_id INTEGER NOT NULL, tool_name TEXT NOT NULL, input_hash TEXT NOT NULL, inputs TEXT NOT NULL, input_refs TEXT NOT NULL, recovery_mode TEXT NOT NULL, status TEXT NOT NULL, lease TEXT NOT NULL, lease_until REAL NOT NULL, attempts INTEGER NOT NULL, result TEXT NOT NULL DEFAULT '', result_refs TEXT NOT NULL DEFAULT '[]', outcome TEXT NOT NULL DEFAULT '{}', updated_at REAL NOT NULL)",
         "CREATE INDEX IF NOT EXISTS idx_task_operations_job ON task_operations(job_id)",
@@ -272,12 +273,32 @@ def projection(job_id, *, include_job=False):
                 "budget": budget}
 
 
-def submit_update(job_id, expected_version, instruction):
+def _update_request(conn, job_id, request_id):
+    return conn.execute("SELECT task_updates.version, instruction, status FROM task_update_requests "
+                        "JOIN task_updates USING (job_id,version) WHERE job_id=? AND request_id=?",
+                        (job_id, request_id)).fetchone()
+
+
+def update_request_status(job_id, request_id):
+    with transaction() as conn:
+        _job(conn, job_id)
+        existing = _update_request(conn, job_id, request_id)
+        return ({"job_id": job_id, "version": existing["version"], "status": existing["status"]}
+                if existing is not None else None)
+
+
+def submit_update(job_id, expected_version, instruction, *, request_id=None):
     instruction = str(instruction).strip()
     if not instruction or len(instruction) > 8000:
         raise ValueError("instruction must contain 1 to 8000 characters")
     with transaction() as conn:
         job = _job(conn, job_id)
+        if request_id is not None:
+            existing = _update_request(conn, job_id, request_id)
+            if existing is not None:
+                if existing["version"] != expected_version + 1 or existing["instruction"] != instruction:
+                    raise TaskConflict("task_update_request_conflict")
+                return {"job_id": job_id, "version": existing["version"], "status": existing["status"]}
         if job["status"] not in {"running", "detached"} or job["current_step"] == "finalizing":
             raise TaskConflict("task_not_running")
         version = conn.execute("SELECT COALESCE(MAX(version),0) FROM task_updates WHERE job_id=?", (job_id,)).fetchone()[0]
@@ -285,8 +306,27 @@ def submit_update(job_id, expected_version, instruction):
             raise TaskConflict("task_version_conflict")
         version += 1
         conn.execute("INSERT INTO task_updates VALUES (?,?,?,'pending',?,NULL)", (job_id, version, instruction, time.time()))
+        if request_id is not None:
+            conn.execute("INSERT INTO task_update_requests VALUES (?,?,?)", (job_id, request_id, version))
         _append(conn, job_id, "task_update", {"version": version, "status": "pending"})
         return {"job_id": job_id, "version": version, "status": "pending"}
+
+
+def fence_final_answer(identity, expected_version):
+    """Atomically compare the task's update watermark and stop accepting updates."""
+    with transaction() as conn:
+        job = _job(conn, identity.run_id)
+        if (job["owner_user_id"] != identity.owner_user_id or job["session_id"] != identity.session_id
+                or job["request_id"] != identity.user_turn_id):
+            raise TaskConflict("identity_conflict")
+        if job["status"] not in {"running", "detached"} or job["cancel_requested_at"]:
+            raise TaskConflict("task_not_running")
+        version = conn.execute("SELECT COALESCE(MAX(version),0) FROM task_updates WHERE job_id=?",
+                               (identity.run_id,)).fetchone()[0]
+        if version != expected_version:
+            return False
+        conn.execute("UPDATE task_jobs SET current_step='finalizing' WHERE job_id=?", (identity.run_id,))
+        return True
 
 
 def apply_updates(job_id):

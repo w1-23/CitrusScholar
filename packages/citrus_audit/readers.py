@@ -62,7 +62,7 @@ def _auto_header_rows(raw_rows: list[list[Any]], width: int, scan: int = 8) -> l
     return rows or [start + 1]
 
 def _resolve_headers(raw_rows: list[list[Any]], header_rows: list[int],
-                     width: int) -> tuple[list[str], list[int]]:
+                     width: int, *, explicit: bool = False) -> tuple[list[str], list[int]]:
     """合并一或多行（1 基）表头，返回 (规范列名, 实际使用的表头行)。
 
     规范列名取**叶子名**（最下一层表头的字段名），分组名只作为可读路径保留在
@@ -79,7 +79,7 @@ def _resolve_headers(raw_rows: list[list[Any]], header_rows: list[int],
         values = (values + [""] * width)[:width]
         populated = sum(bool(v) for v in values)
         # 多列表头要求至少两个字段；单列区域不能用列数阈值丢弃显式表头。
-        if (width > 1 and populated <= 1) or (width == 1 and not populated):
+        if not explicit and ((width > 1 and populated <= 1) or (width == 1 and not populated)):
             continue
         # Excel 的合并表头只在最左格保存可见值：向右补齐，保证每列都带分组名。
         filled: list[str] = []
@@ -603,21 +603,25 @@ def normalize_regions(regions, *, default_sheet='', limit=20):
         sheet = item.get('sheet') or default_sheet or ''
         if not isinstance(sheet, str) or len(sheet) > 250:
             raise ValueError("区域工作表名无效")
+        sheet = sheet.strip()
+        group = (item.get('file_index'), sheet)
         left, top, right, bottom = _region_box(item.get('bounds'))
         rows = _region_header_rows(item.get('header_rows'), top, bottom)
         region_id = item.get('region_id') or ''
         if not isinstance(region_id, str) or len(region_id) > 160:
             raise ValueError("区域ID必须是不超过160字符的字符串")
+        region_id = region_id.strip()
         if region_id:
-            if region_id in identifiers:
-                raise ValueError("区域ID必须唯一")
-            identifiers.add(region_id)
+            key = (group, region_id)
+            if key in identifiers:
+                raise ValueError("同一文件和工作表的区域ID必须唯一")
+            identifiers.add(key)
         box = (left, top, right, bottom)
-        for other in boxes.get(sheet, ()):
+        for other in boxes.get(group, ()):
             if (max(left, other[0]) <= min(right, other[2])
                     and max(top, other[1]) <= min(bottom, other[3])):
                 raise ValueError("同一工作表的显式区域不能重叠")
-        boxes.setdefault(sheet, []).append(box)
+        boxes.setdefault(group, []).append(box)
         normalized.append({**item, 'sheet': sheet, 'bounds': _a1(*box),
                            'header_rows': rows, 'region_id': region_id})
     return normalized
@@ -670,7 +674,7 @@ def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id='')
             raw.extend([[None] * width for _ in range(total_rows - len(raw))])
         raw = raw[:total_rows]
     relative = [row - top + 1 for row in rows]
-    header, used = _resolve_headers(raw, relative, width)
+    header, used = _resolve_headers(raw, relative, width, explicit=True)
     used = sorted(used)
     absolute_headers = [row + top - 1 for row in used]
     first_header, header_bottom = min(absolute_headers), max(absolute_headers)
@@ -744,9 +748,13 @@ def read_region(data, name, *, bounds, header_rows, sheet_name='', region_id='')
 def read_regions(data, name, *, regions, sheet_name=''):
     """Read a bounded set of explicit, non-overlapping absolute regions."""
     normalized = normalize_regions(regions, default_sheet=sheet_name)
-    return [read_region(data, name, bounds=item['bounds'], header_rows=item['header_rows'],
-                        sheet_name=item['sheet'], region_id=item['region_id'])
-            for item in normalized]
+    tables = [read_region(data, name, bounds=item['bounds'], header_rows=item['header_rows'],
+                          sheet_name=item['sheet'], region_id=item['region_id'])
+              for item in normalized]
+    normalize_regions([{'sheet': table.sheet, 'bounds': table.region_bounds,
+                        'header_rows': table.header_rows, 'region_id': table.region_id}
+                       for table in tables])
+    return tables
 
 
 

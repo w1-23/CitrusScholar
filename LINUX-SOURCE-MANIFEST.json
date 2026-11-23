@@ -4,7 +4,7 @@
   "baseline_commit": "9130e336c863600c934d892913fbb7d6f04a3832",
   "baseline_tree": "b8cbb7dfcb796df604c823fa81543a967e25d7a9",
   "parent_candidate_commit": "9e58a97d8f961c103fc07cdb712599b8fc9ce6a0",
-  "integrated_branch_commit": "8cb564de782a4a102b3c93bce4392c89c68952fe",
+  "integrated_branch_commit": "1c43808",
   "source": "Remote integrated candidate: stability freeze 9e58a97 + review/linux-8042-verified backend features + dual-source retrieval prompt",
   "inventory_scope": "Candidate source files excluding this manifest and transient Python bytecode.",
   "members": {
@@ -1194,9 +1194,9 @@
       "sha256": "2cc61b951c7f72fe1a3f776622bf0ba66736ca1c2982a31909cb23b4b7dcc22b"
     },
     "01_src/src/graph/export_contract.py": {
-      "bytes": 50297,
+      "bytes": 55120,
       "executable": false,
-      "sha256": "c8a42814febd6a299e0df883c1dcf883ead0eef20827f59f0a1b09f46d2f1558"
+      "sha256": "b2935677d74eae86a0454c6163947860b65d15f9f9a11fc659a92f7c8571ccc5"
     },
     "01_src/src/graph/general_agent_graph.py": {
       "bytes": 2753,
@@ -2524,9 +2524,9 @@
       "sha256": "738dd0e5c10c399a7cf43f2b64f75a6cb6940418ea5e34c40edef9e2ceeaa550"
     },
     "02_config/config.yaml": {
-      "bytes": 11511,
+      "bytes": 11850,
       "executable": false,
-      "sha256": "b7321fa72ecb0410304ae02fa41678aacfbf55dc431c7f543f5a07ed16f6ac33"
+      "sha256": "f0b39fb6a9fe966db42adaabb0a4fa8766a54ec4b0b22c9314c01a39bbcfb5f8"
     },
     "02_config/skills.catalog.json": {
       "bytes": 20007,
@@ -3342,6 +3342,11 @@
       "bytes": 114,
       "executable": false,
       "sha256": "babf1a2e2784d116337bc9539d806e5fff291f096832812603683ef9509236d5"
+    },
+    "01_src/src/graph/export_contract_delivery_test.py": {
+      "bytes": 2924,
+      "executable": false,
+      "sha256": "6ccd704d5ff6f39856eca138dbc72f4405f3ca937f9677634457c482b3db7f09"
     }
   }
 }

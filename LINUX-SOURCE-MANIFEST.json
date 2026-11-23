@@ -4,7 +4,7 @@
   "baseline_commit": "d275430d3ef01bf9558ccd85204d1bdede631989",
   "baseline_tree": "7454ec18ab7154a7780f66abbbc7eb1a6839d9a7",
   "parent_candidate_commit": "d275430d3ef01bf9558ccd85204d1bdede631989",
-  "integrated_branch_commit": "91015a4396cfd415d552472f0c203ef43256342f",
+  "integrated_branch_commit": "37f7765bdb5eb29bb2e81f9fa799400960cf601e",
   "source": "CitrusScholar standalone Skills and runtime candidate",
   "inventory_scope": "Tracked regular files in integrated_branch_commit excluding this manifest and transient Python bytecode.",
   "members": {
@@ -3816,7 +3816,7 @@
     "02_config/standalone-skills.lock.json": {
       "bytes": 1421,
       "executable": false,
-      "sha256": "42f15512ded95a272b51b28a82e3a87c4908186b512076d1954291c24cb1cef4"
+      "sha256": "b30bfdc5a10e9fc80169d5caa93d17c31631a9feb1fa20ba2e5fedb2b243e1cd"
     },
     "04_scripts/build_worker_bundle.py": {
       "bytes": 1259,

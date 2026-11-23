@@ -261,7 +261,7 @@ def _bootstrap_engine_path() -> tuple[Path, Path | None]:
                 sys.path.insert(0, text)
             if support_root is None and (candidate / "citrus_figures" / "__init__.py").is_file():
                 support_root = candidate
-            if not root and support_root is None:
+            if not root and support_root is None and here == Path("/opt/citrusfig"):
                 raise RuntimeError("figure_support_root_not_found")
             return candidate, support_root
     raise RuntimeError("figure_engine_root_not_found")

@@ -40,6 +40,23 @@ def _rooted(value: str, root: str) -> str:
     return f"/{root}/" + (value[2:] if value.startswith("./") else value)
 
 
+_WORKSPACE_PREFLIGHT_REASONS = {
+    "workspace_unavailable": "workspace_unavailable",
+    "workspace_current_unavailable": "workspace_unavailable",
+    "workspace_scope_denied": "workspace_scope_denied",
+    "workspace_session_denied": "workspace_scope_denied",
+    "workspace_file_scope_denied": "workspace_scope_denied",
+    "execution_task_scope_mismatch": "workspace_scope_denied",
+    "workspace_mount_readonly": "workspace_read_only",
+}
+
+
+def _workspace_preflight_reason(exc):
+    """Recognize only deterministic, pre-mutation workspace refusals."""
+    code = exc.args[0] if exc.args and isinstance(exc.args[0], str) else None
+    return _WORKSPACE_PREFLIGHT_REASONS.get(code) if code else None
+
+
 @contextmanager
 def code_execution_context(identity, tool_call_id):
     """Host-only binding, propagated through registry's copied ContextVars."""
@@ -349,18 +366,36 @@ def _dispatch(operation, **args):
                 wid = args.pop("workspace_id")
                 if wid is None:
                     key = "code_" + _key(identity.run_id)
-                    current = workspace.create(task_id=key, request_id=key)
+                    try:
+                        current = workspace.create(task_id=key, request_id=key)
+                    except (LookupError, PermissionError) as exc:
+                        reason = _workspace_preflight_reason(exc)
+                        if reason:
+                            return reject(reason)
+                        raise
                 else:
-                    current = workspace.open(wid)
+                    try:
+                        current = workspace.open(wid)
+                    except (LookupError, PermissionError) as exc:
+                        reason = _workspace_preflight_reason(exc)
+                        if reason:
+                            return reject(reason)
+                        raise
                 page = workspace.list_files(current["workspace_id"], **args)
                 fields = ("path", "version", "file_id", "sha256", "size_bytes")
                 return _result({"task_id": current["task_id"], "workspace_id": current["workspace_id"],
                     "revision": current["revision"], "files": [{k: item[k] for k in fields} for item in page["items"]],
                     "next_offset": page["next_offset"]})
             if operation == "write":
-                current = workspace.open(args["workspace_id"])
+                try:
+                    current = workspace.open(args["workspace_id"])
+                except (LookupError, PermissionError) as exc:
+                    reason = _workspace_preflight_reason(exc)
+                    if reason:
+                        return reject(reason)
+                    raise
                 if current["task_id"] != args["task_id"]:
-                    raise PermissionError("execution_task_scope_mismatch")
+                    return reject("workspace_scope_denied", expected_task_id=args["task_id"])
                 if current["revision"] != args["expected_revision"]:
                     return reject("workspace_revision_conflict", latest_revision=current["revision"])
                 from src.session import files
@@ -375,12 +410,26 @@ def _dispatch(operation, **args):
                     "revision": result["revision"], **{k: ref[k] for k in ("path", "file_id", "version", "sha256", "size_bytes")}},
                     reason="code_workspace_written")
             if operation == "bind_input":
-                logical_path(args["path"])
+                # The schema normalizes relative proposals to /input/... before
+                # dispatch. A value that still does not name an input is a
+                # deterministic preflight rejection, not an unknown write.
+                try:
+                    logical_path(args["path"])
+                except (ValueError, TypeError):
+                    return reject("execution_input_path_required",
+                                  expected_prefix="/input/")
                 if not args["path"].startswith("/input/"):
-                    raise ValueError("execution_input_path_required")
-                current = workspace.open(args["workspace_id"])
+                    return reject("execution_input_path_required",
+                                  expected_prefix="/input/")
+                try:
+                    current = workspace.open(args["workspace_id"])
+                except (LookupError, PermissionError) as exc:
+                    reason = _workspace_preflight_reason(exc)
+                    if reason:
+                        return reject(reason)
+                    raise
                 if current["task_id"] != args["task_id"]:
-                    raise PermissionError("execution_task_scope_mismatch")
+                    return reject("workspace_scope_denied", expected_task_id=args["task_id"])
                 if current["revision"] != args["expected_revision"]:
                     return reject("workspace_revision_conflict", latest_revision=current["revision"])
                 from src.session import files
@@ -396,6 +445,11 @@ def _dispatch(operation, **args):
                         expected_sha256=args["sha256"], source={"tool": "code_bind_input"})
                 except WorkspaceConflict as exc:
                     return reject("workspace_revision_conflict", latest_revision=exc.latest_revision)
+                except (LookupError, PermissionError) as exc:
+                    reason = _workspace_preflight_reason(exc)
+                    if reason:
+                        return reject(reason)
+                    raise
                 ref = result["ref"]
                 return _result({"task_id": args["task_id"], "workspace_id": args["workspace_id"],
                     "revision": result["revision"], **{k: ref[k] for k in ("path", "file_id", "version", "sha256", "size_bytes")}},
@@ -445,9 +499,15 @@ def _dispatch(operation, **args):
                 from src.code_execution.presence import worker_available
                 if not worker_available(service.repository.path):
                     return reject("code_worker_unavailable")
-                current = workspace.open(args["workspace_id"])
+                try:
+                    current = workspace.open(args["workspace_id"])
+                except (LookupError, PermissionError) as exc:
+                    reason = _workspace_preflight_reason(exc)
+                    if reason:
+                        return reject(reason)
+                    raise
                 if current["task_id"] != args["task_id"]:
-                    raise PermissionError("execution_task_scope_mismatch")
+                    return reject("workspace_scope_denied", expected_task_id=args["task_id"])
                 if current["revision"] != args["expected_revision"]:
                     return reject("workspace_revision_conflict", latest_revision=current["revision"])
                 try:

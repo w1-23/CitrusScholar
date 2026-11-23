@@ -76,6 +76,66 @@ def _cancelled(exc):
             or "cancel" in type(exc).__name__.lower())
 
 
+def _validate_new_script_inputs(bindings, owner, analysis_result_ref=None):
+    """Validate new-run references without registering snapshot bytes.
+
+    This is deliberately read-only. Any missing, unauthorized, changed or
+    malformed reference is rejected before save_script() and before a run is
+    reserved, so it cannot be mistaken for an unknown worker side effect.
+    """
+    import keyword
+    import re
+    from pathlib import Path
+    from src.figures.projects import ProjectError, normalize_script_bindings
+    from src.research.analysis_results import load_analysis_result, load_dataset_snapshot
+    from src.session import files
+
+    resolved = normalize_script_bindings(bindings)
+    total = 0
+
+    def check_file(file_id, *, allow_internal=False):
+        nonlocal total
+        original = files.get_account_file(file_id, owner, allow_internal=allow_internal)
+        if not original:
+            raise ProjectError("data_unavailable", "输入文件不存在或不属于当前账号。")
+        path = Path(original["path"])
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
+            raise ProjectError("invalid_inputs", "输入必须是大小受限的普通文件。")
+        with path.open("rb") as handle:
+            payload = handle.read(32 * 1024 * 1024 + 1)
+        total += len(payload)
+        if len(payload) > 32 * 1024 * 1024 or total > 64 * 1024 * 1024:
+            raise ProjectError("invalid_inputs", "脚本输入超过体积上限。")
+        digest = hashlib.sha256(payload).hexdigest()
+        if original.get("sha256") and original["sha256"] != digest:
+            raise ProjectError("source_changed", "原始输入已改变，请登记新的数据版本。")
+
+    if analysis_result_ref:
+        analysis = load_analysis_result(owner, analysis_result_ref)
+        dataset_ref = analysis.to_dict().get("dataset_ref")
+        if not isinstance(dataset_ref, dict):
+            raise ProjectError("data_unavailable", "分析结果缺少可复用的冻结数据集。")
+        if {"analysis_result", "analysis_data"} & set(resolved):
+            raise ProjectError("invalid_inputs", "analysis_result / analysis_data 是分析结果保留的输入变量。")
+        dataset = load_dataset_snapshot(owner, dataset_ref)
+        payload_file_ref = dataset.to_dict().get("payload_file_ref")
+        if payload_file_ref:
+            check_file(payload_file_ref, allow_internal=True)
+
+    for variable, raw in resolved.items():
+        if (not isinstance(variable, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", variable)
+                or keyword.iskeyword(variable)
+                or variable in {"plt", "matplotlib", "show", "emit", "load_dataset"}):
+            raise ProjectError("invalid_inputs", "输入变量名无效或与绘图变量冲突。")
+        if set(raw) == {"dataset_ref"}:
+            dataset = load_dataset_snapshot(owner, raw["dataset_ref"])
+            payload_file_ref = dataset.to_dict().get("payload_file_ref")
+            if payload_file_ref:
+                check_file(payload_file_ref, allow_internal=True)
+        else:
+            check_file(raw["file_id"])
+
+
 def _finalize(assets, owner, session, run, status, payload):
     """Do not turn a completed publication into an empty rejection on log I/O.
 
@@ -109,6 +169,10 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
     owner, session = get_user_id(), get_session_id()
     saved, run, context = None, None, {}
     created = False
+    # Everything up to the first durable run reservation is preflight. A
+    # rejected repair target or malformed binding can be corrected by the model
+    # and must not be upgraded to an unknown write.
+    phase = "preflight"
     # Only a real host request identity authorizes idempotent reuse. Neither
     # identical source nor equal parameters means two research runs are one.
     # This optional host-only kwarg is never forwarded into the sandbox executor.
@@ -179,6 +243,8 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                 # This ref selects retained host facts, never caller-supplied
                 # internal file IDs. Running/unknown writes cannot be replayed.
                 previous = assets.get_run(owner, session, repair_from_run_id)
+                if previous["status"] == "succeeded":
+                    raise ValueError("Repair target already succeeded; this is not a failed run. Create a new run with explicit input bindings and figure outputs instead.")
                 if previous["status"] not in {"failed", "partial"}:
                     raise ValueError("Repair requires a retained failed or partial run; inspect other run states first")
                 replay = (previous.get("result") or {}).get("replay")
@@ -191,6 +257,9 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                 kwargs.update(replay["execution_options"])
                 kwargs["inputs_json"] = bindings
                 kwargs["outputs_json"] = previous["output_contract"]
+            if replay is None:
+                analysis_result_ref = _object(kwargs.get("analysis_result_ref_json"), "analysis_result_ref_json")
+                _validate_new_script_inputs(bindings, owner, analysis_result_ref)
             preset = None
             if ref.get("kind") == "builtin_script":
                 preset = get_preset(ref)
@@ -207,6 +276,7 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                 if not re.match(r'[A-Za-z_]', name):
                     name = 'analysis_' + name
                 saved = assets.save_script(owner, session, name=name, source=script)
+            phase = "source_persisted"
             from src.figures.script_outputs import normalize_output_contract
             try:
                 contract = _object(kwargs.get("outputs_json"), "outputs_json")
@@ -218,12 +288,17 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                 # pure validation cannot have reserved a run, executed code or
                 # published outputs; report that boundary, retaining the ref so
                 # the model can correct the contract without resaving the source.
-                payload = {"error": assets._error(str(exc)), "_tool_outcome": {
+                payload = {"error": assets._error(str(exc)),
+                           "failure_phase": phase, "script_persisted": bool(saved),
+                           "run_reserved": False, "_tool_outcome": {
                     "status": "not_run", "reason_code": "script_execution_rejected", "artifacts": []}}
                 if getattr(exc, "reason_code", "") == "render_script_emit_not_available":
                     payload["error"] = f"[RENDER_SCRIPT_EMIT_NOT_AVAILABLE] {exc}"
                     payload["error_code"] = "render_script_emit_not_available"
-                return receipt(str(exc), payload)
+                content, payload = receipt(str(exc), payload)
+                from src.research.script_reconciliation import observe_preflight_rejection
+                observe_preflight_rejection(payload)
+                return content, payload
             context = {"script_ref": saved["script_ref"], "parameters": parameters}
             if replay is not None:
                 context["replay_input_snapshots"] = replay["input_snapshots"]
@@ -252,6 +327,7 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
             run, created = assets.begin_budgeted_run(owner, session, saved["script_ref"], inputs=bindings,
                 parameters=parameters, output_contract=contract, environment=environment,
                 logical_task_id=logical, request_key=request_key, max_failures=failure_limit)
+            phase = "dispatch"
             context["run_id"] = run["run_id"]
             if not created:
                 if run['status'] == 'running':
@@ -285,6 +361,18 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
             # compaction or a finalization failure and is never replaced by [] .
             return complete(content, payload, status)
     except Exception as exc:
+        if phase in {"preflight", "source_persisted"}:
+            # No run was reserved and no worker was dispatched. A source may
+            # already be saved, but that is not a worker side effect; the
+            # first-party proof still authorizes a model-correctable not_run.
+            payload = {"error": assets._error(str(exc)),
+                       "failure_phase": phase, "script_persisted": bool(saved),
+                       "run_reserved": bool(run), "_tool_outcome": {
+                "status": "not_run", "reason_code": "script_execution_rejected", "artifacts": []}}
+            content, payload = receipt(str(exc), payload)
+            from src.research.script_reconciliation import observe_preflight_rejection
+            observe_preflight_rejection(payload)
+            return content, payload
         state = 'cancelled' if _cancelled(exc) else 'failed'
         payload = {"error": assets._error(str(exc)), "_tool_outcome": {
             "status": state, "reason_code": "script_execution_cancelled" if state == 'cancelled' else "script_execution_rejected",

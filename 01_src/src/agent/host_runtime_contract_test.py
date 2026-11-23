@@ -128,6 +128,65 @@ class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.artifact["_tool_outcome"]["status"], "unknown")
         self.assertNotIn("host_preflight_reconciled", message.additional_kwargs)
 
+    def code_bind(self, call):
+        content, artifact = code_tools._dispatch("bind_input", path="/input/data/book.xlsx",
+            file_id="b" * 32, sha256="c" * 64, **self.bind_args)
+        return ToolMessage(content=content, artifact=artifact, name=call["name"],
+            tool_call_id=call["id"], additional_kwargs={"execution_dispatched": True})
+
+    async def test_missing_workspace_is_a_trusted_not_run(self):
+        self.workspace.open.side_effect = LookupError("workspace_unavailable")
+        with patch("src.session.files.get_file") as source:
+            message = await self.run_tool(self.code_bind, "code_bind_input")
+        source.assert_not_called()
+        self.workspace.bind.assert_not_called()
+        self.assertEqual(message.artifact["_tool_outcome"], {
+            "status": "not_run", "reason_code": "workspace_unavailable", "artifacts": []})
+        self.assertIn("host_preflight_reconciled", message.additional_kwargs)
+        self.assertNotIn("operation_uncertain", message.additional_kwargs)
+
+    async def test_task_scope_mismatch_is_a_trusted_not_run(self):
+        self.workspace.open.return_value = {"task_id": "different-task", "revision": 2}
+        with patch("src.session.files.get_file") as source:
+            message = await self.run_tool(self.code_bind, "code_bind_input")
+        source.assert_not_called()
+        self.workspace.bind.assert_not_called()
+        self.assertEqual(message.artifact["_tool_outcome"], {
+            "status": "not_run", "reason_code": "workspace_scope_denied", "artifacts": []})
+        self.assertIn("host_preflight_reconciled", message.additional_kwargs)
+        self.assertNotIn("operation_uncertain", message.additional_kwargs)
+
+    async def test_read_only_mount_is_a_trusted_not_run(self):
+        from src.session import files
+        self.workspace.open.return_value = {"task_id": "fixture-task", "revision": 1}
+        self.workspace.bind.side_effect = PermissionError("workspace_mount_readonly")
+        with patch("src.session.files.get_file", return_value={
+                "visibility": "public", "origin": next(iter(files.ORIGINS)), "sha256": "c" * 64}):
+            message = await self.run_tool(self.code_bind, "code_bind_input")
+        self.assertEqual(message.artifact["_tool_outcome"], {
+            "status": "not_run", "reason_code": "workspace_read_only", "artifacts": []})
+        self.assertIn("host_preflight_reconciled", message.additional_kwargs)
+        self.assertNotIn("operation_uncertain", message.additional_kwargs)
+
+    async def test_relative_bind_path_is_normalized_before_operation_and_execution(self):
+        seen = {}
+        start = Mock(return_value=("operation-one", "lease"))
+
+        async def execute(_tool, call, **_kwargs):
+            seen["executor"] = call["args"]
+            return ToolMessage(content="{}", artifact={}, name=call["name"],
+                               tool_call_id=call["id"])
+
+        tool = SimpleNamespace(name="code_bind_input", args_schema=code_tools.BindInputArgs)
+        call = {"name": "code_bind_input", "id": CALL["id"], "args": {
+            "task_id": "fixture-task", "workspace_id": "a" * 32, "expected_revision": 1,
+            "path": "data/book.xlsx", "file_id": "b" * 32, "sha256": "c" * 64}}
+        with (patch.object(task_events, "start_operation", start),
+              patch.object(registry, "_execute_single_tool", execute)):
+            await registry._run_single_tool(tool, call, require_durable=True)
+        self.assertEqual(start.call_args.args[3]["path"], "/input/data/book.xlsx")
+        self.assertEqual(seen["executor"]["path"], "/input/data/book.xlsx")
+
     async def test_workspace_rollback_has_the_same_proof_contract(self):
         from src.agent.workspace_storage import WorkspaceConflict as VersionConflict
         storage = Mock(owner=IDENTITY.owner_user_id, session=IDENTITY.session_id)

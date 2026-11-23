@@ -7,7 +7,7 @@ finite lease can be reclaimed, but its request budget is never replenished.
 """
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from copy import deepcopy
@@ -33,7 +33,6 @@ _CACHE = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_TTL = 6 * 3600
 _AUDIT_CONCURRENCY = 4
-_AUDIT_WORKERS = ThreadPoolExecutor(max_workers=_AUDIT_CONCURRENCY, thread_name_prefix="reference-audit")
 _BATCH_LOOKUPS: ContextVar[dict | None] = ContextVar("reference_batch_lookups", default=None)
 
 
@@ -158,7 +157,10 @@ def _view(conn, audit, *, offset=0, limit=100):
         result = json.loads(item['result']) if item['result'] else None
         status = result['status'] if result else 'not_checked'
         entry = json.loads(item['entry'])
-        verdict = project_verdict(entry, result, audit_id=audit['id']) if result else None
+        stored = result.get('verdict') if isinstance(result, dict) else None
+        verdict = (stored if isinstance(stored, dict)
+                   and stored.get('decision') in {'verified', 'correction_required', 'not_confirmed'}
+                   else project_verdict(entry, result, audit_id=audit['id']) if result else None)
         row_data.append((item, entry, result, verdict))
         if verdict:
             verdict_counts[verdict['decision']] += 1
@@ -510,6 +512,387 @@ def _project_verification(claims, facts, *, uncertain_fields=(), stopped=''):
             'detail': '登记记录存在与引用身份、字段准确性分别报告；未查到不等于不存在。'}
 
 
+# ---------------------------------------------------------------- identity kernel
+from citrus_refcheck.verification import (
+    BatchLimits as _KernelLimits, Capabilities as _KernelCapabilities,
+    Observation as _KernelObservation, verify_batch as _verify_batch,
+)
+from citrus_refcheck.lookup import AuditStopped as _KernelStopped
+from citrus_refcheck.providers import normalize_doi as _kernel_doi, norm_title as _kernel_title
+from citrus_refcheck.compare import _value as _kernel_value
+
+_KERNEL_VERSION = 'citrus_refcheck/reference-verification/1'
+_KERNEL_DOI = re.compile(r'10\.\d{4,9}/\S+')
+_KERNEL_STOPS = frozenset({'cancelled', 'canceled', 'deadline', 'request_budget_exhausted',
+                           'network_disabled', 'operation_stopped', 'lease_lost',
+                           'item_deadline', 'rate_limit_cooldown'})
+
+
+def _kernel_reason(error):
+    reason = str(getattr(error, 'reason', error) or 'operation_stopped')
+    if reason == 'budget_exhausted':
+        reason = 'request_budget_exhausted'
+    return reason if reason in _KERNEL_STOPS else 'operation_stopped'
+
+
+def _legacy_reason(reason):
+    return {'canceled': 'cancelled', 'item_deadline': 'deadline',
+            'request_budget_exhausted': 'budget_exhausted',
+            'rate_limit_cooldown': 'operation_stopped'}.get(reason, reason or '')
+
+
+def _kernel_check(check):
+    def guarded():
+        try:
+            check()
+        except AuditStopped as exc:
+            raise _KernelStopped(_kernel_reason(exc)) from exc
+    return guarded
+
+
+def _kernel_debit(debit):
+    def guarded(query):
+        try:
+            debit()
+        except AuditStopped as exc:
+            raise _KernelStopped(_kernel_reason(exc)) from exc
+    return guarded
+
+
+class _KernelRecorder:
+    """Thread-safe side channel for exact receipts and candidates per query."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.receipts = {}
+        self.records = {}
+        self.evidence = {}
+
+    def add(self, key, source, status, error, evidence):
+        refs = []
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            ref = str(item.get('response_sha256') or '')
+            if len(ref) == 64:
+                refs.append('http:' + ref)
+            elif item.get('url'):
+                refs.append('http:' + digest([item.get('url'), item.get('status'),
+                                              item.get('http_status')]))
+        receipt = {'source': source, 'http_status': status if type(status) is int else 0,
+                   'error': error or '', 'evidence_refs': list(dict.fromkeys(refs))[:20]}
+        with self.lock:
+            self.receipts.setdefault(key, []).append(receipt)
+            self.evidence.setdefault(key, []).extend(
+                item for item in evidence[:20] if isinstance(item, dict))
+
+    def add_records(self, key, source, records, lookup_kind):
+        with self.lock:
+            bucket = self.records.setdefault(key, [])
+            seen = {(item.get('source'), item.get('doi') or item.get('arxiv_id')
+                     or _kernel_title(item.get('title'))) for item in bucket}
+            for record in records[:20]:
+                if not isinstance(record, dict):
+                    continue
+                item = {**record, 'source': record.get('source') or source,
+                        'lookup_kind': lookup_kind}
+                identity = (item.get('source'), item.get('doi') or item.get('arxiv_id')
+                            or _kernel_title(item.get('title')))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                bucket.append(item)
+            del bucket[20:]
+
+
+def _entry_query_key(entry):
+    if entry.get('parse_status') == 'invalid_row':
+        return None
+    claims = entry.get('claims') or {}
+    doi = _kernel_doi(claims.get('doi'))
+    if doi:
+        return ('doi', doi) if _KERNEL_DOI.fullmatch(doi) else None
+    arxiv = _kernel_value(claims, 'arxiv_id')
+    if arxiv:
+        return ('arxiv', arxiv)
+    title = _kernel_value(claims, 'title')
+    return ('search', title) if title else None
+
+
+def _call_provider(function, args, source, deadline, check, recorder, key, kind,
+                   *, collect_records=True):
+    try:
+        with lit.bounded_lookup(deadline=deadline, check=check, debit=lambda: None) as context:
+            status, records, error = function(*args)
+        evidence = deepcopy(context.evidence)
+    except _KernelStopped:
+        raise
+    except Exception as exc:
+        status, records, error, evidence = 0, [], type(exc).__name__, []
+    if type(status) is not int:
+        error = error or str(status) or 'invalid_response'
+        status = 0
+    if status not in (200, 404) and not error:
+        error = f'http_{status}' if 100 <= status <= 599 else 'invalid_response'
+    if not isinstance(records, (list, tuple)):
+        records, error = [], error or 'invalid_provider_payload'
+    records = [record for record in records if isinstance(record, dict)]
+    usable = status == 200 and not error
+    recorder.add(key, source, status, error, evidence)
+    if collect_records:
+        recorder.add_records(key, source, records if usable else [], kind)
+    return {'status': status, 'records': records if usable else [],
+            'error': error or '', 'evidence': evidence}
+
+
+def _observation(recorder, key, source):
+    receipts = list(recorder.receipts.get(key, []))
+    records = [dict(item) for item in recorder.records.get(key, [])][:20]
+    successes = [item for item in receipts
+                 if item.get('http_status') == 200 and not item.get('error')]
+    statuses = [item.get('http_status') for item in receipts
+                if type(item.get('http_status')) is int]
+    if successes:
+        status, error = 200, ''
+    elif 429 in statuses:
+        status, error = 429, ''
+    elif statuses and all(value == 404 for value in statuses):
+        status, error = 404, ''
+    else:
+        status = statuses[-1] if statuses else 0
+        error = next((item.get('error') for item in receipts if item.get('error')), '')
+        if not error:
+            error = f'http_{status}' if 100 <= status <= 599 else 'provider_error'
+    refs = ['record:' + digest(record) for record in records]
+    for receipt in receipts:
+        refs.extend(receipt.get('evidence_refs') or [])
+    return _KernelObservation(source=source, http_status=status, records=tuple(records),
+                              evidence_refs=tuple(list(dict.fromkeys(refs))[:20]), error=error)
+
+
+def _make_lookups(recorder, check, web_allowed):
+    def doi_lookup(query, deadline):
+        key, base = ('doi', query.value), query.value
+        first = _call_provider(lit._crossref_work, (lit.quote(base, safe='/'),),
+                               'Crossref', deadline, check, recorder, key, 'doi')
+        direct = any(_kernel_doi(record.get('doi')) == base for record in first['records'])
+        if first['status'] == 404 or (first['status'] == 200 and not direct):
+            _call_provider(lit._datacite_work, (lit.quote(base, safe='/'),),
+                           'DataCite', deadline, check, recorder, key, 'doi')
+        return _observation(recorder, key, 'Crossref+DataCite')
+
+    def arxiv_lookup(query, deadline):
+        key, base = ('arxiv', query.value), query.value
+        first = _call_provider(lit._arxiv_by_id, (base,), 'arXiv', deadline, check,
+                               recorder, key, 'arxiv_id')
+        found = any(record.get('arxiv_id') == base for record in first['records'])
+        if first['status'] == 404 or (first['status'] == 200 and not found):
+            _call_provider(lit._datacite_arxiv, (base,), 'DataCite', deadline, check,
+                           recorder, key, 'arxiv_id')
+        return _observation(recorder, key, 'arXiv+DataCite')
+
+    def title_lookup(query, deadline):
+        key, title = ('search', query.value), query.value
+        if web_allowed:
+            suggested = _call_provider(lit._deepseek_reference_candidates, (title,),
+                                       'DeepSeek Search', deadline, check, recorder, key,
+                                       'title', collect_records=False)
+            dois = []
+            for record in suggested['records']:
+                doi = _kernel_doi(record.get('doi'))
+                if doi and _KERNEL_DOI.fullmatch(doi) and doi not in dois:
+                    dois.append(doi)
+                if len(dois) == 2:
+                    break
+            for doi in dois:
+                confirmed = _call_provider(lit._crossref_work,
+                                           (lit.quote(doi, safe='/'),), 'Crossref',
+                                           deadline, check, recorder, key, 'doi')
+                if any(_kernel_doi(record.get('doi')) == doi for record in confirmed['records']):
+                    break
+        first = _call_provider(lit._crossref_search, (title,), 'Crossref', deadline,
+                               check, recorder, key, 'title')
+        exact = any(_kernel_title(record.get('title')) == _kernel_title(title)
+                    for record in first['records'])
+        if first['status'] == 404 or (first['status'] == 200 and not exact):
+            _call_provider(lit._openalex_search, (title,), 'OpenAlex', deadline, check,
+                           recorder, key, 'title')
+        return _observation(recorder, key, 'DeepSeek Search+Crossref+OpenAlex')
+
+    return doi_lookup, arxiv_lookup, title_lookup
+
+
+def _kernel_verdict(entry, result, audit_id):
+    from citrus_refcheck.verdict import project_verdict
+    verdict = project_verdict(entry, result, audit_id=audit_id)
+    status = result.get('match_status')
+    if status in {'unconfirmed', 'unprocessed'}:
+        verdict['identity'] = 'unresolved'
+        verdict['decision'] = 'not_confirmed'
+        if not any(item.get('field') == 'identity' for item in verdict['critical_unknowns']):
+            verdict['critical_unknowns'].insert(0, {
+                'field': 'identity', 'missing_evidence': 'unique_registry_identity',
+                'reason': result.get('reason') or status})
+    elif status == 'conflict':
+        verdict['identity'] = 'conflict'
+        if verdict['material_differences']:
+            verdict['decision'] = 'correction_required'
+        else:
+            verdict['decision'] = 'not_confirmed'
+            if not any(item.get('field') == 'identity' for item in verdict['critical_unknowns']):
+                verdict['critical_unknowns'].insert(0, {
+                    'field': 'identity', 'missing_evidence': 'consistent_registry_identity',
+                    'reason': result.get('reason') or 'identity_conflict'})
+    elif status == 'matching':
+        if verdict['material_differences']:
+            verdict['decision'] = 'correction_required'
+        elif verdict['decision'] == 'not_confirmed':
+            remaining = [item for item in verdict['critical_unknowns']
+                         if not (item.get('field') == 'identity'
+                                 and item.get('reason') == 'unresolved')]
+            if not remaining:
+                verdict['identity'] = 'confirmed'
+                verdict['decision'] = 'verified'
+                verdict['critical_unknowns'] = remaining
+    verdict['note'] = {
+        'verified': '已确认引用身份，未发现有证据支持的关键差错。',
+        'correction_required': '登记证据支持更正至少一项已提交的书目信息。',
+        'not_confirmed': '现有证据不足以确认引用；未核实不等于不存在。',
+    }[verdict['decision']]
+    verdict['kernel'] = _KERNEL_VERSION
+    return verdict
+
+
+def _kernel_result(entry, evidence, recorder, audit_id):
+    claims = entry.get('claims') or {}
+    uncertain = entry.get('uncertain_fields') or []
+    key = _entry_query_key(entry)
+    raw_match = evidence.get('match') if isinstance(evidence, dict) else None
+    match = dict(raw_match) if isinstance(raw_match, dict) else None
+    receipts = list(recorder.receipts.get(key, [])) if key else []
+    candidates = [dict(item) for item in recorder.records.get(key, [])] if key else []
+    lookup_kind = key[0] if key else ''
+    kind = {'doi': 'doi', 'arxiv': 'arxiv_id'}.get(lookup_kind, 'title')
+    if match is not None:
+        match.setdefault('source', next((item.get('source') for item in candidates
+                                         if match.get('doi')
+                                         and _kernel_doi(item.get('doi')) == _kernel_doi(match.get('doi'))), ''))
+        match.setdefault('lookup_kind', kind)
+        match['record_sha256'] = match.get('record_sha256') or digest(match)
+        duplicate = any(
+            item.get('source') == match.get('source')
+            and (item.get('doi') or item.get('title')) == (match.get('doi') or match.get('title'))
+            for item in candidates)
+        if not duplicate:
+            candidates.insert(0, match)
+    for item in candidates:
+        item.setdefault('lookup_kind', kind)
+        item['record_sha256'] = item.get('record_sha256') or digest(item)
+    providers, errors, http_evidence = {}, {}, []
+    for receipt in receipts:
+        source = str(receipt.get('source') or 'adapter')
+        status = receipt.get('http_status')
+        error = str(receipt.get('error') or '')
+        if status == 200 and not error:
+            providers[source] = 'ok'
+        elif status == 404 and not error:
+            providers[source] = 'not_found'
+        else:
+            providers[source] = 'error'
+            errors[source] = error or (f'http_{status}'
+                                       if type(status) is int and 100 <= status <= 599
+                                       else 'invalid_response')
+        http_evidence.append({'source': source, 'http_status': status,
+                              'error': errors.get(source, ''),
+                              'evidence_refs': list(receipt.get('evidence_refs') or [])})
+    provider_conflicts = []
+    by_doi = {}
+    for item in candidates:
+        doi = _kernel_doi(item.get('doi'))
+        if doi:
+            by_doi.setdefault(doi, []).append(item)
+    for group in by_doi.values():
+        if len({item.get('source') for item in group}) < 2:
+            continue
+        base = group[0]
+        for item in group[1:]:
+            fields = [field for field, value in compare_fields(base, item).items()
+                      if value['status'] == 'conflicting']
+            if fields:
+                provider_conflicts.append({'provider': item.get('source'), 'fields': fields,
+                                           'record_sha256': item.get('record_sha256')})
+    fields = compare_fields(claims, match, uncertain_fields=uncertain)
+    processing = str(evidence.get('processing_status') or 'unprocessed')
+    match_status = str(evidence.get('match_status') or 'unprocessed')
+    reason = str(evidence.get('reason') or '')
+    if processing != 'processed':
+        status, existence, identity = 'not_checked', 'not_checked', 'not_checked'
+    elif match_status == 'matching':
+        differences = evidence.get('differences') or []
+        status = ('metadata_mismatch'
+                  if any(item.get('status') == 'conflicting' for item in differences)
+                  else 'metadata_matched')
+        existence = 'record_found'
+        identity = ('identifier_match' if reason == 'identifier_match'
+                    else 'metadata_corroborated')
+    elif match_status == 'conflict':
+        status, existence, identity = ('metadata_mismatch', 'record_found',
+                                       'identifier_conflict_candidate')
+    elif match_status == 'unconfirmed':
+        existence, identity = 'not_established', 'unresolved'
+        if reason in {'rate_limited', 'provider_error'}:
+            status = 'network_error'
+        elif reason == 'not_found':
+            status = 'not_found_in_checked_registries'
+        elif reason == 'capability_unavailable':
+            status = 'not_checked'
+        else:
+            status = 'metadata_uncertain'
+    else:
+        status, existence, identity = 'metadata_uncertain', 'not_established', 'unresolved'
+    retryable = bool(processing != 'processed' or errors
+                     or reason in {'rate_limited', 'provider_error', 'deadline',
+                                   'request_budget_exhausted', 'item_deadline'})
+    if reason in {'not_found', 'invalid_input', 'capability_unavailable'}:
+        retryable = False
+    result = {
+        'status': status, 'existence': existence, 'identity': identity, 'fields': fields,
+        'metadata_scope': 'minimal_identity', 'rule_version': RULE_VERSION,
+        'claims_sha256': entry.get('claims_sha256') or digest(claims),
+        'retryable': retryable,
+        'stop_reason': reason if reason in _KERNEL_STOPS else '',
+        'facts': {'records': candidates, 'providers': providers, 'errors': errors,
+                  'http_evidence': http_evidence, 'planned_sources': sorted(providers),
+                  'query_time': time.time()},
+        'evidence': http_evidence, 'errors': errors, 'candidates': candidates,
+        'selected_record': match,
+        'identifier_records': [item for item in candidates
+                               if claims.get('doi')
+                               and _kernel_doi(item.get('doi')) == _kernel_doi(claims.get('doi'))],
+        'title_candidates': [item for item in candidates
+                             if item is not match and item.get('lookup_kind') == 'title'],
+        'selection_basis': ('exact_identifier' if reason == 'identifier_match'
+                            else 'title_match' if reason == 'title_match' else 'unresolved'),
+        'provider_conflicts': provider_conflicts,
+        'limits': {'max_seconds': 25, 'kernel': _KERNEL_VERSION,
+                   'response_limit_bytes': 4 * 1024 * 1024, 'retries': 0},
+        'doi': _kernel_doi(claims.get('doi')), 'input_title': _kernel_value(claims, 'title'),
+        'input_authors': _kernel_value(claims, 'authors'), 'input_year': _kernel_value(claims, 'year'),
+        'metadata_title': _kernel_value(match or {}, 'title'),
+        'metadata_authors': _kernel_value(match or {}, 'authors'),
+        'metadata_year': _kernel_value(match or {}, 'year'),
+        'metadata_journal': _kernel_value(match or {}, 'journal'),
+        'provider': (match or {}).get('source', ''), 'source_url': (match or {}).get('url', ''),
+        'evidence_url': (match or {}).get('url', ''),
+        'field_conflicts': '; '.join(field for field, value in fields.items()
+                                     if value['status'] == 'conflicting'),
+        'match_status': match_status, 'processing_status': processing, 'reason': reason,
+        'detail': '身份内核仅核对存在性与最小身份；已处理但未确认不等于文献不存在。',
+    }
+    result['verdict'] = _kernel_verdict(entry, result, audit_id)
+    return result
+
+
 def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resume=False, progress=None):
     from src.core.cancel import is_cancelled
     from src.core.capability_policy import allows
@@ -555,19 +938,18 @@ def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resum
             conn.execute("UPDATE reference_audits SET status='running',cancelled=0,lease_token=?,lease_until=?,updated=? WHERE id=?",
                          (token, time.time() + time_budget + 10, time.time(), audit_id))
             raw = conn.execute('SELECT * FROM reference_records WHERE audit_id=? ORDER BY ordinal', (audit_id,)).fetchall()
-            # First finish untouched entries; retry failures only on explicit resume.
             pending, retries = [], []
             for item in raw:
                 entry = json.loads(item['entry'])
                 prior = json.loads(item['result']) if item['result'] else None
                 pair = (item['ordinal'], entry, prior)
-                if prior is None:
-                    pending.append(pair)
-                elif prior.get('rule_version') != RULE_VERSION or prior.get('claims_sha256') != entry['claims_sha256']:
+                if (prior is None or prior.get('rule_version') != RULE_VERSION
+                        or prior.get('claims_sha256') != entry['claims_sha256']):
                     pending.append(pair)
                 elif resume and prior.get('retryable'):
                     retries.append(pair)
             selected = (pending + retries)[:max_rows]
+            remaining_budget = max(0, int(audit['request_limit'] - audit['requests_used']))
 
         def check():
             if is_cancelled():
@@ -577,90 +959,83 @@ def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resum
             if not (allows('bibliographic_lookup') or allows('web_search')):
                 raise AuditStopped('network_disabled')
             with _connect() as conn:
-                audit = _load(conn, owner, session_id, audit_id)
-                if audit['cancelled'] or audit['lease_token'] != token:
-                    raise AuditStopped('cancelled' if audit['cancelled'] else 'lease_lost')
+                current = _load(conn, owner, session_id, audit_id)
+                if current['cancelled'] or current['lease_token'] != token:
+                    raise AuditStopped('cancelled' if current['cancelled'] else 'lease_lost')
 
         def debit():
             check()
             with _connect() as conn:
-                audit = _load(conn, owner, session_id, audit_id)
-                if audit['lease_token'] != token or audit['cancelled']:
+                current = _load(conn, owner, session_id, audit_id)
+                if current['lease_token'] != token or current['cancelled']:
                     raise AuditStopped('lease_lost')
-                if audit['requests_used'] >= audit['request_limit']:
+                if current['requests_used'] >= current['request_limit']:
                     raise AuditStopped('budget_exhausted')
                 conn.execute('UPDATE reference_audits SET requests_used=requests_used+1 WHERE id=?', (audit_id,))
 
-        batch_lookups = {}
-
-        def verify(entry, prior):
-            check()
-            _BATCH_LOOKUPS.set(batch_lookups)
-            if entry.get('parse_status') == 'invalid_row':
-                return {'status': 'not_checked', 'existence': 'not_checked', 'identity': 'not_checked',
-                        'reason': entry['parse_error'], 'rule_version': RULE_VERSION,
-                        'claims_sha256': entry['claims_sha256'], 'retryable': False}
-            if (prior and prior.get('rule_version') != RULE_VERSION and not prior.get('retryable')
-                    and prior.get('claims_sha256') == entry['claims_sha256'] and prior.get('facts')):
-                return _project_verification(entry['claims'], prior['facts'],
-                                             uncertain_fields=entry.get('uncertain_fields', []))
-            return verify_record(entry['claims'], owner=owner, session_id=session_id,
-                                 uncertain_fields=entry.get('uncertain_fields', []),
-                                 deadline=deadline, check=check, debit=debit)
-
-        def commit(ordinal, entry, result):
-            with _connect() as conn:
-                audit = _load(conn, owner, session_id, audit_id)
-                if audit['lease_token'] != token or audit['cancelled']:
-                    raise AuditStopped('cancelled' if audit['cancelled'] else 'lease_lost')
-                conn.execute('UPDATE reference_records SET result=?,attempts=attempts+1 WHERE audit_id=? AND ordinal=?',
-                             (_json(result), audit_id, ordinal))
-                conn.execute('''INSERT INTO reference_attempts(audit_id,ordinal,attempt,result,created)
-                    SELECT audit_id,ordinal,attempts,result,? FROM reference_records WHERE audit_id=? AND ordinal=?''',
-                    (time.time(), audit_id, ordinal))
-                conn.execute('UPDATE reference_audits SET updated=? WHERE id=?', (time.time(), audit_id))
-            completed.append(ordinal)
-            if progress:
-                progress({'audit_id': audit_id, 'record_id': entry['record_id'], 'record_index': ordinal,
-                          'status': result['status'], 'durable': True})
-
-        workers = {}
-        remaining = iter(selected)
-
-        def dispatch():
-            item = next(remaining, None)
-            if item is not None:
-                ordinal, entry, prior = item
-                future = _AUDIT_WORKERS.submit(copy_context().run, verify, entry, prior)
-                workers[future] = (ordinal, entry)
-
+        batch = None
+        recorder = _KernelRecorder()
         try:
-            for _ in range(min(len(selected), _AUDIT_CONCURRENCY)):
-                dispatch()
-            while workers:
-                future = next(as_completed(workers))
-                ordinal, entry = workers.pop(future)
+            guarded_check = _kernel_check(check)
+            lookups = _make_lookups(recorder, guarded_check, allows('web_search'))
+            capabilities = _KernelCapabilities(check=guarded_check, debit=_kernel_debit(debit),
+                                               lookup_doi=lookups[0], lookup_arxiv=lookups[1],
+                                               search=lookups[2])
+            limits = _KernelLimits(concurrency=_AUDIT_CONCURRENCY,
+                                   request_budget=remaining_budget,
+                                   timeout=float(time_budget),
+                                   item_timeout=float(max(0.1, min(8.0, time_budget))),
+                                   rate_limit_retries=0)
+            entries = [entry for _, entry, _ in selected]
+            batch = _verify_batch({'entries': entries}, capabilities=capabilities, limits=limits)
+        except (_KernelStopped, AuditStopped) as exc:
+            batch, reason = None, _legacy_reason(_kernel_reason(exc))
+        except Exception:
+            batch, reason = None, 'operation_stopped'
+        if batch is not None:
+            reason = reason or _legacy_reason(str(batch.get('stop_reason') or ''))
+            for row in batch.get('entries', []):
+                entry = row
+                evidence = row.get('evidence') or {}
+                stop = str(evidence.get('reason') or evidence.get('stop_reason') or '')
+                if (evidence.get('processing_status') != 'processed'
+                        and stop not in {'invalid_input', 'capability_unavailable'}):
+                    continue
                 try:
-                    result = future.result()
-                    commit(ordinal, entry, result)
-                    reason = reason or result.get('stop_reason', '')
+                    result = _kernel_result(entry, evidence, recorder, audit_id)
+                    with _connect() as conn:
+                        current = _load(conn, owner, session_id, audit_id)
+                        if current['lease_token'] != token or current['cancelled']:
+                            raise AuditStopped('cancelled' if current['cancelled'] else 'lease_lost')
+                        conn.execute('UPDATE reference_records SET result=?,attempts=attempts+1 WHERE audit_id=? AND ordinal=?',
+                                     (_json(result), audit_id, entry['record_index']))
+                        conn.execute('''INSERT INTO reference_attempts(audit_id,ordinal,attempt,result,created)
+                            SELECT audit_id,ordinal,attempts,result,? FROM reference_records WHERE audit_id=? AND ordinal=?''',
+                                     (time.time(), audit_id, entry['record_index']))
+                        conn.execute('UPDATE reference_audits SET updated=? WHERE id=?', (time.time(), audit_id))
                 except AuditStopped as exc:
-                    reason = exc.reason if exc.reason in {'cancelled', 'lease_lost'} else reason or exc.reason
-                if not reason:
-                    dispatch()
-        finally:
-            for future in workers:
-                future.cancel()
-            if workers:
-                wait(workers)
-            with _connect() as conn:
-                audit = _load(conn, owner, session_id, audit_id)
-                if audit['lease_token'] == token:
-                    view = _view(conn, audit, limit=0)
-                    status = ('cancelled' if reason == 'cancelled' else 'budget_exhausted' if reason == 'budget_exhausted'
-                              else view['status'] if view['terminal'] else 'partial')
-                    conn.execute('UPDATE reference_audits SET status=?,cancelled=?,lease_token=?,lease_until=0,updated=? WHERE id=?',
-                                 (status, int(reason == 'cancelled'), '', time.time(), audit_id))
+                    reason = reason or _legacy_reason(_kernel_reason(exc))
+                    break
+                except Exception:
+                    reason = reason or 'operation_stopped'
+                    break
+                completed.append(entry['record_index'])
+                if progress:
+                    try:
+                        progress({'audit_id': audit_id, 'record_id': entry.get('record_id', ''),
+                                  'record_index': entry['record_index'],
+                                  'status': result['status'], 'durable': True})
+                    except Exception:
+                        pass
+        with _connect() as conn:
+            current = _load(conn, owner, session_id, audit_id)
+            if current['lease_token'] == token:
+                final = _view(conn, current, limit=0)
+                status = ('cancelled' if reason == 'cancelled'
+                          else 'budget_exhausted' if reason == 'budget_exhausted'
+                          else final['status'] if final['terminal'] else 'partial')
+                conn.execute('UPDATE reference_audits SET status=?,cancelled=?,lease_token=?,lease_until=0,updated=? WHERE id=?',
+                             (status, int(reason == 'cancelled'), '', time.time(), audit_id))
     result = get_audit(owner, session_id, audit_id)
     result.update(run_reason=reason or 'batch_finished', processed_indices=sorted(completed))
     return result

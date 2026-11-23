@@ -99,27 +99,46 @@ def argument_problem(tool_name: str, args: dict, fields: dict) -> str:
     return ""
 
 
-def check_tool_arguments(tool: Any, tool_name: str, args: dict) -> str:
+def validate_tool_arguments(tool: Any, tool_name: str, args: dict) -> tuple[str, dict]:
+    """Validate once and return the normalized arguments used for dispatch."""
     if not isinstance(args, dict):
-        return f"[ERR_ARG] 工具 {tool_name} 的参数必须是对象；本次未执行。请按当前工具schema重新生成完整参数。"
+        return (f"[ERR_ARG] 工具 {tool_name} 的参数必须是对象；本次未执行。请按当前工具schema重新生成完整参数。", args)
+    schema = getattr(tool, "args_schema", None)
     fields = schema_fields(tool)
     problem = argument_problem(tool_name, args, fields)
     if problem:
-        return problem
-    schema = getattr(tool, "args_schema", None)
+        return problem, args
+    if schema is None:
+        # No declared schema means there is nothing to validate or normalize.
+        # Treating that as "accepts no arguments" rejected tools that legitimately
+        # take free-form kwargs, so dispatch the original arguments unchanged.
+        return "", args
+    if not fields and args:
+        return f"[ERR_ARG] 工具 {tool_name} 不接受参数；本次未执行。请使用空对象。", args
     validate = getattr(schema, "model_validate", None)
     if callable(validate):
-        # Validation only: never execute the coerced model or manufacture values.
-        # Raw content_and_artifact functions must get the same type checks as
-        # normal LangChain tools before the dispatch marker is set.
-        if not fields and args:
-            return f"[ERR_ARG] 工具 {tool_name} 不接受参数；本次未执行。请使用空对象。"
         from pydantic import ValidationError
         try:
-            validate(args, strict=True)
+            validated = validate(args, strict=True)
         except ValidationError as exc:
             details = [".".join(str(part) for part in error["loc"]) + ": " + error["msg"]
                        for error in exc.errors(include_input=False, include_url=False)[:8]]
             return (f"[ERR_ARG] 工具 {tool_name} 参数校验未通过；本次未执行。" +
-                    "；".join(details) + "。请依据当前schema修正类型、范围或枚举后重新提议，不要原样重试。")
-    return ""
+                    "；".join(details) + "。请依据当前schema修正类型、范围或枚举后重新提议，不要原样重试。", args)
+        # This is the critical boundary: field validators normalize paths and
+        # other bounded values. Executing the raw dict would silently discard
+        # that result and make validation disagree with dispatch.
+        dump = getattr(validated, "model_dump", None)
+        if callable(dump):
+            try:
+                normalized = dump(mode="python")
+            except TypeError:
+                normalized = dump()
+            if isinstance(normalized, dict):
+                return "", normalized
+    return "", args
+
+
+def check_tool_arguments(tool: Any, tool_name: str, args: dict) -> str:
+    """Compatibility wrapper for callers that only need the error text."""
+    return validate_tool_arguments(tool, tool_name, args)[0]

@@ -3203,8 +3203,14 @@ function restoreSessionCitations() {
     .then(function (r) { if (epoch !== authEpoch) return; return r.json(); }).then(function (d) { if (epoch !== authEpoch) return;
       if (reqSid !== sessionId) return;
       var groups = d && d.groups;
-      var gTotal = groups ? ((groups.rag || []).length + (groups.ucr || []).length +
-                             (groups.web || []).length + (groups.historical || []).length) : 0;
+      var gTotal = 0;
+      if (groups) {
+        for (var _gk in groups) {
+          if (Object.prototype.hasOwnProperty.call(groups, _gk)) {
+            gTotal += (groups[_gk] || []).length;
+          }
+        }
+      }
       if (!groups || gTotal === 0) {
         if (roundHistory.length === 0) {
           // v8.10q: save_evidence 是后台 spawn 异步落库——切换会话时最新一轮
@@ -4936,6 +4942,8 @@ async function sendMsg() {
             doi: '',
             tier: w.tier || '',
             tier_label: w.tier_label || '',
+            role: w.role || (w.cited ? 'cited' : 'candidate'),
+            cited: !!w.cited,
             round_no: (w.round_no != null ? w.round_no : 1),
             _isSummary: !!w.is_summary,
             evidence_level: w.evidence_level, provenance: w.provenance,
@@ -5527,8 +5535,17 @@ async function sendMsg() {
     var sm = srcMeta(item);
     var isUcr = sm.cls === 'ucr';
     var du = item.doi && item.doi !== 'N/A' ? 'https://doi.org/' + encodeURIComponent(item.doi) : '#';
-    var b = item.type === 'main' ? 'citation-badge' : 'citation-badge uncited';
-    var sl = item.type === 'dynamic' ? 'Agent 发现' : (item.type === 'web' ? 'Web' : (item.type === 'historical' ? '历史证据' : (typeof item.score === 'number' && Number.isFinite(item.score) ? 'CE=' + item.score.toFixed(3) : '')));
+    // Candidate/uncited entries never claim to be cited.  The role is set by
+    // the backend from the actual answer markers, so this is a display-only
+    // decision, not a new inference.
+    var _isCandidate = item.role === 'candidate' || item.type === 'candidate'
+      || item.type === 'uncited';
+    var b = (!_isCandidate && item.type === 'main') ? 'citation-badge' : 'citation-badge uncited';
+    var sl = _isCandidate ? '候选（正文未引用）'
+      : (item.type === 'dynamic' ? 'Agent 发现'
+      : (item.type === 'web' ? 'Web'
+      : (item.type === 'historical' ? '历史证据'
+      : (typeof item.score === 'number' && Number.isFinite(item.score) ? 'CE=' + item.score.toFixed(3) : ''))));
     var h = '<div class="citation-item" onclick="this.classList.toggle(\'expanded\')">';
     // ── v10.15（C.1 + C.2）：侧栏渲染为「**标题 + 🔗**」 ─────────────────────
     //   用户口径（报告 45 问题 2）：侧栏此前显示 `[W2] Web:` —— **标题行根本不存在**
@@ -5608,10 +5625,14 @@ async function sendMsg() {
     // v9.4: 恢复视图同样支持动态来源组（与 live 侧栏同口径，未知组排在内置 4 组之后）
     var dyn = [];
     var gkeys = Object.keys(_restoredGroups || {});
+    var _FIXED_RESTORE = ['rag', 'ucr', 'web', 'historical',
+                           'web_t1', 'web_t2', 'web_t3'];
     for (var gk = 0; gk < gkeys.length; gk++) {
-      if (['rag', 'ucr', 'web', 'historical'].indexOf(gkeys[gk]) === -1) dyn.push(gkeys[gk]);
+      if (_FIXED_RESTORE.indexOf(gkeys[gk]) === -1) dyn.push(gkeys[gk]);
     }
-    var order = ['rag', 'ucr', 'web', 'historical'].concat(dyn);
+    // Keep the live order: local first, then web T1/T2/T3.
+    var order = ['rag', 'web_t1', 'web_t2', 'web_t3', 'ucr', 'web', 'historical']
+      .concat(dyn);
     var total = 0;
     for (var g = 0; g < order.length; g++) total += (_restoredGroups[order[g]] || []).length;
     citationCount.textContent = String(total) + (_restoredRefPool ? ' · ' + _restoredRefPool : '');
@@ -5657,11 +5678,13 @@ async function sendMsg() {
       citationCount.textContent = '0';
       return;
     }
-    var tC = 0, tU = 0;
+    var tC = 0, tU = 0, tW = 0, tH = 0;
     for (var i = 0; i < roundHistory.length; i++) {
       tC += roundHistory[i].cited.length; tU += roundHistory[i].uncited.length;
+      tW += (roundHistory[i].web || []).length;
+      tH += (roundHistory[i].historical || []).length;
     }
-    citationCount.textContent = (tC + tU);
+    citationCount.textContent = (tC + tU + tW + tH);
     var html = '';
     for (var i = roundHistory.length - 1; i >= 0; i--) {
       var round = roundHistory[i];

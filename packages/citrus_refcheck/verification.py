@@ -1,5 +1,5 @@
 """Run one bounded identity check per distinct query and project it onto each input."""
-from concurrent.futures import Executor, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import Executor, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from dataclasses import dataclass, replace
 import math
@@ -351,23 +351,50 @@ def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits())
         for _ in range(min(len(groups), limits.concurrency)):
             dispatch()
         while workers:
-            future = next(as_completed(workers))
-            reason = collect(future, workers.pop(future))
-            if reason in {'cancelled', 'canceled'} or (reason in _BATCH_STOPS and not stop):
-                stop = reason
-            if not stop:
-                dispatch()
+            remaining = requests.deadline - time.monotonic()
+            if remaining <= 0:
+                stop = stop or 'deadline'
+                break
+            done, _pending = wait(tuple(workers), timeout=min(remaining, 1.0),
+                                  return_when=FIRST_COMPLETED)
+            if not done:
+                if requests.interrupted.is_set():
+                    stop = stop or 'cancelled'
+                    break
+                continue
+            for future in done:
+                query = workers.pop(future)
+                if future.cancelled():
+                    continue
+                try:
+                    reason = collect(future, query)
+                except AuditStopped as error:
+                    reason = _stop_code(error)
+                except BudgetExceeded:
+                    reason = 'request_budget_exhausted'
+                except Exception:
+                    reason = 'operation_stopped'
+                if reason in {'cancelled', 'canceled'} or (reason in _BATCH_STOPS and not stop):
+                    stop = reason
+                if not stop:
+                    dispatch()
+            if stop in {'cancelled', 'canceled'}:
+                break
     except KeyboardInterrupt:
         requests.interrupted.set()
         stop = 'cancelled'
-        for future, query in workers.items():
+        for future, query in list(workers.items()):
             if future.done() and not future.cancelled():
-                collect(future, query)
+                try:
+                    collect(future, query)
+                except Exception:
+                    pass
     finally:
         for future in workers:
             future.cancel()
         if workers:
-            wait(workers)
+            grace = max(0.0, min(2.0, requests.deadline - time.monotonic()))
+            wait(tuple(workers), timeout=grace)
     for index, row in enumerate(rows):
         if row['evidence'] is None:
             row['evidence'] = _row_result(entries[index], None, (), stop or 'not_started')

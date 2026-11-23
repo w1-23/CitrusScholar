@@ -151,7 +151,9 @@ async def persist_agent_turn(state: dict) -> dict:
             cited_refs = refs_data.get("cited") if isinstance(refs_data, dict) else None
             from src.core.background import adopt, spawn
 
-            write = session_manager.save_evidence(session_id, query, evidence, "", cited_refs)
+            write = session_manager.save_evidence(
+                session_id, query, evidence, "", cited_refs,
+                references=refs_data if isinstance(refs_data, dict) else None)
             if lease is not None:
                 adopt(create_account_task(lease, write))
             else:

@@ -310,6 +310,12 @@ class HostTools:
         try:
             if original.artifact is not None and not isinstance(original.artifact, dict):
                 raise TypeError("unsupported_tool_artifact")
+            # The JSON boundary recorded any wrapper it could not encode
+            # losslessly. Refuse a clean success in that case so the turn keeps
+            # the honest partial/unknown outcome instead of claiming success.
+            if (isinstance(delivered.artifact, dict)
+                    and delivered.artifact.get("_unsupported_types")):
+                raise TypeError("unsupported_tool_artifact_value")
             delivered = persistent_message(delivered)
         except (TypeError, ValueError, RecursionError):
             status = 'unknown' if execution.uncertain else 'partial' if record['status'] in {'complete', 'partial'} else record['status']

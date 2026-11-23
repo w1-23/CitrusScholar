@@ -268,7 +268,8 @@ class SessionManager:
                 # 发的 cited_refs 不一致。落盘后端点优先读本列。
                 cur = conn.execute("PRAGMA table_info(session_evidence)")
                 ev_cols = {row[1] for row in cur.fetchall()}
-                for col, col_type in [("cited_refs_json", "TEXT")]:
+                for col, col_type in [("cited_refs_json", "TEXT"),
+                                      ("references_json", "TEXT")]:
                     if col not in ev_cols:
                         try:
                             conn.execute(
@@ -1235,23 +1236,26 @@ class SessionManager:
 
     async def save_evidence(self, session_id: str, query: str,
                             evidence: list, report_text: str,
-                            cited_refs: Optional[list] = None) -> None:
+                            cited_refs: Optional[list] = None,
+                            references: Optional[dict] = None) -> None:
         """保存一轮检索的证据账本（结构化清单 + 报告全文 + 正文实际引用集）。
 
         v9.6.3: cited_refs 为本轮经过"按正文过滤 + 重编号"后的引用集（实时 SSE
         发的那一份），持久化后 /citations 刷新路径才能与其一致。
         """
-        if not evidence and not report_text:
+        if not evidence and not report_text and not references:
             return
         try:
             await asyncio.to_thread(self._save_evidence_sync, session_id,
-                                    query, evidence, report_text, cited_refs)
+                                    query, evidence, report_text, cited_refs,
+                                    references)
         except Exception as e:
             logger.error(f"[SessionManager] save_evidence failed: {e}")
 
     def _save_evidence_sync(self, session_id: str, query: str,
                             evidence: list, report_text: str,
-                            cited_refs: Optional[list] = None):
+                            cited_refs: Optional[list] = None,
+                            references: Optional[dict] = None):
         import sqlite3
         lock = _get_session_lock(session_id)
         with lock:
@@ -1271,14 +1275,21 @@ class SessionManager:
                         _cited = json.dumps(cited_refs, ensure_ascii=False)[:1_000_000]
                     except Exception:
                         _cited = ""
+                _references = ""
+                if isinstance(references, dict):
+                    try:
+                        _references = json.dumps(
+                            references, ensure_ascii=False)[:1_000_000]
+                    except Exception:
+                        _references = ""
                 conn.execute(
                     "INSERT INTO session_evidence "
                     "(session_id, turn_seq, query, evidence_json, report_text, "
-                    " cited_refs_json, created_at) "
-                    "VALUES (?,?,?,?,?,?,?)",
+                    " cited_refs_json, references_json, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
                     (session_id, turn_seq, query[:500],
                      json.dumps(evidence, ensure_ascii=False)[:1_000_000],
-                     _report, _cited, datetime.now().isoformat()),
+                     _report, _cited, _references, datetime.now().isoformat()),
                 )
                 conn.commit()
         logger.info(f"[SessionManager] evidence saved: session={session_id[:8]} "

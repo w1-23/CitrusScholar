@@ -470,6 +470,17 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
             raise task_events.TaskConflict("durable_operation_context_required")
         return await _execute_single_tool(tool, tool_call, on_dispatch=on_dispatch)
     name, args = tool_call.get("name", tool.name), tool_call.get("args", {})
+    # Bind the validated model before operation identity and dispatch. Some
+    # schemas normalize relative paths (data/book.xlsx -> /input/data/book.xlsx);
+    # retaining the raw dict here made validation pass while execution received
+    # a different, invalid value.
+    from src.tools.argument_check import validate_tool_arguments
+    argument_error, args = validate_tool_arguments(tool, name, args)
+    if argument_error:
+        return ToolMessage(content=argument_error, tool_call_id=tool_call["id"],
+                           name=name, status="error", artifact={"_tool_outcome": {
+                               "status": "not_run", "reason_code": "invalid_tool_arguments"}})
+    tool_call = {**tool_call, "args": args}
     readonly = is_readonly_call(name, args)
     mode, refs = _recovery_inputs(name, args, owner)
     operation_id, lease = task_events.start_operation(
@@ -645,12 +656,14 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
     # content_and_artifact tools bypass pydantic below (raw_func(**args)), so a
     # wrong keyword would surface as an unactionable TypeError. Check the
     # declared schema first and name the legal parameters.
-    from src.tools.argument_check import check_tool_arguments
-    argument_error = check_tool_arguments(tool, tool_name, args)
+    from src.tools.argument_check import validate_tool_arguments
+    argument_error, normalized_args = validate_tool_arguments(tool, tool_name, args)
     if argument_error:
         return ToolMessage(content=argument_error, tool_call_id=tool_call["id"],
                            name=tool_name, status="error", artifact={"_tool_outcome": {
                                "status": "not_run", "reason_code": "invalid_tool_arguments"}})
+    args = normalized_args
+    tool_call = {**tool_call, "args": args}
 
     # Pure, code-owned extension validation belongs before dispatch as well.
     # This handles JSON configuration semantics that the outer type schema

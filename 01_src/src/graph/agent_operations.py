@@ -1271,7 +1271,19 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
         persisted_artifact["_citrus_execution"].update(
             tool_call_id=str(call.get("id") or ""), logical_key=logical_key, attempt=attempt,
             reused_from_tool_call_id=str(call.get("_reused_from_tool_call_id") or ""))
-        message.artifact = persisted_artifact
+        # The artifact is checkpointed verbatim with the message. Tool functions
+        # do return numpy/pandas scalars, paths and timestamps, and a single
+        # non-native value used to make the whole checkpoint unreadable. Convert
+        # the closed wrapper set here; unknown types are marked and warned, not
+        # silently stringified.
+        from src.core.json_boundary import sanitize_artifact
+        unsupported_types: list[str] = []
+        message.artifact = sanitize_artifact(persisted_artifact, context=f"tool:{name}",
+                                             unknown_log=unsupported_types)
+        if unsupported_types and isinstance(message.artifact, dict):
+            # Keep the honest "not fully encodable" signal: the publisher turns
+            # this into a partial/unknown outcome instead of a clean success.
+            message.artifact["_unsupported_types"] = sorted(set(unsupported_types))
         _record_execution_terminal(call, step, content, artifact_validations)
         return {**step, "artifact_validations": artifact_validations}
     except Exception:

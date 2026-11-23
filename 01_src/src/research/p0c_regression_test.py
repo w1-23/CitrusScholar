@@ -203,15 +203,23 @@ class P0CRegressionTests(unittest.TestCase):
         self.enterContext(patch.object(task_events, 'remaining_seconds', lambda _: 600))
         attempted = []
 
-        def verify(claim, **kwargs):
-            attempted.append(claim['title'])
-            retry = claim['title'] == 'Citation 17' and attempted.count('Citation 17') == 1
-            kwargs['debit']()
-            facts = _facts(errors={'fixture': 'timeout'}) if retry else _facts(claim)
-            return service._project_verification(claim, facts)
+        def lookup(doi):
+            attempted.append(doi)
+            index = int(doi.rsplit('/', 1)[-1])
+            if index == 17 and attempted.count(doi) == 1:
+                return 0, [], 'timeout'
+            return 200, [{'source': 'Crossref', 'doi': doi,
+                          'title': f'Citation {index}', 'year': '2024',
+                          'url': 'https://doi.org/' + doi}], ''
 
-        self.enterContext(patch.object(service, 'verify_record', verify))
-        source = ('doi,title,year\n' + ''.join(f'10.1234/duplicate,Citation {i},2024\n' for i in range(100))).encode()
+        self.enterContext(patch.object(service.lit, '_crossref_work', lookup))
+        self.enterContext(patch.object(service.lit, '_datacite_work',
+                                       side_effect=AssertionError('unnecessary registry')))
+        self.enterContext(patch.object(service.lit, '_crossref_search',
+                                       side_effect=AssertionError('unnecessary search')))
+        self.enterContext(patch.object(service.lit, '_openalex_search',
+                                       side_effect=AssertionError('unnecessary search')))
+        source = ('doi,title,year\n' + ''.join(f'10.1234/{i},Citation {i},2024\n' for i in range(100))).encode()
         audit = service.create_audit(5, 'test', name='input.csv', content=source, request_budget=101)
         audit_id = audit['audit_id']
         journal = []

@@ -44,7 +44,37 @@ def _compact_audit(payload):
         verdict = row.get("verdict") or {}
         compact.update(title=str(claims.get("title") or row.get("citation") or "")[:180],
                        decision=verdict.get("decision", "not_checked"))
+        # The model must be able to write the final short report from this
+        # first response. Returning only field names caused it to re-read large
+        # evidence pages and then overstate a field mismatch as identity match.
+        if verdict:
+            compact["verdict_note"] = str(verdict.get("note") or "")[:240]
+            compact["verdict_identity"] = str(verdict.get("identity") or "")
+            compact["material_differences"] = [
+                {key: str(item.get(key) or "")[:240] for key in
+                 ("field", "submitted", "registered", "reason")}
+                for item in (verdict.get("material_differences") or [])[:5]
+                if isinstance(item, dict)
+            ]
+            compact["benign_variants"] = [
+                {key: str(item.get(key) or "")[:240] for key in
+                 ("field", "variant_type", "explanation")}
+                for item in (verdict.get("benign_variants") or [])[:5]
+                if isinstance(item, dict)
+            ]
+            compact["critical_unknowns"] = [
+                {key: str(item.get(key) or "")[:160] for key in
+                 ("field", "missing_evidence", "reason")}
+                for item in (verdict.get("critical_unknowns") or [])[:5]
+                if isinstance(item, dict)
+            ]
+        for key in ("processing_status", "match_status", "reason"):
+            value = row.get(key)
+            if isinstance(value, str) and 0 < len(value) <= 160:
+                compact[key] = value
         selected = row.get("selected_record") or {}
+        if isinstance(selected.get("title"), str) and selected["title"]:
+            compact["matched_record_title"] = selected["title"][:180]
         submitted_doi = row.get("doi") or claims.get("doi")
         for key, value in (("doi", submitted_doi),
                            ("matched_record_doi", selected.get("doi") if selected.get("doi") != submitted_doi else None),
@@ -53,7 +83,7 @@ def _compact_audit(payload):
             if isinstance(value, str) and 0 < len(value) <= 240:
                 compact[key] = value
         if fields := verdict.get("material_differences"):
-            compact["differing_fields"] = [item["field"] for item in fields[:5]]
+            compact["differing_fields"] = [item.get("field", "") for item in fields[:5]]
         if row.get("status") not in {"metadata_matched", "not_checked"} and row.get("metadata_title"):
             compact["registered_title"] = row["metadata_title"][:180]
         if errors := row.get("errors"):

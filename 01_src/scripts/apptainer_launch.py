@@ -183,11 +183,17 @@ def command(config, role):
     native_runtime = config.get('native_runtime', False)
     if type(native_runtime) is not bool:
         raise ValueError('Invalid native runtime setting')
+    # The release source tree is the single authority for both the application
+    # and the method packages. Without ``packages/`` on PYTHONPATH the image's
+    # site-packages copy shadows a freshly published skill package, so a fixed
+    # reference kernel or audit rule never reaches the running task.
+    python_path = [f'{source}/packages', f'{source}/01_src']
     if skill_release is not None:
         binds.append((str(skill_release), 'ro'))
         result += ['--env', 'CITRUS_SKILL_RELEASE=' + str(skill_release)]
         if (skill_release / 'python').is_dir():
-            result += ['--env', f'PYTHONPATH={skill_release}/python:{source}/01_src']
+            python_path.insert(0, f'{skill_release}/python')
+    result += ['--env', 'PYTHONPATH=' + ':'.join(python_path)]
     if native_runtime:
         if skill_release is None:
             raise ValueError('Native runtime requires a pinned Skill release; an empty method set is supported')

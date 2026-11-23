@@ -7,12 +7,17 @@ import json
 
 _current = contextvars.ContextVar("workspace_preflight_reconciliation", default=None)
 _CODE_REASONS = {
-    "code_write": {"workspace_revision_conflict"},
-    "code_bind_input": {"workspace_revision_conflict", "code_input_source_denied"},
+    "code_workspace": {"workspace_unavailable", "workspace_scope_denied"},
+    "code_write": {"workspace_revision_conflict", "workspace_unavailable",
+                   "workspace_scope_denied"},
+    "code_bind_input": {"workspace_revision_conflict", "code_input_source_denied",
+                        "execution_input_path_required", "workspace_unavailable",
+                        "workspace_scope_denied", "workspace_read_only"},
     "code_execute": {"code_worker_unavailable", "environment_revision_not_found",
                      "execution_base_environment_revision_must_be_1", "environment_selection_scope_mismatch"},
     "code_environment_install": {"code_worker_unavailable", "workspace_revision_conflict",
-                                 "environment_lock_not_bound"},
+                                 "environment_lock_not_bound", "workspace_unavailable",
+                                 "workspace_scope_denied"},
     "code_environment_publish": {"environment_publication_conflict", "environment_execution_not_found",
                                  "environment_successful_installer_required", "environment_base_is_immutable"},
 }

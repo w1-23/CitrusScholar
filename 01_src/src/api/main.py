@@ -2069,7 +2069,8 @@ async def cancel_chat_turn(session_id: str, client_request_id: str, request: Req
         wake.set()
     return JSONResponse(present_turn(turn), headers={"Cache-Control": "no-store"})
 
-
+
+
 @app.post("/api/v2/session/{session_id}/turn-queue/{client_request_id}/reconcile")
 async def reconcile_chat_turn(session_id: str, client_request_id: str,
                               request: Request):
@@ -5111,14 +5112,84 @@ async def session_citations(session_id: str, request: Request):
             # v9.6.3: 不再 LIMIT 10、不再只读 evidence_json。
             # 优先读 cited_refs_json（本轮"按正文过滤 + 重编号"后的引用集，与实时
             # SSE 的 citations 事件同源）；老会话无该列时回退到 evidence_json。
+            columns = {row[1] for row in conn.execute(
+                "PRAGMA table_info(session_evidence)").fetchall()}
+            refs_column = ("references_json" if "references_json" in columns
+                           else "NULL AS references_json")
             rows = conn.execute(
-                "SELECT turn_seq, evidence_json, cited_refs_json FROM session_evidence "
-                "WHERE session_id=? ORDER BY id ASC", (session_id,)).fetchall()
+                f"SELECT turn_seq, evidence_json, cited_refs_json, {refs_column} "
+                "FROM session_evidence WHERE session_id=? ORDER BY id ASC",
+                (session_id,)).fetchall()
     except Exception as e:
         logger.warning(f"[API] session citations failed: {e}")
         return {"session_id": session_id, "groups": groups, "count": 0}
     for r in rows:   # 旧 → 新：编号顺序与回答内首次出现一致
         turn_seq = r["turn_seq"]
+        # v10.20: full reference projection (cited + uncited + web, with roles
+        # and tiers) is persisted as one payload.  It is the only form that can
+        # restore the live sidebar exactly; older rows fall back below.
+        refs_full = None
+        try:
+            if r["references_json"]:
+                refs_full = _json.loads(r["references_json"])
+        except Exception:
+            refs_full = None
+        if (isinstance(refs_full, dict)
+                and (refs_full.get("cited") or refs_full.get("uncited")
+                     or refs_full.get("web_separate"))):
+            for role_key, role in (("cited", "cited"), ("uncited", "candidate")):
+                for e in refs_full.get(role_key) or []:
+                    if not isinstance(e, dict):
+                        continue
+                    src = str(e.get("source") or "rag").strip() or "rag"
+                    group = "rag"
+                    doi = clean_doi(e.get("doi"))
+                    title = str(e.get("title") or "").strip()[:150]
+                    key = (doi or str(e.get("chunk_id") or "") or title).strip()
+                    if not key or key in seen.setdefault(group, set()):
+                        continue
+                    seen[group].add(key)
+                    groups.setdefault(group, []).append({
+                        "ref_id": str(e.get("ref_id") or ""),
+                        "type": "main" if role == "cited" else "candidate",
+                        "role": role,
+                        "source": src,
+                        "doi": doi or "N/A",
+                        "url": "",
+                        "title": title,
+                        "year": str(e.get("year") or ""),
+                        "score": float(e.get("score") or 0),
+                        "chunk_id": str(e.get("chunk_id") or ""),
+                        "text_preview": str(e.get("text_preview") or "")[:250],
+                        "round_seq": turn_seq,
+                    })
+            for e in refs_full.get("web_separate") or []:
+                if not isinstance(e, dict):
+                    continue
+                url = str(e.get("url") or "").strip()
+                tier = str(e.get("tier") or "T3").upper()
+                group = {"T1": "web_t1", "T2": "web_t2"}.get(tier, "web_t3")
+                key = url or str(e.get("title") or "").strip()
+                if not key or key in seen.setdefault(group, set()):
+                    continue
+                seen[group].add(key)
+                groups.setdefault(group, []).append({
+                    "ref_id": str(e.get("ref_id") or ""),
+                    "type": "web",
+                    "role": "cited" if e.get("role") == "cited" else "candidate",
+                    "source": "web",
+                    "doi": "N/A",
+                    "url": url,
+                    "title": str(e.get("title") or e.get("host") or "")[:150],
+                    "year": "",
+                    "score": 0,
+                    "chunk_id": str(e.get("host") or ""),
+                    "text_preview": str(e.get("snippet") or "")[:250],
+                    "tier": tier,
+                    "tier_label": str(e.get("tier_label") or ""),
+                    "round_seq": turn_seq,
+                })
+            continue
         raw = None
         try:
             if r["cited_refs_json"]:

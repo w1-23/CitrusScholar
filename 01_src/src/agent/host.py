@@ -1015,7 +1015,10 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
     local_generations = {generation for item in host.main_results if isinstance(item, dict)
                          if (generation := (item.get("read_entry") or {}).get("generation") or item.get("generation"))}
     capability_runtime["observed_index_generations"] = sorted(local_generations)
+    from src.core.turn_sources import references_data
+    ref_data = references_data(answer, host.main_results, host.web_results)
     return {"query": state["query"], "answer": answer, "gen_time_ms": elapsed,
+        "references_data": ref_data,
         **({"capability_snapshot": capability_snapshot} if capability_snapshot is not None else {}),
         "capability_runtime": capability_runtime,
         "execution_suspension": {},

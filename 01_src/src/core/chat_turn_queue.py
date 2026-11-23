@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -30,6 +31,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from src.core import jobs
+
+logger = logging.getLogger(__name__)
 
 
 QUEUED = "queued"
@@ -1067,6 +1070,14 @@ def begin_settling(*, owner_user_id: int, session_id: str,
         return _reread(conn, owner_user_id, session_id, client_request_id)
 
 
+def _write_terminal_log(view: dict) -> None:
+    try:
+        from src.core.turn_logs import write_turn_log
+        write_turn_log(view)
+    except Exception as exc:  # logging must never alter terminal state
+        logger.warning("turn_txt_log_dispatch_failed kind=%s", type(exc).__name__)
+
+
 def finalize_terminal(*, owner_user_id: int, session_id: str,
                       client_request_id: str, generation: int,
                       history_saved: bool, reason: str = "",
@@ -1089,34 +1100,36 @@ def finalize_terminal(*, owner_user_id: int, session_id: str,
             if (row["history_saved"] == int(history_saved)
                     and (not reason.strip()
                          or existing_reason == reason.strip())):
-                return _with_position(conn, _decode(row))
-            raise TurnStateConflict("terminal_conflict",
-                                    job_id=row["root_job_id"])
-        if row["state"] != SETTLING:
-            raise TurnNotQueued(row["state"], job_id=row["root_job_id"])
-        _check_generation(row, generation)
-        if (row["history_saved"] is not None
-                and bool(row["history_saved"]) != history_saved):
-            raise TurnStateConflict("history_saved_conflict",
-                                    job_id=row["root_job_id"])
-        final_reason = reason.strip() or row["clear_reason"]
-        if not history_saved and not final_reason:
-            raise ValueError(
-                "reason is required when history_saved is false")
-        now = time.time()
-        cursor = conn.execute(
-            "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
-            "history_saved=?, clear_reason=?, finished_at=?, updated_at=? "
-            "WHERE owner_user_id=? AND session_id=? AND client_request_id=? "
-            "AND state=? AND generation=?",
-            (TERMINAL, int(history_saved), final_reason, now, now,
-             owner_user_id, session_id, client_request_id, SETTLING,
-             generation),
-        )
-        if cursor.rowcount != 1:
-            raise TurnQueueNotReady("terminal_lost", job_id=row["root_job_id"])
-        return _reread(conn, owner_user_id, session_id, client_request_id)
-
+                view = _with_position(conn, _decode(row))
+            else:
+                raise TurnStateConflict("terminal_conflict",
+                                        job_id=row["root_job_id"])
+        else:
+            if row["state"] != SETTLING:
+                raise TurnNotQueued(row["state"], job_id=row["root_job_id"])
+            _check_generation(row, generation)
+            if (row["history_saved"] is not None
+                    and bool(row["history_saved"]) != history_saved):
+                raise TurnStateConflict("history_saved_conflict",
+                                        job_id=row["root_job_id"])
+            final_reason = reason.strip() or row["clear_reason"]
+            if not history_saved and not final_reason:
+                raise ValueError("reason is required when history_saved is false")
+            now = time.time()
+            cursor = conn.execute(
+                "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
+                "history_saved=?, clear_reason=?, finished_at=?, updated_at=? "
+                "WHERE owner_user_id=? AND session_id=? AND client_request_id=? "
+                "AND state=? AND generation=?",
+                (TERMINAL, int(history_saved), final_reason, now, now,
+                 owner_user_id, session_id, client_request_id, SETTLING,
+                 generation),
+            )
+            if cursor.rowcount != 1:
+                raise TurnQueueNotReady("terminal_lost", job_id=row["root_job_id"])
+            view = _reread(conn, owner_user_id, session_id, client_request_id)
+    _write_terminal_log(view)
+    return view
 
 def mark_reconcile_required(*, owner_user_id: int, session_id: str,
                             client_request_id: str,
@@ -1176,34 +1189,37 @@ def resolve_reconcile(*, owner_user_id: int, session_id: str,
         if row is None:
             raise TurnNotFound("turn_not_found")
         if row["state"] == TERMINAL:
-            return _with_position(conn, _decode(row))
-        if row["state"] != RECONCILE_REQUIRED:
-            raise TurnStateConflict(row["state"], job_id=row["root_job_id"])
-        expected = row["generation"] if generation is None else generation
-        _check_generation(row, expected)
-        now = time.time()
-        cursor = conn.execute(
-            "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
-            "history_saved=0, clear_reason=?, finished_at=?, updated_at=? "
-            "WHERE owner_user_id=? AND session_id=? AND client_request_id=? "
-            "AND state=? AND generation=?",
-            (TERMINAL, reason.strip(), now, now, owner_user_id, session_id,
-             client_request_id, RECONCILE_REQUIRED, expected),
-        )
-        if cursor.rowcount != 1:
-            raise TurnQueueNotReady("reconcile_lost",
-                                    job_id=row["root_job_id"])
-        job = _require_root_job(conn, row)
-        if job["status"] not in jobs.TERMINAL_STATUS:
-            now_iso = datetime.now().isoformat()
-            conn.execute(
-                "UPDATE task_jobs SET status='failed', "
-                "current_step='reconciled', error=?, updated_at=?, "
-                "finished_at=? WHERE job_id=?",
-                ("outcome_unknown_reconciled", now_iso, now_iso,
-                 row["root_job_id"]),
+            view = _with_position(conn, _decode(row))
+        else:
+            if row["state"] != RECONCILE_REQUIRED:
+                raise TurnStateConflict(row["state"], job_id=row["root_job_id"])
+            expected = row["generation"] if generation is None else generation
+            _check_generation(row, expected)
+            now = time.time()
+            cursor = conn.execute(
+                "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
+                "history_saved=0, clear_reason=?, finished_at=?, updated_at=? "
+                "WHERE owner_user_id=? AND session_id=? AND client_request_id=? "
+                "AND state=? AND generation=?",
+                (TERMINAL, reason.strip(), now, now, owner_user_id, session_id,
+                 client_request_id, RECONCILE_REQUIRED, expected),
             )
-        return _reread(conn, owner_user_id, session_id, client_request_id)
+            if cursor.rowcount != 1:
+                raise TurnQueueNotReady("reconcile_lost",
+                                        job_id=row["root_job_id"])
+            job = _require_root_job(conn, row)
+            if job["status"] not in jobs.TERMINAL_STATUS:
+                now_iso = datetime.now().isoformat()
+                conn.execute(
+                    "UPDATE task_jobs SET status='failed', "
+                    "current_step='reconciled', error=?, updated_at=?, "
+                    "finished_at=? WHERE job_id=?",
+                    ("outcome_unknown_reconciled", now_iso, now_iso,
+                     row["root_job_id"]),
+                )
+            view = _reread(conn, owner_user_id, session_id, client_request_id)
+    _write_terminal_log(view)
+    return view
 
 
 def cancel_queued(*, owner_user_id: int, session_id: str,
@@ -1223,30 +1239,33 @@ def cancel_queued(*, owner_user_id: int, session_id: str,
         if row is None:
             raise TurnNotFound("turn_not_found")
         if row["state"] == TERMINAL:
-            if row["clear_reason"] == CANCELLED_REASON:
-                return _reread(conn, owner_user_id, session_id,
-                               client_request_id)
-            raise TurnNotQueued("terminal", job_id=row["root_job_id"])
-        if row["state"] != QUEUED:
-            raise TurnNotQueued(row["state"], job_id=row["root_job_id"])
-        job = conn.execute("SELECT status FROM task_jobs WHERE job_id=?",
-                           (row["root_job_id"],)).fetchone()
-        if job is not None and job["status"] != QUEUED:
-            raise TurnNotQueued(job["status"], job_id=row["root_job_id"])
-        now = time.time()
-        cursor = conn.execute(
-            "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
-            "clear_reason=?, history_saved=0, finished_at=?, updated_at=? "
-            "WHERE owner_user_id=? AND session_id=? AND client_request_id=? "
-            "AND state=?",
-            (TERMINAL, CANCELLED_REASON, now, now, owner_user_id, session_id,
-             client_request_id, QUEUED),
-        )
-        if cursor.rowcount != 1:
-            raise TurnQueueNotReady("cancel_lost", job_id=row["root_job_id"])
-        jobs.cancel_queued_job(conn, row["root_job_id"],
-                               reason="turn_queue_cancelled")
-        return _reread(conn, owner_user_id, session_id, client_request_id)
+            if row["clear_reason"] != CANCELLED_REASON:
+                raise TurnNotQueued("terminal", job_id=row["root_job_id"])
+            view = _reread(conn, owner_user_id, session_id,
+                           client_request_id)
+        else:
+            if row["state"] != QUEUED:
+                raise TurnNotQueued(row["state"], job_id=row["root_job_id"])
+            job = conn.execute("SELECT status FROM task_jobs WHERE job_id=?",
+                               (row["root_job_id"],)).fetchone()
+            if job is not None and job["status"] != QUEUED:
+                raise TurnNotQueued(job["status"], job_id=row["root_job_id"])
+            now = time.time()
+            cursor = conn.execute(
+                "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
+                "clear_reason=?, history_saved=0, finished_at=?, updated_at=? "
+                "WHERE owner_user_id=? AND session_id=? AND client_request_id=? "
+                "AND state=?",
+                (TERMINAL, CANCELLED_REASON, now, now, owner_user_id, session_id,
+                 client_request_id, QUEUED),
+            )
+            if cursor.rowcount != 1:
+                raise TurnQueueNotReady("cancel_lost", job_id=row["root_job_id"])
+            jobs.cancel_queued_job(conn, row["root_job_id"],
+                                   reason="turn_queue_cancelled")
+            view = _reread(conn, owner_user_id, session_id, client_request_id)
+    _write_terminal_log(view)
+    return view
 
 
 def reject_claim(*, owner_user_id: int, session_id: str,
@@ -1279,7 +1298,9 @@ def reject_claim(*, owner_user_id: int, session_id: str,
             "WHERE owner_user_id=? AND session_id=? AND client_request_id=?",
             (TERMINAL, reason, now, now, owner_user_id, session_id, client_request_id),
         )
-        return _reread(conn, owner_user_id, session_id, client_request_id)
+        view = _reread(conn, owner_user_id, session_id, client_request_id)
+    _write_terminal_log(view)
+    return view
 
 
 # ---------------------------------------------------------------------------

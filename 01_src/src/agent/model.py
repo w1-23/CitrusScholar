@@ -94,8 +94,8 @@ class ModelDriver:
                    else schema for schema in schemas]
 
     async def __call__(self, messages: tuple[BaseMessage, ...],
-                       identity: ExecutionIdentity) -> AIMessage:
-        schemas = self.schemas_for(identity)
+                       identity: ExecutionIdentity, *, native_schemas=(), on_delta=None) -> AIMessage:
+        schemas = [*self.schemas_for(identity), *native_schemas]
         model = self.model
         limit = int(self.output_tokens or getattr(model, "max_tokens", 0) or 4096)
         if self.max_output_tokens is not None:
@@ -106,7 +106,7 @@ class ModelDriver:
         from src.core.task_events import TaskConflict, run_model_attempt
 
         async def invoke():
-            chunk = await stream_llm_response(bound, list(messages), verify_terminal=True)
+            chunk = await stream_llm_response(bound, list(messages), on_text=on_delta, verify_terminal=True)
             return _complete_stream_message(chunk)
 
         try:

@@ -1,0 +1,81 @@
+{
+  "id": "reference-verification",
+  "version": "2.0.2",
+  "path": "skills/reference-verification",
+  "entry": "SKILL.md",
+  "package": "citrus_refcheck",
+  "dependency": "citrusscholar-support[refcheck]==2.0.0",
+  "sha256": "e7c4763c9322d63bf6dfd646b4cae31f31d5db939c1c2e113484b6a91ed98943",
+  "files": [
+    {
+      "path": "PROVENANCE.md",
+      "sha256": "b7cde9604f037076d4a74f2eb38c9e448c4296e1d9515a05ed77b354e2c5367f",
+      "size": 646
+    },
+    {
+      "path": "SKILL.md",
+      "sha256": "44de59cc7e05b558132ad3043bb70c80d3431ac9b288aa45f6e7ded0f9e4eb81",
+      "size": 2237
+    },
+    {
+      "path": "assets/status-vocabulary.json",
+      "sha256": "346b67aa554b72ce97f46c5b030ea265dc2277a438280dba30ad2d7b2497d320",
+      "size": 257
+    },
+    {
+      "path": "references/01-identity-and-evidence.md",
+      "sha256": "3281e3ece773c1a70846de3af949ac59d7da685cc042387c1e0d61f6ebffc5a1",
+      "size": 244
+    },
+    {
+      "path": "references/02-sources-and-routes.md",
+      "sha256": "55f4a2d4909a9c16c1a94ccdfbef191c65ef9e36766dceb695756755b3895a20",
+      "size": 392
+    },
+    {
+      "path": "references/03-source-types.md",
+      "sha256": "8031953809997dd36a46e80f1f98915f7c7be07836254d83e3095c693ed9c1fa",
+      "size": 378
+    },
+    {
+      "path": "references/04-fields-and-differences.md",
+      "sha256": "6c4a7f8f47b1f16b27a5c7f4f0543287e997e86dba35c67d8c5a3056446d2393",
+      "size": 372
+    },
+    {
+      "path": "references/05-batch-cache-resume.md",
+      "sha256": "d2d2c20dd160c7e1c2ce5b80f3d8d7e53a466dca048580d2e5a1c0a0dca6bc94",
+      "size": 610
+    },
+    {
+      "path": "references/06-output-and-export.md",
+      "sha256": "1abbe4c767ee935478c0fc45a4fde172ffa2ab948a808452f2023e90f7d89803",
+      "size": 563
+    },
+    {
+      "path": "scripts/extract.py",
+      "sha256": "bd915886fab938ebb32cf469bbf94c874f5b20cd26bbb1f32d582e79fab20f40",
+      "size": 200
+    },
+    {
+      "path": "scripts/render_report.py",
+      "sha256": "04a7306aab1029d30fec6a377733b383a977a05d374cdb094a4f3b4789a69a44",
+      "size": 199
+    },
+    {
+      "path": "scripts/verify_batch.py",
+      "sha256": "f121216ff80f4a30b1713698fb922b8de10603119080690a78114c3ee29b4386",
+      "size": 198
+    },
+    {
+      "path": "scripts/verify_one.py",
+      "sha256": "a086adb3ca8deb6d12ee51ee40d4dd971f4185be595846c3a5b159080fe0a71d",
+      "size": 199
+    },
+    {
+      "path": "templates/correction-table.md",
+      "sha256": "babf1a2e2784d116337bc9539d806e5fff291f096832812603683ef9509236d5",
+      "size": 114
+    }
+  ]
+}

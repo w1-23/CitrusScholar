@@ -397,7 +397,7 @@ def _tick_label_problems(figure: Any, *, strict_boxes: bool = True) -> list[str]
 
 
 def _fit_declarative_labels(rendered: RenderedFigure, resolved: ResolvedFigure) -> None:
-    """Fit complete categorical labels or refuse; never thin marks or labels."""
+    """Try to fit the complete categorical labels on the fixed canvas."""
     figure = rendered.figure
     panels = resolved.panels or (resolved,)
     categorical_axes = []
@@ -423,6 +423,8 @@ def _fit_declarative_labels(rendered: RenderedFigure, resolved: ResolvedFigure) 
                            for ax in categorical_axes) if not resolved.panels else True
         if not problems and plot_area_ok:
             return
+    if not resolved.qa_profile.get("journal_strict", False):
+        return
     raise SpecError(
         "unreadable_labels",
         "当前画布的完整类别标签重叠或超出边界；未删行、截短标签或隐藏数据。"

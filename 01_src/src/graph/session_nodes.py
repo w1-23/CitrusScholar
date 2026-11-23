@@ -19,7 +19,11 @@ async def load_session_context(state: AgentState) -> dict:
     mode = "general_agent"
     result: dict = {}
     from src.core.progress_bus import emit_encoded
+    from src.core.public_progress import emit_public_progress
+    from src.core.tracing import get_job_id
 
+    if job_id := get_job_id():
+        emit_public_progress("", category="agent_prepare", note_id=f"{job_id}:prepare", job_id=job_id)
     try:
         from src.session.manager import session_manager
         from src.core.context_manager import (ContextManager, build_context_budget,

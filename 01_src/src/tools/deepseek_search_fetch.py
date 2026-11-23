@@ -181,6 +181,7 @@ def _fetch_url(url: str, timeout: float | None = None) -> dict:
 
 
 _MAX_QUERY_CHARS = 128
+DEEPSEEK_SEARCH_URL = "https://api.deepseek.com/v1/tools/search"
 
 
 def _clamp_query(query: str, limit: int = _MAX_QUERY_CHARS) -> tuple[str, bool]:
@@ -202,6 +203,10 @@ def _clamp_query(query: str, limit: int = _MAX_QUERY_CHARS) -> tuple[str, bool]:
             break
     cut = cut.rstrip(" 　,，;；:：-—、")
     return (cut or text[:limit]).strip(), True
+
+
+def _deepseek_search_payload(query: str, count: int, need_content: bool) -> dict:
+    return {"query": query, "ori_question": query, "count": count, "need_content": need_content}
 
 
 def _error_text(response: requests.Response) -> str:
@@ -251,13 +256,9 @@ def deepseek_search(query: str, count: int = 8,
                       "content_size": "high" if need_content else "medium"},
                 timeout=_search_timeout())
         else:
-            payload = {"query": query, "count": count, "need_content": bool(need_content)}
-            # Provider intent hints must not reintroduce the untranslated
-            # question after the fail-closed gate.
-            payload["ori_question"] = query
             response = requests.post(
-                "https://api.deepseek.com/v1/tools/search",
-                headers=_headers(), json=payload, timeout=_search_timeout())
+                DEEPSEEK_SEARCH_URL, headers=_headers(), timeout=_search_timeout(),
+                json=_deepseek_search_payload(query, count, bool(need_content)))
         if response.status_code != 200:
             return _error_text(response), {"web_results": []}
         body = response.json()

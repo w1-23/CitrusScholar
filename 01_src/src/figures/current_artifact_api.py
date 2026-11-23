@@ -246,7 +246,7 @@ def _stored_layout(project):
 
 def audit_current_bytes(*, artifacts, source=None, backend="python",
                         stored_layout=None, mode="initial", supersedes=None,
-                        vendor_root=None):
+                        vendor_root=None, journal_strict=False):
     """Audit exact current bytes; never render, re-export or execute source.
 
     ``stored_layout`` is applied only when its captured artifact digest equals
@@ -272,7 +272,8 @@ def audit_current_bytes(*, artifacts, source=None, backend="python",
             binding = "unbound"
     receipt = run_current_qa(
         artifacts=artifacts, mode=mode, source=source, backend=backend,
-        layout_manifest=layout_manifest, supersedes=supersedes, vendor_root=vendor_root)
+        layout_manifest=layout_manifest, supersedes=supersedes, vendor_root=vendor_root,
+        journal_strict=journal_strict)
     receipt["layout"] = {
         "binding": binding,
         "artifact_sha256": pdf_sha256,
@@ -290,7 +291,7 @@ def audit_current_bytes(*, artifacts, source=None, backend="python",
     return receipt
 
 
-def _capture(project, owner, supersedes):
+def _capture(project, owner, supersedes, *, journal_strict=False):
     exports = project.get("exports_json") or {}
     artifacts, members, bindings = [], {}, []
     checks = ((project.get("manifest_json") or {}).get("render_receipt") or {}).get("checks") or {}
@@ -318,7 +319,7 @@ def _capture(project, owner, supersedes):
         artifacts=artifacts, source=source, backend=backend,
         stored_layout=_stored_layout(project),
         mode="reaudit" if supersedes else "initial",
-        supersedes=supersedes, vendor_root=vendor_root)
+        supersedes=supersedes, vendor_root=vendor_root, journal_strict=journal_strict)
     if vendor_root is None:
         for check in receipt["checks"]:
             if check["reason_code"] == "resource_absent":
@@ -410,7 +411,7 @@ def _bundle(project, receipt, members):
 
 
 def verify_project(figure_id, owner, *, expected_revision, supersedes_file_id=None,
-                   include_bundle=False):
+                   include_bundle=False, journal_strict=False):
     """Run under the API's retained account lease and capacity reservation."""
     from src.core.tracing import get_client_request_id
     from src.research.artifacts import publish_artifact
@@ -423,7 +424,7 @@ def verify_project(figure_id, owner, *, expected_revision, supersedes_file_id=No
         current = (project.get("manifest_json") or {}).get("current_qa_receipt") or {}
         if isinstance(current, dict) and current.get("version") == 2 and current.get("receipt_id") == _receipt_id(current):
             previous = current["receipt_id"]
-    receipt, members, bindings = _capture(project, owner, previous)
+    receipt, members, bindings = _capture(project, owner, previous, journal_strict=journal_strict)
     bundle_blob, manifest = _bundle(project, receipt, members) if include_bundle else (None, None)
     stem = f"figure_{figure_id}_r{expected_revision}_{receipt['receipt_id'][:12]}"
 

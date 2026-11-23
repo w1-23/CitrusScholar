@@ -17,7 +17,7 @@ import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import os
 import re
 import threading
@@ -49,7 +49,7 @@ SOURCE_PRIORITY = (
 )
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 
-_MIN_INTERVAL = {"pubmed": 0.34, "arxiv": 3.0}
+_MIN_INTERVAL = {"pubmed": 0.34, "arxiv": 3.0, "deepseek_search": 0.25}
 _last_call: dict[str, float] = {}
 _rate_lock = threading.Lock()
 
@@ -96,7 +96,7 @@ def bounded_lookup(*, deadline: float, check=None, debit=None):
         _LOOKUP_CONTEXT.reset(token)
 
 
-def _bounded_get(context, url, params, source):
+def _bounded_get(context, url, params, source, *, post_json=None, headers=None):
     started = time.time()
     evidence = {'provider': source, 'url': url, 'query': params or {},
                 'checked_at': started, 'status': 'not_checked'}
@@ -132,8 +132,9 @@ def _bounded_get(context, url, params, source):
             context.debit()  # durable charge before dispatch, including failures
         chunks, size = [], 0
         evidence['status'] = 'dispatched'
-        with httpx.stream('GET', url, params=params, follow_redirects=False,
-                          timeout=min(3.0, remaining), headers=_headers()) as response:
+        method = 'POST' if post_json is not None else 'GET'
+        with httpx.stream(method, url, params=params, json=post_json, follow_redirects=False,
+                          timeout=min(3.0, remaining), headers=headers or _headers()) as response:
             evidence['http_status'] = response.status_code
             if response.status_code != 200:
                 error = '' if response.status_code == 404 else f'http_{response.status_code}'
@@ -360,6 +361,44 @@ def _annotate(record: dict, query: str, doi: str, arxiv_id: str,
                 conflicts.append(f"year:{supplied_year}->{record['year']}")
     record["field_conflicts"] = conflicts
     return record
+
+
+def _deepseek_reference_candidates(query: str):
+    from src.tools.deepseek_search_fetch import (DEEPSEEK_SEARCH_URL, _clamp_query,
+                                                  _deepseek_search_payload, _headers as search_headers)
+
+    context = _LOOKUP_CONTEXT.get()
+    if context is None:
+        raise RuntimeError('bounded_reference_lookup_required')
+    try:
+        headers = search_headers()
+    except RuntimeError:
+        return 0, [], 'search_not_configured'
+    query, _ = _clamp_query(query)
+    status, body, error = _bounded_get(context, DEEPSEEK_SEARCH_URL, None, 'deepseek_search',
+                                      post_json=_deepseek_search_payload(query, 5, False), headers=headers)
+    if status != 200:
+        return status, [], error
+    rows = body.get('results') if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        return 0, [], 'invalid_provider_payload'
+    candidates = []
+    for row in rows[:5]:
+        if not isinstance(row, dict) or not isinstance(row.get('title'), str):
+            continue
+        url = row.get('link') or row.get('url')
+        if not isinstance(url, str) or len(url) > 2048:
+            continue
+        try:
+            target = urlsplit(url)
+            resolver = (target.scheme == 'https' and not target.username and not target.password
+                        and target.hostname in {'doi.org', 'dx.doi.org'})
+        except ValueError:
+            continue
+        doi = normalize_doi(row.get('doi')) or (normalize_doi(target.path[1:]) if resolver else '')
+        if doi:
+            candidates.append({'title': row['title'][:1000], 'doi': doi})
+    return 200, candidates, ''
 
 
 def _web_candidate(query: str, year: str) -> tuple[list[dict], str]:

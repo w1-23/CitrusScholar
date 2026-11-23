@@ -80,7 +80,26 @@ async def _run(state, identity, ledger):
     from src.graph.model_driver import _model_timeout, request_deadline_from_settings
     from src.graph.request_plan import executor_authorizations, merge_task_instructions
 
+    from .checkpoint_store import checkpoint_path, native_checkpoint_path
+    from src.config import PROJECT_ROOT
+    from src.core.provider_protocol import uses_deepseek_protocol
+    from src.core.public_progress import emit_public_progress
+
     started = time.monotonic()
+    if state.get("agent_resume") is True:
+        emit_public_progress("", category="agent_prepare", note_id=f"{identity.run_id}:resume-prepare",
+                             job_id=identity.run_id)
+    provider_scope = (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())
+    state_root = PROJECT_ROOT / "state"
+    resume = state.get("agent_resume") is True
+    native_supported = not uses_deepseek_protocol(provider_scope[1], provider_scope[0])
+    if resume:
+        native = (native_supported
+                  and not checkpoint_path(state_root, identity, provider_scope).is_file()
+                  and native_checkpoint_path(state_root, identity, provider_scope).is_file())
+    else:
+        native = (native_supported and os.getenv("CITRUS_NATIVE_RUNTIME") == "1"
+                  and settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True))
     # A fresh composer request is a new script task, even when the session still
     # carries an older task's assets. Only a durable question child can inherit
     # its parent's scope; same-job recovery restores it from the checkpoint below.
@@ -128,7 +147,9 @@ async def _run(state, identity, ledger):
         host.records.extend(inherited)
     def refresh_allowed():
         host.allowed_names = allowed_presets(state, has_tables=bool(tables), has_pool=pool is not None)
-        host.allowed_names.update({"read_context_evidence", "read_skill", "load_skill"})
+        host.allowed_names.add("read_context_evidence")
+        if not native:
+            host.allowed_names.update({"read_skill", "load_skill"})
         host.allowed_names.update(WORKSPACE_TOOL_NAMES)
         host.allowed_names.update(PLAN_TOOL_NAMES)
         if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
@@ -142,15 +163,19 @@ async def _run(state, identity, ledger):
     refresh_allowed()
     from .skill_adapter import SkillSession, validate_scenario_selection, validate_selected_skills
     from .skill_tools import register_skill_reader, skill_execution_context
-    skills = SkillSession(identity, refresh_allowed)
-    register_skill_reader(catalog)
+    skills = None if native else SkillSession(identity, refresh_allowed)
+    if skills is not None:
+        register_skill_reader(catalog)
     # Host readiness remains independent of method loading; new generic tools
     # registered by the application must not inherit a scientific allowlist.
     loaded = build_loaded_context(state, mode="general_agent", format_hint=state.get("format_hint"))
     human = build_human_message(loaded, retrieval_context=str(state.get("candidate_pool_notice") or "") if pool else "")
+    pinned_skills = []
     try:
         selected_metadata = await asyncio.to_thread(
             validate_scenario_selection, state.get("selected_skills"))
+        if native:
+            pinned_skills = [row["id"] for row in selected_metadata]
     except (OSError, ValueError, KeyError):
         # The API validates its own selection contract. A package becoming
         # unavailable afterwards must not disable this request's other tools.
@@ -174,7 +199,8 @@ async def _run(state, identity, ledger):
                 for image in images if image.get("url")]
         else:
             human.content = str(human.content) + "\n当前主模型不支持图片输入；不可声称已看到原图。"
-    prompt = await asyncio.to_thread(system_prompt, host.allowed_names)
+    prompt = await asyncio.to_thread(system_prompt, host.allowed_names, native_skills=True) if native else (
+        await asyncio.to_thread(system_prompt, host.allowed_names))
     if "local_hybrid_search" in host.allowed_names:
         try:
             from src.retrieval.corpus_registry import load_corpus_registry
@@ -195,6 +221,9 @@ async def _run(state, identity, ledger):
                "资料库类别或追问。可以参考这样的长度和用词：" + intro_example + "。")
     messages, trace_start = assemble_supervisor_messages(prompt, state, human)
     messages = ops._sanitize_history_tool_protocol(messages)
+    if native:
+        messages = messages[1:]
+        trace_start -= 1
     model = get_llm(model=get_deepseek_model(), api_key=settings.RESOLVED_MAIN_API_KEY,
         base_url=settings.RESOLVED_MAIN_BASE_URL, temperature=settings.TEMPERATURE_MAIN,
         max_tokens=settings.MAX_TOKENS, timeout=_model_timeout())
@@ -207,6 +236,8 @@ async def _run(state, identity, ledger):
     async def invoke_scoped(tool, call, current_identity):
         # Skills supply guidance, never tool admission. HostTools and the
         # capability executor retain identity, readiness and operation policy.
+        if skills is None:
+            return await host.invoke(tool, call, current_identity)
         with skill_execution_context(skills):
             return await host.invoke(tool, call, current_identity)
 
@@ -237,7 +268,7 @@ async def _run(state, identity, ledger):
                 "original_request_state": original_request_state, "trace_start": trace_start,
                 "working_assets": deepcopy({key: working[key] for key in asset_fields}),
                 "script_budget_scope": state["script_budget_scope"],
-                "query": state["query"], "skills": skills.export(),
+                "query": state["query"], "skills": skills.export() if skills is not None else None,
                 "update_version": update_version, "final_review": deepcopy(final_review),
                 "artifact_requirements": deepcopy(requirements),
                 "records": host.records,
@@ -286,7 +317,8 @@ async def _run(state, identity, ledger):
             ops._capture_interaction_refs(state, saved.get("messages", []))
         trace_start = int(saved["trace_start"])
         state["query"] = saved["query"]
-        skills.restore(saved.get("skills"))
+        if skills is not None:
+            skills.restore(saved.get("skills"))
         update_version = int(saved.get("update_version", 0))
         requirements = deepcopy(saved["artifact_requirements"]) if "artifact_requirements" in saved else (
             contract_for_explicit_outputs(state["query"]).deliverables)
@@ -318,7 +350,8 @@ async def _run(state, identity, ledger):
         if is_cancelled():
             raise asyncio.CancelledError()
         host.assert_context()
-        await asyncio.to_thread(skills.verify_view, history)
+        if skills is not None:
+            await asyncio.to_thread(skills.verify_view, history)
         _epoch.get().working_state = host.working_state()
 
     async def prepare(_):
@@ -541,33 +574,60 @@ async def _run(state, identity, ledger):
 
     from .batch_journal import BatchJournal, BatchObservationNotStored, RecoveryRequiresReconciliation
     from .checkpoint_store import (CheckpointProtectionError, checkpoint_diagnostic,
-                                   checkpoint_scope, open_checkpoint)
-    from src.config import PROJECT_ROOT
+                                   checkpoint_scope, native_checkpoint_scope,
+                                   open_checkpoint, open_native_checkpoint)
     journal = BatchJournal(identity)
-    from .context_projection import EncryptedContextArchive, WorkingContextProjection
+    from .context_projection import EncryptedContextArchive, WorkingContextProjection, _MeteredSummaryModel
+
     async def context_projected(payload):
         task_events.append_event(identity.run_id, "context_projection", payload)
-    projection = WorkingContextProjection(
-        archive=EncryptedContextArchive(PROJECT_ROOT / "state", identity,
-            (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())),
-        summary_model=model,
-        enabled=bool(settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True)),
-        deadline=deadline, trigger_tokens=settings.CONTEXT_WORKING_SOFT_TOKENS,
-        target_tokens=min(settings.CONTEXT_WORKING_TARGET_TOKENS, settings.CONTEXT_WORKING_SOFT_TOKENS),
-        readback_available="read_context_evidence" in refresh_allowed(),
-        tool_schemas=lambda: driver.schemas_for(identity), on_projection=context_projected)
 
-    async def metered_model(history, current_identity):
+    projection = None
+    native_options = None
+    if native:
+        from .research_skill_catalog import ROOT
+        native_options = {"skill_root": ROOT / "skills", "system_prompt": prompt,
+            "summary_model": _MeteredSummaryModel(transport=model, identity=identity,
+                                                  deadline=deadline, max_attempts=1),
+            "summary_trigger": settings.CONTEXT_WORKING_SOFT_TOKENS,
+            "summary_keep": min(settings.CONTEXT_WORKING_TARGET_TOKENS,
+                                settings.CONTEXT_WORKING_SOFT_TOKENS - 256)}
+    else:
+        projection = WorkingContextProjection(
+            archive=EncryptedContextArchive(state_root, identity, provider_scope),
+            summary_model=model,
+            enabled=bool(settings.CONTEXT_BUDGET_ENABLED and state.get("context_compression", True)),
+            deadline=deadline, trigger_tokens=settings.CONTEXT_WORKING_SOFT_TOKENS,
+            target_tokens=min(settings.CONTEXT_WORKING_TARGET_TOKENS, settings.CONTEXT_WORKING_SOFT_TOKENS),
+            readback_available="read_context_evidence" in refresh_allowed(),
+            tool_schemas=lambda: driver.schemas_for(identity), on_projection=context_projected)
+
+    announced_model_request = False
+
+    async def metered_model(history, current_identity, *, native_schemas=()):
+        nonlocal announced_model_request
         # One schema snapshot for both the send-view estimate and ModelDriver.
         model_allowed.clear()
         model_allowed.update(refresh_allowed())
         # before_model's host_state watermark is already synchronously committed.
         task_events.acknowledge_updates(identity.run_id, update_version)
-        view = await projection.project(history)
-        await asyncio.to_thread(skills.verify_view, view)
-        # ModelDriver's synchronous schema callback consumes this request-local
-        # snapshot; exact hashes are revalidated before every physical proposal.
-        return await driver(view, current_identity)
+        view = history if projection is None else await projection.project(history)
+        if skills is not None:
+            await asyncio.to_thread(skills.verify_view, view)
+        if not announced_model_request:
+            emit_public_progress("", category="agent_model_wait",
+                                 note_id=f"{identity.run_id}:first-model", job_id=identity.run_id)
+            announced_model_request = True
+        if projection is not None:
+            return await driver(view, current_identity)
+        from src.core.public_progress import PublicAnswerPreview
+        preview = PublicAnswerPreview() if not requirements and not host.messages and not resume else None
+        try:
+            return await driver(view, current_identity, native_schemas=native_schemas,
+                                on_delta=preview.append if preview is not None else None)
+        finally:
+            if preview is not None:
+                preview.clear()
 
     async def durable_execute(response, current_identity):
         batch = await journal.execute(response, execute, validate_recovered=host.validate_observation)
@@ -576,7 +636,8 @@ async def _run(state, identity, ledger):
         for call, message in zip(response.tool_calls, batch.messages):
             if message.tool_call_id not in known:
                 host.restore_observation(message)
-            await asyncio.to_thread(skills.observe, message)
+            if skills is not None:
+                await asyncio.to_thread(skills.observe, message)
         return batch
 
     def validate_resume():
@@ -609,21 +670,22 @@ async def _run(state, identity, ledger):
         export_host=export_host, restore_host=restore_host, validate_resume=validate_resume,
         recover_output=True, resolve_execution_waits=resolve_execution_waits,
         acknowledge_execution_waits=acknowledge_execution_waits, record_rejected=rejected)
+    checkpoint_config = (native_checkpoint_scope if native else checkpoint_scope)(identity, provider_scope)
+    checkpoint_open = open_native_checkpoint if native else open_checkpoint
+    lock_identity = (identity.owner_user_id, identity.session_id) if native else identity
     try:
-        with execution_lock(PROJECT_ROOT / "state" / "agent_locks", identity):
-            async with open_checkpoint(PROJECT_ROOT / "state", identity,
-                    (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())) as saver:
-                result = await runtime.run(identity, messages, saver=saver,
-                    resume=state.get("agent_resume") is True,
-                    checkpoint_config=checkpoint_scope(identity, (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())))
+        with execution_lock(state_root / "agent_locks", lock_identity):
+            async with checkpoint_open(state_root, identity, provider_scope) as saver:
+                result = await runtime.run(identity, messages, saver=saver, resume=resume,
+                    checkpoint_config=checkpoint_config, native_options=native_options,
+                    pinned_skills=pinned_skills)
                 if result.status == "suspended" and result.reason == "execution_pending":
                     from .execution_outcome import validate_execution_suspension
                     from .runtime import _pending_calls
                     # Read the latest actual commit while the protected saver is
                     # open. Raw messages may be DeltaChannel fragments; only the
                     # reconstructed Harness result can establish native pairing.
-                    committed = await saver.aget_tuple({"configurable": checkpoint_scope(identity,
-                        (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()))})
+                    committed = await saver.aget_tuple({"configurable": checkpoint_config})
                     values = committed.checkpoint["channel_values"] if committed else {}
                     if (values.get("stop_status") != "suspended"
                             or values.get("stop_reason") != "execution_pending"
@@ -648,7 +710,9 @@ async def _run(state, identity, ledger):
         locations = " -> ".join(f"{frame.name}:{frame.lineno}" for frame in frames[-12:])
         logger.warning("General agent stopped: %s [%s]", type(exc).__name__, locations)
         reason = "execution_error:" + type(exc).__name__
-        if isinstance(exc, (BatchObservationNotStored, RecoveryRequiresReconciliation)):
+        if isinstance(exc, AdmissionStopped):
+            reason = exc.reason
+        elif isinstance(exc, (BatchObservationNotStored, RecoveryRequiresReconciliation)):
             reason = ("recovery_requires_reconciliation"
                       if isinstance(exc, RecoveryRequiresReconciliation) or exc.effects_uncertain
                       else exc.reason)
@@ -665,6 +729,10 @@ async def _run(state, identity, ledger):
         result = RunResult("incomplete", reason,
             latest.messages if latest else tuple(messages), latest.model_steps if latest else 0,
             pending_tool_calls=latest.pending_tool_calls if latest else ())
+    if native:
+        trace_start = next((index for index, message in enumerate(result.messages)
+            if message.additional_kwargs.get("context_origin") == "user"
+            and message.additional_kwargs.get("run_id") == identity.run_id), len(result.messages))
     return await _finish(state, identity, ledger, host, result, trace_start, started,
                          final_review=final_review)
 
@@ -763,12 +831,14 @@ def _verified_turn_delivery(host):
 
 
 async def _finish(state, identity, ledger, host, result, trace_start, started, *, final_review=None):
+    from langchain_core.messages import get_notification_metadata
     from src.core import figures, task_events
     from src.core.progress_bus import emit_answer_start, emit_encoded, emit_text
     from src.core.task_result import build_task_result
     from src.core.turn_outcome import TurnOutcome, completion_digest, reviewed_completion_valid
     from src.graph.agent_operations import _safe_persisted_trace, _sanitize_answer_artifact_links
-    trace = _settled_trace(list(result.messages)[trace_start:], host, result)
+    trace = _settled_trace([message for message in result.messages[trace_start:]
+                            if get_notification_metadata(message) is None], host, result)
     # Candidates and raw JSON envelopes belong only to the protected graph.
     # Session persistence appends the exact accepted public answer once.
     trace = [m for m in trace if not (isinstance(m, AIMessage) and not m.tool_calls)]
@@ -822,6 +892,7 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
             "context_summary_incomplete": "工作摘要输出未完成，原始上下文未被替换。",
             "context_summary_timeout": "工作摘要请求超时，原始上下文未被替换。",
             "checkpoint_recovery_incomplete": "无法安全恢复本轮执行状态，已登记的成果仍可查看。",
+            "native_thread_requires_reconciliation": "此会话的上一轮尚未确认收尾，请先恢复原任务。",
             "context_projection_deadline": "准备工作上下文时达到任务时限。",
             "context_summary_attempt_failed": "工作摘要请求失败，原始上下文未被替换。",
             "model_budget_reserved:finalization": "余量已为最终答复保留，不再发起中间调用。",

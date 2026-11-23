@@ -95,6 +95,99 @@ class P0CRegressionTests(unittest.TestCase):
         uncertain = service._project_verification({**claim, 'year': '2023'}, _facts(first))
         assert uncertain['fields']['year']['reason'] == 'possible_online_print_difference_not_documented'
 
+    def test_parallel_reference_lookup_reuses_requests_and_stops_at_confirmed_identity(self):
+        from contextvars import ContextVar
+        from threading import Barrier, Lock
+        from src import config
+        from src.core import cancel, task_events, tracing
+
+        root = Path(self.enterContext(TemporaryDirectory()))
+        self.enterContext(patch.object(config, 'PROJECT_ROOT', root))
+        self.enterContext(patch.object(service, '_scope', lambda owner, session: None))
+        self.enterContext(patch.object(service, '_lease', lambda owner: nullcontext()))
+        self.enterContext(patch.object(service, '_CACHE', {}))
+        permission = ContextVar('fixture_network_permission', default=False)
+        permission.set(True)
+        self.enterContext(patch.object(tracing, 'web_search_enabled', permission.get))
+        self.enterContext(patch.object(cancel, 'is_cancelled', lambda: False))
+        self.enterContext(patch.object(task_events, 'remaining_seconds', lambda _: 600))
+        first_wave = Barrier(4, timeout=5)
+        lock = Lock()
+        requests = []
+
+        def lookup(doi):
+            assert permission.get()
+            lookup_context = service.lit._LOOKUP_CONTEXT.get()
+            lookup_context.debit()
+            with lock:
+                requests.append(doi)
+                wave = len(requests)
+            if wave <= 4:
+                first_wave.wait()
+            return 200, [{'source': 'Crossref', 'doi': doi, 'title': 'Fixture ' + doi.split('/')[-1]}], ''
+
+        self.enterContext(patch.object(service.lit, '_crossref_work', lookup))
+        self.enterContext(patch.object(service.lit, '_datacite_work', side_effect=AssertionError('unnecessary registry')))
+        self.enterContext(patch.object(service.lit, '_crossref_search', side_effect=AssertionError('unnecessary search')))
+        entries = [{'doi': f'10.1234/{index}', 'title': f'Fixture {index}'} for index in range(9)]
+        entries.append(entries[0].copy())
+        audit = service.create_audit(21, 'parallel-fixture', references=entries, request_budget=9)
+        result = service.run_audit(21, 'parallel-fixture', audit['audit_id'], max_rows=10, time_budget=15)
+
+        assert sorted(requests) == [f'10.1234/{index}' for index in range(9)]
+        assert result['processed_indices'] == list(range(10))
+        assert result['budget']['requests_used'] == 9
+        assert result['terminal']
+        assert result['verdict_counts']['verified'] == 10
+        assert len({row['record_id'] for row in result['rows']}) == 10
+
+    def test_title_lookup_uses_deepseek_metadata_then_checks_registry_identity(self):
+        from contextlib import contextmanager
+        from src.core import tracing
+        from src.tools import deepseek_search_fetch as search
+
+        title = '合成引用题名用于验证原文检索'
+        claims = {'title': title, 'authors': 'Alex Chen', 'year': '2024'}
+        calls = []
+
+        class Response:
+            status_code = 200
+            headers = {'content-type': 'application/json'}
+
+            def iter_bytes(self):
+                yield json.dumps({'results': [{'title': title, 'url': 'https://doi.org/10.1234/title-route',
+                                               'content': 'fixture body must not be used'}]}).encode()
+
+        @contextmanager
+        def transport(method, url, **kwargs):
+            assert (method, url) == ('POST', search.DEEPSEEK_SEARCH_URL)
+            assert kwargs['json'] == {'query': title, 'ori_question': title, 'count': 5, 'need_content': False}
+            assert kwargs['follow_redirects'] is False
+            calls.append('search')
+            yield Response()
+
+        def registry(doi):
+            assert doi == '10.1234/title-route'
+            service.lit._LOOKUP_CONTEXT.get().debit()
+            calls.append('registry')
+            return 200, [{**claims, 'source': 'Crossref', 'doi': doi}], ''
+
+        with (patch.object(tracing, 'web_search_enabled', return_value=True),
+              patch.object(search, '_headers', return_value={'Content-Type': 'application/json'}),
+              patch.object(service.lit.httpx, 'stream', transport),
+              patch.object(service.lit, '_crossref_work', registry),
+              patch.object(service.lit, '_crossref_search', side_effect=AssertionError('unnecessary source')),
+              patch.object(service, '_CACHE', {})):
+            debits = []
+            result = service.verify_record(claims, owner=22, session_id='title-route', debit=lambda: debits.append(True))
+
+        from citrus_refcheck.verdict import project_verdict
+        verdict = project_verdict({'claims': claims}, result, audit_id='fixture')
+        assert calls == ['search', 'registry'] and len(debits) == 2
+        assert verdict['decision'] == 'verified'
+        assert result['metadata_title'] == title
+        assert 'fixture body must not be used' not in json.dumps(result)
+
     def test_100_structured_rows_resume_export_and_receipts(self):
         from src import config
         from src.core import tracing
@@ -128,6 +221,25 @@ class P0CRegressionTests(unittest.TestCase):
             journal.append(_record(step, f'call-{i}'))
         assert step['coverage']['pending'] == 0 and step['coverage']['retryable'] == 1 and not step['terminal']
         assert service.run_audit(5, 'test', audit_id)['processed_indices'] == []
+        from src.research.reference_tools import verify_uploaded_references
+        with patch('src.core.tracing.get_user_id', return_value=5), patch('src.core.tracing.get_session_id', return_value='test'):
+            report = json.loads(verify_uploaded_references.invoke({'audit_id': audit_id}))
+        assert report['audit_status']['ready_for_report']
+        assert report['coverage']['retryable'] == 1 and not report['coverage']['complete']
+        assert report['_tool_outcome']['reason_code'] == 'reference_identity_report_ready_with_source_gaps'
+        assert report['_tool_outcome']['status'] == 'complete'
+        assert report['budget']['requests_used'] == 100
+        report_record = _record(report, 'report')
+        effective = effective_tool_records([*journal, report_record])
+        assert all(row['reason'] == 'cumulative_identity_report_ready' for row in effective[:-2])
+        assert effective[-2]['status'] == 'partial'
+        assert journal[0]['status'] == 'partial'
+        other_report = _record({**report, 'audit_id': 'f' * 32}, 'other-report')
+        assert effective_tool_records([journal[0], other_report])[0]['status'] == 'partial'
+
+        from src.agent.preset_catalog import canonical_tool_schema
+        properties = canonical_tool_schema(verify_uploaded_references)['function']['parameters']['properties']
+        assert not {'allow_web', 'batch_size', 'start_index'} & properties.keys()
         settled = service.run_audit(5, 'test', audit_id, resume=True)
         assert settled['processed_indices'] == [17] and settled['coverage']['complete']
         assert len(attempted) == 101 and settled['budget']['requests_remaining'] == 0
@@ -165,6 +277,26 @@ class P0CRegressionTests(unittest.TestCase):
         assert effective_tool_records([journal[0], _record(other, 'other')])[0]['status'] == 'partial'
         bad_publish = {**step, 'export_status': 'failed'}
         assert effective_tool_records([_record(bad_publish, 'bad'), journal[-1]])[0]['status'] == 'partial'
+
+    def test_compact_reference_batch_reaches_the_model_without_readback(self):
+        from langchain_core.messages import ToolMessage
+        from src.core.tool_result_view import FIRST_DELIVERY_BYTES, content_wire_bytes, first_delivery
+        from src.research.reference_tools import _compact_audit
+
+        payload = {"schema": "reference_audit/2", "audit_id": "a" * 32,
+                   "coverage": {"total": 10, "pending": 0, "retryable": 1}, "rows": [
+                       {"record_id": f"ref-{index}", "record_index": index, "status": "metadata_matched",
+                        "claims": {"title": "A long bibliographic title with authors and necessary distinguishing information " +
+                                  str(index)},
+                        "source_url": f"https://doi.org/10.1234/fixture-{index}", "provider": "Crossref"}
+                       for index in range(10)]}
+        compact = _compact_audit(payload)
+        content = json.dumps(compact, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        assert content_wire_bytes(content) > FIRST_DELIVERY_BYTES
+        message = ToolMessage(content=content, tool_call_id="audit", name="verify_uploaded_references")
+        assert first_delivery(message, call={"args": {"operation": "run"}}, reader_available=True) is message
+        assert [row["record_index"] for row in compact["rows"]] == list(range(10))
+        assert compact["next_offset"] is None
 
     def test_catalog_installs_new_tool_contracts(self):
         from src.agent.preset_catalog import _PRESETS, _load, _read_manifest

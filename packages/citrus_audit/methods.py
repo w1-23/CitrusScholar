@@ -523,6 +523,7 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
         receipt['actual'] = sorted(k for k,r in receipts.items() if r['tested'])
         receipt['gap'] = sorted(k for k in chosen if receipts[k]['status'] != 'executed')
         receipt['findings_omitted'] = sum(r.get('findings_omitted', 0) for r in receipts.values())
+        receipt['rules'] = dict(receipts)
         return findings, issue_rows
     # Invalid requested configuration remains invalid even when no rows exist.
     # Unrequested rules neither validate nor execute their configurations.

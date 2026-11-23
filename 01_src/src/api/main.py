@@ -2864,13 +2864,22 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             jobs_mod.save_terminal_snapshot(
                 job_id, done_payload.get("turn_envelope") or {})
 
-        async def commit_failed_terminal(safe_error, *, current_step="incomplete",
-                                         error=""):
-            return await _commit_failed_terminal(
-                commit_terminal, session_id=sid, job_id=job_id,
-                safe_error=safe_error, tool_status=get_request_journal(),
-                elapsed_ms=int((time.perf_counter() - t0) * 1000),
-                current_step=current_step, error=error)
+        async def commit_failed_terminal(safe_error, *, current_step="incomplete", error=""):
+            from src.core.task_events import TaskConflict
+            from src.core.turn_envelope import build_turn_envelope
+
+            envelope = build_turn_envelope(tool_status=get_request_journal(),
+                job_status="failed", stop_reason="graph_processing_error", notices=[safe_error])
+            done_payload = {"session_id": sid, "job_id": job_id, "answer": "",
+                "notice": safe_error, "history_saved": False, "turn_status": envelope.display_status,
+                "turn_envelope": envelope.as_dict(), "artifact_ids": list(envelope.artifact_ids),
+                "total_elapsed_ms": int((time.perf_counter() - t0) * 1000)}
+            try:
+                await commit_terminal(done_payload, status="failed", current_step=current_step,
+                                      error=error, stop_reason="graph_processing_error")
+            except TaskConflict as conflict:
+                return conflict
+            return None
 
         async def flush_bridge() -> None:
             # v9.2 P4 根治: 确定性排空替代时序补丁（原 done 前 sleep(0.5) 与
@@ -3153,7 +3162,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"[SSE v2] graph processing error: {e}")
+                logger.error("[SSE v2] graph processing error kind=%s", type(e).__name__)
                 model_unconfigured = not bool(settings.RESOLVED_MAIN_API_KEY)
                 safe_error = ("主模型尚未配置，请联系管理员配置模型后重试。附件仍可在资料库中查看。"
                               if model_unconfigured else "处理请求时发生内部错误，请稍后重试")
@@ -3173,7 +3182,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                     # graph exception cannot leave an active/finalizing execution
                     # segment behind.
                     deferred = await commit_failed_terminal(
-                        safe_error, current_step="incomplete", error=str(e)[:500])
+                        safe_error, current_step="incomplete", error=type(e).__name__)
                     if deferred is None:
                         try:
                             from src.admin_audit import finish_request
@@ -3200,13 +3209,13 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                 pass
                 try:
                     from src.core.business_logger import blog
-                    blog("request_error", err=str(e)[:200])
+                    blog("request_error", err=type(e).__name__)
                 except Exception:
                     pass
                 # v8.13: 结构化诊断事件（请求失败快照）
                 try:
                     from src.core.diag import diag
-                    diag("request_error", err=type(e).__name__, msg=str(e)[:200])
+                    diag("request_error", err=type(e).__name__)
                 except Exception:
                     pass
             finally:

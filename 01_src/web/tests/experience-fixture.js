@@ -15,6 +15,7 @@
   window.experienceRequests = () => ({posts: state().posts || [], imports: state().imports || [], saves: state().saves || [],
     exports: state().exports || [], updates: state().updates || [], lookups: state().lookups || []});
   window.experienceUpdateMode = (mode, hold = false) => save({updateMode: mode, lookupHeld: hold});
+  window.experienceApplyUpdates = () => save({appliedVersion: 1 + Object.keys(state().receipts || {}).length});
   window.experienceQueueAvailability = available => save({queueUnavailable: !available});
   window.experienceStep = phase => save({phase, start: phase === 'start' ? Date.now() / 1000 - 10 : start()});
   window.experienceScale = (turns, files) => save({turns, files});
@@ -111,15 +112,17 @@
       save({lookups: [...(state().lookups || []), id]});
       const receipt = (state().receipts || {})[id];
       status = state().lookupHeld ? 503 : receipt ? 200 : 404;
-      body = status === 200 ? receipt : {};
+      body = status === 200 ? {...receipt, status: receipt.version <= (state().appliedVersion || 0) ? 'applied' : 'pending'} : {};
     } else if (p === '/api/v2/chat/jobs/' + job + '/updates' && settings?.method === 'POST') {
       const payload = JSON.parse(settings.body);
       const receipts = state().receipts || {};
       save({updates: [...(state().updates || []), payload]});
-      if (state().updateMode === 'conflict') status = 409;
-      else {
+      if (state().updateMode === 'conflict') {
+        status = 409;
+        body = {detail: {code: 'task_version_conflict'}};
+      } else {
         const id = payload.update_request_id;
-        body = receipts[id] || {version: 2 + Object.keys(receipts).length, instruction: payload.instruction};
+        body = receipts[id] || {job_id: job, version: 2 + Object.keys(receipts).length, status: 'pending'};
         save({receipts: {...receipts, [id]: body}});
         if (state().updateMode === 'lost') throw new TypeError('Fixture dropped update receipt');
       }
@@ -147,7 +150,8 @@
       const events = frames(), after = +(url.searchParams.get('after') || 0);
       body = {job_id: job, protocol: 'citrus-task/1', status: has('done') ? 'completed' : 'running',
         terminal_snapshot: envelope(), context_snapshot: events.filter(x => x.event === 'context_snapshot').at(-1)?.data,
-        task_version: 1 + Object.keys(state().receipts || {}).length,
+        task_version: 1 + Object.keys(state().receipts || {}).length, applied_version: state().appliedVersion || 0,
+        pending_updates: Object.values(state().receipts || {}).filter(receipt => receipt.version > (state().appliedVersion || 0)),
         event_cursor: events.length, next_cursor: events.length, has_more: false, events: events.filter(x => x.seq > after)};
       if (body.context_snapshot) body.context_snapshot = {...body.context_snapshot, seq: events.filter(x => x.event === 'context_snapshot').at(-1).seq};
     }

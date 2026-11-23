@@ -18,12 +18,19 @@ def validate_nature_receipt(manifest: dict, *, pdf: bytes | None = None) -> dict
         "pdf_text": {"pass", "warn"},
         "pdf_collisions": {"pass", "warn"},
     }
+    policy = receipt.get("policy")
+    ordinary = isinstance(policy, dict) and policy.get("journal_strict") is False
+    statuses = {"pass", "warn", "review_required"}
+    if ordinary:
+        statuses.update({"fail", "not_auditable"})
+        for states in allowed.values():
+            states.update({"fail", "not_auditable"})
     if not isinstance(checks, dict) or any(
         not isinstance(checks.get(name), dict) or checks[name].get("status") not in states
         for name, states in allowed.items()
     ):
         raise ValueError("Nature 图件检查失败或无法审计；保留诊断，未发布图件。")
-    if receipt.get("status") not in {"pass", "warn", "review_required"}:
+    if receipt.get("status") not in statuses:
         raise ValueError("Nature 图件检查总状态无效。")
     digest = receipt.get("pdf_sha256")
     if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
@@ -74,13 +81,18 @@ def accept_current_render_qa(manifest: dict, blobs: dict[str, bytes], mode: str)
                              "sha256": hashlib.sha256(blob).hexdigest()}:
             reject()
     pdf = measured["pdf"]
+    policy = receipt.get("policy") or {}
+    panel = next(check for check in checks if check.get("check") == "panel_alignment")
+    no_layout = (layout is None and policy.get("journal_strict") is False
+                 and panel.get("executed") == "not_run" and panel.get("conclusion") == "undetermined"
+                 and panel.get("reason_code") == "bound_layout_absent" and panel.get("artifact") is None)
     digest = pdf.get("sha256")
     if (not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
             or type(pdf.get("size")) is not int or pdf["size"] <= 0
             or ("pdf" not in blobs and pdf.get("role") != "internal_qa")
-            or not isinstance(layout, dict) or layout.get("artifact_sha256") != digest
-            or layout.get("capture") != "pdf_draw_event" or layout.get("rerendered") is not False
-            or not isinstance(layout.get("layout"), dict)):
+            or (not no_layout and (not isinstance(layout, dict) or layout.get("artifact_sha256") != digest
+                or layout.get("capture") != "pdf_draw_event" or layout.get("rerendered") is not False
+                or not isinstance(layout.get("layout"), dict)))):
         reject()
     if mode == "initial" and (manifest.get("nature_skill_receipt") or {}).get("pdf_sha256") != digest:
         reject()
@@ -93,7 +105,8 @@ def accept_current_render_qa(manifest: dict, blobs: dict[str, bytes], mode: str)
         artifact = check.get("artifact")
         if (check.get("executed") not in {"not_run", "attempted", "executed"}
                 or check.get("conclusion") not in {"pass", "warn", "fail", "not_applicable", "undetermined"}
-                or (name in {"panel_alignment", "pdf_text", "pdf_collisions"} and artifact != pdf)
+                or (name in {"pdf_text", "pdf_collisions"} and artifact != pdf)
+                or (name == "panel_alignment" and not no_layout and artifact != pdf)
                 or (name == "svg_schematic" and artifact != measured.get("svg"))
                 or (name == "visual" and check.get("executed") != "not_run")):
             reject()

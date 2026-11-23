@@ -146,6 +146,7 @@ class SandboxJob:
     image_sha256: str = ""
     output_contract: dict[str, Any] = field(default_factory=dict)
     output_key: str = ""
+    expected_frozen_receipt: dict[str, Any] | None = None
 
     def as_json(self) -> str:
         from .script_outputs import input_contract_for_target
@@ -171,6 +172,8 @@ class SandboxJob:
             "output_contract": self.output_contract,
             "output_key": self.output_key,
             **({"input_contract": typed} if typed else {}),
+            **({"expected_frozen_receipt": self.expected_frozen_receipt}
+               if self.expected_frozen_receipt is not None else {}),
         }, ensure_ascii=False)
 
 
@@ -789,6 +792,9 @@ def _script_diagnostic(value: Any) -> dict:
     line = value.get("line")
     if type(line) is int and 0 < line <= MAX_SCRIPT_BYTES:
         result["line"] = line
+    column = value.get("column")
+    if type(column) is int and 0 < column <= MAX_SCRIPT_BYTES:
+        result["column"] = column
     if code == "input_type_mismatch" and value["stage"] == "render":
         parameter, actual = value.get("parameter"), value.get("actual")
         if (isinstance(parameter, str) and re.fullmatch(r"data\[(?:'[_a-zA-Z][_a-zA-Z0-9]{0,63}'|\?)\]", parameter)

@@ -100,7 +100,7 @@ function browser() {
   new Element().appendChild(get('ctxBar'));
   const context = {console, document, AbortController, AbortSignal, DOMException, TextDecoder, URLSearchParams, navigator: {},
     marked: {Renderer: class {}, parse: text => '<p>' + String(text) + '</p>'},
-    URL: {revokeObjectURL() {}}, FileReader: class { readAsDataURL() { if (this.onload) this.onload(); } },
+    URL: class extends URL { static revokeObjectURL() {} }, FileReader: class { readAsDataURL() { if (this.onload) this.onload(); } },
     localStorage: storage(), sessionStorage: storage(), history: {replaceState() {}},
     location: {search: '', hash: '', pathname: '/'}, performance: {now: () => 10},
     setTimeout: (fn, ms) => { timers.set(++timerId, {fn, ms: ms || 0}); return timerId; },
@@ -112,7 +112,7 @@ function browser() {
     fetch: (url, opts) => { const req = {url, opts: opts || {}, settled: false, ...deferred()}; requests.push(req); return req.promise; }};
   context.window = context;
   vm.createContext(context);
-  for (const file of ['task-state.js', 'task-transport.js', 'task-cards.js', 'task-controls.js', 'app.js']) {
+  for (const file of ['task-state.js', 'task-transport.js', 'task-cards.js', 'task-controls.js', 'app.js', 'corpus_reader.js']) {
     vm.runInContext(readFileSync(join(__dirname, '../assets', file), 'utf8'), context, {filename: file});
   }
   context.currentAccount = {user_id: 'test', username: 'test'};
@@ -212,8 +212,7 @@ test('a queued turn reports its position and only follows the job after dispatch
   assert.equal(b.requests.filter(r => r.url.includes('/updates')).length, 0);
 });
 
-test('sending while a turn runs queues behind it and never posts an implicit update', async () => {
-  const b = browser();
+async function startRunningTurn(b) {
   b.userInput.value = '第一条';
   await b.context.sendMsg();
   await flush();
@@ -224,23 +223,79 @@ test('sending while a turn runs queues behind it and never posts an implicit upd
   b.respond(r => r.url.includes('/jobs/root-1/events'), {job_id: 'root-1', protocol: 'citrus-task/1',
     events: [{seq: 1, event: 'job', data: {job_id: 'root-1', status: 'running'}}], next_cursor: 1, has_more: false});
   await flush();
-  b.respond(r => r.url === '/jobs/root-1', {job_id: 'root-1', status: 'running', event_cursor: 1});
+  b.respond(r => r.url === '/jobs/root-1', {job_id: 'root-1', status: 'running', event_cursor: 1, task_version: 3});
   await flush();
 
+  return b.context.activeTurnComposer;
+}
+
+function clickComposerMode(b) {
+  b.get('composer-new-message').listeners.click[0]();
+}
+
+test('the composer targets the executing job and shows receipt separately from application', async () => {
+  const b = browser();
+  const binding = await startRunningTurn(b);
+  assert.equal(b.get('composer-new-message').textContent, '作为新任务');
+  assert.match(b.get('composer-task-target').textContent, /第一条.*任务版本 3/);
+  assert.equal(b.get('composer-task-target').title, 'root-1');
+  assert.equal(b.chatContainer.querySelector('.task-update-toggle'), null);
+  assert.equal(b.get('input-tools-menu').hidden, true);
+  b.userInput.value = '先核对数据单位';
+  const submitted = b.context.sendMsg();
+  await flush();
+  const update = b.last(r => r.opts.method === 'POST' && r.url.endsWith('/updates'));
+  assert.equal(update.url, '/api/v2/chat/jobs/root-1/updates');
+  assert.deepEqual(JSON.parse(update.opts.body), {
+    update_request_id: JSON.parse(update.opts.body).update_request_id,
+    expected_version: 3, instruction: '先核对数据单位'
+  });
+  assert.equal(b.requests.filter(r => r.opts.method === 'POST' && r.url.endsWith('/turn-queue')).length, 1);
+  b.respond(r => r === update, {job_id: 'root-1', version: 4, status: 'pending'});
+  await submitted;
+  const status = b.chatContainer.querySelector('.task-control-status');
+  assert.match(status.textContent, /已接收第 4 版补充，等待应用/);
+  assert.equal(b.userInput.value, '');
+  assert.match(b.get('composer-task-target').textContent, /任务版本 4/);
+  binding.store.receive('task_update', {job_id: 'root-1', version: 4, status: 'applied'});
+  assert.match(status.textContent, /已应用第 4 版/);
+  assert.equal(b.context.sessionStorage.getItem(b.context.composerDraftKey('root-1') + '.received'), null);
+});
+
+test('the new-task override queues the draft with its attachments, Skills, and browse choice', async () => {
+  const b = browser();
+  await startRunningTurn(b);
   b.userInput.value = '第二条';
+  clickComposerMode(b);
+  assert.equal(b.userInput.value, '第二条');
+  assert.equal(b.get('input-tools-menu').hidden, false);
+  assert.equal(b.get('composer-new-message').textContent, '补充当前任务');
+  b.context._selectedAccountFileRefs.push({file_id: 'stored-file', name: 'data.csv'});
+  b.get('browse-requested').checked = true;
+  const skills = {items: [{id: 's1', version: '2', digest: 'digest'}]};
+  let acknowledged;
+  b.context.skillPicker = {capture: () => acknowledged ? {items: []} : skills,
+    acknowledge: selection => { acknowledged = selection; }};
   await b.context.sendMsg();
   await flush();
   const posts = b.requests.filter(r => r.opts.method === 'POST');
   assert.equal(posts.length, 2);
   const second = posts[posts.length - 1];
   assert.equal(second.url, '/api/v2/session/session/turn-queue');
-  assert.equal(JSON.parse(second.opts.body).query, '第二条');
+  const payload = JSON.parse(second.opts.body);
+  assert.equal(payload.query, '第二条');
+  assert.deepEqual(payload.file_refs, ['stored-file']);
+  assert.deepEqual(payload.selected_skills, skills.items);
+  assert.equal(payload.browse_requested, true);
   assert.equal(b.requests.filter(r => r.url.includes('/updates')).length, 0);
   const secondId = JSON.parse(second.opts.body).client_request_id;
   b.respond(r => r.opts.method === 'POST' && JSON.parse(r.opts.body).client_request_id === secondId,
     turnEntry({client_request_id: secondId, job_id: 'root-2', state: 'queued', queue_position: 2}), 202);
   await flush();
   assert.equal(b.chatContainer.querySelectorAll('[data-request-id]').filter(n => n.dataset.requestId === secondId).length > 0, true);
+  assert.equal(acknowledged, skills);
+  assert.equal(b.get('composer-task-target').title, 'root-1');
+  assert.equal(b.get('composer-new-message').textContent, '作为新任务');
 });
 
 test('admissions are serialized so queue order matches send order', async () => {
@@ -357,34 +412,34 @@ test('a pending question leaves the ordinary send available for the next turn', 
   assert.equal(b.userInput.value, '');
 });
 
-test('the explicit task card reuses the composer and reconciles a lost update using its original ID', async () => {
-  const b = browser();
+function observedTask(b, job, transport, taskVersion = 1) {
   const store = b.context.CitrusTaskState.create({});
-  store.hydrate({job_id: 'job-update', status: 'running', task_version: 1});
-  const posts = [], lookups = [];
+  store.hydrate({job_id: job, status: 'running', task_version: taskVersion});
   const container = new Element('div');
   const controls = b.context.CitrusTaskControls.create({container, store, owns: () => true,
-    onUpdate: b.context.openComposerSupplement, isUpdateSelected: b.context.isSupplementSelected,
-    readDraft: b.context.readSupplementDraft,
-    transport: {
-      post: async (job, path, payload) => {
-        posts.push([job, path, {...payload}]);
-        if (posts.length === 1) throw new TypeError('lost response');
-        return {version: 2};
-      },
-      lookupUpdate: async (job, id) => { lookups.push([job, id]); throw Object.assign(new Error('not found'), {status: 404}); },
-      refresh: async () => ({job_id: 'job-update', status: 'running'}), stop() {}
-    }});
-  b.userInput.value = '先保留新消息';
-  assert.equal(container.querySelector('.task-update-input'), null);
-  container.querySelector('.task-update-toggle').onclick();
-  assert.equal(b.userInput.value, '');
+    readDraft: b.context.readSupplementDraft, onReconcile: b.context.reconcileSupplement,
+    onChange: b.context.selectActiveTurn, transport: {refresh: async () => {}, ...transport}});
+  b.context.registerTurnBinding({query: job, store, controls, owns: () => true});
+  return {store, controls};
+}
+
+test('a lost update reuses its ID and preserves edits made since the first submission', async () => {
+  const b = browser(), job = 'job-update';
+  const posts = [], lookups = [];
+  const {store, controls} = observedTask(b, job, {
+    post: async (target, path, payload) => {
+      posts.push([target, path, {...payload}]);
+      if (posts.length === 1) throw new TypeError('lost response');
+      return {job_id: job, version: 2, status: 'pending'};
+    },
+    lookupUpdate: async (target, id) => { lookups.push([target, id]); throw Object.assign(new Error('not found'), {status: 404}); }
+  });
   b.userInput.value = '换一个角度补充';
   await b.context.sendMsg();
   assert.equal(b.userInput.value, '换一个角度补充');
   assert.equal(posts.length, 1);
-  const [job, path, payload] = posts[0];
-  assert.equal(job, 'job-update');
+  const [target, path, payload] = posts[0];
+  assert.equal(target, job);
   assert.equal(path, 'updates');
   assert.equal(payload.expected_version, 1);
   assert.equal(payload.instruction, '换一个角度补充');
@@ -395,12 +450,146 @@ test('the explicit task card reuses the composer and reconciles a lost update us
   assert.deepEqual(lookups, [[job, payload.update_request_id], [job, payload.update_request_id]]);
   assert.deepEqual(posts[1], posts[0]);
   assert.equal(b.userInput.value, '核对期间的另一份补充草稿');
-  assert.equal(b.context.readSupplementDraft(job).pending, null);
+  assert.equal(b.context.composerDraft(b.context.composerDraftKey(job)).pending, null);
   store.hydrate({job_id: job, terminal_snapshot: {display_status: 'partial'}});
-  b.context.refreshTaskComposer();
-  assert.equal(b.userInput.value, '先保留新消息');
-  assert.equal(controls.element.querySelector('.task-update-recovery').hidden, false);
+  assert.equal(b.userInput.value, '核对期间的另一份补充草稿');
+  const recovered = controls.element.querySelector('.task-update-recovery');
+  assert.equal(recovered.hidden, false);
+  assert.match(recovered.textContent, /第 2 版 · 换一个角度补充/);
   assert.equal(b.requests.filter(request => request.opts.method === 'POST').length, 0);
+});
+
+test('terminal rejection leaves the draft pinned until the user opts into a new task', async () => {
+  const b = browser(), job = 'ending-job', response = deferred();
+  const {store} = observedTask(b, job, {post: () => response.promise});
+  b.userInput.value = '任务结束时的草稿';
+  const sending = b.context.sendMsg();
+  const otherPosts = [];
+  observedTask(b, 'next-in-line', {post: (...args) => { otherPosts.push(args); }});
+  store.hydrate({job_id: job, terminal_snapshot: {display_status: 'completed'}});
+  response.reject(Object.assign(new Error('closed'), {status: 409, detail: {code: 'task_not_running'}}));
+  await sending;
+  assert.equal(b.get('composer-task-target').title, job);
+  assert.equal(b.get('send-btn').disabled, true);
+  assert.equal(b.userInput.value, '任务结束时的草稿');
+  await b.context.sendMsg();
+  assert.equal(otherPosts.length, 0);
+  assert.equal(b.requests.filter(r => r.opts.method === 'POST').length, 0);
+  clickComposerMode(b);
+  assert.equal(b.userInput.value, '任务结束时的草稿');
+  await b.context.sendMsg();
+  await flush();
+  const post = b.last(r => r.opts.method === 'POST');
+  assert.equal(JSON.parse(post.opts.body).query, '任务结束时的草稿');
+  assert.equal(post.url, '/api/v2/session/session/turn-queue');
+});
+
+test('a receipt arriving after terminal keeps the submitted text recoverable until application is known', async () => {
+  const b = browser(), job = 'late-receipt', response = deferred();
+  const {store, controls} = observedTask(b, job, {post: () => response.promise});
+  b.userInput.value = '保留到确认应用为止';
+  const sending = b.context.sendMsg();
+  store.hydrate({job_id: job, terminal_snapshot: {display_status: 'cancelled'}});
+  response.resolve({job_id: job, version: 2, status: 'pending'});
+  await sending;
+  assert.equal(b.userInput.value, '');
+  assert.match(controls.element.querySelector('.task-control-status').textContent, /已接收第 2 版补充，应用状态待确认/);
+  assert.match(controls.element.querySelector('.task-update-recovery').textContent, /第 2 版 · 保留到确认应用为止/);
+  b.context.composerDrafts.clear();
+  controls.render(store.state);
+  assert.match(controls.element.querySelector('.task-update-recovery').textContent, /保留到确认应用为止/);
+  store.receive('task_update', {job_id: job, version: 2, status: 'not_applied'});
+  assert.match(controls.element.querySelector('.task-control-status').textContent, /第 2 版调整未应用/);
+  assert.equal(controls.element.querySelector('.task-update-recovery').hidden, false);
+});
+
+test('restoring an active task looks up an unresolved receipt without posting again', async () => {
+  const b = browser(), job = 'restored-update', id = 'update-original';
+  const key = b.context.composerDraftKey(job);
+  b.context.sessionStorage.setItem(key, '原先的草稿');
+  b.context.sessionStorage.setItem(key + '.update', JSON.stringify({text: '原先的草稿',
+    payload: {update_request_id: id, expected_version: 1, instruction: '原先的草稿'}}));
+  const lookups = [];
+  observedTask(b, job, {post: () => assert.fail('lookup must never post'), lookupUpdate: async (...args) => {
+    lookups.push(args);
+    return {job_id: job, version: 2, status: 'applied'};
+  }});
+  await flush();
+  assert.deepEqual(lookups, [[job, id]]);
+  assert.equal(b.userInput.value, '');
+  assert.equal(b.context.sessionStorage.getItem(key + '.update'), null);
+});
+
+test('a stale version preserves the draft and resubmission uses the refreshed version', async () => {
+  const b = browser(), job = 'versioned-job';
+  const versions = [];
+  const {store} = observedTask(b, job, {post: async (_job, _path, payload) => {
+    versions.push(payload.expected_version);
+    if (versions.length === 1) throw Object.assign(new Error('conflict'), {status: 409, detail: {code: 'task_version_conflict'}});
+    return {job_id: job, version: 7, status: 'applied'};
+  }, refresh: async () => store.hydrate({job_id: job, task_version: 6})});
+  b.userInput.value = '版本冲突时的草稿';
+  await b.context.sendMsg();
+  assert.equal(b.userInput.value, '版本冲突时的草稿');
+  assert.match(b.get('composer-task-target').textContent, /任务版本 6/);
+  assert.match(b.get('composer-task-status').textContent, /草稿已保留/);
+  await b.context.sendMsg();
+  assert.deepEqual(versions, [1, 6]);
+  assert.equal(b.userInput.value, '');
+});
+
+test('answer UI renders API-marked final chunks, honors reset, and accepts a terminal answer', async () => {
+  const b = browser();
+  const {store} = await startRunningTurn(b);
+  const answer = b.chatContainer.querySelector('.turn-answer');
+  store.receive('answer_start', {private: true});
+  store.receive('text', {content: 'unmarked'});
+  await b.runTimers();
+  assert.equal(answer.textContent, '');
+  store.receive('answer_start', {});
+  store.receive('text', {content: 'private', visibility: 'internal'});
+  store.receive('text', {content: 'First '});
+  await b.runTimers();
+  assert.equal(answer.textContent, 'First ');
+  store.receive('text', {content: 'second'});
+  await b.runTimers();
+  assert.equal(answer.textContent, 'First second');
+  store.receive('text_reset', {});
+  assert.equal(answer.textContent, '');
+  store.receive('text', {content: 'stale chunk'});
+  store.receive('done', {answer: 'Server final', turn_envelope: {display_status: 'completed'}});
+  store.receive('answer_start', {});
+  store.receive('text', {content: 'late chunk'});
+  await b.runTimers();
+  assert.equal(answer.style.display, '');
+  assert.equal(answer.textContent, 'Server final');
+  assert.doesNotMatch(answer.textContent, /stale|private/);
+});
+
+test('turn sources are collapsed and deduplicated by record, URL, DOI, and shared version', async () => {
+  const b = browser(), bubble = new Element('div');
+  b.chatContainer.appendChild(bubble);
+  const reader = b.context.CitrusCorpusReader;
+  reader.attachTurnSources(bubble, 'sources-request');
+  const sharedRef = {document_id: 'shared-doc', version_id: 'v1', index_generation: 'g1'};
+  b.respond('/turn-sources?', {sources: [
+    {kind: 'local', record_key: 'paper_1', origin: 'history', title: 'old local duplicate'},
+    {kind: 'local', record_key: 'paper_1', origin: 'current', doi: '10.1000/ORIGINAL', title: 'current local'},
+    {kind: 'web', url: 'https://doi.org/10.1000/original', title: 'DOI duplicate'},
+    {kind: 'web', url: 'https://example.org/paper#section', title: 'web source'},
+    {kind: 'web', origin: 'history', url: 'https://example.org/paper', title: 'URL duplicate'},
+    {kind: 'web', url: 'javascript:alert(1)', title: 'invalid URL'},
+    {kind: 'shared', read_ref: sharedRef, title: 'shared version'},
+    {kind: 'shared', read_ref: {...sharedRef, start: 100}, title: 'shared duplicate'}
+  ]});
+  await flush();
+  const panel = bubble.querySelector('.cr-turn-sources');
+  assert.equal(panel.tagName, 'DETAILS');
+  assert.equal(panel.open, false);
+  assert.equal(panel.querySelector('summary').textContent, '候选来源（3）');
+  assert.deepEqual(panel.querySelectorAll('.cr-ts-chip').map(chip => chip.textContent), ['shared version', 'current local', 'web source']);
+  reader.attachTurnSources(bubble, 'sources-request');
+  assert.equal(b.requests.filter(r => r.url.includes('/turn-sources?')).length, 1);
 });
 
 test('history groups the latest continuation under its original user turn', () => {

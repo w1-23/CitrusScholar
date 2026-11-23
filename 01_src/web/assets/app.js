@@ -1176,6 +1176,8 @@ var composerDraftPrefix = 'citrus.composer.';
 var composerDrafts = new Map();
 var composerSelections = new Map();
 var composerSupplement = null;
+var composerNewTaskJob = '';
+var composerTaskViewDisposing = false;
 var queueSyncUnavailable = false;
 var browseCheckbox = document.getElementById('browse-requested');
 
@@ -1186,14 +1188,15 @@ function composerDraftKey(jobId) {
 
 function composerDraft(key) {
   if (!composerDrafts.has(key)) {
-    var text = '', pending = null;
+    var text = '', pending = null, received = {};
     try {
       if (key) {
         text = sessionStorage.getItem(key) || '';
         pending = JSON.parse(sessionStorage.getItem(key + '.update') || 'null');
+        received = JSON.parse(sessionStorage.getItem(key + '.received') || 'null') || {};
       }
     } catch (_) {}
-    composerDrafts.set(key, {text: text, revision: 0, pending: pending});
+    composerDrafts.set(key, {text: text, revision: 0, pending: pending, received: received});
   }
   return composerDrafts.get(key);
 }
@@ -1218,12 +1221,20 @@ function savePendingUpdate(key, pending) {
   } catch (_) {}
 }
 
+function saveReceivedUpdates(key, received) {
+  try {
+    if (Object.keys(received).length) sessionStorage.setItem(key + '.received', JSON.stringify(received));
+    else sessionStorage.removeItem(key + '.received');
+  } catch (_) {}
+}
+
 function saveComposerInput() {
   writeComposerDraft(composerSupplement ? composerSupplement.key : composerDraftKey(), userInput.value);
 }
 
 function clearComposerDrafts() {
   composerSupplement = null;
+  composerNewTaskJob = '';
   composerDrafts.clear();
   composerSelections.clear();
   queueSyncUnavailable = false;
@@ -1263,12 +1274,24 @@ function restoreComposerSession(preserve) {
   renderAttachmentSelection();
 }
 
-function readSupplementDraft(jobId) {
-  return jobId ? composerDraft(composerDraftKey(jobId)) : null;
-}
-
-function isSupplementSelected(store) {
-  return !!composerSupplement && composerSupplement.controller.store === store && composerSupplement.jobId === store.state.job_id;
+function readSupplementDraft(state) {
+  var key = composerDraftKey(state.job_id);
+  if (!key || !state.job_id) return null;
+  var draft = composerDraft(key), received = draft.received;
+  var unapplied = [], pruned = false;
+  var terminal = CitrusTaskState.isTerminal(state);
+  Object.keys(received).forEach(function (version) {
+    var notApplied = state.not_applied_updates.some(function (item) { return item.version === Number(version); });
+    if (!notApplied && Number(version) <= state.applied_version) {
+      delete received[version];
+      pruned = true;
+    } else if (terminal) {
+      unapplied.push('第 ' + version + ' 版 · ' + received[version]);
+    }
+  });
+  if (pruned) saveReceivedUpdates(key, received);
+  if (!terminal) return null;
+  return {text: [draft.text].concat(unapplied).filter(Boolean).join('\n\n'), pending: draft.pending};
 }
 
 function leaveComposerSupplement() {
@@ -1280,21 +1303,48 @@ function leaveComposerSupplement() {
   return previous;
 }
 
-function openComposerSupplement(controller) {
-  if (!controller.canUpdate()) return;
-  var jobId = controller.store.state.job_id, key = composerDraftKey(jobId);
+function activeSupplementBinding() {
+  var binding = activeTurnComposer;
+  return !composerTaskViewDisposing && binding && binding.owns() && !binding.stopping &&
+    (!binding.queueEntry || ['settling', 'terminal'].indexOf(binding.queueEntry.state) < 0) &&
+    binding.controls && binding.controls.acceptsUpdates &&
+    binding.controls.acceptsUpdates() ? binding : null;
+}
+
+function selectComposerSupplement(binding) {
+  var jobId = binding.store.state.job_id, key = composerDraftKey(jobId);
   if (!key) return;
-  if (!isSupplementSelected(controller.store)) {
-    saveComposerInput();
-    var previous = composerSupplement;
-    composerSupplement = {controller: controller, jobId: jobId, key: key, epoch: authEpoch};
-    userInput.value = readSupplementDraft(jobId).text;
-    if (previous) previous.controller.render(previous.controller.store.state);
-    controller.render(controller.store.state);
+  saveComposerInput();
+  composerSupplement = {controller: binding.controls, jobId: jobId, key: key, epoch: authEpoch,
+    label: String(binding.query || '').replace(/\s+/g, ' ').trim().slice(0, 48) || jobId};
+  var draft = composerDraft(key);
+  userInput.value = draft.text;
+  if (draft.pending) {
+    var target = composerSupplement;
+    Promise.resolve().then(function () {
+      if (composerSupplement === target) return settleComposerUpdate(target, 'lookup');
+    });
   }
-  refreshTaskComposer();
-  userInput.focus();
-  if (composerDraft(key).pending && !controller.isBusy()) void settleComposerUpdate(composerSupplement, 'lookup');
+}
+
+function composerHasNewTaskOptions() {
+  return !!(_selectedAttachments.length || window._selectedAccountFileRefs.length ||
+    browseCheckbox && browseCheckbox.checked || skillPicker && skillPicker.capture().items.length);
+}
+
+function useNewTaskComposer(moveDraft) {
+  var binding = activeSupplementBinding();
+  composerNewTaskJob = binding ? binding.store.state.job_id : '';
+  var previous = leaveComposerSupplement();
+  if (previous && moveDraft && !userInput.value) {
+    var draft = composerDraft(previous.key);
+    if (!draft.pending && !previous.controller.isBusy()) {
+      userInput.value = draft.text;
+      writeComposerDraft(previous.key, '');
+      saveComposerInput();
+    }
+  }
+  if (previous && previous.controller.owns()) previous.controller.render(previous.controller.store.state);
 }
 
 function reconcileSupplement(controller) {
@@ -1304,11 +1354,12 @@ function reconcileSupplement(controller) {
 
 function submitComposerSupplement() {
   var target = composerSupplement, controller = target.controller;
-  if (controller.isBusy() || controller.store.state.job_id !== target.jobId) return;
+  if (!controller.owns() || controller.isBusy() || controller.store.state.job_id !== target.jobId) return;
   saveComposerInput();
-  var draft = composerDraft(target.key);
-  if (draft.pending) return settleComposerUpdate(target, controller.canUpdate() ? 'retry' : 'lookup');
-  if (!controller.canUpdate() || !draft.text.trim()) return;
+  var draft = composerDraft(target.key), binding = activeSupplementBinding();
+  var canSend = binding && binding.controls === controller && binding.store.state.job_id === target.jobId;
+  if (draft.pending) return settleComposerUpdate(target, canSend ? 'retry' : 'lookup');
+  if (!canSend || !draft.text.trim()) return;
   var requestId = 'update-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
   savePendingUpdate(target.key, {text: draft.text, payload: {update_request_id: requestId,
     expected_version: controller.store.state.task_version, instruction: draft.text.trim()}});
@@ -1319,11 +1370,18 @@ async function settleComposerUpdate(target, action) {
   var controller = target.controller;
   var draft = composerDraft(target.key), pending = draft.pending;
   if (!pending || controller.isBusy() || controller.store.state.job_id !== target.jobId) return;
-  var outcome = await controller.submitUpdate(pending.payload, action);
+  var outcome = await controller.submitUpdate(pending.payload, action, function () {
+    var binding = activeSupplementBinding();
+    return composerSupplement === target && binding && binding.controls === controller && binding.store.state.job_id === target.jobId;
+  });
   if (outcome === 'pending' || target.epoch !== authEpoch || draft.pending !== pending) return;
   if (composerSupplement && composerSupplement.key === target.key) saveComposerInput();
+  if (outcome.version && outcome.status !== 'applied' && (outcome.status !== 'not_applied' || draft.text !== pending.text)) {
+    draft.received[outcome.version] = pending.text;
+    saveReceivedUpdates(target.key, draft.received);
+  }
   savePendingUpdate(target.key, null);
-  if (outcome === 'accepted' && draft.text === pending.text) {
+  if (outcome.version && outcome.status !== 'not_applied' && draft.text === pending.text) {
     writeComposerDraft(target.key, '');
     if (composerSupplement && composerSupplement.key === target.key) userInput.value = '';
   }
@@ -1333,8 +1391,14 @@ async function settleComposerUpdate(target, action) {
 
 var newMessageModeButton = document.getElementById('composer-new-message');
 if (newMessageModeButton) newMessageModeButton.addEventListener('click', function () {
-  var previous = leaveComposerSupplement();
-  if (previous) previous.controller.render(previous.controller.store.state);
+  if (composerSupplement) useNewTaskComposer(true);
+  else {
+    var binding = activeSupplementBinding();
+    if (binding) {
+      composerNewTaskJob = '';
+      selectComposerSupplement(binding);
+    }
+  }
   refreshTaskComposer();
   userInput.focus();
 });
@@ -2580,6 +2644,8 @@ function findTurnQueueEntry(turns, requestId) {
 
 // Retire observers and view controls only. Navigation never sends cancellation.
 function disposeTaskView() {
+  composerTaskViewDisposing = true;
+  composerNewTaskJob = '';
   leaveComposerSupplement();
   historyRestoreVersion += 1;
   abortHistoryRequests();
@@ -2599,6 +2665,7 @@ function disposeTaskView() {
   var permission = document.getElementById('permission-card');
   if (permission) permission.remove();
   _pendingPermission = null;
+  composerTaskViewDisposing = false;
   refreshTaskComposer();
 }
 
@@ -2666,15 +2733,28 @@ function unregisterTurnBinding(binding) {
 }
 
 function refreshTaskComposer() {
-  if (composerSupplement) {
-    var targetController = composerSupplement.controller;
-    var targetState = targetController.store.state;
-    if (!targetController.owns() || targetState.job_id !== composerSupplement.jobId || CitrusTaskState.isTerminal(targetState)) leaveComposerSupplement();
+  var available = activeSupplementBinding();
+  var activeJob = available ? available.store.state.job_id : '';
+  var currentTarget = composerSupplement && available && composerSupplement.controller === available.controls && composerSupplement.jobId === activeJob;
+  if (composerSupplement && !currentTarget && !userInput.value && !composerDraft(composerSupplement.key).pending) leaveComposerSupplement();
+  if (!composerSupplement && activeJob && composerNewTaskJob !== activeJob) {
+    if (userInput.value || composerHasNewTaskOptions()) composerNewTaskJob = activeJob;
+    else {
+      selectComposerSupplement(available);
+      currentTarget = !!composerSupplement;
+    }
   }
   var supplement = composerSupplement;
   var pendingUpdate = supplement && composerDraft(supplement.key).pending;
+  var targetReachable = supplement && supplement.controller.owns() && supplement.controller.store.state.job_id === supplement.jobId;
   var mode = document.getElementById('composer-supplement');
-  if (mode) mode.hidden = !supplement;
+  if (mode) mode.hidden = !supplement && !activeJob;
+  var target = document.getElementById('composer-task-target');
+  if (target) {
+    target.textContent = supplement ? '补充任务 · ' + supplement.label + (targetReachable ? ' · 任务版本 ' + supplement.controller.store.state.task_version : '') : '作为新任务发送';
+    target.title = supplement ? supplement.jobId : '';
+  }
+  if (newMessageModeButton) newMessageModeButton.textContent = supplement ? '作为新任务' : '补充当前任务';
   ['composer-browse', 'input-tools-menu', 'attachment-list', 'selected-skills'].forEach(function (id) {
     var element = document.getElementById(id);
     if (!element) return;
@@ -2693,9 +2773,9 @@ function refreshTaskComposer() {
   var composerHasAttachments = !!((_selectedAttachments && _selectedAttachments.length) ||
     (window._selectedAccountFileRefs && window._selectedAccountFileRefs.length));
   if (button) {
-    button.disabled = !!historyRequest || !!(supplement && (supplement.controller.isBusy() || !pendingUpdate && !supplement.controller.canUpdate()));
+    button.disabled = !!historyRequest || !!(supplement && (supplement.controller.isBusy() || !(currentTarget || pendingUpdate && targetReachable)));
     button.style.display = composerHasText || pendingUpdate ? 'flex' : 'none';
-    var sendLabel = pendingUpdate ? '核对并重试上次补充' : supplement ? '提交补充' : '发送消息';
+    var sendLabel = pendingUpdate ? (currentTarget ? '核对并重试上次补充' : '核对上次补充') : supplement ? '提交补充' : '发送消息';
     button.title = sendLabel + ' (Enter)';
     button.setAttribute('aria-label', sendLabel);
   }
@@ -2706,7 +2786,7 @@ function refreshTaskComposer() {
   if (userInput) {
     if (supplement) userInput.maxLength = 8000;
     else userInput.removeAttribute('maxlength');
-    userInput.placeholder = supplement ? '补充本轮要求（仅正文）' : awaitingQuestion
+    userInput.placeholder = supplement ? '给此任务补充要求（仅正文）' : awaitingQuestion
       ? '可发送新消息，答复请使用选择卡片'
       : executing ? '有新要求？发送后会排在当前任务之后'
       : queued ? '可继续发送，消息会按发送顺序排队'
@@ -2719,8 +2799,9 @@ function refreshTaskComposer() {
     userInput.parentNode.appendChild(hint);
   }
   if (hint) {
-    hint.textContent = supplement ? (supplement.controller.updateNotice() ||
-      (supplement.controller.isBusy() ? '正在处理补充…' : pendingUpdate ? '上次补充的提交状态待确认。' : supplement.controller.canUpdate() ? '补充仅发送给选中的任务。' : '当前任务暂时无法接收补充。'))
+    hint.textContent = supplement ? (supplement.controller.isBusy() ? '正在提交或核对补充…'
+      : !currentTarget && !pendingUpdate ? '此任务当前无法接收补充。草稿已保留，可选择「作为新任务」。'
+      : supplement.controller.updateNotice() || (pendingUpdate ? '上次补充的接收状态待确认。' : '附件、场景和联网选项可用于新任务。'))
       : queueSyncUnavailable ? '队列状态待同步。可刷新重试。'
       : _composerNotice && (composerHasText || composerHasAttachments) ? _composerNotice
       : !composerHasText && composerHasAttachments ? '已选择附件；请填写正文后再发送。'
@@ -4266,6 +4347,7 @@ function toolStatusText(status, reason) {
     some_material_unreviewed: '部分材料未能检查',
     fields_unavailable: '读取字段不存在；请使用 JSON Pointer 路径（如 /rows）',
     result_fields_unavailable: '所选字段不可读，可改用原文分页', result_fields_invalid: '请选择更少的字段',
+    result_fields_missing: '已返回可用字段，部分字段不存在', result_json_invalid: '回执格式不支持字段读取，可按原文查看',
     result_read_range: '请调整起始位置或缩小单页范围', result_page_too_large: '请缩小原文页或字段范围',
     result_access_denied: '回执读取权限未通过', result_unavailable: '当前会话没有可读取的回执原文',
     result_integrity_failed: '回执原文未通过完整性校验', result_storage_unavailable: '暂时无法读取回执存储',
@@ -4293,7 +4375,7 @@ function toolStatusText(status, reason) {
   return '未完成' + reasonText;
 }
 
-async function sendMsg(isFollowUp) {
+async function sendMsg() {
   if (!currentAccount || !sessionId || accountDocumentRetired || historyRequest) return;
   if (composerSupplement) return submitComposerSupplement();
   var epoch = authEpoch, requestSessionId = sessionId;
@@ -4301,7 +4383,6 @@ async function sendMsg(isFollowUp) {
   function ownsControls() {
     return ownsTurn() && !!activeTurnComposer && activeTurnComposer.requestId === clientRequestId;
   }
-  if (isFollowUp === undefined) isFollowUp = false;
   var sendBtnEl = document.getElementById('send-btn');
   if (sendBtnEl && sendBtnEl.disabled) return;
   var rawDraft = String(userInput.value || '');
@@ -4498,7 +4579,6 @@ async function sendMsg(isFollowUp) {
   var fullText = '';
   var isAnswerStarted = false;
   var isFinalAnswerArmed = false;
-  var preAnswerText = '';
   var renderPending = false;
   var hasTerminalEvent = false;
   var snapshotOnly = false;
@@ -4509,10 +4589,10 @@ async function sendMsg(isFollowUp) {
     onError: function () { if (ownsTurn()) { _turnDisconnected = true; syncWaiting(); } }
   });
   var taskControls = CitrusTaskControls.create({container: botContent, store: taskStore, transport: taskTransport, owns: ownsTurn,
-    onUpdate: openComposerSupplement, isUpdateSelected: isSupplementSelected, readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
+    readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
     onChange: function () { if (ownsControls() || composerSupplement && composerSupplement.controller.store === taskStore) refreshTaskComposer(); }});
   var myBinding = {
-    requestId: clientRequestId, sessionId: requestSessionId, owns: ownsTurn,
+    requestId: clientRequestId, sessionId: requestSessionId, owns: ownsTurn, query: query,
     store: taskStore, controls: taskControls, cancel: stopCurrentTurn,
     stopping: false, following: false, queueEntry: null,
     dispose: function (reason) { stopCurrentTurn(reason || 'switch'); },
@@ -4658,7 +4738,11 @@ async function sendMsg(isFollowUp) {
     }
   }
 
-  function handleSendFollowUp(q) { userInput.value = q; sendMsg(true); }
+  function handleSendFollowUp(q) {
+    useNewTaskComposer(false);
+    userInput.value = q;
+    sendMsg();
+  }
 
   function showBanner(msg) {
     if (!ownsControls()) return;
@@ -4677,16 +4761,43 @@ async function sendMsg(isFollowUp) {
     showBanner._t = setTimeout(function () { b.style.display = 'none'; }, 8000);
   }
 
+  function attachAnswerSources() {
+    if (window.CitrusCorpusReader && window.CitrusCorpusReader.attachTurnSources) {
+      window.CitrusCorpusReader.attachTurnSources(botMessage, clientRequestId);
+    }
+  }
+
   function handleEvent(type, data) {
     if (!ownsTurn()) return;
     processPanel.receive(type, data);
     renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
+    if (type === 'agent_recovery' && data.status === 'admitted') {
+      hasTerminalEvent = false; snapshotOnly = false; fullText = '';
+      isFinalAnswerArmed = false; isAnswerStarted = false;
+    }
+    if (type === 'answer_start' || type === 'text' || type === 'text_reset') {
+      if ((hasTerminalEvent && !snapshotOnly) || !isPublicAnswerEvent(data)) return;
+      if (type === 'answer_start') isFinalAnswerArmed = true;
+      if (type === 'text_reset') {
+        isFinalAnswerArmed = false; isAnswerStarted = false; fullText = '';
+        answerDiv.replaceChildren(); answerDiv.style.display = 'none';
+      }
+      if (type === 'text' && isFinalAnswerArmed && typeof data.content === 'string') {
+        if (!isAnswerStarted && data.content.trim()) {
+          isAnswerStarted = true; clearTimeout(spinnerTimeout);
+          var executionStart = queueEntry && !queueEntry.active_child_job_id && Number(queueEntry.started_at);
+          _firstTokenElapsedMs = executionStart > 0 ? Math.max(0, Date.now() - executionStart * 1000) : null;
+          if (ownsControls()) mascotSay('generating');
+          answerDiv.style.display = '';
+        }
+        fullText += data.content;
+        renderAnswer();
+      }
+      return;
+    }
     // Retired rounds may finish replaying into their own DOM. They cannot
     // release the composer, alter context usage, permissions or the sidebar.
     if (!ownsControls()) {
-      if (type === 'answer_start') isFinalAnswerArmed = true;
-      if (type === 'text' && isFinalAnswerArmed) { fullText += data.content || ''; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText); }
-      if (type === 'text_reset') { fullText = ''; isFinalAnswerArmed = false; answerDiv.innerHTML = ''; }
       if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
         applyTurnEnvelope(data); hasTerminalEvent = true; clearTimeout(spinnerTimeout); finishStatus();
         if (data.answer) {
@@ -4694,6 +4805,7 @@ async function sendMsg(isFollowUp) {
           if (String(data.answer).trim()) processPanel.answerVisible();
         }
         loadTurnGeneratedFiles(data);
+        attachAnswerSources();
       }
       return;
     }
@@ -4718,31 +4830,6 @@ async function sendMsg(isFollowUp) {
       case 'tool_result':
       case 'agent_switch':
       case 'assistant_progress': break; // Public content is projected once above.
-      case 'answer_start':
-        isFinalAnswerArmed = true;
-        break;
-      case 'text':
-        if (!isFinalAnswerArmed) {
-          // Compatibility buffer for an old-style tool-round stream. New
-          // backend never sends text before answer_start.
-          preAnswerText += data.content;
-          break;
-        }
-        if (!isAnswerStarted && String(data.content || '').trim()) {
-          var executionStart = queueEntry && !queueEntry.active_child_job_id && Number(queueEntry.started_at);
-          _firstTokenElapsedMs = executionStart > 0 ? Math.max(0, Date.now() - executionStart * 1000) : null;
-          isAnswerStarted=true; clearTimeout(spinnerTimeout); mascotSay('generating');
-          // The first visible answer chunk collapses the trace independently
-          // of the authoritative task status; users can reopen it at any time.
-          answerDiv.style.display='';
-        }
-        fullText+=data.content; renderAnswer(); break;
-      case 'text_reset':
-        // A1: 工具轮里的临时增量不是回答——作废已上屏文本；该轮内容随后由
-        // assistant_progress 作为工作说明进入执行时间线。
-        isFinalAnswerArmed = false; isAnswerStarted = false;
-        if (fullText || preAnswerText) { fullText=''; preAnswerText=''; renderAnswer(); }
-        break;
       case 'draft':
         // v8.17.15: 草稿全链删除——后端不再推送 draft 事件，忽略（防御残留）
         break;
@@ -4962,7 +5049,7 @@ async function sendMsg(isFollowUp) {
         if (fullText.indexOf('__NEED_COMPLEX__')>=0) {
           var uc=document.createElement('div');uc.style.cssText='margin-top:12px;text-align:center';
           var ub=document.createElement('button');ub.className='need-complex-btn';ub.textContent='继续深入检索';
-          ub.onclick=function(){userInput.value=currentQuery;sendMsg()};
+          ub.onclick=function(){handleSendFollowUp(query)};
           uc.appendChild(ub);botContent.appendChild(uc);
         }
         if (_firstTokenElapsedMs != null) botContent.appendChild(createElapsedBadge(_firstTokenElapsedMs));
@@ -4972,9 +5059,7 @@ async function sendMsg(isFollowUp) {
         loadTurnGeneratedFiles(data);
         // v8.10: 回答完整生成后才显示 👍/👎 反馈栏（主流时序）
         appendFeedback(answerDiv.closest('.message'));
-        if (window.CitrusCorpusReader && typeof window.CitrusCorpusReader.attachTurnSources === 'function') {
-          window.CitrusCorpusReader.attachTurnSources(botMessage || botContent.closest('.message'), clientRequestId);
-        }
+        attachAnswerSources();
         setSendDisabled(false);userInput.focus();break;
       case 'error':
         snapshotOnly = false;
@@ -5128,7 +5213,7 @@ async function sendMsg(isFollowUp) {
     var observer = queueEntry && observeQueuedJob(queueEntry);
     if (!observer || queueFollowedJobId === observer) return;
     if (queueFollowedJobId) {
-      fullText = ''; preAnswerText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
+      fullText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
       hasTerminalEvent = false; snapshotOnly = false;
     }
     queueFollowedJobId = observer;
@@ -5184,7 +5269,10 @@ async function sendMsg(isFollowUp) {
         renderAttachmentSelection();
       }
       if (window.turnRail && window.turnRail.addPending && entry.job_id) window.turnRail.addPending(clientRequestId, query);
+      if (currentRoundId === requestRoundId && composerNewTaskJob && !composerSupplement &&
+          !userInput.value && !composerHasNewTaskOptions()) composerNewTaskJob = '';
     }
+    refreshTaskComposer();
     renderQueueStatus();
     maybeFollowObserver();
     syncWaiting();
@@ -5318,7 +5406,7 @@ async function sendMsg(isFollowUp) {
 
   function streamOnce() {
     if (!ownsTurn()) return;
-    fullText = ''; preAnswerText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
+    fullText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
     renderPending = false; _turnDisconnected = false; _turnDisplayStatus = ''; _turnEnvelope = null;
     answerDiv.style.display = ''; answerDiv.innerHTML = '';
     deliveryDiv.hidden = true; deliveryDiv.replaceChildren();
@@ -6227,10 +6315,14 @@ function projectHistoryTrace(process, trace) {
   });
 }
 
+function isPublicAnswerEvent(data) {
+  return data.private !== true && data.internal !== true && ['private', 'internal'].indexOf(data.visibility) < 0;
+}
+
 function bindHistoryTask(turn, content, answer, process, ownsContext, useComposer) {
   var epoch = authEpoch, sid = sessionId, round = currentRoundId, armed = false, streamedAnswer = '', closed = false;
   var binding = null, entry = turn.queueEntry, queuePoll = null, observed = '', queueStatus, disconnected = false;
-  var hasSavedAnswer = !!String(turn.answer && turn.answer.content || '').trim();
+  var hasSavedAnswer = !!String(turn.answer && turn.answer.content || '').trim(), finalAnswerReceived = false;
   function syncWaiting() {
     process.syncTask(store.state, entry, {hasAnswer: hasSavedAnswer || !!streamedAnswer.trim(),
       disconnected: disconnected, stopping: !!(binding && binding.stopping)});
@@ -6295,16 +6387,28 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (!owns()) return;
     process.receive(type, data);
     renderArtifactDelivery(content, store.state.artifact_delivery);
-    if (type === 'agent_recovery' && data.status === 'admitted') answer.dataset.displayStatus = '';
+    if (type === 'agent_recovery' && data.status === 'admitted') {
+      answer.dataset.displayStatus = '';
+      finalAnswerReceived = false; armed = false; streamedAnswer = '';
+    }
     if (type.indexOf('context_') === 0 || data.context_snapshot) projectContext();
-    if (type === 'answer_start') armed = true;
-    if (type === 'text' && armed) { streamedAnswer += data.content || ''; if (!turn.answer || !turn.answer.content) answer.innerHTML = renderMarkdownSafe(streamedAnswer); }
-    if (type === 'text_reset') { armed = false; streamedAnswer = ''; if (!turn.answer || !turn.answer.content) answer.innerHTML = ''; }
+    if (!finalAnswerReceived && isPublicAnswerEvent(data)) {
+      if (type === 'answer_start') armed = true;
+      if (type === 'text' && armed && typeof data.content === 'string') {
+        streamedAnswer += data.content;
+        if (!hasSavedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer);
+      }
+      if (type === 'text_reset') {
+        armed = false; streamedAnswer = '';
+        if (!hasSavedAnswer) answer.replaceChildren();
+      }
+    }
     if ((type === 'done' || type === 'error') && data.answer) {
       answer.innerHTML = renderMarkdownSafe(data.answer);
       if (String(data.answer).trim()) process.answerVisible();
     }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
+      finalAnswerReceived = true;
       process.terminal(CitrusTaskState.displayStatus(data));
       answer.dataset.displayStatus = CitrusTaskState.displayStatus(data);
       if (Array.isArray(data.artifact_ids) && window.loadSessionFiles) window.loadSessionFiles().then(function (payload) {
@@ -6318,7 +6422,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
   var transport = CitrusTaskTransport.create({store: store, fetch: accountFetch, owns: owns, onSnapshot: snapshot,
     onError: function () { if (owns()) { disconnected = true; syncWaiting(); } }});
   var controls = CitrusTaskControls.create({container: content, store: store, transport: transport, owns: owns,
-    onUpdate: openComposerSupplement, isUpdateSelected: isSupplementSelected, readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
+    readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
     onChange: function() {
       if (binding) reconcileControls();
       else if (composerSupplement && composerSupplement.controller.store === store) refreshTaskComposer();
@@ -6329,6 +6433,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     artifact_delivery: turn.artifactDelivery, question: turn.question, context_snapshot: turn.contextSnapshot});
   if (useComposer || entry && entry.state !== 'terminal') {
     binding = {owns: owns, store: store, controls: controls, cancel: cancel, stopping: false,
+      query: turn.user && turn.user.content,
       queueEntry: entry, following: false, dispose: dispose};
     registerTurnBinding(binding);
   }
@@ -6386,7 +6491,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
 
     if (job && job !== observed) {
       observed = job;
-      streamedAnswer = ''; armed = false;
+      streamedAnswer = ''; armed = false; finalAnswerReceived = false;
       content.dataset.jobId = job;
       transport.followContinuation(job);
     }

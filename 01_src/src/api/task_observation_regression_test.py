@@ -92,6 +92,32 @@ class TaskObservationTests(unittest.TestCase):
         self.assertIn("fixture-progress", str(live))
         self.assertNotIn("private fixture input", str(live) + str(saved))
 
+    def test_model_public_note_survives_delivery_replay_and_history(self):
+        from src.core.public_progress import emit_public_progress, public_progress_text
+
+        job_id = self.claim.job_id
+        public_note = "我已识别两块数据，接下来用第二块绘图。"
+        chunks = [{"type": "reasoning", "text": "private fixture"},
+                  {"type": "text", "text": public_note}]
+        self.assertEqual(public_progress_text(chunks, has_tool_calls=True), public_note)
+        self.assertEqual(public_progress_text(chunks, has_tool_calls=False), "")
+        for private in ('<think>private fixture</think>', '<invoke name="tool">private args</invoke>',
+                        '进度 {"args":"private fixture"}', '["private fixture"]',
+                        'Bearer fixture-token', '密码：fixture-password'):
+            self.assertEqual(public_progress_text(private, has_tool_calls=True), "")
+
+        with patch('src.core.public_progress.emit_progress') as publish:
+            self.assertTrue(emit_public_progress(public_note, note_id="model-note", job_id=job_id))
+        event, payload = publish.call_args.args
+        observed = task_events.append_event(job_id, event, payload)
+        replay = self.client.get(f'/jobs/{job_id}/events').json()
+        history = self.client.get(f'/sessions/{self.sid}/messages').json()
+        saved = next(row for row in history['turns'][0]['trace'] if row['event'] == 'assistant_progress')
+        self.assertEqual((saved['seq'], saved['data']['text']), (observed['seq'], public_note))
+        self.assertIn('model-note', str(replay))
+        self.assertIn(public_note, str(replay))
+        self.assertNotIn('private fixture', str(replay) + str(history))
+
     def test_terminal_snapshot_and_event_cursor_share_a_view(self):
         job_id = self.claim.job_id
         initial = task_events.append_event(job_id, 'job', {'job_id': job_id, 'status': 'running'})
@@ -126,3 +152,25 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual(self.client.get(f'{route}/update-2').status_code, 404)
         self.owner += 1
         self.assertEqual(self.client.get(f'{route}/update-1').status_code, 404)
+
+
+def test_public_answer_preview_is_temporary_and_filters_private_prefixes(monkeypatch):
+    from src.core import progress_bus
+    from src.core.public_progress import PublicAnswerPreview
+
+    events = []
+    monkeypatch.setattr(progress_bus, "emit_answer_start", lambda: events.append("answer_start"))
+    monkeypatch.setattr(progress_bus, "emit_text", lambda value: events.append(value))
+    monkeypatch.setattr(progress_bus, "emit_text_reset", lambda: events.append("text_reset"))
+    preview = PublicAnswerPreview()
+    preview.append("This is a safe plain-text preview of the visible answer. ")
+    preview.append("This remains in the final answer stream.")
+    preview.clear()
+    assert events == ["answer_start", "This is a safe plain-text preview of the visible answer.", "text_reset"]
+    for text in ('{"answer": "This is a private completion envelope. "}',
+                 '<think>This is privately authored reasoning material.</think> ',
+                 'One should never disclose a Bearer example-private-token. '):
+        preview = PublicAnswerPreview()
+        preview.append(text)
+        preview.clear()
+        assert len(events) == 3

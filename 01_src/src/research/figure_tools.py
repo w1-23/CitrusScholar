@@ -72,6 +72,16 @@ def _json_arg(raw: Any, name: str) -> Any:
     raise ToolArgumentError(f"{name} 需要 JSON 文本。")
 
 
+def _requested_formats(raw: Any) -> tuple[str, ...] | None:
+    formats = _json_arg(raw, "formats_json")
+    if formats is None:
+        return None
+    if (not isinstance(formats, (list, tuple)) or not formats
+            or any(not isinstance(fmt, str) or fmt.strip().lower() not in FIGURE_FORMATS for fmt in formats)):
+        raise ToolArgumentError('formats_json 需要格式数组，例如 ["svg", "png", "pdf"]。')
+    return tuple(dict.fromkeys(fmt.strip().lower() for fmt in formats))
+
+
 def _owner() -> int:
     from src.core.tracing import get_user_id
     return int(get_user_id() or 0)
@@ -214,7 +224,7 @@ def create_research_figure(
     数据引用 kind：attachment（本轮上传的表，按列名取）、account_file（资料库
     file_id + 列名）、inline（直接给 values，≤200 行）。
     error：none / sd / se / ci95 —— 误差棒的含义，必须与数据实际算出的量一致。
-    formats_json：新图件统一交付 SVG，可省略此参数。
+    formats_json：默认 SVG。可指定 ["svg", "png", "pdf"] 或其中所需格式。
     output_name：文件名（不含扩展名），默认用标题。
 
     先检查数据形状、研究问题和单位；样本编号/高唯一率标签不是默认处理组，
@@ -232,10 +242,9 @@ def create_research_figure(
         if title:
             raw_spec = dict(raw_spec)
             raw_spec.setdefault("title", title)
-        _json_arg(formats_json, "formats_json")
+        formats = _requested_formats(formats_json) or ("svg",)
     except ToolArgumentError as exc:
         return _error("ARG", str(exc))
-    formats = ("svg",)
 
     from src.figures.spec import SpecError, parse_spec
     try:
@@ -266,19 +275,24 @@ def create_research_figure(
 
     stem = output_name or resolved.title or "figure"
     published: list[dict[str, Any]] = []
+    publish_failures = []
     for fmt in formats:
         payload = blobs.get(fmt)
         if payload is None:
+            publish_failures.append({"format": fmt, "error": "请求格式未导出"})
             continue
         try:
             entry = _publish(f"{stem}.{fmt}", payload, MIME_BY_FORMAT[fmt])
         except Exception as exc:  # noqa: BLE001
-            return _error("PUBLISH", f"{fmt} 交付失败：{exc}")
+            publish_failures.append({"format": fmt, "error": type(exc).__name__})
+            continue
         published.append({"format": fmt, **entry})
+    if not published:
+        return _error("PUBLISH", "请求格式均未交付。")
 
     svg_bytes = blobs.get("svg")
     placeholder = ""
-    if svg_bytes:
+    if svg_bytes and any(item["format"] == "svg" for item in published):
         try:
             placeholder = _register_figure(
                 svg_bytes, resolved.title or "科研图件")
@@ -308,6 +322,7 @@ def create_research_figure(
         "figure_placeholder": placeholder,
         "data_provenance": source_info,
         "editable": bool(project),
+        "failures": publish_failures,
         "note": ("图内微调在「图表工作台」完成（/figures），可改颜色、字号、线宽与标签位置；"
                  "数据值与统计量不可更改。" if project else
                  "图件文件已发布，但可编辑项目保存失败；可下载文件，需重试创建项目。"),
@@ -317,8 +332,9 @@ def create_research_figure(
     if qa_failures:
         summary["note"] += " 本地质量检查未通过：" + "、".join(qa_failures) + "；已发布文件保留，需修复后重新验收。"
     summary["_tool_outcome"] = {
-        "status": "complete" if project and not qa_failures else "partial",
-        "reason_code": ("figure_qa_needs_attention" if qa_failures else
+        "status": "complete" if project and not publish_failures and not qa_failures else "partial",
+        "reason_code": ("format_publication_failed" if publish_failures else
+                        "figure_qa_needs_attention" if qa_failures else
                         "figure_published" if project else "project_persistence_failed"),
         "artifacts": [item["artifact_url"] for item in published
                       if item.get("artifact_url")],
@@ -405,7 +421,7 @@ def _run_research_figure_script(
     ax.bar(['CK', 'T1'], [10.1, 12.2], color='#0F4D92', label='果实重量')
     ax.set_ylabel('g'); ax.set_title('果实重量')
 
-    formats_json：新图件统一交付 SVG，可省略此参数。
+    formats_json：覆盖各输出的请求格式。省略时沿用输出契约，没有契约时默认 SVG。
     output_name：文件名（不含扩展名）。
 
     失败时返回 [FIGURE_...] 形式的说明，指出问题与改法；沙箱不会执行任何
@@ -420,7 +436,11 @@ def _run_research_figure_script(
     if len(text) > _MAX_SCRIPT_CHARS + (65000 if script_record else 0):
         return _error("ARG", f"脚本超过 {_MAX_SCRIPT_CHARS} 字符上限，请精简后重试。")
 
-    formats = ("svg",)
+    try:
+        requested_formats = _requested_formats(formats_json)
+    except ToolArgumentError as exc:
+        return _error("ARG", str(exc))
+    formats = requested_formats or ("svg",)
 
     runner = _sandbox_runner if _sandbox_runner is not None else _select_script_runner()
     if runner is None:
@@ -433,10 +453,8 @@ def _run_research_figure_script(
     try:
         from src.figures.script_outputs import normalize_output_contract
         contract = normalize_output_contract(_json_arg(outputs_json, "outputs_json"))
-        if contract:
-            # Apply delivery policy after the runtime has identified the request.
-            # Presets and retained repairs keep their original request identity.
-            contract["figures"] = [{**figure, "formats": list(formats)}
+        if contract and requested_formats is not None:
+            contract["figures"] = [{**figure, "formats": list(requested_formats)}
                                    for figure in contract["figures"]]
         bindings = _json_arg(inputs_json, "inputs_json") or {}
         profile = parse_qa_profile(_json_arg(qa_profile_json, "qa_profile_json"))
@@ -672,10 +690,7 @@ def run_research_figure_script(
     try:
         parse_qa_profile(_json_arg(qa_profile_json, "qa_profile_json"))
         normalize_output_contract(_json_arg(outputs_json, "outputs_json"))
-        formats = _json_arg(formats_json, "formats_json")
-        if formats is not None and (not isinstance(formats, (list, tuple))
-                or any(not isinstance(fmt, str) or fmt.lower().strip() not in FIGURE_FORMATS for fmt in formats)):
-            raise ToolArgumentError("formats_json 需要 JSON 格式数组，例如 [\"svg\"]。新图件统一交付 SVG。")
+        _requested_formats(formats_json)
     except (ValueError, TypeError) as exc:
         if isinstance(exc, RenderScriptEmitUnavailable):
             # Pure, repeatable rejection: no script save, run reservation or
@@ -721,7 +736,7 @@ run_research_figure_script.__doc__ = inspect.cleandoc(_run_research_figure_scrip
 script与script_ref_json二选一；源码执行前自动暂存，返回script_ref及run_id，
 失败也保留源码。parameters_json是JSON对象，脚本内通过parameters读取，不拼接代码。
 修复已保存的failed/partial运行时，只提供修改后的script或script_ref_json与repair_from_run_id；
-其余参数留空。宿主继承该运行的固定输入、参数、输出约定和审核选项，重新校验后创建新运行。新图件仍统一交付 SVG。
+其余参数留空。宿主继承该运行的固定输入、参数、输出约定和审核选项，重新校验后创建新运行，沿用原运行的交付格式。
 改变输出契约（如改为独立render_script）需显式绑定授权输入发起新运行，不传repair_from_run_id。
 先read_run查看具体失败；running或状态未知的运行不能重放。旧记录缺少完整修复输入时须显式绑定授权来源。
 内置脚本可自动使用其声明的输出契约；任务脚本需要明确绑定输入和输出。

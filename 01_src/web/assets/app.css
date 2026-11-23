@@ -712,7 +712,8 @@ footer {
 .composer-mode, .composer-browse { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
 .composer-mode[hidden], .composer-browse[hidden], .input-box .attachment-list[hidden], .input-actions .input-tools[hidden] { display: none; }
 .composer-browse input { accent-color: var(--accent); }
-.task-update-toggle[aria-pressed="true"] { border-color: var(--accent); }
+.composer-mode { flex-wrap: wrap; min-width: 0; }
+#composer-task-target { overflow-wrap: anywhere; }
 .task-update-recovery p { white-space: pre-wrap; overflow-wrap: anywhere; }
 .task-recovery .task-control-hint { flex-basis: 100%; }
 .task-result { flex-basis: 100%; min-width: 0; margin: 5px 0; padding: 4px 0; border-top: 1px solid var(--border-hairline); font-size: 12px; }

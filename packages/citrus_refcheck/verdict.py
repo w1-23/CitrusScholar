@@ -104,7 +104,10 @@ def project_verdict(entry, result, *, audit_id):
         identity = "ambiguous"
     elif not (doi or arxiv) and len(title_matches) == 1:
         selected = next(iter(title_matches.values()))
-        if len({r.get("source") for r, _ in selected} - {None, ""}) >= 2:
+        registry_identity = any(r.get("source") in _DIRECT_REGISTRIES
+                                and r.get("lookup_kind") == "title_registry"
+                                and normalize_doi(r.get("doi")) for r, _ in selected)
+        if registry_identity or len({r.get("source") for r, _ in selected} - {None, ""}) >= 2:
             identity = "confirmed"
 
     differences, variants, unknowns = [], [], []

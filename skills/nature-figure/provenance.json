@@ -1,6 +1,6 @@
 {
   "name": "nature-figure",
-  "version": "2.1.2",
+  "version": "3.0.0",
   "distribution": "citrusscholar-support==2.0.0",
   "package": "citrus_figures",
   "vendor": {
@@ -25,8 +25,8 @@
     },
     {
       "path": "SKILL.md",
-      "sha256": "d74e8d7661bfaa9b0d5ea120f56655c8bee2fe32dfdd6b32673806a0afcfa35d",
-      "size": 2218
+      "sha256": "ce75f184a81d67cbfe53efc7728251a6a4f0bbbab6ba87f7bd7d839cf3ed3246",
+      "size": 2878
     },
     {
       "path": "provenance.extra.json",
@@ -300,11 +300,11 @@
     }
   ],
   "adapter_identity": {
-    "version": "2.1.2",
+    "version": "3.0.0",
     "kind": "citrus-adapter-resource-set",
     "supersedes": {
-      "version": "2.1.1",
-      "catalog_manifest_sha256": "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6"
+      "version": "2.1.2",
+      "catalog_manifest_sha256": "d8a629298048632590fc58b3e00030bf06a439cb79324ed7a9615bef2a7e174e"
     },
     "current_catalog": "02_config/skills.catalog.json (skills[id=nature-figure].sha256)"
   }

@@ -210,6 +210,56 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
             tracing.set_session_id(await reopened.get_or_create_session(None, 7))
             self.assertEqual(json.loads(read_tool_result.invoke({"tool_call_id": first.tool_call_id}))["status"], "unavailable")
 
+    async def test_workbook_snapshot_reuse_is_bound_to_source_version_and_scope(self):
+        from io import BytesIO
+        from openpyxl import Workbook
+        from citrus_audit import inspection
+        from src.research import tools
+
+        def source(value):
+            workbook = Workbook()
+            workbook.active.append([value, "value"])
+            stream = BytesIO()
+            workbook.save(stream)
+            data = stream.getvalue()
+            ref = {"kind": "account_file", "file_id": "same-id", "sha256": hashlib.sha256(data).hexdigest()}
+            return {"name": "same.xlsx", "source_ref": ref, "data": data}
+
+        args = {"inspection": "layout"}
+        with (patch.object(tools, "_audit_source_tables", return_value=[source("first")]) as inputs,
+              patch.object(inspection, "inspect_workbook", wraps=inspection.inspect_workbook) as parser):
+            first = tools.inspect_uploaded_table.invoke(args)
+            snapshot = json.loads(first)["snapshot_ref"]
+            self.assertTrue(tool_results.record(tool_call_id="workbook-origin", session_id=self.sid,
+                request_id="previous-turn", tool_name="inspect_uploaded_table", status="complete", result_text=first))
+            replay = json.loads(tools.inspect_uploaded_table.invoke(args))
+            self.assertEqual(replay["reused_tool_call_id"], "workbook-origin")
+            self.assertEqual(replay["snapshot_ref"], snapshot)
+            self.assertEqual(parser.call_count, 1)
+
+            inputs.return_value = [source("second")]
+            changed = json.loads(tools.inspect_uploaded_table.invoke(args))
+            self.assertNotEqual(changed["snapshot_ref"], snapshot)
+            self.assertNotIn("reused_tool_call_id", changed)
+            self.assertEqual(parser.call_count, 2)
+
+        tracing.set_user_id(8)
+        self.assertIsNone(tool_results.fetch_workbook_snapshot(snapshot["key"]))
+
+    async def test_optional_readback_fields_preserve_available_values_and_null(self):
+        original = '{"qa":{"status":"pass","nullable":null,"score":0.12345678901234567890}}'
+        delivered = self.delivery("qa-fields", original)
+        fields = ["/qa/status", "/qa/nullable", "/qa/score", "/error", "/qa/details"]
+        rendered = read_tool_result.invoke({"tool_call_id": delivered.tool_call_id, "fields": fields})
+        result = json.loads(rendered)
+        self.assertEqual(result["storage"]["state"], "complete")
+        self.assertEqual(result["missing_fields"], ["/error", "/qa/details"])
+        self.assertEqual(result["_tool_outcome"]["status"], "complete")
+        self.assertEqual(result["selected_values"]["/qa/status"], "pass")
+        self.assertIsNone(result["selected_values"]["/qa/nullable"])
+        self.assertIn("0.12345678901234567890", result["result_text"])
+        self.assertIsNone(result["page"]["next_start_char"])
+
     async def test_readback_rejections_and_corruption_do_not_count_as_execution_failures(self):
         from src.tools.outcome import safe_tool_step
 
@@ -220,7 +270,7 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         cases = [({**args, "max_chars": 20_001}, "result_read_range"),
                  ({**args, "max_chars": 20_000}, "result_page_too_large"),
                  ({**args, "start_char": len(raw) + 1}, "result_read_range"),
-                 ({**args, "fields": ["/unknown"]}, "result_fields_unavailable"),
+                 ({**args, "fields": ["/unknown"]}, "result_json_invalid"),
                  ({"tool_call_id": "missing"}, "result_unavailable")]
         for inputs, reason in cases:
             with self.subTest(reason=reason):
@@ -255,6 +305,9 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(clipped["storage"]["complete"])
         self.assertEqual(clipped["_tool_outcome"]["status"], "partial")
         self.assertEqual(clipped["result_text"], raw[:30])
+        fields = json.loads(read_tool_result.invoke({**args, "fields": ["/unknown"]}))
+        self.assertEqual(fields["reason"], "result_retention_truncated")
+        self.assertNotIn("selected_values", fields)
 
     async def test_published_pages_survive_soft_budget_and_have_hard_limit_resume_range(self):
         from src.agent.host import _finish

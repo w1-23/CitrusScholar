@@ -5,12 +5,12 @@
   "skills": [
     {
       "id": "candidate-search",
-      "version": "2.0.1",
+      "version": "3.0.0",
       "path": "skills/candidate-search",
       "entry": "SKILL.md",
       "package": "citrus_retrieval",
       "dependency": "citrusscholar-support[retrieval]==2.0.0",
-      "sha256": "3d400fbdfebbb55e05f78e56cb2c6d569280fa4a42e20ea4e6afae2970ee12cf",
+      "sha256": "6d423a6010bcceb5e88b81404499944b329941bb6f265d93868ed7b280836572",
       "files": [
         {
           "path": "PROVENANCE.md",
@@ -19,8 +19,8 @@
         },
         {
           "path": "SKILL.md",
-          "sha256": "d8db0f60b7e56cf528a83aa2cba8e68101c09dcf2e9db74536696d46c9691b9f",
-          "size": 3346
+          "sha256": "4fa967ddff97e59fa09589771f5ca6a4348d9c2fc00163a2ad10cc70810a066b",
+          "size": 2381
         },
         {
           "path": "references/evidence-and-fetch.md",
@@ -42,16 +42,20 @@
           "sha256": "4617c1a4e420ef9efe89aa0d534c3c28a5691974167d9a45dd26c1c8b23e20cb",
           "size": 126
         }
-      ]
+      ],
+      "supersedes": {
+        "version": "2.0.1",
+        "manifest_sha256": "3d400fbdfebbb55e05f78e56cb2c6d569280fa4a42e20ea4e6afae2970ee12cf"
+      }
     },
     {
       "id": "reference-verification",
-      "version": "2.0.2",
+      "version": "3.0.0",
       "path": "skills/reference-verification",
       "entry": "SKILL.md",
       "package": "citrus_refcheck",
       "dependency": "citrusscholar-support[refcheck]==2.0.0",
-      "sha256": "e7c4763c9322d63bf6dfd646b4cae31f31d5db939c1c2e113484b6a91ed98943",
+      "sha256": "04694fa7594ae4d6f553875b4a0844d4ecd8583a4fe086c0f2c7f1d01d245939",
       "files": [
         {
           "path": "PROVENANCE.md",
@@ -60,8 +64,8 @@
         },
         {
           "path": "SKILL.md",
-          "sha256": "44de59cc7e05b558132ad3043bb70c80d3431ac9b288aa45f6e7ded0f9e4eb81",
-          "size": 2237
+          "sha256": "825452882f4a8a0fac816fddceb887c71beb046e645029d0b7d76b24bb43df28",
+          "size": 2534
         },
         {
           "path": "assets/status-vocabulary.json",
@@ -123,16 +127,20 @@
           "sha256": "babf1a2e2784d116337bc9539d806e5fff291f096832812603683ef9509236d5",
           "size": 114
         }
-      ]
+      ],
+      "supersedes": {
+        "version": "2.0.2",
+        "manifest_sha256": "e7c4763c9322d63bf6dfd646b4cae31f31d5db939c1c2e113484b6a91ed98943"
+      }
     },
     {
       "id": "data-audit",
-      "version": "2.2.0",
+      "version": "3.0.0",
       "path": "skills/data-audit",
       "entry": "SKILL.md",
       "package": "citrus_audit",
       "dependency": "citrusscholar-support[audit]==2.0.0",
-      "sha256": "2ba1186ae3ae3db8dcaccb70ec5ad07beb7f1dbb508c463b587b1471596937e0",
+      "sha256": "0630f3acc35029d8e9b1b8968890c8da44791911e5175bead179007b1158e024",
       "files": [
         {
           "path": "PROVENANCE.md",
@@ -141,8 +149,8 @@
         },
         {
           "path": "SKILL.md",
-          "sha256": "ec5a9fa8c10b720c4fcee663f8c8bdb495d02ef52674efd79b842f80f9784ad7",
-          "size": 7987
+          "sha256": "01aaab0d01f1a94b509fd3ef64299cefe40f0c5f55139b3aea32bf48a0d9afdd",
+          "size": 2584
         },
         {
           "path": "references/marking.md",
@@ -174,16 +182,20 @@
           "sha256": "5bd67927dc1554115c6eb9be8103981e1209d3afc2d4fa182d235ebd5f459b12",
           "size": 99
         }
-      ]
+      ],
+      "supersedes": {
+        "version": "2.2.0",
+        "manifest_sha256": "2ba1186ae3ae3db8dcaccb70ec5ad07beb7f1dbb508c463b587b1471596937e0"
+      }
     },
     {
       "id": "nature-figure",
-      "version": "2.1.2",
+      "version": "3.0.0",
       "path": "skills/nature-figure",
       "entry": "SKILL.md",
       "package": "citrus_figures",
       "dependency": "citrusscholar-support[figures]==2.0.0",
-      "sha256": "d8a629298048632590fc58b3e00030bf06a439cb79324ed7a9615bef2a7e174e",
+      "sha256": "2660ac78e3602c2e9fa3e6cd0e88d6997f1335d408c0de66d142041cb03f41b9",
       "files": [
         {
           "path": "ADAPTER.md",
@@ -197,8 +209,8 @@
         },
         {
           "path": "SKILL.md",
-          "sha256": "d74e8d7661bfaa9b0d5ea120f56655c8bee2fe32dfdd6b32673806a0afcfa35d",
-          "size": 2218
+          "sha256": "ce75f184a81d67cbfe53efc7728251a6a4f0bbbab6ba87f7bd7d839cf3ed3246",
+          "size": 2878
         },
         {
           "path": "provenance.extra.json",
@@ -207,7 +219,7 @@
         },
         {
           "path": "provenance.json",
-          "sha256": "82a3fe2cdb2aa05a574b9eab6a8ba9517459f981ec5cb381a7b91ea5eb09d9e1",
+          "sha256": "ca41cd631869602fc87e2e6a03a596e2a1989ec73aa8326b7ec643be8b038f2f",
           "size": 12445
         },
         {
@@ -477,8 +489,8 @@
         }
       ],
       "supersedes": {
-        "version": "2.1.1",
-        "manifest_sha256": "bfe1616a3903302684776552f025f4a314f1ed832298e42eabfb3be7e44289e6"
+        "version": "2.1.2",
+        "manifest_sha256": "d8a629298048632590fc58b3e00030bf06a439cb79324ed7a9615bef2a7e174e"
       }
     }
   ]

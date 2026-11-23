@@ -89,11 +89,12 @@ class SvgEditBatch(BaseModel):
 
 
 class CurrentArtifactRequest(BaseModel):
-    """An existing render revision, never caller paths/source or QA policy."""
+    """Request a built-in QA mode for an existing render revision."""
 
     model_config = {"extra": "forbid"}
     expected_revision: int = Field(ge=0, strict=True)
     supersedes_file_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    journal_strict: bool = Field(default=False, strict=True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -338,7 +339,8 @@ async def _current_artifact_operation(figure_id: str, body: CurrentArtifactReque
                 lease, verify_project, figure_id, owner,
                 expected_revision=body.expected_revision,
                 supersedes_file_id=body.supersedes_file_id,
-                include_bundle=include_bundle)
+                include_bundle=include_bundle,
+                journal_strict=body.journal_strict)
         except projects.ProjectError as exc:
             return _fail(exc)
     return JSONResponse(result, headers={"Cache-Control": "private, no-store",

@@ -6,13 +6,13 @@
   <meta name="robots" content="noindex,nofollow">
   <title>图表工作台 · CitrusScholar</title>
   <link rel="stylesheet" href="/assets/app.css?v=32">
-  <link rel="stylesheet" href="/assets/figures.css?v=12">
+  <link rel="stylesheet" href="/assets/figures.css?v=13">
   <link rel="stylesheet" href="/assets/guide.css?v=3">
   <script src="/assets/figures/edit_model.js?v=2" defer></script>
   <script src="/assets/figures/scene_projection.js?v=2" defer></script>
   <script src="/assets/figures/hit_geometry.js?v=1" defer></script>
   <script src="/assets/xlsx.full.min.js?v=1" defer></script>
-  <script src="/assets/figures.js?v=17" defer></script>
+  <script src="/assets/figures.js?v=18" defer></script>
   <script src="/assets/guide.js?v=4" defer></script>
 </head>
 <body class="figure-app">
@@ -174,13 +174,18 @@
         <label class="setting-row"><span>辅助网格<small>10 mm 间距</small></span><input type="checkbox" id="gridToggle" checked></label>
         <label class="setting-row"><span>毫米标尺<small>随缩放调整刻度</small></span><input type="checkbox" id="rulerToggle" checked></label>
         <p class="hint">辅助显示只用于编辑定位，不写入图件或导出文件。</p>
-        <h2 class="section-title spaced">图件检查</h2>
-        <p class="hint">检查当前已保存文件。执行状态与检查结论分别列出。</p>
-        <button class="button secondary" id="verifyFigureButton" disabled>检查图件</button>
-        <button class="button secondary" id="bundleFigureButton" disabled>导出证据包</button>
-        <div id="figureQaStatus" class="hint" role="status" aria-live="polite">未打开图件</div>
-        <div id="figureQaChecks"></div>
-        <div id="figureQaDownloads"></div>
+        <details class="figure-advanced">
+          <summary>高级 · 图件检查</summary>
+          <p class="hint">检查当前已保存文件。默认报告排版和可读性提示。</p>
+          <label class="setting-row"><span>期刊严格检查</span><input type="checkbox" id="figureJournalStrict"></label>
+          <div class="figure-qa-actions">
+            <button class="button secondary" id="verifyFigureButton" disabled>检查图件</button>
+            <button class="button secondary" id="bundleFigureButton" disabled>导出证据包</button>
+          </div>
+          <div id="figureQaStatus" class="hint" role="status" aria-live="polite">未打开图件</div>
+          <div id="figureQaChecks"></div>
+          <div id="figureQaDownloads"></div>
+        </details>
       </section>
       <div class="inspector-bottom"><button class="button danger" id="deleteButton" disabled>删除当前图件</button></div>
     </aside>

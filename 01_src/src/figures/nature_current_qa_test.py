@@ -111,8 +111,7 @@ def test_initial_worker_current_qa_reuses_one_audited_pdf():
     visual = next(check for check in qa["checks"] if check["check"] == "visual")
     assert (visual["executed"], visual["conclusion"], visual["reason_code"]) == (
         "not_run", "undetermined", "capability_absent")
-    assert qa["policy"]["blocking_checks"] == [
-        "format_integrity", "panel_alignment", "pdf_collisions", "pdf_text"]
+    assert qa["policy"] == {"blocking_checks": ["format_integrity"], "journal_strict": False}
 
     # The layout was captured at the single PDF draw and names those exact bytes.
     assert layout["capture"] == "pdf_draw_event" and layout["rerendered"] is False
@@ -412,7 +411,13 @@ axes[1].set_position([position.x0, position.y0 + 0.06, position.width, position.
     panel = next(c for c in receipt["checks"] if c["check"] == "panel_alignment")
     assert panel["executed"] == "executed" and panel["conclusion"] == "fail"
     assert "row-axes-misalignment" in {f["kind"] for f in panel["diagnostics"]["findings"]}
-    assert receipt["overall"]["blocking"] == ["panel_alignment"]
+    assert receipt["overall"]["blocking"] == []
+    assert "panel_alignment" in receipt["overall"]["advisory"]
+    strict = verify_current_figure(
+        artifacts={"pdf": pdf}, source=misaligned, layout_manifest=layout,
+        mode="initial", policy={"journal_strict": True}, vendor_root=vendor)
+    assert strict["policy"]["journal_strict"] is True
+    assert strict["overall"]["blocking"] == ["panel_alignment"]
 
     tiny = '''
 import matplotlib.pyplot as plt
@@ -558,3 +563,124 @@ def test_categorical_bar_keeps_layout_evidence_from_pdf_export():
     assert pdf["role"] == "internal_qa" and layout["artifact_sha256"] == pdf["sha256"]
     alignment = next(check for check in receipt["checks"] if check["check"] == "panel_alignment")
     assert alignment["executed"] == "executed" and alignment["artifact"] == pdf
+
+
+def test_ordinary_worker_accepts_typography_findings_but_journal_strict_refuses():
+    from src.figures.nature_receipts import accept_current_render_qa, validate_nature_receipt
+
+    script = SCRIPT + "axes[0].text(0.5, 0.5, 'Tiny annotation', fontsize=3)\n"
+    result = _run(script=script)
+    manifest = json.loads(result.outputs["manifest"])
+    blobs = {fmt: result.outputs[fmt] for fmt in ("svg", "png", "pdf")}
+    legacy = validate_nature_receipt(manifest, pdf=blobs["pdf"])
+    assert legacy["checks"]["pdf_text"]["status"] == "fail"
+    receipt = accept_current_render_qa(manifest, blobs, "initial")
+    assert "pdf_text" in receipt["overall"]["advisory"]
+    assert receipt["overall"]["blocking"] == []
+
+    strict = LocalBackend().run(SandboxJob(script=script, outputs=OUTPUTS,
+                                            qa_profile={"journal_strict": True}))
+    assert not strict.ok and "pdf" not in strict.outputs
+
+
+def test_mixed_artist_frozen_project_replays_styles_and_reports_exact_refusals(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from citrus_figures.style_replay import valid_baseline, typed_payload_sha256
+    from src.figures import sandbox
+    from src.session import files as session_files
+
+    script = "import pandas as pd\nemit.table('samples', pd.DataFrame({'x': [1, 2], 'y': [2, 3]}))\n"
+    renderer = """
+from matplotlib.lines import Line2D
+class FixedLine(Line2D):
+    pass
+frame = data['samples']
+fig, ax = plt.subplots()
+ax.set_xscale('log')
+ax.plot(frame['x'], frame['y'], label='Measured series')
+ax.add_line(FixedLine([1, 2], [3, 2], label='Custom series'))
+ax.set_title('Mixed artists')
+"""
+    contract = {"version": 2, "tables": [{"name": "samples"}], "figures": [
+        {"name": "main", "title": "Mixed", "formats": ["svg"],
+         "parents": ["samples"], "render_script": renderer}]}
+    initial = _run(script=script, contract=contract, outputs=output_slots(contract))
+    manifest = json.loads(initial.outputs["figure:main:manifest"])
+    receipt = manifest["frozen_render_receipt"]
+    assert receipt["geometry_status"] == "unsupported"
+    assert valid_baseline(receipt["style_replay"])
+    targets = {item["artist"]: item for item in manifest["objects"] if item["role"] == "series"}
+    assert "color" in targets["Line2D"]["editable"]
+    assert targets["FixedLine"]["editable"] == []
+    assert targets["FixedLine"]["editing_limitation"] == "unsupported_artist_type"
+
+    payload = json.loads(initial.outputs["table:samples"])
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                      allow_nan=False).encode("utf-8")
+    table = tmp_path / "table.json"
+    table.write_bytes(data)
+    digest = _sha(data)
+    assert receipt["data_sha256"] == {"samples": digest}
+    snapshot = {"variable": "samples", "sha256": digest, "file_id": "frozen", "size_bytes": len(data),
+                "sandbox_name": "input_0.json"}
+    source = {"version": 3, "output_contract": contract, "output_key": "main",
+              "frozen_render": {"version": 1, "receipt": receipt, "input_snapshots": [snapshot]}}
+    monkeypatch.setattr(sandbox, "select_backend", lambda **kwargs: LocalBackend())
+    monkeypatch.setattr(session_files, "get_account_file", lambda file_id, owner, **kwargs: (
+        {"path": table} if file_id == "frozen" and owner == 7 else None))
+    project = {"source_kind": "script", "source_json": source,
+               "data_refs_json": [{"file_id": "frozen", "sha256": digest}, {"file_id": "expired_raw_input"}]}
+    projects._verify_sources(project, 7)
+    with pytest.raises(projects.ProjectError) as raised:
+        projects._verify_sources(project, 8)
+    assert raised.value.code == "frozen_data_unavailable"
+    override = {"gid": targets["Line2D"]["gid"], "prop": "color", "value": "#c0392b"}
+    blobs, edited, accepted = projects._render_script(source, [override], owner_user_id=7, render_mode="preview")
+    second, _, _ = projects._render_script(source, [override], owner_user_id=7, render_mode="preview")
+    assert blobs["svg"] == second["svg"] != initial.outputs["figure:main:svg"]
+    assert accepted == [override]
+    assert edited["style_replay_proof"] == {
+        "coordinates_sha256": receipt["style_replay"]["coordinates_sha256"],
+        "overrides_sha256": typed_payload_sha256(accepted)}
+    _, saved, _ = projects._render_script(source, [override], owner_user_id=7, render_mode="edit")
+    assert saved["style_replay_proof"] == edited["style_replay_proof"]
+    assert saved["current_qa_receipt"]["mode"] == "edit"
+
+    with pytest.raises(projects.ProjectError) as raised:
+        projects._render_script(source, [{**override, "gid": targets["FixedLine"]["gid"]}],
+                                owner_user_id=7, render_mode="preview")
+    assert raised.value.code == "prop_not_editable"
+
+    for field, code in (("coordinates_sha256", "render_data_changed"),
+                        ("baseline_sha256", "renderer_output_changed"),
+                        ("targets_sha256", "renderer_targets_changed")):
+        changed = deepcopy(source)
+        changed["frozen_render"]["receipt"]["style_replay"][field] = "a" * 64
+        with pytest.raises(projects.ProjectError) as raised:
+            projects._render_script(changed, [override], owner_user_id=7, render_mode="preview")
+        assert raised.value.code == code
+
+    for field, value, code in (("renderer_sha256", "a" * 64, "renderer_changed"),
+                               ("data_sha256", {"samples": "a" * 64}, "frozen_data_changed")):
+        changed = deepcopy(source)
+        changed["frozen_render"]["receipt"][field] = value
+        with pytest.raises(projects.ProjectError) as raised:
+            projects._frozen_render_state(changed)
+        assert raised.value.code == code
+
+
+def test_raw_line_coordinates_distinguish_integers_with_identical_rendered_paths():
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from citrus_figures.style_replay import replay_baseline
+
+    figure, axes = plt.subplots()
+    try:
+        line, = axes.plot(np.array([2**53, 2**53 + 4], dtype=np.int64), [0, 1])
+        original = replay_baseline(figure)
+        line.set_xdata(np.array([2**53 + 1, 2**53 + 4], dtype=np.int64))
+        changed = replay_baseline(figure)
+        assert changed["baseline_sha256"] == original["baseline_sha256"]
+        assert changed["coordinates_sha256"] != original["coordinates_sha256"]
+    finally:
+        plt.close(figure)

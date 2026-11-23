@@ -38,6 +38,34 @@ def receipt(call, reason):
         additional_kwargs={"execution_dispatched": False})
 
 
+class AttachmentRetrievalScopeTests(unittest.TestCase):
+    def test_attachment_plot_exposes_local_tools_and_allows_explicit_mixed_work(self):
+        from src.agent.host_policy import allowed_presets
+        from src.graph import tool_availability
+        from src.graph.tool_availability import Env
+
+        def runtime_env(**facts):
+            return Env(local_corpus=True, script_sandbox=True, **facts)
+
+        state = {"session_id": "scoped", "attachment_refs": [{"file_id": "fixture"}]}
+        cases = [
+            ("绘制这个图的第二部分，qPCR 的数据", False),
+            ("不要参考论文，用附件数据绘图", False),
+            ("结合论文解释后绘图", True),
+            ("请联网检索，再绘制这个图", True),
+        ]
+        with (patch.object(tool_availability, "runtime_env", runtime_env),
+              patch.object(tool_availability, "provider_denials", return_value=frozenset()),
+              patch.object(tracing, "web_search_enabled", return_value=True)):
+            for query, permits_search in cases:
+                with self.subTest(query=query):
+                    available = allowed_presets({**state, "query": query}, has_tables=True, has_pool=False)
+                    self.assertIn("run_research_figure_script", available)
+                    self.assertEqual("deepseek_search" in available, permits_search)
+                    self.assertEqual("local_hybrid_search" in available, permits_search)
+                    self.assertNotIn("browse_web", available)
+
+
 class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.workspace = Mock()

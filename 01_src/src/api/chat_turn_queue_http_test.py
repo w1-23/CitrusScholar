@@ -45,6 +45,7 @@ def runtime(monkeypatch, tmp_path):
     started = []
     released = {"legacy", "last"}
     asking, hold_cleanup, held = set(), set(), {}
+    graph_errors = set()
 
     class ControlledGraph:
         async def astream(self, state, **_):
@@ -55,6 +56,8 @@ def runtime(monkeypatch, tmp_path):
                 if monotonic() > deadline:
                     raise TimeoutError("fixture release missing")
                 await asyncio.sleep(0.01)
+            if cid in graph_errors:
+                raise RuntimeError("fixture private provider detail")
             answer = "answer to " + state["query"]
             output = {"answer": answer, "turn_outcome": {"status": "completed"}}
             if cid in asking:
@@ -105,6 +108,7 @@ def runtime(monkeypatch, tmp_path):
             yield SimpleNamespace(client=client, sid=sid, started=started, released=released,
                                   owner=owner, path=f"/api/v2/session/{sid}/turn-queue",
                                   other_owner=other_owner, asking=asking, held=held, hold_cleanup=hold_cleanup,
+                                  graph_errors=graph_errors,
                                   other=auth.login("queue-other", password)[1])
         finally:
             for lease in held.values():
@@ -301,3 +305,26 @@ def test_startup_settles_completed_child(runtime, monkeypatch):
     for job_id in (child, follower["job_id"]):
         events = runtime.client.get(f"/jobs/{job_id}/events").json()["events"]
         assert sum(row["event"] == "done" for row in events) == 1
+
+
+def test_graph_exception_commits_one_failed_terminal_and_advances_queue(runtime):
+    runtime.graph_errors.add("provider-error")
+    runtime.released.update({"provider-error", "after-error"})
+    failed = send(runtime, "provider-error", "failing question")
+    following = send(runtime, "after-error", "following question")
+    wait_for(lambda: state(runtime, "provider-error") == "terminal")
+    wait_for(lambda: state(runtime, "after-error") == "terminal")
+
+    failed_job = jobs.get_job(failed["job_id"])
+    assert failed_job["status"] == "failed"
+    assert failed_job["error"] == "RuntimeError"
+    assert jobs.get_job(following["job_id"])["status"] == "completed"
+    response = runtime.client.get(f"/jobs/{failed['job_id']}/events")
+    assert response.status_code == 200
+    assert "fixture private provider detail" not in response.text
+    done = [event for event in response.json()["events"] if event["event"] == "done"]
+    assert len(done) == 1
+    assert done[0]["data"]["turn_status"] == "failed"
+    assert done[0]["data"]["answer"] == ""
+    assert done[0]["data"]["history_saved"] is False
+    assert runtime.started == ["provider-error", "after-error"]

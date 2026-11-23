@@ -1,41 +1,31 @@
 ---
 name: candidate-search
-description: 组合本地混合召回、网页来源和同篇多路获取，先返回少量候选，再以持久证据引用直接读取原文。
-license: MIT
+description: 在回答需要外部或本地资料时，快速取得足够的可引用证据。默认服务于解释与查找，不自动升级为书目审计、全文综述或论文论点核验。
 metadata:
-  version: "2.0.1"
+  version: "3.0.0"
 ---
 
-# 候选检索与证据回读
+# 科研检索：取得足够的证据即回答
 
-目标是取得可回读资料，主 Agent 负责检索策略与最终解释。支持包不生成终答、不启动 Agent；本地检索和网页检索互补，同篇论文的多个获取来源才竞速。
+## 适用范围
+需要查找资料、补充时效性或使用本地领域资料时采用。已有证据足够的续问、单纯附件处理、绘图和文字修改不必重新检索。本方法不限制其他已授权能力。
 
-独立运行依赖 `citrusscholar-support[retrieval]==2.0.0`。该 extra 不自动装模型运行时，避免将 CPU ORT 装进 GPU 环境；重排另用 retrieval-models extra，E5 单独选择 fastembed/fastembed-gpu 0.8.0 和相容 ONNX provider。Linux CUDA 可按原 requirements-gpu.txt，Windows DirectML 保留专属环境。不要同时安装 CPU/GPU ORT 发行。资源与参数见 references。所有数据、模型、证据目录和作用域显式传入，不读取平台密钥或默认语料。
+## 最短有效路线
+先使用当前任务已经取得的来源与结果。需要新证据时，选择已授权的网页 Search 或本地检索；用户明确要求两路时，在两路均可用的情况下并行进行一轮有界检索。来源偏好不等于每个任务都必须查全部来源。
 
-## 选择路线
+使用返回的真实来源链接和可见片段。原文片段或摘要只支持它实际陈述的内容，不能称为全文；搜索服务生成的解释不是独立的来源证明。涉及精确数值、引语、存在争议的关键细节或片段不足时，定向读取相应来源，不默认逐篇阅读全文。
 
-- 本地英文索引：将检索意图写成英文，保留专业名和精确标识。仅这条路线需要英文；翻译失败说明 translation_error，不视为零命中。
-- 网页/原文抓取/中文原题名：保留原文。通过宿主已授权的 web/fetch 工具，或显式配置的库回调执行；此独立 CLI 不捏造网页搜索服务。
-- DOI、PMID、PMCID、arXiv 等可用标识：优先直接取得对象；候选相关不等于引文身份已确认。需要核对时读 reference-verification 方法。
+找到足以回答当前问题的证据后停止搜索，先给直接解释及少量关键来源。只有用户要求系统综述、核对论点、比较全文或明确深查时，扩大检索范围。缺口可以如实标明，不为凑齐所有来源反复查询。
 
-## 本地与读取入口
+## 工具使用
+使用当前提供的 Search、Fetch 和本地资料接口。只有需要动态内容、交互或特定浏览器操作且本轮已授权时使用 Browse。权限拒绝不是换工具绕过的理由，也不应原样重试。
 
-`python scripts/search_local.py "English research query" --data-root DATA --model-root MODELS --corpora CORPUS_ID --evidence-dir EVIDENCE --owner OWNER --session SESSION --turn TURN`
+本地英文索引的自然语言查询可做必要英译；精确标识、中文题名与网页查询保留原文。直接使用返回的稳定引用，不要求先额外 inspect 才能读已知资料。
 
-GPU 默认使用 Windows DirectML。Linux 可用 `--provider CUDAExecutionProvider` 或相容已安装 provider；`--allow-cpu` 显式选 CPU。缺 provider 不隐式回退。`--without-rerank` 会在诊断中明确未精排，不能写成完整双模型结果。
+## 输出与失败
+默认给回答，不生成审计报告，不逐条核验 DOI，不追加全局科学审核。来源列表只展示实际采用的证据，候选与已读区分。
 
-首返最多 6 条，每条 snippet≤240 字符，不含全文。读取返回的 ref：
+查询失败不等于零结果；一个可选来源失败不自动否定已有充分证据。复用已完成查询，只有查询目标、输入或证据缺口发生变化才发起新调用。
 
-`python scripts/read_evidence.py --ref REF --generation GENERATION --evidence-dir EVIDENCE --owner OWNER --session SESSION --turn TURN --offset 0 --max-chars 4000`
-
-直接按 ref/paper_id/chunk_id 读取，不要求先 inspect。保存文件绑定 owner/session/turn/index generation，失效返回 evidence_expired，不能重搜后冒充同一证据。不要把另一个用户的作用域参数用于读取。
-
-## 解释证据
-
-逐项区分候选、已获取、已交付模型和已引用。passage/abstract/full_text 等 evidence_level 原样保留；摘要不能称全文。来源包含十个键；引用气泡应使用持久记录，不能现搜补全缺项。
-
-竞速响应中的 cancelled_after_success/not_awaited_after_success 表示停止等待的事实；Future.cancel 不保证 HTTP 已中止。timeout/error/no_match 分开说明。失败历史不能被一次成功抹除。
-
-## 与其他证据链的边界
-
-候选检索只给出检索证据和可回读定位。文献身份核对使用 reference-verification 自己的 audit_id，不把候选命中写成已确认引文。表格数据审查使用 data-audit 的 review_id 和 data-audit-findings/1 投影；候选检索结果不充当数据审查发现，也不得声称已得到合并审查工作簿。
+## 按需参考
+[检索参数](references/retrieval-and-parameters.md) · [证据与 Fetch](references/evidence-and-fetch.md)

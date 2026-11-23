@@ -84,3 +84,51 @@ def create_host_agent(model, tools, policy, saver, state_schema):
         backend=HostOnlyBackend(model.identity),
         checkpointer=saver, state_schema=state_schema,
         name="citrus_main_loop")
+
+
+NATIVE_EXECUTOR_ID = "citrus-deepagents-0.7.38-native-v1"
+NATIVE_MODEL_PROVIDER = "citrus_metered_native"
+NATIVE_READ_TOOLS = frozenset({"ls", "glob", "grep", "read_file"})
+
+
+@cache
+def configure_native_profile():
+    import deepagents
+    if deepagents.__version__ != SDK_VERSION:
+        raise RuntimeError("unsupported_deepagents_version")
+    register_harness_profile(NATIVE_MODEL_PROVIDER, HarnessProfile(
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute"}),
+        excluded_middleware=frozenset({"PatchToolCallsMiddleware"})))
+
+
+def create_native_agent(model, tools, policy, saver, state_schema, *,
+                        skill_root, system_prompt, summary_model,
+                        summary_trigger=48000, summary_keep=32000):
+    from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+    from deepagents.middleware.filesystem import FilesystemPermission
+    from deepagents.middleware.summarization import SummarizationMiddleware
+
+    configure_native_profile()
+    backend = CompositeBackend(default=StateBackend(), routes={
+        "/skills/": FilesystemBackend(root_dir=skill_root, virtual_mode=True),
+    })
+    permissions = [FilesystemPermission(
+        operations=["write", "edit", "delete"], paths=["/**"], mode="deny")]
+    summary = SummarizationMiddleware(summary_model, backend=backend,
+        trigger=("tokens", summary_trigger), keep=("tokens", summary_keep),
+        trim_tokens_to_summarize=4000)
+    from langchain.agents.middleware import ToolErrorMiddleware
+
+    def read_error(error, request):
+        if isinstance(error, PermissionError):
+            return "当前路径无读取权限。请使用本轮获授权的文件或技能资源。"
+        if isinstance(error, (FileNotFoundError, NotADirectoryError, IsADirectoryError)):
+            return "路径与读取方式不匹配。请检查授权目录中实际存在的资源。"
+        return None
+
+    read_errors = ToolErrorMiddleware(on_error=read_error, tools=sorted(NATIVE_READ_TOOLS))
+    return create_deep_agent(model=model, tools=tools,
+        middleware=[summary, policy, read_errors], system_prompt=system_prompt,
+        subagents=[], skills=["/skills/"], backend=backend, permissions=permissions,
+        checkpointer=saver, state_schema=state_schema, name="citrus_native_loop")

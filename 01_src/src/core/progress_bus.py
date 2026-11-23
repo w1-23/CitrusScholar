@@ -496,6 +496,8 @@ def _fields(data: dict, *, tokens=(), numbers=()) -> dict:
 
 
 PUBLIC_WORK_NOTES = {
+    "agent_prepare": "正在准备本轮上下文",
+    "agent_model_wait": "已开始请求模型，正在等待输出",
     "table_processed": "已完成表格处理。",
     "checking_references": "正在核验文献来源。",
     "figure_registered": "图件已登记，可查看或下载。",
@@ -532,7 +534,9 @@ def public_progress_payload(event: str, data: dict) -> dict:
         call_ids = data.get("tool_call_ids")
         if text:
             public["category"] = category
-        text = text or _PUBLIC_WORK_NOTE
+        from src.core.public_progress import sanitize
+        note = sanitize(data.get("text")) if data.get("origin") == "model" else ""
+        text = text or note or _PUBLIC_WORK_NOTE
         public.update(visibility="public", origin="host" if "category" in public else "model", phase="working",
                       text=text, chars=len(text),
                       tool_call_ids=[cid for item in call_ids if (cid := _token(item))]

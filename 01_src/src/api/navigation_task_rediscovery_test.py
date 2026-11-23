@@ -44,7 +44,9 @@ def test_empty_history_returns_exact_task_identity_without_invented_query(runtim
     rt = runtime
     sid = asyncio.run(session(rt))
     job_id = claim(rt, sid, status=status)
-    snapshot = {"display_status": "failed", "history_saved": False, "notices": ["persisted notice"]}
+    public_notice = "本轮已停止"
+    snapshot = {"display_status": "failed", "history_saved": False,
+                "notices": [public_notice, "private event detail"]}
     assert jobs.save_terminal_snapshot(job_id, snapshot)
     context = {"logical_call_id": "observed-call", "estimated_tokens": 1234}
     event = task_events.append_event(job_id, "context_snapshot", context)
@@ -65,7 +67,7 @@ def test_empty_history_returns_exact_task_identity_without_invented_query(runtim
     assert turn["history_pending"] and turn["replay_cursor"] == 0
     assert turn["user"] is None and turn["answer"] is None
     assert turn["message_ids"] == [] and turn["trace"] == []
-    assert turn["terminal_snapshot"] == jobs.decode_terminal_snapshot(jobs.get_job(job_id))
+    assert turn["terminal_snapshot"] == {**snapshot, "notices": [public_notice]}
     assert turn["context_snapshot"] == context
     assert view["context"] == context
     rt.client.cookies.set("citrus_auth", rt.other)

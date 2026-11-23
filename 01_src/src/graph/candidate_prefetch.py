@@ -159,6 +159,7 @@ async def _prefetch(state: AgentState) -> dict:
         return _response(_snapshot(STATUS_SKIPPED, reason="empty_query"))
 
     from src.graph.retrieval_router import (
+        attachment_processing_only,
         decide_retrieval,
         parse_request_constraints,
         source_scope,
@@ -166,8 +167,14 @@ async def _prefetch(state: AgentState) -> dict:
     from src.graph.tool_policy import resolve_tool_policy
 
     scope = source_scope(query)
-    if scope == "web":
-        return _response(_snapshot(STATUS_SKIPPED, reason="scope_web"))
+    if scope != "local":
+        reason = "scope_web" if scope == "web" else "model_selects_retrieval"
+        return _response(_snapshot(STATUS_SKIPPED, reason=reason))
+
+    if attachment_processing_only(query,
+            has_source=bool(state.get("attachment_refs") or state.get("request_tables")),
+            browse_requested=state.get("browse_requested") is True):
+        return _response(_snapshot(STATUS_SKIPPED, reason="attachment_processing"))
 
     constraints = parse_request_constraints(query, scope)
     if (constraints.source_policy == "deny"

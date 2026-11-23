@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
 
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, get_notification_metadata
 from langchain_openai import ChatOpenAI
 from pydantic import Field
 
@@ -62,6 +62,8 @@ def current_tool_loop_start(messages) -> int:
     start, turn_id = 0, None
     for i, message in enumerate(messages):
         if not isinstance(message, HumanMessage):
+            continue
+        if get_notification_metadata(message) is not None:
             continue
         metadata = message.additional_kwargs
         trusted = metadata.get("context_trusted") is True

@@ -5,6 +5,7 @@ import unittest
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 
+from citrus_audit.inspection import discover_regions
 from citrus_audit.readers import normalize_regions, read_region
 from citrus_audit.workbook import export_reviewed_workbook
 
@@ -24,6 +25,41 @@ def _source():
 
 
 class RegionWorkbookTest(unittest.TestCase):
+    def test_small_sheet_scan_includes_second_block_beyond_preview(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        for header, last_row in ((1, 17), (27, 50)):
+            for column in range(1, 27):
+                sheet.cell(header, column, f'column {column}')
+                for row in range(header + 1, last_row + 1):
+                    sheet.cell(row, column, row + column)
+        stream = io.BytesIO()
+        workbook.save(stream)
+
+        result = discover_regions(stream.getvalue(), 'blocks.xlsx', header_rows=[1, 27])
+
+        self.assertEqual([(region['bounds'], region['header_rows']) for region in result['regions']],
+                         [('A1:Z17', [1]), ('A27:Z50', [27])])
+        self.assertEqual(result['detection']['scan_rows'], 50)
+        self.assertEqual(result['detection']['scan_columns'], 26)
+        self.assertTrue(result['detection']['scan_complete'])
+        self.assertNotIn('scan_window_limited', result['limitations'])
+
+    def test_sparse_data_beyond_budget_marks_layout_incomplete(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet['A1'] = 'within range'
+        sheet['A3000'] = 'beyond scan'
+        stream = io.BytesIO()
+        workbook.save(stream)
+
+        result = discover_regions(stream.getvalue(), 'sparse.xlsx')
+
+        self.assertEqual([region['bounds'] for region in result['regions']], ['A1:A1'])
+        self.assertFalse(result['detection']['scan_complete'])
+        self.assertEqual(result['detection']['scan_clipped_edges'], ['bottom'])
+        self.assertIn('scan_window_limited', result['limitations'])
+
     def test_region_identity_is_scoped_by_file_and_sheet(self):
         regions = normalize_regions([
             {'file_index': 0, 'sheet': 'S', 'bounds': 'D1:E5', 'header_rows': [1], 'region_id': 'r1'},

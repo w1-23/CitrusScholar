@@ -69,6 +69,31 @@ def _contract(render_source: str, *, name: str = "relations") -> dict:
 
 
 class StaticRenderScriptContractTests(unittest.TestCase):
+    def test_worker_distinguishes_syntax_error_from_denied_import(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        from src.figures import worker
+
+        with tempfile.TemporaryDirectory() as scratch:
+            job_path = Path(scratch) / "job.json"
+            fixtures = [
+                ("figure = (", worker.EXIT_SCRIPT_ERROR, "script_syntax"),
+                ("import socket", worker.EXIT_FORBIDDEN, "forbidden_import"),
+            ]
+            for source, code, reason in fixtures:
+                with self.subTest(reason=reason):
+                    job_path.write_text(json.dumps({"script": source}), encoding="utf-8")
+                    output = StringIO()
+                    with redirect_stdout(output), redirect_stderr(StringIO()):
+                        self.assertEqual(worker.run(job_path), code)
+                    payload = json.loads(output.getvalue())
+                    self.assertEqual(payload["diagnostic"]["stage"], "analysis")
+                    self.assertEqual(payload["diagnostic"]["error_code"], reason)
+                    if reason == "script_syntax":
+                        self.assertGreaterEqual(payload["diagnostic"]["line"], 1)
+                        self.assertGreaterEqual(payload["diagnostic"]["column"], 1)
+                        self.assertNotIn("FIGURE_SCRIPT_FORBIDDEN", payload["message"])
+
     def test_frozen_renderer_refuses_a_path_before_execution(self):
         result = capture_outputs("", output_contract=_contract(GOOD_RENDERER), output_key="relations",
                                  frozen_tables={"tidy": Path("private-fixture-path.csv")})
@@ -259,3 +284,16 @@ class PresetRendererContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_tool_preserves_declared_formats_and_applies_explicit_override():
+    contract = _contract(GOOD_RENDERER)
+    contract["figures"][0]["formats"] = ["svg", "png", "pdf"]
+    with (mock.patch("src.figures.projects.snapshot_script_inputs", return_value=([], [])),
+          mock.patch("src.figures.projects.script_replay_inputs", return_value=({}, {}, {})),
+          mock.patch("src.research.script_execution.publish_script_outputs") as publish):
+        for requested, expected in (("", ["svg", "png", "pdf"]), ('["pdf", "PNG"]', ["pdf", "png"])):
+            figure_tools._run_research_figure_script(script="pass", outputs_json=contract,
+                formats_json=requested, _sandbox_runner=object())
+            assert publish.call_args.kwargs["contract"]["figures"][0]["formats"] == expected
+    assert contract["figures"][0]["formats"] == ["svg", "png", "pdf"]

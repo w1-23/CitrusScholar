@@ -6,26 +6,26 @@
     message.setAttribute('role', 'status'); host.appendChild(message);
     var recover = document.createElement('div'); recover.className = 'task-recovery'; host.appendChild(recover);
     options.container.appendChild(host);
-    var updateToggle = document.createElement('button'); updateToggle.type = 'button';
-    updateToggle.className = 'task-update-toggle'; updateToggle.textContent = '补充本轮要求';
-    updateToggle.setAttribute('aria-controls', 'user-input'); host.appendChild(updateToggle);
-    updateToggle.onclick = function () { if (canUpdate() && options.onUpdate) options.onUpdate(controller); };
     var recovery = document.createElement('details'); recovery.className = 'task-update-recovery';
-    var recoveryTitle = document.createElement('summary'); recoveryTitle.textContent = '查看未提交的补充';
+    var recoveryTitle = document.createElement('summary'); recoveryTitle.textContent = '查看保留的补充';
     var recoveryText = document.createElement('p'); recovery.appendChild(recoveryTitle); recovery.appendChild(recoveryText);
     var checkUpdate = document.createElement('button'); checkUpdate.type = 'button';
     checkUpdate.textContent = '核对上次补充';
     checkUpdate.onclick = function () { if (!busy && options.onReconcile) options.onReconcile(controller); };
     recovery.appendChild(checkUpdate); host.appendChild(recovery);
-    var busy = false, recoveryKey = '', requestNote = '', acceptedVersion = 0;
+    var busy = false, recoveryKey = '', requestNote = '', acceptedVersion = 0, statusJobId = '';
     function alive() { return options.owns(); }
     function render(state) {
       if (!alive()) return;
-      host.hidden = !state.job_id;
+      if (state.job_id !== statusJobId) {
+        statusJobId = state.job_id; requestNote = ''; acceptedVersion = 0;
+      }
       var notApplied = state.not_applied_updates || [];
-      if (acceptedVersion > 0 && (state.applied_version >= acceptedVersion || notApplied.some(function (item) { return item.version === acceptedVersion; }))) { requestNote = ''; acceptedVersion = 0; }
+      if (acceptedVersion > 0 && (state.applied_version >= acceptedVersion || notApplied.some(function (item) { return item.version === acceptedVersion; }))) acceptedVersion = 0;
       var pending = state.pending_updates.length;
-      message.textContent = requestNote || (pending ? '有 ' + pending + ' 条调整待应用。'
+      var updateStatus = root.CitrusTaskState.isTerminal(state) ? '应用状态待确认。' : '等待应用。';
+      message.textContent = requestNote || (acceptedVersion ? '已接收第 ' + acceptedVersion + ' 版补充，' + updateStatus
+        : pending ? '已接收 ' + pending + ' 条补充，' + updateStatus
         : state.applied_version > 0 ? '已应用第 ' + state.applied_version + ' 版要求。' : '');
       if (notApplied.length) message.textContent += (message.textContent ? ' ' : '') + notApplied.map(function (item) {
         return '第 ' + item.version + ' 版调整未应用' + (item.reason === 'service_restart' ? '（服务重启）' : '') + '。';
@@ -59,19 +59,13 @@
           note.textContent = '仅恢复支持的本地读取或计算步骤；不会重新执行整轮任务。'; recover.appendChild(note);
         }
       }
-      var updatable = canUpdate();
-      var selected = options.isUpdateSelected && options.isUpdateSelected(options.store);
-      var terminal = root.CitrusTaskState.isTerminal(state);
-      updateToggle.hidden = !options.onUpdate || terminal || (!updatable && !selected);
-      updateToggle.disabled = !updatable;
-      updateToggle.setAttribute('aria-pressed', String(!!selected && !terminal));
-      var draft = terminal && options.readDraft ? options.readDraft(state.job_id) : null;
+      var draft = options.readDraft ? options.readDraft(state) : null;
       var remaining = draft ? draft.text : '';
       if (recoveryText.textContent !== remaining) recoveryText.textContent = remaining;
       checkUpdate.hidden = !draft || !draft.pending || !options.onReconcile;
       checkUpdate.disabled = busy;
       recovery.hidden = !remaining && checkUpdate.hidden;
-      host.hidden = !state.job_id || (!message.textContent && !eligible.length && updateToggle.hidden && recovery.hidden);
+      host.hidden = !state.job_id || (!message.textContent && !eligible.length && recovery.hidden);
       if (options.onChange) options.onChange(state);
     }
     function eligible(state) {
@@ -79,34 +73,37 @@
         && !(state.question && state.question.status === 'pending')
         && !state.approvals.some(function (item) { return item.status === 'pending'; });
     }
-    function canUpdate() { return alive() && !busy && eligible(options.store.state); }
-    async function submitUpdate(payload, action) {
+    function acceptsUpdates() { return alive() && eligible(options.store.state); }
+    async function submitUpdate(payload, action, mayRetry) {
       var state = options.store.state, jobId = state.job_id;
       if (!alive() || !jobId || busy) return 'pending';
-      var maySubmit = canUpdate();
-      if (action === 'submit' && !maySubmit) return 'rejected';
+      if (action === 'submit' && !acceptsUpdates()) return 'rejected';
       if (!payload.instruction || payload.instruction.length > 8000) {
         requestNote = '本轮补充最多 8000 个字符。'; render(state); return 'rejected';
       }
       function ownsJob() { return alive() && options.store.state.job_id === jobId; }
-      function receipt(result) { return !!result && Number.isSafeInteger(result.version) && result.version > 0; }
+      function receipt(result) {
+        return !!result && result.job_id === jobId && result.version === payload.expected_version + 1 &&
+          ['pending', 'applied', 'not_applied'].indexOf(result.status) >= 0;
+      }
       async function lookup() {
         try { return {result: await options.transport.lookupUpdate(jobId, payload.update_request_id)}; }
         catch (error) { return {missing: error.status === 404}; }
       }
-      async function accept(result) {
-        if (!ownsJob()) return 'accepted';
-        requestNote = '补充已提交，等待后续步骤应用。';
-        acceptedVersion = result.version;
+      function accept(result) {
+        if (!ownsJob()) return result;
         var latest = options.store.state;
-        var known = result.version <= latest.applied_version || (latest.not_applied_updates || []).some(function (item) { return item.version === result.version; });
-        if (!known && !root.CitrusTaskState.isTerminal(latest)) {
-          options.store.hydrate({job_id: jobId, task_version: Math.max(latest.task_version, result.version),
-            pending_updates: latest.pending_updates.filter(function (item) { return item.version !== result.version; }).concat([result])});
+        var terminal = root.CitrusTaskState.isTerminal(latest);
+        acceptedVersion = result.status === 'pending' ? result.version : 0;
+        requestNote = result.status === 'not_applied' ? '第 ' + result.version + ' 版补充未应用。' : '';
+        var projection = {job_id: jobId, task_version: Math.max(latest.task_version, result.version)};
+        if (result.status === 'applied') projection.applied_version = Math.max(latest.applied_version, result.version);
+        if (result.status === 'pending' && !terminal) {
+          projection.pending_updates = latest.pending_updates.filter(function (item) { return item.version !== result.version; }).concat([result]);
         }
-        try { await options.transport.refresh(jobId); }
-        catch (_) { if (ownsJob() && acceptedVersion > 0) requestNote = '补充已提交；暂时无法刷新应用状态。'; }
-        return 'accepted';
+        options.store.hydrate(projection);
+        Promise.resolve(options.transport.refresh(jobId)).catch(function () {});
+        return result;
       }
       function pending() {
         if (ownsJob()) requestNote = '上次补充的提交状态待确认。';
@@ -116,16 +113,22 @@
       try {
         if (action !== 'submit') {
           var prior = await lookup();
-          if (receipt(prior.result)) return await accept(prior.result);
-          if (action === 'lookup' || !prior.missing || !ownsJob() || !eligible(options.store.state)) return pending();
+          if (receipt(prior.result)) return accept(prior.result);
+          if (prior.missing && ownsJob() && root.CitrusTaskState.isTerminal(options.store.state)) {
+            requestNote = '任务已结束，未找到这次补充的接收记录。';
+            return 'rejected';
+          }
+          if (action === 'lookup' || !prior.missing || !ownsJob() || !acceptsUpdates() || !mayRetry()) return pending();
         }
         try {
           var result = await options.transport.post(jobId, 'updates', payload);
-          if (receipt(result)) return await accept(result);
+          if (receipt(result)) return accept(result);
         } catch (error) {
           if (!ownsJob()) return 'pending';
           if (error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 499) {
-            requestNote = error.message;
+            var code = error.detail && error.detail.code;
+            requestNote = code === 'task_not_running' ? '任务已停止接收补充。草稿已保留，可选择「作为新任务」。'
+              : code === 'task_version_conflict' ? '任务版本已更新。草稿已保留，请核对版本后重试。' : error.message;
             if (error.status === 409) {
               try { await options.transport.refresh(jobId); } catch (_) {}
             }
@@ -133,11 +136,11 @@
           }
         }
         var found = await lookup();
-        return receipt(found.result) ? await accept(found.result) : pending();
+        return receipt(found.result) ? accept(found.result) : pending();
       } finally { busy = false; if (alive()) render(options.store.state); }
     }
-    var controller = {element: host, render: render, store: options.store, owns: alive, canUpdate: canUpdate,
-      submitUpdate: submitUpdate, isBusy: function () { return busy; }, updateNotice: function () { return requestNote; }};
+    var controller = {element: host, render: render, store: options.store, owns: alive, acceptsUpdates: acceptsUpdates,
+      submitUpdate: submitUpdate, isBusy: function () { return busy; }, updateNotice: function () { return message.textContent; }};
     controller.dispose = options.store.subscribe(render);
     render(options.store.state);
     return controller;

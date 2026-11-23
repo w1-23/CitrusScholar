@@ -508,10 +508,13 @@ class _ProtectedSqliteSaver(AsyncSqliteSaver):
 
 
 def _prepare(root: Path, identity: ExecutionIdentity, provider_scope: tuple[str, str]):
-    directory = Path(root) / "checkpoints"
+    return _prepare_database(checkpoint_path(root, identity, provider_scope))
+
+
+def _prepare_database(path: Path):
+    directory = path.parent.parent
     _directory(directory)
     key = _load_key(directory)
-    path = checkpoint_path(root, identity, provider_scope)
     _directory(path.parent)
     # Precreate with a restrictive mode so SQLite doesn't use umask defaults.
     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
@@ -546,3 +549,51 @@ async def open_checkpoint(root: Path, identity: ExecutionIdentity,
     async with aiosqlite.connect(str(path)) as connection:
         yield _ProtectedSqliteSaver(
             connection, serde=ProtectedCheckpointSerializer(key, identity, provider_scope))
+
+
+_NATIVE_NAMESPACE = "native-session-v1"
+
+
+def _native_binding(identity: ExecutionIdentity, provider_scope: tuple[str, str]) -> dict:
+    binding = _binding(identity, provider_scope)
+    del binding["run_id"], binding["user_turn_id"]
+    return {**binding, "namespace": _NATIVE_NAMESPACE}
+
+
+def native_checkpoint_scope(identity: ExecutionIdentity, provider_scope: tuple[str, str]) -> dict:
+    digest = hashlib.sha256(_canonical(_native_binding(identity, provider_scope))).hexdigest()
+    return {"thread_id": digest, "checkpoint_ns": ""}
+
+
+def native_checkpoint_path(root: Path, identity: ExecutionIdentity,
+                           provider_scope: tuple[str, str]) -> Path:
+    thread_id = native_checkpoint_scope(identity, provider_scope)["thread_id"]
+    return Path(root) / _NATIVE_NAMESPACE / thread_id / "checkpoint.sqlite3"
+
+
+class _NativeEncryptedSerializer(EncryptedSerializer):
+    def __init__(self, key: bytes, binding: dict):
+        super().__init__(_AesGcm(key, binding), JsonPlusSerializer(
+            pickle_fallback=False, allowed_json_modules=[], allowed_msgpack_modules=[]))
+
+    def loads_typed(self, data: tuple[str, bytes]) -> Any:
+        tag, _, cipher = data[0].partition("+")
+        if cipher != _CIPHER or tag not in {"null", "bytes", "bytearray", "msgpack"}:
+            raise CheckpointProtectionError("encrypted_checkpoint_required", structure="ciphertext")
+        try:
+            return super().loads_typed(data)
+        except CheckpointProtectionError:
+            raise
+        except Exception:
+            raise CheckpointProtectionError("invalid_checkpoint_payload", structure="envelope.value") from None
+
+
+@asynccontextmanager
+async def open_native_checkpoint(root: Path, identity: ExecutionIdentity,
+                                 provider_scope: tuple[str, str]) -> AsyncIterator[AsyncSqliteSaver]:
+    binding = _native_binding(identity, provider_scope)
+    with _checkpoint_operation("prepare"):
+        path, key = await asyncio.to_thread(_prepare_database,
+            native_checkpoint_path(root, identity, provider_scope))
+    async with aiosqlite.connect(str(path)) as connection:
+        yield _ProtectedSqliteSaver(connection, serde=_NativeEncryptedSerializer(key, binding))

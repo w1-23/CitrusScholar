@@ -7,6 +7,7 @@ import re
 
 INLINE_CHARS = 16000
 FIRST_DELIVERY_BYTES = 3072
+REFERENCE_PAGE_BYTES = 8192
 # Readers have a separate per-page ceiling: an already-encoded 16 KB JSON
 # page can need up to twice that space once escaped as a message string.
 READER_DELIVERY_BYTES = 2 * INLINE_CHARS + 2
@@ -120,7 +121,12 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         size = content_wire_bytes(text)
     except (ValueError, TypeError, RecursionError):
         return _failure(message, "result_storage_unavailable")
-    if size <= (READER_DELIVERY_BYTES if is_reader else FIRST_DELIVERY_BYTES):
+    limit = READER_DELIVERY_BYTES if is_reader else FIRST_DELIVERY_BYTES
+    if message.name == "verify_uploaded_references":
+        args = call.get("args") or {}
+        limit = (READER_DELIVERY_BYTES if args.get("operation") == "read" and args.get("include_evidence") is True
+                 else REFERENCE_PAGE_BYTES)
+    if size <= limit:
         return message
     reference = _verified_reference(message, text) if isinstance(text, str) else None
     if is_reader:

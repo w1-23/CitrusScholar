@@ -29,11 +29,15 @@ from typing_extensions import NotRequired
 from .events import LoopCheckpoint, LoopEvent
 from .model import NON_SUCCESS_TERMINALS
 from .runtime import AdmissionStopped, RunResult, RunLimits
-from .deep_agent_runtime import create_host_agent, EXECUTOR_ID, MODEL_PROVIDER
+from .deep_agent_runtime import (
+    EXECUTOR_ID, MODEL_PROVIDER, NATIVE_EXECUTOR_ID, NATIVE_MODEL_PROVIDER,
+    NATIVE_READ_TOOLS, create_host_agent, create_native_agent,
+)
 
 
 class HarnessState(DeepAgentState):
     executor_id: NotRequired[str]
+    active_run_id: NotRequired[str]
     model_steps: NotRequired[int]
     final_answer_recovery: NotRequired[bool]
     host_state: NotRequired[dict]
@@ -56,29 +60,40 @@ class _DriverModel(BaseChatModel):
     identity: Any = Field(exclude=True)
     model_name: str = "citrus-host-main-loop"
     expected_tools: frozenset[str] = Field(default_factory=frozenset, exclude=True)
+    native: bool = Field(default=False, exclude=True)
 
     def _get_ls_params(self, stop=None, **kwargs):
         return {**super()._get_ls_params(stop=stop, **kwargs),
-                "ls_provider": MODEL_PROVIDER, "ls_model_name": self.model_name}
+                "ls_provider": NATIVE_MODEL_PROVIDER if self.native else MODEL_PROVIDER,
+                "ls_model_name": self.model_name}
 
     @property
     def _llm_type(self):
         return "citrus-metered-provider"
 
     def bind_tools(self, tools, **kwargs):
-        # Fail closed if an SDK default adds native tools behind the host's back.
         from langchain_core.utils.function_calling import convert_to_openai_tool
-        names = {convert_to_openai_tool(tool)["function"]["name"] for tool in tools}
+        schemas = [convert_to_openai_tool(tool) for tool in tools]
+        names = {schema["function"]["name"] for schema in schemas}
+        added = names - self.expected_tools
+        if not added <= (NATIVE_READ_TOOLS if self.native else frozenset()):
+            raise RuntimeError("unexpected_deepagents_tool_inventory")
+        if self.native:
+            return self.bind(native_schemas=tuple(schema for schema in schemas
+                if schema["function"]["name"] in added))
         if names != self.expected_tools:
             raise RuntimeError("unexpected_deepagents_tool_inventory")
-        # ModelDriver binds the authoritative allowed schemas after admission.
         return self
 
     def _generate(self, *args, **kwargs):
         raise RuntimeError("async_model_required")
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        message = await self.driver(tuple(messages), self.identity)
+        if self.native:
+            message = await self.driver(tuple(messages), self.identity,
+                                        native_schemas=kwargs.get("native_schemas", ()))
+        else:
+            message = await self.driver(tuple(messages), self.identity)
         if not isinstance(message, AIMessage):
             raise TypeError("model_must_return_ai_message")
         message = message.model_copy(update={"additional_kwargs": {
@@ -163,8 +178,11 @@ class HarnessRuntime:
             import logging
             logging.getLogger(__name__).warning("public_progress_failed stage=tool_round kind=%s", type(exc).__name__)
 
-    async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None):
+    async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None,
+                  native_options=None, pinned_skills=()):
         adapter = self
+        native = native_options is not None
+        executor_id = NATIVE_EXECUTOR_ID if native else EXECUTOR_ID
         latest = {"messages": list(messages), "model_steps": 0}
         batch_task = None
         batch_key = None
@@ -321,14 +339,23 @@ class HarnessRuntime:
             async def awrap_tool_call(self, request, handler):
                 nonlocal batch_task, batch_key
                 response = next(m for m in reversed(request.state["messages"]) if isinstance(m, AIMessage))
-                key = tuple(call["id"] for call in response.tool_calls)
+                if native and request.tool_call["name"] in NATIVE_READ_TOOLS:
+                    result = await handler(request)
+                    if not isinstance(result, ToolMessage):
+                        raise ValueError("native_read_must_return_tool_message")
+                    return result.model_copy(update={"additional_kwargs": {
+                        **result.additional_kwargs, **identity.message_metadata("tool")}})
+                calls = [call for call in response.tool_calls
+                         if not native or call["name"] not in NATIVE_READ_TOOLS]
+                dispatch_response = response.model_copy(update={"tool_calls": calls}) if native else response
+                key = tuple(call["id"] for call in calls)
                 if batch_key != key:
                     batch_key = key
                     async def dispatch():
                         await observed(request.state, "tools")
                         await admit(tuple(request.state["messages"]))
                         await event("batch_started", request.state, key)
-                        result = await adapter.execute(response, identity)
+                        result = await adapter.execute(dispatch_response, identity)
                         if {m.tool_call_id for m in result.messages} != set(key) or len(result.messages) != len(key):
                             raise ValueError("executor_observation_pairing_mismatch")
                         await event("batch_finished", request.state, key)
@@ -350,18 +377,31 @@ class HarnessRuntime:
 
         tools = [StructuredTool(name=s["function"]["name"], description=s["function"]["description"],
                                 args_schema=s["function"]["parameters"], func=_forbidden_tool) for s in self.schemas]
-        graph = create_host_agent(_DriverModel(driver=self.model, identity=identity,
-            expected_tools=frozenset(tool.name for tool in tools)),
-            tools, Policy(), saver, HarnessState)
+        model = _DriverModel(driver=self.model, identity=identity, native=native,
+                             expected_tools=frozenset(tool.name for tool in tools))
+        if native:
+            graph = create_native_agent(model, tools, Policy(), saver, HarnessState,
+                                        **native_options)
+        else:
+            graph = create_host_agent(model, tools, Policy(), saver, HarnessState)
         config = {"configurable": checkpoint_config or {"thread_id": identity.run_id},
                   "recursion_limit": max(64, self.limits.max_model_steps * 6 + 20)}
         snapshot = await graph.aget_state(config)
-        if snapshot.values:
+        continuing_thread = bool(native and snapshot.values and not resume
+                                 and snapshot.values.get("active_run_id") != identity.run_id)
+        if continuing_thread:
+            from .runtime import _pending_calls
+            if (snapshot.values.get("executor_id") != executor_id or snapshot.next
+                    or snapshot.values.get("stop_reason") != "answered"
+                    or _pending_calls(snapshot.values["messages"])):
+                raise AdmissionStopped("native_thread_requires_reconciliation")
+        if snapshot.values and not continuing_thread:
             if not resume:
                 raise ValueError("existing_turn_requires_explicit_resume")
             # Old executor checkpoints remain readable but cannot silently adopt
             # new graph behavior. Pause them without mutating or redispatching.
-            if snapshot.values.get("executor_id") != EXECUTOR_ID:
+            if (snapshot.values.get("executor_id") != executor_id
+                    or native and snapshot.values.get("active_run_id") != identity.run_id):
                 return self._result({**snapshot.values, "stop_status": "incomplete",
                     "stop_reason": "executor_checkpoint_incompatible"})
             await observed(snapshot.values)
@@ -430,7 +470,24 @@ class HarnessRuntime:
             if resume:
                 raise ValueError("execution_checkpoint_missing")
             initial = {"messages": list(messages), "model_steps": 0,
-                       "host_state": host_snapshot(), "executor_id": EXECUTOR_ID}
+                       "host_state": host_snapshot(), "executor_id": executor_id}
+            if native:
+                if continuing_thread:
+                    prior_request = (snapshot.values.get("host_state") or {}).get("original_request_state") or {}
+                    request_id = prior_request.get("request_id")
+                    anchor = next((index for index in range(len(messages) - 2, -1, -1)
+                                   if request_id and isinstance(messages[index], AIMessage)
+                                   and not messages[index].tool_calls
+                                   and messages[index].additional_kwargs.get("context_trusted") is True
+                                   and messages[index].additional_kwargs.get("context_origin") == "assistant"
+                                   and messages[index].additional_kwargs.get("request_id") == request_id),
+                                  len(messages) - 2)
+                    initial["messages"] = [message for message in messages[anchor + 1:]
+                                           if message.additional_kwargs.get("context_origin") != "historical_evidence"]
+                initial.update(active_run_id=identity.run_id, pinned_skills=list(pinned_skills),
+                    final_answer_recovery=False, batch_notes=[], batch_status="",
+                    unknown_operations=[], execution_waits=[], execution_wake=[],
+                    stop_status="", stop_reason="", rejected_responses=[])
         await event("run_started", latest)
         timer = asyncio.timeout(max(0, self.limits.deadline-time.monotonic())
                                 if self.limits.deadline != float("inf") else None)

@@ -1,15 +1,33 @@
 ---
 name: nature-figure
-description: Create, revise, package and audit scientific Matplotlib figures using explicit data and final artifact bytes. Apply pinned Nature figure guidance with honest per-check coverage, reproducible source/data bundles and frozen style edits.
-version: 2.1.2
+description: 根据明确数据生成可复现科研图件，并在冻结数据上修改样式。普通绘图默认本地完成；指定期刊要求时才启用相应投稿检查，不自动检索论文或审计全部数据。
+metadata:
+  version: "3.0.0"
 ---
 
-# CitrusScholar 托管绘图
+# 科研绘图：先完成图，再按目标精修
 
-1. 分析入口用 `inputs_json` 声明授权文件，并用 `input_contract.raw` 将原件绑定为 `Path`。分析脚本可直接读取这些文件，也可以用授权 Code 做计算。
-2. 在 `input_contract.tables` 中声明需由 Worker 预载的表格，或在分析脚本中将数据读为 `DataFrame`，用 `emit.table` 登记需要冻结的表。记录单位、实验单元、样本量、误差定义和统计参数。
-3. 独立 `render_script` 只接收冻结的 `data[name]` 表格。每项必须是 `DataFrame`，脚本生成一张 Figure。样式修改复用冻结数据，不重算统计。已声明表格的 CSV/Excel 加载示例见 [托管接口](ADAPTER.md) 和 [绘图方法](references/figure-methods.md)。
+## 范围
+使用已授权附件、保存的数据快照或用户明确指定的来源。已有结构和数据足够时直接绘图，不重复读取整张表，不为解释样本名称自动联网。必须的语义缺失才定向澄清；明确给出的作图任务无需再次询问是否执行。
 
-默认交付 SVG。用户要求 PNG、PDF 或多种格式时，按实际生成的成果交付。预览、正式和期刊模式选择相应的校验要求。QA 必须绑定最终文件的摘要，保留真实的 FAIL、未运行项及覆盖缺口。独立调用方式见 [standalone CLI](references/standalone-cli.md)。
+## 数据与脚本
+原始文件是 Path；读取后才是 DataFrame。复用真实 dataset_ref 或已保存结果，保持原始坐标和变换说明。原始观测、组统计和误差表分开，依真实分组键对齐，不用截断或随意广播凑形状。
 
-The vendored snapshot is the fixed 44-file upstream set (40 core files plus four pinned execution peripherals) at commit `7bff1d0`; a separately supplied user ZIP is a different upstream snapshot (8 of 39 same-named files differ) and is not packaged. Python paths are the `citrus_figures` library and the `scripts/citrus/` adapters. R execution and OpenRouter image generation are disabled and never invoked by the service; image-generation networks, private templates, gallery images, and external models are not automatically enabled. Keep acquisition, local execution authorization and network authorization distinct. Consult the [resource bridge](references/bridge.md), [release scope](RELEASE.md) and [vendor provenance](vendor/nature-skills/provenance.json). Do not claim a complete upstream repository or availability of excluded assets.
+通过授权 Code/绘图 Worker 运行标准 Python 和 Matplotlib。优先复用适合的已安装辅助函数或短脚本，但不强制所有任务同一模板。长代码先写为文件再引用执行，不反复放进长 JSON 参数。
+
+分析结果保存为不可变数据；独立渲染脚本只读取冻结表。样式修改不重新执行统计分析。当前托管接口的渲染阶段提供 data[name]，不假设分析阶段也存在同名已解析变量；使用实际暴露的调用合同。 用 `input_contract.raw` 绑定原文件，用 `input_contract.tables` 声明预读表，或在分析脚本里用 `emit.table` 登记冻结结果。
+
+## 错误修复
+语法、输入类型、数组形状、渲染失败和安全拒绝分别处理。基于实际行号、类型/形状与当前脚本版本修正。补丁零匹配或多匹配不是写入成功，重新读当前代码后修改。只有确实未知的副作用才需要对账。
+
+## 质量与交付
+默认做文件有效性、数值来源、标签与误差定义等必要检查。用户未要求 Nature 投稿时，不把所有期刊美学检查设成发布门槛。确切投稿要求需绑定具体配置；FAIL、warning、not_run 如实保留，不冒称通过。
+
+用户要求的格式优先；生成可预览文件并登记图件、原数据快照、渲染脚本和版本。文件生成、可下载、可编辑、QA 通过是不同事实。
+
+编辑能力按对象和属性提供。复杂对象不支持移动时，仍可在已验证能力范围内改其他对象的颜色、字体等；不改数值、数据坐标或统计定义。不具备稳定映射的对象明确只读。
+
+默认交付简短图件说明和实际文件，不输出长篇审计记录。保留完整 QA 供需要复核或投稿的用户按需查看。
+
+## 按需参考
+[托管 Worker](ADAPTER.md) · [绘图示例](references/figure-methods.md) · [独立 CLI](references/standalone-cli.md) · [资源与许可](references/bridge.md)

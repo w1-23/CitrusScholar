@@ -689,6 +689,11 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
             # source identity. Do not guess their series links from labels.
             record["editable"] = []
             record["editing_limitation"] = "unverified_figure_legend_links"
+        if source == "script" and record["editable"]:
+            from citrus_figures.style_replay import style_capabilities
+            record["editable"], reason = style_capabilities(artist, role, members or [artist], record["editable"])
+            if reason:
+                record["editing_limitation"] = reason
         if "parent_gid" in entry:
             record["parent_gid"] = entry["parent_gid"]
         if "visible" in EDITABLE_BY_ROLE.get(role, ()) and artist is not None:
@@ -898,8 +903,15 @@ def scientific_qa_receipt(rendered: RenderedFigure) -> dict[str, Any]:
         "font_glyph_coverage": figure_glyph_coverage(figure),
         "embedded_raster_resolution": {"status": "unsupported"},
     }
-    return {"version": 1, "profile": profile, "checks": checks,
-            "status": "needs_attention" if any(v["status"] == "fail" for v in checks.values()) else "measured_checks_pass",
+    advisory = []
+    if not profile.get("journal_strict", False):
+        advisory = [name for name, result in checks.items()
+                    if result["status"] == "fail" and name != "data"]
+        for name in advisory:
+            checks[name] = {**checks[name], "status": "warn", "measured_status": "fail"}
+    status = ("needs_attention" if any(result["status"] == "fail" for result in checks.values())
+              else "warn" if any(result["status"] == "warn" for result in checks.values()) else "measured_checks_pass")
+    return {"version": 1, "profile": profile, "checks": checks, "status": status, "advisory": advisory,
             "unsupported": [key for key, value in checks.items() if value["status"] == "unsupported"]}
 
 

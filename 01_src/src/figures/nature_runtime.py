@@ -27,15 +27,6 @@ _MODULES = frozenset({"validate_figure", "audit_panel_alignment", "audit_pdf_tex
 CURRENT_QA_VENDOR_RELATIVE = "skills/nature-figure/vendor/nature-skills"
 CURRENT_QA_CHECKS = ("format_integrity", "source_preflight", "panel_alignment",
                      "pdf_text", "pdf_collisions", "svg_schematic", "visual")
-# Reception gates on measured format integrity. The legacy v1 initial audit
-# keeps its stricter rendered gate; after an explicit save, source preflight,
-# PDF text, collisions and panel geometry remain visible advisories. SVG
-# security findings are enforced separately from typography advisories.
-CURRENT_QA_BLOCKING = {
-    "initial": ("format_integrity", "panel_alignment", "pdf_text", "pdf_collisions"),
-    "edit": ("format_integrity",),
-    "reaudit": ("format_integrity",),
-}
 _SVG_SECURITY_KINDS = frozenset({"forbidden", "external-ref"})
 
 
@@ -130,7 +121,7 @@ def current_security_findings(receipt):
 
 
 def run_current_qa(*, artifacts, mode, source=None, layout_manifest=None,
-                   supersedes=None, vendor_root=None, checks=None, backend="python"):
+                   supersedes=None, vendor_root=None, checks=None, backend="python", journal_strict=False):
     """Audit exact caller bytes with the pinned, hash-verified vendor set.
 
     Artifacts are explicit bytes; this never renders, re-exports or executes
@@ -139,8 +130,6 @@ def run_current_qa(*, artifacts, mode, source=None, layout_manifest=None,
     missing layout or vendor root stays an explicit ``not_run`` entry instead
     of being reported as a pass.
     """
-    if mode not in CURRENT_QA_BLOCKING:
-        raise ValueError("unknown current-QA mode")
     from citrus_figures.verification import verify_current_figure
     if isinstance(artifacts, dict):
         artifacts = [{"format": fmt, "bytes": blob} for fmt, blob in artifacts.items()]
@@ -161,7 +150,7 @@ def run_current_qa(*, artifacts, mode, source=None, layout_manifest=None,
     return verify_current_figure(
         artifacts=rows, source=source_bytes, layout_manifest=layout_manifest,
         mode=mode, checks=checks, backend=backend,
-        policy={"blocking_checks": list(CURRENT_QA_BLOCKING[mode])},
+        policy={"journal_strict": journal_strict},
         vendor_root=vendor_root, supersedes=supersedes, visual_inspector=None)
 
 
@@ -253,13 +242,12 @@ def _geometry_status(report: dict, code: int) -> str:
 
 
 def audit_fig(figure: Any, source: str, *,
-              pdf_factory: Callable[[], bytes]) -> tuple[dict[str, Any], bytes]:
+              pdf_factory: Callable[[], bytes], journal_strict=False) -> tuple[dict[str, Any], bytes]:
     """Audit final figure state and exactly one internal PDF, never a CLI.
 
     Returns (receipt, audited_pdf_bytes). Publication must reuse these bytes
-    when PDF is requested. Rendered FAIL or any unavailable check raises
-    NatureAuditError with the receipt. Source findings are advisory; raw FAIL
-    and WARN remain visible as review_required rather than silently passing.
+    when PDF is requested. Journal strict mode enforces measured quality and
+    the availability of the rendered checks. The receipt preserves the outcomes.
     """
     receipt: dict[str, Any] = {
         "version": 1, "skill": "nature-figure", "skill_version": SKILL_VERSION,
@@ -279,9 +267,8 @@ def audit_fig(figure: Any, source: str, *,
             "policy": "advisory_source_preflight",
             "adaptation": (
                 "Original source is checked unchanged. CitrusScholar manages font defaults, "
-                "export formats and final-artifact QA outside the emit script. Raw upstream "
-                "source findings remain advisory; rendered alignment, PDF text and collision "
-                "failures block publication. This is not a claim of submission compliance."
+                "export formats and final-artifact QA outside the emit script. Source "
+                "findings remain advisory. Journal strict mode enforces rendered quality."
             ),
         }
     except Exception as exc:
@@ -360,6 +347,8 @@ def audit_fig(figure: Any, source: str, *,
     statuses = {check["status"] for check in checks.values()}
     receipt["status"] = next((status for status in ("fail", "not_auditable", "review_required", "warn")
                               if status in statuses), "pass")
-    if statuses & {"fail", "not_auditable"}:
+    receipt["policy"] = {"journal_strict": journal_strict}
+    if journal_strict and any(check["status"] in {"fail", "not_auditable"}
+                              for name, check in checks.items() if name != "source_preflight"):
         raise NatureAuditError(receipt)
     return receipt, pdf

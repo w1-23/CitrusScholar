@@ -373,11 +373,16 @@ def _modern_audit_scope(record, receipt):
             and scope.get("complete") is True and scope.get("processing_complete") is True
             and not (pending or retryable)):
         return identity, "settled"
+    if (reason == "reference_identity_report_ready_with_source_gaps"
+            and record.get("status") == "complete" and payload.get("terminal") is False
+            and scope.get("complete") is False and not pending and retryable
+            and payload.get("run_reason") in {"batch_finished", "all_entries_attempted_use_explicit_resume"}):
+        return identity, "reportable"
     if (reason == "reference_coverage_incomplete" and record.get("status") == "partial"
             and payload.get("terminal") is False and (pending or retryable)
             and payload.get("export_status") in {None, "not_requested"}
             and not payload.get("run_reason") in {"cancelled", "cancelled_use_resume", "lease_lost", "already_running"}):
-        return identity, "open"
+        return identity, "pending" if pending else "source_gap"
     return None
 
 
@@ -392,6 +397,7 @@ def reconcile_coverage_records(records):
     ledger = CoverageLedger()
     modern = {}
     settled = {}
+    reportable = {}
     for index, record in enumerate(records):
         receipt = record.get("op_receipt")
         name = record.get("name") or record.get("tool_name")
@@ -408,14 +414,18 @@ def reconcile_coverage_records(records):
                 modern[index] = proof
                 if phase == "settled":
                     settled[identity] = index
+                elif phase == "reportable":
+                    reportable[identity] = index
     effective = []
     for index, record in enumerate(records):
         proof = modern.get(index)
-        covered = proof and proof[1] == "open" and settled.get(proof[0], -1) > index
-        if covered or ledger.reconciles_reference_batch(record):
-            effective.append({**record, "status": "complete",
-                              "reason": "cumulative_coverage_completed",
-                              "reason_code": "cumulative_coverage_completed"})
+        open_batch = proof and proof[1] in {"pending", "source_gap"}
+        covered = open_batch and settled.get(proof[0], -1) > index
+        reported = open_batch and proof[1] == "pending" and reportable.get(proof[0], -1) > index
+        if covered or ledger.reconciles_reference_batch(record) or reported:
+            reason = ("cumulative_identity_report_ready" if reported and not covered
+                      else "cumulative_coverage_completed")
+            effective.append({**record, "status": "complete", "reason": reason, "reason_code": reason})
         else:
             effective.append(record)
     return effective

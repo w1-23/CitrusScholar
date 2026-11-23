@@ -332,7 +332,7 @@ def _promote_current_qa(manifest: dict, container=None, *, receipt=None, layout=
         manifest["current_qa_layout"] = layout
 
 
-def _check_script(script: str) -> tuple[str, str, int | None] | None:
+def _check_script(script: str) -> tuple[str, str, int | None, int | None] | None:
     """Refuse a script that imports a forbidden module.
 
     A plain textual check: it does not pretend to be a security boundary
@@ -342,7 +342,7 @@ def _check_script(script: str) -> tuple[str, str, int | None] | None:
     try:
         tree = ast.parse(script)
     except SyntaxError as exc:
-        return f"脚本语法错误：{exc}", "script_syntax", exc.lineno
+        return f"脚本语法错误：{exc.msg}", "script_syntax", exc.lineno, exc.offset
     for node in ast.walk(tree):
         names: list[str] = []
         if isinstance(node, ast.Import):
@@ -352,7 +352,7 @@ def _check_script(script: str) -> tuple[str, str, int | None] | None:
         for name in names:
             root = str(name).split(".", 1)[0]
             if root in _FORBIDDEN_MODULES:
-                return f"脚本导入了被禁止的模块「{root}」。", "forbidden_import", node.lineno
+                return f"脚本导入了被禁止的模块「{root}」。", "forbidden_import", node.lineno, node.col_offset + 1
     return None
 
 
@@ -361,10 +361,12 @@ def _guard_imports(script: str) -> str | None:
     return issue[0] if issue else None
 
 
-def _script_diagnostic(stage, error_code, line=None, bindings=None):
+def _script_diagnostic(stage, error_code, line=None, bindings=None, *, column=None):
     diagnostic = {"stage": stage, "error_code": error_code}
     if type(line) is int and line > 0:
         diagnostic["line"] = line
+    if type(column) is int and column > 0:
+        diagnostic["column"] = column
     if bindings:
         diagnostic["inputs"] = bindings
     return diagnostic
@@ -405,9 +407,10 @@ def run(job_path: Path) -> int:
 
     issue = _check_script(script_text)
     if issue:
-        message, error_code, line = issue
-        return _report(EXIT_FORBIDDEN, message,
-                       diagnostic=_script_diagnostic("analysis", error_code, line))
+        message, error_code, line, column = issue
+        exit_code = EXIT_SCRIPT_ERROR if error_code == "script_syntax" else EXIT_FORBIDDEN
+        return _report(exit_code, message,
+                       diagnostic=_script_diagnostic("analysis", error_code, line, column=column))
 
     # The inputs the script may read, bound to names the script chooses.
     try:
@@ -460,7 +463,9 @@ def run(job_path: Path) -> int:
         return _run_outputs(job, script_text, namespace, out_dir, core, exporter,
                             manifest_module, inputs_contract=input_contract, paths=paths)
 
-    result = core.capture_figure(script_text, namespace=namespace, check_layout=mode == "initial")
+    journal_strict = (job.get("qa_profile") or {}).get("journal_strict") is True
+    result = core.capture_figure(script_text, namespace=namespace,
+                                 check_layout=mode == "initial" and journal_strict)
     if result.error:
         if result.error_type == "no_figure":
             return _report(EXIT_NO_FIGURE, script_stdout=result.stdout)
@@ -474,6 +479,9 @@ def run(job_path: Path) -> int:
                        f"脚本生成了 {result.figures_seen} 张图。")
 
     figure = result.figure
+    if mode == "initial" and not journal_strict:
+        from citrus_figures.styling import prepare_figure_fonts
+        prepare_figure_fonts(figure)
     axes = list(getattr(figure, "axes", []) or []) if figure is not None else []
     rendered = manifest_module.assign_locators(
         core.RenderedFigure(figure=figure, axes=axes, qa_profile=job.get("qa_profile") or {}))
@@ -632,9 +640,10 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
         for entry in separated:
             issue = _check_script(entry["render_script"])
             if issue:
-                message, error_code, line = issue
-                return _report(EXIT_FORBIDDEN, message,
-                               diagnostic=_script_diagnostic("render", error_code, line))
+                message, error_code, line, column = issue
+                exit_code = EXIT_SCRIPT_ERROR if error_code == "script_syntax" else EXIT_FORBIDDEN
+                return _report(exit_code, message,
+                               diagnostic=_script_diagnostic("render", error_code, line, column=column))
         frozen_tables = None
         render_mapping = None
         if inputs_contract:
@@ -690,7 +699,9 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
 
     def error(key, exc):
         # Bound worst-case UTF-8 across all 57 states plus script stdout.
-        states[key] = {"status": "error", "error": str(exc)[:160]}
+        code = getattr(exc, "code", None)
+        detail = f"[{code}] {exc}" if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,64}", code) else str(exc)
+        states[key] = {"status": "error", "error": detail[:160]}
 
     def write(key, blob, limit=_MAX_OUTPUT_BYTES):
         nonlocal total
@@ -743,13 +754,15 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
                 from matplotlib.backends.backend_agg import FigureCanvasAgg
                 FigureCanvasAgg(figure)
             mode = job.get("render_mode", "initial")
-            if mode == "initial":
+            frozen_receipt = result.frozen_render_receipts.get(name)
+            if mode == "initial" or frozen_receipt is not None:
                 if core.__name__.startswith("src."):
                     from src.figures.styling import prepare_figure_fonts
                 else:
                     from figures.styling import prepare_figure_fonts
                 prepare_figure_fonts(figure)
-            problems = core._tick_label_problems(figure, strict_boxes=False) if mode == "initial" else []
+            journal_strict = (job.get("qa_profile") or {}).get("journal_strict") is True
+            problems = core._tick_label_problems(figure, strict_boxes=False) if mode == "initial" and journal_strict else []
             if problems:
                 raise ValueError("完整刻度标签重叠或超出固定画布：" + ", ".join(problems)
                                  + "；请沿用 figure-export/nature-figure 工作流修正布局，保留完整数据。")
@@ -757,7 +770,20 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
                 figure=figure, axes=list(figure.axes), qa_profile=job.get("qa_profile") or {}))
             manifest = manifest_module.build_manifest(rendered, source="script", include_qa=False)
             accepted = []
+            replay_proof = None
+            if frozen_receipt is not None:
+                from citrus_figures.style_replay import replay_baseline
+                frozen_receipt = {**frozen_receipt, "style_replay": replay_baseline(figure, manifest["objects"])}
             if job.get("replay_overrides"):
+                from citrus_figures.style_replay import (REPLAY_ERRORS, coordinate_sha256,
+                    replay_mismatch, typed_payload_sha256, valid_baseline)
+                from citrus_figures.overrides import OverrideError
+                expected = job.get("expected_frozen_receipt")
+                baseline = (frozen_receipt or {}).get("style_replay")
+                refusal = (replay_mismatch(expected, frozen_receipt) if expected is not None
+                           else None if valid_baseline(baseline) else "replay_evidence_unavailable")
+                if refusal:
+                    raise OverrideError(refusal, REPLAY_ERRORS[refusal])
                 if core.__name__.startswith("src."):
                     from src.figures.overrides import validate_overrides, apply_overrides, merge_overrides
                 else:
@@ -766,12 +792,11 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
                 base = validate_overrides(job.get("base_overrides") or [], manifest)
                 accepted = validate_overrides(merge_overrides(base, incoming), manifest)
                 applied = apply_overrides(rendered, manifest, accepted)
-                applied_count += len(applied)
-                # Manual edits are not an aesthetic acceptance gate.
-                if mode == "initial" and core._tick_label_problems(figure, strict_boxes=False):
-                    raise ValueError("初始图件完整刻度标签重叠或超出固定画布。")
+                if len(applied) != len(accepted):
+                    raise OverrideError("override_acknowledgement_invalid", "工作器未应用全部样式修改。")
+                replay_proof = {"coordinates_sha256": baseline["coordinates_sha256"],
+                                "overrides_sha256": typed_payload_sha256(accepted)}
             manifest = manifest_module.build_manifest(rendered, source="script", include_qa=False)
-            frozen_receipt = result.frozen_render_receipts.get(name)
             if frozen_receipt is not None:
                 manifest["frozen_render_receipt"] = frozen_receipt
             try:
@@ -795,6 +820,11 @@ def _run_outputs(job, script_text, namespace, out_dir, core, exporter, manifest_
                         write_json(prefix + "overrides", accepted, 256 * 1024)
                 raise
             manifest = manifest_module.build_manifest(rendered, source="script", include_qa=mode != "preview")
+            if replay_proof is not None:
+                if coordinate_sha256(figure) != replay_proof["coordinates_sha256"]:
+                    raise OverrideError("override_data_changed", REPLAY_ERRORS["override_data_changed"])
+                manifest["style_replay_proof"] = replay_proof
+                applied_count += len(accepted)
             if frozen_receipt is not None:
                 manifest["frozen_render_receipt"] = frozen_receipt
             manifest["render_receipt"] = render_receipt

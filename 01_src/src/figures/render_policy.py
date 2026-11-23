@@ -12,7 +12,7 @@ def render_mode(value="initial") -> str:
     return value
 
 
-def _current_qa(*, mode, pdf, layout, blobs, source):
+def _current_qa(*, mode, pdf, layout, blobs, source, journal_strict):
     """Audit this export's exact bytes; never re-export to certify them."""
     from .nature_runtime import (CurrentQaError, current_security_findings,
                                  layout_evidence, run_current_qa)
@@ -21,7 +21,7 @@ def _current_qa(*, mode, pdf, layout, blobs, source):
     artifacts.extend({"format": fmt, "bytes": blob, "role": "figure"}
                      for fmt, blob in blobs.items() if fmt != "pdf")
     receipt = run_current_qa(artifacts=artifacts, mode=mode,
-                             source=source or None, layout_manifest=layout)
+                             source=source or None, layout_manifest=layout, journal_strict=journal_strict)
     evidence = layout_evidence(layout, hashlib.sha256(pdf).hexdigest())
     security = current_security_findings(receipt)
     blocked = list(receipt.get("overall", {}).get("blocking") or ())
@@ -33,6 +33,7 @@ def _current_qa(*, mode, pdf, layout, blobs, source):
 def export_figure(rendered, *, mode, exporter, formats, dpi=300, source="",
                   allow_format_failure=False):
     mode = render_mode(mode)
+    journal_strict = rendered.qa_profile.get("journal_strict", False)
     receipt = None
     current_receipt = None
     current_layout = None
@@ -67,18 +68,18 @@ def export_figure(rendered, *, mode, exporter, formats, dpi=300, source="",
             from src.figures.nature_runtime import audit_fig
         # The legacy v1 receipt is preserved; the pinned PDF above is audited
         # rather than exporting a second one.
-        receipt, pdf = audit_fig(rendered.figure, source, pdf_factory=lambda: pdf)
+        receipt, pdf = audit_fig(rendered.figure, source, pdf_factory=lambda: pdf, journal_strict=journal_strict)
         blobs = export_formats(fmt for fmt in formats if fmt != "pdf")
         if "pdf" in formats:
             blobs["pdf"] = pdf
         current_receipt, current_layout = _current_qa(
-            mode="initial", pdf=pdf, layout=layout, blobs=blobs, source=source)
+            mode="initial", pdf=pdf, layout=layout, blobs=blobs, source=source, journal_strict=journal_strict)
     elif mode == "edit":
         blobs = export_formats(fmt for fmt in formats if fmt != "pdf")
         if "pdf" in formats:
             blobs["pdf"] = pdf
         current_receipt, current_layout = _current_qa(
-            mode="edit", pdf=pdf, layout=layout, blobs=blobs, source=source)
+            mode="edit", pdf=pdf, layout=layout, blobs=blobs, source=source, journal_strict=journal_strict)
     else:
         blobs = export_formats(formats)
     signatures = {"svg": b"<?xml", "png": b"\x89PNG\r\n\x1a\n", "pdf": b"%PDF-",

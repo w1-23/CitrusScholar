@@ -85,7 +85,8 @@
     resetScene();
     state.current = null;
     state.staticPreview = false;
-    state.qa = null; state.qaFlight = null; state.qaError = ''; renderQa();
+    state.qa = null; state.qaFlight = null; state.qaError = '';
+    el('figureJournalStrict').checked = false; renderQa();
     state.selected = '';
     state.selectedGroup = '';
     state.expanded = {};
@@ -371,6 +372,7 @@
     if (state.qa && (!current || state.qa.render_version !== current.render_version)) state.qa = null;
     var disabled = !current || !!state.qaFlight || !!state.saving || hasEdits() || !Number.isSafeInteger(current.render_version);
     el('verifyFigureButton').disabled = disabled; el('bundleFigureButton').disabled = disabled;
+    el('figureJournalStrict').disabled = disabled;
     var status = el('figureQaStatus'), checks = el('figureQaChecks'), links = el('figureQaDownloads');
     checks.replaceChildren(); links.replaceChildren();
     status.textContent = state.qaError || (state.qaFlight ? '正在检查已保存文件…' : current ? '尚未运行当前文件检查。' : '未打开图件');
@@ -397,16 +399,23 @@
       var section = document.createElement('details');
       var heading = document.createElement('summary');
       var overall = receipt.overall || {};
+      var policy = receipt.policy || {};
+      var strict = policy.journal_strict === true;
       heading.textContent = pair[0] + '：' + (receipt.version === 2 ?
-        label(overall.execution) + ' · ' + label(overall.conclusion) : label(receipt.status));
+        label(overall.execution) + ' · ' + label(overall.conclusion) : label(receipt.status)) +
+        (strict ? ' · 期刊严格检查' : '');
       section.appendChild(heading);
       var entries = Array.isArray(receipt.checks) ? receipt.checks.map(function(check) { return [check && check.check, check]; }) :
         Object.keys(receipt.checks || {}).map(function(key) { return [key, receipt.checks[key]]; });
       entries.forEach(function(entry) {
         var check = entry[1]; if (!check || typeof check !== 'object') return;
         var row = document.createElement('div'); row.className = 'hint';
+        var advisory = (overall.advisory || receipt.advisory || []).indexOf(entry[0]) >= 0 ||
+          (receipt.version === 1 && !strict && policy.journal_strict === false && check.status === 'fail');
+        var conclusion = advisory && (check.conclusion === 'fail' || check.measured_status === 'fail' || check.status === 'fail') ?
+          '提示（未达标）' : label(receipt.version === 2 ? check.conclusion : check.status);
         row.textContent = String(entry[0] || '检查项') + '：' + (receipt.version === 2 ?
-          label(check.executed) + ' · 结论：' + label(check.conclusion) : label(check.status)) +
+          label(check.executed) + ' · 结论：' + conclusion : conclusion) +
           (check.reason_code || check.reason ? '；' + String(check.reason_code || check.reason) : '');
         if (check.artifact && typeof check.artifact === 'object') {
           var artifact = check.artifact;
@@ -420,7 +429,8 @@
     var latest = state.qa ? state.qa.receipt : manifest.current_qa_receipt;
     if (latest && !state.qaError && !state.qaFlight) {
       status.textContent = (state.qa ? '当前文件' : '保存时检查') + '：' +
-        label(latest.overall.execution) + ' · 结论：' + label(latest.overall.conclusion);
+        label(latest.overall.execution) + ' · 结论：' + label(latest.overall.conclusion) +
+        ((latest.overall.advisory || []).length ? ' · 有提示' : '');
     }
     if (state.qa) {
       [['下载检查回执', state.qa.receipt_file], ['下载证据包', state.qa.bundle]].forEach(function(pair) {
@@ -439,7 +449,7 @@
     var id = state.current.figure_id, epoch = state.epoch, revision = state.current.render_version;
     var flight = {}; state.qaFlight = flight; state.qaError = '';
     function owns() { return ownsProject(id, epoch) && state.current.render_version === revision && state.qaFlight === flight; }
-    var body = {expected_revision: revision};
+    var body = {expected_revision: revision, journal_strict: el('figureJournalStrict').checked};
     if (state.qa && state.qa.render_version === revision && state.qa.receipt_file) body.supersedes_file_id = state.qa.receipt_file.file_id;
     renderQa();
     return jsonRequest(API + '/projects/' + encodeURIComponent(id) + (bundle ? '/bundle' : '/verify'), {
@@ -1205,11 +1215,21 @@
       return;
     }
     var editable = object.editable || [];
+    var limitations = {
+      unsupported_artist_type: '此绘图对象没有可验证的样式编辑方式。',
+      dynamic_artist: '此对象通过动态绘制或自定义样式方法生成。',
+      annotation_anchor: '箭头注释的锚点位置保持固定。',
+      managed_axes_position: '此坐标轴的位置由绘图布局管理。',
+      scalar_mapped_colors: '此对象的部分样式由数值和色标控制。',
+      unverified_figure_legend_links: '图例与数据系列之间缺少可验证的关联。'
+    };
+    var limitation = limitations[object.editing_limitation];
     if (!editable.length) {
-      panel.innerHTML = '<p class="property-empty">这个对象没有可修改的属性。</p>';
+      panel.innerHTML = '<p class="property-empty">' + esc(limitation || '这个对象没有可修改的属性。') + '</p>';
       return;
     }
     var rows = state.selectedGroup ? ['<p class="property-empty">只显示全部成员共有的样式。不同值留空；一次调整可整体撤销。文字内容与系列名称请单独选择对象修改。</p>'] : [];
+    if (limitation) rows.push('<p class="property-empty">' + esc(limitation) + '</p>');
     ['text', 'label'].forEach(function (prop) {
       if (editable.indexOf(prop) < 0 || state.selectedGroup) return;
       var content = currentValue(object.gid, prop, '');

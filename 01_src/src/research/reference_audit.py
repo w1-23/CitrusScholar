@@ -7,7 +7,9 @@ finite lease can be reclaimed, but its request budget is never replenished.
 """
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from copy import deepcopy
 import io
 import json
@@ -30,6 +32,9 @@ RULE_VERSION = 'reference-fields/4'
 _CACHE = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_TTL = 6 * 3600
+_AUDIT_CONCURRENCY = 4
+_AUDIT_WORKERS = ThreadPoolExecutor(max_workers=_AUDIT_CONCURRENCY, thread_name_prefix="reference-audit")
+_BATCH_LOOKUPS: ContextVar[dict | None] = ContextVar("reference_batch_lookups", default=None)
 
 
 class AuditStopped(Exception):
@@ -260,15 +265,37 @@ def _lookup_cached(owner, session_id, key, call, context):
                 item.update(cache_hit=True, cache_age_seconds=round(now - cached[0], 3))
             context.evidence.extend(evidence)
             return deepcopy(cached[1])
-    start = len(context.evidence)
-    result = call()
-    if (result[0] == 200 and isinstance(result[1], list) and result[1]
-            and all(isinstance(item, dict) for item in result[1]) and not result[2]):
+    lookups = _BATCH_LOOKUPS.get()
+    future = None
+    if lookups is not None:
         with _CACHE_LOCK:
-            _CACHE[cache_key] = (now, deepcopy(result), deepcopy(context.evidence[start:]))
-            if len(_CACHE) > 2000:
-                for stale in sorted(_CACHE, key=lambda item: _CACHE[item][0])[:500]:
-                    del _CACHE[stale]
+            previous = lookups.get(cache_key)
+            if previous is None:
+                future = lookups[cache_key] = Future()
+        if previous is not None:
+            try:
+                result, evidence = previous.result(timeout=max(0, context.deadline - time.monotonic()))
+            except TimeoutError as exc:
+                raise AuditStopped('deadline') from exc
+            context.evidence.extend({**item, 'batch_reuse': True} for item in deepcopy(evidence))
+            return deepcopy(result)
+    start = len(context.evidence)
+    try:
+        result = call()
+        evidence = deepcopy(context.evidence[start:])
+        if (result[0] == 200 and isinstance(result[1], list) and result[1]
+                and all(isinstance(item, dict) for item in result[1]) and not result[2]):
+            with _CACHE_LOCK:
+                _CACHE[cache_key] = (now, deepcopy(result), evidence)
+                if len(_CACHE) > 2000:
+                    for stale in sorted(_CACHE, key=lambda item: _CACHE[item][0])[:500]:
+                        del _CACHE[stale]
+        if future is not None:
+            future.set_result((deepcopy(result), evidence))
+    except BaseException as exc:
+        if future is not None:
+            future.set_exception(exc)
+        raise
     return result
 
 
@@ -295,7 +322,7 @@ def verify_record(claims, *, owner=0, session_id='', uncertain_fields=(), deadli
         def plan(kind, source_names):
             planned_sources.update(name + ':' + kind for name in source_names)
 
-        def query(provider, kind, value, function):
+        def query(provider, kind, value, function, *, collect=True):
             nonlocal stopped
             if check:
                 check()
@@ -319,35 +346,60 @@ def verify_record(claims, *, owner=0, session_id='', uncertain_fields=(), deadli
             if error:
                 errors[key] = error
             if status == 200 and not error:
-                # Preserve provider differences instead of flattening deduplication.
-                for record in found:
-                    if record.get('title') or record.get('doi'):
-                        records.append({**record, 'lookup_kind': kind,
-                                        'record_sha256': digest(record)})
+                if collect:
+                    records.extend({**record, 'lookup_kind': kind, 'record_sha256': digest(record)}
+                                   for record in found if record.get('title') or record.get('doi'))
                 if context.evidence:
                     context.evidence[-1]['candidate_count'] = len(found)
+                return found
+            return []
+        def has_identity(identifier, field):
+            return bool(identifier and any(
+                item.get('source') in {'Crossref', 'DataCite', 'arXiv'}
+                and (lit.normalize_doi(item.get(field)) if field == 'doi' else item.get(field)) == identifier
+                and (not title or (lit.norm_title(item.get('title')) == lit.norm_title(title)
+                                    and 'title' not in uncertain_fields))
+                for item in records
+            ))
+
         try:
             if doi:
-                plan('doi', ('Crossref', 'OpenAlex', 'DataCite', 'Semantic Scholar'))
                 encoded = lit.quote(doi, safe='/')
-                for provider, function in (('Crossref', lit._crossref_work), ('OpenAlex', lit._openalex_work),
-                                           ('DataCite', lit._datacite_work), ('Semantic Scholar', lit._s2_doi)):
+                for provider, function in (('Crossref', lit._crossref_work), ('DataCite', lit._datacite_work)):
+                    plan('doi', (provider,))
                     query(provider, 'doi', doi, lambda fn=function: fn(encoded))
+                    if has_identity(doi, 'doi'):
+                        break
             elif arxiv_id:
-                plan('arxiv_id', ('arXiv', 'DataCite'))
+                plan('arxiv_id', ('arXiv',))
                 query('arXiv', 'arxiv_id', arxiv_id, lambda: lit._arxiv_by_id(arxiv_id))
-                query('DataCite', 'arxiv_id', arxiv_id, lambda: lit._datacite_arxiv(arxiv_id))
-            # A wrong identifier must not suppress the independent title path.
-            exact = [item for item in records if doi and lit.normalize_doi(item.get('doi')) == doi]
-            needs_title = not exact or any(
-                lit.norm_title(item.get('title')) != lit.norm_title(title)
-                or any(value['status'] == 'conflicting' for value in compare_fields(claims, item).values())
-                for item in exact)
-            if title and (not doi or needs_title):
-                plan('title', ('Crossref', 'OpenAlex', 'Europe PMC', 'PubMed'))
-                for provider, function in (('Crossref', lit._crossref_search), ('OpenAlex', lit._openalex_search),
-                                           ('Europe PMC', lit._epmc_search), ('PubMed', lit._pubmed_search)):
-                    query(provider, 'title', title, lambda fn=function: fn(title))
+                if not has_identity(arxiv_id, 'arxiv_id'):
+                    plan('arxiv_id', ('DataCite',))
+                    query('DataCite', 'arxiv_id', arxiv_id, lambda: lit._datacite_arxiv(arxiv_id))
+            if title and not (has_identity(doi, 'doi') or has_identity(arxiv_id, 'arxiv_id')):
+                matched = False
+                if not (doi or arxiv_id):
+                    plan('title', ('DeepSeek Search',))
+                    candidates = query('DeepSeek Search', 'title', lit.norm_title(title),
+                                       lambda: lit._deepseek_reference_candidates(title), collect=False) or []
+                    identifiers = {item['doi'] for item in candidates
+                                   if lit.norm_title(item['title']) == lit.norm_title(title)}
+                    if len(identifiers) == 1:
+                        suggested_doi = next(iter(identifiers))
+                        plan('title_registry', ('Crossref',))
+                        query('Crossref', 'title_registry', suggested_doi,
+                              lambda: lit._crossref_work(lit.quote(suggested_doi, safe='/')))
+                        for item in records:
+                            if lit.normalize_doi(item.get('doi')) != suggested_doi:
+                                continue
+                            checks = compare_fields(claims, item, uncertain_fields=uncertain_fields)
+                            matched = all(checks[field]['status'] == 'matched' for field in ('title', 'authors', 'year'))
+                            if matched:
+                                break
+                if not matched:
+                    plan('title', ('Crossref', 'OpenAlex'))
+                    query('Crossref', 'title', title, lambda: lit._crossref_search(title))
+                    query('OpenAlex', 'title', title, lambda: lit._openalex_search(title))
         except AuditStopped as exc:
             stopped = exc.reason
         evidence = deepcopy(context.evidence)
@@ -444,7 +496,7 @@ def _project_verification(claims, facts, *, uncertain_fields=(), stopped=''):
             'selection_basis': 'exact_identifier' if direct else 'title_candidate' if best else 'unresolved',
             'provider_conflicts': provider_conflicts,
             'limits': {'max_seconds': 25, 'title_candidates_per_provider': 8,
-                       'web_fallback': 'not_performed', 'translation': 'not_performed',
+                       'web_search': 'DeepSeek Search:title' in facts['providers'], 'translation': 'not_performed',
                        'response_limit_bytes': 4 * 1024 * 1024, 'retries': 0},
             'doi': doi, 'input_title': title, 'input_authors': _value(claims, 'authors'),
             'input_year': _value(claims, 'year'),
@@ -536,40 +588,68 @@ def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resum
                     raise AuditStopped('budget_exhausted')
                 conn.execute('UPDATE reference_audits SET requests_used=requests_used+1 WHERE id=?', (audit_id,))
 
+        batch_lookups = {}
+
+        def verify(entry, prior):
+            check()
+            _BATCH_LOOKUPS.set(batch_lookups)
+            if entry.get('parse_status') == 'invalid_row':
+                return {'status': 'not_checked', 'existence': 'not_checked', 'identity': 'not_checked',
+                        'reason': entry['parse_error'], 'rule_version': RULE_VERSION,
+                        'claims_sha256': entry['claims_sha256'], 'retryable': False}
+            if (prior and prior.get('rule_version') != RULE_VERSION and not prior.get('retryable')
+                    and prior.get('claims_sha256') == entry['claims_sha256'] and prior.get('facts')):
+                return _project_verification(entry['claims'], prior['facts'],
+                                             uncertain_fields=entry.get('uncertain_fields', []))
+            return verify_record(entry['claims'], owner=owner, session_id=session_id,
+                                 uncertain_fields=entry.get('uncertain_fields', []),
+                                 deadline=deadline, check=check, debit=debit)
+
+        def commit(ordinal, entry, result):
+            with _connect() as conn:
+                audit = _load(conn, owner, session_id, audit_id)
+                if audit['lease_token'] != token or audit['cancelled']:
+                    raise AuditStopped('cancelled' if audit['cancelled'] else 'lease_lost')
+                conn.execute('UPDATE reference_records SET result=?,attempts=attempts+1 WHERE audit_id=? AND ordinal=?',
+                             (_json(result), audit_id, ordinal))
+                conn.execute('''INSERT INTO reference_attempts(audit_id,ordinal,attempt,result,created)
+                    SELECT audit_id,ordinal,attempts,result,? FROM reference_records WHERE audit_id=? AND ordinal=?''',
+                    (time.time(), audit_id, ordinal))
+                conn.execute('UPDATE reference_audits SET updated=? WHERE id=?', (time.time(), audit_id))
+            completed.append(ordinal)
+            if progress:
+                progress({'audit_id': audit_id, 'record_id': entry['record_id'], 'record_index': ordinal,
+                          'status': result['status'], 'durable': True})
+
+        workers = {}
+        remaining = iter(selected)
+
+        def dispatch():
+            item = next(remaining, None)
+            if item is not None:
+                ordinal, entry, prior = item
+                future = _AUDIT_WORKERS.submit(copy_context().run, verify, entry, prior)
+                workers[future] = (ordinal, entry)
+
         try:
-            for ordinal, entry, prior in selected:
-                check()
-                if entry.get('parse_status') == 'invalid_row':
-                    result = {'status': 'not_checked', 'existence': 'not_checked', 'identity': 'not_checked',
-                              'reason': entry['parse_error'], 'rule_version': RULE_VERSION,
-                              'claims_sha256': entry['claims_sha256'], 'retryable': False}
-                elif (prior and prior.get('rule_version') != RULE_VERSION and not prior.get('retryable')
-                      and prior.get('claims_sha256') == entry['claims_sha256'] and prior.get('facts')):
-                    result = _project_verification(entry['claims'], prior['facts'],
-                        uncertain_fields=entry.get('uncertain_fields', []))
-                else:
-                    result = verify_record(entry['claims'], owner=owner, session_id=session_id,
-                        uncertain_fields=entry.get('uncertain_fields', []), deadline=deadline, check=check, debit=debit)
-                with _connect() as conn:
-                    audit = _load(conn, owner, session_id, audit_id)
-                    if audit['lease_token'] != token or audit['cancelled']:
-                        raise AuditStopped('cancelled' if audit['cancelled'] else 'lease_lost')
-                    # Preserve bounded partial evidence too; resume rechecks retryable results.
-                    conn.execute('UPDATE reference_records SET result=?,attempts=attempts+1 WHERE audit_id=? AND ordinal=?',
-                                 (_json(result), audit_id, ordinal))
-                    conn.execute('''INSERT INTO reference_attempts(audit_id,ordinal,attempt,result,created)
-                        SELECT audit_id,ordinal,attempts,result,? FROM reference_records WHERE audit_id=? AND ordinal=?''',
-                        (time.time(), audit_id, ordinal))
-                    conn.execute('UPDATE reference_audits SET updated=? WHERE id=?', (time.time(), audit_id))
-                completed.append(ordinal)
-                if progress:
-                    progress({'audit_id': audit_id, 'record_id': entry['record_id'], 'record_index': ordinal,
-                              'status': result['status'], 'durable': True})
-                if result.get('stop_reason'):
-                    raise AuditStopped(result['stop_reason'])
-        except AuditStopped as exc:
-            reason = exc.reason
+            for _ in range(min(len(selected), _AUDIT_CONCURRENCY)):
+                dispatch()
+            while workers:
+                future = next(as_completed(workers))
+                ordinal, entry = workers.pop(future)
+                try:
+                    result = future.result()
+                    commit(ordinal, entry, result)
+                    reason = reason or result.get('stop_reason', '')
+                except AuditStopped as exc:
+                    reason = exc.reason if exc.reason in {'cancelled', 'lease_lost'} else reason or exc.reason
+                if not reason:
+                    dispatch()
         finally:
+            for future in workers:
+                future.cancel()
+            if workers:
+                wait(workers)
             with _connect() as conn:
                 audit = _load(conn, owner, session_id, audit_id)
                 if audit['lease_token'] == token:
@@ -579,7 +659,7 @@ def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resum
                     conn.execute('UPDATE reference_audits SET status=?,cancelled=?,lease_token=?,lease_until=0,updated=? WHERE id=?',
                                  (status, int(reason == 'cancelled'), '', time.time(), audit_id))
     result = get_audit(owner, session_id, audit_id)
-    result.update(run_reason=reason or 'batch_finished', processed_indices=completed)
+    result.update(run_reason=reason or 'batch_finished', processed_indices=sorted(completed))
     return result
 
 

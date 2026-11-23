@@ -244,8 +244,10 @@ class NatureVolcanoLabelPlacementTests(unittest.TestCase):
         _, result = self._capture()
         figure = result.figures["volcano"]
         axes = figure.axes[0]
-        figure.canvas.draw()
-        renderer = figure.canvas.get_renderer()
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        canvas = FigureCanvasAgg(figure)
+        canvas.draw()
+        renderer = canvas.get_renderer()
         table = result.tables["volcano_data"]
         texts = list(axes.texts)
         self.assertEqual(sorted(text.get_text() for text in texts),

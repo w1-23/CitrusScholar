@@ -308,6 +308,7 @@ class _MeteredSummaryModel(BaseChatModel):
     transport: Any = Field(exclude=True)
     identity: Any = Field(exclude=True)
     deadline: float
+    max_attempts: int = 3
     failure: Any = Field(default=None, exclude=True, repr=False)
 
     @property
@@ -344,7 +345,7 @@ class _MeteredSummaryModel(BaseChatModel):
         # At most two length recoveries, using the same complete middleware input
         # and transport. Each physical attempt reserves the original run budget;
         # neither an incomplete response nor an expired deadline permits dispatch.
-        for attempt in range(3):
+        for attempt in range(self.max_attempts):
             if time.monotonic() >= self.deadline:
                 raise AdmissionStopped("context_projection_deadline")
             transport = self.transport.model_copy(update={"max_tokens": limit})
@@ -377,7 +378,7 @@ class _MeteredSummaryModel(BaseChatModel):
                 raise AdmissionStopped("context_summary_incomplete")
             finish = response.response_metadata.get("finish_reason")
             if finish in {"length", "max_tokens", "max_output_tokens"}:
-                if attempt < 2 and limit < cap:
+                if attempt + 1 < self.max_attempts and limit < cap:
                     limit = min(limit * 2, cap)
                     continue
                 raise AdmissionStopped("context_summary_incomplete")

@@ -1520,6 +1520,23 @@ def validate_inspection_request(*, file_index: int = 0, sheet_name: str = "", he
         raise ToolArgumentError("表头行从1开始；本次未读取来源。")
 
 
+_WORKBOOK_PARSER_VERSION = 'citrus-xlsx-layout/2'
+
+
+def _workbook_snapshot_ref(data, source, sheet, headers, mode, cell_range, page_rows, cursor):
+    if not isinstance(source, dict) or not isinstance(source.get('file_id'), str) or not source['file_id']:
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    if source.get('sha256') != digest:
+        return None
+    options = [sheet.strip(), headers, mode]
+    if mode == 'cells':
+        options.extend((cell_range, page_rows, cursor))
+    key = hashlib.sha256(json.dumps([_WORKBOOK_PARSER_VERSION, source['file_id'], digest, options],
+                                    ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+    return {'key': key, 'parser_version': _WORKBOOK_PARSER_VERSION}
+
+
 @tool
 def inspect_uploaded_table(file_index: int = 0, sheet_name: str = "", header_row: int = 1,
                            header_rows_json: str | list[int] = "",
@@ -1530,7 +1547,7 @@ def inspect_uploaded_table(file_index: int = 0, sheet_name: str = "", header_row
     file_ids_json 显式选择本账号真实文件ID，可跨轮读取，无需重附；不接受latest、文件名或路径。
     非空ID列表是本次源列表，file_index 在该列表内从0选择；不会混入本轮附件或其他历史文件。
     空ID列表保留原本轮附件file_index逻辑。账号来源校验owner、实际SHA-256与大小，合计最多20MB/20文件。
-    XLSX/XLSM 默认 layout，返回工作表、可见性、合并格和前24行/48列中观察到的块；范围外需要单独读取。
+    XLSX/XLSM 默认 layout，返回工作表、可见性、合并格和已发现区域。查看 detection 的扫描范围和完整性；同一文件版本和读法可复用已存结构。
     inspection=cells、cell_range="A1:F40" 按原坐标读取公式或值，默认10行，宽页也按单元格数和字节缩小。
     续读使用相同工作表和范围及 next_cursor；来源字节变化后游标失效。需要原字段统计时使用 inspection=profile。
     header_row 选择表头，header_rows_json=[2,3] 指定多层表头。新规则审查用audit_uploaded_data；
@@ -1560,15 +1577,30 @@ def inspect_uploaded_table(file_index: int = 0, sheet_name: str = "", header_row
         if not isinstance(data, bytes) or not data or len(data) > _AUDIT_SOURCE_MAX_BYTES:
             return json.dumps(_audit_source_not_run('source_unavailable', '工作簿字节不足或超过读取上限。'),
                               ensure_ascii=False)
-        try:
-            result = inspect_workbook(data, name, sheet_name=sheet_name, header_rows=header_rows,
-                mode='layout' if inspection == 'auto' else inspection, cell_range=cell_range,
-                page_rows=page_rows, cursor=cursor)
-        except ValueError as exc:
-            raise ToolArgumentError(str(exc)) from None
-        result.update(file_index=file_index, source_selection=source_selection)
-        if item.get('source_ref'):
-            result['source_ref'] = item['source_ref']
+        from src.core.tool_results import fetch_workbook_snapshot
+
+        mode = 'layout' if inspection == 'auto' else inspection
+        source = item.get('source_ref')
+        snapshot_ref = _workbook_snapshot_ref(data, source, sheet_name, header_rows, mode,
+                                               cell_range, page_rows, cursor)
+        saved = fetch_workbook_snapshot(snapshot_ref['key']) if snapshot_ref else None
+        if saved and (saved[1].get('source_ref', {}).get('file_id') != source['file_id']
+                      or saved[1].get('source_sha256') != source['sha256']):
+            saved = None
+        if saved:
+            call_id, result = saved
+            result['reused_tool_call_id'] = call_id
+        else:
+            try:
+                result = inspect_workbook(data, name, sheet_name=sheet_name, header_rows=header_rows,
+                                          mode=mode, cell_range=cell_range, page_rows=page_rows, cursor=cursor)
+            except ValueError as exc:
+                raise ToolArgumentError(str(exc)) from None
+        result.update(name=name, file_index=file_index, source_selection=source_selection)
+        if source:
+            result['source_ref'] = source
+        if snapshot_ref:
+            result['snapshot_ref'] = snapshot_ref
         return json.dumps(result, ensure_ascii=False, default=str)
     frame, meta = _load_frame(file_index, sheet_name, header_row, header_rows, tables=tables)
     profile = _profile(frame)

@@ -224,6 +224,26 @@ def parse_request_constraints(
                               pure, "automatic_advice")
 
 
+_EXTERNAL_EVIDENCE = re.compile(
+    r'(?:结合|参照|参考|根据|依据|综合|对照|引用|查找|寻找|对比).{0,14}(?:论文|文献|公开(?:资料|来源)|外部(?:资料|来源)|网页)'
+    r'|\b(?:use|find|cite|based on|with)\b.{0,25}\b(?:papers?|studies|external sources|literature)\b', re.I)
+
+
+def attachment_processing_only(query: str, *, has_source: bool, browse_requested: bool = False) -> bool:
+    if not has_source or browse_requested:
+        return False
+    from src.graph.agent_operations import (_explicit_data_audit, _explicit_reference_check,
+                                            _explicit_visualization_request)
+    from src.graph.intent_text import intent_with_negation, mask_literal_payload
+
+    query = mask_literal_payload(query)
+    if not (_explicit_visualization_request(query) or _explicit_data_audit(query)):
+        return False
+    constraints = parse_request_constraints(query, source_scope(query))
+    return (constraints.source_policy != "required" and not _explicit_reference_check(query)
+            and not intent_with_negation(query, _EXTERNAL_EVIDENCE))
+
+
 @dataclass(frozen=True)
 class RetrievalDecision:
     mode: str

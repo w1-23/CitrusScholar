@@ -8,7 +8,8 @@ from pathlib import Path
 from .nature_runtime import COMMIT, SKILL_VERSION, load_module
 
 CHECKS = ("format_integrity", "source_preflight", "panel_alignment", "pdf_text", "pdf_collisions", "svg_schematic", "visual")
-DEFAULT_BLOCKING = tuple(name for name in CHECKS if name != "source_preflight")
+DEFAULT_BLOCKING = ("format_integrity",)
+JOURNAL_BLOCKING = (*DEFAULT_BLOCKING, "panel_alignment", "pdf_text", "pdf_collisions", "svg_schematic")
 
 
 class Unauditable(ValueError):
@@ -45,7 +46,7 @@ def verify_current_figure(*, artifacts, source=None, layout_manifest=None, figur
     layout_manifest must be {artifact_sha256, layout}; its producer attests that
     layout was captured at that export. A bare live figure cannot certify old
     bytes. visual_inspector is an explicitly supplied callable, never discovered.
-    policy accepts blocking_checks; it does not authorize external operations.
+    Use policy.journal_strict for the journal checks or blocking_checks for a custom gate.
     """
     if mode not in {"initial", "edit", "reaudit"}:
         raise ValueError("invalid verification mode")
@@ -59,7 +60,11 @@ def verify_current_figure(*, artifacts, source=None, layout_manifest=None, figur
     for identity, blob in rows:
         by_format.setdefault(identity["format"], []).append((identity, blob))
     receipts, errors = [], []
-    blocking_checks = set((policy or {}).get("blocking_checks", DEFAULT_BLOCKING))
+    policy = policy or {}
+    journal_strict = policy.get("journal_strict", False)
+    if type(journal_strict) is not bool:
+        raise ValueError("journal_strict must be boolean")
+    blocking_checks = set(policy.get("blocking_checks", JOURNAL_BLOCKING if journal_strict else DEFAULT_BLOCKING))
     if blocking_checks - set(CHECKS):
         raise ValueError("unknown blocking check")
 
@@ -207,7 +212,7 @@ def verify_current_figure(*, artifacts, source=None, layout_manifest=None, figur
                "overall": {"execution": "partial" if unexecuted and any(r["executed"] != "not_run" for r in receipts) else "not_started" if unexecuted else "complete",
                            "conclusion": conclusion, "blocking": blocking, "advisory": advisory, "unexecuted": unexecuted,
                            "claims": ["Checks certify only listed hashes and stated coverage.", "Visual inspection was not run: no visual model capability supplied."] if visual_inspector is None else ["Visual inspector supplied explicitly."]},
-               "policy": {"blocking_checks": sorted(blocking_checks)}}
+               "policy": {"blocking_checks": sorted(blocking_checks), "journal_strict": journal_strict}}
     if supersedes:
         receipt["supersedes"] = supersedes
     receipt["receipt_id"] = sha256(json.dumps(receipt, sort_keys=True, ensure_ascii=False, default=str).encode())

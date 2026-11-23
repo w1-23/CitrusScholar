@@ -47,6 +47,8 @@ jobs:
             01_src/src/agent/context_projection_regression_test.py \
             01_src/src/agent/context_schema_budget_test.py \
             01_src/src/agent/host_runtime_contract_test.py \
+            01_src/src/agent/native_runtime_test.py \
+            01_src/src/research/p0c_regression_test.py \
             01_src/src/agent/nature_skill_resources_test.py \
             01_src/src/agent/preset_schema_manifest_test.py \
             01_src/src/core/context_send_view_test.py \

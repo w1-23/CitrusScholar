@@ -3,8 +3,7 @@
 The model already streams assistant text next to its tool calls.  That text
 has two very different meanings depending on how the *round* ends:
 
-* round ends with tool calls -> the text is private working narration. The
-  execution timeline may show a fixed working label, not the model's text.
+* round ends with tool calls -> sanitized public content goes to the timeline.
 * round ends without tool calls -> the text **is** the final answer and keeps
   using the existing ``text`` path.
 
@@ -14,8 +13,8 @@ module therefore classifies at round level and never touches the answer path.
 
 Hard rules:
 * private ``reasoning_content`` is never a source here;
-* only a code-owned label is published; malformed or credential-like working
-  text does not create a progress note;
+* private protocol markup, structured payloads and credential-like text do not
+  create a progress note;
 * every failure here is swallowed: public progress must never block the agent.
 """
 
@@ -27,7 +26,7 @@ import os
 import re
 import uuid
 
-from src.core.progress_bus import PUBLIC_WORK_NOTES, _PUBLIC_WORK_NOTE, emit_progress, get_turn_scope
+from src.core.progress_bus import PUBLIC_WORK_NOTES, emit_progress, get_turn_scope
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +36,9 @@ MAX_CHARS = 400
 
 _ENV_FLAG = "CITRUS_PUBLIC_PROGRESS"
 
-# DSML / tool-protocol leakage (providers occasionally emit these as text).
-_DSML_BLOCK_RE = re.compile(
-    r"<[^>]{0,40}?\bDSML\b[^>]{0,40}?>.*?</[^>]{0,40}?\bDSML\b[^>]{0,40}?>",
-    re.I | re.S)
-_PROTOCOL_TAG_RE = re.compile(
-    r"</?\s*(?:[|｜]{1,2}\s*DSML\s*[|｜]{1,2}\s*)?(?:calls|invoke|parameter)\b[^>]*>",
-    re.I)
+_PRIVATE_TEXT_RE = re.compile(
+    r'</?\s*(?:think|analysis|reasoning|tool_calls?|tool_result|calls|invoke|parameter|function)\b'
+    r'|\bDSML\b|\bBearer\s+\S+|(?:\{|,)\s*"[^"]+"\s*:', re.I)
 _TOOL_MARKER_RE = re.compile(r"\[(?:TOOL_[A-Z_]+|[Ww]?\d{1,3})\]")
 
 # Credential-ish material must never reach the timeline.
@@ -51,6 +46,8 @@ _SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
     re.compile(r"(?i)\bapi[_\- ]?key\b\s*[:=]"),
     re.compile(r"(?i)\b(?:password|passwd|secret|token)\b\s*[:=]\s*\S+"),
+    re.compile(r"(?:密码|密钥|访问令牌)\s*[：:=]\s*\S+"),
+    re.compile(r"\bhttps?://[^/\s:@]+:[^/\s@]+@", re.I),
     re.compile(r"\b[A-Fa-f0-9]{40,}\b"),
     re.compile(r"\b[A-Za-z0-9+/]{60,}={0,2}\b"),
 )
@@ -75,22 +72,56 @@ def enabled() -> bool:
 
 def sanitize(text: str) -> str:
     """Return a single-line, bounded, credential-free public note or ``\"\"``."""
-    raw = str(text or "")
-    if not raw.strip() or _COMPLETION_RE.search(raw):
+    if not isinstance(text, str) or len(text) > 16_000:
         return ""
-    cleaned = _DSML_BLOCK_RE.sub(" ", raw)
-    cleaned = _PROTOCOL_TAG_RE.sub("", cleaned)
-    cleaned = _TOOL_MARKER_RE.sub("", cleaned)
+    raw = text.strip()
+    if (not raw or raw.startswith(("{", "[")) or "```" in raw
+            or _COMPLETION_RE.search(raw) or _PRIVATE_TEXT_RE.search(raw)):
+        return ""
+    cleaned = _TOOL_MARKER_RE.sub("", raw)
     for pattern in _SECRET_PATTERNS:
         if pattern.search(cleaned):
             return ""
-    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
+    from src.core.pii_mask import mask_sensitive
+    cleaned = _WHITESPACE_RE.sub(" ", mask_sensitive(cleaned)).strip()
     # Leading punctuation only ("…") is noise, not a note.
     if len(cleaned) <= 1:
         return ""
     if len(cleaned) > MAX_CHARS:
         cleaned = cleaned[: MAX_CHARS - 1].rstrip() + "…"
     return cleaned
+
+
+class PublicAnswerPreview:
+    def __init__(self):
+        self._prefix = ""
+        self._published = False
+        self._closed = False
+
+    def append(self, chunk: str) -> None:
+        if self._closed or self._published:
+            return
+        if len(self._prefix) + len(chunk) > MAX_CHARS:
+            self._closed = True
+            return
+        self._prefix += chunk
+        boundary = max(self._prefix.rfind(char) for char in "。！？!?\n ")
+        if boundary < 48:
+            return
+        self._closed = True
+        text = sanitize(self._prefix[:boundary + 1]) if sanitize(self._prefix) else ""
+        if text:
+            from src.core.progress_bus import emit_answer_start, emit_text
+            emit_answer_start()
+            emit_text(text)
+            self._published = True
+
+    def clear(self) -> None:
+        self._closed = True
+        if self._published:
+            from src.core.progress_bus import emit_text_reset
+            emit_text_reset()
+            self._published = False
 
 
 def emit_retrieval_stage(stage: str) -> None:
@@ -121,15 +152,14 @@ def public_content_text(content) -> str:
 def public_progress_text(chunks, has_tool_calls: bool) -> str:
     """Classify one model round: working note vs final answer.
 
-    Only retain the presence of working text, not its content. The final
-    round produces no progress note and still uses the answer path.
+    The final round produces no progress note and uses the answer path.
     """
     if not has_tool_calls:
         return ""
     if not chunks:
         return ""
     try:
-        return _PUBLIC_WORK_NOTE if sanitize(public_content_text(chunks)) else ""
+        return sanitize(public_content_text(chunks))
     except Exception:  # noqa: BLE001 - progress must never break execution
         return ""
 
@@ -145,9 +175,9 @@ def emit_public_progress(text: str, *, step_id: str = "",
     """
     try:
         label = PUBLIC_WORK_NOTES.get(category)
-        if not enabled() or (not label and not sanitize(text)):
+        note = label or sanitize(text)
+        if not enabled() or not note:
             return False
-        note = label or _PUBLIC_WORK_NOTE
         from src.core.tracing import get_job_id
         job_id = str(job_id or get_job_id() or "")
         scope = (*get_turn_scope(), job_id)

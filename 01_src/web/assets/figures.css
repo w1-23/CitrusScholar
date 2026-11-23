@@ -240,6 +240,11 @@ button.editor-guide { padding: 0; border: 0; background: transparent; font: inhe
 .editor-guide:hover { color: var(--accent); }
 .section-title { font-size: 12px; font-weight: 600; margin: 0 0 14px; }
 .section-title.spaced { margin-top: 25px; }
+.figure-advanced { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--line); }
+.figure-advanced > summary { cursor: pointer; font-size: 12px; font-weight: 600; }
+.figure-advanced #figureQaChecks > details { margin: 8px 0; font-size: 11px; }
+.figure-advanced #figureQaChecks summary { cursor: pointer; }
+.figure-qa-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
 .canvas-facts { margin: 0 0 16px; }
 .canvas-facts > div { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; font-size: 11px; }
 .canvas-facts dt { color: var(--muted); }

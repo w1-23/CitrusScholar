@@ -11,7 +11,9 @@ from pathlib import Path
 import time
 
 from .identity import ExecutionIdentity
-from .checkpoint_store import checkpoint_path, checkpoint_scope, open_checkpoint
+from .checkpoint_store import (checkpoint_path, checkpoint_scope, open_checkpoint,
+                               native_checkpoint_path, native_checkpoint_scope,
+                               open_native_checkpoint)
 from src.core.task_events import TaskConflict
 
 # Only stable server-prepared request/context fields are recoverable. Runtime
@@ -60,16 +62,23 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
     The wait argument is never accepted from an HTTP body. Its values come from
     the Host suspension or the durable parked segment, under the original fence.
     """
-    if not checkpoint_path(root, identity, provider_scope).is_file():
+    from .deep_agent_runtime import EXECUTOR_ID, NATIVE_EXECUTOR_ID
+
+    native = not checkpoint_path(root, identity, provider_scope).is_file()
+    if native and not native_checkpoint_path(root, identity, provider_scope).is_file():
         raise TaskConflict("recovery_checkpoint_missing")
-    async with open_checkpoint(root, identity, provider_scope) as saver:
-        saved = await saver.aget_tuple({"configurable": checkpoint_scope(identity, provider_scope)})
+    opener = open_native_checkpoint if native else open_checkpoint
+    scope = native_checkpoint_scope if native else checkpoint_scope
+    executor_id = NATIVE_EXECUTOR_ID if native else EXECUTOR_ID
+    async with opener(root, identity, provider_scope) as saver:
+        saved = await saver.aget_tuple({"configurable": scope(identity, provider_scope)})
         if saved is None:
             raise TaskConflict("recovery_checkpoint_missing")
-        from .deep_agent_runtime import EXECUTOR_ID
         raw_values = saved.checkpoint.get("channel_values", {})
-        if not isinstance(raw_values, dict) or raw_values.get("executor_id") != EXECUTOR_ID:
+        if not isinstance(raw_values, dict) or raw_values.get("executor_id") != executor_id:
             raise TaskConflict("executor_checkpoint_incompatible")
+        if native and raw_values.get("active_run_id") != identity.run_id:
+            raise TaskConflict("recovery_identity_mismatch")
         from langgraph.graph import END, START, StateGraph
         from .harness import HarnessState
         # A schema-only reader has no model, executor, tools or policy hooks.

@@ -314,16 +314,21 @@
     var url = '/api/v2/session/' + encodeURIComponent(sid) +
               '/turn-sources?request_id=' + encodeURIComponent(rid);
 
+    function ownsSources() {
+      return window.sessionId === sid && bubble.isConnected !== false &&
+        bubble.getAttribute('data-cr-sources') === 'loading:' + rid;
+    }
     function attempt(index, checks, finalRecheck) {
-      if (bubble.getAttribute('data-cr-sources') === 'loaded:' + rid) return;
+      if (!ownsSources()) return;
       fetch(url, { credentials: 'same-origin' })
         .then(function (r) {
           return r.json().catch(function () { return {}; })
             .then(function (payload) { return { ok: r.ok, status: r.status, payload: payload }; });
         })
         .then(function (res) {
+          if (!ownsSources()) return;
           var list = (res.ok && res.payload && res.payload.sources) || [];
-          if (list.length && renderTurnSources(bubble, list)) {
+          if (Array.isArray(list) && list.length && renderTurnSources(bubble, list)) {
             bubble.setAttribute('data-cr-sources', 'loaded:' + rid);
             return;
           }
@@ -355,6 +360,7 @@
           }
         })
         .catch(function () {
+          if (!ownsSources()) return;
           if (index + 1 < SOURCE_RETRY_DELAYS.length) {
             bubble.setAttribute('data-cr-sources', 'loading:' + rid);
             setTimeout(function () { attempt(index + 1, checks, finalRecheck); }, SOURCE_RETRY_DELAYS[index + 1]);
@@ -380,34 +386,62 @@
     }
   }
 
+  function sourceIdentity(item) {
+    var keys = [];
+    if (item.kind === 'shared' && item.read_ref && item.read_ref.document_id) {
+      var ref = item.read_ref;
+      return ['shared:' + JSON.stringify([ref.document_id, ref.version_id, ref.index_generation])];
+    }
+    var url = safeWebUrl(item.url);
+    if (item.kind === 'local' && item.record_key) keys.push('local:' + item.record_key);
+    else if (item.kind !== 'web' || !url) return [];
+    if (url) keys.push('url:' + url.split('#')[0]);
+    var doi = String(item.doi || '').trim().toLowerCase()
+      .replace(/^https?:\/\/(?:dx\.)?doi\.org\//, '').replace(/^doi:\s*/, '');
+    if (!doi && url && /^https?:\/\/(?:dx\.)?doi\.org\//i.test(url)) {
+      doi = new URL(url).pathname.slice(1).toLowerCase();
+    }
+    if (/^10\.\d+\//.test(doi)) keys.push('doi:' + doi);
+    return keys;
+  }
+
   function renderTurnSources(bubble, list) {
     var old = bubble.querySelector('.cr-turn-sources');
-    if (old && old.parentNode) old.parentNode.removeChild(old);
     var shared = [], currentLocals = [], currentWebs = [], historyLocals = [], historyWebs = [];
-    for (var i = 0; i < (list || []).length; i++) {
-      var item = list[i] || {};
+    var seen = new Set(), count = 0;
+    var candidates = list.filter(Boolean);
+    var ordered = candidates.filter(function (item) { return item.origin !== 'history'; })
+      .concat(candidates.filter(function (item) { return item.origin === 'history'; }));
+    ordered.forEach(function (item) {
+      var keys = sourceIdentity(item);
+      if (!keys.length || keys.some(function (key) { return seen.has(key); })) return;
+      keys.forEach(function (key) { seen.add(key); });
+      count++;
       var historical = item.origin === 'history';
-      if (item.kind === 'shared' && item.read_ref) {
-        shared.push(item);
-      } else if (item.kind === 'web' && safeWebUrl(item.url)) {
-        (historical ? historyWebs : currentWebs).push(item);
-      } else if (item.kind === 'local' && item.record_key) {
-        (historical ? historyLocals : currentLocals).push(item);
-      }
-    }
-    if (!shared.length && !currentLocals.length && !currentWebs.length &&
-        !historyLocals.length && !historyWebs.length) return false;
+      if (item.kind === 'shared') shared.push(item);
+      else if (item.kind === 'local') (historical ? historyLocals : currentLocals).push(item);
+      else (historical ? historyWebs : currentWebs).push(item);
+    });
+    if (!count) return false;
+    if (old) old.remove();
 
-    var row = document.createElement('div');
+    var row = document.createElement('details');
     row.className = 'cr-turn-sources';
+    row.open = !!(old && old.open);
+    var summary = document.createElement('summary');
+    summary.textContent = '候选来源（' + count + '）';
+    row.appendChild(summary);
+    var chips = document.createElement('div');
+    chips.className = 'cr-ts-items';
+    row.appendChild(chips);
 
     function group(title, items, makeChip) {
       if (!items.length) return;
       var label = document.createElement('span');
       label.className = 'cr-ts-label';
       label.textContent = title;
-      row.appendChild(label);
-      for (var k = 0; k < items.length; k++) row.appendChild(makeChip(items[k]));
+      chips.appendChild(label);
+      for (var k = 0; k < items.length; k++) chips.appendChild(makeChip(items[k]));
     }
 
     function localChip(item) {

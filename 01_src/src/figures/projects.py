@@ -259,44 +259,54 @@ def script_replay_inputs(source: dict[str, Any], owner: int) -> tuple[dict, dict
 
 
 def _frozen_render_state(source: dict[str, Any]) -> dict:
-    """Only a separately rendered, verified numerical snapshot is style-editable."""
+    """Validate the renderer identity and immutable table bindings."""
     import hashlib
     import re
+    from citrus_figures.style_replay import REPLAY_ERRORS
     from src.figures.script_outputs import normalize_output_contract
+
     frozen = source.get("frozen_render")
+    if not isinstance(frozen, dict):
+        raise ProjectError("analysis_not_frozen", "脚本图缺少冻结分析结果和独立渲染脚本。", status=409)
     try:
         contract = normalize_output_contract(source.get("output_contract"))
         entry = next(item for item in contract["figures"] if item["name"] == source.get("output_key"))
+        renderer = entry["render_script"]
+        parents = entry["parents"]
         receipt = frozen["receipt"]
         snapshots = frozen["input_snapshots"]
-        parents = entry["parents"]
-        valid = (frozen["version"] == 1 and receipt["version"] == 1
-            and receipt["geometry_status"] == "supported"
-            and not receipt["geometry_unsupported"]
-            and re.fullmatch(r"[a-f0-9]{64}", receipt["geometry_sha256"])
-            and receipt["renderer_sha256"] == hashlib.sha256(entry["render_script"].encode("utf-8")).hexdigest()
-            and isinstance(receipt["data_sha256"], dict)
-            and set(receipt["data_sha256"]) == set(parents)
-            and all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value)
-                    for value in receipt["data_sha256"].values())
-            and len(snapshots) == len(parents)
-            and all(row["sha256"] == receipt["data_sha256"][row["variable"]] for row in snapshots)
-            and {row["variable"] for row in snapshots} == set(parents))
-        if not valid:
-            raise ValueError("invalid frozen render")
+        if frozen["version"] != 1 or receipt["version"] != 1 or not parents:
+            raise ValueError("unsupported freeze record")
     except (ValueError, KeyError, TypeError, StopIteration, AttributeError):
-        # Legacy receipts recorded plain Text labels as unsupported geometry.
-        # The current geometry check supports them, but the stored receipt is
-        # immutable evidence: say so instead of implying the figure is broken.
-        legacy = (isinstance(frozen, dict) and isinstance(frozen.get("receipt"), dict)
-                  and frozen["receipt"].get("geometry_unsupported") == ["unsupported artist: Text"])
-        message = ("这张图由旧版几何检查标记为不可编辑（普通文字标签），旧记录保持原样，不会被自动改写。"
-                   "请从现有原始脚本和冻结数据重新生成当前渲染版本后再做样式修改；原图仍可下载。"
-                   if legacy else
-                   "这张脚本图尚无可验证的冻结分析与独立渲染结果，不能安全地仅修改样式。"
-                   "请先保留原数据和分析结果，生成独立渲染版本；原图仍可下载。")
-        raise ProjectError("analysis_not_frozen", message, status=409) from None
+        raise ProjectError("frozen_render_invalid", "保存的冻结渲染合同或回执无效。", status=409) from None
+    if receipt.get("renderer_sha256") != hashlib.sha256(renderer.encode("utf-8")).hexdigest():
+        raise ProjectError("renderer_changed", REPLAY_ERRORS["renderer_changed"], status=409)
+    hashes = receipt.get("data_sha256")
+    if (not isinstance(hashes, dict) or set(hashes) != set(parents)
+            or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value) for value in hashes.values())
+            or not isinstance(snapshots, list) or len(snapshots) != len(parents)
+            or any(not isinstance(row, dict) or not isinstance(row.get("variable"), str)
+                   or row["variable"] not in hashes or row.get("sha256") != hashes[row["variable"]] for row in snapshots)
+            or {row["variable"] for row in snapshots} != set(parents)):
+        raise ProjectError("frozen_data_changed", REPLAY_ERRORS["frozen_data_changed"], status=409)
     return frozen
+
+
+def _require_replay_evidence(receipt):
+    import re
+    from citrus_figures.style_replay import REPLAY_ERRORS, REPLAY_UNAVAILABLE, valid_baseline
+
+    baseline = receipt.get("style_replay")
+    if baseline is None:
+        legacy_digest = receipt.get("geometry_sha256")
+        if (receipt.get("geometry_status") != "supported" or receipt.get("geometry_unsupported") != []
+                or not isinstance(legacy_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", legacy_digest)):
+            code = "legacy_replay_evidence_unavailable"
+            raise ProjectError(code, REPLAY_ERRORS[code], status=409)
+    elif not valid_baseline(baseline):
+        reason = baseline.get("unavailable") if isinstance(baseline, dict) else None
+        code = reason if isinstance(reason, str) and reason in REPLAY_UNAVAILABLE else "replay_evidence_unavailable"
+        raise ProjectError(code, REPLAY_ERRORS[code], status=409)
 
 
 def _render_script(source: dict[str, Any], overrides: list[dict[str, Any]],
@@ -306,17 +316,16 @@ def _render_script(source: dict[str, Any], overrides: list[dict[str, Any]],
     """Replay only the independent renderer over verified frozen tables.
 
     The one-shot sandbox receives no original analysis script or raw inputs.
-    The complete numerical receipt must match before an edit is accepted.
+    The worker must verify the saved baseline and preserve its raw coordinates.
     An unavailable sandbox fails explicitly instead of serving a stale preview.
     """
     from src.figures.sandbox import SandboxJob, SandboxUnavailable, select_backend
 
     frozen = _frozen_render_state(source)
+    _require_replay_evidence(frozen["receipt"])
     # Style replay receives only the separated renderer and frozen tables.
     # The original analysis source remains provenance, never replay input.
     text = "pass"
-    if not str(source.get("script") or "").strip():
-        raise ProjectError("missing_script", "这张图缺少绘图脚本，无法重新渲染。")
 
     from src.config import settings
 
@@ -354,6 +363,7 @@ def _render_script(source: dict[str, Any], overrides: list[dict[str, Any]],
         qa_profile=source.get("qa_profile") or {}, outputs=outputs, overrides=overrides,
         output_contract=contract, output_key=output_key,
         base_overrides=existing or [], replay_overrides=True, render_mode=render_mode, dpi=_figure_dpi(),
+        expected_frozen_receipt=frozen["receipt"],
         timeout_sec=int(getattr(settings, "FIGURES_SANDBOX_TIMEOUT_SEC", 120) or 120),
         memory_mb=int(getattr(settings, "FIGURES_SANDBOX_MEMORY_MB", 1024) or 1024),
         cpus=str(getattr(settings, "FIGURES_SANDBOX_CPUS", "1.0") or "1.0"),
@@ -377,6 +387,19 @@ def _render_script(source: dict[str, Any], overrides: list[dict[str, Any]],
             from src.figures.script_outputs import validate_receipt
             report = validate_receipt(output_bytes["result"], contract,
                                       job_id=job.job_id, output_key=output_key)
+            from citrus_figures.style_replay import REPLAY_ERRORS
+            import re
+            for key in ("manifest", "overrides", *formats):
+                state = report["slots"][f"figure:{output_key}:{key}"]
+                if state["status"] != "ok":
+                    detail = state.get("error") or "工作器未返回图件输出。"
+                    known = {**REPLAY_ERRORS, "prop_not_editable": "", "unsupported_artist": "",
+                             "shared_legend_conflict": "", "ambiguous_legend": "", "unresolved_artist": "",
+                             "apply_failed": "", "override_acknowledgement_invalid": ""}
+                    match = re.fullmatch(r"\[([a-z_]+)\] (.+)", detail)
+                    if match and match[1] in known:
+                        raise ProjectError(match[1], known[match[1]] or match[2], status=409)
+                    raise ProjectError("render_output_failed", detail, status=409)
             output_bytes = {key: output_bytes[f"figure:{output_key}:{key}"]
                             for key in (*formats, "manifest", "overrides")}
         else:
@@ -385,8 +408,11 @@ def _render_script(source: dict[str, Any], overrides: list[dict[str, Any]],
         if len(manifest_bytes) > MAX_MANIFEST_BYTES:
             raise ValueError("manifest budget exceeded")
         manifest = json.loads(manifest_bytes.decode("utf-8"))
-        if manifest.get("frozen_render_receipt") != frozen["receipt"]:
-            raise ProjectError("render_data_changed", "渲染代码、冻结结果或图中数值发生变化，本次样式修改未保存。", status=409)
+        from citrus_figures.style_replay import REPLAY_ERRORS, replay_mismatch, typed_payload_sha256
+        actual_receipt = manifest.get("frozen_render_receipt") if isinstance(manifest, dict) else None
+        refusal = replay_mismatch(frozen["receipt"], actual_receipt)
+        if refusal:
+            raise ProjectError(refusal, REPLAY_ERRORS[refusal], status=409)
         if (not isinstance(report, dict) or (not contract and report.get("override_protocol") != 1)
                 or report.get("applied_count") != len(merge_overrides(existing or [], overrides))
                 or not isinstance(manifest, dict)
@@ -399,6 +425,10 @@ def _render_script(source: dict[str, Any], overrides: list[dict[str, Any]],
             raise ValueError("override response budget exceeded")
         accepted = json.loads(override_bytes.decode("utf-8"))
         _check_worker_overrides(accepted, merge_overrides(existing or [], overrides), manifest)
+        if manifest.get("style_replay_proof") != {
+                "coordinates_sha256": actual_receipt["style_replay"]["coordinates_sha256"],
+                "overrides_sha256": typed_payload_sha256(accepted)}:
+            raise ProjectError("override_acknowledgement_invalid", "工作器未确认坐标与样式修改的对应关系。", status=409)
         if render_mode != "preview" and source.get("version", 0) >= 2:
             from src.figures.spec import parse_qa_profile
             receipt = manifest.get("qa_receipt") or {}
@@ -578,18 +608,12 @@ def _can_edit(project: dict[str, Any]) -> bool:
         return project.get("source_kind", "spec") in {"spec", "svg"}
     source = project.get("source_json") or {}
     try:
-        _frozen_render_state(source)
+        _require_replay_evidence(_frozen_render_state(source)["receipt"])
     except ProjectError:
-        return False
-    # Legacy projects never recorded a reproducible input-name mapping. Do
-    # not drop declared dependencies and accidentally replay different data.
-    if source.get("inputs") or source.get("sources"):
-        return False
-    if project.get("data_refs_json") and "input_snapshots" not in source:
         return False
     from src.config import settings
     backend = str(getattr(settings, "FIGURES_SANDBOX_BACKEND", "") or "").lower()
-    return bool(source.get("script")) and (
+    return (
         (backend in {"docker", "wsl-docker", "apptainer"} and bool(getattr(settings, "FIGURES_SANDBOX_IMAGE", "")))
         or (backend == "local" and bool(getattr(settings, "FIGURES_SANDBOX_ALLOW_LOCAL", False))))
 
@@ -602,18 +626,11 @@ def edit_context(project: dict[str, Any]) -> dict[str, Any]:
     error = None
     if not editable and _is_script(project):
         try:
-            _frozen_render_state(source)
+            _require_replay_evidence(_frozen_render_state(source)["receipt"])
         except ProjectError as exc:
             error = {"code": exc.code, "message": exc.message}
         if error is None:
-            if source.get("inputs") or source.get("sources") or (
-                    project.get("data_refs_json") and "input_snapshots" not in source):
-                error = {"code": "input_mapping_unavailable",
-                         "message": "旧图件未保存可验证的输入名称映射，不能安全重放。"}
-            elif not source.get("script"):
-                error = {"code": "script_unavailable", "message": "图件未保存可重放的源脚本。"}
-            else:
-                error = {"code": "sandbox_unavailable", "message": "当前未配置可用的图件样式重绘沙箱。"}
+            error = {"code": "sandbox_unavailable", "message": "当前未配置可用的图件样式重绘沙箱。"}
     elif not editable:
         error = {"code": "source_not_editable", "message": "当前图件来源不支持样式重绘。"}
     bindings = {}
@@ -685,6 +702,21 @@ def _verify_sources(project: dict[str, Any], owner: int) -> None:
     from src.session import files as session_files
     import hashlib
     source = project.get("source_json") or {}
+    if _is_script(project):
+        frozen = _frozen_render_state(source)
+        _require_replay_evidence(frozen["receipt"])
+        snapshots = frozen["input_snapshots"]
+        pins = {ref.get("file_id"): ref.get("sha256") for ref in project.get("data_refs_json") or []
+                if isinstance(ref, dict) and ref.get("file_id")}
+        if any(not isinstance(row.get("file_id"), str) or pins.get(row["file_id"]) != row["sha256"]
+               for row in snapshots):
+            raise ProjectError("frozen_data_unpinned", "冻结表缺少本图件的固定数据引用。", status=409)
+        try:
+            script_replay_inputs({"input_snapshots": snapshots}, owner)
+        except ProjectError as exc:
+            codes = {"data_unavailable": "frozen_data_unavailable", "source_changed": "frozen_data_changed"}
+            raise ProjectError(codes.get(exc.code, exc.code), exc.message, status=409) from exc
+        return
     from src.figures.declarative_snapshot import load_snapshot, SnapshotError
     try:
         load_snapshot(source)
@@ -700,18 +732,6 @@ def _verify_sources(project: dict[str, Any], owner: int) -> None:
         except Exception as exc:
             raise ProjectError("analysis_unavailable", "保存的分析结果或数据版本无法验证，拒绝重放。") from exc
     refs = project.get("data_refs_json") or []
-    frozen = source.get("frozen_render")
-    if frozen is not None:
-        snapshots = frozen.get("input_snapshots") if isinstance(frozen, dict) else None
-        if (not isinstance(snapshots, list) or not snapshots
-                or any(not isinstance(row, dict) or not isinstance(row.get("file_id"), str)
-                       or not row["file_id"] or not isinstance(row.get("sha256"), str)
-                       or not row["sha256"] for row in snapshots)):
-            raise ProjectError("source_unverified", "冻结渲染数据引用格式无效。")
-        pins = {ref.get("file_id"): ref.get("sha256") for ref in refs if isinstance(ref, dict)}
-        if any(pins.get(row["file_id"]) != row["sha256"] for row in snapshots):
-            raise ProjectError("source_unverified", "冻结渲染数据缺少固定引用。")
-        script_replay_inputs({"input_snapshots": snapshots}, owner)
     pinned = {str(ref.get("file_id")): ref for ref in refs if isinstance(ref, dict) and ref.get("file_id")}
     spec = (project.get("source_json") or {}).get("spec") or {}
     if isinstance(spec, dict):
@@ -753,13 +773,6 @@ def _render_edits(project: dict[str, Any], owner: int, raw_overrides: Any,
     _verify_sources(project, owner)
     source = project.get("source_json") or {}
     if _is_script(project):
-        if (source.get("inputs") or source.get("sources")
-                or (project.get("data_refs_json") and "input_snapshots" not in source)):
-            raise ProjectError("script_inputs_unavailable", "脚本原始输入映射无法重建，不能重放；请重新生成图件。")
-        if source.get("input_snapshots"):
-            pinned = {ref.get("file_id"): ref.get("sha256") for ref in project.get("data_refs_json", []) if isinstance(ref, dict)}
-            if any(pinned.get(item.get("file_id")) != item.get("sha256") for item in source["input_snapshots"]):
-                raise ProjectError("source_unverified", "脚本输入快照缺少固定引用。")
         if not isinstance(raw_overrides, list) or any(not isinstance(item, dict) for item in raw_overrides):
             raise ProjectError("invalid_overrides", "修改必须是对象列表。")
         # Validate every submitted entry in the worker before merging; a bad
@@ -911,8 +924,6 @@ def preview_overrides(figure_id: str, owner: int, raw_overrides: Any,
     def validate():
         _assert_current(project, owner)
         _verify_sources(project, owner)
-        if _is_script(project):
-            script_replay_inputs(project.get("source_json") or {}, owner)
     def render():
         merged, _, manifest, blobs = _render_edits(project, owner, entries,
                                                    formats=("svg",), render_mode="preview")
@@ -938,8 +949,10 @@ def save_overrides(figure_id: str, owner: int, raw_overrides: Any,
     from src.figures.preview_pipeline import invalidate
     invalidate(owner, figure_id)
     revision = int(project.get("render_version") or 0)
+    previous_exports = project.get("exports_json") or {}
+    formats = tuple(fmt for fmt in FIGURE_FORMATS if fmt in DEFAULT_FORMATS or fmt in previous_exports)
     merged, changed, new_manifest, blobs = _render_edits(
-        project, owner, entries, formats=DEFAULT_FORMATS)
+        project, owner, entries, formats=formats)
     _confirm_edit_targets(new_manifest, targets)
 
     stem = project.get("title") or "figure"

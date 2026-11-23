@@ -188,43 +188,79 @@ def run(browser, origin, output):
         capture('answer')
         check('Only explicitly public progress is rendered',
               "document.querySelector('.research-process').textContent.includes('公开进度：正在核查列名') && !document.querySelector('#chat-container').textContent.includes('INTERNAL_FIXTURE_MARKER')")
-        check('Browse defaults off', "document.querySelector('#browse-requested').checked === false")
+        check('The single composer defaults to the running task and shows its version',
+              "document.querySelectorAll('.input-box textarea, .task-controls textarea').length === 1 "
+              "&& !document.querySelector('#composer-supplement').hidden "
+              "&& document.querySelector('#composer-task-target').title === 'browser-fixture-job' "
+              "&& document.querySelector('#composer-task-target').textContent.includes('任务版本 1') "
+              "&& document.querySelector('#composer-new-message').textContent === '作为新任务' "
+              "&& document.querySelector('#input-tools-menu').hidden && document.querySelector('#composer-browse').hidden")
+        browser.click('#composer-new-message')
+        check('The new-task override exposes attachments, Skills, and Browse with Browse off',
+              "document.querySelector('#composer-new-message').textContent === '补充当前任务' "
+              "&& !document.querySelector('#input-tools-menu').hidden && !document.querySelector('#composer-browse').hidden "
+              "&& !document.querySelector('#browse-requested').checked && document.activeElement.id === 'user-input'")
         fill('待发送的新消息草稿')
-        browser.click('.task-update-toggle')
-        check('Task update reuses the single composer and locks new-request controls',
-              "document.querySelectorAll('.input-box textarea, .task-controls textarea').length === 1 && !document.querySelector('#composer-supplement').hidden && document.querySelector('#input-tools-menu').hidden && document.querySelector('#composer-browse').hidden && document.activeElement.id === 'user-input'")
+        browser.click('#composer-new-message')
+        check('Returning to the active task keeps the separate new-task draft out of the composer',
+              "document.querySelector('#user-input').value === '' "
+              "&& document.querySelector('#composer-task-target').title === 'browser-fixture-job' "
+              "&& document.querySelector('#input-tools-menu').hidden && document.activeElement.id === 'user-input'")
         fill('被拒绝的补充')
         evaluate("experienceUpdateMode('conflict')")
         browser.click('#send-btn')
         check('Conflict preserves the update draft without queueing a new turn',
-              "experienceRequests().updates.length === 1 && experienceRequests().posts.length === 0 && document.querySelector('#user-input').value === '被拒绝的补充' && document.querySelector('#composer-task-status').textContent.includes('核对最新状态')")
+              "experienceRequests().updates.length === 1 && experienceRequests().updates[0].expected_version === 1 "
+              "&& experienceRequests().updates[0].instruction === '被拒绝的补充' && experienceRequests().posts.length === 0 "
+              "&& document.querySelector('#user-input').value === '被拒绝的补充' "
+              "&& document.querySelector('#composer-task-status').textContent.includes('草稿已保留') "
+              "&& !document.querySelector('#send-btn').disabled")
         fill('回执会丢失的补充')
         evaluate("experienceUpdateMode('lost', true)")
         browser.click('#send-btn')
         check('Lost update receipt uses its own ID and preserves the draft',
               "experienceRequests().updates.length === 2 && experienceRequests().lookups[0] === experienceRequests().updates[1].update_request_id && document.querySelector('#user-input').value === '回执会丢失的补充' && !document.querySelector('#send-btn').disabled")
         browser.call('Page.reload', ignoreCache=True)
-        check('Reload resumes in new-message mode and keeps that draft',
-              "document.querySelector('#user-input')?.value === '待发送的新消息草稿' && document.querySelector('#composer-supplement').hidden && document.querySelector('.task-update-toggle:not([hidden])')")
+        check('Reload keeps the separate new-task draft and offers the active task',
+              "document.querySelector('#user-input')?.value === '待发送的新消息草稿' "
+              "&& !document.querySelector('#composer-supplement').hidden "
+              "&& document.querySelector('#composer-new-message').textContent === '补充当前任务'")
         evaluate("experienceUpdateMode('lost', false)")
-        browser.click('.task-update-toggle')
-        check('Lookup after reload confirms the original update without reposting',
-              "experienceRequests().updates.length === 2 && experienceRequests().lookups.at(-1) === experienceRequests().updates[1].update_request_id && document.querySelector('#user-input').value === '' && !document.querySelector('#send-btn').disabled")
+        browser.click('#composer-new-message')
+        check('Lookup after reload confirms receipt of the original update without reposting',
+              "experienceRequests().updates.length === 2 && experienceRequests().posts.length === 0 "
+              "&& experienceRequests().lookups.at(-1) === experienceRequests().updates[1].update_request_id "
+              "&& document.querySelector('#user-input').value === '' && !document.querySelector('#send-btn').disabled "
+              "&& document.querySelector('#composer-task-target').textContent.includes('任务版本 2') "
+              "&& document.querySelector('#composer-task-status').textContent.includes('已接收第 2 版补充，等待应用')")
+        evaluate('experienceApplyUpdates()')
+        check('The application watermark changes the receipt message to applied',
+              "document.querySelector('#composer-task-status').textContent.includes('已应用第 2 版要求')")
         fill('终态保留的补充草稿')
         switch_session('另一个会话')
         check('Different session receives an independent new-message draft',
               "document.querySelector('#user-input').value === '' && document.querySelector('#composer-supplement').hidden")
         fill('另一个会话的草稿')
         switch_session('表格核对')
-        check('Returning restores only the original new-message draft',
-              "document.querySelector('#user-input').value === '待发送的新消息草稿' && document.querySelector('.task-update-toggle:not([hidden])')")
-        browser.click('.task-update-toggle')
+        check('Returning restores the original new-task draft',
+              "document.querySelector('#user-input').value === '待发送的新消息草稿' "
+              "&& document.querySelector('#composer-new-message').textContent === '补充当前任务'")
+        browser.click('#composer-new-message')
         check('The same job restores its own update draft', "document.querySelector('#user-input').value === '终态保留的补充草稿'")
         phase('done')
         check('Terminal state displays completion', "document.querySelector('.turn-answer[data-display-status=completed]') && !document.querySelector('.is-running') && true")
         capture('completed')
-        check('Terminal job restores new-message mode and makes the unsubmitted update readable',
-              "document.querySelector('#composer-supplement').hidden && document.querySelector('#user-input').value === '待发送的新消息草稿' && document.querySelector('.task-update-recovery:not([hidden]) p').textContent === '终态保留的补充草稿'")
+        check('Terminal race keeps the supplement pinned and blocks sending it to another task',
+              "document.querySelector('#composer-task-target').title === 'browser-fixture-job' "
+              "&& document.querySelector('#user-input').value === '终态保留的补充草稿' "
+              "&& document.querySelector('#send-btn').disabled && experienceRequests().posts.length === 0 "
+              "&& document.querySelector('.task-update-recovery:not([hidden]) p')?.textContent === '终态保留的补充草稿'")
+        browser.click('#composer-new-message')
+        check('Explicitly switching after terminal restores the separate new-task draft',
+              "document.querySelector('#composer-supplement').hidden "
+              "&& document.querySelector('#user-input').value === '待发送的新消息草稿' "
+              "&& !document.querySelector('#send-btn').disabled "
+              "&& document.querySelector('.task-update-recovery:not([hidden]) p')?.textContent === '终态保留的补充草稿'")
         browser.click('#input-tools-menu summary')
         check('The plus menu exposes attachment selection and the real methods catalog',
               "document.querySelector('#attachment-btn') && document.querySelector('[data-skill-id=data-audit]')")
@@ -304,6 +340,9 @@ def run(browser, origin, output):
         for expected in (60, 90, 120, 122):
             browser.click('#loadMoreProjects')
             check(f'Project paging reaches {expected} entries', f"document.querySelectorAll('#projectList [data-open]').length === {expected}")
+        check('Desktop import opens on entry', "!document.querySelector('#importPanel').hidden && document.querySelector('#importToggle').getAttribute('aria-expanded') === 'true'")
+        browser.click('#importToggle')
+        check('The import panel can be collapsed', "document.querySelector('#importPanel').hidden")
         browser.click('#importToggle')
         check('CSV origin bytes are shown before mapping', "document.querySelector('#importPreviewBody')?.textContent.includes('north, south') && !document.querySelector('#importMapping').disabled")
         evaluate("const picker = document.querySelector('#dataFileSelect'); picker.value = 'workbook'; picker.dispatchEvent(new Event('change',{bubbles:true}));")

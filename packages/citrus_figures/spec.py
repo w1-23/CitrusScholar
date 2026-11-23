@@ -437,7 +437,7 @@ def parse_qa_profile(raw: Any) -> dict[str, Any]:
     """Explicit project QA thresholds; names do not imply journal certification."""
     if raw is None or raw == "":
         return {}
-    allowed = {"name", "final_size_mm", "min_font_pt", "min_linewidth_pt", "caption"}
+    allowed = {"name", "final_size_mm", "min_font_pt", "min_linewidth_pt", "caption", "journal_strict"}
     if not isinstance(raw, dict) or set(raw) - allowed:
         raise SpecError("invalid_profile", "qa_profile 含有未知字段。")
     name = str(raw.get("name") or "scientific")
@@ -447,6 +447,10 @@ def parse_qa_profile(raw: Any) -> dict[str, Any]:
     out = {"name": name, "min_font_pt": _number(raw.get("min_font_pt", 5), 1, 24, "min_font_pt"),
            "min_linewidth_pt": _number(raw.get("min_linewidth_pt", 0.5), 0.1, 4, "min_linewidth_pt"),
            "caption": _text(raw.get("caption"), 4000, "caption")}
+    if "journal_strict" in raw:
+        if type(raw["journal_strict"]) is not bool:
+            raise SpecError("invalid_profile", "journal_strict 必须为布尔值。")
+        out["journal_strict"] = raw["journal_strict"]
     size = raw.get("final_size_mm")
     if size is not None:
         if not isinstance(size, (list, tuple)) or len(size) != 2:

@@ -296,6 +296,21 @@ def storage_integrity(row: dict) -> dict:
     }
 
 
+def _authorized_result_session() -> str:
+    from src.core.tracing import get_session_id, get_user_id
+    from src.core.resource_access import PRIVATE_FILE, authorize_resource
+    from src.session.manager import session_manager
+
+    uid, sid = get_user_id(), get_session_id()
+    if type(uid) is not int or uid <= 0 or not sid:
+        raise PermissionError("result_access_denied")
+    decision = authorize_resource(PRIVATE_FILE, {"user_id": uid},
+                                  owner_user_id=session_manager.get_session_owner(sid))
+    if not decision.allowed:
+        raise PermissionError("result_access_denied")
+    return sid
+
+
 def fetch_for_current_request(tool_call_id: str, *, strict: bool = False) -> dict | None:
     """Owner + session scoped read, using authenticated server context only.
 
@@ -304,22 +319,14 @@ def fetch_for_current_request(tool_call_id: str, *, strict: bool = False) -> dic
     Strict readback distinguishes a rejected current scope or storage error.
     Missing IDs and IDs elsewhere in an authorized scope remain indistinguishable.
     """
-    from src.core.tracing import get_session_id, get_user_id
-    from src.core.resource_access import PRIVATE_FILE, authorize_resource
-    from src.session.manager import session_manager
-    uid, sid = get_user_id(), get_session_id()
+    try:
+        sid = _authorized_result_session()
+    except PermissionError:
+        if strict:
+            raise
+        return None
     cid = str(tool_call_id or "").strip()
-    if not uid or uid <= 0 or not sid:
-        if strict:
-            raise PermissionError("result_access_denied")
-        return None
     if not cid:
-        return None
-    decision = authorize_resource(PRIVATE_FILE, {"user_id": uid},
-                                  owner_user_id=session_manager.get_session_owner(sid))
-    if not decision.allowed:
-        if strict:
-            raise PermissionError("result_access_denied")
         return None
     try:
         ensure_schema()
@@ -334,6 +341,35 @@ def fetch_for_current_request(tool_call_id: str, *, strict: bool = False) -> dic
             raise
         logger.debug("tool_results scoped read failed: %s", type(exc).__name__)
         return None
+
+
+def fetch_workbook_snapshot(snapshot_key: str) -> tuple[str, dict] | None:
+    if not isinstance(snapshot_key, str) or re.fullmatch(r"[a-f0-9]{64}", snapshot_key) is None:
+        return None
+    try:
+        session = _authorized_result_session()
+        ensure_schema()
+        with _connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM tool_results WHERE session_id=? AND tool_name='inspect_uploaded_table' "
+                "AND status='complete' AND retained=1 AND truncated=0 AND result_chars<=32000 "
+                "AND instr(result_text, ?) > 0 ORDER BY created_at DESC, rowid DESC LIMIT 8",
+                (session, snapshot_key)).fetchall()
+        for stored in rows:
+            record = dict(stored)
+            if not storage_integrity(record)["complete"]:
+                continue
+            try:
+                snapshot = json.loads(record["result_text"])
+            except (ValueError, RecursionError):
+                continue
+            ref = snapshot.get("snapshot_ref") if isinstance(snapshot, dict) else None
+            if isinstance(ref, dict) and ref.get("key") == snapshot_key:
+                return record["tool_call_id"], snapshot
+    except (PermissionError, sqlite3.Error) as exc:
+        logger.debug("workbook snapshot lookup unavailable: %s", type(exc).__name__)
+    return None
 
 
 def fetch(tool_call_id: str) -> dict | None:

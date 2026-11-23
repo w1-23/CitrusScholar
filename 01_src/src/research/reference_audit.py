@@ -177,14 +177,14 @@ def _view(conn, audit, *, offset=0, limit=100):
     pending = total - processed
     complete = bool(total and not pending and not retryable and not counts.get('not_checked')
                     and not counts.get('network_error') and inventory['extraction']['status'] == 'complete')
-    processing_complete = bool(total and not pending and not retryable)
+    processing_complete = bool(total and not pending)
     review_required = bool(inventory['extraction']['status'] != 'complete'
                            or verdict_counts['correction_required'] or verdict_counts['not_confirmed'])
     terminal = processing_complete and not audit['cancelled']
-    status = ('completed_with_review' if review_required else 'complete') if terminal else audit['status']
+    status = ('completed_with_review' if (review_required or retryable) else 'complete') if terminal else audit['status']
     has_budget = audit['requests_used'] < audit['request_limit']
     retry_optional = bool(total and not pending and retryable and not stale)
-    next_action = ('export_and_review' if terminal and review_required else 'export' if terminal
+    next_action = ('export_and_review' if terminal and (review_required or retryable) else 'export' if terminal
                    else 'budget_exhausted_export_partial' if not has_budget
                    else 'export_and_review' if retry_optional
                    else 'resume' if audit['cancelled'] or (retryable and not pending)
@@ -197,7 +197,7 @@ def _view(conn, audit, *, offset=0, limit=100):
     return {'schema': 'reference_audit/2', 'audit_id': audit['id'],
             'status': status, 'source': inventory['source'],
             'terminal': terminal, 'review_required': review_required,
-            'next_action': next_action, 'can_resume': bool(not terminal and has_budget and (pending or retryable)),
+            'next_action': next_action, 'can_resume': bool(has_budget and (pending or retryable)),
             'export_ready': True, 'retry_optional': retry_optional,
             'parser_version': inventory['parser_version'], 'rule_version': RULE_VERSION,
             'extraction': inventory['extraction'], 'counts': counts, 'verdict_counts': verdict_counts,
@@ -212,16 +212,15 @@ def _view(conn, audit, *, offset=0, limit=100):
                      for item, entry, result, verdict in row_data[offset:offset + limit]],
             'offset': offset, 'next_offset': offset + limit if offset + limit < total else None,
             'created_at': audit['created'], 'updated_at': audit['updated'],
-            'summary': ('库存条目均已尝试，待人工复核解析或字段结果；请导出此 audit_id 的全量证据，无需反复 resume。'
+            'summary': ('库存条目均已尝试；来源错误或未确认结论保留在报告中。如需重试，显式 resume=True，仍服从剩余预算；无需为交付持续续跑。'
+                        if terminal and retry_optional else
+                        '库存条目均已尝试，待人工复核解析或字段结果；请导出此 audit_id 的全量证据，无需反复 resume。'
                         if terminal and review_required else
-                        '全部库存条目均已尝试，但来源错误仍未解决；请先按此 audit_id 导出完整证据并人工复核。'
-                        '如需重试，显式 resume=True，仍服从剩余预算；无需为交付持续续跑。'
-                        if retry_optional else
                         '登记记录与字段准确性分开呈现；未查到、解析遗漏或联网失败不能证明文献虚构。'),
-            '_tool_outcome': {'status': 'complete' if terminal and complete else 'partial',
-                              'reason_code': 'audit_completed_with_review' if terminal and complete and review_required
-                              else 'audit_complete' if terminal and complete
-                              else 'reference_extraction_incomplete' if terminal
+            '_tool_outcome': {'status': 'complete' if terminal else 'partial',
+                              'reason_code': 'audit_completed_with_review' if terminal and (review_required or retryable)
+                              else 'audit_complete' if terminal
+                              else 'reference_extraction_incomplete' if processing_complete
                               else 'reference_coverage_incomplete',
                               'artifacts': [], 'result_refs': [{'kind': 'reference_audit', 'audit_id': audit['id']}]}}
 
@@ -545,7 +544,7 @@ def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resum
                 result['run_reason'] = 'cancelled_use_resume'
                 return result
             view = _view(conn, audit)
-            if view['terminal']:
+            if view['terminal'] and not (resume and view['coverage']['retryable']):
                 view['run_reason'] = 'already_completed'
                 view['processed_indices'] = []
                 return view

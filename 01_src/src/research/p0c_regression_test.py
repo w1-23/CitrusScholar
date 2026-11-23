@@ -219,20 +219,23 @@ class P0CRegressionTests(unittest.TestCase):
             step = service.run_audit(5, 'test', audit_id, max_rows=20)
             assert step['processed_indices'] == list(range(i * 20, i * 20 + 20))
             journal.append(_record(step, f'call-{i}'))
-        assert step['coverage']['pending'] == 0 and step['coverage']['retryable'] == 1 and not step['terminal']
-        assert service.run_audit(5, 'test', audit_id)['processed_indices'] == []
+        assert step['coverage']['pending'] == 0 and step['coverage']['retryable'] == 1 and step['terminal']
+        already = service.run_audit(5, 'test', audit_id)
+        assert already['processed_indices'] == [] and already['run_reason'] == 'already_completed'
         from src.research.reference_tools import verify_uploaded_references
         with patch('src.core.tracing.get_user_id', return_value=5), patch('src.core.tracing.get_session_id', return_value='test'):
             report = json.loads(verify_uploaded_references.invoke({'audit_id': audit_id}))
         assert report['audit_status']['ready_for_report']
+        assert report['terminal'] is True
         assert report['coverage']['retryable'] == 1 and not report['coverage']['complete']
-        assert report['_tool_outcome']['reason_code'] == 'reference_identity_report_ready_with_source_gaps'
+        assert report['_tool_outcome']['reason_code'] == 'audit_completed_with_review'
         assert report['_tool_outcome']['status'] == 'complete'
         assert report['budget']['requests_used'] == 100
         report_record = _record(report, 'report')
         effective = effective_tool_records([*journal, report_record])
         assert all(row['reason'] == 'cumulative_identity_report_ready' for row in effective[:-2])
-        assert effective[-2]['status'] == 'partial'
+        assert effective[-2]['status'] == 'complete' and effective[-2]['reason'] == 'audit_completed_with_review'
+        assert effective[-1]['status'] == 'complete' and effective[-1]['reason'] == 'audit_completed_with_review'
         assert journal[0]['status'] == 'partial'
         other_report = _record({**report, 'audit_id': 'f' * 32}, 'other-report')
         assert effective_tool_records([journal[0], other_report])[0]['status'] == 'partial'
@@ -275,7 +278,10 @@ class P0CRegressionTests(unittest.TestCase):
             exported.close()
         other = {**settled, 'audit_id': 'f' * 32}
         assert effective_tool_records([journal[0], _record(other, 'other')])[0]['status'] == 'partial'
-        bad_publish = {**step, 'export_status': 'failed'}
+        bad_publish = {**step, 'terminal': False, 'export_status': 'failed',
+                       '_tool_outcome': {**step['_tool_outcome'], 'status': 'partial',
+                                         'reason_code': 'publication_failed'},
+                       'coverage': {**step['coverage'], 'processing_complete': False}}
         assert effective_tool_records([_record(bad_publish, 'bad'), journal[-1]])[0]['status'] == 'partial'
 
     def test_compact_reference_batch_reaches_the_model_without_readback(self):

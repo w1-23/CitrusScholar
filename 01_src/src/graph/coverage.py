@@ -380,6 +380,10 @@ def _modern_audit_scope(record, receipt):
     reason = record.get("reason") or record.get("reason_code")
     if reason != receipt.get("reason_code"):
         return None
+    if (reason == "audit_completed_with_review"
+            and record.get("status") == "complete" and payload.get("terminal") is True
+            and scope.get("processing_complete") is True and not pending and retryable):
+        return identity, "reportable"
     if (reason in {"audit_complete", "audit_completed_with_review"}
             and record.get("status") == "complete" and payload.get("terminal") is True
             and scope.get("complete") is True and scope.get("processing_complete") is True

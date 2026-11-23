@@ -4,7 +4,7 @@
   "baseline_commit": "9130e336c863600c934d892913fbb7d6f04a3832",
   "baseline_tree": "b8cbb7dfcb796df604c823fa81543a967e25d7a9",
   "parent_candidate_commit": "9e58a97d8f961c103fc07cdb712599b8fc9ce6a0",
-  "integrated_branch_commit": "1c43808",
+  "integrated_branch_commit": "69763ac",
   "source": "Remote integrated candidate: stability freeze 9e58a97 + review/linux-8042-verified backend features + dual-source retrieval prompt",
   "inventory_scope": "Candidate source files excluding this manifest and transient Python bytecode.",
   "members": {
@@ -37,6 +37,11 @@
       "bytes": 10608,
       "executable": false,
       "sha256": "0c66a312ef6b298c93c73b4b6920e586857ad516b9c87a56f19b5c00fdf6b6c6"
+    },
+    "conftest.py": {
+      "bytes": 506,
+      "executable": false,
+      "sha256": "4142fece10c0fdbf600c9e191590351f5e963f699cf383406a82d2096e80b773"
     },
     "pyproject.toml": {
       "bytes": 1295,

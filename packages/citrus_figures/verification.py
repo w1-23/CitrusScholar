@@ -5,7 +5,7 @@ import hashlib
 import json
 import tempfile
 from pathlib import Path
-from .nature_runtime import COMMIT, SKILL_VERSION, load_module
+from .nature_runtime import COMMIT, SKILL_VERSION, load_module, validate_vendor
 
 CHECKS = ("format_integrity", "source_preflight", "panel_alignment", "pdf_text", "pdf_collisions", "svg_schematic", "visual")
 DEFAULT_BLOCKING = ("format_integrity",)
@@ -207,13 +207,19 @@ def verify_current_figure(*, artifacts, source=None, layout_manifest=None, figur
     blocking = [r["check"] for r in receipts if r["check"] in blocking_checks and r["conclusion"] == "fail"]
     advisory = [r["check"] for r in receipts if r["conclusion"] == "warn" or (r["conclusion"] == "fail" and r["check"] not in blocking_checks)]
     conclusion = "error" if errors else "fail" if blocking else "incomplete" if unexecuted else "warn" if advisory else "pass"
+    vendor_commit = COMMIT
+    if vendor_root is not None:
+        try:
+            vendor_commit = validate_vendor(vendor_root, verify_files=False)["commit"]
+        except (OSError, ValueError, KeyError, TypeError):
+            vendor_commit = None
     receipt = {"version": 2, "mode": mode, "skill": "nature-figure", "skill_version": SKILL_VERSION,
-               "vendor_commit": COMMIT, "artifacts": [r[0] for r in rows], "checks": receipts, "errors": errors,
+               "vendor_commit": vendor_commit, "artifacts": [r[0] for r in rows], "checks": receipts, "errors": errors,
                "overall": {"execution": "partial" if unexecuted and any(r["executed"] != "not_run" for r in receipts) else "not_started" if unexecuted else "complete",
                            "conclusion": conclusion, "blocking": blocking, "advisory": advisory, "unexecuted": unexecuted,
                            "claims": ["Checks certify only listed hashes and stated coverage.", "Visual inspection was not run: no visual model capability supplied."] if visual_inspector is None else ["Visual inspector supplied explicitly."]},
                "policy": {"blocking_checks": sorted(blocking_checks), "journal_strict": journal_strict}}
     if supersedes:
         receipt["supersedes"] = supersedes
-    receipt["receipt_id"] = sha256(json.dumps(receipt, sort_keys=True, ensure_ascii=False, default=str).encode())
+    receipt["receipt_id"] = sha256(json.dumps(receipt, sort_keys=True, ensure_ascii=False, allow_nan=False).encode())
     return receipt

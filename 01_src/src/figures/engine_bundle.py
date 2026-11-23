@@ -25,7 +25,7 @@ SUPPORT_VERSION = "2.0.0"
 SUPPORT_PACKAGES = frozenset({"citrus_audit", "citrus_figures"})
 
 
-def _support_files() -> dict[str, bytes]:
+def _support_files(packages=SUPPORT_PACKAGES) -> dict[str, bytes]:
     """Stage the installed, non-editable wheel and verify every RECORD hash.
 
     This is the common source for Docker, image refresh and Apptainer. Never
@@ -49,7 +49,7 @@ def _support_files() -> dict[str, bytes]:
     for entry in distribution.files or ():
         name = entry.as_posix()
         parts = PurePosixPath(name).parts
-        if not parts or parts[0] not in SUPPORT_PACKAGES or not name.endswith(".py"):
+        if not parts or parts[0] not in packages or not name.endswith(".py"):
             continue
         if any(part in {".", "..", "tests", "__pycache__"} for part in parts):
             raise ValueError("Invalid support wheel member: " + name)
@@ -60,7 +60,7 @@ def _support_files() -> dict[str, bytes]:
         if digest != entry.hash.value or len(data) != entry.size:
             raise ValueError("Installed support wheel integrity mismatch: " + name)
         result[name] = data
-    if any(package + "/__init__.py" not in result for package in SUPPORT_PACKAGES):
+    if any(package + "/__init__.py" not in result for package in packages):
         raise ValueError("Support wheel execution package missing")
     record = distribution.read_text("RECORD")
     if not record:
@@ -81,6 +81,22 @@ def bundle_files() -> dict[str, bytes]:
     result["worker.py"] = (source / "figures/worker.py").read_bytes()
     result.update({f"src/research/{name}": (source / "research" / name).read_bytes()
                    for name in METHOD_FILES})
+    from .nature_runtime import released_vendor_root
+
+    released = released_vendor_root()
+    if released is not None:
+        from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT, RELEASE_VENDOR_PATH, validate_vendor
+
+        provenance = validate_vendor(released, verify_files=False, expected_commit=RELEASE_VENDOR_COMMIT)
+        result[f"{RELEASE_VENDOR_PATH}/provenance.json"] = (json.dumps(provenance, sort_keys=True) + "\n").encode()
+        for entry in provenance["files"]:
+            path = entry["path"]
+            data = (released / path).read_bytes()
+            if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                raise ValueError("Worker Nature resource hash mismatch: " + path)
+            result[f"{RELEASE_VENDOR_PATH}/{path}"] = data
+        result.update(_support_files({"citrus_figures"}))
+        return result
     prefix = "src/prompts/skills/vendor/nature-skills/"
     vendor = source / "prompts/skills/vendor/nature-skills"
     raw = (vendor / "provenance.json").read_bytes()

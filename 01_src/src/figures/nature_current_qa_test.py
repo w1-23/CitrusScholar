@@ -95,6 +95,23 @@ def _render(script: str):
     return rendered, pdf, layout
 
 
+def test_configured_nature_qa_rejects_missing_and_legacy_resources(tmp_path, monkeypatch):
+    from citrus_figures.nature_runtime import RELEASE_VENDOR_PATH
+    from src.figures.engine_bundle import bundle_files
+
+    assert current_vendor_root() == VENDOR
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        current_vendor_root()
+    with pytest.raises(FileNotFoundError):
+        bundle_files()
+    shutil.copytree(VENDOR, tmp_path / RELEASE_VENDOR_PATH)
+    with pytest.raises(ValueError, match="vendor_identity_mismatch"):
+        current_vendor_root()
+    with pytest.raises(ValueError, match="vendor_identity_mismatch"):
+        bundle_files()
+
+
 def test_initial_worker_current_qa_reuses_one_audited_pdf():
     result = _run()
     manifest = json.loads(result.outputs["manifest"])

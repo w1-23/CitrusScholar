@@ -509,6 +509,9 @@ def _local_env() -> dict[str, str]:
     env["MPLBACKEND"] = "Agg"
     env["MPLCONFIGDIR"] = env.get("HOME", "/tmp")
     env["CITRUS_FIGURES_ROOT"] = str(Path(__file__).resolve().parents[2])
+    release = os.environ.get("CITRUS_SKILL_RELEASE")
+    if release:
+        env["CITRUS_SKILL_RELEASE"] = release
     # The daemon address is not for the script: it names a way to reach the
     # Docker daemon, and a script has no business knowing where it is.
     env.pop("DOCKER_HOST", None)

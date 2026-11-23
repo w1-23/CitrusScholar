@@ -72,21 +72,34 @@ def _vendor_candidates():
     return candidates
 
 
-def current_vendor_root():
-    """Return the first fully verified 44-file vendor root, or ``None``.
+def released_vendor_root() -> Path | None:
+    from citrus_figures.nature_runtime import RELEASE_VENDOR_PATH
 
-    The legacy 40-file root remains for the pinned v1 receipt. Only the current
-    release inventory (which includes ``audit_svg_schematic``) is accepted
-    here; an unverifiable root disables checks instead of trusting unhashed
-    bytes or a partially populated directory.
-    """
+    release = os.environ.get("CITRUS_SKILL_RELEASE")
+    base = Path(release) if release else Path(__file__).resolve().parents[2]
+    candidate = base / RELEASE_VENDOR_PATH
+    return candidate if release or candidate.exists() else None
+
+
+def expected_vendor_commit() -> str:
+    from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT
+
+    return RELEASE_VENDOR_COMMIT if released_vendor_root() is not None else COMMIT
+
+
+def current_vendor_root():
+    """Select the pinned release before searching for compatibility resources."""
     try:
-        from citrus_figures.nature_runtime import validate_vendor
+        from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT, validate_vendor
     except ImportError:
         return None
+    released = released_vendor_root()
+    if released is not None:
+        validate_vendor(released, expected_commit=RELEASE_VENDOR_COMMIT)
+        return released
     for candidate in _vendor_candidates():
         try:
-            validate_vendor(candidate)
+            validate_vendor(candidate, expected_commit=COMMIT)
         except (OSError, ValueError, KeyError, TypeError):
             continue
         return candidate
@@ -177,6 +190,11 @@ class NatureAuditError(ValueError):
 
 
 def _load(name: str):
+    released = released_vendor_root()
+    if released is not None:
+        from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT, load_module
+
+        return load_module(name, vendor_root=released, expected_commit=RELEASE_VENDOR_COMMIT)
     if name not in _MODULES:
         raise ValueError("Unapproved nature-figure module")
     root = _VENDOR_ROOT.resolve()
@@ -251,7 +269,7 @@ def audit_fig(figure: Any, source: str, *,
     """
     receipt: dict[str, Any] = {
         "version": 1, "skill": "nature-figure", "skill_version": SKILL_VERSION,
-        "commit": COMMIT, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        "commit": expected_vendor_commit(), "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "checks": {},
     }
     checks = receipt["checks"]

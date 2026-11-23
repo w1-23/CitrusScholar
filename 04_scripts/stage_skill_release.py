@@ -50,6 +50,24 @@ def stage_package(repository: Path, commit: str, output: Path | None, *,
                     shutil.copyfileobj(source, destination)
 
 
+def stage_nature_qa(repository: Path, commit: str, release: Path) -> None:
+    from citrus_figures.nature_runtime import (RELEASE_VENDOR_COMMIT, RELEASE_VENDOR_MEMBERS,
+                                               RELEASE_VENDOR_PATH, SOURCE, validate_vendor)
+
+    vendor = release / RELEASE_VENDOR_PATH
+    files = []
+    for path in RELEASE_VENDOR_MEMBERS:
+        origin = path if path == "LICENSE" else f"vendor/upstream/{path}"
+        data = subprocess.check_output(["git", "-C", str(repository), "show", f"{commit}:{origin}"])
+        target = vendor / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        files.append({"path": path, "sha256": hashlib.sha256(data).hexdigest()})
+    provenance = {"source": SOURCE, "commit": RELEASE_VENDOR_COMMIT, "files": files}
+    (vendor / "provenance.json").write_text(json.dumps(provenance, sort_keys=True) + "\n", encoding="utf-8")
+    validate_vendor(vendor, expected_commit=RELEASE_VENDOR_COMMIT)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     root = Path(__file__).resolve().parents[1]
@@ -69,7 +87,7 @@ def main(argv=None) -> int:
     if args.output.exists() or args.output.is_symlink():
         raise ValueError("skill_release_output_already_exists")
 
-    sys.path.insert(0, str(root / "01_src"))
+    sys.path[:0] = [str(root / "01_src"), str(root / "packages")]
     from src.agent.installed_skills import list_installed
 
     with tempfile.TemporaryDirectory(prefix=".citrus-skill-stage-", dir=args.output.parent) as staging:
@@ -81,7 +99,8 @@ def main(argv=None) -> int:
         python_root = release / "python"
         runtime_names = {name for name, entry in entries.items()
                          if isinstance(entry, dict) and "python_package" in entry} if args.include_runtime else set()
-        for name in sorted(names | runtime_names):
+        nature_qa = {"nature-figure"} & (set(entries) if args.include_runtime else names)
+        for name in sorted(names | runtime_names | nature_qa):
             entry = entries[name]
             if (not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
                     or not isinstance(entry, dict)
@@ -98,6 +117,8 @@ def main(argv=None) -> int:
                                                f"{entry['commit']}:{filename}"])
                 if hashlib.sha256(raw).hexdigest() != expected:
                     raise ValueError("skill_dependency_lock_mismatch")
+            if name in nature_qa:
+                stage_nature_qa(repository, entry["commit"], release)
             source_package = entry.get("python_package") if name in runtime_names else None
             if name in runtime_names:
                 if (not isinstance(source_package, str)

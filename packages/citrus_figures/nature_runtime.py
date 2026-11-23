@@ -12,17 +12,31 @@ SKILL_VERSION = "2.8.0"
 # Canonical inventory fingerprint binds the injected provenance itself to this
 # reviewed release; changing both a script and its local hash cannot bless it.
 PROVENANCE_FILES_SHA256 = "a9b8e661bf460a401e17017f134a735432da9d7832e3f561a63c6cf47fb92b9e"
+RELEASE_VENDOR_COMMIT = "c6701dbea29afa7c596d029b957b7edc92130ea5"
+RELEASE_VENDOR_PATH = "nature-qa"
+_VENDOR_INVENTORIES = {
+    COMMIT: PROVENANCE_FILES_SHA256,
+    RELEASE_VENDOR_COMMIT: "00fd4525a3e5418551ae34b4b0ba9a579b5df55fc5c68482464dd0eda6c4721e",
+}
 _MODULES = frozenset({"validate_figure", "audit_panel_alignment", "audit_pdf_text",
                       "audit_figure_collisions", "figure_safety", "plot_templates", "audit_svg_schematic"})
+RELEASE_VENDOR_MEMBERS = ("LICENSE", *(f"skills/nature-figure/scripts/{name}.py" for name in sorted(_MODULES)))
 
 
-def validate_vendor(vendor_root, *, verify_files=True):
+def validate_vendor(vendor_root, *, verify_files=True, expected_commit=None):
     root = Path(vendor_root).resolve(strict=True)
     provenance = json.loads((root / "provenance.json").read_bytes())
-    if provenance.get("source") != SOURCE or provenance.get("commit") != COMMIT:
+    commit = provenance.get("commit")
+    expected_inventory = _VENDOR_INVENTORIES.get(commit)
+    if (provenance.get("source") != SOURCE or expected_inventory is None
+            or (expected_commit is not None and commit != expected_commit)):
         raise ValueError("vendor_identity_mismatch")
+    inventory = sorted(provenance["files"], key=lambda row: row["path"])
+    identity = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+    if hashlib.sha256(identity).hexdigest() != expected_inventory:
+        raise ValueError("vendor_inventory_hash_mismatch")
     seen = set()
-    for entry in provenance["files"]:
+    for entry in inventory:
         relative = entry["path"]
         path = (root / relative).resolve(strict=verify_files)
         if relative in seen or not path.is_relative_to(root):
@@ -30,20 +44,14 @@ def validate_vendor(vendor_root, *, verify_files=True):
         seen.add(relative)
         if verify_files and hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
             raise ValueError("vendor_hash_mismatch: " + relative)
-    inventory = json.dumps(sorted(provenance["files"], key=lambda row: row["path"]), sort_keys=True, separators=(",", ":")).encode()
-    if hashlib.sha256(inventory).hexdigest() != PROVENANCE_FILES_SHA256:
-        raise ValueError("vendor_inventory_hash_mismatch")
     return provenance
 
 
-def load_module(name, *, vendor_root):
+def load_module(name, *, vendor_root, expected_commit=None):
     if name not in _MODULES:
         raise ValueError("unapproved_vendor_module")
     root = Path(vendor_root).resolve(strict=True)
-    # The inventory itself is pinned, but an absent unrelated peripheral must
-    # not disable this check. Validate only the helper being executed here;
-    # validate_vendor(root) separately proves full resource completeness.
-    provenance = validate_vendor(root, verify_files=False)
+    provenance = validate_vendor(root, verify_files=False, expected_commit=expected_commit)
     relative = f"skills/nature-figure/scripts/{name}.py"
     entry = next((r for r in provenance["files"] if r["path"] == relative), None)
     if entry is None:

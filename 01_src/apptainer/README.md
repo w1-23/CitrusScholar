@@ -58,6 +58,8 @@ sha256sum /absolute/release/standalone-skills/inventory.json
 
 部署配置的 `skill_release` 使用该绝对目录，`skill_release_sha256` 使用上面的清单摘要。启动器逐文件核验，校验通过后以只读方式挂载，并使可信服务优先导入该发行的计算包。`native_runtime` 单独控制是否选择原生运行时。可用 `--enable` 指定曝光的方法，空清单用于基线，`--include-runtime` 使这些条件共用相同的执行库。
 
+同一命令也从锁定的 Nature 包提取 `nature-qa/`。它包含工作台和绘图执行器实际调用的上游检查脚本，使用同一发行清单，且在 `--enable` 为空时仍随运行库安装。启用固定发行的环境应重建带匹配支持 wheel 的应用和 Worker 镜像。旧发布的 QA 回执仍可读取。
+
 图件或 Code Worker 继续使用各自的固定镜像。构建 Code 镜像时，从同一数据审查提交构建 wheel 并预装所需锁定依赖，避免与兼容用支持包重复拥有 `citrus_audit`。仅 staging 文件不会改变 Worker 镜像，也不会给用户脚本添加外网或宿主目录。将主仓 SHA、Skill SHA、依赖和实际镜像摘要一起记录，首次启动先验证 Worker 内对应导入和脚本。运行中的发布目录保持只读且保留已接纳任务使用的旧发行物。
 
 ## 隔离验收启动

@@ -4,12 +4,14 @@ import hashlib
 import json
 import re
 
-COMMIT = "7bff1d0539c0dfad6c30178bb93ce6dd8a5cebf8"
+from citrus_figures.nature_runtime import COMMIT, RELEASE_VENDOR_COMMIT
 
 
-def validate_nature_receipt(manifest: dict, *, pdf: bytes | None = None) -> dict:
+def validate_nature_receipt(manifest: dict, *, pdf: bytes | None = None, expected_commit=None) -> dict:
     receipt = manifest.get("nature_skill_receipt")
-    if not isinstance(receipt, dict) or receipt.get("version") != 1 or receipt.get("commit") != COMMIT:
+    commits = (COMMIT, RELEASE_VENDOR_COMMIT) if expected_commit is None else (expected_commit,)
+    if (not isinstance(receipt, dict) or receipt.get("version") != 1
+            or receipt.get("commit") not in commits):
         raise ValueError("工作器未返回当前 Nature 核心检查回执；请部署匹配版本的科研沙箱。")
     checks = receipt.get("checks")
     allowed = {
@@ -43,13 +45,13 @@ def validate_nature_receipt(manifest: dict, *, pdf: bytes | None = None) -> dict
 def current_receipt_id(receipt: dict) -> str:
     value = {key: item for key, item in receipt.items() if key != "receipt_id"}
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
-                                     default=str).encode()).hexdigest()
+                                     allow_nan=False).encode()).hexdigest()
 
 
 def accept_current_render_qa(manifest: dict, blobs: dict[str, bytes], mode: str) -> dict:
     """Accept one worker receipt and bind its figures to the exact exports."""
     from citrus_figures.verification import CHECKS
-    from src.figures.nature_runtime import current_security_findings
+    from src.figures.nature_runtime import current_security_findings, expected_vendor_commit
 
     def reject():
         raise ValueError("当前图件 QA 回执缺失、未绑定实际导出或含阻断结果。")
@@ -59,7 +61,7 @@ def accept_current_render_qa(manifest: dict, blobs: dict[str, bytes], mode: str)
     layout = manifest.get("current_qa_layout", acknowledgement.get("current_qa_layout"))
     if (not isinstance(receipt, dict) or receipt.get("version") != 2
             or receipt.get("mode") != mode or receipt.get("skill") != "nature-figure"
-            or receipt.get("vendor_commit") != COMMIT
+            or receipt.get("vendor_commit") != expected_vendor_commit()
             or receipt.get("receipt_id") != current_receipt_id(receipt)):
         reject()
     for key, value in (("current_qa_receipt", receipt), ("current_qa_layout", layout)):
@@ -101,7 +103,8 @@ def accept_current_render_qa(manifest: dict, blobs: dict[str, bytes], mode: str)
                     or not isinstance(layout.get("layout"), dict)))):
             reject()
         if mode == "initial":
-            legacy = validate_nature_receipt(manifest, pdf=blobs.get("pdf"))
+            legacy = validate_nature_receipt(manifest, pdf=blobs.get("pdf"),
+                                             expected_commit=receipt["vendor_commit"])
             if legacy["pdf_sha256"] != digest:
                 reject()
     integrity = [c.get("artifact") for c in checks if c.get("check") == "format_integrity"

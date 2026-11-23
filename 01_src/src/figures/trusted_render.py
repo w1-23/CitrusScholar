@@ -109,6 +109,9 @@ def _environment(root: Path) -> dict[str, str]:
            "TEMP": str(root), "TMP": str(root), "MPLCONFIGDIR": str(root / "mpl"),
            "MPLBACKEND": "Agg", "LANG": "C.UTF-8", "OPENBLAS_NUM_THREADS": "1",
            "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1"}
+    release = os.environ.get("CITRUS_SKILL_RELEASE")
+    if release:
+        env["CITRUS_SKILL_RELEASE"] = release
     if os.name == "nt":
         for key in ("SYSTEMROOT", "WINDIR"):
             if os.environ.get(key):

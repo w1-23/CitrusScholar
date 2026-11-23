@@ -123,7 +123,9 @@ def _verify_render(manifest: dict, blobs: dict[str, bytes], mode: str) -> None:
                 or check.get('sha256') != hashlib.sha256(data).hexdigest()):
             raise ValueError('Drawing export does not match its render integrity receipt.')
     if mode == 'initial':
-        validate_nature_receipt(manifest, pdf=blobs.get('pdf'))
+        from .nature_runtime import expected_vendor_commit
+
+        validate_nature_receipt(manifest, pdf=blobs.get('pdf'), expected_commit=expected_vendor_commit())
     elif manifest.get('nature_skill_receipt') is not None:
         raise ValueError('Manual rendering incorrectly claims a repeated Nature audit.')
 

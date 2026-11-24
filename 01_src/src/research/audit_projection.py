@@ -172,11 +172,33 @@ def iter_findings(report, targets):
                    'detail': signal.get('detail', ''), 'locations': [location],
                    'evidence': signal.get('evidence') or {}, 'coverage': {}}
 
+def _standalone_findings(report):
+    for saved in report.get("snapshots", ()):
+        source = source_fields(saved["file_index"], saved["source_file_id"],
+                               saved["source_name"], saved["source_sha256"])
+        for entry in saved["report"]["tables"]:
+            table = entry["table"]
+            target = {**source, **table, "header_row": table.get("header_row") or 1}
+            for signal in entry["result"]["data"]["findings"]:
+                rule = signal["check"]
+                version = signal.get("method_version") or METHOD_VERSION
+                location = table_location(target, signal)
+                evidence = signal.get("evidence") or {}
+                if evidence.get("ranges"):
+                    location["ranges"] = list(evidence["ranges"])
+                yield {"kind": _finding_kind(rule, version), "rule": rule,
+                       "rule_version": version, "severity": signal.get("severity", ""),
+                       "detail": signal.get("detail", ""), "locations": [location],
+                       "evidence": evidence, "coverage": {}}
+
+
 def project_findings(report):
     """Expose a bounded read view without duplicating immutable reports in storage."""
     findings, size, omitted = [], 0, 0
     counts = defaultdict(int)
-    for finding in iter_findings(report, table_targets(report)):
+    source = (_standalone_findings(report) if report.get("schema") == "standalone-audit-review/1"
+              else iter_findings(report, table_targets(report)))
+    for finding in source:
         counts[finding['kind']] += 1
         encoded = len(json.dumps(finding, ensure_ascii=False).encode('utf-8'))
         if len(findings) >= MAX_FINDINGS or size + encoded > MAX_PROJECTION_BYTES:

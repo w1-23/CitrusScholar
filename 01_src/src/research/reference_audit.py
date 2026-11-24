@@ -909,6 +909,7 @@ def _kernel_result(entry, evidence, recorder, audit_id):
         'field_conflicts': '; '.join(field for field, value in fields.items()
                                      if value['status'] == 'conflicting'),
         'match_status': match_status, 'processing_status': processing, 'reason': reason,
+        'identity_differences': evidence.get('differences') or [],
         'detail': '身份内核仅核对存在性与最小身份；已处理但未确认不等于文献不存在。',
     }
     result['verdict'] = _kernel_verdict(entry, result, audit_id)

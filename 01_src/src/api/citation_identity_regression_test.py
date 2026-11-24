@@ -37,7 +37,8 @@ def citation_session(tmp_path, monkeypatch):
     sid = asyncio.run(sessions.get_or_create_session('citation-session', owner_user_id=31))
     job_id = jobs.claim_job(sid, 'server-request', owner_user_id=31, client_request_id='client-request', payload={}).job_id
     tokens = [(var, var.set(value)) for var, value in (
-        (tracing._user_id, 31), (tracing._session_id, sid), (tracing._job_id, job_id))]
+        (tracing._user_id, 31), (tracing._session_id, sid), (tracing._job_id, job_id),
+        (tracing._client_request_id, 'client-request'))]
     progress_bus.set_turn_scope(sid, 'client-request')
     app = FastAPI()
     app.add_api_route('/corpus/source', main.corpus_source_endpoint)
@@ -168,3 +169,73 @@ def test_web_fetch_receipt_and_legacy_ledger_migration(citation_session):
     expired = run.client.get(url).json()['sources'][0]
     assert expired['source_ref'] == source['source_ref']
     assert expired['source_status'] == 'unavailable' and 'snippet' not in expired
+
+
+def test_answer_bubbles_bind_delivered_local_and_duplicate_web_references(citation_session):
+    from src.core.turn_sources import answer_citations, visible_citation_bubbles
+
+    run = citation_session
+    first = {'corpus_id': 'cqa_literature', 'paper_id': 'paper_fixture_identity',
+             'chunk_id': 'chunk_fixture_identity', 'title': 'Fixture title',
+             'text': 'First known excerpt. Second known excerpt.'}
+    matches, _ = evidence_adapter.persist_local_rows([first], query='fixture', generation='base-old')
+    for position, (start, width) in enumerate(((0, 13), (20, 12)), 1):
+        body, artifact = read_local_evidence.func(ref=matches[0]['source_ref'], turn_id=run.job,
+            generation='base-old', offset=start, max_chars=width)
+        artifact['main_results'][0]['citation_ref'] = f'L{position}'
+        record_tool('read_candidate', f'local-{position}', body, artifact)
+    webpage = {'url': 'https://example.org/page', 'title': 'Site', 'summary': 'Delivered evidence'}
+    for position in (1, 2):
+        record_tool('deepseek_search', f'web-{position}', f'[W{position}] Site\nDelivered evidence',
+                    {'web_results': [{**webpage, 'citation_ref': f'W{position}'}]})
+    body, projection = answer_citations(
+        'First[L1] second[L2] web[W2][W1] invalid[W99] history[H3]\n\n'
+        'Literal `[L1]`, “quoted [W2]”, and [ordinary](https://example.org).',
+        session_id=run.sid, request_id='client-request', user=run.user)
+    assert body == ('First second web invalid history\n\n'
+                    'Literal `[L1]`, “quoted [W2]”, and [ordinary](https://example.org).')
+    assert projection['dropped'] == ['W99', 'H3']
+    bubbles = projection['bubbles']
+    assert [item['ref_id'] for item in bubbles] == ['L1', 'L2', 'W2']
+    assert bubbles[0]['record_key'] != bubbles[1]['record_key']
+    scope = {'session_id': run.sid, 'request_id': 'client-request'}
+    assert visible_citation_bubbles(bubbles, run.user, **scope) == bubbles
+    assert not visible_citation_bubbles([bubbles[-1]], run.user,
+                                        session_id=run.sid, request_id='another-turn')
+    assert not visible_citation_bubbles([{**bubbles[-1], 'url': 'https://example.org/other'}],
+                                        run.user, **scope)
+    with sqlite3.connect(manager.DB_PATH) as conn:
+        conn.execute("UPDATE turn_source_ledger SET read_ref='{}' WHERE citation_ref='W2'")
+    assert visible_citation_bubbles(bubbles, run.user, **scope) == bubbles[:2]
+
+
+@pytest.mark.parametrize('abstract_only', [False, True])
+def test_fetched_paper_can_be_cited_without_showing_internal_id(citation_session, monkeypatch, abstract_only):
+    from src.core.turn_sources import answer_citations
+    from src.tools import deepseek_search_fetch
+
+    run = citation_session
+    url = 'https://example.org/paper'
+    source = {'url': url, 'title': 'A verified paper', 'format': 'search_result',
+              'content': 'An excerpt delivered to the model.', 'ok': True,
+              'validity': 'abstract_only' if abstract_only else 'valid'}
+    monkeypatch.setattr(deepseek_search_fetch, '_enabled', lambda name: name == 'web_fetch')
+    monkeypatch.setattr(deepseek_search_fetch, '_public_http_url_error', lambda _: '')
+    monkeypatch.setattr(deepseek_search_fetch, '_retain_paper', lambda *args, **kwargs: None)
+    monkeypatch.setattr(deepseek_search_fetch, '_retain_missing_paper', lambda **kwargs: None)
+
+    def race(candidates, deadline, doi, title, attempts):
+        attempts.append(source)
+        return None if abstract_only else source
+
+    monkeypatch.setattr(deepseek_search_fetch, '_race_candidates', race)
+    assert turn_source_ledger.allocate_citation_refs(run.sid, 'client-request', 'web', 1) == ['W1']
+    body, artifact = deepseek_search_fetch.deepseek_fetch_paper.func(urls=[url])
+    assert '[W2]' in body
+    assert artifact['web_results'][0]['citation_ref'] == 'W2'
+    record_tool('deepseek_fetch_paper', 'paper-read', body, artifact)
+    answer, projection = answer_citations('From the paper.[W2]', session_id=run.sid,
+                                          request_id='client-request', user=run.user)
+    assert answer == 'From the paper.'
+    assert projection['bubbles'] == [
+        {'kind': 'web', 'url': url, 'title': 'A verified paper', 'ref_id': 'W2'}]

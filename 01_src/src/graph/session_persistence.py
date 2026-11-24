@@ -80,6 +80,9 @@ async def persist_agent_turn(state: dict) -> dict:
             metadata["citrus_generation_ms"] = generation_ms
         metadata["citrus_task_snapshot"] = {key: state[key] for key in
             ("task_contract", "coverage", "turn_outcome", "capability_snapshot", "capability_runtime") if key in state}
+        refs = state.get("references_data") or {}
+        if refs.get("display") == "bubble_only" and refs.get("bubbles"):
+            metadata["citrus_citation_bubbles"] = refs["bubbles"]
         trace[-1] = trace[-1].model_copy(update={"response_metadata": metadata})
 
         from src.core.account_leases import (

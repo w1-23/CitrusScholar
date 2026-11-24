@@ -230,6 +230,37 @@ def publish_audit_workbooks(report, *, load_source, title='', review_id=''):
     from . import tools
     from .audit_projection import iter_findings, location_cells, source_key, table_targets
 
+    if report.get("schema") == "standalone-audit-review/1":
+        from citrus_audit.api import AuditSnapshot, export_workbook
+        from citrus_audit.reporting import dumps
+
+        receipts, errors = {}, []
+        for saved in report["snapshots"]:
+            raise_if_cancelled("data_audit_workbook")
+            try:
+                name, digest = saved["source_name"], saved["source_sha256"]
+                snapshot = AuditSnapshot(load_source(saved), name, dumps(saved["report"]), digest)
+                if snapshot.report_sha256 != saved["report_sha256"]:
+                    raise ValueError("审查快照摘要不符")
+                content, stats = export_workbook(snapshot, presentation="annotated")
+                content = normalize_ooxml_bytes(content)
+                filename = tools._short_stem(name) + "_审查标注.xlsx"
+                publication_key = sha256(dumps([saved["source_file_id"], digest, snapshot.report_sha256,
+                                               "xlsx", "annotated/1"]).encode()).hexdigest()
+                url = tools._save_artifact(filename, content,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    source_file_id=saved["source_file_id"], source_sha256=digest,
+                    logical_task_id="audit_workbook:" + publication_key)
+                receipts[(saved["file_index"], digest)] = {"url": url, "filename": filename,
+                    "sha256": sha256(content).hexdigest(), "size_bytes": len(content),
+                    "source_file_id": saved["source_file_id"], "source_sha256": digest,
+                    "file_index": saved["file_index"], "cells": stats.get("marked_locations", 0)}
+            except ToolCancelled:
+                raise
+            except Exception as exc:
+                errors.append(f"{saved['source_name']}: {type(exc).__name__}: {exc}")
+        return receipts, errors
+
     groups, targets_by_location = defaultdict(list), defaultdict(list)
     errors = []
     targets = list(table_targets(report))
@@ -319,7 +350,8 @@ def _publish_data_audit(review_id: str, output_format: str, title: str = '') -> 
     if not report.get('table_results'):
         raise ValueError('该复核记录没有表格扫描结果')
     stem = tools._safe_name(title or '数据审查')
-    payload = _data_audit_payload(review)
+    standalone = report.get("schema") == "standalone-audit-review/1"
+    payload = report if standalone else _data_audit_payload(review)
     prepared = []
     if output_format in {'json', 'html'}:
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, indent=2)
@@ -329,11 +361,11 @@ def _publish_data_audit(review_id: str, output_format: str, title: str = '') -> 
             from .audit_projection import location_cells
             rows = ''.join('<tr>' + ''.join('<td>' + escape(str(value)) + '</td>' for value in (
                 loc.get('source_name', ''), loc.get('sheet', ''), loc.get('region_id', ''),
-                ', '.join(location_cells(loc).values()), item['rule'], item['severity'], item['detail'])) + '</tr>'
-                for item in payload['finding_projection']['findings'] for loc in item['locations'])
+                ', '.join(loc.get('ranges') or location_cells(loc).values()), item['rule'], item['severity'], item['detail'])) + '</tr>'
+                for item in payload.get('finding_projection', {}).get('findings', []) for loc in item['locations'])
             content = ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>' +
                 escape(title or '数据审查') + '</title></head><body><h1>' + escape(title or '数据审查') +
-                '</h1><p>' + escape(payload['interpretation']) + '</p><p>复核记录：' + escape(review_id) +
+                '</h1><p>' + escape(payload.get('interpretation') or '保存的审查范围、发现及覆盖见下方快照。') + '</p><p>复核记录：' + escape(review_id) +
                 '</p><table><thead><tr><th>文件</th><th>工作表</th><th>区域</th><th>单元格</th><th>类别</th>' +
                 '<th>严重程度</th><th>说明</th></tr></thead><tbody>' + rows +
                 '</tbody></table><details><summary>完整结果、覆盖与规则执行凭证</summary><pre>' +

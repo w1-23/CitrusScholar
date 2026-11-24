@@ -10,18 +10,43 @@ from langchain_core.tools import InjectedToolArg, tool
 def _audit_status(payload):
     coverage = payload.get("coverage", {})
     action = payload.get("next_action")
-    ready = bool(payload.get("terminal") or action in {
-        "export", "export_and_review", "budget_exhausted_export_partial"})
+    total, processed, pending = (coverage.get(key) for key in ("total", "processed", "pending"))
+    scoped = (payload.get("schema") == "reference_audit/2"
+              and all(type(count) is int and count >= 0 for count in (total, processed, pending))
+              and total > 0 and total == processed + pending
+              and coverage.get("processing_complete") is (pending == 0))
+    ready = scoped and (payload.get("terminal") is True and pending == 0
+                        or action == "budget_exhausted_export_partial")
     suggestions = ["report_saved_rows"] if ready else []
     if coverage.get("pending") and not ready:
         suggestions.append("check_pending_entries")
     return {
         "ready_for_report": ready,
+        "processing_complete": scoped and pending == 0,
+        "coverage_complete": scoped and coverage.get("complete") is True,
         "pending": coverage.get("pending", 0),
         "retryable": coverage.get("retryable", 0),
         "recommended_actions": suggestions,
         "evidence_scope": "bibliographic_identity_and_fields",
     }
+
+
+def _identity_report_rows(rows):
+    from citrus_refcheck import report_view
+
+    entries = []
+    for row in rows:
+        if row.get("match_status") not in {"matching", "conflict", "unconfirmed", "unprocessed"}:
+            continue
+        entries.append({"claims": row.get("claims") or {}, "citation": row.get("citation", ""),
+            "record_id": row.get("record_id"), "record_index": row.get("record_index"),
+            "evidence": {"processing_status": row.get("processing_status"),
+                         "match_status": row["match_status"], "reason": row.get("reason"),
+                         "match": row.get("selected_record"), "differences": row.get("identity_differences") or []}})
+    if not entries:
+        return {}
+    snapshot = {"schema_version": "reference-verification/1", "entries": entries}
+    return {row["record_index"]: row for row in report_view(snapshot)["rows"]}
 
 
 def _compact_audit(payload):
@@ -34,6 +59,7 @@ def _compact_audit(payload):
     rows = []
     response = {key: payload[key] for key in header if key in payload}
     response.update(rows=rows, result_view="compact", next_offset=payload.get("next_offset"))
+    report_rows = _identity_report_rows(payload.get("rows", []))
     for row in payload.get("rows", []):
         if len(rows) == 10:
             response["next_offset"] = row["record_index"]
@@ -80,6 +106,14 @@ def _compact_audit(payload):
             if isinstance(item, dict):
                 notes.append({"field": str(item.get("field") or "")[:80],
                               "variant": str(item.get("variant_type") or item.get("explanation") or "")[:160]})
+        if kernel := report_rows.get(row.get("record_index")):
+            compact.update(processing_status=kernel["processing_status"], identity=kernel["identity"])
+            if kernel["citation"]:
+                compact["citation"] = kernel["citation"]
+            if kernel["field_notes"]:
+                notes = [{key: str(note.get(key) or "")[:160]
+                          for key in ("field", "submitted", "registered", "reason")}
+                         for note in kernel["field_notes"][:5]]
         if notes:
             compact["field_notes"] = notes
         compact["retryable"] = bool(row.get("retryable"))
@@ -97,6 +131,68 @@ def _compact_audit(payload):
     return response
 
 
+
+def identity_report_requested(query):
+    import re
+    from src.graph.agent_operations import _explicit_reference_check
+    from src.graph.intent_text import intent_with_negation
+
+    if not _explicit_reference_check(query):
+        return False
+    stripped = re.sub(r"https?://[^\s，。；！？]+", "", query)
+    other_goals = re.compile(
+        r"(?:精校|逐字段|(?:查看|查阅|读取|阅读|读|查|获取|核对|核验)?\s*全文|"
+        r"论点|摘要|综述|绘图|画图|画.{0,8}(?:箱线图|热图|柱状图|散点图)|"
+        r"(?:(?:比较|对比|解释|分析|评价|评述|归纳|提炼).{0,24}(?:方法|结论|局限|观点|创新))|"
+        r"分析数据|审查数据|翻译|改写|导出|下载|投稿|"
+        r"\b(?:(?:read\s+|fetch\s+)?full\s*text|plot|summari[sz]e|export|translate|"
+        r"(?:then|also|and)\s+compare)\b)", re.I)
+    return not intent_with_negation(stripped, other_goals)
+
+
+def saved_identity_report(owner, session, audit_id):
+    from html import escape
+    from src.core.turn_source_ledger import safe_http_url
+    from src.research.reference_audit import get_audit
+
+    payload = get_audit(owner, session, audit_id, limit=5000)
+    if not _audit_status(payload)["ready_for_report"] or payload.get("next_offset") is not None:
+        return None
+    rows = []
+    coverage = payload["coverage"]
+    labels = {"matched": "已匹配", "conflict": "身份冲突", "unresolved": "尚未确认", "unprocessed": "未处理"}
+
+    def cell(value):
+        return escape(" ".join(str(value or "").split())).replace("|", "&#124;").replace("[", "&#91;")
+
+    for original in payload["rows"]:
+        compact = _compact_audit({"rows": [original]})["rows"]
+        if not compact:
+            return None
+        row = compact[0]
+        record = row.get("matched") or {}
+        title = cell(record.get("title") or record.get("doi") or "—")
+        url = safe_http_url(row.get("source_url"))
+        if not url and record.get("doi") and record["doi"].startswith("10."):
+            url = safe_http_url("https://doi.org/" + record["doi"])
+        source = f"[{cell(row.get('provider') or record.get('source') or '来源')}](<{url}>)" if url else "—"
+        notes = [cell(f"{note['field']} {note.get('submitted', '')} → {note.get('registered', '')} {note.get('reason', '')}")
+                 if "submitted" in note else cell(f"{note['field']} {note.get('variant', '')}")
+                 for note in row.get("field_notes", [])]
+        detail = "；".join(notes) or cell(row.get("reason") or "—")
+        ordinal = int(row["record_index"]) + 1
+        citation = cell(row.get("citation") or original.get("citation") or row["title"])
+        handling = "已处理" if row["processing_status"] == "processed" else "未处理"
+        rows.append(f"| {ordinal} | {citation} | {handling} | {labels[row['identity']]} | {title} · {source} | {detail} |")
+    if not rows:
+        return None
+    summary = f"已处理 {coverage['processed']}/{coverage['total']} 条文献。"
+    if not coverage.get("complete"):
+        summary += "未处理条目、尚未确认的身份与来源缺口见下表。"
+    return "\n".join([summary, "", "| 序号 | 提交引文 | 处理 | 身份 | 匹配对象与来源 | 备注 |",
+                     "|---|---|---|---|---|---|", *rows])
+
+
 @tool
 def verify_uploaded_references(file_index: int = 0, references_json: str | list | dict = "",
                                allow_web: Annotated[bool, InjectedToolArg] = True,
@@ -107,16 +203,13 @@ def verify_uploaded_references(file_index: int = 0, references_json: str | list 
                                resume: bool = False, offset: int = 0,
                                include_evidence: bool = False,
                                column_map: dict[str, str] | None = None, encoding: str = "") -> str:
-    """批量核实引文的存在性与书目身份，默认只读登记元数据和搜索片段。
+    """按原序批量核对作品身份，返回紧凑行、来源和 audit_id。
 
-    首次传 references_json、text、file_id 或本轮附件 file_index。提供 CSV/TSV
-    列映射时用 column_map，非 UTF-8 / 带 BOM 的 UTF-16 需声明 encoding。
-    有标识先查登记库，无标识按原题名用 DeepSeek Search 定位，身份明确即停。
-    未确认和来源错误均可写入报告。返回原序紧凑结果与 audit_id；read 复用结果，
-    include_evidence 读取单条完整证据。create/run/read/list/cancel 共用同一库存。
-    run 默认最多核查 20 条，服从任务截止、历史请求预算与联网授权。禁止读取全文或 PDF 仍使用 run，run 只查书目信息。离线复用使用 read。
-    ready_for_report=true 时直接呈现结果与缺口。只有用户另行要求重查时才传 resume=True。
-    publish=True 导出已存 XLSX，其它格式用 deliver_research_artifact。
+    首次传 references_json、text、file_id 或附件 file_index。CSV/TSV 可用
+    column_map 和 encoding。run 使用授权书目查询；read 从快照分页，不联网。
+    ready_for_report 表示快照可报告。只有显式要求重核才用 resume=True；
+    publish=True 从已存记录导出 XLSX。include_evidence 仅用于 read，
+    run 会忽略该兼容参数并返回紧凑结果。
     """
     from src.core.tracing import get_user_id, get_session_id, get_client_request_id
     from src.research import reference_audit as service
@@ -136,8 +229,8 @@ def verify_uploaded_references(file_index: int = 0, references_json: str | list 
     if type(max_rows) is not int or not 0 <= max_rows <= 100:
         return rejected("max_rows 需要 0–100 的整数（0 使用默认20）。", "invalid_reference_limit")
     try:
-        if include_evidence and operation != "read":
-            raise ToolArgumentError("include_evidence 仅用于 operation=read；运行返回紧凑结果。")
+        if include_evidence and operation not in {"read", "run"}:
+            raise ToolArgumentError("include_evidence 仅用于 operation=read；其他操作不接受该参数。")
         if operation == "list":
             payload = {"audits": service.list_audits(owner, session),
                 "_tool_outcome": {"status": "complete", "reason_code": "reference_audits_listed", "artifacts": []}}
@@ -234,7 +327,8 @@ def verify_uploaded_references(file_index: int = 0, references_json: str | list 
                 outcome.update(status="complete", reason_code="reference_identity_report_ready_with_source_gaps",
                                coverage="全部条目已尝试；来源缺口与未确认结论保留在报告中")
             payload.pop("next_action", None)
-            payload = ({**payload, "result_view": "full_evidence"} if include_evidence
+            payload = ({**payload, "result_view": "full_evidence"}
+                       if include_evidence and operation == "read"
                        else _compact_audit(payload))
         return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (ValueError, LookupError, PermissionError, ToolArgumentError) as exc:

@@ -278,8 +278,8 @@ async def _run(state, identity, ledger):
     # Selection remains pinned metadata. The main loop reads applicable method
     # pages as needed; no mandatory preload can block unrelated capabilities.
     update_version = 0
-    from src.graph.task_contract import contract_for_explicit_outputs
-    requirements = contract_for_explicit_outputs(state["query"]).deliverables
+    from src.graph.task_contract import contract_for_turn
+    requirements = contract_for_turn(state["query"], has_tables=bool(tables)).deliverables
     # Private, identity-bound checkpoint state. Raw final envelopes stay in the
     # graph; only the extracted, validated answer crosses the user boundary.
     final_review = {}
@@ -320,7 +320,7 @@ async def _run(state, identity, ledger):
             "retrieval": {"candidate_prefetch": bool(settings.CANDIDATE_PREFETCH_ENABLED and policy.allows("local_rag")),
                           "rrf_k": settings.RRF_K, "candidate_window": settings.CANDIDATE_WINDOW,
                           "top_k_vector": settings.TOP_K_VECTOR, "query_cache": bool(settings.RAG_CACHE_ENABLED)},
-            "skill_runtime": runtime_provenance(PROJECT_ROOT),
+            "skill_runtime": runtime_provenance(),
         }
     original_request_state = capture_original_request_state(state)
 
@@ -396,7 +396,7 @@ async def _run(state, identity, ledger):
             skills.restore(saved.get("skills"))
         update_version = int(saved.get("update_version", 0))
         requirements = deepcopy(saved["artifact_requirements"]) if "artifact_requirements" in saved else (
-            contract_for_explicit_outputs(state["query"]).deliverables)
+            contract_for_turn(state["query"], has_tables=bool(tables)).deliverables)
         final_review.clear()
         final_review.update(deepcopy(saved.get("final_review") or {}))
         if final_review and (final_review.get("request_version") != update_version
@@ -436,7 +436,7 @@ async def _run(state, identity, ledger):
             return ()
         state["query"] = merge_task_instructions(str(state.get("query") or ""), updates)
         update_version = max(row["version"] for row in updates)
-        requirements = contract_for_explicit_outputs(state["query"]).deliverables
+        requirements = contract_for_turn(state["query"], has_tables=bool(tables)).deliverables
         final_review.clear()  # A previous candidate cannot accept new requirements.
         tracing.set_original_query(state["query"])
         refresh_allowed()
@@ -493,6 +493,17 @@ async def _run(state, identity, ledger):
         # checkpoints can still consume their original envelope on recovery.
         from src.core.turn_outcome import completion_from_answer, repairable_proposal_reason
         legacy_review = final_review.get("phase") == "pending"
+        route_gate = None
+        if not legacy_review:
+            from .research_routes import research_route_gate
+            route_gate = research_route_gate(
+                host.records, host.allowed_names,
+                prior=final_review.get("research_route_gate"))
+            if route_gate.challenge:
+                final_review["research_route_gate"] = route_gate.next_state()
+                task_events.append_event(identity.run_id, "research_route_gate",
+                                         route_gate.as_dict())
+                return FinalCheck(False, (route_gate.message,))
         try:
             statement = parse_completion(text) if legacy_review else completion_from_answer(text, host.records)
         except (ValueError, TypeError):
@@ -502,6 +513,10 @@ async def _run(state, identity, ledger):
             from src.core.progress_bus import emit_progress
             emit_progress('browse_phase', {'phase': 'organizing'})
         public_answer = statement.answer
+        if route_gate is not None and route_gate.exhausted and route_gate.notice:
+            if route_gate.notice not in public_answer:
+                public_answer += "\n\n" + route_gate.notice
+                statement = statement.model_copy(update={"answer": public_answer})
         delivery_gaps, artifact_contract = [], None
         if requirements and not legacy_review:
             from src.core.task_result import effective_tool_records
@@ -561,7 +576,8 @@ async def _run(state, identity, ledger):
                 corrected = next((r.get("tool_call_id") for r in host.records
                     if r.get("status") == "complete" and r.get("tool_call_id") in goal_refs
                     and positions.get(cid, float("inf")) < positions.get(r.get("tool_call_id"), -1)
-                    and _same_repair_target(calls.get(cid), calls.get(r.get("tool_call_id")))), None)
+                    and _same_repair_target(calls.get(cid), calls.get(r.get("tool_call_id")),
+                                            records=host.records)), None)
                 if corrected:
                     repairs.append(ProposalRepair(rejected_call_id=cid, corrected_call_id=corrected,
                         reason="提案在执行前被拒绝；本轮随后使用成功操作满足了所声明的目标。"))
@@ -577,7 +593,8 @@ async def _run(state, identity, ledger):
             no_dispatch = host.proven_no_dispatch(claim.rejected_call_id)
             if (no_dispatch and positions.get(claim.rejected_call_id, float("inf")) <
                     positions.get(claim.corrected_call_id, -1)
-                    and _same_repair_target(calls.get(claim.rejected_call_id), calls.get(claim.corrected_call_id))):
+                    and _same_repair_target(calls.get(claim.rejected_call_id), calls.get(claim.corrected_call_id),
+                                            records=host.records)):
                 verified_repairs.append(claim.rejected_call_id)
         # Exploratory read receipts describe individual attempts, not additional
         # user obligations. Once the agent cites successful evidence for its
@@ -636,6 +653,11 @@ async def _run(state, identity, ledger):
                 "goals": [goal for goal in statement.goals if goal.evidence_call_ids],
                 "proposal_repairs": [claim for claim in statement.proposal_repairs
                                      if claim.rejected_call_id in verified_repairs]})
+        from src.core.turn_sources import answer_citations
+        public_answer, ref_data = await asyncio.to_thread(answer_citations, public_answer,
+            session_id=identity.session_id, request_id=host._result_request_id(),
+            user={"user_id": identity.owner_user_id, "role": tracing.get_user_role()})
+        statement = statement.model_copy(update={"answer": public_answer})
         if not task_events.fence_final_answer(identity, update_version):
             return FinalCheck(False, await prepare(identity))
         outcome = reviewed_turn_outcome(statement, host.records, identity=asdict(identity),
@@ -643,7 +665,7 @@ async def _run(state, identity, ledger):
             verified_repairs=verified_repairs, superseded_proposals=superseded,
             artifact_contract=artifact_contract, delivery_gaps=delivery_gaps)
         host.publish_resolutions(outcome)
-        final_review.update(phase="accepted", answer=public_answer, outcome=outcome.as_dict(),
+        final_review.update(phase="accepted", answer=public_answer, outcome=outcome.as_dict(), references=ref_data,
             request_version=update_version, request_hash=completion_digest(state["query"]))
         return FinalCheck()
 
@@ -770,13 +792,33 @@ async def _run(state, identity, ledger):
     async def acknowledge_execution_waits(current_identity, wait_ids, checkpoint_ref):
         await execution_wait_boundary().acknowledge(current_identity, wait_ids, checkpoint_ref)
 
+    async def final_from_observations():
+        import json
+        from src.research.reference_tools import identity_report_requested, saved_identity_report
+
+        if (not host.messages or requirements or task_events.updates_after(identity.run_id, update_version)
+                or not identity_report_requested(state["query"])):
+            return None
+        for observation in reversed(tuple(host.messages.values())):
+            if observation.name != "verify_uploaded_references" or observation.status == "error":
+                continue
+            try:
+                data = json.loads(observation.content)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(data, dict) and (data.get("audit_status") or {}).get("ready_for_report") and data.get("audit_id"):
+                return await asyncio.to_thread(saved_identity_report, identity.owner_user_id,
+                                               identity.session_id, data["audit_id"])
+        return None
+
     runtime = HarnessRuntime(metered_model, durable_execute, admit, check_final,
         RunLimits(max_model_steps=settings.AGENT_MAX_MODEL_CALLS, deadline=deadline),
         schemas=catalog.schemas({row["name"] for row in catalog.describe()}),
         on_event=event, checkpoint=checkpoint, prepare=prepare,
         export_host=export_host, restore_host=restore_host, validate_resume=validate_resume,
         recover_output=True, resolve_execution_waits=resolve_execution_waits,
-        acknowledge_execution_waits=acknowledge_execution_waits, record_rejected=rejected)
+        acknowledge_execution_waits=acknowledge_execution_waits, record_rejected=rejected,
+        final_from_observations=final_from_observations)
     checkpoint_options = {"context_scope": context_scope} if native else {}
     checkpoint_config = (native_checkpoint_scope if native else checkpoint_scope)(
         identity, provider_scope, **checkpoint_options)
@@ -846,7 +888,7 @@ async def _run(state, identity, ledger):
                          final_review=final_review)
 
 
-def _same_repair_target(rejected, corrected):
+def _same_repair_target(rejected, corrected, *, records=()):
     if not rejected or not corrected or rejected["name"] != corrected["name"]:
         return False
     name = rejected["name"]
@@ -860,6 +902,22 @@ def _same_repair_target(rejected, corrected):
         # target; a pre-dispatch rejection is repaired by the later write.
         return all(original.get(key) and original[key] == replacement.get(key)
                    for key in ("workspace_id", "task_id"))
+    if name == "run_research_figure_script":
+        parent = original.get("repair_from_run_id")
+        if not parent or replacement.get("repair_from_run_id"):
+            return bool(parent and parent == replacement.get("repair_from_run_id"))
+        from src.core.task_result import _operation_identity
+
+        previous = next((row for row in records if row.get("name") == name
+                         and row.get("status") in {"failed", "partial"}
+                         and (row.get("op_receipt") or {}).get("run_id") == parent), None)
+        completed = next((row for row in records if row.get("tool_call_id") == corrected.get("id")
+                          and row.get("name") == name and row.get("status") == "complete"), None)
+        previous_identity = _operation_identity(previous) if previous else None
+        return bool(previous_identity and previous_identity[1].startswith("script_repair:")
+                    and completed and _operation_identity(completed) == previous_identity
+                    and any(item.get("valid") and item.get("request_matches") is True
+                            for item in completed.get("artifact_validations", ())))
     if name == "research_workspace":
         previous = original.get("script_ref") or {}
         current = replacement.get("script_ref") or {}
@@ -1050,6 +1108,13 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
     if task_result.status != outcome.status and outcome.status not in {"cancelled", "awaiting_input"}:
         outcome = TurnOutcome(task_result.status, reason_code, result.reason)
         task_result = build_task_result(host.records, requested_status=outcome.status, turn_outcome=outcome)
+    ref_data = (final_review or {}).get("references") if result.status == "complete" else None
+    if ref_data is None:
+        from src.core.tracing import get_user_role
+        from src.core.turn_sources import answer_citations
+        answer, ref_data = await asyncio.to_thread(answer_citations, answer,
+            session_id=identity.session_id, request_id=host._result_request_id(),
+            user={"user_id": identity.owner_user_id, "role": get_user_role()})
     task_events.release_finalization(identity.run_id)
     emit_answer_start()
     emit_text(answer)
@@ -1059,8 +1124,6 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
     local_generations = {generation for item in host.main_results if isinstance(item, dict)
                          if (generation := (item.get("read_entry") or {}).get("generation") or item.get("generation"))}
     capability_runtime["observed_index_generations"] = sorted(local_generations)
-    from src.core.turn_sources import references_data
-    ref_data = references_data(answer, host.main_results, host.web_results)
     return {"query": state["query"], "answer": answer, "gen_time_ms": elapsed,
         "references_data": ref_data,
         **({"capability_snapshot": capability_snapshot} if capability_snapshot is not None else {}),

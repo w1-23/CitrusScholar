@@ -13,7 +13,8 @@ import tarfile
 import tempfile
 
 
-ROOT_FILES = frozenset({"SKILL.md", "README.md", "LICENSE", "NOTICE", "NOTICE.md", "CAPABILITY_MIGRATION.md"})
+ROOT_FILES = frozenset({"SKILL.md", "README.md", "LICENSE", "NOTICE", "NOTICE.md",
+                        "THIRD_PARTY_NOTICES.md", "CAPABILITY_MIGRATION.md"})
 RESOURCE_DIRECTORIES = frozenset({"scripts", "references", "assets", "examples"})
 
 

@@ -120,7 +120,7 @@ def directory_prompt(available_tools: set[str]) -> str:
     from deepagents.backends import StateBackend
     from deepagents.middleware.skills import SkillsMiddleware
     from langchain.agents.middleware import ModelRequest
-    rows = research_catalog.list_skills()
+    rows = scenario_catalog()
     try:
         ordinary = [entry["id"] for entry in registry._catalog()
                     if entry["id"] not in SCENARIO_SKILLS | {"nature-figure"}]
@@ -135,7 +135,7 @@ def directory_prompt(available_tools: set[str]) -> str:
     rows = [row for row in rows if allows("skill:" + row["id"])]
     if not rows:
         return "No verified skills are available; generic authorized tools remain usable."
-    metadata = [{"name": row["id"], "description": row["description"] + " " + row["applicability"],
+    metadata = [{"name": row["id"], "description": row["description"] + " " + row.get("applicability", ""),
                  "path": row["id"], "allowed_tools": [], "metadata": {}, "license": None,
                  "compatibility": "version=" + row["version"] + " sha256=" + row["sha256"]}
                 for row in rows]
@@ -158,7 +158,10 @@ def _encode(value):
 
 class SkillSession:
     """Host-owned receipts persisted in the existing protected host checkpoint."""
-    def __init__(self, identity, available):
+    def __init__(self, identity, available, *, release=None):
+        from .installed_skills import release_path
+
+        self.release = release if release is not None else release_path()
         self.identity = identity
         self.available = available
         self.receipts: dict[str, dict] = {}
@@ -181,7 +184,12 @@ class SkillSession:
                 or type(max_chars) is not int or not 1 <= max_chars <= 20000):
             raise ValueError("invalid_skill_pagination")
         dependencies = []
-        if research_catalog.has_identity(skill_id, version, sha256):
+        if self.release is not None and len(version) == 40:
+            from .installed_skills import read_installed_resource
+
+            info, page = read_installed_resource(self.release, selected, resource,
+                                                 start_char=start_char, max_chars=max_chars)
+        elif research_catalog.has_identity(skill_id, version, sha256):
             info, page = research_catalog.read_resource(skill_id, version, sha256, resource,
                                                        start_char=start_char, max_chars=max_chars)
         else:

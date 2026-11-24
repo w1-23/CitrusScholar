@@ -2066,6 +2066,45 @@ function renderSvgBlock(source) {
   }
 }
 
+function renderCitationBubbles(container, bubbles) {
+  container.replaceChildren();
+  container.classList.add('turn-citation-bubbles');
+  (Array.isArray(bubbles) ? bubbles : []).forEach(function (source) {
+    var link = document.createElement('a');
+    link.className = 'turn-citation-bubble';
+    var title = String(source.title || '来源');
+    if (source.kind === 'web' && /^https?:\/\//i.test(source.url || '')) {
+      link.href = source.url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = '联网：' + title;
+    } else if (source.kind === 'local' && /^cite:[a-f0-9]{64}$/.test(source.record_key || '')) {
+      link.href = '/api/v2/corpus/source?record=' + encodeURIComponent(source.record_key);
+      link.textContent = '本地：' + title;
+      link.addEventListener('click', function (event) {
+        if (typeof window.openCorpusSource !== 'function') return;
+        event.preventDefault();
+        window.openCorpusSource(source.record_key);
+      });
+    } else if (source.kind === 'shared' && source.read_ref) {
+      var ref = source.read_ref;
+      var params = new URLSearchParams({version_id: ref.version_id, index_generation: ref.index_generation,
+                                        md_sha256: ref.md_sha256, start: ref.start, length: ref.end - ref.start});
+      link.href = '/api/v2/shared-corpus/documents/' + encodeURIComponent(ref.document_id) + '?' + params;
+      link.textContent = '本地：' + title;
+      link.addEventListener('click', function (event) {
+        if (!window.CitrusCorpusReader || typeof window.CitrusCorpusReader.openShared !== 'function') return;
+        event.preventDefault();
+        window.CitrusCorpusReader.openShared(ref);
+      });
+    } else return;
+    container.appendChild(link);
+  });
+  container.style.display = container.childElementCount ? 'flex' : 'none';
+  container.style.flexWrap = 'wrap';
+  container.style.gap = '0.35rem';
+}
+
 function renderMarkdownSafe(text) {
   // Accept bare SVG responses as well as fenced ```svg blocks.
   var svgBlocks = [];
@@ -4895,6 +4934,10 @@ async function sendMsg() {
       case 'section_start':
       case 'section_done': break;
       case 'citations':
+        if (data.display === 'bubble_only') {
+          renderCitationBubbles(citationsDiv, data.bubbles);
+          break;
+        }
         // v9.2: 引用编号统一重排在后端完成（renumber_refs）——事件附带 remap，
         // 前端按 remap 重写正文 [n]/[Wn]/[Hn] 与 cited ref_id 后写入 roundHistory，
         // 侧栏与正文编号一致（替代 v8.17.3 前端 W 专用压缩）。
@@ -6591,6 +6634,11 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     var answerBody = document.createElement('div'); answerBody.className = 'turn-answer';
     answerBody.dataset.displayStatus = turn.displayStatus;
     answerBody.innerHTML = renderMarkdownSafe(answer.content); contentEl.appendChild(answerBody);
+    if (answer.citation_bubbles && answer.citation_bubbles.length) {
+      var citationRow = document.createElement('div');
+      contentEl.appendChild(citationRow);
+      renderCitationBubbles(citationRow, answer.citation_bubbles);
+    }
     if (turn.artifactDelivery) renderArtifactDelivery(contentEl, turn.artifactDelivery);
     var process = createResearchProcessPanel(turn.intentSummary || (turn.user && turn.user.content));
     contentEl.insertBefore(process.element, contentEl.firstChild);

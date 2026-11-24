@@ -775,6 +775,9 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
         session_id=session_id, tool_name=tool_name, filename=safe,
         source_key=source_file_id, source_sha256=source_sha256,
         output_sha256=output_sha256, request_id=request_id)
+    audit_workbook = re.fullmatch(r"audit_workbook:[a-f0-9]{64}", logical_task_id or "") is not None
+    if audit_workbook:
+        key = hashlib.sha256(f"{owner_user_id}:{session_id}:{logical_task_id}:{output_sha256}".encode()).hexdigest()
     existing: sqlite3.Row | None = None
     try:
         with closing(sqlite3.connect(str(db))) as conn, conn:
@@ -820,16 +823,12 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                 handle.flush()
                 os.fsync(handle.fileno())
             raise_if_cancelled("artifact:before_commit")
-            publication_started()
-            os.replace(part, path)
         except BaseException:
             try:
                 part.unlink(missing_ok=True)
             except OSError:
                 pass
             raise
-        written_path = path
-
         now = time.time()
         published_existing: sqlite3.Row | None = None
         conn: sqlite3.Connection | None = None
@@ -856,6 +855,9 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                 if not exact_published:
                     published_existing = None
             if published_existing is None:
+                raise_if_cancelled("artifact:before_commit")
+                publication_started()
+                os.replace(part, path)
                 prior = conn.execute(
                     "SELECT artifact_id, logical_artifact_id, "
                     "COALESCE(version,1) AS version FROM artifacts "
@@ -895,10 +897,9 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
             if published_existing is not None:
                 artifact_id = str(published_existing["artifact_id"])
                 path = Path(str(published_existing["path"])).resolve()
-                # The newly written candidate becomes redundant once another
-                # exact request has committed the same logical output.
+                publication_started()
                 try:
-                    written_path.unlink(missing_ok=True)
+                    part.unlink(missing_ok=True)
                 except OSError:
                     logger.warning("Could not remove superseded concurrent artifact bytes")
         except BaseException:
@@ -911,6 +912,10 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                     conn.close()
                 except sqlite3.Error:
                     pass
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove uncommitted artifact bytes")
             _discard_artifact(path, session_id, artifact_id)
             raise
 
@@ -927,9 +932,12 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                 if append_key:
                     conn.execute("INSERT OR REPLACE INTO artifact_append_batches VALUES(?,?)",
                                  (append_key, artifact_id))
-        register_publication(db_path=db, artifact_id=artifact_id,
+        registered = register_publication(db_path=db, artifact_id=artifact_id,
                              project_root=PROJECT_ROOT, client_request_id=request_id,
                              allow_ownerless=owner_user_id == 0)
+        if audit_workbook and request_id and owner_user_id:
+            from src.session.files import link_turn_files
+            link_turn_files(session_id, owner_user_id, request_id, [registered["file_id"]])
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not register artifact in session files: %s", exc)
         # Keep the verified bytes/index so a retry can finish registration.
@@ -1052,6 +1060,12 @@ def validate_artifact_links(
                 base["request_matches"] = (
                     not expected_request_id or base["request_id"] == expected_request_id
                 )
+                if (not base["request_matches"] and owner and re.fullmatch(
+                        r"audit_workbook:[a-f0-9]{64}", str(row["logical_task_id"] or ""))):
+                    from src.session.files import list_turn_files
+                    linked = list_turn_files(expected_session, owner, [expected_request_id])
+                    base["request_matches"] = any(item.get("artifact_id") == artifact_id
+                        for item in linked.get(expected_request_id, []))
                 if not base["request_matches"]:
                     base["reason_code"] = "request_mismatch"
                     results.append(base)
@@ -2629,9 +2643,14 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
                        shape='{"ranges":{…},"relations":[…],"key_columns":[…]}') if checks_json else {}
     supported_checks = {'optional_fields', 'required_fields', 'ranges', 'relations', 'key_columns',
                         'groups', 'values', 'column_mapping', 'integer_data_confirmed', 'sd_kind',
-                        'mean_decimals', 'sd_decimals', 'reported_summaries', 'composite_keys',
+                        'mean_decimals', 'sd_decimals', 'reported_summaries', 'reported_p_values', 'composite_keys',
                         'pattern_checks', 'expected_structure', 'selected_checks', 'audit_plan', 'custom_findings',
-                        'regions'}
+                        'regions', 'field_roles', 'requested_checks', 'profile'}
+    if ("field_roles" in checks and not isinstance(checks["field_roles"], dict)
+            or "requested_checks" in checks and (not isinstance(checks["requested_checks"], list)
+                or any(not isinstance(value, str) for value in checks["requested_checks"]))
+            or "profile" in checks and checks["profile"] not in ("balanced", "on_demand")):
+        raise ToolArgumentError("field_roles 必须为对象，requested_checks 必须为字符串数组，profile 必须为 balanced 或 on_demand。")
     if 'selected_checks' in checks:
         from citrus_audit.data_audit_rules import RULES
         selected = checks['selected_checks']
@@ -2705,6 +2724,11 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
     summaries = checks.get('reported_summaries', [])
     if not isinstance(summaries, list) or len(summaries) > 50:
         raise ToolArgumentError('reported_summaries 必须为最多50个明确映射；invalid_input')
+    if 'reported_p_values' in checks:
+        values = checks['reported_p_values']
+        if (not isinstance(values, list) or len(values) > 50
+                or any(not isinstance(binding, dict) for binding in values)):
+            raise ToolArgumentError('reported_p_values 必须为最多50个明确映射；invalid_input')
     plan = None
     if 'audit_plan' in checks:
         from citrus_audit.plan import QUALITY_DEFAULT, parse_plan
@@ -2750,60 +2774,15 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
                         publish: bool = False,
                         publish_formats: list[str] | None = None,
                         file_ids_json: str | list[str] = "") -> tuple[str, dict[str, Any]]:
-    """审查明确选中的表格，默认返回发现、原始位置、覆盖和可复核引用。
+    """对授权原表的指定工作表或区域执行一次审查并保存快照。
 
-    file_ids_json 显式选择本账号真实文件ID，支持跨轮追加新规则，无需重附文件；
-    不接受latest、文件名或路径。非空ID列表替换本次源列表，file_indexes_json在该列表内从0选择，
-    不混入本轮附件或其他历史文件；空ID列表保留本轮附件index逻辑。
-    账号来源校验owner、实际SHA-256与登记大小，单次合计最多20MB/20文件，仍复用有界表格解析器。
-    追加新规则会执行新扫描并产生新review；已有review_id仅需导出时用交付工具，不重扫。
-
-    publish=True 默认仅发布标注 XLSX；publish_formats=["xlsx","html","json"] 显式选择所需格式，
-    给出非空 publish_formats 也表示请求发布。默认不生成工作簿或附件。
-    同一次扫描的 integrity_review.review_id 可交给 deliver_research_artifact(kind="data_audit",
-    review_id=真实ID, output_format="xlsx|html|json") 按需导出，勿重扫或编造 read_tool_result ID。
-
-    默认执行确定性检查并返回**具体单元格**位置；publish=True 时添加浅红填充、红色边框、批注，
-    以及「问题清单」（工作表/单元格/类型/原值/规则/严重程度/建议）与「审查概览」。
-    检测项：缺失、非数值、重复行、重复主键、疑似离群（组内 IQR）、越界、跨列逻辑冲突。
-    checks_json 为严格配置对象；未知键会拒绝并提示，不能传自然语言规则。
-    分组与测量映射的标准写法：{"groups":["Group"],"values":["Value1","Value2"]}，必须使用真实列名；
-    column_mapping 仅用于角色到列名，如 {"mean":"均值","n":"样本量","replicate":"重复编号"}，不替代 groups/values。
-    checks_json 可选：{"optional_fields":[...], "required_fields":[...],
-    "ranges":{"列":{"min":..,"max":..}},
-    "relations":[{"left":"列A","op":"<=","right":"列B"}], "key_columns":["样本ID"]}。
-    备注/说明类列（如 Note、备注）在没有任何规则覆盖时按可选列处理；如确需逐格标注缺失，
-    用 required_fields 显式声明（或用 ranges/key_columns 等规则覆盖该列）。
-    整数汇总核查须确认 integer_data_confirmed、column_mapping 的 mean/n/sd 与 sd_kind；
-    数值单元格还须通过 mean_decimals/sd_decimals 提供实际报告小数位数，否则明确不检查。
-    checks_json.reported_summaries 可传最多50个明确映射：raw_file_index/raw_sheet/raw_column、
-    可选原始行号 raw_rows、reported_file_index/reported_sheet/reported_row、columns={"n":"样本量列","mean":"均值列"}。
-    比较 mean/sd/se 还须同口径 same_units_confirmed=true、sample_unit_confirmed=true、decimals={"mean":2}；
-    SD/SE 须 sd_kind="sample"。仅读取真实绑定单元格；不从正文/图注猜测值或检验设计。
-    annotations_json 是独立的人工作者/模型注释层，不替代或关闭确定性扫描。元素必须是对象：
-    {"row": 3, "verdict": "正常|需核对|错误", "reason": "判断依据",
-     "field": "涉及列名（可选）", "sheet": "工作表名（多表文件必填）"}。
-    row 是原文件的 Excel 行号（含表头偏移，表头占第 1 行时首条数据是第 2 行）；
-    verdict 与 reason 不能同时为空；未指定 sheet 的标注只在单表文件上生效。
-    publish=True 时一份源文件只产出一个综合标注工作簿。先 inspect_uploaded_table 看清字段与工作表名。
-    默认选择至少两个不同附件时，还会在有界快照上执行跨文件数值关系复核；
-    完整证据返回并保存为账号内复核记录，publish=True 才另发布 JSON。
-    可选 checks_json.composite_keys=[["subject","visit"]]；pattern_checks 选择 raw_numeric_tail、
-    adjacent_equal_differences、sliding_equal_differences、repeated_sequences、repeated_blocks。
-    pattern_checks.columns 必须为 values 的子集并遵循原列顺序；order_confirmed=true 才扫描顺序模式，
-    axis="columns" 另需 same_units_confirmed=true；window=3..100，默认5，默认精确比较（容差0）。
-    原始尾数只对共享解析器保存词法精度的文本数值执行；数值型Excel不能恢复原始末位。
-    expected_structure 显式给 factors、unit_column、可选 replicate_column、expected_cells：
-    [{"treatment":"control","expected_units":3,"expected_replicates":2}]，不推测实验语义。
-    checks_json.regions 显式选择 XLSX 同一工作表的绝对矩形区域：
-    [{"file_index":0,"sheet":"Data","bounds":"D5:F20","header_rows":[5,6],"region_id":"可选"}]。
-    区域列保持原 Excel 列号，表头行可晚于第20行；同一工作表区域必须互不重叠，并以不同 region_id 参与比较。
-    checks_json.audit_plan 使用 schema="audit-plan/1"，mode 是 experimental_quality 或 research_integrity。
-    完整性模式的 comparisons 支持 sample_alignment（真实 key_columns）、finite_rectangle（原表 rows/columns）、
-    window_search（两侧明确的 rectangles，每个包含原表 rows/columns，及 window={rows,columns}、可选 max_windows/max_pairs/seed）。
-    每个比较都要绑定来源 file_index/sheet、已知 units，异单位给 right_factor_to_left，并可指定绝对/相对容差。
-    自定义检测可传 checks_json.custom_findings={execution_id,path}，path 是已接纳的 /outputs/*.json，
-    内容按 data-audit Skill 的 custom-audit-report/1 格式（含输入哈希、报告级覆盖和 findings）。宿主验签、核对坐标，再列为人工复核线索。
+    file_ids_json 选择账号中真实文件，file_indexes_json 指定来源序号。
+    sheet_name 用实际表名；checks_json.regions 绑定 file_index、sheet、
+    绝对 bounds 和 header_rows。field_roles 映射列角色、键和脚注，
+    requested_checks 限定用户要求的检查，profile 默认 balanced。
+    reported_summaries / reported_p_values 只接受核实后的区域与统计量绑定。
+    默认每份原件交付一份 XLSX。再次导出用已有 review_id，无需重扫。
+    显式旧审查计划保留兼容；工具返回有限摘要和已有成果引用。
     """
     def summarize_findings(targets, digest):
         # Marked-cell counts belong to workbook rendering, not computation.
@@ -2830,12 +2809,25 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         artifact['audit_results'] = []
         return json.dumps(artifact, ensure_ascii=False), artifact
     if requested is None:
-        requested = list(range(len(tables)))
+        requested = region_indexes if regions else list(range(len(tables)))
     if not requested:
         text = "未执行审查：没有选中的本轮附件或显式账号文件引用；请用file_ids_json提供真实文件ID，或附上文件。"
         artifact = _audit_source_not_run('no_selected_attachment', text)
         artifact['audit_results'] = []
         return text, artifact
+    from src.core.tracing import original_query
+    query = original_query()
+    modern_options = {"field_roles", "requested_checks", "profile", "reported_p_values"}
+    current_chat = bool(query) and not (validated["plan"] or validated["custom_findings"])
+    if current_chat or modern_options.intersection(validated["checks"]):
+        from .audit_review_adapter import run_review
+        from .delivery_reconciliation import delivery_outcome
+
+        try:
+            return run_review(tables, requested, validated, sheet_name=sheet_name, query=query)
+        except ToolArgumentError as exc:
+            artifact = {"_tool_outcome": delivery_outcome("failed", "invalid_tool_arguments", [])}
+            return f"[ERR_ARG] {exc}。请修正参数后重新提议。", artifact
     if regions:
         unknown = sorted(set(region_indexes) - set(range(len(tables))))
         if unknown:

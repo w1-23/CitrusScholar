@@ -493,7 +493,7 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
         if name == "run_research_figure_script":
             from src.research.script_reconciliation import capture_script_failure
             reconciliation_scope = capture_script_failure(owner, job["session_id"])
-        elif name == "deliver_research_artifact":
+        elif name in {"deliver_research_artifact", "audit_uploaded_data"}:
             from src.research.delivery_reconciliation import capture_delivery
             reconciliation_scope = capture_delivery(name, tool_call["id"])
         elif name in ZERO_WRITE_TOOL_NAMES:
@@ -659,9 +659,6 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
     if reject_reason:
         return ToolMessage(content=reject_reason, tool_call_id=tool_call["id"], name=tool_name, artifact={})
 
-    # content_and_artifact tools bypass pydantic below (raw_func(**args)), so a
-    # wrong keyword would surface as an unactionable TypeError. Check the
-    # declared schema first and name the legal parameters.
     from src.tools.argument_check import validate_tool_arguments
     argument_error, normalized_args = validate_tool_arguments(tool, tool_name, args)
     if argument_error:

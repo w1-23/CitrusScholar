@@ -82,7 +82,7 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def record_report(owner: int, session_id: str, report: dict) -> dict:
+def record_report(owner: int, session_id: str, report: dict, *, review_id: str | None = None) -> dict:
     from src.session.manager import session_manager
     from src.core.cancel import raise_if_cancelled
     from src.core.account_leases import account_lease
@@ -116,17 +116,27 @@ def record_report(owner: int, session_id: str, report: dict) -> dict:
     text = json.dumps(report, ensure_ascii=False, allow_nan=False)
     if len(text.encode("utf-8")) > MAX_REPORT_BYTES:
         raise ValueError("review report exceeds limit")
-    rid = uuid.uuid4().hex
-    with account_lease(owner):
-        raise_if_cancelled("integrity_review_publish")
-        ids = sorted(source_ids)
-        files.replace_resource_references(owner, "integrity_review", rid, ids)
+    if review_id is not None and not re.fullmatch(r"[a-f0-9]{32}", review_id):
+        raise ValueError("invalid review identity")
+    rid = review_id or uuid.uuid4().hex
+    with account_lease(owner), closing(_connect()) as conn:
+        pinned = False
         try:
-            with closing(_connect()) as conn, conn:
-                raise_if_cancelled("integrity_review_commit")
-                conn.execute("INSERT INTO integrity_reviews VALUES(?,?,?,?,?)", (rid, owner, session_id, text, _now()))
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                prior = conn.execute("SELECT owner,session_id FROM integrity_reviews WHERE review_id=?", (rid,)).fetchone()
+                if prior:
+                    if prior["owner"] != owner or prior["session_id"] != session_id:
+                        raise ValueError("review identity conflict")
+                else:
+                    raise_if_cancelled("integrity_review_publish")
+                    files.replace_resource_references(owner, "integrity_review", rid, sorted(source_ids))
+                    pinned = True
+                    raise_if_cancelled("integrity_review_commit")
+                    conn.execute("INSERT INTO integrity_reviews VALUES(?,?,?,?,?)", (rid, owner, session_id, text, _now()))
         except BaseException:
-            files.release_resource_references(owner, "integrity_review", rid)
+            if pinned:
+                files.release_resource_references(owner, "integrity_review", rid)
             raise
     return {"review_id": rid, "review_url": "/integrity-review?review=" + rid}
 

@@ -47,7 +47,10 @@ jobs:
             01_src/src/agent/context_projection_regression_test.py \
             01_src/src/agent/context_schema_budget_test.py \
             01_src/src/agent/host_runtime_contract_test.py \
+            01_src/src/agent/research_routes_test.py \
             01_src/src/agent/native_runtime_test.py \
+            01_src/src/agent/skill_provenance_test.py \
+            01_src/src/agent/release_turn_boundaries_test.py \
             01_src/src/research/p0c_regression_test.py \
             01_src/src/agent/nature_skill_resources_test.py \
             01_src/src/agent/preset_schema_manifest_test.py \
@@ -56,9 +59,13 @@ jobs:
             01_src/src/guardrails/turn_checkpoint_deterministic_test.py \
             01_src/src/api/task_observation_regression_test.py \
             01_src/src/api/citation_identity_regression_test.py \
+            01_src/src/api/citation_roles_refresh_test.py \
+            01_src/src/core/citation_stable_refs_test.py \
             01_src/src/research/render_script_contract_test.py \
+            01_src/src/research/reference_kernel_test.py \
             01_src/src/research/audit_release_test.py \
             01_src/src/research/audit_projection_test.py \
+            01_src/src/research/standalone_audit_integration_test.py \
             packages/citrus_audit/region_workbook_test.py \
             01_src/src/shared_corpus/maintenance_regression_test.py \
             01_src/src/shared_corpus/pmc_intake_test.py \

@@ -150,7 +150,7 @@ def _local_evidence(ref: dict, session_id: str, user: dict, *, preview: bool = F
         result = read_evidence(ref["ref"], turn_id=ref["turn_id"], generation=ref["generation"],
                                offset=ref["start"], max_chars=width if preview else min(width, SNIPPET_CHARS),
                                user=user, session_id=session_id)
-    except (ValueError, OSError):
+    except (ValueError, OSError, PermissionError):
         return None
     expected_end = ref["end"] if preview else min(ref["end"], ref["start"] + SNIPPET_CHARS)
     return result if result["status"] == "ok" and result["range"]["end"] == expected_end else None
@@ -416,3 +416,119 @@ def references_data(answer: str, main_results, web_results) -> dict[str, Any]:
         "dropped": list(dict.fromkeys(dropped)),
         "pre_renumbered": True,
     }
+
+
+_LITERAL_MARKDOWN = re.compile(
+    r"^[ \t]{0,3}(?:`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^[ \t]{0,3}(?:`{3,}|~{3,})[^\n]*(?:\n|$)|\Z)"
+    r"|^[ \t]*>[^\n]*|(`+)[^\n]*?\1|\\\[[^\]\n]*\]"
+    r"|!?\[[^\]\n]+\]\([^\n]*?\)|!?\[(?![LWHClwhc]\d{1,3}\])[^\]\n]+\][ \t]*\[[^\]\n]*\]"
+    r'|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』|"[^"\n]*"', re.M)
+_INLINE_REFERENCE = re.compile(r"\[([LWHC]\d{1,3})\]", re.I)
+
+
+def _visible_shared_reference(ref, user):
+    from src.shared_corpus.references import read_reference
+    from src.shared_corpus.runtime import current_runtime
+
+    if "active" not in user or "approval_status" not in user:
+        from src.auth import user_by_id
+        user = user_by_id(int(user.get("user_id") or 0)) or {}
+    ref = read_reference({"read_ref": ref})
+    if ref and user.get("active") and user.get("approval_status") == "approved":
+        runtime = current_runtime()
+        if runtime is not None and runtime.reference_visible(ref):
+            return ref
+    return None
+
+
+def _citation_entries(session_id, request_id):
+    entries = {}
+    for row in turn_source_ledger.fetch_rows(session_id, request_id):
+        marker = str(row.get("citation_ref") or "").upper()
+        if marker:
+            entries[marker] = row if marker not in entries else None
+    return entries
+
+
+def _web_citation(row, stored):
+    ref = _read_ref(row)
+    url = turn_source_ledger.safe_http_url(row.get("url"))
+    call = stored.get(ref.get("tool_call_id")) if ref else None
+    if (url and call and call["full_sha256"] == ref.get("full_sha256")
+            and tool_results.storage_integrity(call)["complete"]):
+        return {"kind": "web", "url": url, "title": row["title"]}
+    return None
+
+
+def answer_citations(answer, *, session_id, request_id, user):
+    """Project visible text and verified turn evidence in a single pass."""
+    entries = _citation_entries(session_id, request_id)
+    markers = []
+
+    def redact(match):
+        markers.append(match[1].upper())
+        return ""
+
+    parts, start = [], 0
+    for literal in _LITERAL_MARKDOWN.finditer(answer):
+        parts.extend((_INLINE_REFERENCE.sub(redact, answer[start:literal.start()]), literal[0]))
+        start = literal.end()
+    parts.append(_INLINE_REFERENCE.sub(redact, answer[start:]))
+    cited, dropped = [], []
+    stored = None
+    seen = set()
+    for marker in dict.fromkeys(markers):
+        row = entries.get(marker)
+        ref = _read_ref(row) if row else None
+        if not ref:
+            dropped.append(marker)
+            continue
+        if row["kind"] == "local":
+            ref = turn_source_ledger.local_read_reference(ref)
+            if not ref or not _local_evidence(ref, session_id, user):
+                dropped.append(marker)
+                continue
+            item = {"kind": "local", "record_key": row["source_key"], "title": row["title"]}
+        elif row["kind"] == "shared":
+            ref = _visible_shared_reference(ref, user)
+            if not ref or turn_source_ledger.reference_key("shared", ref) != row["source_key"]:
+                dropped.append(marker)
+                continue
+            item = {"kind": "shared", "read_ref": ref, "title": row["title"]}
+        elif row["kind"] == "web":
+            if stored is None:
+                stored = {call["tool_call_id"]: call for call in tool_results.fetch_by_request(session_id, request_id)}
+            item = _web_citation(row, stored)
+            if not item:
+                dropped.append(marker)
+                continue
+        else:
+            dropped.append(marker)
+            continue
+        key = (row["kind"], row["source_key"])
+        if key not in seen:
+            item["ref_id"] = marker
+            cited.append(item)
+            seen.add(key)
+    return "".join(parts), {"display": "bubble_only", "bubbles": cited, "dropped": dropped}
+
+
+def visible_citation_bubbles(bubbles, user, *, session_id, request_id):
+    """Recheck saved evidence for a turn in the caller's owned session."""
+    entries = stored = None
+    visible = []
+    for item in bubbles:
+        kind = item.get("kind")
+        if kind == "local" and read_local_citation(item.get("record_key", ""), user):
+            visible.append(item)
+        elif kind == "shared" and _visible_shared_reference(item.get("read_ref"), user):
+            visible.append(item)
+        elif kind == "web" and request_id:
+            if entries is None:
+                entries = _citation_entries(session_id, request_id)
+                stored = {call["tool_call_id"]: call for call in tool_results.fetch_by_request(session_id, request_id)}
+            row = entries.get(item.get("ref_id"))
+            source = _web_citation(row, stored) if row and row["kind"] == "web" else None
+            if source and source["url"] == item.get("url"):
+                visible.append({**source, "ref_id": item["ref_id"]})
+    return visible

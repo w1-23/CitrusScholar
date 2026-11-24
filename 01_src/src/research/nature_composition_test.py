@@ -438,7 +438,8 @@ def test_figure_methods_guidance_and_resource_stay_non_authorizing():
     assert resource_id not in system_prompt(set())
     assert resource_id not in system_prompt({"read_skill", "web_search"})
     for tool in ("create_research_figure", "run_research_figure_script", "draw_svg"):
-        assert resource_id in system_prompt({tool})
+        assert resource_id not in system_prompt({tool})
+        assert resource_id not in system_prompt({tool}, native_skills=True)
 
     resource = (Path(__file__).resolve().parents[3]
                 / "skills" / "nature-figure" / "references" / "figure-methods.md")

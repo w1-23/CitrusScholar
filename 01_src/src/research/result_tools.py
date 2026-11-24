@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Annotated
 
 from langchain_core.tools import tool
@@ -101,7 +102,8 @@ def _shared_result_accessible(row, text, fetch_result) -> bool:
             evidence = read_evidence(ref["ref"], turn_id=ref["turn_id"], generation=ref["generation"],
                                      offset=ref["start"], max_chars=ref["end"] - ref["start"])
             if evidence["status"] == "ok" and evidence["range"]["end"] == ref["end"]:
-                return text == "<untrusted_local_evidence>\n" + evidence["text"] + "\n</untrusted_local_evidence>"
+                body = re.sub(r"^\[L[1-9]\d{0,2}\]\n", "", text, count=1)
+                return body == "<untrusted_local_evidence>\n" + evidence["text"] + "\n</untrusted_local_evidence>"
         return False
     if name not in {"search_agent_corpus", "local_hybrid_search"}:
         return True

@@ -705,6 +705,8 @@ async def _run(state, identity, ledger):
         # One schema snapshot for both the send-view estimate and ModelDriver.
         model_allowed.clear()
         model_allowed.update(refresh_allowed())
+        if not host.has_result_readback():
+            model_allowed.discard("read_tool_result")
         # before_model's host_state watermark is already synchronously committed.
         task_events.acknowledge_updates(identity.run_id, update_version)
         view = history if projection is None else await projection.project(history)

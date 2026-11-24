@@ -75,7 +75,11 @@ def contract_for_turn(query: str, *, has_tables: bool) -> TaskContract:
                          r"\bplot\s+(?:this|the|these|data)\b", re.I)
     short_drawing = re.compile(
         r"(?:好[的吧]?\s*)?(?:(?:请你?|帮我|麻烦你?|直接|继续|先|再)\s*)*"
-        r"(?:画(?:一下|一张|个|一幅)?\s*图|作图|出图)(?:吧|即可)?")
+        r"(?:画一下(?:\s*图)?|画(?:一张|个|一幅)?\s*图|作图|绘图|出图)(?:吧|即可)?")
+    named_drawing = re.compile(
+        r"\s*(?:(?:请你?|帮我|麻烦你?|直接|继续|先|再)\s*)*"
+        r"(?:画|绘制|生成|制作)(?:一张|一个|一幅)?[^？！?!。；;]{0,60}"
+        r"(?:箱线图|热图|热力图|折线图|散点图|柱状图|流程图|示意图)(?:吧|即可)?\s*")
     audit = has_tables and _explicit_data_audit(content)
     text_only = re.search(r"(?:只|仅)(?:要|给|用|输出|提供)?(?:文字|文本)|"
                           r"(?:不要|无需|不用)(?:生成|交付|导出)?(?:文件|工作簿)|\btext only\b", content, re.I)
@@ -84,7 +88,8 @@ def contract_for_turn(query: str, *, has_tables: bool) -> TaskContract:
         if has_tables and intent_with_negation(content, drawing):
             requirements.append({"product_id": "attachment_figure", "label": "附件数据图",
                                  "kinds": ["figure"], "formats": ["svg"]})
-        elif any(short_drawing.fullmatch(clause.strip()) for clause in intent_clauses(content)):
+        elif any(short_drawing.fullmatch(clause.strip()) or named_drawing.fullmatch(clause)
+                 for clause in intent_clauses(content)):
             requirements.append({"product_id": "requested_figure", "label": "图件",
                                  "kinds": ["figure"], "formats": ["svg"]})
     if audit and not text_only and not any("xlsx" in item["formats"] for item in requirements):

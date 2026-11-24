@@ -8,6 +8,7 @@ import re
 INLINE_CHARS = 16000
 FIRST_DELIVERY_BYTES = 3072
 REFERENCE_PAGE_BYTES = 8192
+SEARCH_DELIVERY_BYTES = 12288
 # Readers have a separate per-page ceiling: an already-encoded 16 KB JSON
 # page can need up to twice that space once escaped as a message string.
 READER_DELIVERY_BYTES = 2 * INLINE_CHARS + 2
@@ -126,6 +127,8 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         args = call.get("args") or {}
         limit = (READER_DELIVERY_BYTES if args.get("operation") == "read" and args.get("include_evidence") is True
                  else REFERENCE_PAGE_BYTES)
+    elif message.name in {"local_hybrid_search", "deepseek_search"}:
+        limit = SEARCH_DELIVERY_BYTES
     if size <= limit:
         return message
     reference = _verified_reference(message, text) if isinstance(text, str) else None
@@ -175,12 +178,12 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         "tool_result_ref": reference,
         "delivery": "stored_result_with_partial_preview",
         "execution_status": status,
-        "read_with": {"tool": "read_tool_result", "tool_call_id": message.tool_call_id, "start_char": 0},
+        "read_with": {"tool": "read_tool_result", "tool_call_id": message.tool_call_id},
         "complete": False,
         "field_index": index,
         "control_observation": control,
         "previews": previews,
-        "notice": "原文已完整保存。这里不是完整检查结果；按字段或字符分页回读，不要重复执行。",
+        "notice": "原文已完整保存。缺少关键结果时只读必要字段；如需续读，使用返回的 next_cursor。",
     }
 
     def render():

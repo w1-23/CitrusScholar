@@ -1,6 +1,7 @@
 """Authenticated, bounded readback of retained tool results (no model calls)."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Annotated
@@ -123,16 +124,24 @@ def _shared_result_accessible(row, text, fetch_result) -> bool:
                for item in rows)
 
 
+def _next_cursor(source, offset, fields):
+    identity = json.dumps([source["tool_call_id"], source["full_sha256"], offset, fields or []],
+                          ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 @tool
 def read_tool_result(tool_call_id: str, start_char: int = 0,
                      max_chars: int = 6000,
                      fields: Annotated[list[str] | None, Field(
                          description="JSON Pointers; at most 32 fields, each at most 512 characters. "
-                                     "Split larger selections into separate requests.")] = None) -> str:
+                                     "Split larger selections into separate requests.")] = None,
+                     cursor: str = "") -> str:
     """Read back a previously truncated tool result from this authenticated session.
 
-    Use a tool_call_id from a result reference. Identity and session come from
-    the server. Request 1–20000 characters and continue at next_start_char.
+    Use the tool_call_id offered in a partial delivery. Select only necessary
+    fields on the initial read. Continue with the returned next_cursor and the
+    same tool_call_id. The host resolves the offset and prior selection.
     Optional JSON Pointers (such as /coverage or /tests/0/p) select up to 32
     fields of at most 512 characters each. Offsets count stored text or the
     selected fields' rendered JSON. Use the same fields when continuing a page.
@@ -182,6 +191,8 @@ def read_tool_result(tool_call_id: str, start_char: int = 0,
         return _read_rejected("unavailable", "evidence_unavailable", "回执所引用的原始证据已过期或不可访问。")
     source = {"tool_call_id": row["tool_call_id"], "full_sha256": storage["full_sha256"],
               "original_chars": storage["original_chars"], "stored_chars": storage["stored_chars"]}
+    if cursor and cursor != _next_cursor(source, start_char, fields):
+        return _read_rejected("invalid_arguments", "result_cursor_invalid", "续读标记与当前回执或字段范围不一致。")
     missing_fields = []
     if fields:
         if storage["state"] == "truncated":
@@ -225,6 +236,7 @@ def read_tool_result(tool_call_id: str, start_char: int = 0,
         "missing_fields": missing_fields,
         "page": {"start_char": offset, "end_char": end, "total_chars": len(text),
                  "next_start_char": end if end < len(text) else None,
+                 "next_cursor": _next_cursor(source, end, fields) if end < len(text) else None,
                  "complete": offset == 0 and end == len(text), "offset_basis": basis},
         "result_text": text[offset:end], "content_origin": "untrusted_historical_tool_result",
         "_tool_outcome": _outcome("partial" if clipped else "complete",

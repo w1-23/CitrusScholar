@@ -36,18 +36,6 @@ def _succeeded(records: Iterable[object], names: frozenset[str]) -> bool:
     return False
 
 
-def _message(missing: tuple[str, ...], *, local_done: bool, web_done: bool) -> str:
-    routes = set(missing)
-    if routes == {"local", "web"}:
-        return ("宿主检查：本轮已开始检索，但本地检索与 DeepSeek 网络 Search 都还没有完成一次尝试。"
-                "当前授权允许时，对同一知识子目标各补一次；已有等价证据可直接复用。")
-    if "local" in routes:
-        prefix = "本轮已做 DeepSeek 网络 Search，但缺少本地检索的一次尝试。" if web_done else "本轮缺少本地检索的一次尝试。"
-        return "宿主检查：" + prefix + "当前授权允许时补一次本地检索；已有等价本地证据可直接复用。"
-    prefix = "本轮已做本地检索，但缺少 DeepSeek 网络 Search 的一次尝试。" if local_done else "本轮缺少 DeepSeek 网络 Search 的一次尝试。"
-    return "宿主检查：" + prefix + "当前授权允许时补一次网络 Search。"
-
-
 def _notice(missing: tuple[str, ...]) -> str:
     labels = {"local": "本地检索", "web": "DeepSeek 网络 Search"}
     return "覆盖说明：本轮" + "、".join(labels[item] for item in missing) + "未完成；回答仅基于已实际取得的证据。"

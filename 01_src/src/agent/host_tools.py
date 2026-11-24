@@ -30,6 +30,49 @@ class HostTools:
     pending_question: dict | None = None
     allowed_names: set[str] = field(default_factory=set)
     published_resolutions: dict[str, str] = field(default_factory=dict)
+    pending_result_reads: dict[str, str] = field(default_factory=dict)
+
+    def result_readbacks(self):
+        """Eligible partial deliveries and their latest committed read page."""
+        eligible = {cid: None for cid, message in self.messages.items()
+                    if message.additional_kwargs.get("first_delivery_reference") is True}
+        for message in self.messages.values():
+            if message.name != "read_tool_result":
+                continue
+            try:
+                observation = json.loads(message.content)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(observation, dict) or observation.get("status") != "ok":
+                continue
+            target = observation.get("tool_call_id")
+            if isinstance(target, str) and target in eligible:
+                eligible[target] = observation
+        return eligible
+
+    def has_result_readback(self):
+        return any(page is None or page["page"].get("next_cursor")
+                   for page in self.result_readbacks().values())
+
+    def _prepare_result_readback(self, args, call_id):
+        target, token = args.get("tool_call_id"), args.get("cursor", "")
+        if not isinstance(target, str) or args.get("start_char", 0) != 0:
+            return False
+        candidates = self.result_readbacks()
+        if target not in candidates or target in self.pending_result_reads:
+            return False
+        previous = candidates[target]
+        if previous is None:
+            if token:
+                return False
+        else:
+            page = previous["page"]
+            if not token or token != page.get("next_cursor") or args.get("fields") is not None:
+                return False
+            args["start_char"] = page["next_start_char"]
+            args["fields"] = previous["selected_fields"] or None
+        self.pending_result_reads[target] = call_id
+        return True
 
     def publish_resolutions(self, outcome=None):
         from src.core.task_result import resolved_tool_attempts
@@ -183,6 +226,12 @@ class HostTools:
         from src.tools.interaction import bind_question_context, reset_question_context
         from src.core.task_events import TaskConflict
         call = deepcopy(call)
+        if call["name"] == "read_tool_result" and not self._prepare_result_readback(call["args"], call["id"]):
+            reason = "result_readback_not_offered"
+            return ToolExecution(ToolMessage(content="回执无需回读，或续读标记失效。请使用已有结果。",
+                status="error", name=call["name"], tool_call_id=call["id"],
+                additional_kwargs={"execution_dispatched": False},
+                artifact={"_tool_outcome": {"status": "not_run", "reason_code": reason}}))
         logical_key = 'host:' + uuid.uuid4().hex
         retry_of = call['args'].get('retry_of') if call['name'] == 'browse_web' else None
         retry_target = self._claim_target(call, retry_of) if retry_of else None
@@ -337,6 +386,10 @@ class HostTools:
         retain_observation(identity, execution, delivered, call)
         self.records.append(record)
         self._adopt_observation(delivered)
+        if call["name"] == "read_tool_result":
+            target = call["args"].get("tool_call_id")
+            if isinstance(target, str) and self.pending_result_reads.get(target) == call["id"]:
+                self.pending_result_reads.pop(target)
         if record.get('status') == 'complete':
             category = ''
             if call['name'] in {'inspect_uploaded_table', 'audit_uploaded_table', 'audit_uploaded_data', 'audit_uploaded_data_bundle'}:

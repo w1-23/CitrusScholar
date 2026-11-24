@@ -39,7 +39,10 @@ async def workbench_page(request: Request):
     from src.auth import user_for_token
 
     if not user_for_token(request.cookies.get("citrus_auth", "")):
-        return RedirectResponse(url="/?next=" + quote(request.url.path, safe=""), status_code=303)
+        target = request.url.path
+        if request.url.query:
+            target += "?" + request.url.query
+        return RedirectResponse(url="/?next=" + quote(target, safe=""), status_code=303)
     page = WEB_DIR / "figure-workbench.html"
     if not page.is_file():
         raise HTTPException(status_code=404, detail="图件工作台页面未部署。")

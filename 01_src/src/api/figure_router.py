@@ -201,7 +201,10 @@ async def serve_figure_page(request: Request):
 
     user = user_for_token(request.cookies.get("citrus_auth", ""))
     if not user:
-        return RedirectResponse(url="/?next=" + quote(request.url.path, safe=""), status_code=303)
+        target = request.url.path
+        if request.url.query:
+            target += "?" + request.url.query
+        return RedirectResponse(url="/?next=" + quote(target, safe=""), status_code=303)
     html_path = WEB_DIR / "figures.html"
     if not html_path.exists():
         return HTMLResponse(

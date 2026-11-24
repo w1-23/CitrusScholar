@@ -159,7 +159,7 @@
           .then(function (data) {
             if (isCurrent && !isCurrent()) throw new DOMException('Project changed', 'AbortError');
             if (response.status === 401) {
-              location.replace('/?next=%2Ffigures');
+              location.replace('/?next=' + encodeURIComponent(location.pathname + location.search));
               throw new Error('登录已失效');
             }
             if (!response.ok) {
@@ -2121,7 +2121,7 @@
     }).then(function (response) {
       if (request !== state.dataPreviewRequest || fileId !== el('dataFileSelect').value) return null;
       if (response.status === 401) {
-        location.replace('/?next=%2Ffigures');
+        location.replace('/?next=' + encodeURIComponent(location.pathname + location.search));
         throw new Error('登录已失效');
       }
       if (response.status === 416) throw new Error('文件为空或读取范围无效。');

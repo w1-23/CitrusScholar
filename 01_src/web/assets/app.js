@@ -829,7 +829,7 @@ async function authenticate(mode) {
       if (currentAccount.role !== 'admin') throw new Error('此页面仅管理员可访问。');
       location.replace('/admin'); return;
     }
-    if (['/figures', '/figures/legacy', '/figure-workbench'].includes(next)) {
+    if (/^\/(?:figures(?:\/legacy)?|figure-workbench)(?:\?|$)/.test(next || '')) {
       location.replace(next); return;
     }
     await startAuthenticatedApp();

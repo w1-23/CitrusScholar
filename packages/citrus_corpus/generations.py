@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .contract import LEGACY, CorpusSpec, RetrievalParameters
+from .contract import ISOLATED, LEGACY, CorpusSpec, RetrievalParameters
 from .search import (
     BUILDER_VERSION,
     CHUNKS_FILENAME,
@@ -236,6 +236,8 @@ def _require_manifest(manifest: dict[str, Any],
     if manifest.get("query_prefix") != QUERY_PREFIX:
         raise GenerationContractError("manifest_query_prefix_mismatch")
     _require_string(manifest.get("embedding_model"), "embedding_model")
+    if spec == ISOLATED:
+        _require_string(manifest.get("encoder_fingerprint"), "encoder_fingerprint")
     dimension = _require_int(manifest.get("dimension"), "dimension", 1)
     if dimension != EMBEDDING_DIM:
         raise GenerationContractError("manifest_dimension_mismatch")
@@ -512,6 +514,15 @@ def _verify_models(embedder: Any, reranker: Any, manifest: dict[str, Any]) -> No
         raise GenerationContractError("reranker_required")
 
 
+def encoder_fingerprint(embedder):
+    """Fingerprint the supplied model revision and retrieval input contract."""
+    profile = getattr(embedder, "fingerprint", None)
+    if not isinstance(profile, str) or not _HEX64_RE.fullmatch(profile):
+        raise GenerationContractError("encoder_fingerprint_required")
+    return manifest_digest({"implementation": profile, "model": embedder.model_name, "dimension": embedder.dim,
+                            "passage_prefix": DOCUMENT_PREFIX, "query_prefix": QUERY_PREFIX})
+
+
 def load_generation(root: Path, generation: str, *, embedder: Any,
                     reranker: Any, spec: CorpusSpec = LEGACY,
                     parameters: RetrievalParameters = RetrievalParameters()) -> GenerationHandle:
@@ -530,6 +541,8 @@ def load_generation(root: Path, generation: str, *, embedder: Any,
     chunks_by_id = {str(row["chunk_id"]): row for row in rows}
     db, table = _verify_lance(generation_dir, manifest, chunks_by_id)
     _verify_models(embedder, reranker, manifest)
+    if spec == ISOLATED and encoder_fingerprint(embedder) != manifest["encoder_fingerprint"]:
+        raise GenerationContractError("encoder_fingerprint_mismatch")
 
     root_path = _resolve_root(root)
     try:

@@ -19,9 +19,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .contract import LEGACY, CorpusSpec
+from .contract import ISOLATED, LEGACY, CorpusSpec
 from .generations import (
     canonical_json,
+    encoder_fingerprint,
     generation_directory,
     manifest_digest,
     read_generation_manifest,
@@ -480,6 +481,8 @@ def build_generation(root: Path, chunks: list[dict], *,
         "chunks_sha256": chunks_sha256,
         "documents": documents,
     }
+    if spec == ISOLATED:
+        identity_core["encoder_fingerprint"] = encoder_fingerprint(embedder)
     generation = "g" + manifest_digest(identity_core)[:32]
     core = dict(identity_core)
     core["generation"] = generation

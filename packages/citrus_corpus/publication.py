@@ -6,7 +6,7 @@ from .build import build_generation
 from .catalog import Catalog
 from .chunks import chunk_document
 from .contract import ISOLATED
-from .generations import load_generation, read_generation_manifest
+from .generations import encoder_fingerprint, load_generation, read_generation_manifest
 from .pointers import read_pointer, write_pointer
 from .prepare import read_document_files
 from .search import HEALTH_QUERY
@@ -52,7 +52,7 @@ class Publisher:
             payload = _selection_payload(selection)
             if current and current["selection"] == payload:
                 active_manifest = read_generation_manifest(self.store.root, active)
-                if active_manifest["embedding_model"] == self.embedder.model_name:
+                if active_manifest.get("encoder_fingerprint") == encoder_fingerprint(self.embedder):
                     return {"state": "active", "generation": active}
             now = self.now()
             if last_build and now - last_build < MIN_BUILD_INTERVAL:

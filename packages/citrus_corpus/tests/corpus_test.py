@@ -17,6 +17,7 @@ from citrus_corpus.store import Store
 
 class FixtureEmbedder:
     model_name = "test/local-token-vector"
+    fingerprint = sha256(b"local-token-vector version 1").hexdigest()
     dim = 1024
 
     def __init__(self):

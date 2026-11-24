@@ -32,7 +32,6 @@ _TARGETS = MappingProxyType({
     "browse_web": "src.tools.browse_web",
     "deepseek_fetch_paper": "src.tools.deepseek_search_fetch",
     "local_hybrid_search": "src.tools.deepseek_search_fetch",
-    "inspect_candidates": "src.tools.candidate_tools",
     "read_candidate": "src.tools.candidate_tools",
     "search_candidates": "src.tools.candidate_tools",
     "draw_svg": "src.tools.draw_svg",
@@ -50,7 +49,6 @@ _TARGETS = MappingProxyType({
     "recall_research_notes": "src.research.tools",
     "analyze_research_data": "src.research.statistics_tools",
     "audit_research_images": "src.research.image_integrity_tools",
-    "create_research_figure": "src.research.figure_tools",
     "run_research_figure_script": "src.research.figure_tools",
     "propose_document_ingest": "src.shared_corpus.tool_adapter",
     "prepare_document": "src.shared_corpus.tool_adapter",
@@ -87,7 +85,6 @@ _PRESETS = (
     _Preset("browse_web", "web", "browse_web", "session_artifact", ("network", "session"), ()),
     _Preset("deepseek_fetch_paper", "web", "deepseek_fetch_paper", None, ("network",), ()),
     _Preset("local_hybrid_search", "rag", "local_hybrid_search", None, ("local_corpus",), ()),
-    _Preset("inspect_candidates", "rag", "candidate_pool", None, ("local_corpus", "candidate_pool"), ()),
     _Preset("read_candidate", "rag", "candidate_pool", None, ("local_corpus", "candidate_pool"), ()),
     _Preset("search_candidates", "rag", "candidate_pool", None, ("local_corpus", "candidate_pool"), ()),
     _Preset("draw_svg", "analysis", "draw_svg", None, (), ("figure",)),
@@ -105,7 +102,6 @@ _PRESETS = (
     _Preset("recall_research_notes", "research", "research_notes", None, ("research_tools",), ()),
     _Preset("analyze_research_data", "research", "research_statistics", "session_artifact", ("research_tools", "session"), ("statistics_report",)),
     _Preset("audit_research_images", "research", "research_image_integrity", "session_artifact", ("account_files", "research_tools", "session"), ("report_json",)),
-    _Preset("create_research_figure", "research", "research_artifacts", "session_artifact", ("research_tools", "session"), ("figure_package",)),
     _Preset("run_research_figure_script", "research", "research_artifacts", "session_artifact", ("session", "research_tools", "script_sandbox"), ("figure_package",)),
     # Administrator-published shared literature; visibility is gated by the
     # shared corpus runtime through the ``shared_corpus`` requirement.

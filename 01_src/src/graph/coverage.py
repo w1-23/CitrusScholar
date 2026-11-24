@@ -6,7 +6,7 @@ from src.core.op_receipt import result_payload
 VERIFICATION_RESOLVED = frozenset({"metadata_matched", "metadata_mismatch", "web_candidate",
                                   "title_candidate", "not_found_in_checked_registries"})
 TRACKED_TOOLS = frozenset({"verify_uploaded_references", "audit_uploaded_data",
-                           "run_research_figure_script", "create_research_figure"})
+                           "run_research_figure_script",})
 
 def _nonnegative_int(value):
     return type(value) is int and value >= 0
@@ -124,7 +124,7 @@ class CoverageLedger:
                         added += 1
                     else:
                         repeated += 1
-        elif tool_name in {"run_research_figure_script", "create_research_figure"} or (
+        elif tool_name in {"run_research_figure_script"} or (
                 tool_name == "research_workspace" and (payload.get("_tool_outcome") or {}).get("reason_code") == "figure_edit_saved"):
             # Internal datasets advance preparation without satisfying a figure.
             import json

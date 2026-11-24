@@ -49,8 +49,6 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     # Candidate tools expose the request-scoped candidate pool. They declare
     # LOCAL_CORPUS only: the "local search was done" completion gate must keep
     # being satisfied by local_hybrid_search, never by a candidate tool.
-    "inspect_candidates": ToolMetadata(
-        "查看候选", capabilities=frozenset({LOCAL_CORPUS})),
     "read_candidate": ToolMetadata(
         "读取候选原文", capabilities=frozenset({LOCAL_CORPUS})),
     "search_candidates": ToolMetadata(
@@ -87,8 +85,6 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
         "查阅课题记录", capabilities=frozenset({RESEARCH})),
     "analyze_research_data": ToolMetadata(
         "统计分析", "下载统计结果", frozenset({RESEARCH, ARTIFACT})),
-    "create_research_figure": ToolMetadata(
-        "生成科研图", "下载图件", frozenset({RESEARCH, ARTIFACT, VISUALIZATION})),
     "run_research_figure_script": ToolMetadata(
         "执行绘图脚本", "下载图件", frozenset({RESEARCH, ARTIFACT, VISUALIZATION})),
     # Administrator-published shared literature. Visibility is gated by the

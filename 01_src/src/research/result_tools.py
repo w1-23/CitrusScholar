@@ -129,7 +129,7 @@ def read_tool_result(tool_call_id: str, start_char: int = 0,
                      fields: Annotated[list[str] | None, Field(
                          description="JSON Pointers; at most 32 fields, each at most 512 characters. "
                                      "Split larger selections into separate requests.")] = None) -> str:
-    """Read an earlier tool result from this authenticated session.
+    """Read back a previously truncated tool result from this authenticated session.
 
     Use a tool_call_id from a result reference. Identity and session come from
     the server. Request 1–20000 characters and continue at next_start_char.

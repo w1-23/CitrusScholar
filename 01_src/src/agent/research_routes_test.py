@@ -61,11 +61,6 @@ def test_read_candidate_alone_does_not_start_a_discovery_turn():
     assert not gate.active
 
 
-def test_inspect_candidates_satisfies_local_reuse():
-    gate = research_route_gate([row("inspect_candidates"), row("deepseek_search")], BOTH)
-    assert not gate.active
-
-
 def test_fetch_and_fetch_paper_are_not_deepseek_search():
     fetch_only = research_route_gate([row("deepseek_fetch")], BOTH)
     paper_only = research_route_gate([row("deepseek_fetch_paper")], BOTH)

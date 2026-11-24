@@ -2812,6 +2812,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
     """对授权原表的指定工作表或区域执行一次审查并保存快照。
 
     file_ids_json 选择账号中真实文件，file_indexes_json 指定来源序号。
+    先检查 layout。多区块必须确认 checks_json.regions 才能审查。
     sheet_name 用实际表名；checks_json.regions 绑定 file_index、sheet、
     绝对 bounds 和 header_rows。field_roles 映射列角色、键和脚注，
     requested_checks 限定用户要求的检查，profile 默认 balanced

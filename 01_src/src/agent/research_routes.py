@@ -6,7 +6,7 @@ import re
 from typing import Iterable, Mapping
 
 LOCAL_DISCOVERY = frozenset({"local_hybrid_search", "search_candidates", "search_agent_corpus"})
-LOCAL_REUSE = frozenset({"read_candidate", "inspect_candidates", "read_local_evidence"})
+LOCAL_REUSE = frozenset({"read_candidate", "read_local_evidence"})
 WEB_SEARCH = frozenset({"deepseek_search"})
 
 _NOT_RUN = frozenset({"not_run", "rejected"})

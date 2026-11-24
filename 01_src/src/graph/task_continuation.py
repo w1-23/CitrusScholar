@@ -53,7 +53,7 @@ def restore_continuation(state, tables, *, validate_artifacts):
         record["artifact_validations"] = fresh
         record["artifact_count"] = sum(v.get("valid") is True for v in fresh)
         # Figure coverage is usable only if its published exports still exist.
-        if name in {"run_research_figure_script", "create_research_figure"} or (
+        if name in {"run_research_figure_script"} or (
                 name == "research_workspace" and receipt.get("reason_code") == "figure_edit_saved"):
             valid_links = {v.get("link") for v in fresh if v.get("valid") is True}
             figures = payload.get("figures") if isinstance(payload.get("figures"), list) else [payload]

@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 REPAIR_TOOLS = {
-    "figure": ("run_research_figure_script", "create_research_figure"),
+    "figure": ("run_research_figure_script",),
     "verification": ("verify_uploaded_references",),
     "audit": ("audit_uploaded_data",),
     "input": ("request_user_input",),

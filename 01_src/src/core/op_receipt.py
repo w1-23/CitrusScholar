@@ -38,7 +38,7 @@ def make_receipt(name: str, call_id: str, content: Any, artifact: Any) -> dict:
             "checks_sha256", "audit_mode", "requested_sheet", "file", "ok", "sheets", "skipped",
             "coverage", "issues", "reason_code", "rule_execution", "annotation_errors") if k in r}
             for r in payload.get("results", payload.get("audit_results", [])) if isinstance(r, dict)]}
-    elif name in {"run_research_figure_script", "create_research_figure"} or (
+    elif name in {"run_research_figure_script"} or (
             name == "research_workspace" and outcome.reason_code == "figure_edit_saved"):
         fields = ("figure_id", "title", "exports", "editable", "qa_receipt", "qa_failures",
                   "nature_skill_receipt", "initial_nature_skill_receipt", "edit_provenance", "render_receipt", "status", "failures")

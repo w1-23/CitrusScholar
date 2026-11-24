@@ -23,7 +23,6 @@ from src.tools.deepseek_search_fetch import (
     local_hybrid_search,
 )
 from src.tools.candidate_tools import (
-    inspect_candidates,
     read_candidate,
     search_candidates,
 )
@@ -48,7 +47,6 @@ from src.research.tools import (
 from src.research.statistics_tools import analyze_research_data
 from src.research.image_integrity_tools import audit_research_images, validate_image_audit_request
 from src.research.figure_tools import (
-    create_research_figure,
     run_research_figure_script,
 )
 
@@ -81,8 +79,6 @@ _TOOL_DECLARATIONS = (
     # candidate_prefetch node filled before the model saw the turn. They are
     # visible only when a pool exists for this request, so the model can never
     # call them for a pool that was never built.
-    (inspect_candidates, "rag", "candidate_pool", None,
-     ("local_corpus", "candidate_pool"), (), ""),
     (read_candidate, "rag", "candidate_pool", None,
      ("local_corpus", "candidate_pool"), (), ""),
     (search_candidates, "rag", "candidate_pool", None,
@@ -116,8 +112,6 @@ _TOOL_DECLARATIONS = (
      ("account_files", "research_tools", "session"), ("report_json",), ""),
     # A spec may use attachments, account files, or inline values. None of
     # those sources is mandatory, but publication still requires a session.
-    (create_research_figure, "research", "research_artifacts", "session_artifact",
-     ("research_tools", "session"), ("figure_package",), ""),
     (run_research_figure_script, "research", "research_artifacts", "session_artifact",
      ("session", "research_tools", "script_sandbox"), ("figure_package",), ""),
     # Administrator-published shared literature. Every tool is hidden until

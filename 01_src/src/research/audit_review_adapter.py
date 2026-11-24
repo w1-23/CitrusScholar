@@ -49,7 +49,7 @@ def _sheet_scope(raw, name, proposed, query):
 
 
 def run_review(tables, indexes, validated, *, sheet_name, query):
-    from citrus_audit import review_sheet
+    from citrus_audit import discover_regions, review_sheet
     from src.core.cancel import raise_if_cancelled
     from src.core.tracing import get_session_id, get_user_id
     from src.research.delivery_reconciliation import delivery_outcome
@@ -79,7 +79,7 @@ def run_review(tables, indexes, validated, *, sheet_name, query):
             if type(file_index) is not int or file_index not in stats:
                 raise ToolArgumentError(f"{key} 需通过 file_index 绑定本次审查的原件。")
             stats[file_index].setdefault(key, []).append({k: v for k, v in binding.items() if k != "file_index"})
-    snapshots, targets, inputs, errors, plans = [], [], {}, [], []
+    snapshots, targets, inputs, errors, plans, layouts = [], [], {}, [], [], []
     for index in indexes:
         raise_if_cancelled("data_audit_review")
         source = tables[index]
@@ -92,12 +92,27 @@ def run_review(tables, indexes, validated, *, sheet_name, query):
             errors.append(f"{name} 未指定审查区域")
             continue
         actual_sheet = _sheet_scope(raw, name, sheet_name, query)
+        if not regions and Path(name).suffix.lower() in {".xlsx", ".xlsm"}:
+            sheets = [actual_sheet] if actual_sheet else []
+            if not sheets:
+                from citrus_audit.readers import open_xlsx_readonly
+                with closing(open_xlsx_readonly(raw, name, data_only=True)) as workbook:
+                    sheets = list(workbook.sheetnames)
+            for sheet in sheets:
+                layout = discover_regions(raw, name, sheet_name=sheet, header_rows=validated["header_rows"])
+                if layout["region_count"] > 1 or layout["regions_truncated"]:
+                    layouts.append({"file_index": index, **layout})
         options = {"sheet_scope": actual_sheet, "regions": regions or None, "field_roles": roles,
                    "requested_checks": selected, "profile": profile,
                    "header_rows": None if regions else validated["header_rows"], **stats[index]}
         identity = {"file_index": index, "source_file_id": file_id, "source_sha256": digest, "source_name": name}
         plans.append((identity, options))
         inputs[index] = raw
+
+    if layouts:
+        message = "未执行审查：发现多区块或区域列表不完整。请先确认 layout，再传入 checks_json.regions。"
+        artifact = {"layouts": layouts, "_tool_outcome": delivery_outcome("not_run", "audit_regions_required", [])}
+        return message + "\n" + json.dumps({"layouts": layouts}, ensure_ascii=False), artifact
 
     from src.core.tracing import get_client_request_id, get_job_id
     from src.research.integrity_review import get_review

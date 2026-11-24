@@ -4,7 +4,7 @@
 A request may run one local hybrid search *before* the model sees it.  The
 resulting chunks stay in this module's process memory; only a count/family
 notice reaches the model.  Candidate text becomes visible exclusively through
-bounded tool calls (``inspect_candidates`` / ``read_candidate`` /
+bounded tool calls (``read_candidate`` /
 ``search_candidates``).
 
 Design constraints:
@@ -387,7 +387,7 @@ class CandidatePool:
             "本轮已在进入模型前同步检索本地语料"
             f"（语料族：{families}{translated}）。"
             f"候选池：{len(self.candidates)} 条，候选正文未放入上下文。"
-            "需要证据时先调用 inspect_candidates(gap=\"当前缺口\") 查看候选元数据，"
+            "需要证据时先调用 read_candidate(gap=\"当前缺口\") 查看候选元数据，"
             "再用 read_candidate(candidate_id=\"c01\") 读取有界原文；"
             "缺口变化时用 search_candidates(query=\"...\") 补充。"
             "不要一次读取全部候选。"

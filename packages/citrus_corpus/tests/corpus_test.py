@@ -195,3 +195,25 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
     with reader.pin(**models) as restored:
         assert restored.search("leaf") == []
     assert len(intake.catalog.versions()) == 2
+
+
+def test_publication_window_reacts_to_load_disk_and_marker(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from citrus_corpus import __main__ as cli
+
+    marker = tmp_path / "idle"
+    load = [6.0]
+    free = [32 * 1024 ** 2]
+    monkeypatch.setattr(cli.os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(cli.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
+    monkeypatch.setattr(cli.shutil, "disk_usage", lambda root: SimpleNamespace(free=free[0]))
+    available = cli._publication_window(tmp_path, marker, 0.75, 16)
+    assert not available()
+    marker.touch()
+    assert not available()
+    load[0] = 2.0
+    assert available()
+    free[0] = 1
+    assert not available()
+    with pytest.raises(ValueError, match="corpus_publication_budget_invalid"):
+        cli._publication_window(tmp_path, marker, float("nan"), 16)

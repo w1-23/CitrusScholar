@@ -1,8 +1,10 @@
 """Operator commands for an initialized private corpus root."""
 from argparse import ArgumentParser
 import json
+import math
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import sys
 import time
@@ -63,7 +65,12 @@ def parser():
     worker.add_argument("--allow-network", action="store_true")
     worker.add_argument("--allow-redirect-host", action="append", default=[])
     worker.add_argument("--network-marker", help="optional file whose presence authorizes network dispatch")
-    commands.add_parser("publish").add_argument("--idle-marker")
+    publish = commands.add_parser("publish")
+    publish.add_argument("--idle-marker")
+    publish.add_argument("--watch", action="store_true")
+    publish.add_argument("--poll-seconds", type=int, default=30)
+    publish.add_argument("--max-load-per-cpu", type=float, default=0.75)
+    publish.add_argument("--min-free-mib", type=int, default=2048)
     rollback = commands.add_parser("rollback")
     rollback.add_argument("generation")
     search = commands.add_parser("search")
@@ -74,6 +81,40 @@ def parser():
     reference = commands.add_parser("read")
     reference.add_argument("reference", help="JSON reference returned by search")
     return main
+
+
+def _publication_window(root, marker, max_load_per_cpu, min_free_mib):
+    if (not math.isfinite(max_load_per_cpu) or max_load_per_cpu <= 0
+            or not 0 <= min_free_mib <= 1024 * 1024):
+        raise ValueError("corpus_publication_budget_invalid")
+
+    def idle():
+        if marker is not None and not Path(marker).is_file():
+            return False
+        load = os.getloadavg()[0]
+        return (load <= max_load_per_cpu * (os.cpu_count() or 1)
+                and shutil.disk_usage(root).free >= min_free_mib * 1024 ** 2)
+
+    return idle
+
+
+def _publish(args, store):
+    if not 5 <= args.poll_seconds <= 3600:
+        raise ValueError("corpus_publication_interval_invalid")
+    idle = _publication_window(store.root, args.idle_marker, args.max_load_per_cpu, args.min_free_mib)
+    publisher = Publisher(store, idle=idle, **_models(args))
+    if not args.watch:
+        return publisher.publish()
+    previous = None
+    while True:
+        try:
+            state = publisher.publish()
+        except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:
+            state = {"state": "deferred", "error": _error_code(exc)}
+        if state != previous:
+            print(json.dumps(state, ensure_ascii=False), flush=True)
+            previous = state
+        time.sleep(args.poll_seconds)
 
 
 def _run(args):
@@ -121,11 +162,14 @@ def _run(args):
         with Reader(store).pin(**_models(args)) as pinned:
             return pinned.search(args.query, args.limit)
     os.nice(10)
-    idle_marker = getattr(args, "idle_marker", None)
-    publisher = Publisher(store, idle=(lambda: idle_marker is None or Path(idle_marker).is_file()), **_models(args))
     if command == "rollback":
-        return publisher.rollback(args.generation)
-    return publisher.publish()
+        return Publisher(store, **_models(args)).rollback(args.generation)
+    return _publish(args, store)
+
+
+def _error_code(exc):
+    code = str(exc)
+    return code if code and len(code) <= 80 and all(c.isalnum() or c == "_" for c in code) else type(exc).__name__
 
 
 def main():
@@ -135,10 +179,7 @@ def main():
     try:
         result = _run(args)
     except (OSError, sqlite3.Error, ValueError, LookupError, RuntimeError) as exc:
-        code = str(exc)
-        if not code or len(code) > 80 or not all(char.isalnum() or char == "_" for char in code):
-            code = type(exc).__name__
-        print(json.dumps({"state": "failed", "error": code}), file=sys.stderr)
+        print(json.dumps({"state": "failed", "error": _error_code(exc)}), file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False))
     return 0

@@ -118,7 +118,7 @@ def test_policy_has_no_candidate_final_alias_and_keeps_host_projection():
     assert "[cNN]" not in prompt
     assert "宿主发布前会移除这些标记" in prompt
     assert "本地：题名" in prompt and "联网：" in prompt
-    assert "各尝试一轮" not in prompt
+    assert "尝试一轮" not in prompt
     examples = prompt.split("<source_routing_examples>", 1)[1].split("</source_routing_examples>", 1)[0]
     assert examples.count("正确：") == examples.count("反例：") == 3
     assert all(example in examples for example in ("分别查看本地资料和公开网络", "只查本地资料", "画箱线图"))

@@ -16,10 +16,16 @@ import tempfile
 ROOT_FILES = frozenset({"SKILL.md", "README.md", "LICENSE", "NOTICE", "NOTICE.md",
                         "THIRD_PARTY_NOTICES.md", "CAPABILITY_MIGRATION.md"})
 RESOURCE_DIRECTORIES = frozenset({"scripts", "references", "assets", "examples"})
+NATURE_ACTIVE_FILES = frozenset({
+    "SKILL.md", "references/citrus-host-adapter.md", "references/figure-methods.md",
+    "references/quality.md", "scripts/freeze_groups.py", "scripts/render_grouped.py",
+    "examples/grouped_svg.py",
+})
 
 
 def stage_package(repository: Path, commit: str, output: Path | None, *,
-                  python_root: Path, source_package: str | None) -> None:
+                  python_root: Path, source_package: str | None,
+                  active_files: frozenset[str] | None = None) -> None:
     module = PurePosixPath(source_package) if source_package else None
     with tempfile.TemporaryFile() as archive:
         subprocess.run(["git", "-C", str(repository), "archive", "--format=tar", commit],
@@ -36,7 +42,8 @@ def stage_package(repository: Path, commit: str, output: Path | None, *,
                     if not member.isdir() and path.suffix not in {".py", ".json", ".yaml", ".md"}:
                         raise ValueError("invalid_skill_python_member")
                     target = python_root / module.name / path.relative_to(module)
-                elif output and (path.parts[0] in RESOURCE_DIRECTORIES or member.name in ROOT_FILES):
+                elif output and (path.as_posix() in active_files if active_files is not None else
+                                 path.parts[0] in RESOURCE_DIRECTORIES or member.name in ROOT_FILES):
                     target = output.joinpath(*path.parts)
                 else:
                     continue
@@ -130,7 +137,8 @@ def main(argv=None) -> int:
                     raise ValueError("duplicate_skill_python_package")
                 runtime[module] = entry["commit"]
             stage_package(repository, entry["commit"], skills / name if name in names else None,
-                          python_root=python_root, source_package=source_package)
+                          python_root=python_root, source_package=source_package,
+                          active_files=NATURE_ACTIVE_FILES if name == "nature-figure" else None)
             if name in names:
                 selected[name] = entry["commit"]
         for module in runtime:

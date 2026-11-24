@@ -489,17 +489,6 @@ async def _run(state, identity, ledger):
         # checkpoints can still consume their original envelope on recovery.
         from src.core.turn_outcome import completion_from_answer, repairable_proposal_reason
         legacy_review = final_review.get("phase") == "pending"
-        route_gate = None
-        if not legacy_review:
-            from .research_routes import research_route_gate
-            route_gate = research_route_gate(
-                host.records, host.allowed_names,
-                prior=final_review.get("research_route_gate"))
-            if route_gate.challenge:
-                final_review["research_route_gate"] = route_gate.next_state()
-                task_events.append_event(identity.run_id, "research_route_gate",
-                                         route_gate.as_dict())
-                return FinalCheck(False, (route_gate.message,))
         try:
             statement = parse_completion(text) if legacy_review else completion_from_answer(text, host.records)
         except (ValueError, TypeError):
@@ -509,10 +498,13 @@ async def _run(state, identity, ledger):
             from src.core.progress_bus import emit_progress
             emit_progress('browse_phase', {'phase': 'organizing'})
         public_answer = statement.answer
-        if route_gate is not None and route_gate.exhausted and route_gate.notice:
-            if route_gate.notice not in public_answer:
-                public_answer += "\n\n" + route_gate.notice
-                statement = statement.model_copy(update={"answer": public_answer})
+        if settings.RESEARCH_ROUTE_NOTICE_ENABLED and not legacy_review:
+            from .research_routes import explicitly_requests_both_sources, research_route_gate
+            if explicitly_requests_both_sources(state["query"]):
+                route_gate = research_route_gate(host.records, host.allowed_names, explicit=True)
+                if route_gate.notice and route_gate.notice not in public_answer:
+                    public_answer += "\n\n" + route_gate.notice
+                    statement = statement.model_copy(update={"answer": public_answer})
         delivery_gaps, artifact_contract = [], None
         if requirements and not legacy_review:
             from src.core.task_result import effective_tool_records

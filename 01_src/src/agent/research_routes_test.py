@@ -16,14 +16,14 @@ def test_no_discovery_is_not_gated_so_direct_reuse_can_finish():
 def test_local_discovery_requires_one_deepseek_search():
     gate = research_route_gate([row("local_hybrid_search")], BOTH)
     assert gate.active and gate.missing == ("web",)
-    assert gate.challenge and "DeepSeek 网络 Search" in gate.message
+    assert not gate.challenge and not gate.message
     assert "DeepSeek 网络 Search" in gate.notice
 
 
 def test_deepseek_search_requires_one_local_attempt():
     gate = research_route_gate([row("deepseek_search")], BOTH)
     assert gate.active and gate.missing == ("local",)
-    assert gate.challenge and "本地检索" in gate.message
+    assert not gate.challenge and not gate.message
 
 
 def test_both_routes_attempted_is_satisfied():
@@ -48,7 +48,7 @@ def test_not_run_route_does_not_count():
     gate = research_route_gate(
         [row("local_hybrid_search"), row("deepseek_search", "not_run")], BOTH)
     assert gate.active and gate.missing == ("web",)
-    assert gate.challenge
+    assert not gate.challenge
 
 
 def test_successful_read_candidate_satisfies_local_reuse():
@@ -95,20 +95,19 @@ def test_web_only_authorized_does_not_require_local():
     assert not gate.active
 
 
-def test_one_challenge_is_bounded_then_notice_is_added():
-    first = research_route_gate([row("local_hybrid_search")], BOTH)
-    assert first.challenge
-    second = research_route_gate([row("local_hybrid_search")], BOTH,
-                                 prior=first.next_state())
-    assert not second.challenge and second.exhausted
-    assert "DeepSeek 网络 Search未完成" in second.notice
+def test_explicit_dual_source_notice_without_available_tools():
+    gate = research_route_gate([], set(), explicit=True)
+    assert gate.missing == ("local", "web")
+    assert gate.notice and not gate.message and not gate.challenge
 
 
-def test_new_missing_set_gets_one_new_challenge():
-    prior = {"version": 1, "challenged": {"local+web": 1}}
-    gate = research_route_gate([row("local_hybrid_search")], BOTH, prior=prior)
-    assert gate.active and gate.missing == ("web",)
-    assert gate.challenge
+def test_notice_only_for_explicit_dual_source_request():
+    from src.agent.research_routes import explicitly_requests_both_sources
+
+    assert explicitly_requests_both_sources("请分别查看本地资料和公开网络")
+    assert explicitly_requests_both_sources("本地和网络都要")
+    assert not explicitly_requests_both_sources("只查本地，别联网")
+    assert not explicitly_requests_both_sources("本地和网络有什么区别？")
 
 
 def test_inherited_attempts_do_not_start_this_turn():
@@ -124,12 +123,10 @@ def test_policy_has_no_candidate_final_alias_and_keeps_host_projection():
     assert "[cNN]" not in prompt
     assert "宿主发布前会移除这些标记" in prompt
     assert "本地：题名" in prompt and "联网：" in prompt
-    assert "对获准的本地检索和网络 Search 各尝试一轮" in prompt
+    assert "各尝试一轮" not in prompt
     examples = prompt.split("<source_routing_examples>", 1)[1].split("</source_routing_examples>", 1)[0]
     assert examples.count("正确：") == examples.count("反例：") == 3
     assert all(example in examples for example in ("分别查看本地资料和公开网络", "只查本地资料", "画箱线图"))
-    assert "该来源最多发起一次检索调用" in prompt
-    assert "再查相同的本地语料" in examples
     assert "宿主会在终答前核对本轮两路覆盖" not in prompt
 
 

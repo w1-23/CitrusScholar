@@ -343,6 +343,7 @@ class Settings(BaseSettings):
     STATS_MAX_SAMPLE_SIZE: int = Field(default_factory=lambda: _yaml_val("statistics", "max_sample_size", default=100000))
 
     # Task scripts expire independently of permanent, code-owned presets.
+    RESEARCH_ROUTE_NOTICE_ENABLED: bool = False
     RESEARCH_SCRIPT_IDLE_DAYS: int = Field(default=7, ge=1, le=365)
 
     # ── Figures（科研绘图与图内微调）──

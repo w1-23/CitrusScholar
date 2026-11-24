@@ -219,3 +219,44 @@ def build_preset_catalog() -> CapabilityCatalog:
             execution_mode=preset.execution_mode,
         ))
     return catalog
+
+
+def allowed_presets(state: dict, *, has_tables: bool, has_pool: bool) -> set[str]:
+    import os
+
+    from src.config import settings
+    from src.core.capability_policy import policy_for_state
+    from src.core.tracing import web_search_enabled
+    from src.core.tool_catalog import TOOL_METADATA
+    from src.graph.retrieval_router import attachment_processing_only, retrieval_denied, source_scope
+    from src.graph.tool_availability import runtime_env, provider_denials
+    query = str(state.get("query") or "")
+    scope = source_scope(query, exclusive_only=True)
+    local_processing = attachment_processing_only(query,
+        has_source=bool(has_tables or state.get("attachment_refs")),
+        browse_requested=state.get("browse_requested") is True)
+    env = runtime_env(source_scope=scope,
+        attachments=int(has_tables), account_files=len(state.get("account_files") or []),
+        session=bool(state.get("session_id")), network=web_search_enabled(),
+        research_tools=os.getenv("CITRUS_RESEARCH_TOOLS_ENABLED", "true").strip().lower()
+                       not in {"0", "false", "no", "off"},
+        retrieval=not local_processing and not retrieval_denied(query, scope), candidate_pool=has_pool,
+        denied=provider_denials(settings))
+    policy = policy_for_state(state)
+    names = set()
+    for name, (requires, _, _) in preset_bindings().items():
+        if name == "browse_web" and state.get("browse_requested") is not True:
+            continue
+        caps = TOOL_METADATA[name].capabilities
+        if local_processing and (name == "verify_uploaded_references" or
+                                 caps & {"network", "local_corpus", "shared_corpus"}):
+            continue
+        # A persisted evidence ref is readable without a process-local pool or
+        # a currently loaded index. The adapter rechecks session/corpus rights.
+        needed = tuple(r for r in requires if r not in {"candidate_pool", "local_corpus"}) if name == "read_candidate" else requires
+        if not policy.tool_allowed(name) or name in env.denied or not all(env.has(requirement) for requirement in needed):
+            continue
+        if not state.get("visualization_enabled", True) and "visualization" in caps:
+            continue
+        names.add(name)
+    return names

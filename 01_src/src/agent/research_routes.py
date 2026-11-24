@@ -1,25 +1,8 @@
-"""Bounded local + DeepSeek Search coverage for one research turn.
-
-The gate is deliberately small. It does not classify the user request and it
-does not decide whether a question is a research question: the model already
-made that decision by starting a discovery tool. Once one of the two
-authorized discovery routes has actually started, the host asks for the other
-route once; a second final attempt is accepted with an explicit coverage note.
-
-Tool names are the contract:
-
-* local discovery: ``local_hybrid_search`` / ``search_candidates`` /
-  ``search_agent_corpus``;
-* local reuse: a successful ``read_candidate`` / ``inspect_candidates`` /
-  ``read_local_evidence``;
-* web discovery: ``deepseek_search`` only.
-
-Fetch, Browse and literature metadata lookup are reads or metadata operations,
-not the DeepSeek Search route.
-"""
+"""Compute observed research source coverage without steering execution."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Iterable, Mapping
 
 LOCAL_DISCOVERY = frozenset({"local_hybrid_search", "search_candidates", "search_agent_corpus"})
@@ -53,16 +36,6 @@ def _succeeded(records: Iterable[object], names: frozenset[str]) -> bool:
     return False
 
 
-def _challenged(prior: object) -> dict[str, int]:
-    if not isinstance(prior, Mapping) or prior.get("version") != 1:
-        return {}
-    raw = prior.get("challenged")
-    if not isinstance(raw, Mapping):
-        return {}
-    return {key: value for key, value in raw.items()
-            if isinstance(key, str) and type(value) is int and 0 <= value <= 2}
-
-
 def _message(missing: tuple[str, ...], *, local_done: bool, web_done: bool) -> str:
     routes = set(missing)
     if routes == {"local", "web"}:
@@ -86,50 +59,37 @@ class RouteGate:
     missing: tuple[str, ...] = ()
     message: str = ""
     notice: str = ""
-    attempts: int = 0
-    prior: Mapping | None = None
+    challenge: bool = False
 
-    @property
-    def challenge(self) -> bool:
-        return self.active and bool(self.missing) and self.attempts == 0
 
-    @property
-    def exhausted(self) -> bool:
-        return self.active and bool(self.missing) and self.attempts > 0
+def explicitly_requests_both_sources(query: str) -> bool:
+    from src.graph.retrieval_router import retrieval_denied, source_scope
 
-    def next_state(self) -> dict:
-        state = {"version": 1, "challenged": dict(_challenged(self.prior))}
-        key = "+".join(self.missing)
-        state["challenged"][key] = int(state["challenged"].get(key, 0)) + 1
-        return state
-
-    def as_dict(self) -> dict:
-        return {"schema_version": 1, "active": self.active,
-                "missing": list(self.missing), "attempts": self.attempts,
-                "challenge": self.challenge, "exhausted": self.exhausted,
-                "notice": self.notice}
+    scope = source_scope(query, exclusive_only=True)
+    if scope in {"local", "web"} or retrieval_denied(query, scope):
+        return False
+    local = r"本地|知识库|\blocal\b"
+    web = r"公开网|联网|网络|网上|网页|\b(?:web|internet|online)\b"
+    request = r"分别|同时|都要|都查|都用|都搜|一起查|交叉核对|结合|请.{0,12}(?:查|搜索|检索)|\bboth\b"
+    return all(re.search(pattern, query, re.I) for pattern in (local, web, request))
 
 
 def research_route_gate(records: Iterable[object], allowed: Iterable[str], *,
-                        prior: object = None) -> RouteGate:
-    """Return the bounded route gate for one final-answer attempt."""
+                        explicit: bool = False) -> RouteGate:
+    """Report missing coverage without generating a model instruction."""
     allowed_names = {str(item) for item in (allowed or ())}
     local_authorized = bool(allowed_names & LOCAL_DISCOVERY)
     web_authorized = bool(allowed_names & WEB_SEARCH)
-    if not (local_authorized or web_authorized):
+    if not explicit and not (local_authorized or web_authorized):
         return RouteGate()
-    if not _attempted(records, LOCAL_DISCOVERY | WEB_SEARCH):
+    if not explicit and not _attempted(records, LOCAL_DISCOVERY | WEB_SEARCH):
         return RouteGate()
     local_done = _attempted(records, LOCAL_DISCOVERY) or _succeeded(records, LOCAL_REUSE)
     web_done = _attempted(records, WEB_SEARCH)
     missing = tuple(route for route, authorized, done in (
         ("local", local_authorized, local_done),
         ("web", web_authorized, web_done),
-    ) if authorized and not done)
+    ) if (authorized or explicit) and not done)
     if not missing:
         return RouteGate()
-    prior_state = prior if isinstance(prior, Mapping) else None
-    attempts = int(_challenged(prior_state).get("+".join(missing), 0))
-    return RouteGate(active=True, missing=missing,
-                     message=_message(missing, local_done=local_done, web_done=web_done),
-                     notice=_notice(missing), attempts=attempts, prior=prior_state)
+    return RouteGate(active=True, missing=missing, notice=_notice(missing))

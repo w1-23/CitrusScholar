@@ -23,6 +23,7 @@ import uuid
 
 from citrus_refcheck.compare import (
     FIELDS, _value, _author_comparison, _journal_comparison, compare_fields,
+    identity_sufficient as _identity_sufficient,
 )
 
 from src.research import literature as lit
@@ -34,6 +35,7 @@ _CACHE_LOCK = threading.Lock()
 _CACHE_TTL = 6 * 3600
 _AUDIT_CONCURRENCY = 4
 _BATCH_LOOKUPS: ContextVar[dict | None] = ContextVar("reference_batch_lookups", default=None)
+_PROVIDER_DEBIT: ContextVar = ContextVar("reference_provider_debit", default=None)
 
 
 class AuditStopped(Exception):
@@ -81,10 +83,14 @@ def _connect():
         conn.execute('''CREATE TABLE IF NOT EXISTS reference_audits (
             id TEXT PRIMARY KEY, owner INTEGER NOT NULL, session TEXT NOT NULL,
             inventory TEXT NOT NULL, status TEXT NOT NULL, request_limit INTEGER NOT NULL,
-            requests_used INTEGER NOT NULL DEFAULT 0, cancelled INTEGER NOT NULL DEFAULT 0,
+            requests_used INTEGER NOT NULL DEFAULT 0,
+            queries_used INTEGER NOT NULL DEFAULT 0,
+            cancelled INTEGER NOT NULL DEFAULT 0,
             lease_token TEXT NOT NULL DEFAULT '', lease_until REAL NOT NULL DEFAULT 0,
             created REAL NOT NULL, updated REAL NOT NULL)''')
         conn.execute('CREATE INDEX IF NOT EXISTS reference_scope ON reference_audits(owner,session,created)')
+        if 'queries_used' not in {row[1] for row in conn.execute('PRAGMA table_info(reference_audits)')}:
+            conn.execute('ALTER TABLE reference_audits ADD COLUMN queries_used INTEGER NOT NULL DEFAULT 0')
         conn.execute('''CREATE TABLE IF NOT EXISTS reference_records (
             audit_id TEXT NOT NULL REFERENCES reference_audits(id) ON DELETE CASCADE,
             ordinal INTEGER NOT NULL, entry TEXT NOT NULL, result TEXT,
@@ -209,6 +215,7 @@ def _view(conn, audit, *, offset=0, limit=100):
                          'extraction_complete': inventory['extraction']['status'] == 'complete',
                          'source_sha256': inventory['source']['sha256']},
             'budget': {'request_limit': audit['request_limit'], 'requests_used': audit['requests_used'],
+                       'queries_used': audit['queries_used'],
                        'requests_remaining': max(0, audit['request_limit'] - audit['requests_used'])},
             'rows': [{**_row(item, entry, result, verdict), 'attempt_history': history.get(item['ordinal'], [])}
                      for item, entry, result, verdict in row_data[offset:offset + limit]],
@@ -622,6 +629,9 @@ def _entry_query_key(entry):
 def _call_provider(function, args, source, deadline, check, recorder, key, kind,
                    *, collect_records=True):
     try:
+        debit = _PROVIDER_DEBIT.get()
+        if debit is not None:
+            debit()
         with lit.bounded_lookup(deadline=deadline, check=check, debit=lambda: None) as context:
             status, records, error = function(*args)
         evidence = deepcopy(context.evidence)
@@ -670,7 +680,16 @@ def _observation(recorder, key, source):
                               evidence_refs=tuple(list(dict.fromkeys(refs))[:20]), error=error)
 
 
-def _make_lookups(recorder, check, web_allowed):
+def _make_lookups(recorder, check, web_allowed, debit=None):
+    def with_debit(lookup):
+        def guarded(query, deadline):
+            token = _PROVIDER_DEBIT.set(debit)
+            try:
+                return lookup(query, deadline)
+            finally:
+                _PROVIDER_DEBIT.reset(token)
+        return guarded
+
     def doi_lookup(query, deadline):
         key, base = ('doi', query.value), query.value
         first = _call_provider(lit._crossref_work, (lit.quote(base, safe='/'),),
@@ -704,12 +723,15 @@ def _make_lookups(recorder, check, web_allowed):
                     dois.append(doi)
                 if len(dois) == 2:
                     break
+            claims = {'title': title, 'authors': getattr(query, 'authors', '')}
             for doi in dois:
                 confirmed = _call_provider(lit._crossref_work,
                                            (lit.quote(doi, safe='/'),), 'Crossref',
                                            deadline, check, recorder, key, 'doi')
-                if any(_kernel_doi(record.get('doi')) == doi for record in confirmed['records']):
-                    break
+                match = next((record for record in confirmed['records']
+                              if _kernel_doi(record.get('doi')) == doi), None)
+                if match is not None and _identity_sufficient(claims, match):
+                    return _observation(recorder, key, 'Crossref')
         first = _call_provider(lit._crossref_search, (title,), 'Crossref', deadline,
                                check, recorder, key, 'title')
         exact = any(_kernel_title(record.get('title')) == _kernel_title(title)
@@ -719,7 +741,7 @@ def _make_lookups(recorder, check, web_allowed):
                            recorder, key, 'title')
         return _observation(recorder, key, 'DeepSeek Search+Crossref+OpenAlex')
 
-    return doi_lookup, arxiv_lookup, title_lookup
+    return (with_debit(doi_lookup), with_debit(arxiv_lookup), with_debit(title_lookup))
 
 
 def _kernel_verdict(entry, result, audit_id):
@@ -963,70 +985,74 @@ def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resum
                 if current['cancelled'] or current['lease_token'] != token:
                     raise AuditStopped('cancelled' if current['cancelled'] else 'lease_lost')
 
-        def debit():
+        def _lease_checked():
             check()
             with _connect() as conn:
                 current = _load(conn, owner, session_id, audit_id)
                 if current['lease_token'] != token or current['cancelled']:
                     raise AuditStopped('lease_lost')
-                if current['requests_used'] >= current['request_limit']:
-                    raise AuditStopped('budget_exhausted')
+                return current
+
+        def debit_request():
+            current = _lease_checked()
+            if current['requests_used'] >= current['request_limit']:
+                raise AuditStopped('budget_exhausted')
+            with _connect() as conn:
                 conn.execute('UPDATE reference_audits SET requests_used=requests_used+1 WHERE id=?', (audit_id,))
+
+        def debit_query():
+            _lease_checked()
+            with _connect() as conn:
+                conn.execute('UPDATE reference_audits SET queries_used=queries_used+1 WHERE id=?', (audit_id,))
 
         batch = None
         recorder = _KernelRecorder()
         try:
             guarded_check = _kernel_check(check)
-            lookups = _make_lookups(recorder, guarded_check, allows('web_search'))
-            capabilities = _KernelCapabilities(check=guarded_check, debit=_kernel_debit(debit),
+            lookups = _make_lookups(recorder, guarded_check, allows('web_search'), debit_request)
+            capabilities = _KernelCapabilities(check=guarded_check, debit=_kernel_debit(debit_query),
                                                lookup_doi=lookups[0], lookup_arxiv=lookups[1],
                                                search=lookups[2])
+
+            def persist_row(row):
+                evidence = row.get('evidence') or {}
+                stop = str(evidence.get('reason') or evidence.get('stop_reason') or '')
+                if (evidence.get('processing_status') != 'processed'
+                        and stop not in {'invalid_input', 'capability_unavailable'}):
+                    return
+                result = _kernel_result(row, evidence, recorder, audit_id)
+                with _connect() as conn:
+                    current = _load(conn, owner, session_id, audit_id)
+                    if current['lease_token'] != token or current['cancelled']:
+                        raise AuditStopped('cancelled' if current['cancelled'] else 'lease_lost')
+                    conn.execute('UPDATE reference_records SET result=?,attempts=attempts+1 WHERE audit_id=? AND ordinal=?',
+                                 (_json(result), audit_id, row['record_index']))
+                    conn.execute('''INSERT INTO reference_attempts(audit_id,ordinal,attempt,result,created)
+                        SELECT audit_id,ordinal,attempts,result,? FROM reference_records WHERE audit_id=? AND ordinal=?''',
+                                 (time.time(), audit_id, row['record_index']))
+                    conn.execute('UPDATE reference_audits SET updated=? WHERE id=?', (time.time(), audit_id))
+                completed.append(row['record_index'])
+                if progress:
+                    try:
+                        progress({'audit_id': audit_id, 'record_id': row.get('record_id', ''),
+                                  'record_index': row['record_index'],
+                                  'status': result['status'], 'durable': True})
+                    except Exception:
+                        pass
             limits = _KernelLimits(concurrency=_AUDIT_CONCURRENCY,
                                    request_budget=remaining_budget,
                                    timeout=float(time_budget),
                                    item_timeout=float(max(0.1, min(8.0, time_budget))),
                                    rate_limit_retries=0)
             entries = [entry for _, entry, _ in selected]
-            batch = _verify_batch({'entries': entries}, capabilities=capabilities, limits=limits)
+            batch = _verify_batch({'entries': entries}, capabilities=capabilities, limits=limits,
+                                  on_row=persist_row)
         except (_KernelStopped, AuditStopped) as exc:
             batch, reason = None, _legacy_reason(_kernel_reason(exc))
         except Exception:
             batch, reason = None, 'operation_stopped'
         if batch is not None:
             reason = reason or _legacy_reason(str(batch.get('stop_reason') or ''))
-            for row in batch.get('entries', []):
-                entry = row
-                evidence = row.get('evidence') or {}
-                stop = str(evidence.get('reason') or evidence.get('stop_reason') or '')
-                if (evidence.get('processing_status') != 'processed'
-                        and stop not in {'invalid_input', 'capability_unavailable'}):
-                    continue
-                try:
-                    result = _kernel_result(entry, evidence, recorder, audit_id)
-                    with _connect() as conn:
-                        current = _load(conn, owner, session_id, audit_id)
-                        if current['lease_token'] != token or current['cancelled']:
-                            raise AuditStopped('cancelled' if current['cancelled'] else 'lease_lost')
-                        conn.execute('UPDATE reference_records SET result=?,attempts=attempts+1 WHERE audit_id=? AND ordinal=?',
-                                     (_json(result), audit_id, entry['record_index']))
-                        conn.execute('''INSERT INTO reference_attempts(audit_id,ordinal,attempt,result,created)
-                            SELECT audit_id,ordinal,attempts,result,? FROM reference_records WHERE audit_id=? AND ordinal=?''',
-                                     (time.time(), audit_id, entry['record_index']))
-                        conn.execute('UPDATE reference_audits SET updated=? WHERE id=?', (time.time(), audit_id))
-                except AuditStopped as exc:
-                    reason = reason or _legacy_reason(_kernel_reason(exc))
-                    break
-                except Exception:
-                    reason = reason or 'operation_stopped'
-                    break
-                completed.append(entry['record_index'])
-                if progress:
-                    try:
-                        progress({'audit_id': audit_id, 'record_id': entry.get('record_id', ''),
-                                  'record_index': entry['record_index'],
-                                  'status': result['status'], 'durable': True})
-                    except Exception:
-                        pass
         with _connect() as conn:
             current = _load(conn, owner, session_id, audit_id)
             if current['lease_token'] == token:

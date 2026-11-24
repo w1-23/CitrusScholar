@@ -80,10 +80,10 @@ class ReferenceKernelTests(unittest.TestCase):
         self.assertEqual(len(report['rows']), 6)
         self.assertEqual([row['record_index'] for row in report['rows']], list(range(6)))
         for row in report['rows']:
-            self.assertEqual(row['status'], 'metadata_matched')
-            self.assertEqual(row['match_status'], 'matching')
+            self.assertEqual(row['processing_status'], 'processed')
+            self.assertEqual(row['identity'], 'matched')
             self.assertEqual(row['reason'], 'identifier_match')
-            self.assertEqual(row['decision'], 'verified')
+            self.assertFalse(row['retryable'])
         self.assertIsNone(report['next_offset'])
 
     def test_rate_limit_is_reported_as_unconfirmed_gap(self):
@@ -192,3 +192,33 @@ class ReferenceKernelTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+    def test_title_lookup_stops_after_confirmed_identity(self):
+        calls = []
+
+        def search(title):
+            calls.append('search')
+            return 200, [{'doi': '10.1234/title-match'}], ''
+
+        def crossref(doi):
+            calls.append('doi')
+            return 200, [{'source': 'Crossref', 'doi': '10.1234/title-match',
+                          'title': 'Exact shared title', 'authors': 'Alice Example',
+                          'year': '2024'}], ''
+
+        entries = [{'doi': '', 'title': 'Exact shared title',
+                    'authors': 'Alice Example', 'year': '2024'}]
+        with (patch.object(service.lit, '_deepseek_reference_candidates', search),
+              patch.object(service.lit, '_crossref_work', crossref),
+              patch.object(service.lit, '_crossref_search',
+                           side_effect=AssertionError('early stop must skip Crossref search')),
+              patch.object(service.lit, '_openalex_search',
+                           side_effect=AssertionError('early stop must skip OpenAlex'))):
+            audit = self._audit(entries, budget=5)
+            result = service.run_audit(7, 'kernel', audit['audit_id'],
+                                       max_rows=10, time_budget=15)
+
+        self.assertEqual(calls, ['search', 'doi'])
+        self.assertEqual(result['budget']['requests_used'], 2)
+        self.assertEqual(result['budget']['queries_used'], 1)
+        self.assertEqual(result['rows'][0]['identity'], 'identifier_match')

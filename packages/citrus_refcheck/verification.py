@@ -307,7 +307,7 @@ def _row_result(entry, query, observations, stop):
             'reason': reason, 'match': record, 'sources': receipts, 'differences': differences}
 
 
-def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits()):
+def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits(), on_row=None):
     """Verify an explicit inventory once. All observations, including 429s, are reportable."""
     requests = _BatchRequests(capabilities, limits)
     entries = inventory['entries']
@@ -329,6 +329,8 @@ def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits())
             groups.setdefault(query, []).append(index)
         else:
             rows[index]['evidence'] = _row_result(entry, query, (), 'capability_unavailable' if query else 'invalid_input')
+            if on_row is not None:
+                on_row(dict(rows[index]))
 
     executor = capabilities.executor or _WORKERS
     pending = iter(groups)
@@ -345,6 +347,8 @@ def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits())
         observations, reason = future.result()
         for index in groups[query]:
             rows[index]['evidence'] = _row_result(entries[index], query, observations, reason)
+            if on_row is not None:
+                on_row(dict(rows[index]))
         return reason
 
     try:

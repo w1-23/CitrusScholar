@@ -34,58 +34,58 @@ def _compact_audit(payload):
     rows = []
     response = {key: payload[key] for key in header if key in payload}
     response.update(rows=rows, result_view="compact", next_offset=payload.get("next_offset"))
-    keys = ("record_id", "record_index", "status", "existence", "identity", "retryable")
     for row in payload.get("rows", []):
         if len(rows) == 10:
             response["next_offset"] = row["record_index"]
             break
-        compact = {key: row[key] for key in keys if key in row}
         claims = row.get("claims") or {}
         verdict = row.get("verdict") or {}
-        compact.update(title=str(claims.get("title") or row.get("citation") or "")[:180],
-                       decision=verdict.get("decision", "not_checked"))
-        # The model must be able to write the final short report from this
-        # first response. Returning only field names caused it to re-read large
-        # evidence pages and then overstate a field mismatch as identity match.
-        if verdict:
-            compact["verdict_note"] = str(verdict.get("note") or "")[:240]
-            compact["verdict_identity"] = str(verdict.get("identity") or "")
-            compact["material_differences"] = [
-                {key: str(item.get(key) or "")[:240] for key in
-                 ("field", "submitted", "registered", "reason")}
-                for item in (verdict.get("material_differences") or [])[:5]
-                if isinstance(item, dict)
-            ]
-            compact["benign_variants"] = [
-                {key: str(item.get(key) or "")[:240] for key in
-                 ("field", "variant_type", "explanation")}
-                for item in (verdict.get("benign_variants") or [])[:5]
-                if isinstance(item, dict)
-            ]
-            compact["critical_unknowns"] = [
-                {key: str(item.get(key) or "")[:160] for key in
-                 ("field", "missing_evidence", "reason")}
-                for item in (verdict.get("critical_unknowns") or [])[:5]
-                if isinstance(item, dict)
-            ]
-        for key in ("processing_status", "match_status", "reason"):
-            value = row.get(key)
-            if isinstance(value, str) and 0 < len(value) <= 160:
-                compact[key] = value
         selected = row.get("selected_record") or {}
-        if isinstance(selected.get("title"), str) and selected["title"]:
-            compact["matched_record_title"] = selected["title"][:180]
-        submitted_doi = row.get("doi") or claims.get("doi")
-        for key, value in (("doi", submitted_doi),
-                           ("matched_record_doi", selected.get("doi") if selected.get("doi") != submitted_doi else None),
-                           ("source_url", row.get("source_url")),
-                           ("provider", row.get("provider"))):
+        processing = str(row.get("processing_status") or
+                         ("processed" if row.get("status") not in (None, "", "not_checked") else "unprocessed"))
+        identity_raw = str(row.get("identity") or verdict.get("identity") or
+                           ("matched" if row.get("status") == "metadata_matched" else ""))
+        if processing != "processed":
+            identity = "unprocessed"
+        elif identity_raw in {"identifier_match", "metadata_corroborated", "confirmed", "matched"}:
+            identity = "matched"
+        elif identity_raw in {"identifier_conflict_candidate", "conflict", "conflicting"}:
+            identity = "conflict"
+        else:
+            identity = "unresolved"
+        compact = {
+            "record_id": row.get("record_id", ""),
+            "record_index": row.get("record_index"),
+            "title": str(claims.get("title") or row.get("citation") or "")[:180],
+            "processing_status": processing,
+            "identity": identity,
+        }
+        matched = {key: selected.get(key) or row.get(f"matched_record_{key}")
+                   for key in ("doi", "title", "year", "source")}
+        matched = {key: str(value)[:240] for key, value in matched.items() if value}
+        if matched:
+            compact["matched"] = matched
+        for key in ("source_url", "provider"):
+            value = row.get(key)
             if isinstance(value, str) and 0 < len(value) <= 240:
                 compact[key] = value
-        if fields := verdict.get("material_differences"):
-            compact["differing_fields"] = [item.get("field", "") for item in fields[:5]]
-        if row.get("status") not in {"metadata_matched", "not_checked"} and row.get("metadata_title"):
-            compact["registered_title"] = row["metadata_title"][:180]
+        notes = []
+        for item in (verdict.get("material_differences") or [])[:3]:
+            if isinstance(item, dict):
+                notes.append({"field": str(item.get("field") or "")[:80],
+                              "submitted": str(item.get("submitted") or "")[:160],
+                              "registered": str(item.get("registered") or "")[:160],
+                              "reason": str(item.get("reason") or "")[:160]})
+        for item in (verdict.get("benign_variants") or [])[:2]:
+            if isinstance(item, dict):
+                notes.append({"field": str(item.get("field") or "")[:80],
+                              "variant": str(item.get("variant_type") or item.get("explanation") or "")[:160]})
+        if notes:
+            compact["field_notes"] = notes
+        compact["retryable"] = bool(row.get("retryable"))
+        reason = row.get("reason")
+        if isinstance(reason, str) and 0 < len(reason) <= 160:
+            compact["reason"] = reason
         if errors := row.get("errors"):
             compact["unavailable_sources"] = list(errors)[:3]
         rows.append(compact)

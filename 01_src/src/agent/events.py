@@ -38,3 +38,4 @@ class LoopEvent:
     tool_call_ids: tuple[str, ...] = ()
     status: str = ""
     reason: str = ""
+    citrus_output_limit_exhausted: bool | None = None

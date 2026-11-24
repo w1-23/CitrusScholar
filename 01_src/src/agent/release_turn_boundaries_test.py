@@ -54,7 +54,7 @@ def test_attachment_plot_needs_a_downloadable_svg():
     assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
 
 
-@pytest.mark.parametrize("query", ["画图", "好，帮我画个图", "请继续出图"])
+@pytest.mark.parametrize("query", ["画图", "好，帮我画个图", "请继续出图", "画一下", "帮我画一张箱线图"])
 def test_short_drawing_requests_need_a_current_turn_figure(query):
     requirements = contract_for_turn(query, has_tables=False).deliverables
     assert [item["formats"] for item in requirements] == [["svg"]]
@@ -62,7 +62,7 @@ def test_short_drawing_requests_need_a_current_turn_figure(query):
     assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
 
 
-@pytest.mark.parametrize("query", ["不要画图", "请解释如何画图", "出图方法是什么"])
+@pytest.mark.parametrize("query", ["不要画图", "请解释如何画图", "出图方法是什么", "别画一下图", "解释怎么画箱线图"])
 def test_short_drawing_mentions_do_not_require_a_figure(query):
     assert not contract_for_turn(query, has_tables=False).deliverables
 

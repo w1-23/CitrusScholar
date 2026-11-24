@@ -210,10 +210,10 @@ class HarnessRuntime:
                 await adapter.checkpoint(LoopCheckpoint(identity, tuple(state["messages"]),
                     state.get("model_steps", 0), phase, _pending_calls(state["messages"])))
 
-        async def event(kind, state, ids=()):
+        async def event(kind, state, ids=(), *, output_limit_exhausted=None):
             if adapter.on_event:
                 await adapter.on_event(LoopEvent(kind, identity, state.get("model_steps", 0), tuple(ids),
-                    state.get("stop_status", ""), state.get("stop_reason", "")))
+                    state.get("stop_status", ""), state.get("stop_reason", ""), output_limit_exhausted))
 
         def host_snapshot():
             return adapter.export_host() if adapter.export_host else {}
@@ -293,7 +293,9 @@ class HarnessRuntime:
                                 or any(ord(char) < 32 for char in cid) for cid in ids)
                             or len(set(ids)) != len(ids) or previous.intersection(ids)):
                     invalid = "invalid_or_reused_tool_call_id"
-                await event("model_finished", state, ids)
+                await event("model_finished", state, ids, output_limit_exhausted=(
+                    response.response_metadata.get("citrus_output_limit_exhausted")
+                    if invalid == "model_length" else None))
                 if response.response_metadata.get("citrus_stream_terminal_unconfirmed"):
                     await event("model_output_rejected", {**state, "stop_reason": "model_stream_unconfirmed"}, ids)
                     return {"stop_status": "incomplete", "stop_reason": "model_stream_unconfirmed", "jump_to": "end"}

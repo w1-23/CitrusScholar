@@ -16,7 +16,7 @@
   },
   "data-audit": {
     "repository": "https://github.com/w1-23/data-audit.git",
-    "commit": "a2bcd46254f2ecd734ecadb417b6c0c50d92b3c3",
+    "commit": "355ebd53876664865d645154437b5a21fd33c1c8",
     "python_package": "citrus_audit",
     "dependencies": {
       "requirements-linux-cp312.lock": "cf261ea3fbe5bbb068d8f7eece11e8a5910293daca884145fb03b11377ceab5d"

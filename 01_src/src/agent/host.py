@@ -927,9 +927,10 @@ def _same_repair_target(rejected, corrected, *, records=()):
                    for key in ("workspace_id", "task_id"))
     if name == "run_research_figure_script":
         parent = original.get("repair_from_run_id")
-        if not parent or replacement.get("repair_from_run_id"):
-            return bool(parent and parent == replacement.get("repair_from_run_id"))
+        if not parent or replacement.get("repair_from_run_id") not in (None, "", parent):
+            return False
         from src.core.task_result import _operation_identity
+        from src.graph.export_contract import artifact_matches_requirement
 
         previous = next((row for row in records if row.get("name") == name
                          and row.get("status") in {"failed", "partial"}
@@ -937,9 +938,11 @@ def _same_repair_target(rejected, corrected, *, records=()):
         completed = next((row for row in records if row.get("tool_call_id") == corrected.get("id")
                           and row.get("name") == name and row.get("status") == "complete"), None)
         previous_identity = _operation_identity(previous) if previous else None
+        figure_requirement = {"kinds": ["figure"], "formats": ["svg", "png", "pdf"]}
         return bool(previous_identity and previous_identity[1].startswith("script_repair:")
                     and completed and _operation_identity(completed) == previous_identity
-                    and any(item.get("valid") and item.get("request_matches") is True
+                    and any(item.get("request_matches") is True and item.get("link")
+                            and artifact_matches_requirement(item, figure_requirement)
                             for item in completed.get("artifact_validations", ())))
     if name == "research_workspace":
         previous = original.get("script_ref") or {}

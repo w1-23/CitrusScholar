@@ -66,21 +66,27 @@ def contract_for_explicit_outputs(query: str) -> TaskContract:
 
 def contract_for_turn(query: str, *, has_tables: bool) -> TaskContract:
     from src.graph.agent_operations import _explicit_data_audit
-    from src.graph.intent_text import intent_with_negation, mask_literal_payload
+    from src.graph.intent_text import intent_clauses, intent_with_negation, mask_literal_payload
     import re
 
     explicit = contract_for_explicit_outputs(query)
-    if not has_tables:
-        return explicit
     content = mask_literal_payload(query)
     drawing = re.compile(r"(?:绘制|绘图|画|可视化).{0,16}(?:数据|表格|附件|箱线|热图|图)|"
                          r"\bplot\s+(?:this|the|these|data)\b", re.I)
-    audit = _explicit_data_audit(content)
+    short_drawing = re.compile(
+        r"(?:好[的吧]?\s*)?(?:(?:请你?|帮我|麻烦你?|直接|继续|先|再)\s*)*"
+        r"(?:画(?:一下|一张|个|一幅)?\s*图|作图|出图)(?:吧|即可)?")
+    audit = has_tables and _explicit_data_audit(content)
     text_only = re.search(r"(?:只|仅)(?:要|给|用|输出|提供)?(?:文字|文本)|"
                           r"(?:不要|无需|不用)(?:生成|交付|导出)?(?:文件|工作簿)|\btext only\b", content, re.I)
     requirements = explicit.deliverables
-    if not any(FIGURE_KINDS.intersection(item["kinds"]) for item in requirements) and intent_with_negation(content, drawing):
-        requirements.append({"product_id": "attachment_figure", "label": "附件数据图", "kinds": ["figure"], "formats": ["svg"]})
+    if not text_only and not any(FIGURE_KINDS.intersection(item["kinds"]) for item in requirements):
+        if has_tables and intent_with_negation(content, drawing):
+            requirements.append({"product_id": "attachment_figure", "label": "附件数据图",
+                                 "kinds": ["figure"], "formats": ["svg"]})
+        elif any(short_drawing.fullmatch(clause.strip()) for clause in intent_clauses(content)):
+            requirements.append({"product_id": "requested_figure", "label": "图件",
+                                 "kinds": ["figure"], "formats": ["svg"]})
     if audit and not text_only and not any("xlsx" in item["formats"] for item in requirements):
         requirements.append({"product_id": "annotated_workbook", "label": "数据审查标注工作簿",
                              "kinds": ["annotation_table"], "formats": ["xlsx"]})

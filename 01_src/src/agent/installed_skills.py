@@ -105,3 +105,53 @@ def read_installed_resource(release, selected, resource, *, start_char, max_char
     return info, {"resource": name, "text": text[start_char:end], "sha256": digest,
                   "version": info["version"], "start_char": start_char, "total_chars": len(text),
                   "next_start_char": end if end < len(text) else None}
+
+
+def _script_approvals(release: Path):
+    from .research_skill_catalog import _bytes, _path, _MAX_RESOURCE_BYTES
+
+    if not (release / "approved-scripts.json").exists():
+        return {}, {}
+    inventory = json.loads(_bytes(_path(release, "inventory.json"), _MAX_RESOURCE_BYTES))
+    raw = _bytes(_path(release, "approved-scripts.json"), _MAX_RESOURCE_BYTES)
+    if not isinstance(inventory, dict) or inventory.get("approved-scripts.json") != hashlib.sha256(raw).hexdigest():
+        raise ValueError("skill_script_approval_integrity")
+    approved = json.loads(raw)
+    if not isinstance(approved, dict):
+        raise ValueError("invalid_skill_script_approval")
+    return approved, inventory
+
+
+def approved_script_entries() -> list[dict]:
+    release = release_path()
+    if release is None:
+        return []
+    approved, _inventory = _script_approvals(release)
+    enabled = {row["id"]: row["version"] for row in active_skills()}
+    entries = []
+    for key in sorted(approved):
+        prefix, skill, resource = key.split("/", 2)
+        if prefix == "skills" and skill in enabled:
+            entries.append({"skill_id": skill, "version": enabled[skill], "resource": resource})
+    return entries
+
+
+def read_approved_script(skill_id: str, version: str, resource: str) -> tuple[bytes, str]:
+    from src.core.capability_policy import allows
+    from .research_skill_catalog import _bytes, _path
+
+    release = release_path()
+    if (release is None or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", skill_id)
+            or not allows("skill:" + skill_id) or not resource.endswith(".py")):
+        raise ValueError("skill_script_not_approved")
+    if not any(row["id"] == skill_id and row["version"] == version for row in list_installed(release)):
+        raise ValueError("skill_script_version_mismatch")
+    approved, inventory = _script_approvals(release)
+    key = f"skills/{skill_id}/{resource}"
+    expected = approved.get(key)
+    if not isinstance(expected, str) or expected != inventory.get(key):
+        raise ValueError("skill_script_not_approved")
+    content = _bytes(_path(model_directory(release) / skill_id, resource), 65536)
+    if hashlib.sha256(content).hexdigest() != expected:
+        raise ValueError("skill_script_integrity_failed")
+    return content, expected

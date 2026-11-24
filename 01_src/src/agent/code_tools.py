@@ -102,6 +102,15 @@ class WriteArgs(_Args):
         return value
 
 
+class BindSkillScriptArgs(_Args):
+    task_id: Task
+    workspace_id: Id
+    expected_revision: int = Field(ge=1, le=2**31 - 1)
+    skill_id: Annotated[str, Field(max_length=100, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]
+    version: Annotated[str, Field(pattern=r"^[a-f0-9]{40}$")]
+    resource: Path
+
+
 class BindInputArgs(_Args):
     task_id: Task
     workspace_id: Id
@@ -382,11 +391,16 @@ def _dispatch(operation, **args):
                             return reject(reason)
                         raise
                 page = workspace.list_files(current["workspace_id"], **args)
+                from .installed_skills import approved_script_entries
+                try:
+                    script_entries = approved_script_entries()
+                except (OSError, ValueError):
+                    script_entries = []
                 fields = ("path", "version", "file_id", "sha256", "size_bytes")
                 return _result({"task_id": current["task_id"], "workspace_id": current["workspace_id"],
                     "revision": current["revision"], "files": [{k: item[k] for k in fields} for item in page["items"]],
-                    "next_offset": page["next_offset"]})
-            if operation == "write":
+                    "next_offset": page["next_offset"], "approved_skill_scripts": script_entries[:16]})
+            if operation in {"write", "bind_skill_script"}:
                 try:
                     current = workspace.open(args["workspace_id"])
                 except (LookupError, PermissionError) as exc:
@@ -398,17 +412,30 @@ def _dispatch(operation, **args):
                     return reject("workspace_scope_denied", expected_task_id=args["task_id"])
                 if current["revision"] != args["expected_revision"]:
                     return reject("workspace_revision_conflict", latest_revision=current["revision"])
+                source = None
+                if operation == "bind_skill_script":
+                    from .installed_skills import read_approved_script
+                    try:
+                        content, digest = read_approved_script(args["skill_id"], args["version"], args["resource"])
+                    except (OSError, ValueError):
+                        return reject("code_skill_script_unavailable")
+                    args["path"] = "/workspace/skill-" + digest[:24] + ".py"
+                    source = {"tool": "code_bind_skill_script", "skill_id": args["skill_id"],
+                              "version": args["version"], "resource": args["resource"], "sha256": digest}
+                else:
+                    content = args["content"].encode("utf-8")
                 from src.session import files
                 file = files.register_file(owner_user_id=identity.owner_user_id,
                     session_id=identity.session_id, filename=args["path"].rsplit("/", 1)[-1],
-                    content=args["content"].encode("utf-8"), mime="text/plain", visibility="internal",
-                    producer_tool="code_write", client_request_id=_key(identity.run_id, call_id))
+                    content=content, mime="text/plain", visibility="internal",
+                    producer_tool="code_" + operation, client_request_id=_key(identity.run_id, call_id))
                 result = workspace.bind(args["workspace_id"], path=args["path"], file_id=file["file_id"],
-                    expected_revision=args["expected_revision"], expected_sha256=file["sha256"])
+                    expected_revision=args["expected_revision"],
+                    expected_sha256=digest if source else file["sha256"], source=source)
                 ref = result["ref"]
                 return _result({"task_id": args["task_id"], "workspace_id": args["workspace_id"],
                     "revision": result["revision"], **{k: ref[k] for k in ("path", "file_id", "version", "sha256", "size_bytes")}},
-                    reason="code_workspace_written")
+                    reason="code_skill_script_bound" if source else "code_workspace_written")
             if operation == "bind_input":
                 # The schema normalizes relative proposals to /input/... before
                 # dispatch. A value that still does not name an input is a
@@ -639,6 +666,19 @@ def code_write(task_id: str, workspace_id: str, expected_revision: int, path: st
                      expected_revision=expected_revision, path=path, content=content)
 
 
+@tool(args_schema=BindSkillScriptArgs, response_format="content_and_artifact")
+def code_bind_skill_script(task_id: str, workspace_id: str, expected_revision: int,
+                           skill_id: str, version: str, resource: str):
+    """Bind exact bytes of a reviewed installed Python script listed by code_workspace.
+
+    Supply its skill_id, version and relative resource path. Returns the bound
+    logical path, hash and new revision. Use that path in code_execute with
+    the task's authorized inputs and declared outputs. Binding never executes.
+    """
+    return _dispatch("bind_skill_script", task_id=task_id, workspace_id=workspace_id,
+                     expected_revision=expected_revision, skill_id=skill_id, version=version, resource=resource)
+
+
 @tool(args_schema=BindInputArgs, response_format="content_and_artifact")
 def code_bind_input(task_id: str, workspace_id: str, expected_revision: int, path: str,
                     file_id: str, sha256: str):
@@ -715,11 +755,11 @@ def code_environment_read(workspace_id: str, environment_id: str, revision: int)
                      environment_id=environment_id, revision=revision)
 
 
-_TOOLS = (code_workspace, code_write, code_bind_input, code_execute,
+_TOOLS = (code_workspace, code_write, code_bind_input, code_bind_skill_script, code_execute,
           code_environment_install, code_environment_publish, code_environment_read,
           code_status, code_log, code_cancel, code_wait, code_read, code_deliver)
 CODE_TOOL_NAMES = frozenset(item.name for item in _TOOLS)
-_MUTATES = frozenset({"code_workspace", "code_write", "code_bind_input", "code_execute",
+_MUTATES = frozenset({"code_workspace", "code_write", "code_bind_input", "code_bind_skill_script", "code_execute",
                       "code_environment_install", "code_environment_publish",
                       "code_cancel", "code_deliver"})
 EXECUTION_WAIT_TOOL_NAMES = frozenset({"code_execute", "code_wait", "code_environment_install"})

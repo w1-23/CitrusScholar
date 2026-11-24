@@ -13,6 +13,8 @@ _CODE_REASONS = {
     "code_bind_input": {"workspace_revision_conflict", "code_input_source_denied",
                         "execution_input_path_required", "workspace_unavailable",
                         "workspace_scope_denied", "workspace_read_only"},
+    "code_bind_skill_script": {"workspace_revision_conflict", "workspace_unavailable",
+                               "workspace_scope_denied", "code_skill_script_unavailable"},
     "code_execute": {"code_worker_unavailable", "environment_revision_not_found",
                      "execution_base_environment_revision_must_be_1", "environment_selection_scope_mismatch"},
     "code_environment_install": {"code_worker_unavailable", "workspace_revision_conflict",

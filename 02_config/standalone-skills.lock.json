@@ -20,7 +20,10 @@
     "python_package": "citrus_audit",
     "dependencies": {
       "requirements-linux-cp312.lock": "cf261ea3fbe5bbb068d8f7eece11e8a5910293daca884145fb03b11377ceab5d"
-    }
+    },
+    "approved_scripts": [
+      "scripts/audit.py"
+    ]
   },
   "nature-figure": {
     "repository": "https://github.com/w1-23/nature-figure.git",

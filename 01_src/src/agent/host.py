@@ -1073,7 +1073,6 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
             "recovery_requires_reconciliation": "批次状态尚不能安全恢复。",
             "model_length": "模型输出达到单次输出上限，未完成的提议没有执行。",
             "model_stream_unconfirmed": "未收到可确认的模型流结束信号，未执行该次返回的工具提议。",
-            "final_answer_recovery_incomplete": "一次限额内的答复补写未完成，没有发起新的工具操作。",
             "model_budget_exhausted:tokens": "本轮累计模型用量预算不足以继续请求。",
             "model_budget_exhausted:calls": "本轮模型调用次数已达上限。",
             "model_budget_exhausted:deadline": "本轮任务时间预算已用完。",

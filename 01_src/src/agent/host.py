@@ -23,6 +23,7 @@ from .model import ModelDriver
 from .preset_catalog import build_preset_catalog
 from .runtime import AdmissionStopped, BatchObservation, FinalCheck, RunLimits, RunResult
 from .harness import HarnessRuntime, execution_lock
+from .skill_provenance import runtime_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -322,7 +323,6 @@ async def _run(state, identity, ledger):
             "skill_runtime": runtime_provenance(PROJECT_ROOT),
         }
     original_request_state = capture_original_request_state(state)
-    from .skill_provenance import runtime_provenance
 
     asset_lists = ("dataset_refs", "source_refs", "script_refs", "run_refs")
     asset_fields = (*asset_lists, "plot_intent", "projection_cache")

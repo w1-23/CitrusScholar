@@ -142,6 +142,8 @@ def read_tool_result(tool_call_id: str, start_char: int = 0,
     Use the tool_call_id offered in a partial delivery. Select only necessary
     fields on the initial read. Continue with the returned next_cursor and the
     same tool_call_id. The host resolves the offset and prior selection.
+    To read another field, omit the cursor and select only previously unread
+    JSON Pointers. A wrong pointer does not prevent a corrected selection.
     Optional JSON Pointers (such as /coverage or /tests/0/p) select up to 32
     fields of at most 512 characters each. Offsets count stored text or the
     selected fields' rendered JSON. Use the same fields when continuing a page.

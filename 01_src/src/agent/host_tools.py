@@ -33,8 +33,8 @@ class HostTools:
     pending_result_reads: dict[str, str] = field(default_factory=dict)
 
     def result_readbacks(self):
-        """Eligible partial deliveries and their latest committed read page."""
-        eligible = {cid: None for cid, message in self.messages.items()
+        """Collect the last committed page for each selection of a clipped result."""
+        eligible = {cid: {} for cid, message in self.messages.items()
                     if message.additional_kwargs.get("first_delivery_reference") is True}
         for message in self.messages.values():
             if message.name != "read_tool_result":
@@ -46,31 +46,43 @@ class HostTools:
             if not isinstance(observation, dict) or observation.get("status") != "ok":
                 continue
             target = observation.get("tool_call_id")
-            if isinstance(target, str) and target in eligible:
-                eligible[target] = observation
+            fields = observation.get("selected_fields")
+            if (isinstance(target, str) and target in eligible and isinstance(fields, list)
+                    and all(isinstance(field, str) for field in fields)
+                    and isinstance(observation.get("page"), dict)):
+                eligible[target][tuple(sorted(set(fields)))] = observation
         return eligible
 
     def has_result_readback(self):
-        return any(page is None or page["page"].get("next_cursor")
-                   for page in self.result_readbacks().values())
+        return any(() not in selections or selections[()]["page"].get("next_cursor")
+                   for selections in self.result_readbacks().values())
 
     def _prepare_result_readback(self, args, call_id):
         target, token = args.get("tool_call_id"), args.get("cursor", "")
         if not isinstance(target, str) or args.get("start_char", 0) != 0:
             return False
-        candidates = self.result_readbacks()
-        if target not in candidates or target in self.pending_result_reads:
+        selections = self.result_readbacks().get(target)
+        if selections is None or target in self.pending_result_reads:
             return False
-        previous = candidates[target]
-        if previous is None:
-            if token:
+        if token:
+            if args.get("fields") is not None:
                 return False
-        else:
-            page = previous["page"]
-            if not token or token != page.get("next_cursor") or args.get("fields") is not None:
+            previous = next((entry for entry in selections.values()
+                             if entry["page"].get("next_cursor") == token), None)
+            if previous is None or (() in selections and previous is not selections[()]):
                 return False
-            args["start_char"] = page["next_start_char"]
+            args["start_char"] = previous["page"]["next_start_char"]
             args["fields"] = previous["selected_fields"] or None
+        else:
+            fields = args.get("fields")
+            if fields is not None and (not isinstance(fields, list)
+                    or any(not isinstance(field, str) for field in fields)):
+                return False
+            requested = set(fields or [])
+            if () in selections or (selections and not requested):
+                return False
+            if any(requested.intersection(selection) for selection in selections):
+                return False
         self.pending_result_reads[target] = call_id
         return True
 

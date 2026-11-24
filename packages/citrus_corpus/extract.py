@@ -1,5 +1,6 @@
 """Convert one bounded supported original into offset-stable Markdown."""
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import prepare
 from .html_text import html_to_markdown
@@ -47,6 +48,20 @@ def _pdf(source):
     return text
 
 
+def _jats_doctype(info):
+    """Recognize the publisher's JATS declaration without opening its DTD."""
+    if not info.doctype:
+        return True
+    location = urlsplit(info.system_url or "")
+    public_id = info.public_id or ""
+    return (info.root_name == "article" and info.internalDTD is not None
+            and not info.internalDTD.entities()
+            and location.scheme in {"http", "https"}
+            and location.netloc in {"dtd.nlm.nih.gov", "jats.nlm.nih.gov"}
+            and location.path.endswith(".dtd")
+            and public_id.startswith(("-//NLM//DTD Journal Publishing", "-//NLM//DTD JATS")))
+
+
 def _tree(source, fmt):
     from lxml import etree
 
@@ -59,9 +74,11 @@ def _tree(source, fmt):
         if root is None:
             raise ValueError("document_tree_missing")
         if fmt == "xml":
-            if root.getroottree().docinfo.doctype:
+            if not _jats_doctype(root.getroottree().docinfo):
                 raise ValueError("xml_doctype_disallowed")
             for node in root.iter():
+                if isinstance(node, etree._Entity):
+                    raise ValueError("xml_entity_disallowed")
                 if isinstance(node.tag, str):
                     node.tag = etree.QName(node).localname
             # JATS sections and paragraphs use the same Markdown paths as HTML.

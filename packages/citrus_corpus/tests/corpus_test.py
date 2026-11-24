@@ -82,6 +82,10 @@ def test_extraction_and_scoped_acquisition(store):
     assert intake.queue.status(denied_job["id"])["error"] == "source_redirect_denied"
     xml = b"<article><front><article-title>River Study</article-title></front><body><sec><title>Methods</title><p>Measurements and sampling.</p></sec></body></article>"
     assert "## Methods" in extract_markdown(xml, "xml")
+    jats = b'<!DOCTYPE article PUBLIC "-//NLM//DTD Journal Publishing DTD v3.0" "http://dtd.nlm.nih.gov/publishing/3.0/journalpublishing3.dtd"'
+    assert "## Methods" in extract_markdown(jats + b">" + xml, "xml")
+    with pytest.raises(PreparationError, match="invalid_xml"):
+        extract_markdown(jats + b' [<!ENTITY custom "extra">]>' + xml, "xml")
     with pytest.raises(PreparationError, match="invalid_xml"):
         extract_markdown(b'<!DOCTYPE article SYSTEM "https://b.example/x"><article/>', "xml")
     pdf = pytest.importorskip("fitz")

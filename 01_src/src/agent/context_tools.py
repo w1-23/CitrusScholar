@@ -35,11 +35,34 @@ async def read_context_evidence(checkpoint_id: str, message_count: int,
             or job["session_id"] != tracing.get_session_id()
             or job["status"] not in {"running", "detached"}):
         raise PermissionError("context_archive_scope_unavailable")
-    identity = ExecutionIdentity(job["owner_user_id"], job["session_id"],
-                                 job["request_id"], job["job_id"])
-    archive = EncryptedContextArchive(PROJECT_ROOT / "state", identity,
-                                     (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()))
-    ref = ArchiveReference(archive.config["configurable"]["thread_id"], checkpoint_id, message_count)
+    from src.session.manager import SessionManager
+    identity, provider_scope, thread_id = None, None, None
+    working = SessionManager().get_checkpoint(job["session_id"]).get("working_state") or {}
+    cache = working.get("projection_cache") if isinstance(working, dict) else None
+    archive_ref = cache.get("archive") if isinstance(cache, dict) else None
+    if isinstance(archive_ref, dict) and archive_ref.get("checkpoint_id") == checkpoint_id:
+        # The archive lives in the turn/run namespace that created it. Resolve
+        # that original scope under the current owner/session authorization
+        # instead of assuming today's run owns yesterday's checkpoint.
+        saved, scope = archive_ref.get("identity"), archive_ref.get("provider_scope")
+        if (not isinstance(saved, dict) or not isinstance(scope, list) or len(scope) != 2
+                or any(not isinstance(value, str) or not value for value in scope)
+                or saved.get("owner_user_id") != job["owner_user_id"]
+                or saved.get("session_id") != job["session_id"]):
+            raise PermissionError("context_archive_scope_unavailable")
+        identity = ExecutionIdentity(int(saved["owner_user_id"]), str(saved["session_id"]),
+                                     str(saved.get("user_turn_id") or ""),
+                                     str(saved.get("run_id") or ""))
+        provider_scope, thread_id = (scope[0], scope[1]), str(archive_ref.get("thread_id") or "")
+        if not thread_id:
+            raise PermissionError("context_archive_scope_unavailable")
+    else:
+        identity = ExecutionIdentity(job["owner_user_id"], job["session_id"],
+                                     job["request_id"], job["job_id"])
+        provider_scope = (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())
+    archive = EncryptedContextArchive(PROJECT_ROOT / "state", identity, provider_scope)
+    ref = ArchiveReference(thread_id or archive.config["configurable"]["thread_id"],
+                           checkpoint_id, message_count)
     messages = await archive.read_evidence(ref, start=message_index, stop=message_index + 1)
     text = json.dumps(messages[0], ensure_ascii=False, separators=(",", ":"))
     if start_char > len(text):

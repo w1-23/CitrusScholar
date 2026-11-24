@@ -8,7 +8,7 @@
   },
   "reference-verification": {
     "repository": "https://github.com/w1-23/reference-verification.git",
-    "commit": "58faab0e1aa9a9de8cd9a587a8f991f2c77a5a75",
+    "commit": "a8cc65ea2c16e4efeccfd2d3b99474502682e363",
     "python_package": "packages/citrus_refcheck",
     "dependencies": {
       "requirements.lock": "cd20b991f67fe502e91121b1dbad17284a8a45ddac86383196d6f4a840e5da3e"

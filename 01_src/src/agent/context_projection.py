@@ -27,7 +27,7 @@ No settings, provider clients, tracing scope, or budgets are created here.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import logging
@@ -244,7 +244,7 @@ def _units(messages):
     return units
 
 
-_CACHE_SCHEMA = "working_summary_cache/1"
+_CACHE_SCHEMA = "working_summary_cache/2"
 
 
 def _cache_ranges(indexes):
@@ -338,6 +338,7 @@ class _MeteredSummaryModel(BaseChatModel):
     deadline: float
     max_attempts: int = 3
     failure: Any = Field(default=None, exclude=True, repr=False)
+    calls: int = Field(default=0, exclude=True)
 
     @property
     def _llm_type(self):
@@ -383,6 +384,7 @@ class _MeteredSummaryModel(BaseChatModel):
                 if estimate["estimated_input_tokens"] > task_events.model_input_limit(estimate["output_tokens"]):
                     raise AdmissionStopped("context_summary_incomplete")
             try:
+                self.calls += 1
                 async with asyncio.timeout(max(0.0, self.deadline - time.monotonic())):
                     response = await task_events.run_model_attempt(
                         transport, messages, lambda: transport.ainvoke(messages),
@@ -451,9 +453,13 @@ class WorkingContextProjection(AgentMiddleware):
         self.tool_schemas = tool_schemas if callable(tool_schemas) else list(tool_schemas or [])
         self._schemas = None if callable(tool_schemas) else self.tool_schemas
         self._cache = None
-        # Evidence for the task record: a reused summary means no identical
-        # summary call was paid for again on this turn.
+        # Evidence for the task record: imported means an earlier turn or a
+        # resume supplied a descriptor that still matched; reuse_count means this
+        # run's projection matched its own cache again; summary_calls counts the
+        # real summary-model attempts, not the turns that reused a summary.
         self.reuse_count = 0
+        self.imported = False
+        self.summary_calls = 0
         self._summary_unavailable = False
         self._archive_unavailable = False
 
@@ -543,9 +549,10 @@ class WorkingContextProjection(AgentMiddleware):
         baseline = raw
         if self._cache is not None:
             trace.mark("estimate")
-            previous_required, prefix_count, prefix_digest, removed, summary = self._cache
-            if (required == previous_required and prefix_digest and len(raw) >= prefix_count
-                    and self._prefix_digest(raw, prefix_count) == prefix_digest
+            previous_required, prefix_count, coverage_digest, removed, summary, _archive = self._cache
+            covered_limit = max(removed, default=-1) + 1
+            if (required == previous_required and coverage_digest and len(raw) >= covered_limit
+                    and self._coverage_digest(raw, removed) == coverage_digest
                     and not set(tail).intersection(removed)):
                 baseline = _view(raw, removed, summary)
                 self.reuse_count += 1
@@ -632,6 +639,7 @@ class WorkingContextProjection(AgentMiddleware):
                     raise
                 self._summary_unavailable = True
                 logger.info("context_summary_unavailable reason=%s", error.reason)
+        self.summary_calls = int(getattr(model, "calls", 0))
         if self._summary_unavailable:
             removed = frozenset(indexes[:len(indexes) - keep])
             archived_only = set(removed)
@@ -689,53 +697,76 @@ class WorkingContextProjection(AgentMiddleware):
                 "protected_messages": len(protected), "retained_messages": keep,
                 "archive": ref.as_dict(), "message_indices": sorted(removed)})
         trace.mark("callback")
-        # The descriptor keeps a prefix fingerprint plus the summary and its
-        # covered indices, never a second copy of the raw history. That makes it
-        # persistable so a later turn or a resume reuses the same summary instead
-        # of paying for an identical summary call again.
-        prefix_digest = self._prefix_digest(raw, len(raw))
-        self._cache = ((frozenset(required), len(raw), prefix_digest, removed, summary)
-                       if prefix_digest else None)
+        # The descriptor keeps a fingerprint of the covered originals plus the
+        # summary and its indices, never a second copy of the raw history. That
+        # makes it persistable so a later turn or a resume reuses the same
+        # summary instead of paying for an identical summary call again.
+        coverage_digest = self._coverage_digest(raw, removed)
+        archive_ref = {"thread_id": ref.thread_id, "checkpoint_id": ref.checkpoint_id,
+                       "message_count": ref.message_count,
+                       "provider_scope": list(self.archive.provider_scope),
+                       "identity": asdict(self.archive.identity)}
+        self._cache = ((frozenset(required), len(raw), coverage_digest, removed, summary,
+                        archive_ref) if coverage_digest else None)
         return view
 
-    def _prefix_digest(self, raw, upto):
-        """Stable fingerprint of the first ``upto`` messages, "" when opaque."""
+    def _coverage_digest(self, raw, removed):
+        """Fingerprint only the summarized originals, "" when a read fails.
+
+        Retained messages, newer tail turns, and host-inserted work-state
+        messages may differ between turns without changing the archived
+        coverage; only the removed originals decide whether the saved summary
+        still applies.
+        """
         digest = hashlib.sha256()
         try:
-            for message in raw[:upto]:
-                encoded = json.dumps(messages_to_dict([message])[0], sort_keys=True,
+            for index in sorted(removed):
+                encoded = json.dumps(messages_to_dict([raw[index]])[0], sort_keys=True,
                                      ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 digest.update(len(encoded).to_bytes(8, "big"))
                 digest.update(encoded)
-        except (TypeError, ValueError):
+        except (IndexError, TypeError, ValueError):
             return ""
         return digest.hexdigest()
+
+    def _cache_binding(self) -> dict:
+        """Stable account/session/provider binding; never a per-run identity."""
+        binding = {"owner_user_id": int(self.archive.identity.owner_user_id),
+                   "session_id": str(self.archive.identity.session_id),
+                   "provider_scope": list(self.archive.provider_scope)}
+        encoded = json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return {"owner_user_id": binding["owner_user_id"],
+                "session_id": binding["session_id"],
+                "context_scope": hashlib.sha256(encoded).hexdigest()}
 
     def export_cache(self) -> dict | None:
         """JSON-safe descriptor of the live summary; None when nothing applies."""
         if self._cache is None:
             return None
-        required, count, prefix_digest, removed, summary = self._cache
-        if not prefix_digest or not removed:
+        required, count, coverage_digest, removed, summary, archive_ref = self._cache
+        if not coverage_digest or not removed:
             return None
         try:
             encoded = messages_to_dict([summary])[0]
         except (TypeError, ValueError):
             return None
-        return {"schema": _CACHE_SCHEMA, "count": int(count), "digest": prefix_digest,
+        return {"schema": _CACHE_SCHEMA, "count": int(count), "digest": coverage_digest,
                 "removed": _cache_ranges(removed), "summary": encoded,
                 "trigger_tokens": int(self.trigger_tokens),
                 "target_tokens": int(self.target_tokens),
                 "requirements": sorted(required),
-                "provider_scope": list(getattr(self.archive, "provider_scope", ()) or ())}
+                "provider_scope": list(getattr(self.archive, "provider_scope", ()) or ()),
+                "binding": self._cache_binding(), "archive": archive_ref}
 
     def import_cache(self, descriptor) -> bool:
-        """Adopt a persisted descriptor only when it exactly matches this run."""
+        """Adopt a persisted descriptor only when it matches this session."""
         if not isinstance(descriptor, dict) or descriptor.get("schema") != _CACHE_SCHEMA:
             return False
         if (descriptor.get("trigger_tokens") != int(self.trigger_tokens)
                 or descriptor.get("target_tokens") != int(self.target_tokens)
                 or descriptor.get("provider_scope") != list(getattr(self.archive, "provider_scope", ()) or ())):
+            return False
+        if descriptor.get("binding") != self._cache_binding():
             return False
         count, digest = descriptor.get("count"), descriptor.get("digest")
         if type(count) is not int or count <= 0 or not isinstance(digest, str) or len(digest) != 64:
@@ -745,6 +776,22 @@ class WorkingContextProjection(AgentMiddleware):
         if (removed is None or not isinstance(requirements, list)
                 or any(type(item) is not str for item in requirements)):
             return False
+        archive_ref = descriptor.get("archive")
+        if archive_ref is not None:
+            if (not isinstance(archive_ref, dict)
+                    or not isinstance(archive_ref.get("thread_id"), str)
+                    or not archive_ref.get("thread_id")
+                    or not isinstance(archive_ref.get("checkpoint_id"), str)
+                    or not archive_ref.get("checkpoint_id")
+                    or type(archive_ref.get("message_count")) is not int
+                    or archive_ref["message_count"] < 0):
+                return False
+            saved, scope = archive_ref.get("identity"), archive_ref.get("provider_scope")
+            if (not isinstance(saved, dict) or not isinstance(scope, list) or len(scope) != 2
+                    or any(not isinstance(value, str) or not value for value in scope)
+                    or saved.get("owner_user_id") != self.archive.identity.owner_user_id
+                    or saved.get("session_id") != self.archive.identity.session_id):
+                return False
         try:
             summary = messages_from_dict([descriptor.get("summary")])[0]
         except (KeyError, TypeError, ValueError):
@@ -752,7 +799,8 @@ class WorkingContextProjection(AgentMiddleware):
         if (not isinstance(summary, SystemMessage)
                 or summary.additional_kwargs.get("context_projection") != "working_summary_v1"):
             return False
-        self._cache = (frozenset(requirements), count, digest, removed, summary)
+        self._cache = (frozenset(requirements), count, digest, removed, summary, archive_ref)
+        self.imported = True
         return True
 
     def _defer(self, view, *, reason, before, protected, eligible):

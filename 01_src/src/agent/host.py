@@ -319,16 +319,22 @@ async def _run(state, identity, ledger):
             "retrieval": {"candidate_prefetch": bool(settings.CANDIDATE_PREFETCH_ENABLED and policy.allows("local_rag")),
                           "rrf_k": settings.RRF_K, "candidate_window": settings.CANDIDATE_WINDOW,
                           "top_k_vector": settings.TOP_K_VECTOR, "query_cache": bool(settings.RAG_CACHE_ENABLED)},
+            "skill_runtime": runtime_provenance(PROJECT_ROOT),
         }
     original_request_state = capture_original_request_state(state)
+    from .skill_provenance import runtime_provenance
 
-    asset_fields = ("dataset_refs", "source_refs", "script_refs", "run_refs", "plot_intent")
+    asset_lists = ("dataset_refs", "source_refs", "script_refs", "run_refs")
+    asset_fields = (*asset_lists, "plot_intent", "projection_cache")
 
     def export_host():
         working = host.working_state()
+        assets = {key: deepcopy(working[key]) for key in asset_lists}
+        assets["plot_intent"] = deepcopy(working["plot_intent"])
+        assets["projection_cache"] = deepcopy(working.get("projection_cache"))
         return {"identity": asdict(identity),
                 "original_request_state": original_request_state, "trace_start": trace_start,
-                "working_assets": deepcopy({key: working[key] for key in asset_fields}),
+                "working_assets": assets,
                 "script_budget_scope": state["script_budget_scope"],
                 "query": state["query"], "skills": skills.export() if skills is not None else None,
                 "update_version": update_version, "final_review": deepcopy(final_review),
@@ -349,11 +355,14 @@ async def _run(state, identity, ledger):
             raise task_events.TaskConflict("identity_conflict")
         assets = saved.get("working_assets")
         if assets is not None and (not isinstance(assets, dict)
-                or set(assets) != set(asset_fields)
+                or not set(assets).issubset(asset_fields)
+                or not {"plot_intent", *asset_lists}.issubset(assets)
                 or not isinstance(assets["plot_intent"], dict)
+                or not (assets.get("projection_cache") is None
+                        or isinstance(assets["projection_cache"], dict))
                 or any(not isinstance(assets[key], list)
                        or any(not isinstance(ref, dict) for ref in assets[key])
-                       for key in asset_fields[:-1])):
+                       for key in asset_lists)):
             raise task_events.TaskConflict("recovery_working_assets_invalid")
         scope = (saved.get("script_budget_scope") or original.get("script_budget_scope")
                  or (original.get("context_working_state") or {}).get("script_budget_scope")
@@ -365,7 +374,7 @@ async def _run(state, identity, ledger):
         if assets is not None:
             # Restore only host-owned assets. Query/update watermarks and live
             # supplementary instructions retain their existing recovery path.
-            for key in asset_fields[:-1]:
+            for key in asset_lists:
                 merged = deepcopy(assets[key])
                 for ref in state.get(key) or []:
                     if ref not in merged:
@@ -373,6 +382,10 @@ async def _run(state, identity, ledger):
                 state[key] = merged
             state["plot_intent"] = {**deepcopy(state.get("plot_intent") or {}),
                                     **deepcopy(assets["plot_intent"])}
+            if isinstance(assets.get("projection_cache"), dict):
+                working = dict(state.get("context_working_state") or {})
+                working["projection_cache"] = deepcopy(assets["projection_cache"])
+                state["context_working_state"] = working
         else:
             # Compatibility with earlier checkpoints: rebuild references from
             # authenticated published messages, without executing their tools.
@@ -681,13 +694,25 @@ async def _run(state, identity, ledger):
         # before_model's host_state watermark is already synchronously committed.
         task_events.acknowledge_updates(identity.run_id, update_version)
         view = history if projection is None else await projection.project(history)
+        if projection is None and native_options is not None:
+            runtime = state.get("capability_runtime")
+            if isinstance(runtime, dict):
+                runtime["context_projection"] = {
+                    "schema": "native_thread_v1", "executor": "native",
+                    "summary_enabled": summary_enabled,
+                    "summary_calls": int(getattr(native_options.get("summary_model"), "calls", 0)),
+                }
         if projection is not None:
             runtime = state.get("capability_runtime")
             if isinstance(runtime, dict):
                 runtime["context_projection"] = {
                     "schema": "working_summary_v1",
-                    "summary_reused": projection.reuse_count > 0,
+                    "executor": "projection",
+                    "summary_reused": projection.imported or projection.reuse_count > 0,
+                    "summary_imported": bool(projection.imported),
+                    "summary_reused_in_run": projection.reuse_count > 0,
                     "reuse_events": int(projection.reuse_count),
+                    "summary_calls": int(getattr(projection, "summary_calls", 0)),
                 }
             descriptor = projection.export_cache()
             if descriptor is not None:

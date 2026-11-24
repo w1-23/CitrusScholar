@@ -64,6 +64,85 @@ jobs:
             01_src/src/shared_corpus/pmc_intake_test.py \
             01_src/src/research/nature_composition_test.py \
             01_src/src/figures/nature_current_qa_test.py
+  skills-lock:
+    name: Standalone Skill lock drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install staging dependency
+        run: python -m pip install pyyaml==6.0.2
+      - name: Clone locked Skill repositories
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          lock = json.loads(Path("02_config/standalone-skills.lock.json").read_text())
+          root = Path(os.environ["RUNNER_TEMP"]) / "skill-sources"
+          for name, entry in lock.items():
+              target = root / name
+              subprocess.run(["git", "init", "-q", str(target)], check=True)
+              subprocess.run(["git", "-C", str(target), "remote", "add", "origin",
+                              entry["repository"]], check=True)
+              subprocess.run(["git", "-C", str(target), "fetch", "--depth", "1",
+                              "origin", entry["commit"]], check=True)
+              subprocess.run(["git", "-C", str(target), "checkout", "-q", "FETCH_HEAD"],
+                             check=True)
+          PY
+      - name: Stage locked runtime packages
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          python 04_scripts/stage_skill_release.py \
+            --repositories "$RUNNER_TEMP/skill-sources" \
+            --output "$RUNNER_TEMP/skill-release" \
+            --include-runtime
+      - name: Compare staged packages with the repository
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          release = Path(os.environ["RUNNER_TEMP"]) / "skill-release" / "python"
+          # These legacy fixtures belong to the Citrus test suite, not to the
+          # standalone distribution, so they are allowed as extra local files.
+          allowed_extras = {
+              "citrus_refcheck": {"reference_verdict_eval_test.py",
+                                  "reference_verdict_fixtures.py"},
+              "citrus_audit": {"plan_test.py", "region_workbook_test.py"}}
+          failed = []
+          for module in ("citrus_refcheck", "citrus_audit"):
+              staged, repo = release / module, Path("packages") / module
+              staged_files = {p.relative_to(staged) for p in staged.rglob("*") if p.is_file()}
+              repo_files = {p.relative_to(repo) for p in repo.rglob("*")
+                            if p.is_file() and "__pycache__" not in p.parts}
+              extras = repo_files - staged_files
+              extras -= {Path(name) for name in allowed_extras.get(module, ())}
+              if extras:
+                  failed.append(f"{module}: extra {sorted(map(str, extras))}")
+              for rel in sorted(staged_files):
+                  left = (staged / rel).read_bytes()
+                  right = (repo / rel).read_bytes() if (repo / rel).is_file() else None
+                  if right is None:
+                      failed.append(f"{module}/{rel}: missing from repository")
+                  elif hashlib.sha256(left).digest() != hashlib.sha256(right).digest():
+                      failed.append(f"{module}/{rel}: differs from locked repository")
+          if failed:
+              raise SystemExit("Skill lock drift:\n" + "\n".join(failed))
+          print("Skill runtime packages match the locked repositories")
+          PY
+
   node:
     name: Node browser-state fixtures
     runs-on: ubuntu-24.04

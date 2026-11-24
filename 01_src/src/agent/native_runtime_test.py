@@ -48,6 +48,43 @@ def test_installed_skill_selection_uses_active_release_entries(tmp_path, monkeyp
         list_installed(active)
 
 
+def test_workspace_uses_installed_skill_inventory_and_live_policy(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import pytest
+    from src.agent.workspace_projection import read, resources
+    from src.core import capability_policy
+
+    skill_id = "data-audit"
+    version = "a" * 40
+    prefix = f"skills/{skill_id}/"
+    entry = prefix + "SKILL.md"
+    usage = prefix + "references/usage.md"
+    files = {entry: b"---\nname: data-audit\ndescription: Active audit method\n---\n",
+             usage: b"Read the selected region.\n"}
+    for name, content in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    (tmp_path / prefix / "unlisted.md").write_text("unlisted", encoding="utf-8")
+    (tmp_path / "release.json").write_text(json.dumps({skill_id: version}), encoding="utf-8")
+    (tmp_path / "inventory.json").write_text(json.dumps(
+        {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}), encoding="utf-8")
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(tmp_path))
+    inventory = dict(resources("/skills"))
+    assert set(inventory) == {"/" + name for name in files}
+    descriptor = inventory["/" + usage]
+    assert descriptor["skill_version"] == version
+    assert read("/" + usage, descriptor)[0] == files[usage].decode()
+    (tmp_path / usage).write_bytes(b"Do not read changed bytes.")
+    with pytest.raises(ValueError, match="workspace_skill_integrity_mismatch"):
+        read("/" + usage, descriptor)
+    monkeypatch.setattr(capability_policy, "allows", lambda name: name != f"skill:{skill_id}")
+    assert not list(resources("/skills"))
+    with pytest.raises(PermissionError, match="skill_disabled"):
+        read("/" + usage, descriptor)
+
+
 async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
     skill_root = tmp_path / "skills"
     demo = skill_root / "demo"

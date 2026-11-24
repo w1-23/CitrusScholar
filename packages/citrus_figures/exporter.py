@@ -420,7 +420,8 @@ def export_svg(figure: Any) -> bytes:
     import io
 
     buffer = io.BytesIO()
-    figure.savefig(buffer, format="svg", facecolor="white")
+    options = {"facecolor": "none", "transparent": True} if getattr(figure, "_citrus_transparent", False) else {"facecolor": "white"}
+    figure.savefig(buffer, format="svg", **options)
     return buffer.getvalue()
 
 
@@ -429,7 +430,9 @@ def export_raster(figure: Any, fmt: str = "png", dpi: int = 300) -> bytes:
     import io
 
     buffer = io.BytesIO()
-    figure.savefig(buffer, format=fmt, dpi=dpi, facecolor="white")
+    transparent = fmt == "png" and getattr(figure, "_citrus_transparent", False)
+    options = {"facecolor": "none", "transparent": True} if transparent else {"facecolor": "white"}
+    figure.savefig(buffer, format=fmt, dpi=dpi, **options)
     return buffer.getvalue()
 
 

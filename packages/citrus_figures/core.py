@@ -150,6 +150,15 @@ class ScatterPoint:
         self._apply()
 
     def set_markerfacecolor(self, colour):
+        if colour == "none":
+            state = self._state()
+            state["face_present"][self.index] = False
+            if len(state["face"]):
+                state["face"][self.index, 3] = 0
+            self._apply()
+            return
+        if colour == "auto":
+            colour = self.collection._citrus_series_color
         self._set_marker_colour("face", colour)
 
     def set_markeredgecolor(self, colour):
@@ -505,7 +514,7 @@ def _build_resolved_figure(resolved: ResolvedFigure, *, rendered=None, ax=None,
             token = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
             return f"{prefix}.series_{token}"
         return _series_gid(axes_index, index)
-    _register(rendered, "figure_1", fig, "figure", {"scope": "figure"})
+    _register(rendered, "figure_1", fig, "figure", {"scope": "figure", "role": "figure"})
     # The subplot itself is addressable: a whole axes block can be moved.
     _register(rendered, prefix, ax, "axes", {"axes_index": axes_index, "role": "axes"})
 
@@ -598,6 +607,7 @@ def _build_resolved_figure(resolved: ResolvedFigure, *, rendered=None, ax=None,
                 artist = ax.scatter(
                     positions, values, label=series.name or None, color=colour,
                     s=18, alpha=0.85, zorder=3, edgecolors="none")
+                artist._citrus_series_color = colour
             _register(rendered, series_gid(index), artist, "series", {
                 "axes_index": axes_index, "role": "series", "series_index": index, "series_id": series_gid(index),
                 **({"panel_id": resolved.panel_id} if resolved.panel_id else {}),

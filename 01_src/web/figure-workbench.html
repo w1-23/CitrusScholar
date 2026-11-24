@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>图件工作台 · CitrusScholar</title>
+  <link rel="stylesheet" href="/assets/workbench/workbench.css?v=1">
+  <script src="/assets/figures/hit_geometry.js?v=1" defer></script>
+  <script type="module" src="/assets/workbench/main.js?v=1"></script>
+</head>
+<body>
+  <header class="toolbar">
+    <div class="workspace-name">
+      <a class="brand" href="/" aria-label="CitrusScholar 首页"><span aria-hidden="true">C</span> CitrusScholar</a>
+      <h1>图件工作台</h1>
+    </div>
+    <nav aria-label="工作台操作">
+      <button id="openLibrary" class="primary">打开图件</button>
+      <button id="toggleGroups" class="drawer-button" aria-controls="groups" aria-expanded="false">对象组</button>
+      <button id="toggleInspector" class="drawer-button" aria-controls="inspector" aria-expanded="false">样式</button>
+      <button id="undo" disabled>撤销</button>
+      <button id="redo" disabled>重做</button>
+      <button id="save" class="primary" disabled>保存图件</button>
+      <details id="exports" class="exports">
+        <summary>导出</summary>
+        <div class="export-menu" id="exportMenu"></div>
+      </details>
+    </nav>
+  </header>
+  <main class="workbench">
+    <aside id="groups" class="sidebar" aria-labelledby="groupsTitle">
+      <section class="asset-library" aria-labelledby="assetLibraryTitle">
+        <h2 id="assetLibraryTitle">图件库</h2>
+        <label>按名称筛选<input type="search" id="assetQuery" maxlength="120" placeholder="输入图件名称"></label>
+        <div class="asset-filters">
+          <label>类型<select id="assetKind" aria-label="类型">
+            <option value="">全部</option>
+            <optgroup label="图件来源"><option value="spec">规格图件</option><option value="script">脚本图件</option><option value="svg">静态 SVG</option></optgroup>
+            <optgroup label="规格图型"><option value="chart:line">折线图</option><option value="chart:bar">柱形图</option><option value="chart:scatter">散点图</option><option value="chart:errorbar">误差棒图</option><option value="chart:histogram">直方图</option><option value="chart:boxplot">箱线图</option><option value="chart:multipanel">多子图</option></optgroup>
+          </select></label>
+          <label>编辑权限<select id="assetAccess" aria-label="编辑权限"><option value="">全部</option><option value="editable">可编辑</option><option value="read_only">只读</option></select></label>
+        </div>
+        <p id="assetStatus" role="status"></p>
+        <ul id="assetList" aria-label="已有图件"></ul>
+        <button id="assetMore" hidden>加载更多图件</button>
+        <button id="assetRetry" hidden>重试列表</button>
+      </section>
+      <h2 id="groupsTitle">对象组</h2>
+      <p id="groupsEmpty" class="muted">打开图件后选择要编辑的对象组。</p>
+      <ul id="groupTree" class="tree" role="tree" aria-labelledby="groupsTitle" hidden></ul>
+    </aside>
+    <section class="canvas-area" aria-labelledby="figureTitle">
+      <div class="canvas-toolbar">
+        <div class="figure-name"><h2 id="figureTitle">未打开图件</h2><span id="revision"></span></div>
+        <div class="view-controls" aria-label="画布控制">
+          <button id="zoomOut" aria-label="缩小" disabled>−</button>
+          <button id="fit" aria-label="适合窗口" disabled>适应</button>
+          <button id="zoomIn" aria-label="放大" disabled>＋</button>
+          <button id="picking" aria-pressed="true" disabled>画布选取</button>
+        </div>
+      </div>
+      <div id="canvas" class="canvas" tabindex="0" aria-label="图件画布">
+        <p id="canvasEmpty" class="canvas-empty">从图件库选择已有图件。</p>
+        <div id="frame" class="frame" hidden>
+          <img id="preview" class="preview" alt="图件预览" draggable="false">
+          <div id="outline" class="selection" aria-hidden="true" hidden></div>
+        </div>
+      </div>
+      <p id="canvasStatus" class="canvas-status" aria-live="polite"></p>
+    </section>
+    <aside id="inspector" class="sidebar inspector" aria-labelledby="inspectorTitle">
+      <h2 id="inspectorTitle">样式</h2>
+      <div id="propertyPanel" class="property-panel"><p class="muted">选择对象组以查看可用属性。</p></div>
+    </aside>
+  </main>
+  <footer id="status" class="status" role="status" aria-live="polite"></footer>
+  <dialog id="library" aria-labelledby="libraryTitle">
+    <div class="library-body">
+      <h2 id="libraryTitle">图件库</h2>
+      <p id="libraryNotice" class="muted" role="status"></p>
+      <div id="selectedAsset" class="selected-asset" hidden></div>
+      <fieldset id="libraryItems"><legend>选择已有图件</legend><div id="libraryList" class="library-list"></div></fieldset>
+      <button id="moreFigures" hidden>加载更多</button>
+      <button id="retryLibrary" hidden>重试加载</button>
+    </div>
+    <div class="dialog-actions">
+      <button id="cancelOpen">取消</button>
+      <button id="confirmOpen" class="primary" disabled>打开所选图件</button>
+    </div>
+  </dialog>
+</body>
+</html>

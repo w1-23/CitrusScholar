@@ -57,6 +57,7 @@ EDITABLE_BY_ROLE: dict[str, tuple[str, ...]] = {
     "colorbar": ("visible", "label", "offset_px"),
     "spine": ("color", "linewidth", "visible"),
     "axes": ("offset_px",),
+    "figure": ("transparent",),
 }
 
 # The complete set of editable properties, for validation.
@@ -636,10 +637,23 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
             anchor = _anchor(bbox, role)
             if anchor:
                 record["anchor"] = [round(anchor[0], 3), round(anchor[1], 3)]
+        if role == "figure":
+            if source == "spec":
+                record["transparent"] = bool(getattr(figure, "_citrus_transparent", False))
+            else:
+                record["editable"] = []
         if role in {"series", "point"} and artist is not None:
             from matplotlib.lines import Line2D
             from matplotlib.collections import PathCollection
             record.update(_marker_metadata(artist))
+            if isinstance(artist, Line2D):
+                mode = getattr(artist, "_markerfacecolor", None)
+                record["marker_fill_mode"] = ("auto" if isinstance(mode, str) and mode == "auto"
+                    else "none" if "markerfacecolor" not in record else "custom")
+            elif isinstance(artist, PathCollection):
+                record["marker_fill_mode"] = getattr(artist, "_citrus_marker_fill_mode", None)
+                if record["marker_fill_mode"] is None and "markerfacecolor" in record:
+                    record["marker_fill_mode"] = "auto" if getattr(artist, "_citrus_series_color", None) else "custom"
             if role == "series":
                 source_artist = series_source(rendered, entry)
                 record["label"] = str(source_artist.get_label() or "")
@@ -694,6 +708,10 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
             record["editable"], reason = style_capabilities(artist, role, members or [artist], record["editable"])
             if reason:
                 record["editing_limitation"] = reason
+        if (source == "script" and role == "series" and record.get("semantic_key")
+                and record.get("editing_limitation") != "unverified_figure_legend_links"):
+            from citrus_figures.workbench_styles import options
+            record.update(options(artist))
         if "parent_gid" in entry:
             record["parent_gid"] = entry["parent_gid"]
         if "visible" in EDITABLE_BY_ROLE.get(role, ()) and artist is not None:

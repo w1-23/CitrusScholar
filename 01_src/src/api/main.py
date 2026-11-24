@@ -4723,9 +4723,11 @@ if _frontend_assets.exists():
 # ── The figure workspace ──────────────────────────────────────────────────
 # A separate page and a separate family of endpoints, mounted here so that
 # the rest of the service is untouched by the feature.
-from src.api import figure_router  # noqa: E402
+from src.api import figure_router, figure_workbench_router  # noqa: E402
 
 app.include_router(figure_router.router)
+app.include_router(figure_workbench_router.router)
+app.include_router(figure_workbench_router.page_router)
 from src.api.integrity_router import router as integrity_router  # noqa: E402
 app.include_router(integrity_router)
 from src.api.reference_router import router as reference_router  # noqa: E402
@@ -4738,7 +4740,11 @@ app.include_router(shared_corpus_router)
 
 @app.get("/figures")
 async def serve_figures_page(request: Request):
-    """The standalone figure workspace, for signed-in accounts only."""
+    return await figure_workbench_router.workbench_page(request)
+
+
+@app.get("/figures/legacy", include_in_schema=False)
+async def serve_legacy_figures_page(request: Request):
     return await figure_router.serve_figure_page(request)
 
 

@@ -5,13 +5,15 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from hashlib import sha256
 import json
+import math
 
 from citrus_figures.manifest import EDITABLE_BY_ROLE
+from citrus_figures.workbench_styles import properties as workbench_properties
 from src.figures.projects import ProjectError
 
 _TEXT = {"color", "fontsize", "fontfamily", "fontweight", "fontstyle", "horizontalalignment", "visible"}
 _SERIES = {"color", "linewidth", "linestyle", "marker", "markersize", "markerfacecolor", "markeredgecolor",
-           "markeredgewidth", "facecolor", "edgecolor", "alpha", "visible", "label"}
+           "markeredgewidth", "facecolor", "edgecolor", "alpha", "visible", "label", "cmap"}
 _ALLOWED = {
     "figure": {"transparent"}, "series": _SERIES, "legend": _TEXT | {"frameon", "ncols", "loc", "offset_px"},
     "title": _TEXT | {"text", "offset_px"}, "xlabel": _TEXT | {"text", "offset_px"},
@@ -25,6 +27,9 @@ _LABELS = {"figure": "整张图", "title": "标题", "xlabel": "X 轴标题", "y
 _ARTISTS = {"Line2D": "曲线", "Rectangle": "柱形", "PathCollection": "散点", "PolyCollection": "填充带",
             "FillBetweenPolyCollection": "填充带", "QuadMesh": "热图", "AxesImage": "热图"}
 _MISSING = object()
+_OBSERVED_STYLES = {"alpha", "cmap", "color", "facecolor", "edgecolor", "fontfamily", "fontsize", "fontstyle",
+                    "fontweight", "frameon", "label", "linestyle", "loc", "marker", "markerfacecolor", "markeredgecolor",
+                    "markeredgewidth", "markersize", "ncols", "text", "transparent", "visible"}
 
 
 def invalid(code, message, status=400):
@@ -69,7 +74,8 @@ class Group:
                 values[prop] = options[0]
         return {"id": self.id, "kind": self.kind, "label": self.label, "parent": self.parent,
                 "pick_ids": list(dict.fromkeys(self.hits)), "properties": sorted(self.props),
-                "values": values, "reason": self.reason}
+                "values": values, "reason": self.reason,
+                "line_marker_fill": bool(self.rows and all(row.get("artist") == "Line2D" for row in self.rows))}
 
 
 class Inventory:
@@ -90,7 +96,7 @@ class Inventory:
         group = Group(gid, kind, label, parent.id if parent else None, list(rows),
                       [row["gid"] for row in rows])
         if rows:
-            group.props = set.intersection(*(set(row.get("editable") or ()) & _ALLOWED.get(row["role"], set())
+            group.props = set.intersection(*((set(row.get("editable") or ()) | workbench_properties(row)) & _ALLOWED.get(row["role"], set())
                                              for row in rows))
         group.overrides = {(row["gid"], "offset_px"): self.saved[(row["gid"], "offset_px")]
                            for row in rows if (row["gid"], "offset_px") in self.saved}
@@ -293,10 +299,23 @@ class Inventory:
         actual = {row.get("gid"): row for row in manifest.get("objects", []) if isinstance(row, dict)}
         if len(actual) != len(manifest.get("objects", [])):
             raise invalid("group_members_changed", "重绘返回的对象地址不唯一。", 409)
+        values = {(entry["gid"], entry["prop"]): entry["value"] for entry in accepted}
+        if not expected.keys() <= values.keys():
+            raise invalid("group_edit_unconfirmed", "渲染器未确认全部组样式，修改未保存。", 409)
         for gid, prop in expected:
             if gid not in actual or _identity(expected[gid, prop]) != _identity(actual[gid]):
                 raise invalid("group_members_changed", "重绘时所选组成员发生变化。", 409)
-            if prop not in actual[gid].get("editable", []):
+            if prop not in (set(actual[gid].get("editable", [])) | workbench_properties(actual[gid])):
                 raise invalid("group_property_unavailable", "重绘未确认所选组的样式。", 409)
-        if not expected.keys() <= {(entry["gid"], entry["prop"]) for entry in accepted}:
-            raise invalid("group_edit_unconfirmed", "渲染器未确认全部组样式，修改未保存。", 409)
+            if prop not in _OBSERVED_STYLES:
+                continue
+            observed = _value(actual[gid], prop)
+            wanted = values[gid, prop]
+            if observed is _MISSING:
+                continue  # Some artists cannot report a single effective value.
+            if type(observed) in (int, float) and type(wanted) in (int, float):
+                matches = math.isclose(observed, wanted, abs_tol=1e-6)
+            else:
+                matches = observed == wanted
+            if not matches:
+                raise invalid("group_edit_unconfirmed", "重绘结果与提交的组样式不一致，修改未保存。", 409)

@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
+import json
 from io import BytesIO
 from pathlib import Path
 import threading
@@ -78,10 +79,10 @@ class Library:
         render = render_resolved(resolved, formats=("svg",), dpi=90)
         return self.project(source, render.manifest, render.blobs["svg"], owner, title)
 
-    def project(self, source, manifest, blob, owner=OWNER, title="Historical figure", kind="spec"):
+    def project(self, source, manifest, blob, owner=OWNER, title="Historical figure", kind="spec", refs=()):
         entry = self.publish(owner, "isolated-session", "figure.svg", blob, "image/svg+xml")
         row = store.create_project(owner_user_id=owner, title=title, source_kind=kind,
-                                   source=source, session_id="isolated-session", data_refs=[])
+                                   source=source, session_id="isolated-session", data_refs=list(refs))
         assert store.update_project(row["figure_id"], owner, expected_revision=0,
                                     manifest_json=manifest, exports_json={"svg": entry}, render_version=1)
         return row["figure_id"]
@@ -149,6 +150,10 @@ def test_library_ownership_read_only_and_revision_matched_bytes(library, monkeyp
     assert response.headers["x-figure-sha256"] == hashlib.sha256(static_bytes).hexdigest()
     assert "sandbox" in response.headers["content-security-policy"]
     assert client.post(f"{prefix}/{static}/export/png?revision=1").status_code == 409
+    target = group(service.detail(figure_id, OWNER, 1), "WL", "series")
+    invalid = {"expected_revision": 1, "commands": [{**command(target, "color", "#7a3c96"), "gid": "axes_0.series_0"}]}
+    assert client.post(f"{prefix}/{figure_id}/save", json=invalid).status_code == 422
+    assert client.post(f"{prefix}/{figure_id}/save", json={"expected_revision": 1, "commands": [command(target, "xdata", [1, 2])] }).status_code == 422
     assert len(library.published) == baseline
 
 
@@ -271,6 +276,58 @@ def test_export_remains_pinned_when_current_revision_changes(library, monkeypatc
     assert old.body.startswith(b"%PDF-") and old.digest != new.digest
     assert service.download(figure_id, OWNER, 1, "pdf") == old
     assert store.get_revision_export(figure_id, OWNER, 1, "pdf")["export"]["sha256"] == old.digest
+
+
+def test_frozen_script_vector_heatmap_and_confidence_band(library, monkeypatch):
+    from src.config import settings
+    from src.figures import sandbox
+    from src.figures.script_outputs import output_slots
+
+    renderer = """
+from citrus_figures import register_semantic_identity
+fig, ax = plt.subplots()
+register_semantic_identity(ax, 'comparison.panel', role='axes')
+mesh = ax.pcolormesh([[1, 2], [3, data['samples']['y'].iloc[0]]], cmap='viridis')
+register_semantic_identity(mesh, 'comparison.heatmap', role='series')
+band = ax.fill_between([2, 3, 4], [1, 1, 2], [3, 2, 4], color='#088080', alpha=.4, label='Confidence')
+register_semantic_identity(band, 'comparison.confidence', role='series')
+ax.set_title('Vector heatmap and confidence band')
+ax.legend()
+"""
+    script = "import pandas as pd\nemit.table('samples', pd.DataFrame({'y': [4]}))\n"
+    contract = {"version": 2, "tables": [{"name": "samples"}], "figures": [
+        {"name": "main", "title": "Shapes", "formats": ["svg"], "parents": ["samples"], "render_script": renderer}]}
+    runner = sandbox.LocalBackend()
+    initial = runner.run(sandbox.SandboxJob(script=script, output_contract=contract, outputs=output_slots(contract)))
+    assert initial.ok, initial.describe()
+    manifest = json.loads(initial.outputs["figure:main:manifest"])
+    table = json.dumps(json.loads(initial.outputs["table:samples"]), ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"), allow_nan=False).encode()
+    entry = library.publish(OWNER, "isolated-session", "fixture.json", table, "application/json")
+    receipt = manifest["frozen_render_receipt"]
+    assert receipt["data_sha256"] == {"samples": entry["sha256"]}
+    snapshot = {"variable": "samples", "sha256": entry["sha256"], "file_id": entry["file_id"],
+                "size_bytes": len(table), "sandbox_name": "input_0.json"}
+    source = {"kind": "script", "version": 3, "output_contract": contract, "output_key": "main",
+              "frozen_render": {"version": 1, "receipt": receipt, "input_snapshots": [snapshot]}}
+    fid = library.project(source, manifest, initial.outputs["figure:main:svg"], kind="script", refs=[entry])
+    monkeypatch.setattr(settings, "FIGURES_SANDBOX_BACKEND", "local")
+    monkeypatch.setattr(settings, "FIGURES_SANDBOX_ALLOW_LOCAL", True)
+    monkeypatch.setattr(sandbox, "select_backend", lambda **kwargs: runner)
+    start = service.detail(fid, OWNER, 1)
+    assert not start["read_only_reason"]
+    heatmap = group(start, "热图", "series")
+    band = group(start, "Confidence", "series")
+    assert heatmap["properties"] == ["cmap"] and "color" in band["properties"]
+    changes = [command(heatmap, "cmap", "cividis"), command(band, "color", "#b64342"), command(band, "alpha", .6)]
+    preview = service.edit(fid, OWNER, 1, changes)
+    assert group(preview, "热图", "series")["values"]["cmap"] == "cividis"
+    assert group(preview, "Confidence", "series")["values"]["color"] == "#b64342"
+    assert preview["svg"].encode() != initial.outputs["figure:main:svg"]
+    saved = service.edit(fid, OWNER, 1, changes, save=True)
+    assert saved["render_version"] == 2
+    updated = store.get_project(fid, OWNER)["manifest_json"]
+    assert updated["style_replay_proof"]["coordinates_sha256"] == receipt["style_replay"]["coordinates_sha256"]
 
 
 def serve_fixture(path, port):

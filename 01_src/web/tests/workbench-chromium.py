@@ -5,6 +5,7 @@ import argparse
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
 
 from playwright.sync_api import expect, sync_playwright
 
@@ -49,9 +50,9 @@ def pick_geometry(page, target):
       for (const row of rows) {
         const {x0,x1,y0,y1} = row.bbox;
         for (let py=y0;py<=y1;py+=0.7) for (let px=x0;px<=x1;px+=0.7) {
-          const hit = geometry.hits({x:px,y:py}, false)[0];
-          if (!wanted.pick_ids.includes(hit)) continue;
-          const x=box.left+(px-vx)*box.width/vw, y=box.top+(py-vy)*box.height/vh;
+          const x=Math.round(box.left+(px-vx)*box.width/vw), y=Math.round(box.top+(py-vy)*box.height/vh);
+          const hit = geometry.hits(geometry.point(x, y, box), false)[0];
+          if (!wanted.pick_ids.includes(hit) || document.elementFromPoint(x, y) !== image) continue;
           if (x>available.left && x<available.right && y>available.top && y<available.bottom) return {x,y};
         }
       }
@@ -135,6 +136,7 @@ def run(browser, origin, output):
 
     page.get_by_role("button", name="画布选取").click()
     page.get_by_role("button", name="放大").click()
+    expect(page.get_by_role("button", name="画布选取")).to_have_attribute("aria-pressed", "true")
     point = pick_geometry(page, "X 轴刻度文字")
     page.mouse.click(**point)
     selected(page, "X 轴刻度文字")
@@ -175,7 +177,10 @@ def run(browser, origin, output):
         with page.expect_response(lambda response: endpoint in response.url) as received, page.expect_download(timeout=35000) as download:
             page.get_by_role("button", name=caption, exact=True).click()
         artifact = download.value.path().read_bytes()
-        assert artifact.startswith(prefix)
+        if format == "svg":
+            assert ET.fromstring(artifact).tag == "{http://www.w3.org/2000/svg}svg"
+        else:
+            assert artifact.startswith(prefix)
         assert received.value.headers["x-figure-sha256"] == sha256(artifact).hexdigest()
         assert received.value.headers["x-figure-revision"] == "2"
     page.locator("#exports summary").click()

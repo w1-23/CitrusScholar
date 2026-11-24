@@ -1,6 +1,6 @@
 import { byId, element, renderInspector, renderTree } from './controls.js';
 import { CanvasView, imageAsset } from './canvas.js';
-import { initializeAssets, thumbnail } from './library.js';
+import { initializeAssets, initializeOpenDialog } from './library.js';
 
 const api = '/api/v2/figure-workbench';
 const state = { project: null, selected: null, expanded: new Set(), snapshots: [[]], cursor: 0,
@@ -285,115 +285,7 @@ async function save() {
   }
 }
 
-const library = { epoch: 0, offset: 0, candidate: null, pending: false };
 const dialog = byId('library');
-const libraryNotice = byId('libraryNotice');
-const confirmOpen = byId('confirmOpen');
-
-function libraryStatus(message, error = false) {
-  libraryNotice.textContent = message;
-  libraryNotice.classList.toggle('warning', error);
-}
-
-function chooseAsset(project) {
-  library.candidate = project;
-  confirmOpen.disabled = library.pending;
-  libraryStatus(changed() ? '打开成功后将放弃当前未保存的草稿。' : '确认打开所选图件。');
-}
-
-async function refreshLibrary(more = false) {
-  const epoch = library.epoch;
-  byId('moreFigures').hidden = true;
-  byId('retryLibrary').hidden = true;
-  libraryStatus('正在读取图件库…');
-  if (!more) {
-    library.offset = 0;
-    library.candidate = null;
-    confirmOpen.disabled = true;
-    byId('libraryList').replaceChildren();
-  }
-  try {
-    const response = await request(`${api}/projects?limit=24&offset=${library.offset}`);
-    const { projects, has_more: hasMore } = await response.json();
-    if (epoch !== library.epoch || !dialog.open) return;
-    for (const project of projects) {
-      const row = element('label');
-      const radio = element('input');
-      radio.type = 'radio';
-      radio.name = 'figure';
-      radio.value = project.figure_id;
-      radio.addEventListener('change', () => chooseAsset(project));
-      row.append(radio);
-      const preview = thumbnail(project, revisionUrl);
-      if (preview) row.append(preview);
-      row.append(element('span', project.title || '未命名图件'), element('small', `版本 ${project.render_version}`));
-      byId('libraryList').append(row);
-      const requested = starting.get('figure_id') || starting.get('project');
-      if (!library.candidate && requested === project.figure_id) {
-        radio.checked = true;
-        chooseAsset(project);
-      }
-    }
-    library.offset += projects.length;
-    byId('moreFigures').hidden = !hasMore;
-    if (!library.candidate) libraryStatus(library.offset ? '选择一张图件。' : '图件库中没有可打开的图件。');
-  } catch (error) {
-    if (epoch !== library.epoch || !dialog.open) return;
-    libraryStatus(error.message, true);
-    byId('retryLibrary').hidden = false;
-  }
-}
-
-async function openCandidate() {
-  if (!library.candidate || library.pending) return;
-  const { candidate, epoch } = library;
-  library.pending = true;
-  confirmOpen.disabled = true;
-  byId('libraryItems').disabled = true;
-  libraryStatus('正在打开所选图件…');
-  try {
-    const project = await (await request(revisionUrl(candidate))).json();
-    if (project.figure_id !== candidate.figure_id || project.render_version !== candidate.render_version) {
-      throw new Error('图件版本已更新，请重试加载图件库。');
-    }
-    const asset = await loadAsset(project);
-    if (epoch !== library.epoch || !dialog.open) { URL.revokeObjectURL(asset.url); return; }
-    activate(project, asset);
-    dialog.close();
-    if (matchMedia('(max-width: 920px)').matches) openDrawer('left', true);
-    byId('groupTree').querySelector('[tabindex="0"]')?.focus();
-  } catch (error) {
-    if (epoch !== library.epoch || !dialog.open) return;
-    libraryStatus(error.message, true);
-    byId('retryLibrary').hidden = error.status !== 409;
-  } finally {
-    if (epoch === library.epoch) {
-      library.pending = false;
-      confirmOpen.disabled = false;
-      byId('libraryItems').disabled = false;
-    }
-  }
-}
-
-function openLibrary(preset = null) {
-  if (state.saving || dialog.open) return;
-  library.epoch += 1;
-  library.pending = false;
-  byId('libraryItems').disabled = false;
-  const single = byId('selectedAsset');
-  single.hidden = !preset;
-  single.replaceChildren();
-  byId('libraryItems').hidden = !!preset;
-  byId('moreFigures').hidden = true;
-  byId('retryLibrary').hidden = true;
-  dialog.showModal();
-  if (!preset) { refreshLibrary(); return; }
-  const preview = thumbnail(preset, revisionUrl);
-  if (preview) single.append(preview);
-  single.append(element('strong', preset.title), element('span', `版本 ${preset.render_version}`, 'muted'));
-  chooseAsset(preset);
-  confirmOpen.focus();
-}
 
 for (const [button, side] of [['toggleGroups', 'left'], ['toggleInspector', 'right']]) {
   byId(button).addEventListener('click', () => openDrawer(side, byId(button).getAttribute('aria-expanded') !== 'true'));
@@ -405,17 +297,7 @@ for (const [id, offset] of [['undo', -1], ['redo', 1]]) {
     updateDraft();
   });
 }
-byId('openLibrary').addEventListener('click', () => openLibrary());
 byId('save').addEventListener('click', save);
-byId('moreFigures').addEventListener('click', () => refreshLibrary(true));
-byId('retryLibrary').addEventListener('click', () => {
-  byId('libraryItems').hidden = false;
-  byId('selectedAsset').hidden = true;
-  refreshLibrary();
-});
-confirmOpen.addEventListener('click', openCandidate);
-byId('cancelOpen').addEventListener('click', () => dialog.close());
-dialog.addEventListener('close', () => { library.epoch += 1; });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !dialog.open) {
     openDrawer('left', false);
@@ -432,5 +314,13 @@ window.addEventListener('beforeunload', (event) => {
 });
 renderToolbar();
 renderExports();
+const requested = starting.get('figure_id') || starting.get('project');
+const openLibrary = initializeOpenDialog({ request, api, revisionUrl, loadAsset, activate, changed, requested,
+  busy: () => state.saving,
+  onOpened: () => {
+    if (matchMedia('(max-width: 920px)').matches) openDrawer('left', true);
+    byId('groupTree').querySelector('[tabindex="0"]')?.focus();
+  },
+});
 const refreshAssets = initializeAssets({ request, api, revisionUrl, choose: openLibrary });
-if (starting.has('figure_id') || starting.has('project')) openLibrary();
+if (requested) openLibrary();

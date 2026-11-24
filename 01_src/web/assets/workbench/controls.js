@@ -13,7 +13,7 @@ const labels = {
   markerfacecolor: '标记填充', markeredgecolor: '标记边框颜色', markeredgewidth: '标记边框宽度',
   fontsize: '字号', fontfamily: '字体', fontweight: '字重', fontstyle: '字形', horizontalalignment: '对齐',
   loc: '图例位置', ncols: '图例列数', offset_px: '位置偏移（SVG 点）', alpha: '不透明度',
-  visible: '显示', frameon: '显示图例边框', transparent: '透明背景（SVG / PNG）', capsize: '误差棒端帽大小',
+  cmap: '热图色带', visible: '显示', frameon: '显示图例边框', transparent: '透明背景（SVG / PNG）', capsize: '误差棒端帽大小',
 };
 const propertyOrder = Object.keys(labels);
 const selections = {
@@ -112,7 +112,7 @@ function markerFill(parent, value, modes) {
   return { root: box, read: () => mode.value === 'custom' ? input.value : mode.value, events: [mode, input] };
 }
 
-function addControl(form, prop, value, snapshot) {
+function addControl(form, prop, value, snapshot, group) {
   const name = prop === 'color' && !['series', 'sync'].includes(form.dataset.kind) ? '颜色' : labels[prop];
   let input;
   if (prop === 'offset_px') {
@@ -123,7 +123,7 @@ function addControl(form, prop, value, snapshot) {
     form.append(box);
     return { events: [x, y], read: () => [x.valueAsNumber, y.valueAsNumber] };
   }
-  if (prop === 'markerfacecolor') return markerFill(form, value, snapshot.marker_fill_states);
+  if (prop === 'markerfacecolor') return markerFill(form, value, group.line_marker_fill ? ['auto', 'none', 'custom'] : snapshot.marker_fill_states);
   if (prop.endsWith('color')) {
     input = colorField(form, name, value);
   } else {
@@ -166,7 +166,7 @@ export function renderInspector(container, snapshot, group, values, update) {
   const apply = element('button', '应用到此组', 'primary');
   apply.disabled = true;
   for (const prop of properties) {
-    const control = addControl(form, prop, values[prop], snapshot);
+    const control = addControl(form, prop, values[prop], snapshot, group);
     controls.set(prop, control);
     for (const input of control.events) {
       for (const event of ['input', 'change']) input.addEventListener(event, () => {

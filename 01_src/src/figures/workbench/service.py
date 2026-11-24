@@ -1,6 +1,7 @@
 """Adapt authorized figure revisions into the workbench's group vocabulary."""
 from __future__ import annotations
 
+from citrus_figures.workbench_styles import COLORMAPS
 from src.figures import projects, store
 from src.figures.declarative_snapshot import SnapshotError, load_snapshot
 from src.figures.document import SCHEMA, _digest
@@ -45,7 +46,20 @@ def list_assets(owner, *, limit, offset, query="", kind="", access=""):
     return {"projects": result[:limit], "has_more": len(result) > limit}
 
 
-def _read_only(project, manifest, owner):
+def _document_matches(document, objects):
+    bindings = document.get("objects")
+    if not isinstance(bindings, list) or len(bindings) != len(objects):
+        return False
+    for index, (binding, row) in enumerate(zip(bindings, objects)):
+        if (not isinstance(binding, dict) or binding.get("manifest_ref") != f"/manifest_json/objects/{index}"
+                or binding.get("gid") != row.get("gid") or binding.get("role") != row.get("role")
+                or (binding.get("identity_scope") == "semantic"
+                    and binding.get("semantic_key") != row.get("semantic_key"))):
+            return False
+    return True
+
+
+def _read_only(project, manifest, owner, *, check_document=True):
     source = project.get("source_json")
     if project.get("source_kind") == "svg":
         return "此图件是静态 SVG，未登记系列和子图编辑信息。"
@@ -65,7 +79,8 @@ def _read_only(project, manifest, owner):
     document = project.get("document_json")
     if (not isinstance(document, dict) or document.get("schema") != SCHEMA
             or document.get("revision") != project["render_version"]
-            or document.get("document_id") != project["figure_id"] or not manifest.get("objects")):
+            or document.get("document_id") != project["figure_id"] or not manifest.get("objects")
+            or (check_document and not _document_matches(document, manifest["objects"]))):
         return "图件没有对应版本的已保存对象清单。"
     try:
         if _digest(source) != document.get("source_sha256"):
@@ -86,7 +101,7 @@ def _inventory(project, owner, *, check_preview=True):
         manifest = {"objects": []}
     # Reject a partially normalized inventory. A legacy invalid bounding box
     # can still be read through the sidebar with its geometry warning.
-    reason = _read_only(project, manifest, owner)
+    reason = _read_only(project, manifest, owner, check_document=check_preview)
     if not reason and (not isinstance(raw, dict) or not isinstance(raw.get("objects"), list)
                        or len(raw["objects"]) != len(manifest["objects"])):
         reason = "图件的已保存对象清单无法验证。"
@@ -107,7 +122,7 @@ def _present(project, manifest, inventory, *, formats):
             "render_version": project["render_version"], "read_only_reason": inventory.disabled,
             "groups": inventory.public(), "format_capabilities": formats,
             "hit_manifest": {"objects": manifest["objects"]}, "figure_size": manifest.get("figure_size_px"),
-            "options": {prop: manifest.get(key, []) for prop, key in _OPTIONS.items()},
+            "options": {**{prop: manifest.get(key, []) for prop, key in _OPTIONS.items()}, "cmap": list(COLORMAPS)},
             "marker_fill_states": (["auto", "none", "custom"] if project.get("source_kind") == "spec" else ["custom"])}
 
 

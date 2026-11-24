@@ -128,6 +128,8 @@ def test_policy_has_no_candidate_final_alias_and_keeps_host_projection():
     examples = prompt.split("<source_routing_examples>", 1)[1].split("</source_routing_examples>", 1)[0]
     assert examples.count("正确：") == examples.count("反例：") == 3
     assert all(example in examples for example in ("分别查看本地资料和公开网络", "只查本地资料", "画箱线图"))
+    assert "该来源最多发起一次检索调用" in prompt
+    assert "再查相同的本地语料" in examples
     assert "宿主会在终答前核对本轮两路覆盖" not in prompt
 
 

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import re
+from pathlib import Path
 import uuid
 
 from langchain_core.messages import ToolMessage
@@ -31,6 +32,7 @@ class HostTools:
     allowed_names: set[str] = field(default_factory=set)
     published_resolutions: dict[str, str] = field(default_factory=dict)
     pending_result_reads: dict[str, str] = field(default_factory=dict)
+    skill_release: Path | None = None
 
     def result_readbacks(self):
         """Collect the last committed page for each selection of a clipped result."""
@@ -280,7 +282,7 @@ class HostTools:
         try:
             from contextlib import nullcontext
             from .code_tools import CODE_TOOL_NAMES, EXECUTION_WAIT_TOOL_NAMES, code_execution_context
-            binding = (code_execution_context(identity, call['id'])
+            binding = (code_execution_context(identity, call['id'], skill_release=self.skill_release)
                        if call['name'] in CODE_TOOL_NAMES or call['name'] == 'audit_uploaded_data'
                        else nullcontext())
             retry_binding = nullcontext()

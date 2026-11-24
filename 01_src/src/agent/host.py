@@ -112,20 +112,11 @@ async def _run(state, identity, ledger):
             if not await asyncio.to_thread(bind_native_context_scope, identity, context_scope):
                 raise task_events.TaskConflict("recovery_identity_mismatch")
     summary_enabled = policy.allows("summarization")
-    installed_rows = None
-    skill_root = None
-    if native:
-        from .installed_skills import list_installed, model_directory, release_path
+    from .installed_skills import list_installed, model_directory, task_release
 
-        saved_release = state.get("native_skill_release", "") if resume else None
-        if saved_release is None:
-            configured = release_path()
-        else:
-            configured = Path(saved_release) if saved_release else None
-        release = configured.resolve(strict=True) if configured is not None else None
-        state["native_skill_release"] = str(release) if release is not None else ""
-        installed_rows = list_installed(release) if release is not None else []
-        skill_root = model_directory(release) if release is not None else None
+    release = task_release(state, resume=resume)
+    installed_rows = list_installed(release) if release is not None else []
+    skill_root = model_directory(release) if native and release is not None else None
     # A fresh composer request is a new script task, even when the session still
     # carries an older task's assets. Only a durable question child can inherit
     # its parent's scope; same-job recovery restores it from the checkpoint below.
@@ -154,7 +145,7 @@ async def _run(state, identity, ledger):
     register_workspace_tools(catalog)
     from .code_tools import register_code_tools, CODE_TOOL_NAMES
     register_code_tools(catalog)
-    host = HostTools(identity, state)
+    host = HostTools(identity, state, skill_release=release)
     host.assert_context()
     pool = ops._bind_request_candidate_pool(state) if policy.allows("local_rag") else None
     if not policy.allows("local_rag"):
@@ -192,7 +183,7 @@ async def _run(state, identity, ledger):
     refresh_allowed()
     from .skill_adapter import SkillSession, validate_scenario_selection, validate_selected_skills
     from .skill_tools import register_skill_reader, skill_execution_context
-    skills = None if native else SkillSession(identity, refresh_allowed, allow_archived=resume)
+    skills = None if native else SkillSession(identity, refresh_allowed, release=release, allow_archived=resume)
     if skills is not None:
         register_skill_reader(catalog)
     # Host readiness remains independent of method loading; new generic tools
@@ -230,7 +221,7 @@ async def _run(state, identity, ledger):
         else:
             human.content = str(human.content) + "\n当前主模型不支持图片输入；不可声称已看到原图。"
     prompt = await asyncio.to_thread(system_prompt, host.allowed_names, native_skills=True) if native else (
-        await asyncio.to_thread(system_prompt, host.allowed_names))
+        await asyncio.to_thread(system_prompt, host.allowed_names, skill_rows=installed_rows))
     if "local_hybrid_search" in host.allowed_names:
         try:
             from src.retrieval.corpus_registry import load_corpus_registry
@@ -291,12 +282,6 @@ async def _run(state, identity, ledger):
     from .deep_agent_runtime import EXECUTOR_ID, NATIVE_EXECUTOR_ID, NATIVE_READ_TOOLS
 
     if not resume or not state.get("capability_runtime"):
-        if native:
-            skill_rows = (installed_rows if installed_rows is not None else
-                          [row for row in selected_metadata])
-        else:
-            from .skill_adapter import scenario_catalog
-            skill_rows = await asyncio.to_thread(scenario_catalog)
         state["capability_runtime"] = {
             "schema": 1,
             "executor": NATIVE_EXECUTOR_ID if native else EXECUTOR_ID,
@@ -304,7 +289,9 @@ async def _run(state, identity, ledger):
             "search_provider": settings.RESOLVED_WEB_SEARCH_PROVIDER,
             "summary_enabled": summary_enabled,
             "skills": [{key: row[key] for key in ("id", "version", "sha256")}
-                       for row in skill_rows if policy.allows("skill:" + row["id"])],
+                       for row in installed_rows if policy.allows("skill:" + row["id"])],
+            "skill_release_inventory_sha256": state["skill_release_inventory_sha256"],
+            "source_commit": os.getenv("CITRUS_SOURCE_COMMIT", ""),
             "selected_skills": selected_metadata,
             "attachments": [{"file_id": ref["file_id"], "sha256": ref["sha256"]}
                             for ref in (state.get("attachment_refs") or [])

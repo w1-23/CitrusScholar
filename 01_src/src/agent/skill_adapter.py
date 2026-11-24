@@ -111,12 +111,13 @@ def validate_selected_skills(value, available_tools: set[str] | None = None) -> 
     return result
 
 
-def directory_prompt(available_tools: set[str]) -> str:
+def directory_prompt(available_tools: set[str], *, rows=None) -> str:
     """Use the public upstream directory formatter with authoritative metadata."""
     from deepagents.backends import StateBackend
     from deepagents.middleware.skills import SkillsMiddleware
     from langchain.agents.middleware import ModelRequest
-    rows = scenario_catalog()
+    from src.core.capability_policy import allows
+    rows = scenario_catalog() if rows is None else [row for row in rows if allows("skill:" + row["id"])]
     if not rows:
         return "No verified skills are available; generic authorized tools remain usable."
     metadata = [{"name": row["id"], "description": row["description"] + " " + row.get("applicability", ""),
@@ -140,12 +141,15 @@ def _encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+_USE_PROCESS_RELEASE = object()
+
+
 class SkillSession:
     """Host-owned receipts persisted in the existing protected host checkpoint."""
-    def __init__(self, identity, available, *, release=None, allow_archived=False):
+    def __init__(self, identity, available, *, release=_USE_PROCESS_RELEASE, allow_archived=False):
         from .installed_skills import release_path
 
-        self.release = release if release is not None else release_path()
+        self.release = release_path() if release is _USE_PROCESS_RELEASE else release
         self.allow_archived = allow_archived
         self.identity = identity
         self.available = available

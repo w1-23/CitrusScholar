@@ -20,6 +20,31 @@ def release_path() -> Path | None:
     return path
 
 
+def task_release(state: dict, *, resume: bool) -> Path | None:
+    """Pin one server-side release for method discovery and Code access."""
+    saved = state.get("native_skill_release") if resume else None
+    configured = Path(saved) if saved else None
+    if not resume:
+        configured = release_path()
+    if configured is None:
+        state["native_skill_release"] = ""
+        state["skill_release_inventory_sha256"] = ""
+        return None
+    if not configured.is_absolute():
+        raise ValueError("skill_release_path_must_be_absolute")
+    root = configured.resolve(strict=True)
+    model_directory(root)
+    from .research_skill_catalog import _bytes, _path, _MAX_RESOURCE_BYTES
+
+    digest = hashlib.sha256(_bytes(_path(root, "inventory.json"), _MAX_RESOURCE_BYTES)).hexdigest()
+    expected = state.get("skill_release_inventory_sha256") if resume else None
+    if expected and expected != digest:
+        raise ValueError("skill_release_changed_during_recovery")
+    state["native_skill_release"] = str(root)
+    state["skill_release_inventory_sha256"] = digest
+    return root
+
+
 def model_directory(release: Path) -> Path:
     directory = release / "skills"
     if not directory.is_dir() or directory.is_symlink():
@@ -122,12 +147,12 @@ def _script_approvals(release: Path):
     return approved, inventory
 
 
-def approved_script_entries() -> list[dict]:
-    release = release_path()
+def approved_script_entries(release: Path | None) -> list[dict]:
     if release is None:
         return []
     approved, _inventory = _script_approvals(release)
-    enabled = {row["id"]: row["version"] for row in active_skills()}
+    from src.core.capability_policy import allows
+    enabled = {row["id"]: row["version"] for row in list_installed(release) if allows("skill:" + row["id"])}
     entries = []
     for key in sorted(approved):
         prefix, skill, resource = key.split("/", 2)
@@ -136,11 +161,10 @@ def approved_script_entries() -> list[dict]:
     return entries
 
 
-def read_approved_script(skill_id: str, version: str, resource: str) -> tuple[bytes, str]:
+def read_approved_script(release: Path | None, skill_id: str, version: str, resource: str) -> tuple[bytes, str]:
     from src.core.capability_policy import allows
     from .research_skill_catalog import _bytes, _path
 
-    release = release_path()
     if (release is None or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", skill_id)
             or not allows("skill:" + skill_id) or not resource.endswith(".py")):
         raise ValueError("skill_script_not_approved")

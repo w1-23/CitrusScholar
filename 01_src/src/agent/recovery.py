@@ -28,7 +28,7 @@ _REQUEST_FIELDS = frozenset({
     "long_term_memory", "resident_cards", "user_preferences", "account_files",
     "history_evidence_block", "history_load_status", "history_load_reason", "history_load_error", "format_hint",
     "candidate_pool", "candidate_pool_notice", "request_plan", "task_contract",
-    "native_skill_release", "capability_snapshot", "capability_runtime",
+    "native_skill_release", "skill_release_inventory_sha256", "capability_snapshot", "capability_runtime",
 })
 
 

@@ -58,14 +58,14 @@ def _workspace_preflight_reason(exc):
 
 
 @contextmanager
-def code_execution_context(identity, tool_call_id):
+def code_execution_context(identity, tool_call_id, *, skill_release=None):
     """Host-only binding, propagated through registry's copied ContextVars."""
     if type(identity) is not ExecutionIdentity:
         raise ValueError("execution_identity_required")
     if (not isinstance(tool_call_id, str) or not 1 <= len(tool_call_id) <= 256
             or tool_call_id != tool_call_id.strip() or any(ord(c) < 32 for c in tool_call_id)):
         raise ValueError("execution_native_tool_call_id_required")
-    token = _context.set((identity, tool_call_id))
+    token = _context.set((identity, tool_call_id, skill_release))
     try:
         yield
     finally:
@@ -248,7 +248,7 @@ def _identity():
     binding = _context.get()
     if binding is None:
         raise PermissionError("code_execution_context_required")
-    identity, call_id = binding
+    identity, call_id, _ = binding
     job = jobs.get_job(tracing.get_job_id())
     if (not job or tracing.get_job_id() != identity.run_id
             or tracing.get_user_id() != identity.owner_user_id
@@ -368,6 +368,7 @@ def _dispatch(operation, **args):
         return result
     try:
         identity, call_id = _identity()  # Fresh tracing/job check before any service/store.
+        skill_release = _context.get()[2]
         with account_lease(identity.owner_user_id):
             service = _service(identity)
             workspace = service.workspace
@@ -393,7 +394,7 @@ def _dispatch(operation, **args):
                 page = workspace.list_files(current["workspace_id"], **args)
                 from .installed_skills import approved_script_entries
                 try:
-                    script_entries = approved_script_entries()
+                    script_entries = approved_script_entries(skill_release)
                 except (OSError, ValueError):
                     script_entries = []
                 fields = ("path", "version", "file_id", "sha256", "size_bytes")
@@ -416,7 +417,7 @@ def _dispatch(operation, **args):
                 if operation == "bind_skill_script":
                     from .installed_skills import read_approved_script
                     try:
-                        content, digest = read_approved_script(args["skill_id"], args["version"], args["resource"])
+                        content, digest = read_approved_script(skill_release, args["skill_id"], args["version"], args["resource"])
                     except (OSError, ValueError):
                         return reject("code_skill_script_unavailable")
                     args["path"] = "/workspace/skill-" + digest[:24] + ".py"

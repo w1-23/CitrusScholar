@@ -53,11 +53,12 @@ async def workbench_page(request: Request):
 async def list_figures(request: Request, limit: int = Query(default=24, ge=1, le=100),
                        offset: int = Query(default=0, ge=0), query: str = Query(default="", max_length=120),
                        kind: Literal["", "spec", "script", "svg"] = "",
+                       chart: Literal["", "line", "bar", "scatter", "errorbar", "histogram", "boxplot", "multipanel"] = "",
                        access: Literal["", "editable", "read_only"] = ""):
     owner = _owner(request)
     with _read_scope(owner) as lease:
         result = await run_account_thread(lease, service.list_assets, owner, limit=limit, offset=offset,
-                                          query=query, kind=kind, access=access)
+                                          query=query, kind=kind, chart=chart, access=access)
     return JSONResponse(result, headers=_HEADERS)
 
 
@@ -114,6 +115,8 @@ async def preview_image(figure_id: str, fmt: Literal["svg", "png"], request: Req
     return await _artifact(figure_id, fmt, request, revision, inline=True)
 
 
-@router.api_route("/projects/{figure_id}/export/{fmt}", methods=["GET", "HEAD", "POST"])
+@router.get("/projects/{figure_id}/export/{fmt}", operation_id="download_workbench_figure")
+@router.head("/projects/{figure_id}/export/{fmt}", include_in_schema=False)
+@router.post("/projects/{figure_id}/export/{fmt}", operation_id="generate_workbench_figure")
 async def export_figure(figure_id: str, fmt: Format, request: Request, revision: int = Query(ge=0)):
     return await _artifact(figure_id, fmt, request, revision, generate=request.method == "POST")

@@ -13,7 +13,7 @@ _OPTIONS = {"fontfamily": "font_families", "fontweight": "font_weights", "fontst
             "marker": "marker_options", "linestyle": "linestyle_options"}
 
 
-def list_assets(owner, *, limit, offset, query="", kind="", access=""):
+def list_assets(owner, *, limit, offset, query="", kind="", chart="", access=""):
     result = []
     consumed = 0
     source_offset = 0
@@ -28,6 +28,11 @@ def list_assets(owner, *, limit, offset, query="", kind="", access=""):
             title = str(row.get("title") or "未命名图件")
             if (kind and source_kind != kind) or (needle and needle not in title.casefold()):
                 continue
+            source = row.get("source_json")
+            spec = source.get("spec") if source_kind == "spec" and isinstance(source, dict) else None
+            chart_type = ("multipanel" if spec.get("panels") else spec.get("chart")) if isinstance(spec, dict) else None
+            if chart and chart != chart_type:
+                continue
             editable = None
             if access:
                 _, inventory = _inventory(row, owner)
@@ -39,7 +44,7 @@ def list_assets(owner, *, limit, offset, query="", kind="", access=""):
                 continue
             exports = row.get("exports_json")
             result.append({"figure_id": row["figure_id"], "title": title, "render_version": row["render_version"],
-                           "source_kind": source_kind, "editable": editable,
+                           "source_kind": source_kind, "chart_type": chart_type, "editable": editable,
                            "exports": {fmt: True for fmt in ("svg", "png") if isinstance(exports, dict) and exports.get(fmt)}})
             if len(result) == limit + 1:
                 break

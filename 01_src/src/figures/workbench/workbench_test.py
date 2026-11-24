@@ -140,6 +140,8 @@ def test_library_ownership_read_only_and_revision_matched_bytes(library, monkeyp
     assert {row["figure_id"] for row in client.get(prefix).json()["projects"]} == {figure_id, static}
     assert {row["figure_id"] for row in client.get(prefix, params={"query": "OVERLAP", "kind": "spec", "access": "editable"}).json()["projects"]} == {figure_id}
     assert {row["figure_id"] for row in client.get(prefix, params={"kind": "svg", "access": "read_only"}).json()["projects"]} == {static}
+    assert [row["figure_id"] for row in client.get(prefix, params={"chart": "line"}).json()["projects"]] == [figure_id]
+    assert client.get(prefix, params={"chart": "scatter"}).json()["projects"] == []
     for inaccessible in [foreign, table["file_id"]]:
         assert client.get(f"{prefix}/{inaccessible}?revision=1").status_code == 404
         assert client.get(f"{prefix}/{inaccessible}/preview/svg?revision=1").status_code == 404
@@ -247,6 +249,20 @@ def test_same_names_in_distinct_panels_and_marker_fill_states(library):
         assert groups[left["id"]]["values"]["markerfacecolor"] == fill
         assert groups[right["id"]]["values"]["markerfacecolor"] == "auto"
         assert groups[right["id"]]["values"]["color"] == base
+
+
+def test_shared_legend_sync_is_server_declared_and_group_atomic(library):
+    fid = library.spec({"panels": [leaf(panel="p_left"), leaf(panel="p_right")], "shared_legend": True})
+    opened = service.detail(fid, OWNER, 1)
+    linked = [row for row in opened["groups"] if row["kind"] == "series" and row["label"] == "WL"]
+    assert len(linked) == 2 and all(not row["properties"] for row in linked)
+    sync = group(opened, "同步共享图例 · WL", "sync")
+    with pytest.raises(projects.ProjectError) as error:
+        service.edit(fid, OWNER, 1, [command(linked[0], "color", "#7a3c96")])
+    assert error.value.code == "group_property_unavailable"
+    result = service.edit(fid, OWNER, 1, [command(sync, "color", "#7a3c96")])
+    joined = [row for row in result["hit_manifest"]["objects"] if row.get("role") == "series" and row.get("label") == "WL"]
+    assert len(joined) == 2 and all(row["color"] == "#7a3c96" for row in joined)
 
 
 def test_export_remains_pinned_when_current_revision_changes(library, monkeypatch):

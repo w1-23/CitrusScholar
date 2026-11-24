@@ -20,8 +20,11 @@ export function initializeAssets({ request, api, revisionUrl, choose }) {
     more.hidden = retry.hidden = true;
     message.textContent = '正在读取图件…';
     if (!append) { list.replaceChildren(); offset = 0; }
+    const type = byId('assetKind').value;
     const url = new URLSearchParams({ limit: 12, offset, query: byId('assetQuery').value,
-      kind: byId('assetKind').value, access: byId('assetAccess').value });
+      access: byId('assetAccess').value });
+    if (type.startsWith('chart:')) url.set('chart', type.slice(6));
+    else if (type) url.set('kind', type);
     try {
       const { projects, has_more: hasMore } = await (await request(`${api}/projects?${url}`)).json();
       if (current !== sequence) return;

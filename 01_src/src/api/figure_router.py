@@ -25,6 +25,7 @@ import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -200,7 +201,7 @@ async def serve_figure_page(request: Request):
 
     user = user_for_token(request.cookies.get("citrus_auth", ""))
     if not user:
-        return RedirectResponse(url="/?next=%2Ffigures", status_code=303)
+        return RedirectResponse(url="/?next=" + quote(request.url.path, safe=""), status_code=303)
     html_path = WEB_DIR / "figures.html"
     if not html_path.exists():
         return HTMLResponse(

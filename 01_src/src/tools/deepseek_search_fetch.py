@@ -968,28 +968,21 @@ def _local_hybrid_search_impl(query: str, corpus_types: list[str], limit: int = 
     if not _enabled("local_rag"):
         message, artifact = _disabled("local_rag", "main_results")
         return message, {**artifact, "local_status": "disabled"}
-    from citrus_corpus.contract import ISOLATED
     from src.corpus_integration.read_access import isolated_search
+    from src.corpus_integration.settings import isolated_enabled
     from src.shared_corpus.runtime import FAMILY_ID, current_runtime, retrieval_reader
     from src.shared_corpus.activity import MaintenanceBusy
     try:
         with retrieval_reader():
-            requested = [str(value or "").strip().casefold() for value in (corpus_types or [])]
-            if ISOLATED.family_id in requested:
-                base_families = [family for family in requested if family not in {FAMILY_ID, ISOLATED.family_id}]
-                if l1_categories and base_families:
-                    return _base_hybrid_search(query, base_families, limit, l1_categories,
-                                               render=render, progress=progress)
-                return _search_base_and_shared(isolated_search(), query, [*base_families, ISOLATED.family_id],
-                                               limit, l1_categories, family_id=ISOLATED.family_id,
-                                               render=render, progress=progress)
+            requested = list(dict.fromkeys(str(value or "").strip().casefold() for value in (corpus_types or [])))
             if FAMILY_ID not in requested:
                 return _base_hybrid_search(query, corpus_types, limit, l1_categories,
                                            render=render, progress=progress)
             from src.core.tracing import get_user_id
-            runtime = current_runtime()
-            if runtime is None or not get_user_id():
-                return "[SHARED_CORPUS_UNAVAILABLE]", {"main_results": [], "local_status": "unavailable"}
+            if isolated_enabled():
+                runtime = isolated_search()
+            else:
+                runtime = current_runtime() if get_user_id() else None
             return _search_base_and_shared(runtime, query, requested, limit, l1_categories,
                                            family_id=FAMILY_ID, render=render, progress=progress)
     except MaintenanceBusy:
@@ -1004,7 +997,7 @@ def _search_base_and_shared(runtime, query, families, limit, topics, *, family_i
     from src.shared_corpus.activity import MaintenanceBusy
 
     base_families = [family for family in families if family != family_id]
-    if topics:
+    if topics and (not base_families or (runtime is not None and not runtime.unavailable and runtime.generation)):
         return "[INVALID_TOPIC] Choose separate searches when applying base-corpus topics.", {
             "main_results": [], "local_status": "invalid_topic"}
     limit = max(1, min(int(limit), 12))

@@ -6,10 +6,11 @@ from dataclasses import dataclass
 class CorpusSpec:
     corpus_id: str
     family_id: str
+    require_encoder_fingerprint: bool = False
 
 
 LEGACY = CorpusSpec("shared_agent_literature", "agent_literature")
-ISOLATED = CorpusSpec("isolated_literature", "isolated_literature")
+ISOLATED = CorpusSpec(LEGACY.corpus_id, LEGACY.family_id, require_encoder_fingerprint=True)
 
 
 @dataclass(frozen=True)

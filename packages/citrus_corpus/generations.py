@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .contract import ISOLATED, LEGACY, CorpusSpec, RetrievalParameters
+from .contract import LEGACY, CorpusSpec, RetrievalParameters
 from .search import (
     BUILDER_VERSION,
     CHUNKS_FILENAME,
@@ -236,7 +236,7 @@ def _require_manifest(manifest: dict[str, Any],
     if manifest.get("query_prefix") != QUERY_PREFIX:
         raise GenerationContractError("manifest_query_prefix_mismatch")
     _require_string(manifest.get("embedding_model"), "embedding_model")
-    if spec == ISOLATED:
+    if spec.require_encoder_fingerprint:
         _require_string(manifest.get("encoder_fingerprint"), "encoder_fingerprint")
     dimension = _require_int(manifest.get("dimension"), "dimension", 1)
     if dimension != EMBEDDING_DIM:
@@ -541,7 +541,7 @@ def load_generation(root: Path, generation: str, *, embedder: Any,
     chunks_by_id = {str(row["chunk_id"]): row for row in rows}
     db, table = _verify_lance(generation_dir, manifest, chunks_by_id)
     _verify_models(embedder, reranker, manifest)
-    if spec == ISOLATED and encoder_fingerprint(embedder) != manifest["encoder_fingerprint"]:
+    if spec.require_encoder_fingerprint and encoder_fingerprint(embedder) != manifest["encoder_fingerprint"]:
         raise GenerationContractError("encoder_fingerprint_mismatch")
 
     root_path = _resolve_root(root)

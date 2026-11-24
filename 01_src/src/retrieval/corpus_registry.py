@@ -12,6 +12,8 @@ from typing import Any, Iterator
 
 from src.config import settings
 
+from citrus_corpus.contract import LEGACY
+
 
 class CorpusMetadataError(ValueError):
     """Raised when a corpus record cannot be safely assigned and indexed."""
@@ -29,6 +31,9 @@ def iter_lance_rows(table, columns: list[str], batch_size: int = 8192) -> Iterat
     for batch in scanner.to_batches():
         yield from batch.to_pylist()
 
+
+_SHARED_SEARCH_FAMILY = {"display_name": "共享文献库",
+                         "description": "检索已核准共享的文献及可验证的引用片段。"}
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 _DEFAULT_PATH = Path(__file__).with_name("corpus_registry.default.json")
@@ -65,25 +70,32 @@ class CorpusRegistry:
         """
         return frozenset(set(self.corpora) | set(self.corpus_access))
 
+    @property
+    def search_family_ids(self) -> set[str]:
+        """Base index families plus the separate, enabled shared search family."""
+        from src.corpus_integration.read_access import shared_search_available
+
+        families = self.family_ids
+        if shared_search_available():
+            families.add(LEGACY.family_id)
+        return families
+
     def family(self, family_id: str) -> dict[str, Any] | None:
-        return self.families.get(str(family_id or "").strip().casefold())
+        key = str(family_id or "").strip().casefold()
+        if key == LEGACY.family_id and key not in self.families:
+            return dict(_SHARED_SEARCH_FAMILY)
+        return self.families.get(key)
 
     def display_name(self, family_id: str) -> str:
         item = self.family(family_id) or {}
         return str(item.get("display_name") or family_id)
 
     def describe_families(self, active: set[str] | None = None) -> str:
-        from citrus_corpus.contract import ISOLATED
-        from src.corpus_integration.settings import reader_root
-
-        ids = sorted((active if active is not None else self.family_ids) & self.family_ids)
-        if not ids:
-            return "当前没有可检索的本地语料类别。"
-        lines = [f"- `{family_id}`：{self.display_name(family_id)}。{self.families[family_id].get('description', '')}"
+        available = self.search_family_ids
+        ids = sorted(available if active is None else available & active)
+        lines = [f"- `{family_id}`：{self.display_name(family_id)}。{(self.family(family_id) or {}).get('description', '')}"
                  for family_id in ids]
-        if reader_root() and (active is None or ISOLATED.family_id in active):
-            lines.append(f"- `{ISOLATED.family_id}`：独立文献库。检索已核准共享的文献及可验证的引用片段。")
-        return "\n".join(lines)
+        return "\n".join(lines) or "当前没有可检索的本地语料类别。"
 
     def matching_families(self, query: object) -> set[str]:
         text = str(query or "").casefold()

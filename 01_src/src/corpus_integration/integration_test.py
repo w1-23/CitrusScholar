@@ -96,14 +96,19 @@ def test_disabled_sixth_corpus_preserves_base_search(monkeypatch):
     calls = []
 
     def base(query, families, limit, topics, **kwargs):
-        calls.append(families)
+        calls.append((families, topics))
         return "", {"query": query, "main_results": [{"text": "base"}], "local_status": "hit"}
 
     monkeypatch.setattr(fetch, "_base_hybrid_search", base)
-    _, result = fetch._local_hybrid_search_impl("test", ["literature", "isolated_literature"],
+    _, result = fetch._local_hybrid_search_impl("test", ["literature", "agent_literature"],
                                                render=False, progress=False)
-    assert calls == [["literature"]] and result["main_results"] == [{"text": "base"}]
+    assert calls == [(["literature"], None)] and result["main_results"] == [{"text": "base"}]
     assert result["shared_search_status"] == "unavailable"
+    _, result = fetch._local_hybrid_search_impl("test", ["literature", "agent_literature"], 6,
+                                               ["agriculture/ecology"], render=False, progress=False)
+    assert calls[-1] == (["literature"], ["agriculture/ecology"])
+    assert result["main_results"] == [{"text": "base"}]
+
 
 
 def test_admin_explicit_intake_returns_durable_receipt(tmp_path, monkeypatch):
@@ -137,3 +142,96 @@ def test_admin_explicit_intake_returns_durable_receipt(tmp_path, monkeypatch):
         assert client.get(path + "/" + job_id, headers=admin).json()["state"] == "queued"
         assert Intake(store).process_one()["error"] == "source_missing"
         assert client.get(path + "/" + job_id, headers=admin).json()["state"] == "failed"
+
+
+def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    from citrus_corpus.models import FusedRank
+    from citrus_corpus.publication import Publisher
+    from src import auth
+    from src.core import capability_policy, tracing
+    from src.corpus_integration import read_access
+    from src.graph.tool_availability import runtime_env
+    from src.retrieval.corpus_registry import load_corpus_registry
+    from src.shared_corpus import references, runtime, tool_adapter
+    from src.tools import deepseek_search_fetch as fetch
+
+    class Model:
+        model_name = "fixture-static-vectors"
+        dim = 1024
+        fingerprint = sha256(b"fixture-static-vectors/1").hexdigest()
+
+        def embed_query(self, query):
+            return [1.0] + [0.0] * 1023
+
+        def embed_passages(self, texts):
+            return [self.embed_query(text) for text in texts]
+
+    store = Store.initialize(tmp_path / "isolated")
+    intake = Intake(store)
+    raw = b"# Methods\n\nCitrus soil organic matter was recorded."
+    (store.inbox / "paper.md").write_bytes(raw)
+    intake.submit_local("paper.md", expected_sha256=sha256(raw).hexdigest(), actor="fixture")
+    prepared = intake.process_one()
+    intake.catalog.decide(prepared["document_id"], prepared["version_id"], decision="granted", actor="operator",
+                          reason="Fixture license reviewed", evidence="fixture:rights")
+    model = Model()
+    Publisher(store, embedder=model, reranker=FusedRank()).publish()
+    monkeypatch.setenv("CITRUS_CORPUS_MODE", "isolated")
+    monkeypatch.setenv("CITRUS_CORPUS_READ", "1")
+    monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_ROOT", str(store.root))
+    monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_EMBEDDING_CACHE", str(tmp_path))
+    monkeypatch.setattr(runtime, "_runtime", None)
+    monkeypatch.setattr(tracing, "get_user_id", lambda: 7)
+    monkeypatch.setattr(auth, "user_by_id", lambda owner: {"user_id": owner, "active": True,
+                        "approval_status": "approved", "role": "user"})
+    monkeypatch.setattr(capability_policy, "allows", lambda capability: capability == "local_rag")
+    monkeypatch.setattr(read_access, "_embedder", lambda cache: model)
+    monkeypatch.setattr(fetch, "_enabled", capability_policy.allows)
+    env = runtime_env(script_sandbox=False)
+    assert env.has("shared_corpus") and "prepare_document" in env.denied
+    registry = load_corpus_registry()
+    assert "`agent_literature`" in registry.describe_families()
+    assert "agent_literature" in registry.search_family_ids
+    assert "agent_literature" not in registry.family_ids
+    assert len(registry.registered_corpus_ids) == 5
+
+    _, output = fetch._local_hybrid_search_impl("citrus soil", ["agent_literature"], render=False, progress=False)
+    row = output["shared_results"][0]
+    direct = json.loads(tool_adapter.search_agent_corpus.invoke({"query": "citrus soil"}))
+    assert direct["results"][0]["source_family"] == "agent_literature"
+    assert direct["_tool_outcome"]["coverage"].startswith("shared_agent_literature:")
+    ref = references.read_reference(row)
+    assert ref["source_family"] == "agent_literature" and ref["chunk_id"] == row["chunk_id"]
+    assert read_access.read_reference_page(ref)["markdown"] == row["excerpt"]
+    assert references.read_reference({"read_ref": {**ref, "chunk_id": "invalid"}}) is None
+
+    old = {key: value for key, value in ref.items() if key not in ("chunk_id", "source_family")}
+    assert references.read_reference({"read_ref": old}) == old
+    history = []
+
+    class HistoricalReader:
+        def reference_visible(self, reference):
+            history.append(reference)
+            return True
+
+    monkeypatch.setattr(read_access, "legacy_reader", HistoricalReader)
+    assert read_access.reference_visible(old) and history == [old]
+    monkeypatch.delenv("CITRUS_CORPUS_READ")
+    assert not read_access.reference_visible(ref)
+    assert read_access.reference_visible(old)
+
+    monkeypatch.setenv("CITRUS_CORPUS_MODE", "legacy")
+
+    class LegacyRuntime:
+        unavailable = False
+        generation = "legacy_generation"
+
+        def search(self, query, *, limit):
+            return [{**row, "read_ref": old, "index_generation": self.generation}]
+
+    monkeypatch.setattr(runtime, "_runtime", LegacyRuntime())
+    monkeypatch.setattr(runtime, "retrieval_reader", nullcontext)
+    _, legacy = fetch._local_hybrid_search_impl("citrus soil", ["agent_literature"], render=False, progress=False)
+    assert legacy["shared_generation"] == "legacy_generation"

@@ -3,9 +3,14 @@ from functools import lru_cache
 import os
 import sqlite3
 
-from citrus_corpus.contract import ISOLATED
+from .settings import isolated_enabled, isolated_search_configured, legacy_enabled, reader_root
 
-from .settings import legacy_enabled, reader_root
+
+def shared_search_available():
+    if isolated_enabled():
+        return isolated_search_configured()
+    from src.shared_corpus.runtime import current_runtime
+    return current_runtime() is not None
 
 
 @lru_cache(maxsize=2)
@@ -47,7 +52,7 @@ def isolated_search():
 
     root, cache = reader_root(), os.getenv("CITRUS_ISOLATED_CORPUS_EMBEDDING_CACHE")
     owner = get_user_id()
-    if not root or not cache or not owner:
+    if not isolated_enabled() or not root or not cache or not owner:
         return None
     user = user_by_id(int(owner)) or {}
     if not user.get("active") or user.get("approval_status") != "approved":
@@ -71,7 +76,7 @@ def read_reference_page(ref, *, offset=0, length=6000):
         raise LookupError("shared_document_unavailable")
     start = ref["start"] + offset
     length = min(length, ref["end"] - start)
-    if ref.get("source_family") == ISOLATED.family_id:
+    if "chunk_id" in ref:
         from citrus_corpus.reader import Reader
         from citrus_corpus.store import Store
         from src.core.capability_policy import allows
@@ -102,7 +107,7 @@ def read_reference_page(ref, *, offset=0, length=6000):
 
 
 def reference_visible(ref):
-    if ref.get("source_family") != ISOLATED.family_id:
+    if "chunk_id" not in ref:
         runtime = legacy_reader()
         if runtime is None:
             return False

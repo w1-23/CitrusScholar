@@ -54,6 +54,19 @@ def test_attachment_plot_needs_a_downloadable_svg():
     assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
 
 
+@pytest.mark.parametrize("query", ["画图", "好，帮我画个图", "请继续出图"])
+def test_short_drawing_requests_need_a_current_turn_figure(query):
+    requirements = contract_for_turn(query, has_tables=False).deliverables
+    assert [item["formats"] for item in requirements] == [["svg"]]
+    goals, gaps = artifact_goal_evidence(requirements, [], set())
+    assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
+
+
+@pytest.mark.parametrize("query", ["不要画图", "请解释如何画图", "出图方法是什么"])
+def test_short_drawing_mentions_do_not_require_a_figure(query):
+    assert not contract_for_turn(query, has_tables=False).deliverables
+
+
 def test_verified_workbook_can_be_delivered_with_partial_audit_coverage():
     requirements = contract_for_turn("审查 Sheet1", has_tables=True).deliverables
     link = "/api/v2/session/fixture-session/artifacts/fixture"
@@ -105,6 +118,13 @@ def test_failed_renderer_and_rejected_repair_can_be_replaced_by_same_goal_svg():
         "format_matches": True}]
     assert _same_repair_target(rejected, corrected, records=[failed, success])
     assert effective_tool_records([failed, success]) == [success]
+    direct_repair = corrected | {"args": {"repair_from_run_id": "old-run"}}
+    assert _same_repair_target(rejected, direct_repair, records=[failed, success])
+    assert not _same_repair_target(rejected, direct_repair,
+                                   records=[failed, success | {"artifact_validations": []}])
+    non_figure = success["artifact_validations"][0] | {"filename": "summary.csv", "mime": "text/csv"}
+    assert not _same_repair_target(rejected, direct_repair,
+                                   records=[failed, success | {"artifact_validations": [non_figure]}])
     mismatched = receipt("finished", "complete", "new-run", "b" * 64) | {
         "artifact_validations": success["artifact_validations"]}
     assert not _same_repair_target(rejected, corrected, records=[failed, mismatched])

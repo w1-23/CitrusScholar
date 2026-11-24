@@ -520,6 +520,16 @@ body .session-files-panel .session-file-act {
 /* ===== 数据审查：问题清单跳转定位 + 表头失配告警（2026-10-31） ===== */
 .sf-issue-row { cursor: pointer; }
 .sf-issue-row:hover td { background: rgba(249, 115, 22, 0.10); }
+.sf-audit-jump {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  cursor: pointer;
+}
 .sf-cell-focus {
   outline: 3px solid #f97316;
   outline-offset: -2px;

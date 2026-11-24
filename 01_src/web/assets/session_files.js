@@ -1086,6 +1086,22 @@
         });
       }
 
+      function auditCellTarget(cell) {
+        var link = cell && cell.l && cell.l.Target;
+        if (typeof link !== 'string') return null;
+        var match = /^#(?:'((?:[^']|'')+)'|([^!'\[\]]+))!\$?([A-Z]{1,3})\$?([1-9]\d{0,6})$/i.exec(link);
+        if (!match) return null;
+        var sheet = match[1] ? match[1].replace(/''/g, "'") : match[2];
+        if (sheets.indexOf(sheet) < 0 || !wb.Sheets[sheet]['!ref']) return null;
+        var ref = match[3].toUpperCase() + match[4];
+        var coord = window.XLSX.utils.decode_cell(ref);
+        var range = window.XLSX.utils.decode_range(wb.Sheets[sheet]['!ref']);
+        var visibleRows = coord.r - range.s.r + 1;
+        if (visibleRows < 1 || visibleRows > TABLE_MAX_RENDERED_ROWS || coord.r > range.e.r ||
+            coord.c < range.s.c || coord.c > range.e.c) return null;
+        return { sheet: sheet, ref: ref, visibleRows: visibleRows };
+      }
+
       function applyPendingFocus(body) {
         if (!pendingFocus) return;
         var target = null;
@@ -1133,6 +1149,7 @@
             }
           }
         });
+        var jumps = [];
         var html = '<table class="sf-table sf-table-styled">';
         for (var r = range.s.r; r < range.s.r + visible; r++) {
           html += '<tr>';
@@ -1162,7 +1179,13 @@
             }
             if (style) attrs += ' style="' + style + '"';
             var tag = (r === range.s.r) ? 'th' : 'td';
-            html += '<' + tag + ' class="' + cls + '"' + attrs + '>' + esc(text) +
+            var cellText = esc(text);
+            var jump = name === '审查结果' && c === range.s.c ? auditCellTarget(cell) : null;
+            if (jump) {
+              cellText = '<button type="button" class="sf-audit-jump" data-jump-index="' +
+                         jumps.push(jump) + '">' + cellText + '</button>';
+            }
+            html += '<' + tag + ' class="' + cls + '"' + attrs + '>' + cellText +
                     (note ? '<span class="sf-cell-mark" aria-hidden="true">!</span>' : '') +
                     '</' + tag + '>';
           }
@@ -1191,6 +1214,18 @@
         }
         body.innerHTML = html;
         if (name === _ISSUE_SHEET) bindIssueList(body);
+        body.querySelectorAll('.sf-audit-jump').forEach(function (button) {
+          button.addEventListener('click', function () {
+            var target = jumps[Number(button.getAttribute('data-jump-index')) - 1];
+            var tabs = node.querySelectorAll('.sf-sheet-tab');
+            tabs.forEach(function (tab) {
+              tab.classList.toggle('active', tab.getAttribute('data-sheet') === target.sheet);
+            });
+            pendingFocus = { ref: target.ref };
+            state.visibleRows = Math.max(TABLE_PAGE_ROWS, target.visibleRows);
+            showSheet(target.sheet);
+          });
+        });
         applyPendingFocus(body);
         var moreBtn = body.querySelector('.sf-load-more');
         if (moreBtn) {

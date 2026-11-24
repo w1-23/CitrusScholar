@@ -508,3 +508,37 @@ test('XLSX at the sheetRows cap is described as bounded, never as complete', asy
   assert.match(status, /已渲染 100 \/ 2000 行/);
   assert.doesNotMatch(status, /已渲染全部/);
 });
+
+test('audit workbook preview jumps to an internal source cell without following external links', async () => {
+  const browser = makeBrowser();
+  const xlsx = require('../assets/xlsx.full.min.js');
+  browser.context.XLSX = {...xlsx,
+    read(buffer, options) {
+      return xlsx.read(Buffer.from(new Uint8Array(buffer)), {...options, type: 'buffer'});
+    }
+  };
+  const book = xlsx.utils.book_new();
+  const source = { '!ref': 'H23:I145', H23: { t: 's', v: 'header' },
+    I145: { t: 'n', v: 42, c: [{ a: 'Audit', t: '重复待核' }] } };
+  xlsx.utils.book_append_sheet(book, source, "Samples' data");
+  const summary = xlsx.utils.aoa_to_sheet([
+    ['位置', '类型', '结论'], ["Samples' data!I145", '重复', '核对原始记录'],
+    ['外部地址', '测试', '仅显示文字'], ['不存在的地址', '测试', '仅显示文字']
+  ]);
+  summary.A2.l = { Target: "#'Samples'' data'!$I$145" };
+  summary.A3.l = { Target: 'https://example.org/' };
+  summary.A4.l = { Target: "#'Samples'' data'!Z145" };
+  xlsx.utils.book_append_sheet(book, summary, '审查结果');
+  const file = fileRecord({file_id: 'd'.repeat(32), filename: 'source_审查标注.xlsx',
+    download_url: '/api/v2/files/' + 'd'.repeat(32) + '/download'});
+  const node = await openTablePreview(browser, file, xlsx.write(book, {type: 'array', bookType: 'xlsx'}));
+  node.querySelector('[data-sheet="审查结果"]').click();
+  const buttons = node.querySelectorAll('.sf-audit-jump');
+  assert.equal(buttons.length, 1);
+  buttons[0].click();
+  assert.ok(node.querySelector('[data-sheet="Samples\' data"]').classList.contains('active'));
+  const target = node.querySelector('[data-ref="I145"]');
+  assert.ok(target.classList.contains('sf-cell-focus'));
+  assert.ok(target.classList.contains('sf-cell-noted'));
+  assert.equal(target.getAttribute('title'), '重复待核');
+});

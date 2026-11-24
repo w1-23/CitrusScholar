@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from citrus_figures.core import RenderedFigure
+from citrus_figures.workbench_styles import COLORMAPS, properties as workbench_properties
 from citrus_figures.manifest import (
     ALL_EDITABLE_PROPS, EDITABLE_BY_ROLE, TEXT_ROLES, FONT_WEIGHTS,
     available_font_families, find_by_locator, LINE_STYLE_PROPS, MARKERS, LINESTYLES,
@@ -161,7 +162,7 @@ def validate_overrides(raw: Any, manifest: dict[str, Any]) -> list[dict[str, Any
             raise OverrideError("missing_gid", f"第 {index} 条修改缺少 gid。")
         if not prop:
             raise OverrideError("missing_prop", f"第 {index} 条修改缺少 prop。")
-        if prop not in ALL_EDITABLE_PROPS:
+        if prop not in ALL_EDITABLE_PROPS and prop != "cmap":
             raise OverrideError(
                 "unknown_prop",
                 f"不允许修改属性「{prop}」；可修改的属性："
@@ -175,6 +176,7 @@ def validate_overrides(raw: Any, manifest: dict[str, Any]) -> list[dict[str, Any
         # capability (such as moving data series) bypass today's role policy.
         editable = (set(target.get("editable") or ())
                     & set(EDITABLE_BY_ROLE.get(str(target.get("role") or ""), ())))
+        editable |= workbench_properties(target)
         if prop not in editable:
             raise OverrideError(
                 "prop_not_editable",
@@ -182,11 +184,15 @@ def validate_overrides(raw: Any, manifest: dict[str, Any]) -> list[dict[str, Any
                 f"可修改：{', '.join(sorted(editable)) or '（无）'}。")
 
         if prop in _COLOR_PROPS:
-            if (prop == "markerfacecolor" and manifest.get("source") == "spec"
-                    and target.get("role") == "series" and value in ("auto", "none")):
+            if (prop == "markerfacecolor" and target.get("role") == "series" and value in ("auto", "none")
+                    and (manifest.get("source") == "spec" or target.get("artist") == "Line2D")):
                 clean: Any = value
             else:
                 clean = _normalise_color(value)
+        elif prop == "cmap":
+            if not isinstance(value, str) or value not in COLORMAPS:
+                raise OverrideError("invalid_colormap", "此热图不支持所选色带。")
+            clean = value
         elif prop == "fontsize":
             clean = _normalise_number(value, _MIN_FONTSIZE, _MAX_FONTSIZE, "字号")
         elif prop == "linewidth":
@@ -396,7 +402,8 @@ def apply_overrides(rendered: RenderedFigure, manifest: dict[str, Any],
         for item in overrides:
             if item["gid"] in gids and any(edits.get((gid, item["prop"]), object()) != item["value"] for gid in gids):
                 raise OverrideError("shared_legend_conflict", "共享图例组需要对所有关联序列提交相同样式修改。")
-    legend_links = _capture_legend_links(rendered, manifest, overrides)
+    legend_links = _capture_legend_links(rendered, manifest, [edit for edit in overrides if edit.get("prop") != "cmap"])
+    targets = {item["gid"]: item for item in manifest.get("objects", [])}
     # Whole-series styles apply before child styles, independent of JSON order.
     # A saved point/bar override therefore survives later series style updates.
     for override in sorted(overrides, key=lambda item: str(item.get("gid", "")).count(".")):
@@ -417,11 +424,13 @@ def apply_overrides(rendered: RenderedFigure, manifest: dict[str, Any],
         if artist is None:
             raise OverrideError("unresolved_artist", f"无法重新定位对象「{gid}」，修改未保存。")
         role = str(entry.get("role") if entry else "") or _role_of(manifest, gid)
-        if prop not in EDITABLE_BY_ROLE.get(role, ()):
+        if prop not in EDITABLE_BY_ROLE.get(role, ()) and prop not in workbench_properties(targets.get(gid, {})):
             raise OverrideError("prop_not_editable", f"对象「{gid}」不支持该修改。")
 
         try:
-            if prop == "transparent":
+            if prop == "cmap":
+                artist.set_cmap(value)
+            elif prop == "transparent":
                 artist._citrus_transparent = value
             elif role == "errorbar":
                 _set_error_style(members or artist, prop, value)

@@ -708,6 +708,10 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
             record["editable"], reason = style_capabilities(artist, role, members or [artist], record["editable"])
             if reason:
                 record["editing_limitation"] = reason
+        if (source == "script" and role == "series" and record.get("semantic_key")
+                and record.get("editing_limitation") != "unverified_figure_legend_links"):
+            from citrus_figures.workbench_styles import options
+            record.update(options(artist))
         if "parent_gid" in entry:
             record["parent_gid"] = entry["parent_gid"]
         if "visible" in EDITABLE_BY_ROLE.get(role, ()) and artist is not None:

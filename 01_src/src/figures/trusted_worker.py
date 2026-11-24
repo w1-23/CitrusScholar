@@ -165,6 +165,11 @@ def run(job_path: Path) -> int:
     # trusted engine next to this file is added; never add the job directory.
     engine_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(engine_root))
+    # Isolated Python ignores PYTHONPATH. A checkout or mounted release can
+    # ship the figure kernel next to this same trusted source tree.
+    packages = engine_root.parent / "packages"
+    if (packages / "citrus_figures" / "__init__.py").is_file():
+        sys.path.insert(0, str(packages))
     raw = job_path.read_bytes()
     if len(raw) > MAX_INPUT_BYTES:
         raise ValueError("render input budget exceeded")

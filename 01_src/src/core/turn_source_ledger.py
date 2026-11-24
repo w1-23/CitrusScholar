@@ -46,7 +46,8 @@ def ensure_schema() -> None:
                 snippet TEXT,
                 source_turn_seq INTEGER,
                 created_at TEXT NOT NULL,
-                read_ref TEXT NOT NULL DEFAULT ''
+                read_ref TEXT NOT NULL DEFAULT '',
+                citation_ref TEXT NOT NULL DEFAULT ''
             )
         """)
         conn.execute(
@@ -59,8 +60,19 @@ def ensure_schema() -> None:
         )
         if "read_ref" not in {row[1] for row in conn.execute("PRAGMA table_info(turn_source_ledger)")}:
             conn.execute("ALTER TABLE turn_source_ledger ADD COLUMN read_ref TEXT NOT NULL DEFAULT ''")
+        if "citation_ref" not in {row[1] for row in conn.execute("PRAGMA table_info(turn_source_ledger)")}:
+            conn.execute("ALTER TABLE turn_source_ledger ADD COLUMN citation_ref TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_turn_source_read "
                      "ON turn_source_ledger(kind,source_key)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS turn_source_counters (
+                session_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                next_value INTEGER NOT NULL,
+                PRIMARY KEY (session_id, request_id, kind)
+            )
+        """)
         conn.commit()
     _schema_ready = True
 
@@ -101,8 +113,8 @@ def _insert(row: dict[str, Any]) -> bool:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO turn_source_ledger
                    (session_id,request_id,origin,kind,source_key,title,url,
-                    snippet,source_turn_seq,created_at,read_ref)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    snippet,source_turn_seq,created_at,read_ref,citation_ref)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(row["session_id"]), str(row["request_id"]),
                     str(row["origin"]), str(row["kind"]),
@@ -110,6 +122,7 @@ def _insert(row: dict[str, Any]) -> bool:
                     safe_http_url(row.get("url")) if row["kind"] == "web" else "",
                     _safe_text(row.get("snippet"), 320),
                     row.get("source_turn_seq"), stamp, json.dumps(row["read_ref"]) if row.get("read_ref") else "",
+                    _citation_ref(row.get("citation_ref")),
                 ),
             )
             conn.commit()
@@ -117,6 +130,52 @@ def _insert(row: dict[str, Any]) -> bool:
     except Exception:
         return False
 
+
+
+def _citation_ref(value) -> str:
+    text = str(value or "").strip().upper()
+    import re
+    return text if re.fullmatch(r"[LW]\d{1,3}", text) else ""
+
+
+def allocate_citation_refs(session_id: str, request_id: str, kind: str, count: int) -> list[str]:
+    """Allocate turn-global display ids (L#/W#) for answer citations."""
+    prefix = {"web": "W", "local": "L"}.get(str(kind or "").casefold())
+    try:
+        count = max(0, min(50, int(count or 0)))
+    except (TypeError, ValueError):
+        count = 0
+    if not prefix or count <= 0:
+        return []
+    sid, rid = str(session_id or ""), str(request_id or "")
+    if not sid or not rid:
+        return [f"{prefix}{n}" for n in range(1, count + 1)]
+    try:
+        ensure_schema()
+        with _connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT next_value FROM turn_source_counters "
+                "WHERE session_id=? AND request_id=? AND kind=?",
+                (sid, rid, kind),
+            ).fetchone()
+            start = int(row[0]) if row else 1
+            if row:
+                conn.execute(
+                    "UPDATE turn_source_counters SET next_value=? "
+                    "WHERE session_id=? AND request_id=? AND kind=?",
+                    (start + count, sid, rid, kind),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO turn_source_counters(session_id,request_id,kind,next_value) "
+                    "VALUES (?,?,?,?)",
+                    (sid, rid, kind, start + count),
+                )
+            conn.commit()
+        return [f"{prefix}{n}" for n in range(start, start + count)]
+    except Exception:
+        return [f"{prefix}{n}" for n in range(1, count + 1)]
 
 def _local_source_key(row: dict) -> str:
     from src.core.corpus_source import is_valid_record_key
@@ -179,7 +238,8 @@ def record_tool_sources(session_id: str, request_id: str, *, artifact: dict | No
         row = rows[0]
         return int(_insert({**common, "kind": "local", "source_key": reference_key("cite", ref),
                             "origin": "current" if ref["turn_id"] == get_job_id() else "history",
-                            "title": _local_title(row, _local_source_key(row)), "read_ref": ref}))
+                            "title": _local_title(row, _local_source_key(row)), "read_ref": ref,
+                            "citation_ref": row.get("citation_ref")}))
 
     if tool_name in {"deepseek_fetch", "deepseek_fetch_paper", "browse_web"}:
         if tool_name == "browse_web" and not data.get("_browse_evidence"):
@@ -192,7 +252,7 @@ def record_tool_sources(session_id: str, request_id: str, *, artifact: dict | No
             if url and excerpt:
                 added += _insert({**common, "kind": "web", "source_key": url, "url": url,
                                   "title": clean_web_title(row.get("title"), url), "snippet": excerpt,
-                                  "read_ref": receipt})
+                                  "read_ref": receipt, "citation_ref": row.get("citation_ref")})
         return added
 
     added = 0
@@ -281,7 +341,7 @@ def fetch_rows(session_id: str, request_id: str) -> list[dict]:
         with _connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT origin,kind,source_key,title,url,snippet,source_turn_seq,read_ref "
+                "SELECT origin,kind,source_key,title,url,snippet,source_turn_seq,read_ref,citation_ref "
                 "FROM turn_source_ledger WHERE session_id=? AND request_id=? "
                 "ORDER BY CASE origin WHEN 'current' THEN 0 ELSE 1 END, "
                 "CASE kind WHEN 'local' THEN 0 ELSE 1 END, id",

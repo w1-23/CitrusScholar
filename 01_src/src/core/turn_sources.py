@@ -260,7 +260,7 @@ def sources_payload(session_id: str, request_id: str, *, user: dict,
     return {"status": status, "sources": sources}
 
 
-_ANSWER_REF = re.compile(r"\[(\d{1,2}|W\d{1,2}|H\d{1,2})\]", re.I)
+_ANSWER_REF = re.compile(r"\[(L\d{1,3}|W\d{1,3}|H\d{1,3}|C\d{1,3}|\d{1,2})\]", re.I)
 
 
 def _reference_text(value, limit: int) -> str:
@@ -279,34 +279,53 @@ def _reference_score(value) -> float:
 def references_data(answer: str, main_results, web_results) -> dict[str, Any]:
     """Project retained, authorized sources into the existing citations contract.
 
-    This does not invent a citation.  Local entries are listed as uncited when
-    the answer contains no numeric marker; web entries are always exposed in
-    ``web_separate`` so the source panel can show real URLs.  Markers that point
-    past the retained source set are reported in ``dropped`` and are never
-    turned into clickable evidence.
+    Display ids come from the tool output (``L#`` for local, ``W#`` for web) and
+    are stored with the evidence.  They are never re-derived from array
+    positions, so multi-batch searches, duplicate URLs and repeated chunks keep
+    the same citation identity.  Legacy numeric markers still map to local
+    order, and ``[cNN]`` maps to a visible candidate id.
     """
     from src.core.evidence import clean_doi, src_of
 
-    local, seen_local = [], set()
+    local, seen_local, by_ref = [], set(), {}
+    local_by_key, by_candidate = {}, {}
     for row in main_results if isinstance(main_results, list) else []:
         if not isinstance(row, dict):
             continue
         doi = clean_doi(row.get("doi"))
         key = (doi or str(row.get("record_key") or row.get("chunk_id") or
                row.get("title") or "").strip())
-        if not key or key in seen_local:
+        if not key:
+            continue
+        if key in seen_local:
+            duplicate_ref = str(row.get("citation_ref") or "").strip().upper()
+            if re.fullmatch(r"L\d{1,3}", duplicate_ref):
+                by_ref.setdefault(duplicate_ref, local_by_key[key])
             continue
         seen_local.add(key)
-        ref_id = str(len(local) + 1)
+        ref = str(row.get("citation_ref") or "").strip().upper()
+        if not re.fullmatch(r"L\d{1,3}", ref):
+            ref = str(len(local) + 1)
+        if ref in by_ref:
+            continue
         title = _reference_text(row.get("title") or row.get("paper_title"), 180) or "本地文献"
-        local.append({
-            "ref_id": ref_id, "type": "main", "source": src_of(row),
+        entry = {
+            "ref_id": ref, "type": "main", "source": src_of(row),
             "doi": doi or "N/A", "url": "", "title": title,
             "year": _reference_text(row.get("year"), 32),
             "score": _reference_score(row.get("score", row.get("rerank_score"))),
             "chunk_id": _reference_text(row.get("chunk_id"), 200),
             "text_preview": _reference_text(row.get("snippet") or row.get("text"), 250),
-        })
+        }
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        if candidate_id:
+            entry["candidate_id"] = candidate_id
+        local.append(entry)
+        local_by_key[key] = entry
+        by_ref[ref] = entry
+        for alias in (candidate_id, row.get("source_ref")):
+            if alias:
+                by_candidate.setdefault(str(alias).strip().casefold(), entry)
 
     from src.core.source_tiers import classify_url
 
@@ -315,69 +334,76 @@ def references_data(answer: str, main_results, web_results) -> dict[str, Any]:
         "T2": "权威与行业媒体 / 机构新闻稿",
         "T3": "自媒体 / 论坛 / 来源不明",
     }
-    web, seen_web = [], set()
+    web, seen_web, by_web, web_by_url = [], set(), {}, {}
     for row in web_results if isinstance(web_results, list) else []:
         if not isinstance(row, dict):
             continue
         url = turn_source_ledger.safe_http_url(row.get("url"))
-        if not url or url in seen_web:
+        if not url:
+            continue
+        if url in seen_web:
+            duplicate_ref = str(row.get("citation_ref") or "").strip().upper()
+            if re.fullmatch(r"W\d{1,3}", duplicate_ref):
+                by_web.setdefault(duplicate_ref, web_by_url[url])
             continue
         seen_web.add(url)
-        ref_id = f"W{len(web) + 1}"
+        ref = str(row.get("citation_ref") or "").strip().upper()
+        if not re.fullmatch(r"W\d{1,3}", ref):
+            ref = f"W{len(web) + 1}"
+        if ref in by_web:
+            continue
         from urllib.parse import urlsplit
         host = urlsplit(url).hostname or ""
         tier = classify_url(url, str(row.get("doi") or ""))
-        web.append({
-            "ref_id": ref_id, "type": "web", "source": "web", "url": url,
+        entry = {
+            "ref_id": ref, "type": "web", "source": "web", "url": url,
             "title": _reference_text(row.get("title"), 180) or host or url,
             "host": host,
             "snippet": _reference_text(row.get("abstract") or row.get("snippet") or row.get("text"), 320),
             "round_no": 1, "is_summary": False,
-            # Honest network labelling: every entry stays in the web group and
-            # carries the deterministic tier classification.  Unknown hosts
-            # are T3, never promoted to an authoritative source.
             "origin_label": "网络来源",
             "tier": tier.tier, "tier_rule": tier.rule,
             "tier_label": f"网络来源 · {tier.tier} {tier_labels[tier.tier]}",
             "role": "candidate", "cited": False,
-        })
+        }
+        web.append(entry)
+        web_by_url[url] = entry
+        by_web[ref] = entry
 
-    numeric_markers, web_markers, dropped = set(), set(), []
+    cited_local, cited_web, dropped = set(), set(), []
     for marker in _ANSWER_REF.findall(str(answer or "")):
         token = marker.upper()
-        if token.startswith("W") and token[1:].isdigit():
-            number = int(token[1:])
-            if 1 <= number <= len(web):
-                web_markers.add(number)
-            else:
-                dropped.append(f"W{number}")
-        elif token.startswith("H"):
-            continue
+        entry = None
+        if token.startswith("H"):
+            entry = None
+        elif token.startswith("W"):
+            entry = by_web.get(token)
+        elif token.startswith("L"):
+            entry = by_ref.get(token)
+        elif token.startswith("C"):
+            entry = by_candidate.get(marker.casefold())
         elif token.isdigit():
             number = int(token)
-            if 1 <= number <= len(local):
-                numeric_markers.add(number)
-            else:
-                dropped.append(str(number))
+            entry = local[number - 1] if 1 <= number <= len(local) else None
+        if entry is None:
+            dropped.append(marker)
+        elif entry["type"] == "web":
+            cited_web.add(entry["ref_id"])
+            entry["cited"] = True
+            entry["role"] = "cited"
+        else:
+            cited_local.add(entry["ref_id"])
+            entry["cited"] = True
+            entry["role"] = "cited"
+            entry["type"] = "main"
 
-    # ``web_markers`` must actually decide the role: a web result is cited only
-    # when the answer contains its exact ``[Wn]`` marker.  Everything else is a
-    # candidate and must not render as a citation bubble.
     for item in web:
-        number = int(item["ref_id"][1:])
-        item["cited"] = number in web_markers
-        item["role"] = "cited" if item["cited"] else "candidate"
-
-    cited = [item for item in local if int(item["ref_id"]) in numeric_markers]
-    uncited = [item for item in local if int(item["ref_id"]) not in numeric_markers]
-    for item in cited:
-        item["type"] = "main"
-        item["role"] = "cited"
-        item["cited"] = True
+        if item["ref_id"] not in cited_web:
+            item["cited"] = False
+            item["role"] = "candidate"
+    cited = [item for item in local if item["ref_id"] in cited_local]
+    uncited = [item for item in local if item["ref_id"] not in cited_local]
     for item in uncited:
-        # Candidates keep a numeric ref_id for ordering but are never typed as
-        # "main"; the front end uses this role to render a candidate badge and
-        # to avoid claiming the answer cites them.
         item["type"] = "candidate"
         item["role"] = "candidate"
         item["cited"] = False

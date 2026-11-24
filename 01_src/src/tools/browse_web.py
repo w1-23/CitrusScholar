@@ -150,8 +150,13 @@ async def browse_web(action: Literal['open', 'observe', 'scroll', 'click', 'down
             source_url = urlunsplit((parts.scheme, parts.netloc, parts.path, '', ''))
             text, artifact = _output({**data, 'source_evidence': evidence})
             artifact['_browse_evidence'] = evidence
+            from src.core.turn_source_ledger import allocate_citation_refs
+            from src.core.tracing import get_client_request_id, get_session_id
+            ref = (allocate_citation_refs(get_session_id(), get_client_request_id(), "web", 1)
+                   or ['W1'])[0]
+            artifact['citation_ref'] = ref
             artifact['web_results'] = [{'url': source_url, 'title': result.get('title') or parts.hostname,
-                                       'snippet': observed_text[:320]}]
+                                       'snippet': observed_text[:320], 'citation_ref': ref}]
             return text, artifact
         href = result.get('href')
         emit_progress('browse_phase', {'phase': 'downloading'})

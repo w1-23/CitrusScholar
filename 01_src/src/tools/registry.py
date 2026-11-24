@@ -687,11 +687,7 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
     if isinstance(token, _OperationToken):
         token.set_deadline(exec_timeout)
 
-    # 注意：对于 response_format="content_and_artifact" 的工具，tool.ainvoke()
-    # 会丢弃 artifact 只返回 content 字符串。
-    # 必须直接调用底层函数才能获取完整的 (content, artifact) 元组。
     response_format = getattr(tool, "response_format", None)
-    raw_func = getattr(tool, "func", None)
     ctx = contextvars.copy_context()
     # 记下真正在执行的工具名（写进 ctx，随 ctx.run 传入工具线程）。工具内部的
     # 成果登记用它记录生产者，使"文件由谁产出"可核查。
@@ -703,79 +699,50 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
             token.on_dispatch()
         token.dispatched = True
 
-    if response_format == "content_and_artifact" and raw_func is not None:
-        try:
-            content, artifact = await asyncio.wait_for(
-                _run_sync_with_ctx(ctx, lambda: raw_func(**args)),
-                timeout=exec_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"[PartitionedNode] 工具 {tool.name} 执行超时(>{exec_timeout}s)")
-            return ToolMessage(
-                content=_timeout_message(tool.name, exec_timeout, args),
-                tool_call_id=tool_call["id"], name=tool.name, artifact={})
-        except Exception as e:
-            if _is_cancel_exc(e):
-                _note_late_result(tool_name, "artifact_branch_exc")
-                return _cancel_receipt(tool_name, tool_call["id"], "cancelled_in_tool", token)
-            logger.error(f"[PartitionedNode] 工具 {tool.name} 执行失败: {e}")
-            error_msg = _classify_error(e, tool)
-            return ToolMessage(content=error_msg, tool_call_id=tool_call["id"], name=tool.name, artifact={})
-        # S1 闸门 1：工具线程跑完了，但请求已被取消 → 结果不采用、artifact 丢弃。
-        if token is not None and token.cancelled():
-            _note_late_result(tool_name, "artifact_branch")
-            return _cancel_receipt(tool_name, tool_call["id"], "after_exec", token)
-        from src.core.op_receipt import make_receipt
-        artifact = dict(artifact or {})
-        artifact["op_receipt"] = make_receipt(tool_name, tool_call["id"], content, artifact)
-        artifact.setdefault("_tool_outcome", artifact["op_receipt"]["coverage"]["_tool_outcome"])
-        if isinstance(content, str) and tool_name not in {
-                "deepseek_search", "deepseek_fetch", "deepseek_fetch_paper", "local_hybrid_search"}:
-            content = _offload_large_result(content, tool_name)
-        return ToolMessage(content=content, artifact=artifact, tool_call_id=tool_call["id"], name=tool_name)
-    else:
-        # LangChain discards the artifact when invoked with bare arguments.
-        # A native call envelope preserves both parts for async artifact tools.
-        invocation = ({"type": "tool_call", "name": tool_name,
-                       "id": tool_call["id"], "args": args}
-                      if response_format == "content_and_artifact" else args)
-        try:
-            result = await asyncio.wait_for(_invoke_tool_with_ctx(ctx, tool, invocation),
-                                            timeout=exec_timeout)
-        except asyncio.TimeoutError:
-            logger.error(f"[PartitionedNode] 工具 {tool.name} 执行超时(>{exec_timeout}s)")
-            return ToolMessage(
-                content=_timeout_message(tool.name, exec_timeout, args),
-                tool_call_id=tool_call["id"], name=tool.name, artifact={})
-        except Exception as e:
-            if _is_cancel_exc(e):
-                _note_late_result(tool_name, "plain_branch_exc")
-                return _cancel_receipt(tool_name, tool_call["id"], "cancelled_in_tool", token)
-            logger.error(f"[PartitionedNode] 工具 {tool.name} 执行失败: {e}")
-            error_msg = _classify_error(e, tool)
-            return ToolMessage(content=error_msg, tool_call_id=tool_call["id"], name=tool.name, artifact={})
+    # A native ToolCall envelope is the only supported invocation for
+    # content_and_artifact tools: LangChain preserves the artifact and pairs it
+    # with tool_call_id, while bare arguments return content alone. Sync and
+    # async tools share this path so schema binding, contextvars, timeout,
+    # cancellation and receipts cannot diverge again.
+    invocation = ({"type": "tool_call", "name": tool_name,
+                   "id": tool_call["id"], "args": args}
+                  if response_format == "content_and_artifact" else args)
+    try:
+        result = await asyncio.wait_for(_invoke_tool_with_ctx(ctx, tool, invocation),
+                                        timeout=exec_timeout)
+    except asyncio.TimeoutError:
+        logger.error(f"[PartitionedNode] 工具 {tool.name} 执行超时(>{exec_timeout}s)")
+        return ToolMessage(
+            content=_timeout_message(tool.name, exec_timeout, args),
+            tool_call_id=tool_call["id"], name=tool.name, artifact={})
+    except Exception as e:
+        if _is_cancel_exc(e):
+            _note_late_result(tool_name, "standard_branch_exc")
+            return _cancel_receipt(tool_name, tool_call["id"], "cancelled_in_tool", token)
+        logger.error(f"[PartitionedNode] 工具 {tool.name} 执行失败: {e}")
+        error_msg = _classify_error(e, tool)
+        return ToolMessage(content=error_msg, tool_call_id=tool_call["id"], name=tool.name, artifact={})
 
-        # S1 闸门 1：工具线程跑完了，但请求已被取消 → 结果不采用。
-        if token is not None and token.cancelled():
-            _note_late_result(tool_name, "plain_branch")
-            return _cancel_receipt(tool_name, tool_call["id"], "after_exec", token)
+    # S1 闸门 1：工具线程跑完了，但请求已被取消 → 结果不采用。
+    if token is not None and token.cancelled():
+        _note_late_result(tool_name, "standard_branch")
+        return _cancel_receipt(tool_name, tool_call["id"], "after_exec", token)
 
-        if not isinstance(result, ToolMessage):
-            if isinstance(result, tuple) and len(result) == 2:
-                content, artifact = result
-                result = ToolMessage(content=content, artifact=artifact, tool_call_id=tool_call["id"], name=tool_name)
-            else:
-                result = ToolMessage(content=str(result), tool_call_id=tool_call["id"], name=tool_name)
-        from src.core.op_receipt import make_receipt
-        artifact = dict(result.artifact or {})
-        artifact["op_receipt"] = make_receipt(tool_name, tool_call["id"], result.content, artifact)
-        artifact.setdefault("_tool_outcome", artifact["op_receipt"]["coverage"]["_tool_outcome"])
-        result = result.model_copy(update={"artifact": artifact})
-        if isinstance(result.content, str) and tool_name not in {
-                "deepseek_search", "deepseek_fetch", "deepseek_fetch_paper", "local_hybrid_search"}:
-            result.content = _offload_large_result(result.content, tool_name)
-        return result
-
+    if not isinstance(result, ToolMessage):
+        if isinstance(result, tuple) and len(result) == 2:
+            content, artifact = result
+            result = ToolMessage(content=content, artifact=artifact, tool_call_id=tool_call["id"], name=tool_name)
+        else:
+            result = ToolMessage(content=str(result), tool_call_id=tool_call["id"], name=tool_name)
+    from src.core.op_receipt import make_receipt
+    artifact = dict(result.artifact or {})
+    artifact["op_receipt"] = make_receipt(tool_name, tool_call["id"], result.content, artifact)
+    artifact.setdefault("_tool_outcome", artifact["op_receipt"]["coverage"]["_tool_outcome"])
+    result = result.model_copy(update={"artifact": artifact})
+    if isinstance(result.content, str) and tool_name not in {
+            "deepseek_search", "deepseek_fetch", "deepseek_fetch_paper", "local_hybrid_search"}:
+        result.content = _offload_large_result(result.content, tool_name)
+    return result
 
 async def run_tool_checked(tool: BaseTool, args: dict) -> str:
     """v8.13 第四批: 工具执行统一出口——供图内联/流水线直调复用。

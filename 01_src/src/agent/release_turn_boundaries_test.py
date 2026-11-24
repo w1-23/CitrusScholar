@@ -13,6 +13,37 @@ from src.core.turn_outcome import artifact_goal_evidence
 from src.graph.task_contract import contract_for_turn
 
 
+def test_unconfigured_skill_release_never_activates_archived_prompts(monkeypatch):
+    from src.agent.host_policy import system_prompt
+    from src.prompts.loader import assemble_system_prompt, verify_figure_prompt_loading
+
+    monkeypatch.delenv("CITRUS_SKILL_RELEASE", raising=False)
+    tools = {"run_research_figure_script", "research_workspace"}
+    assert assemble_system_prompt(mode="expert", available_tools=tools) == system_prompt(tools, native_skills=True)
+    with pytest.raises(ValueError, match="skill_release_not_configured"):
+        verify_figure_prompt_loading()
+
+
+def test_request_to_check_both_sources_preserves_authorized_search(monkeypatch):
+    from src.agent.host_policy import allowed_presets, system_prompt
+    from src.core import tracing
+    from src.core.capability_policy import CapabilityPolicy
+    from src.graph import tool_availability
+    from src.graph.retrieval_router import retrieval_denied, source_scope
+
+    monkeypatch.setattr(tracing, "web_search_enabled", lambda: True)
+    monkeypatch.setattr(tool_availability, "provider_denials", lambda settings: frozenset())
+    query = "请简述内标法如何补偿基质效应。请分别查看本地资料和公开网络一次，只引用实际采用的证据。"
+    scope = source_scope(query, exclusive_only=True)
+    assert scope == "fusion"
+    assert not retrieval_denied(query, scope)
+    assert retrieval_denied("这轮别查本地或网络")
+    state = {"query": query, "capability_snapshot": CapabilityPolicy().snapshot()}
+    available = allowed_presets(state, has_tables=False, has_pool=False)
+    assert {"local_hybrid_search", "deepseek_search"} <= available
+    assert "用户明确要求本地资料和公开网络都查时" in system_prompt(available, native_skills=True)
+
+
 def test_attachment_plot_needs_a_downloadable_svg():
     requirements = contract_for_turn("请你绘制这个数据", has_tables=True).deliverables
     assert requirements[0]["formats"] == ["svg"]
@@ -34,6 +65,24 @@ def test_verified_workbook_can_be_delivered_with_partial_audit_coverage():
     assert not gaps and goals[0].artifact_links == [link]
     goals, gaps = artifact_goal_evidence(requirements, [record], set())
     assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
+
+
+def test_rejected_audit_can_be_repaired_only_for_the_same_requested_scope():
+    name = "audit_uploaded_data"
+    base = {"file_ids_json": ["a" * 32], "file_indexes_json": [0], "sheet_name": "Sheet1"}
+    region = {"bounds": "H15:I18", "sheet": "Sheet1", "header_rows": [15]}
+    checks = {"profile": "on_demand", "requested_checks": ["duplicate_row"],
+              "regions": [region | {"file_index": 0}]}
+    corrected = {"name": name, "args": base | {"checks_json": checks}}
+    for bad_checks in (checks | {"regions": [region]},
+                       checks | {"regions": [region], "profile": "duplicates"}):
+        rejected = {"name": name, "args": base | {"checks_json": bad_checks}}
+        assert _same_repair_target(rejected, corrected)
+    assert not _same_repair_target(rejected, corrected | {"args": corrected["args"] | {"file_ids_json": ["b" * 32]}})
+    narrower = checks | {"regions": [region | {"file_index": 0, "bounds": "H15:I17"}]}
+    assert not _same_repair_target(rejected, corrected | {"args": base | {"checks_json": narrower}})
+    different = checks | {"requested_checks": ["missing_values"]}
+    assert not _same_repair_target(rejected, corrected | {"args": base | {"checks_json": different}})
 
 
 def test_failed_renderer_and_rejected_repair_can_be_replaced_by_same_goal_svg():

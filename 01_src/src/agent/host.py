@@ -293,11 +293,8 @@ async def _run(state, identity, ledger):
             skill_rows = (installed_rows if installed_rows is not None else
                           [row for row in selected_metadata])
         else:
-            from .skill_adapter import skill_catalog
-            try:
-                skill_rows = await asyncio.to_thread(skill_catalog, host.allowed_names)
-            except (OSError, ValueError, KeyError):
-                skill_rows = selected_metadata
+            from .skill_adapter import scenario_catalog
+            skill_rows = await asyncio.to_thread(scenario_catalog)
         state["capability_runtime"] = {
             "schema": 1,
             "executor": NATIVE_EXECUTOR_ID if native else EXECUTOR_ID,
@@ -887,11 +884,38 @@ async def _run(state, identity, ledger):
                          final_review=final_review)
 
 
+def _same_audit_target(original, replacement):
+    import json
+    from src.research.tools import validate_audit_request
+
+    def normalized(args):
+        checks = args.get("checks_json") or {}
+        if isinstance(checks, str):
+            checks = json.loads(checks)
+        if not isinstance(checks, dict):
+            raise ValueError("invalid audit checks")
+        checks = dict(checks)
+        if checks.get("requested_checks") and not (checks.get("audit_plan") or checks.get("custom_findings")):
+            checks.pop("profile", None)
+        parsed = validate_audit_request(**(args | {"checks_json": checks}))
+        if not (parsed["file_ids"] or parsed["file_indexes"]):
+            raise ValueError("unspecified audit source")
+        parsed["checks"] = {key: value for key, value in parsed["checks"].items() if key != "regions"}
+        return parsed, args.get("sheet_name") or "", args.get("annotations_json") or "[]"
+
+    try:
+        return normalized(original) == normalized(replacement)
+    except (TypeError, ValueError):
+        return False
+
+
 def _same_repair_target(rejected, corrected, *, records=()):
     if not rejected or not corrected or rejected["name"] != corrected["name"]:
         return False
     name = rejected["name"]
     original, replacement = rejected.get("args") or {}, corrected.get("args") or {}
+    if name == "audit_uploaded_data":
+        return _same_audit_target(original, replacement)
     if name == "code_bind_input":
         # The file identity, not the proposed mount spelling, is the target.
         keys = ("workspace_id", "task_id", "file_id", "sha256")

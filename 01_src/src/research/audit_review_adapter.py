@@ -9,6 +9,22 @@ import re
 
 from src.core.tool_errors import ToolArgumentError
 
+# `duplicates` is a package group alias. An explicit requested_checks list is
+# a demand for concrete checks, so resolve it to the canonical row check rather
+# than activating key/PaperConan prerequisites that may not exist.
+_CHECK_ALIASES = {"duplicates": "duplicate_row", "duplicate_rows": "duplicate_row"}
+
+
+def _selected_checks(checks, query):
+    selected = checks.get("requested_checks")
+    if selected is not None:
+        return list(dict.fromkeys(
+            _CHECK_ALIASES.get(str(item).strip().lower(), str(item).strip())
+            for item in selected))
+    if re.search(r"(?:仅|只)(?:检查|审查|查|看)?(?:数据)?(?:完全)?重复", query):
+        return ["duplicate_row"]
+    return None
+
 
 def text_only(query: str) -> bool:
     return bool(re.search(r"(?:只|仅)(?:要|给|用|输出|提供)?(?:文字|文本)|"
@@ -46,9 +62,7 @@ def run_review(tables, indexes, validated, *, sheet_name, query):
                      ("required_fields", "required_fields"), ("optional_fields", "optional_fields"), ("ranges", "ranges")):
         if old in checks:
             roles.setdefault(new, checks[old])
-    selected = checks.get("requested_checks")
-    if selected is None and re.search(r"(?:仅|只)(?:检查|审查|查|看)?(?:数据)?重复", query):
-        selected = ["duplicates"]
+    selected = _selected_checks(checks, query)
     profile = checks.get("profile") or "balanced"
     if profile == "on_demand":
         if selected is None:

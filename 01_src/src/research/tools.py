@@ -858,14 +858,26 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                 raise_if_cancelled("artifact:before_commit")
                 publication_started()
                 os.replace(part, path)
-                prior = conn.execute(
-                    "SELECT artifact_id, logical_artifact_id, "
-                    "COALESCE(version,1) AS version FROM artifacts "
-                    "WHERE session_id=? AND producer_tool=? AND filename=? "
-                    "AND source_file_id=? AND source_sha256=? "
-                    "ORDER BY COALESCE(version,1) DESC, created_at DESC LIMIT 1",
-                    (session_id, tool_name, safe, source_file_id, source_sha256),
-                ).fetchone()
+                if str(logical_task_id).startswith("figure:"):
+                    # One logical figure keeps one version chain even when a
+                    # re-render renames the output file.
+                    prior = conn.execute(
+                        "SELECT artifact_id, logical_artifact_id, "
+                        "COALESCE(version,1) AS version FROM artifacts "
+                        "WHERE session_id=? AND producer_tool=? AND logical_task_id=? "
+                        "AND mime=? "
+                        "ORDER BY COALESCE(version,1) DESC, created_at DESC LIMIT 1",
+                        (session_id, tool_name, str(logical_task_id)[:128], str(mime or "")),
+                    ).fetchone()
+                else:
+                    prior = conn.execute(
+                        "SELECT artifact_id, logical_artifact_id, "
+                        "COALESCE(version,1) AS version FROM artifacts "
+                        "WHERE session_id=? AND producer_tool=? AND filename=? "
+                        "AND source_file_id=? AND source_sha256=? "
+                        "ORDER BY COALESCE(version,1) DESC, created_at DESC LIMIT 1",
+                        (session_id, tool_name, safe, source_file_id, source_sha256),
+                    ).fetchone()
                 if prior is not None:
                     logical_artifact_id = str(
                         prior["logical_artifact_id"] or logical_artifact_id)
@@ -2624,7 +2636,7 @@ def _audit_explicit_regions(tables, requested, regions, checks, plan, custom_ref
 
 
 def validate_audit_request(*, checks_json: str | dict = "", publish: bool = False,
-                           publish_formats: list[str] | None = None,
+                           publish_formats: str | list[str] | None = None,
                            header_row: int = 1, header_rows_json: str | list[int] = "",
                            file_indexes_json: str | list[int] = "",
                            file_ids_json: str | list[str] = "", **_unused) -> dict:
@@ -2633,7 +2645,9 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
     The registry may call this trusted preflight before setting execution_dispatched.
     The tool uses the same validation, so invalid configuration cannot drift.
     """
-    if publish_formats is not None and (not isinstance(publish_formats, list) or
+    publish_formats = _json_arg(publish_formats, list, None,
+                                shape='["xlsx"] 或 ["xlsx","html"]')
+    if publish_formats is not None and (
             any(not isinstance(fmt, str) or fmt not in {'xlsx', 'html', 'json'} for fmt in publish_formats)):
         raise ToolArgumentError('publish_formats 只支持 xlsx/html/json 字符串数组；invalid_input')
     formats = list(dict.fromkeys(publish_formats)) if publish_formats is not None else (['xlsx'] if publish else [])
@@ -2646,11 +2660,15 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
                         'mean_decimals', 'sd_decimals', 'reported_summaries', 'reported_p_values', 'composite_keys',
                         'pattern_checks', 'expected_structure', 'selected_checks', 'audit_plan', 'custom_findings',
                         'regions', 'field_roles', 'requested_checks', 'profile'}
+    from citrus_audit.review import PROFILES
+    allowed_profiles = (*PROFILES, "on_demand")
     if ("field_roles" in checks and not isinstance(checks["field_roles"], dict)
             or "requested_checks" in checks and (not isinstance(checks["requested_checks"], list)
                 or any(not isinstance(value, str) for value in checks["requested_checks"]))
-            or "profile" in checks and checks["profile"] not in ("balanced", "on_demand")):
-        raise ToolArgumentError("field_roles 必须为对象，requested_checks 必须为字符串数组，profile 必须为 balanced 或 on_demand。")
+            or "profile" in checks and checks["profile"] not in allowed_profiles):
+        raise ToolArgumentError(
+            "field_roles 必须为对象，requested_checks 必须为字符串数组，"
+            f"profile 必须为 {'/'.join(allowed_profiles)} 之一。")
     if 'selected_checks' in checks:
         from citrus_audit.data_audit_rules import RULES
         selected = checks['selected_checks']
@@ -2750,9 +2768,26 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
     if 'regions' in checks:
         from citrus_audit.readers import normalize_regions
         try:
-            regions = normalize_regions(checks['regions'])
-            if any('file_index' not in spec for spec in regions):
-                raise ValueError('托管审查的每个区域必须包含 file_index')
+            raw_regions = checks['regions']
+            if (isinstance(raw_regions, (list, tuple))
+                    and any(isinstance(spec, dict) and 'file_index' not in spec
+                            for spec in raw_regions)):
+                # A single explicitly selected source is unambiguous; the
+                # model does not need to repeat its index in every region.
+                if indexes is not None and len(indexes) == 1:
+                    default_index = indexes[0]
+                elif indexes is None and ids and len(ids) == 1:
+                    default_index = 0
+                else:
+                    default_index = None
+                if default_index is None:
+                    raise ValueError('涉及多个文件时，每个区域必须包含 file_index')
+                raw_regions = [{**spec, 'file_index': default_index}
+                               if isinstance(spec, dict) and 'file_index' not in spec else spec
+                               for spec in raw_regions]
+            # Assign before normalization so omitted and explicit indexes are
+            # grouped together and overlapping rectangles cannot bypass checks.
+            regions = normalize_regions(raw_regions)
             region_indexes = {spec['file_index'] for spec in regions}
             if indexes is not None and not region_indexes <= set(indexes):
                 raise ValueError('区域 file_index 必须在明确选择的文件范围内')
@@ -2772,14 +2807,18 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
                         header_rows_json: str | list[int] = "",
                         note: str = "", checks_json: str | dict = "",
                         publish: bool = False,
-                        publish_formats: list[str] | None = None,
+                        publish_formats: str | list[str] | None = None,
                         file_ids_json: str | list[str] = "") -> tuple[str, dict[str, Any]]:
     """对授权原表的指定工作表或区域执行一次审查并保存快照。
 
     file_ids_json 选择账号中真实文件，file_indexes_json 指定来源序号。
     sheet_name 用实际表名；checks_json.regions 绑定 file_index、sheet、
     绝对 bounds 和 header_rows。field_roles 映射列角色、键和脚注，
-    requested_checks 限定用户要求的检查，profile 默认 balanced。
+    requested_checks 限定用户要求的检查，profile 默认 balanced
+    （可选 balanced/duplicates/relations/numeric_forensics/custom/on_demand）。
+    requested_checks 中的 duplicates/duplicate_rows 归一为 duplicate_row；
+    需要完整重复族时使用 profile=duplicates。
+    publish_formats 接受 JSON 字符串或字符串数组，默认 xlsx。
     reported_summaries / reported_p_values 只接受核实后的区域与统计量绑定。
     默认每份原件交付一份 XLSX。再次导出用已有 review_id，无需重扫。
     显式旧审查计划保留兼容；工具返回有限摘要和已有成果引用。

@@ -67,6 +67,8 @@ jobs:
             01_src/src/research/audit_projection_test.py \
             01_src/src/research/standalone_audit_integration_test.py \
             packages/citrus_audit/region_workbook_test.py \
+            01_src/src/research/audit_request_contract_test.py \
+            01_src/src/research/artifact_logical_identity_test.py \
             01_src/src/shared_corpus/maintenance_regression_test.py \
             01_src/src/shared_corpus/pmc_intake_test.py \
             01_src/src/research/nature_composition_test.py \

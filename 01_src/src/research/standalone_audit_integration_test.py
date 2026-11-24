@@ -70,6 +70,8 @@ def test_one_multiregion_scan_and_one_workbook_reused_for_export(tmp_path, monke
     arguments = dict(sheet_name="Sheet1", query="审查 Sheet1 的重复")
     _, first = audit_review_adapter.run_review(inputs, [0], validated, **arguments)
     _, second = audit_review_adapter.run_review(inputs, [0], validated, **arguments)
+    assert calls[0]["requested_checks"] == ["duplicate_row"]
+    assert first["_tool_outcome"]["status"] == "complete"
     assert len(calls) == 1 and len(first["coverage"]) == 6
     assert first["integrity_review"] == second["integrity_review"]
     receipt, = first["publication_receipts"]

@@ -76,6 +76,18 @@ _FORMATS = {
     "data_audit": ("xlsx", "html", "json"),
 }
 _DEFAULT_FORMAT = {kind: formats[0] for kind, formats in _FORMATS.items()}
+
+
+def _audit_format_requested(query: str, fmt: str) -> bool:
+    """Only non-default data-audit formats require an explicit user request."""
+    text = str(query or "")
+    if fmt == "json":
+        return bool(re.search(r"(?i)\bjson\b|\.json\b", text))
+    if fmt == "html":
+        return bool(re.search(r"(?i)\bhtml\b|网页版?|报告页", text))
+    return True
+
+
 LEGACY_DELIVERY_NAMES = (
     "export_paper_analysis", "export_experiment_design", "export_research_notes",
     "export_table", "export_literature_evidence", "export_corpus_gap_report",
@@ -500,12 +512,21 @@ def deliver_research_artifact(**kwargs) -> tuple[str, dict]:
     kind=table：columns+rows、analysis_result_ref+result_section 或 dataset_ref；CSV/TSV/XLSX。
     脚本 emit.table 已保存的 dataset_ref 可直接交付，不必重抄数据；引用不能混用行列或追加。
     kind=bibliography：明确 audit_id 导出全量审查（JSON/XLSX/RIS/BibTeX），或 references 导出显式书目（XLSX/RIS/BibTeX）；不读取最近一次核验。
-    kind=data_audit：真实 integrity_review.review_id；XLSX/HTML/JSON，直接读取同一次扫描与覆盖，勿重抄发现或重跑扫描。
+    kind=data_audit：真实 integrity_review.review_id；默认 XLSX，仅在用户明确要求时 HTML/JSON；直接读取同一次扫描与覆盖，勿重抄发现或重跑扫描。
     JSON issues 含原始 sheet/cell/cells/category/severity；XLSX 原件需仍可访问且哈希一致。每次仅发布 output_format 请求的格式。
     kind=research_notes：project_name、limit、可选 svg_code；HTML。
     kind=corpus_gap：gaps；CSV。append 仅用于报告、表格、文献、语料缺口分批追加。
     不生成缺失科学数据；Word 文档编辑请使用 word_document。
     """
+    data_audit_note = ""
+    if str(kwargs.get("kind") or "") == "data_audit":
+        requested_format = str(kwargs.get("output_format") or "").strip().lower()
+        if requested_format in {"json", "html"}:
+            from src.core.tracing import original_query
+            query = original_query() or ""
+            if query and not _audit_format_requested(query, requested_format):
+                kwargs = {**kwargs, "output_format": "xlsx"}
+                data_audit_note = "未要求 JSON/HTML；数据审查默认交付一份原表标注 XLSX。\n"
     request = DeliveryInput.model_validate(kwargs)
     from src.core.tracing import get_current_tool_name, set_current_tool_name
     from .delivery_reconciliation import before_publication, delivery_outcome
@@ -528,6 +549,8 @@ def deliver_research_artifact(**kwargs) -> tuple[str, dict]:
     finally:
         set_current_tool_name(previous_tool)
     text = text if isinstance(text, str) else ""
+    if data_audit_note:
+        text = data_audit_note + text
     receipts, complete = _receipts(text)
     # Legacy renderers report validation/publication errors in-band, including
     # partial HTML success followed by a failed SVG companion publication.

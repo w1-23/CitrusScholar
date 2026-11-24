@@ -709,7 +709,7 @@
       "type": "function",
       "function": {
         "name": "audit_uploaded_data",
-        "description": "对授权原表的指定工作表或区域执行一次审查并保存快照。\n\nfile_ids_json 选择账号中真实文件，file_indexes_json 指定来源序号。\nsheet_name 用实际表名；checks_json.regions 绑定 file_index、sheet、\n绝对 bounds 和 header_rows。field_roles 映射列角色、键和脚注，\nrequested_checks 限定用户要求的检查，profile 默认 balanced。\nreported_summaries / reported_p_values 只接受核实后的区域与统计量绑定。\n默认每份原件交付一份 XLSX。再次导出用已有 review_id，无需重扫。\n显式旧审查计划保留兼容；工具返回有限摘要和已有成果引用。",
+        "description": "对授权原表的指定工作表或区域执行一次审查并保存快照。\n\nfile_ids_json 选择账号中真实文件，file_indexes_json 指定来源序号。\nsheet_name 用实际表名；checks_json.regions 绑定 file_index、sheet、\n绝对 bounds 和 header_rows。field_roles 映射列角色、键和脚注，\nrequested_checks 限定用户要求的检查，profile 默认 balanced\n（可选 balanced/duplicates/relations/numeric_forensics/custom/on_demand）。\nrequested_checks 中的 duplicates/duplicate_rows 归一为 duplicate_row；\n需要完整重复族时使用 profile=duplicates。\npublish_formats 接受 JSON 字符串或字符串数组，默认 xlsx。\nreported_summaries / reported_p_values 只接受核实后的区域与统计量绑定。\n默认每份原件交付一份 XLSX。再次导出用已有 review_id，无需重扫。\n显式旧审查计划保留兼容；工具返回有限摘要和已有成果引用。",
         "parameters": {
           "properties": {
             "file_indexes_json": {
@@ -785,6 +785,9 @@
             },
             "publish_formats": {
               "anyOf": [
+                {
+                  "type": "string"
+                },
                 {
                   "items": {
                     "type": "string"
@@ -1084,7 +1087,7 @@
       "type": "function",
       "function": {
         "name": "deliver_research_artifact",
-        "description": "将已具备的研究内容发布到资料库，由界面下载导出。\n\nkind=report：content Markdown，purpose=general/paper_analysis/experiment_design；HTML，可附 svg_code。\nkind=table：columns+rows、analysis_result_ref+result_section 或 dataset_ref；CSV/TSV/XLSX。\n脚本 emit.table 已保存的 dataset_ref 可直接交付，不必重抄数据；引用不能混用行列或追加。\nkind=bibliography：明确 audit_id 导出全量审查（JSON/XLSX/RIS/BibTeX），或 references 导出显式书目（XLSX/RIS/BibTeX）；不读取最近一次核验。\nkind=data_audit：真实 integrity_review.review_id；XLSX/HTML/JSON，直接读取同一次扫描与覆盖，勿重抄发现或重跑扫描。\nJSON issues 含原始 sheet/cell/cells/category/severity；XLSX 原件需仍可访问且哈希一致。每次仅发布 output_format 请求的格式。\nkind=research_notes：project_name、limit、可选 svg_code；HTML。\nkind=corpus_gap：gaps；CSV。append 仅用于报告、表格、文献、语料缺口分批追加。\n不生成缺失科学数据；Word 文档编辑请使用 word_document。",
+        "description": "将已具备的研究内容发布到资料库，由界面下载导出。\n\nkind=report：content Markdown，purpose=general/paper_analysis/experiment_design；HTML，可附 svg_code。\nkind=table：columns+rows、analysis_result_ref+result_section 或 dataset_ref；CSV/TSV/XLSX。\n脚本 emit.table 已保存的 dataset_ref 可直接交付，不必重抄数据；引用不能混用行列或追加。\nkind=bibliography：明确 audit_id 导出全量审查（JSON/XLSX/RIS/BibTeX），或 references 导出显式书目（XLSX/RIS/BibTeX）；不读取最近一次核验。\nkind=data_audit：真实 integrity_review.review_id；默认 XLSX，仅在用户明确要求时 HTML/JSON；直接读取同一次扫描与覆盖，勿重抄发现或重跑扫描。\nJSON issues 含原始 sheet/cell/cells/category/severity；XLSX 原件需仍可访问且哈希一致。每次仅发布 output_format 请求的格式。\nkind=research_notes：project_name、limit、可选 svg_code；HTML。\nkind=corpus_gap：gaps；CSV。append 仅用于报告、表格、文献、语料缺口分批追加。\n不生成缺失科学数据；Word 文档编辑请使用 word_document。",
         "parameters": {
           "properties": {
             "kind": {

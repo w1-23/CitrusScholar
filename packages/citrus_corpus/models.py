@@ -1,6 +1,5 @@
 """Offline CPU query and build models for the isolated corpus."""
 from hashlib import file_digest, sha256
-from importlib.metadata import version
 import json
 from pathlib import Path
 import re
@@ -14,6 +13,8 @@ class CpuE5:
     dim = 1024
 
     def __init__(self, cache_dir):
+        from fastembed import __version__ as fastembed_version
+
         self.cache_dir = Path(cache_dir)
         repository = self.cache_dir / "models--qdrant--multilingual-e5-large-onnx"
         with (repository / "refs" / "main").open(encoding="ascii") as stream:
@@ -21,7 +22,7 @@ class CpuE5:
         if not re.fullmatch(r"[a-f0-9]{40}", revision):
             raise ValueError("corpus_embedding_revision_invalid")
         self.snapshot = repository / "snapshots" / revision
-        profile = {"revision": revision, "fastembed": version("fastembed"), "provider": "CPUExecutionProvider",
+        profile = {"revision": revision, "fastembed": fastembed_version, "provider": "CPUExecutionProvider",
                    "model_data_bytes": (self.snapshot / "model.onnx_data").stat().st_size}
         for name in ("config.json", "model.onnx", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
             item = self.snapshot / name

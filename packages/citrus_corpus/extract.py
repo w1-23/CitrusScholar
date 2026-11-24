@@ -10,6 +10,8 @@ FORMATS = {
     ".md": "markdown", ".markdown": "markdown", ".txt": "text",
     ".pdf": "pdf", ".html": "html", ".htm": "html", ".xml": "xml",
 }
+PARSER_VERSIONS = {"text": "utf8-v1", "markdown": "utf8-markdown-v1", "pdf": "pymupdf-text-v1",
+                   "html": "lxml-markdown-v1", "xml": "lxml-jats-markdown-v1"}
 MEDIA_TYPES = {
     "text/markdown": "markdown", "text/plain": "text", "application/pdf": "pdf",
     "text/html": "html", "application/xhtml+xml": "html", "application/xml": "xml", "text/xml": "xml",

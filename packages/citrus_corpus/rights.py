@@ -144,3 +144,18 @@ def evaluate_source_rights(meta: Any) -> dict[str, Any]:
         "license": "",
         "reason": "license_not_trusted",
     }
+
+
+def decision_evidence(decision, evidence, license_id):
+    """Structure an operator-reviewed, version-bound publication decision."""
+    if decision == "revoked":
+        return "admin_revoke", "", ""
+    if (not isinstance(evidence, str) or not 1 <= len(evidence) <= 1000
+            or any(ord(char) < 32 for char in evidence)):
+        raise ValueError("rights_evidence_required")
+    if license_id:
+        checked = evaluate_source_rights({"license_verified": True, "license": license_id})
+        if checked["status"] != "trusted":
+            raise ValueError("rights_license_inadmissible")
+        return "operator_verified_open_license", checked["license"], evidence
+    return "admin_grant", "", evidence

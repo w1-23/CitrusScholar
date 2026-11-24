@@ -50,7 +50,7 @@ def saved(intake, name, raw, actor="owner", doi="10.1234/work"):
 
 def grant(catalog, result, decision="granted"):
     catalog.decide(result["document_id"], result["version_id"], decision=decision,
-                   actor="reviewer", reason="Original rights checked")
+                   actor="reviewer", reason="Original rights checked", evidence="fixture:open-rights")
 
 
 def test_extraction_and_scoped_acquisition(store):

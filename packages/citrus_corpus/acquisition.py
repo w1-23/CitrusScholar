@@ -81,9 +81,10 @@ def _request(url, remaining):
 
 
 class ExplicitAcquirer:
-    def __init__(self, redirect_hosts=(), *, transport=_request):
+    def __init__(self, redirect_hosts=(), *, transport=_request, allowed=lambda: True):
         self.redirect_hosts = frozenset(str(host).lower() for host in redirect_hosts)
         self.transport = transport
+        self.allowed = allowed
 
     def __call__(self, request):
         if request.get("kind") != "explicit":
@@ -102,10 +103,12 @@ class ExplicitAcquirer:
 
         try:
             for _ in range(3):
-                if urlsplit(current).scheme != "https":
+                if not self.allowed() or urlsplit(current).scheme != "https":
                     raise PreparationError("network_scope_denied")
                 location, data, media = self.transport(current, remaining)
                 if location is None:
+                    if not self.allowed():
+                        raise PreparationError("network_scope_denied")
                     if data is None:
                         raise PreparationError("source_redirect_denied")
                     return data, source_format(urlsplit(current).path, media)

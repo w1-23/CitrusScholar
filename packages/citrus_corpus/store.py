@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS versions (
 CREATE INDEX IF NOT EXISTS versions_latest ON versions(document_id, seq DESC);
 CREATE TABLE IF NOT EXISTS rights_events (
     seq INTEGER PRIMARY KEY, document_id TEXT NOT NULL, version_id TEXT NOT NULL,
-    decision TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, at REAL NOT NULL
+    decision TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, at REAL NOT NULL,
+    basis TEXT NOT NULL, scope TEXT NOT NULL, evidence TEXT NOT NULL, raw_sha256 TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS publications (
     seq INTEGER PRIMARY KEY, generation TEXT NOT NULL UNIQUE, selection TEXT NOT NULL,
@@ -44,11 +45,12 @@ INSERT OR IGNORE INTO corpus_state (id) VALUES (1);
 
 
 class Store:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, read_timeout=0.2):
         raw = Path(root).expanduser()
         if not raw.is_absolute() or raw.is_symlink():
             raise ValueError("corpus_root_invalid")
         self.root = raw.resolve()
+        self.read_timeout = read_timeout
         if self.root != raw or not self.root.is_dir():
             raise ValueError("corpus_root_invalid")
         self.db = self.root / "corpus.sqlite3"
@@ -87,7 +89,7 @@ class Store:
 
     @contextmanager
     def read(self):
-        with closing(sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True, timeout=0.2)) as conn:
+        with closing(sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True, timeout=self.read_timeout)) as conn:
             conn.row_factory = sqlite3.Row
             yield conn
 

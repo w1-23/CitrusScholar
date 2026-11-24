@@ -1,9 +1,11 @@
 """Version continuity, rights audit and live visibility for isolated works."""
 from hashlib import sha256
+import json
 import time
 
-from . import chunks, prepare
+from . import chunks, prepare, rights
 from .contract import ISOLATED
+from .extract import PARSER_VERSIONS
 
 
 class Catalog:
@@ -21,6 +23,7 @@ class Catalog:
             "title": prepare.public_text(job["request"].get("title"), 512),
             "doi": identity.removeprefix("doi:") if identity.startswith("doi:") else "",
             "source_kind": job["request"]["kind"], "source_format": source_format,
+            "source_parser": PARSER_VERSIONS[source_format],
             "source_sha256": raw_digest, "content_sha256": digest, "char_count": len(markdown),
             "prepared_at": prepare.utc_now(), "section_path": [row["section_name"] for row in outline
                                                               if row["section_level"]],
@@ -47,17 +50,23 @@ class Catalog:
             queue.complete(conn, job, document=previous["document_id"], version=previous["version_id"], digest=raw_digest)
         return True
 
-    def decide(self, document_id, version_id, *, decision, actor, reason):
+    def decide(self, document_id, version_id, *, decision, actor, reason, evidence="", license_id=""):
         actor, reason = prepare.public_text(actor, 128), prepare.public_text(reason, 500)
         if not actor or not reason or decision not in {"granted", "revoked"}:
             raise ValueError("rights_decision_invalid")
+        basis, license_token, locator = rights.decision_evidence(decision, evidence, license_id)
+        evidence_record = json.dumps({"locator": locator, "license": license_token}, ensure_ascii=False)
         with self.store.write(timeout=2) as conn:
-            cursor = conn.execute("UPDATE versions SET rights=? WHERE document_id=? AND version_id=?",
-                                  (decision, document_id, version_id))
-            if cursor.rowcount != 1:
+            version = conn.execute("SELECT raw_sha256 FROM versions WHERE document_id=? AND version_id=?",
+                                   (document_id, version_id)).fetchone()
+            if version is None:
                 raise KeyError("corpus_version_unknown")
-            conn.execute("""INSERT INTO rights_events (document_id,version_id,decision,actor,reason,at)
-                         VALUES(?,?,?,?,?,?)""", (document_id, version_id, decision, actor, reason, time.time()))
+            conn.execute("UPDATE versions SET rights=? WHERE document_id=? AND version_id=?",
+                         (decision, document_id, version_id))
+            conn.execute("""INSERT INTO rights_events
+                         (document_id,version_id,decision,actor,reason,at,basis,scope,evidence,raw_sha256)
+                         VALUES(?,?,?,?,?,?,?,?,?,?)""", (document_id, version_id, decision, actor,
+                         reason, time.time(), basis, "shared_corpus_publication", evidence_record, version[0]))
 
     def visible(self, document_id, version_id):
         with self.store.read() as conn:

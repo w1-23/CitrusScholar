@@ -56,10 +56,13 @@ def parser():
     rights.add_argument("version")
     rights.add_argument("--actor", required=True)
     rights.add_argument("--reason", required=True)
+    rights.add_argument("--evidence", default="", help="operator-approved evidence URI or record identifier")
+    rights.add_argument("--license", default="")
     worker = commands.add_parser("worker")
     worker.add_argument("--watch", action="store_true")
     worker.add_argument("--allow-network", action="store_true")
     worker.add_argument("--allow-redirect-host", action="append", default=[])
+    worker.add_argument("--network-marker", help="optional file whose presence authorizes network dispatch")
     commands.add_parser("publish").add_argument("--idle-marker")
     rollback = commands.add_parser("rollback")
     rollback.add_argument("generation")
@@ -90,10 +93,13 @@ def _run(args):
         if command == "job":
             return intake.queue.status(args.id)
         os.nice(10)
-        acquire = ExplicitAcquirer(args.allow_redirect_host) if args.allow_network else None
+        def network_allowed():
+            return args.allow_network and (args.network_marker is None or Path(args.network_marker).is_file())
+
+        acquire = ExplicitAcquirer(args.allow_redirect_host, allowed=network_allowed)
         while True:
             try:
-                result = intake.process_one(acquire=acquire)
+                result = intake.process_one(acquire=acquire if network_allowed() else None)
             except (sqlite3.Error, OSError, ValueError) as exc:
                 if not args.watch:
                     raise
@@ -107,7 +113,7 @@ def _run(args):
         return Catalog(store).versions()
     if command == "rights":
         Catalog(store).decide(args.document, args.version, decision=args.decision,
-                              actor=args.actor, reason=args.reason)
+                              actor=args.actor, reason=args.reason, evidence=args.evidence, license_id=args.license)
         return {"state": args.decision}
     if command == "read":
         return Reader(store).reference(json.loads(args.reference))

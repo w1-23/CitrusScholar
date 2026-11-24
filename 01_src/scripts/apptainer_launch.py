@@ -118,6 +118,11 @@ def command(config, role):
     # Code sandbox command never inherits this flag or these application binds.
     if role in {'web', 'worker'}:
         result += ['--env', 'CITRUS_WORKER_RELEASE=' + release_identity(config)]
+        commit = config.get('source_head')
+        if commit is not None:
+            if not isinstance(commit, str) or not re.fullmatch('[a-f0-9]{40}', commit):
+                raise ValueError('Invalid source commit for deployment')
+            result += ['--env', 'CITRUS_SOURCE_COMMIT=' + commit]
     if role == 'worker' and os.getenv('INVOCATION_ID'):
         invocation = os.environ['INVOCATION_ID']
         if not re.fullmatch('[a-f0-9]{32}', invocation) or invocation == '0' * 32:
@@ -193,6 +198,22 @@ def command(config, role):
         result += ['--env', 'CITRUS_SKILL_RELEASE=' + str(skill_release)]
         if (skill_release / 'python').is_dir():
             python_path.insert(0, f'{skill_release}/python')
+    historical = config.get('historical_skill_releases', [])
+    if not isinstance(historical, list) or len(historical) > 16:
+        raise ValueError('Invalid historical Skill release registry')
+    if role == 'web':
+        used = {Path(path) for path, _mode in binds}
+        for item in historical:
+            if not isinstance(item, dict) or item.keys() != {'path', 'mount_path', 'sha256'}:
+                raise ValueError('Invalid historical Skill release entry')
+            prior = verified_skill_release({'skill_release': item['path'],
+                                           'skill_release_sha256': item['sha256']}, binds)
+            destination = Path(absolute(item['mount_path']))
+            if (prior is None or destination == Path('/') or
+                    any(destination.is_relative_to(path) or path.is_relative_to(destination) for path in used)):
+                raise ValueError('Historical Skill mount overlaps an existing deployment bind')
+            used.add(destination)
+            result += ['--bind', f'{prior}:{destination}:ro']
     result += ['--env', 'PYTHONPATH=' + ':'.join(python_path)]
     if native_runtime:
         if skill_release is None:

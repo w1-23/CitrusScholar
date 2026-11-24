@@ -6108,6 +6108,39 @@ async def list_account_file_library(request: Request, session_id: str = ""):
     }
 
 
+@app.post("/api/v2/session/{session_id}/files/upload", status_code=201)
+async def upload_account_library_file(session_id: str, request: Request, filename: str):
+    """Store a private library file without starting a chat turn."""
+    from mimetypes import guess_type
+    from src.api.turn_envelope import MAX_NAME_CHARS, MAX_UPLOAD_BYTES, _ALLOWED_UPLOAD_SUFFIXES, _register_upload
+
+    user = current_user(request)
+    _require_active_turn_session(session_id, user)
+    name = filename.strip()
+    if (not name or len(name) > MAX_NAME_CHARS or any(c in name for c in ("/", "\\"))
+            or any(ord(c) < 32 for c in name)
+            or Path(name).suffix.lower().lstrip(".") not in _ALLOWED_UPLOAD_SUFFIXES):
+        raise HTTPException(400, "文件名或文件格式不受支持。")
+    content = bytearray()
+    async for block in request.stream():
+        if len(content) + len(block) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "单个文件不能超过 20 MB。")
+        content.extend(block)
+    if not content:
+        raise HTTPException(400, "无法上传空文件。")
+    owner = int(user["user_id"])
+
+    def store():
+        _require_active_turn_session(session_id, user)
+        return _register_upload(session_id=session_id, owner_user_id=owner, name=name,
+                                mime=guess_type(name)[0] or "application/octet-stream",
+                                content=bytes(content), client_request_id="")
+
+    async with _turn_session_lock(session_id):
+        item = await asyncio.to_thread(store)
+    return {key: item[key] for key in ("file_id", "filename", "size_bytes", "sha256")}
+
+
 class AccountFileExportRequest(BaseModel):
     model_config = {"extra": "forbid", "strict": True}
     target_format: str = Field(min_length=1, max_length=20)
@@ -6143,11 +6176,11 @@ async def export_account_file(file_id: str, body: AccountFileExportRequest, requ
 
 
 @app.get("/api/v2/files/{file_id}/preview")
-async def preview_account_file(file_id: str, request: Request):
+async def preview_account_file(file_id: str, request: Request, library_tile: bool = False):
     user = current_user(request)
     from src.session import files as session_files
     info = await asyncio.to_thread(session_files.get_account_file, file_id,
-                                   int(user["user_id"]), touch=True)
+                                   int(user["user_id"]), touch=not library_tile)
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
     from src.session.files import _canonical_mime, kind_for
@@ -6155,6 +6188,9 @@ async def preview_account_file(file_id: str, request: Request):
     # application/octet-stream，浏览器遇到那种类型会下载而不是显示，看起来就是空白。
     mime = _canonical_mime(info.get("filename", ""), info.get("mime_type", ""))
     kind = info.get("kind") or kind_for(info.get("filename", ""), mime)
+    if library_tile and (kind != "image" or mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}
+                         or info["size_bytes"] > 2 * 1024 * 1024):
+        raise HTTPException(404, "该文件没有资料库缩略图。")
     if kind == "html":
         from urllib.parse import quote
         return FileResponse(path=info["path"], media_type="text/html",

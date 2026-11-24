@@ -12,10 +12,11 @@ function messages(b) { return b.get('chat-container').querySelectorAll('.message
 function posts(b) {
   return b.requests.filter(r => r.opts && r.opts.method === 'POST' && r.url.includes('/turn-queue'));
 }
-// refreshTaskComposer only mounts its live hint when the input has a parent.
+// The live hint is mounted by the composer markup.
 function mounted(b) {
   const host = b.get('composer');
   if (input(b).parentNode !== host) host.appendChild(input(b));
+  host.appendChild(b.get('composer-task-status'));
   return b;
 }
 function refresh(b) { b.ctx.refreshTaskComposer(); }
@@ -42,25 +43,25 @@ function rail() {
     dropPending(id) { this.drops.push(id); }, reload() {}, sync() {}};
 }
 
-test('send button is hidden until the composer has text', () => {
+test('send stays mounted and signals availability', () => {
   const b = mounted(browser());
   b.ctx._selectedAttachments = [];
   b.ctx._selectedAccountFileRefs = [];
   input(b).value = '';
   refresh(b);
-  assert.equal(sendBtn(b).style.display, 'none');
+  assert.equal(sendBtn(b).getAttribute('aria-disabled'), 'true');
   input(b).value = '   ';
   refresh(b);
-  assert.equal(sendBtn(b).style.display, 'none', 'whitespace alone does not offer send');
+  assert.equal(sendBtn(b).getAttribute('aria-disabled'), 'true', 'whitespace alone does not offer send');
   input(b).value = '正文';
   refresh(b);
-  assert.equal(sendBtn(b).style.display, 'flex');
+  assert.equal(sendBtn(b).getAttribute('aria-disabled'), 'false');
   input(b).value = '';
   refresh(b);
-  assert.equal(sendBtn(b).style.display, 'none', 'clearing text hides send again');
+  assert.equal(sendBtn(b).getAttribute('aria-disabled'), 'true', 'clearing text disables send semantically');
   b.ctx._selectedAttachments = [{name: 'a.pdf', type: 'application/pdf'}];
   refresh(b);
-  assert.equal(sendBtn(b).style.display, 'none', 'attachments alone do not offer send');
+  assert.equal(sendBtn(b).getAttribute('aria-disabled'), 'true', 'attachments alone do not offer send');
 });
 
 test('Enter suppresses the default newline and sends exactly once', async () => {

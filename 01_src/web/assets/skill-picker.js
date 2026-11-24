@@ -2,6 +2,8 @@
   'use strict';
   var titles = {'candidate-search':'科研检索', 'research-question-answering':'科研问答', 'reference-verification':'文献核验',
     'data-audit':'数据审查', 'nature-figure':'科研绘图'};
+  var icons = {'candidate-search':'search', 'research-question-answering':'search',
+    'reference-verification':'book', 'data-audit':'database', 'nature-figure':'chart'};
   function create(options) {
     var selected = [], catalog = [], generation = 0, revision = 0;
     var list = options.list, status = options.status, summary = options.summary;
@@ -36,12 +38,14 @@
           if (check.checked && selected.length >= 4) { check.checked = false; status.textContent = '每轮最多选择 4 项场景。'; return; }
           selected = selected.filter(function (pick) { return pick.id !== item.id; });
           if (check.checked) selected.push(identity(item));
-          revision++; drawSummary(); closeMenu(true);
+          revision++; drawSummary();
         });
+        var icon = document.createElement('span'); icon.className = 'skill-choice-icon';
+        icon.innerHTML = window.uiIcon(icons[item.id] || 'file');
         var text = document.createElement('span'), name = document.createElement('strong'), description = document.createElement('small');
         name.textContent = title(item);
         description.textContent = item.description;
-        text.appendChild(name); text.appendChild(description); label.appendChild(check); label.appendChild(text); list.appendChild(label);
+        text.appendChild(name); text.appendChild(description); label.appendChild(check); label.appendChild(icon); label.appendChild(text); list.appendChild(label);
       });
       drawSummary();
     }

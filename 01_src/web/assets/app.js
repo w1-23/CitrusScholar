@@ -245,7 +245,7 @@ function renderAgentAvatar(container) {
   if (!container) return;
   var image = document.createElement('img');
   image.className = 'agent-avatar-image';
-  image.src = '/assets/citrusscholar-mascot.png';
+  image.src = '/assets/citrus-mark.svg';
   image.alt = 'CitrusScholar 助手';
   image.width = 36;
   image.height = 36;
@@ -2554,8 +2554,8 @@ function grantPermission(toolName, scope) { return decidePermission(toolName, 'g
 function rejectPermission(toolName) { return decidePermission(toolName, 'rejected', 'once'); }
 
 /* ─── Theme（C: 三套主题循环：浅色清新 → 深色 → 卡通）─── */
-var THEME_CYCLE = ['light', 'cartoon', 'dark'];
-var THEME_LABEL = { light: '春日花笺', cartoon: '午后书房', dark: '夜林花语' };
+var THEME_CYCLE = ['sage', 'paper', 'navy', 'light', 'cartoon', 'dark'];
+var THEME_LABEL = { sage: '浅绿白', paper: '暖纸白', navy: '夜间蓝', light: '春日花笺', cartoon: '午后书房', dark: '夜林花语' };
 (function() {
   var t = localStorage.getItem('citrus_theme') || 'light';
   if (THEME_CYCLE.indexOf(t) < 0) t = 'light';
@@ -2809,30 +2809,23 @@ function refreshTaskComposer() {
     (window._selectedAccountFileRefs && window._selectedAccountFileRefs.length));
   if (button) {
     button.disabled = !!historyRequest || !!(supplement && (supplement.controller.isBusy() || !(currentTarget || pendingUpdate && targetReachable)));
-    button.style.display = composerHasText || pendingUpdate ? 'flex' : 'none';
     var sendLabel = pendingUpdate ? (currentTarget ? '核对并重试上次补充' : '核对上次补充') : supplement ? '提交补充' : '发送消息';
     button.title = sendLabel + ' (Enter)';
     button.setAttribute('aria-label', sendLabel);
+    button.setAttribute('aria-disabled', String(button.disabled || (!composerHasText && !pendingUpdate)));
   }
   if (stop) {
-    stop.style.display = executing ? 'flex' : 'none';
+    stop.disabled = !executing || !!stopping;
+    stop.classList.toggle('is-visible', executing);
     stop.title = '停止执行中的任务；排队中的消息不会被取消';
   }
   if (userInput) {
     if (supplement) userInput.maxLength = 8000;
     else userInput.removeAttribute('maxlength');
-    userInput.placeholder = supplement ? '给此任务补充要求（仅正文）' : awaitingQuestion
-      ? '可发送新消息，答复请使用选择卡片'
-      : executing ? '发送后将作为新消息处理'
-      : queued ? '可继续发送，消息会按发送顺序排队'
-      : '有什么想做的？(Enter 发送 / Shift+Enter 换行)';
+    userInput.placeholder = supplement ? '给此任务补充要求（仅正文）'
+      : '向 CitrusScholar 提问，或上传文件进行分析…';
   }
   var hint = document.getElementById('composer-task-status');
-  if (!hint && userInput && userInput.parentNode) {
-    hint = document.createElement('p'); hint.id = 'composer-task-status'; hint.className = 'composer-task-status';
-    hint.setAttribute('role', 'status'); hint.setAttribute('aria-live', 'polite');
-    userInput.parentNode.appendChild(hint);
-  }
   if (hint) {
     hint.textContent = supplement ? (supplement.controller.isBusy() ? '正在提交或核对补充…'
       : !currentTarget && !pendingUpdate ? '此任务当前无法接收补充。草稿已保留，可选择「作为新任务」。'
@@ -2846,6 +2839,7 @@ function refreshTaskComposer() {
       : queued ? '有 ' + queued + ' 条消息排队中。'
       : terminal && state.display_status === 'cancelled' ? '已停止。可继续发送新的消息。' : '';
     hint.hidden = !hint.textContent;
+    hint.title = hint.textContent;
   }
 }
 
@@ -4008,16 +4002,22 @@ function addMessage(role, html, before, fresh) {
   return div.querySelector('.content');
 }
 
+function uiIcon(name) {
+  return '<svg class="ui-icon" aria-hidden="true"><use href="#ui-' + name + '"></use></svg>';
+}
+
 function appendMessageActions(content, role, text) {
   if (!content) return;
   var message = content.closest ? content.closest('.message') : content.parentNode;
-  var actionHost = role === 'user' && message ? message : content;
+  var assistant = role === 'assistant';
+  if (assistant && !String(text || '').trim()) return;
+  var actionHost = message || content;
   if (actionHost.querySelector('.message-actions')) return;
   var actions = document.createElement('div');
-  actions.className = 'message-actions';
+  actions.className = 'message-actions' + (assistant ? ' assistant-actions' : '');
   var copy = document.createElement('button');
   copy.type = 'button'; copy.className = 'message-action'; copy.title = '复制内容';
-  copy.setAttribute('aria-label', '复制内容'); copy.textContent = '⧉ 复制';
+  copy.setAttribute('aria-label', '复制内容'); copy.innerHTML = uiIcon('copy') + '<span>复制</span>';
   copy.addEventListener('click', function() { copyMessageText(String(text || ''), copy); });
   actions.appendChild(copy);
   if (role === 'user') {
@@ -4037,13 +4037,15 @@ function appendMessageActions(content, role, text) {
     actions.appendChild(edit);
   }
   actionHost.appendChild(actions);
+  if (assistant) appendFeedback(actions);
 }
 
 function copyMessageText(text, button) {
   function showCopied() {
     if (!button) return;
-    var old = button.textContent; button.textContent = '✓ 已复制';
-    setTimeout(function() { button.textContent = old; }, 1200);
+    var label = button.querySelector('span') || button;
+    var old = label.textContent; label.textContent = '已复制';
+    setTimeout(function() { label.textContent = old; }, 1200);
   }
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(showCopied).catch(function() { copyMessageFallback(text, showCopied); });
@@ -4172,8 +4174,8 @@ function appendFeedback(msgEl) {
   if (!msgEl || msgEl.querySelector('.msg-feedback')) return;
   var fb = document.createElement('div');
   fb.className = 'msg-feedback';
-  fb.innerHTML = '<button class="fb-btn" data-rating="1" title="回答有帮助">👍 有用</button>' +
-                 '<button class="fb-btn" data-rating="-1" title="回答有问题">👎 有问题</button>' +
+  fb.innerHTML = '<button class="fb-btn" data-rating="1" title="回答有帮助">' + uiIcon('like') + '<span>有用</span></button>' +
+                 '<button class="fb-btn" data-rating="-1" title="回答有问题">' + uiIcon('dislike') + '<span>有问题</span></button>' +
                  '<span class="fb-msg"></span>';
   msgEl.appendChild(fb);
 }
@@ -4190,7 +4192,7 @@ function submitFeedback(fb, mid, rating, comment) {
   }).then(function (r) { if (epoch !== authEpoch) return; return r.json(); }).then(function (d) { if (epoch !== authEpoch) return;
     var row = fb.querySelector('.fb-row');
     if (row) row.remove();
-    if (d && d.status === 'ok' && fbMsg) { fbMsg.textContent = rating === 1 ? '已记录 👍' : '已记录 👎'; }
+    if (d && d.status === 'ok' && fbMsg) { fbMsg.textContent = '已记录'; }
   }).catch(function () { if (epoch !== authEpoch) return;
     var row = fb.querySelector('.fb-row');
     if (row) row.remove();
@@ -4238,7 +4240,7 @@ async function clearSession(silent) {
   try {
     await accountFetch('/api/v1/session/' + sessionId + '/clear', { method: 'POST' });
     if (epoch !== authEpoch) return;
-    chatContainer.innerHTML = '<div class="message bot"><div class="avatar"><img class="agent-avatar-image" src="/assets/citrusscholar-mascot.png" alt="CitrusScholar 助手" width="36" height="36"></div><div class="content">您好！有什么想了解的？</div></div>';
+    chatContainer.innerHTML = '<div class="message bot"><div class="avatar"><img class="agent-avatar-image" src="/assets/citrus-mark.svg" alt="CitrusScholar 助手" width="36" height="36"></div><div class="content">您好！有什么想了解的？</div></div>';
     sidebarContent.innerHTML = '<div class="empty-sidebar">提交问题后文献将在此展示</div>';
     citationCount.textContent = '0';
     _historyMsgs = [];
@@ -5102,10 +5104,10 @@ async function sendMsg() {
         if (_firstTokenElapsedMs != null) botContent.appendChild(createElapsedBadge(_firstTokenElapsedMs));
         if (data.session_id) sessionId=data.session_id;if(sessionId)localStorage.setItem(sessionStorageKey(),sessionId);
         window.dispatchEvent(new Event('citrus:turn-finished'));
-        appendMessageActions(botContent, 'assistant', fullText.replace(/__NEED_COMPLEX__/g, ''));
+        if (CitrusTaskState.isTerminal({display_status: _terminal})) {
+          appendMessageActions(botContent, 'assistant', fullText.replace(/__NEED_COMPLEX__/g, ''));
+        }
         loadTurnGeneratedFiles(data);
-        // v8.10: 回答完整生成后才显示 👍/👎 反馈栏（主流时序）
-        appendFeedback(answerDiv.closest('.message'));
         attachAnswerSources();
         setSendDisabled(false);userInput.focus();break;
       case 'error':
@@ -6469,6 +6471,9 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
       finalAnswerReceived = true;
+      if (CitrusTaskState.isTerminal(store.state)) {
+        appendMessageActions(content, 'assistant', data.answer || streamedAnswer || (turn.answer && turn.answer.content));
+      }
       process.terminal(CitrusTaskState.displayStatus(data));
       answer.dataset.displayStatus = CitrusTaskState.displayStatus(data);
       if (Array.isArray(data.artifact_ids) && window.loadSessionFiles) window.loadSessionFiles().then(function (payload) {
@@ -6646,7 +6651,9 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
       });
       if (context.current()) renderContextPanel(context.current());
     }
-    appendMessageActions(contentEl, 'assistant', answer.content || '');
+    if (!turn.jobId || process.terminal(turn.displayStatus)) {
+      appendMessageActions(contentEl, 'assistant', answer.content || '');
+    }
     // P0-A: 该轮生成文件只在这一处、按 file_id 幂等追加一次。
     if (turn.files.length) appendTurnGeneratedFiles(contentEl, turn.files, '本轮生成文件');
   }

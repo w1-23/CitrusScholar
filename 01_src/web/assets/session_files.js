@@ -11,12 +11,17 @@
   var panelEl = null;
   var apiBase = '';
   var fileCache = Object.create(null);
+  var libraryRows = [];
   var retentionIdleDays = 0;
   var catalogScope = 0;
 
   function resetSessionFiles() {
     catalogScope += 1;
     fileCache = Object.create(null);
+    libraryRows = [];
+    if (el("librarySearch")) el("librarySearch").value = "";
+    if (el("libraryKind")) el("libraryKind").value = "";
+    if (el("sessionFilesStats")) el("sessionFilesStats").textContent = "";
     retentionIdleDays = 0;
     listLoaded = false;
     closeSessionFilePreview();
@@ -72,12 +77,18 @@
     var jump = (f.turn_request_id && f.source_session_id);
     var menuId = 'session-file-menu-' + String(f.file_id || '');
     var lastAccess = fmtTime(f.last_accessed_at);
+    var ext = String(f.filename || '').split('.').pop().toUpperCase().slice(0, 5);
+    var thumbnail = kind === 'image' && Number(f.size_bytes) <= 2*1024*1024 && safePreviewUrl(f.preview_url);
+    var thumbnailHtml = thumbnail
+      ? '<img src="' + esc(thumbnail + (thumbnail.includes('?') ? '&' : '?') + 'library_tile=1') + '" alt="" loading="lazy">'
+      : window.uiIcon(kind === 'svg' ? 'chart' : 'file') + '<small>' + esc(ext) + '</small>';
     // Card content is not itself a button: preview is an explicit, labelled
     // action, and every secondary operation lives in the ⋯ menu. This keeps a
     // single tab stop per action and gives touch/pointer users a 44px target.
     return '' +
       '<div class="session-file-item" data-file-id="' + esc(f.file_id) + '"' +
       '     data-kind="' + esc(kind) + '" data-filename="' + esc(f.filename) + '">' +
+      '  <span class="session-file-thumb k-' + esc(kind) + '" aria-hidden="true">' + thumbnailHtml + '</span>' +
       '  <div class="session-file-open">' +
       '    <span class="session-file-badge k-' + esc(kind) + '">' + esc(label) + '</span>' +
       // 完整文件名始终放在 title 里：卡片里最多两行，超出的部分截断但可悬停看全名
@@ -85,13 +96,13 @@
       '    <span class="session-file-sub">' + esc(fmtSize(f.size_bytes)) +
              ' · 创建 ' + esc(fmtTime(f.created_at) || '—') + '</span>' +
       (lastAccess
-        ? '    <span class="session-file-last">最近访问 ' + esc(lastAccess) + '</span>'
+        ? '    <span class="session-file-last">最近使用 ' + esc(lastAccess) + '</span>'
         : '') +
       '  </div>' +
       '  <div class="session-file-actions">' +
       '    <button type="button" class="session-file-preview-btn" data-file-act="preview" data-file-id="' +
            esc(f.file_id) + '" title="预览 ' + esc(f.filename) + '" aria-label="预览 ' +
-           esc(f.filename) + '" aria-haspopup="dialog">预览</button>' +
+           esc(f.filename) + '" aria-haspopup="dialog">' + window.uiIcon('eye') + ' 预览</button>' +
       '    <button type="button" class="session-file-ref-pill" data-file-act="reference" data-file-id="' +
            esc(f.file_id) + '" title="在当前对话中引用" aria-label="引用 ' +
            esc(f.filename) + '">＋ 引用</button>' +
@@ -158,20 +169,90 @@
     return '账号资料库 · 跨会话可引用；长期未使用的文件会自动清理。';
   }
 
-  function renderList(payload) {
+  function renderFilteredLibrary() {
     var empty = el('sessionFilesEmpty');
-    var up = (payload.uploaded || []).filter(function (f) { return f.visibility !== 'internal'; });
-    var gen = (payload.generated || []).filter(function (f) { return f.visibility !== 'internal'; });
+    var query = String(el('librarySearch').value || '').trim().toLowerCase();
+    var kind = el('libraryKind').value;
+    var order = el('librarySort').value;
+    var known = ['table','image','svg','pdf','docx','html'];
+    var rows = libraryRows.filter(function (file) {
+      var type = displayKind(file);
+      return (!query || String(file.filename || '').toLowerCase().includes(query)) &&
+        (!kind || kind === type || kind === 'other' && !known.includes(type));
+    });
+    rows.sort(function (a,b) {
+      if (order === 'name') return String(a.filename).localeCompare(String(b.filename), 'zh-CN');
+      if (order === 'created') return (b.created_at || 0) - (a.created_at || 0);
+      return (b.last_accessed_at || b.created_at || 0) - (a.last_accessed_at || a.created_at || 0);
+    });
+    renderGroup(el('sessionFilesUploaded'), el('sessionFilesUploadedGroup'), rows);
+    el('sessionFilesGeneratedGroup').hidden = true;
+    empty.classList.remove('session-files-error');
+    empty.hidden = !!rows.length;
+    empty.textContent = libraryRows.length ? '没有符合筛选条件的资料。' : '还没有资料，上传后可在对话中引用。';
+  }
+
+  function renderList(payload) {
+    libraryRows = (payload.uploaded || []).concat(payload.generated || []).filter(function (f) {
+      return f.visibility !== 'internal';
+    });
     retentionIdleDays = Math.max(0, Math.floor(Number(payload.retention_idle_days) || 0));
     fileCache = Object.create(null);
-    up.concat(gen).forEach(function(file) { fileCache[file.file_id] = file; });
-    renderGroup(el('sessionFilesUploaded'), el('sessionFilesUploadedGroup'), up);
-    renderGroup(el('sessionFilesGenerated'), el('sessionFilesGeneratedGroup'), gen);
-    empty.hidden = (up.length + gen.length) > 0;
-    if (!empty.hidden) empty.textContent = '还没有资料。上传文件和按需生成的文件保存在你的账号资料库中，可在其他会话引用。';
+    libraryRows.forEach(function(file) { fileCache[file.file_id] = file; });
+    el('sessionFilesStats').textContent = '共 ' + libraryRows.length + ' 份资料 · ' +
+      fmtSize(libraryRows.reduce(function (n,file) { return n+(Number(file.size_bytes)||0); },0));
+    renderFilteredLibrary();
     var retention = el('sessionFilesRetention');
-    if (retention) {
-      retention.textContent = retentionSentence(payload.retention_idle_days);
+    if (retention) retention.textContent = retentionSentence(payload.retention_idle_days);
+  }
+
+  function bindLibraryUpload() {
+    var input = el('libraryUploadInput'), button = el('libraryUploadButton');
+    var zone = el('libraryUploadZone'), status = el('libraryUploadStatus');
+    var formats = /\.(?:csv|tsv|xlsx|xls|xlsm|xlsb|pdf|docx|jpe?g|png|webp|gif|txt|md)$/i;
+    button.addEventListener('click', function () { input.click(); });
+    input.addEventListener('change', function () {
+      upload(Array.from(input.files)); input.value = '';
+    });
+    zone.addEventListener('dragover', function (event) {
+      if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+      event.preventDefault(); if (!button.disabled) zone.classList.add('is-dragging');
+    });
+    zone.addEventListener('dragleave', function () { zone.classList.remove('is-dragging'); });
+    zone.addEventListener('drop', function (event) {
+      event.preventDefault(); zone.classList.remove('is-dragging');
+      upload(Array.from(event.dataTransfer.files));
+    });
+    async function upload(files) {
+      if (button.disabled || !files.length) return;
+      var sid = currentSessionId(), scope = catalogScope;
+      status.hidden = false;
+      if (!sid) { status.textContent = '请先打开一个会话。'; return; }
+      if (files.length > 8) { status.textContent = '每次最多上传 8 个文件。'; return; }
+      button.disabled = true;
+      var saved = 0, failures = [];
+      try {
+        for (var index = 0; index < files.length && scope === catalogScope; index++) {
+          var file = files[index];
+          status.textContent = '正在上传 ' + (index+1) + ' / ' + files.length;
+          if (!formats.test(file.name) || file.size > 20*1024*1024 || !file.size) {
+            failures.push(file.name + '：格式或大小不符');
+            continue;
+          }
+          try {
+            var path = '/api/v2/session/' + encodeURIComponent(sid) + '/files/upload?filename=' + encodeURIComponent(file.name);
+            var res = await (window.accountFetch || fetch)(path,{method:'POST',body:file});
+            if (!res.ok) {
+              var body = await res.json().catch(function () { return {}; });
+              failures.push(file.name + '：' + (typeof body.detail === 'string' ? body.detail : '上传失败'));
+            } else saved++;
+          } catch (_) { failures.push(file.name + '：上传失败'); }
+        }
+        if (scope === catalogScope) {
+          status.textContent = (saved ? '已上传 ' + saved + ' 份。' : '') + failures.join('；');
+          if (saved) await loadSessionFiles();
+        }
+      } finally { button.disabled = false; }
     }
   }
 
@@ -1378,6 +1459,10 @@
     panelEl = el('sessionFilesPanel');
     if (!panelEl) return;
     bindLibraryResizer();
+    bindLibraryUpload();
+    el('librarySearch').addEventListener('input', renderFilteredLibrary);
+    el('libraryKind').addEventListener('change', renderFilteredLibrary);
+    el('librarySort').addEventListener('change', renderFilteredLibrary);
     bindFileActions();
     observeTurnCards();
     // 会话切换时刷新列表
@@ -1409,7 +1494,7 @@
      （LIB_MIN_CHAT）。拖动只改 CSS 变量 --library-w，不触碰消息 DOM，
      所以拖动过程不会触发消息列表重渲染。 */
   var LIB_MIN_W = 300;
-  var LIB_DEFAULT_W = 340;
+  var LIB_DEFAULT_W = 468;
   var LIB_GAP = 24;
   var LIB_MIN_CHAT = 320;
   var LIB_W_KEY = 'citrus_library_width';

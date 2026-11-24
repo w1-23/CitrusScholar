@@ -1354,6 +1354,22 @@ def read_local_evidence(ref: str, turn_id: str, generation: str,
     """
     if not _enabled("local_rag"):
         return _disabled("local_rag", "main_results")
+    if not generation:
+        from src.core.tracing import get_client_request_id, get_session_id
+        from src.core.turn_source_ledger import fetch_rows, local_read_reference
+
+        scopes = set()
+        for row in fetch_rows(get_session_id(), get_client_request_id()):
+            if row.get("kind") != "local":
+                continue
+            try:
+                entry = local_read_reference(json.loads(row.get("read_ref") or "null"))
+            except ValueError:
+                continue
+            if entry and entry["ref"] == ref and (not turn_id or entry["turn_id"] == turn_id):
+                scopes.add((entry["turn_id"], entry["generation"]))
+        if len(scopes) == 1:
+            turn_id, generation = scopes.pop()
     from src.retrieval.evidence_adapter import read_evidence
     try:
         result = read_evidence(ref, turn_id=turn_id, generation=generation,

@@ -146,6 +146,33 @@ def test_base_citation_reads_original_range_and_denies_other_scope(citation_sess
     assert run.client.get(sources_url).json()['sources'][0]['read_ref'] == source['read_ref']
 
 
+def test_candidate_read_reuses_only_its_bound_turn_scope(citation_session):
+    from src.tools.candidate_tools import read_candidate
+
+    run = citation_session
+    source = {'corpus_id': 'cqa_literature', 'title': 'Stored fixture',
+              'paper_id': 'paper_fixture_identity', 'chunk_id': 'chunk_fixture_identity',
+              'text': 'Stored evidence for the current turn.'}
+    matches, _ = evidence_adapter.persist_local_rows([source], query='fixture', generation='base-old')
+    row = matches[0]
+    ref = row['source_ref']
+    _, unbound = read_candidate.func(ref, max_chars=20)
+    assert unbound['_tool_outcome']['reason_code'] == 'invalid_evidence_read'
+
+    record_tool('local_hybrid_search', 'candidate', 'Delivered [L1]',
+                {'main_results': [{**row, 'citation_ref': 'L1'}]})
+    _, result = read_candidate.func(ref, max_chars=20)
+    assert result['read_ref'] == {'ref': ref, 'turn_id': run.job, 'generation': 'base-old',
+                                  'start': 0, 'end': 20}
+    _, wrong_scope = read_candidate.func(ref, turn_id='wrong-turn')
+    assert wrong_scope['_tool_outcome']['reason_code'] == 'evidence_scope_unavailable'
+    _, wrong_generation = read_candidate.func(ref, generation='wrong-generation')
+    assert wrong_generation['_tool_outcome']['reason_code'] == 'evidence_expired'
+    tracing._client_request_id.set('different-request')
+    _, unbound = read_candidate.func(ref)
+    assert unbound['_tool_outcome']['reason_code'] == 'invalid_evidence_read'
+
+
 def test_web_fetch_receipt_and_legacy_ledger_migration(citation_session):
     run = citation_session
     url = f'/sessions/{run.sid}/turn-sources?request_id=client-request'

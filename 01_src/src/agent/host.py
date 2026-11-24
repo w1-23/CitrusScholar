@@ -478,7 +478,7 @@ async def _run(state, identity, ledger):
                 from src.research.script_runtime import reset_task_scope
                 reset_task_scope(script_token)
 
-    async def check_final(answer, history, _):
+    async def check_final(answer, history, _, *, allow_delivery_gaps=False):
         notes = await prepare(identity)
         if notes:
             return FinalCheck(False, notes)
@@ -532,6 +532,8 @@ async def _run(state, identity, ledger):
             if delivery_links:
                 public_answer += "\n\n已核验的交付文件\n" + "\n".join(
                     f"- [下载文件 {index}]({link})" for index, link in enumerate(delivery_links, start=1))
+            if delivery_gaps and not allow_delivery_gaps:
+                return FinalCheck(False, tuple(gap["detail"] for gap in delivery_gaps))
             if delivery_gaps:
                 public_answer += "\n\n" + "\n".join(gap["detail"] for gap in delivery_gaps)
             statement = statement.model_copy(update={"answer": public_answer,
@@ -807,6 +809,9 @@ async def _run(state, identity, ledger):
                                                identity.session_id, data["audit_id"])
         return None
 
+    async def check_final_after_followup(answer, history, identity):
+        return await check_final(answer, history, identity, allow_delivery_gaps=True)
+
     runtime = HarnessRuntime(metered_model, durable_execute, admit, check_final,
         RunLimits(max_model_steps=settings.AGENT_MAX_MODEL_CALLS, deadline=deadline),
         schemas=catalog.schemas({row["name"] for row in catalog.describe()}),
@@ -814,7 +819,8 @@ async def _run(state, identity, ledger):
         export_host=export_host, restore_host=restore_host, validate_resume=validate_resume,
         recover_output=True, resolve_execution_waits=resolve_execution_waits,
         acknowledge_execution_waits=acknowledge_execution_waits, record_rejected=rejected,
-        final_from_observations=final_from_observations)
+        final_from_observations=final_from_observations,
+        check_final_after_followup=check_final_after_followup)
     checkpoint_options = {"context_scope": context_scope} if native else {}
     checkpoint_config = (native_checkpoint_scope if native else checkpoint_scope)(
         identity, provider_scope, **checkpoint_options)

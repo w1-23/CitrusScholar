@@ -40,6 +40,7 @@ class HarnessState(DeepAgentState):
     active_run_id: NotRequired[str]
     model_steps: NotRequired[int]
     host_state: NotRequired[dict]
+    delivery_followup_used: NotRequired[bool]
     batch_notes: NotRequired[list[str]]
     batch_status: NotRequired[str]
     unknown_operations: NotRequired[list[str]]
@@ -168,6 +169,7 @@ class HarnessRuntime:
     acknowledge_execution_waits: Any = None
     record_rejected: Any = None
     final_from_observations: Any = None
+    check_final_after_followup: Any = None
 
     async def _publish_working_note(self, response, identity, model_step):
         try:
@@ -221,6 +223,9 @@ class HarnessRuntime:
             if inspect.isawaitable(admitted):
                 await admitted
 
+        def delivery_feedback(check):
+            return "还缺：\n" + "\n".join(check.observations) + "\n请补齐产物，或明确说明无法完成。"
+
         class Policy(AgentMiddleware):
             state_schema = HarnessState
 
@@ -238,7 +243,9 @@ class HarnessRuntime:
                     return {"stop_status": "waiting" if status == "waiting" else "incomplete",
                             "stop_reason": "user_input_required" if status == "waiting" else "operation_outcome_unknown",
                             "jump_to": "end"}
-                if adapter.final_from_observations is not None:
+                followup_used = state.get("delivery_followup_used", False)
+                notes = list(state.get("batch_notes", []))
+                if adapter.final_from_observations is not None and not followup_used:
                     answer = await adapter.final_from_observations()
                     if answer is not None:
                         response = AIMessage(content=answer,
@@ -248,16 +255,18 @@ class HarnessRuntime:
                         if check.accepted:
                             return {"messages": [response], "stop_status": "complete",
                                     "stop_reason": "answered", "host_state": host_snapshot(), "jump_to": "end"}
+                        notes.append(delivery_feedback(check))
+                        followup_used = True
                 if state.get("model_steps", 0) >= adapter.limits.max_model_steps:
                     return {"stop_status": "incomplete", "stop_reason": "model_step_limit", "jump_to": "end"}
                 if time.monotonic() >= adapter.limits.deadline:
                     raise AdmissionStopped("deadline")
-                notes = list(state.get("batch_notes", []))
                 if adapter.prepare:
                     notes.extend(await adapter.prepare(identity))
                 additions = [control(note) for note in notes]
                 await admit(tuple([*state["messages"], *additions]))
                 update = {"messages": additions, "batch_notes": [], "batch_status": "",
+                          "delivery_followup_used": followup_used,
                           "model_steps": state.get("model_steps", 0)+1, "host_state": host_snapshot()}
                 # Before-model state is synchronously checkpointed before the call.
                 await observed({**state, **update, "messages": [*state["messages"], *additions]}, "model")
@@ -332,9 +341,14 @@ class HarnessRuntime:
                     await event("model_output_rejected", {**state, "stop_reason": invalid}, ids)
                     return {"stop_status": "incomplete", "stop_reason": invalid, "jump_to": "end"}
                 if not response.tool_calls:
-                    check = await adapter.check_final(response, tuple(state["messages"]), identity)
+                    followup_used = state.get("delivery_followup_used", False)
+                    check_final = (adapter.check_final_after_followup if followup_used else None) or adapter.check_final
+                    check = await check_final(response, tuple(state["messages"]), identity)
                     if not check.accepted:
-                        return {"messages": [control("Final result validation returned these observations:\n" + "\n".join(check.observations))],
+                        if followup_used:
+                            return {"stop_status": "incomplete", "stop_reason": "final_validation_failed",
+                                    "host_state": host_snapshot(), "jump_to": "end"}
+                        return {"messages": [control(delivery_feedback(check))], "delivery_followup_used": True,
                                 "host_state": host_snapshot(), "jump_to": "model"}
                     return {"stop_status": "complete", "stop_reason": "answered", "host_state": host_snapshot()}
                 # Only a complete, valid native-tool round is public progress.
@@ -509,7 +523,8 @@ class HarnessRuntime:
             if resume:
                 raise ValueError("execution_checkpoint_missing")
             initial = {"messages": list(messages), "model_steps": 0,
-                       "host_state": host_snapshot(), "executor_id": executor_id}
+                       "host_state": host_snapshot(), "executor_id": executor_id,
+                       "delivery_followup_used": False}
             if native:
                 if continuing_thread:
                     prior_request = (snapshot.values.get("host_state") or {}).get("original_request_state") or {}

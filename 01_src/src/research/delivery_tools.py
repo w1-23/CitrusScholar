@@ -476,6 +476,7 @@ def deliver_research_artifact(**kwargs) -> tuple[str, dict]:
     """
     request = DeliveryInput.model_validate(kwargs)
     from src.core.tracing import get_current_tool_name, set_current_tool_name
+    from .delivery_reconciliation import before_publication, delivery_outcome
     renderer = {"table": "export_table", "bibliography": "export_literature_evidence",
                 "research_notes": "export_research_notes", "corpus_gap": "export_corpus_gap_report",
                 "data_audit": "audit_uploaded_data"}.get(request.kind)
@@ -488,6 +489,10 @@ def deliver_research_artifact(**kwargs) -> tuple[str, dict]:
         # kinds of this model-facing entrypoint. Historical rows stay unchanged.
         set_current_tool_name(renderer)
         text = _dispatch(request)
+    except (ValueError, LookupError, PermissionError, ToolArgumentError) as exc:
+        if not before_publication():
+            raise
+        text = f"[ERR_DELIVERY_PREFLIGHT] {exc}"
     finally:
         set_current_tool_name(previous_tool)
     text = text if isinstance(text, str) else ""
@@ -500,12 +505,16 @@ def deliver_research_artifact(**kwargs) -> tuple[str, dict]:
     success = bool(receipts) and complete and requested_present and not error
     status = "complete" if success else "partial" if receipts else "failed"
     reason = "" if success else error.group(1).split(":")[-1].lower() if error else "delivery_not_verified"
-    if not success:
-        text = f"[DELIVERY_{status.upper()}] 成果未全部确认入库（{reason}）。\n" + text
+    outcome = delivery_outcome(status, reason, receipts)
+    if outcome["status"] != "complete":
+        status, reason = outcome["status"], outcome["reason_code"]
+        detail = {"not_run": "发布前校验或导出失败，本次未发布成果",
+                  "partial": "已登记部分成果，其余输出失败",
+                  "unknown": "部分发布结果尚未确认，请核对原操作"}.get(status, "成果未全部确认入库")
+        text = f"[DELIVERY_{status.upper()}] {detail}（{reason}）。\n" + text
     artifact = {"kind": request.kind, "purpose": request.purpose, "format": request.output_format,
                 "receipts": receipts, "file_refs": [r["file_id"] for r in receipts],
-                "_tool_outcome": {"status": status, "reason_code": reason,
-                                  "artifacts": [r["url"] for r in receipts]}}
+                "_tool_outcome": outcome}
     if request.dataset_ref:
         artifact["dataset_ref"] = request.dataset_ref.model_dump()
     if request.review_id:

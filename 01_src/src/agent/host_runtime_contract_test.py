@@ -66,6 +66,54 @@ class AttachmentRetrievalScopeTests(unittest.TestCase):
                     self.assertNotIn("browse_web", available)
 
 
+class DeliveryDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delivery_outcome_follows_the_publication_boundary(self):
+        from src.research import delivery_tools, tools
+
+        producer = delivery_tools.deliver_research_artifact
+        url = "/api/v2/session/fixture-session/artifacts/" + "a" * 32
+        link = {"url": url, "filename": "review.xlsx", "file_id": "b" * 32}
+        traces = (
+            ("preflight", "not_run", False, []),
+            ("partial", "partial", False, [url]),
+            ("unknown", "unknown", True, [url]),
+        )
+        for scenario, status, uncertain, artifacts in traces:
+            with self.subTest(scenario=scenario):
+                def dispatch(_request):
+                    from src.research.delivery_reconciliation import publication_started, publication_confirmed
+                    if scenario == "preflight":
+                        raise ValueError("review source changed")
+                    publication_started()
+                    publication_confirmed(url)
+                    if scenario == "unknown":
+                        publication_started()
+                    return f"[ERR_DATA_AUDIT_EXPORT] source failed\n{url}"
+
+                with (patch.object(tracing, "get_user_id", return_value=7),
+                      patch.object(tracing, "get_job_id", return_value="fixture-run"),
+                      patch.object(jobs, "get_job", return_value={"session_id": "fixture-session"}),
+                      patch.object(task_events, "start_operation", return_value=("operation-one", "lease")),
+                      patch.object(task_events, "finish_operation") as finish,
+                      patch.object(task_events, "remaining_seconds", return_value=10),
+                      patch.object(registry, "_check_tool_sandbox", new=AsyncMock(return_value=None)),
+                      patch.object(delivery_tools, "_dispatch", side_effect=dispatch),
+                      patch.object(delivery_tools, "_receipts", return_value=(
+                          [] if scenario == "preflight" else [link], scenario != "preflight")),
+                      patch.object(tools, "_save_artifact") as save):
+                    message = await registry._run_single_tool(producer, {
+                        "name": producer.name, "id": CALL["id"],
+                        "args": {"kind": "data_audit", "review_id": "c" * 32, "output_format": "xlsx"},
+                    }, require_durable=True)
+
+                save.assert_not_called()
+                self.assertEqual(message.artifact["_tool_outcome"]["status"], status)
+                self.assertEqual(message.artifact["_tool_outcome"]["artifacts"], artifacts)
+                self.assertEqual(bool(message.additional_kwargs.get("operation_uncertain")), uncertain)
+                self.assertEqual("host_preflight_reconciled" in message.additional_kwargs, scenario == "preflight")
+                finish.assert_called_once()
+
+
 class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.workspace = Mock()

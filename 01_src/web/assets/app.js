@@ -2686,6 +2686,14 @@ function queueStateLabel(entry) {
     awaiting_input: '等待你的选择', settling: '正在保存结果', terminal: '已结束',
     reconcile_required: '状态待核对'};
   var label = names[entry.state] || '等待确认';
+  var blocker = entry.blocked_by;
+  if (entry.state === 'queued' && blocker && blocker.job_id) {
+    var task = Number(blocker.queue_seq) > 0
+      ? '会话第 ' + Number(blocker.queue_seq) + ' 条任务（' + blocker.job_id + '）'
+      : '任务 ' + blocker.job_id;
+    var reason = names[blocker.kind] || (blocker.kind === 'pending_question' ? '等待你的选择' : '尚未结束');
+    return '被' + task + '阻塞 · ' + reason;
+  }
   if (entry.state === 'queued' && sharedMaintenanceActive) label = '已排队 · 等待语料库更新';
   if (entry.state === 'queued' && Number(entry.queue_position) > 0)
     label += ' · 第 ' + Number(entry.queue_position) + ' 位';

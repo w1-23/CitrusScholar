@@ -701,6 +701,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
     from src.core.cancel import raise_if_cancelled
     from src.core.tracing import get_client_request_id, get_current_tool_name
     from src.core.publication_reconcile import enqueue_publication, register_publication
+    from src.research.delivery_reconciliation import publication_started, publication_confirmed
 
     owner_user_id = int(get_user_id() or 0)
     session_id = str(get_session_id() or "")
@@ -819,6 +820,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                 handle.flush()
                 os.fsync(handle.fileno())
             raise_if_cancelled("artifact:before_commit")
+            publication_started()
             os.replace(part, path)
         except BaseException:
             try:
@@ -914,6 +916,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
 
     try:
         if existing is not None:
+            publication_started()
             # Legacy/exact retry: the immutable artifact already exists. Only
             # this authorized live path may bind an old ownerless row.
             with closing(sqlite3.connect(str(db))) as conn, conn:
@@ -932,8 +935,10 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
         # Keep the verified bytes/index so a retry can finish registration.
         ledger.clear(logical)
         raise DeliverableRejected("artifact_registration_failed", "文件已保存，但资料库登记失败；可重试发布。") from exc
+    url = f"/api/v2/session/{session_id}/artifacts/{artifact_id}"
+    publication_confirmed(url)
     ledger.clear(logical)
-    return f"/api/v2/session/{session_id}/artifacts/{artifact_id}"
+    return url
 
 
 def resolve_artifact(session_id: str, artifact_id: str) -> dict[str, Any] | None:

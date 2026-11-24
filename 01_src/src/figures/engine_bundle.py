@@ -97,8 +97,8 @@ def bundle_files() -> dict[str, bytes]:
             result[f"{RELEASE_VENDOR_PATH}/{path}"] = data
         result.update(_support_files({"citrus_figures"}))
         return result
-    prefix = "src/prompts/skills/vendor/nature-skills/"
-    vendor = source / "prompts/skills/vendor/nature-skills"
+    prefix = "src/prompts/skill_history/vendor/nature-skills/"
+    vendor = source / "prompts/skill_history/vendor/nature-skills"
     raw = (vendor / "provenance.json").read_bytes()
     manifest = json.loads(raw)
     if manifest.get("source") != SOURCE or manifest.get("commit") != COMMIT:
@@ -126,7 +126,7 @@ def bundle_files() -> dict[str, bytes]:
     # New independent resources retain their own catalog/provenance identity;
     # v1 worker receipts above still refer to their original resource set.
     from citrus_figures.nature_runtime import validate_vendor
-    skill_vendor = source.parents[1] / "skills/nature-figure/vendor/nature-skills"
+    skill_vendor = source.parents[1] / "02_config/skill-history/repository-v3/skills/nature-figure/vendor/nature-skills"
     inventory = validate_vendor(skill_vendor)
     skill_prefix = "skills/nature-figure/vendor/nature-skills/"
     result[skill_prefix + "provenance.json"] = (skill_vendor / "provenance.json").read_bytes()

@@ -118,7 +118,7 @@ def completion_from_answer(answer: str, records) -> CompletionEnvelope:
 def artifact_goal_evidence(requirements, rows, verified_links):
     from src.graph.export_contract import deliverable_match_groups
     assets = [(row["tool_call_id"], item) for row in rows
-              if row.get("tool_call_id") and row.get("status") == "complete"
+              if row.get("tool_call_id") and row.get("status") in {"complete", "partial"}
               for item in row.get("artifact_validations", ())
               if (item.get("valid") and item.get("request_matches") is True
                   and item.get("link") in verified_links)]
@@ -158,10 +158,15 @@ def completion_errors(statement: CompletionEnvelope, records, missing=(), *, ver
     # Method loading is not evidence that the user's substantive task was done.
     evidence = {cid for cid, row in by_id.items() if row.get("status") == "complete"
                 and (row.get("name") or row.get("tool_name")) not in {"load_skill", "read_skill", "update_task_plan"}}
+    delivery_evidence = evidence | {cid for cid, row in by_id.items()
+                                    if row.get("status") == "partial"
+                                    and any(item.get("valid") and item.get("request_matches") is True
+                                            for item in row.get("artifact_validations", ()))}
     referenced = set()
     for goal in statement.goals:
         refs = goal.evidence_call_ids
-        if len(refs) != len(set(refs)) or any(cid not in evidence for cid in refs):
+        eligible = delivery_evidence if goal.kind == "deliverable" else evidence
+        if len(refs) != len(set(refs)) or any(cid not in eligible for cid in refs):
             errors.append("invalid_goal_evidence:" + goal.goal)
         if rows and not refs:
             errors.append("missing_goal_evidence:" + goal.goal)

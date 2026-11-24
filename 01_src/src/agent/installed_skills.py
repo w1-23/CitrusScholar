@@ -66,3 +66,42 @@ def list_installed(release: Path) -> list[dict]:
     if {row["id"] for row in rows} != set(selected):
         raise ValueError("incomplete_skill_release")
     return rows
+
+
+def active_skills():
+    from src.core.capability_policy import allows
+
+    try:
+        release = release_path()
+        rows = list_installed(release) if release is not None else []
+    except (OSError, ValueError, KeyError):
+        return []
+    return [row for row in rows if allows("skill:" + row["id"])]
+
+
+def read_installed_resource(release, selected, resource, *, start_char, max_chars):
+    from .research_skill_catalog import _bytes, _path, _MAX_RESOURCE_BYTES
+
+    info = next((row for row in list_installed(release) if row["id"] == selected["id"]), None)
+    if not info or any(info[key] != selected[key] for key in ("id", "version", "sha256")):
+        raise ValueError("selected_skill_identity_mismatch")
+    name = resource or "SKILL.md"
+    inventory = json.loads(_bytes(release / "inventory.json", _MAX_RESOURCE_BYTES))
+    expected = inventory.get(f"skills/{info['id']}/{name}") if isinstance(inventory, dict) else None
+    if not isinstance(expected, str):
+        raise ValueError("skill_resource_unavailable")
+    root = model_directory(release) / info["id"]
+    raw = _bytes(_path(root, name), _MAX_RESOURCE_BYTES)
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected != digest:
+        raise ValueError("skill_changed_during_read")
+    if name == "SKILL.md" and digest != info["sha256"]:
+        raise ValueError("skill_changed_during_read")
+    info["method_resources"] = sorted(
+        key.removeprefix(f"skills/{info['id']}/") for key in inventory
+        if key.startswith(f"skills/{info['id']}/references/"))
+    text = raw.decode("utf-8")
+    end = min(start_char + max_chars, len(text))
+    return info, {"resource": name, "text": text[start_char:end], "sha256": digest,
+                  "version": info["version"], "start_char": start_char, "total_chars": len(text),
+                  "next_start_char": end if end < len(text) else None}

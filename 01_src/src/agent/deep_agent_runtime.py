@@ -173,8 +173,12 @@ def create_native_agent(model, tools, policy, saver, state_schema, *,
     from deepagents.middleware.summarization import SummarizationMiddleware
 
     configure_native_profile()
-    skill_backend = (ScopedSkillBackend(skill_root, capability_policy) if capability_policy is not None
-                     else FilesystemBackend(root_dir=skill_root, virtual_mode=True))
+    if skill_root is None:
+        skill_backend = EmptySkillBackend(None)
+    elif capability_policy is not None:
+        skill_backend = ScopedSkillBackend(skill_root, capability_policy)
+    else:
+        skill_backend = FilesystemBackend(root_dir=skill_root, virtual_mode=True)
     backend = CompositeBackend(default=StateBackend(), routes={"/skills/": skill_backend})
     permissions = [FilesystemPermission(
         operations=["write", "edit", "delete"], paths=["/**"], mode="deny")]
@@ -195,5 +199,5 @@ def create_native_agent(model, tools, policy, saver, state_schema, *,
     read_errors = ToolErrorMiddleware(on_error=read_error, tools=sorted(NATIVE_READ_TOOLS))
     return create_deep_agent(model=model, tools=tools,
         middleware=[*middleware, policy, read_errors], system_prompt=system_prompt,
-        subagents=[], skills=["/skills/"], backend=backend, permissions=permissions,
+        subagents=[], skills=["/skills/"] if skill_root is not None else [], backend=backend, permissions=permissions,
         checkpointer=saver, state_schema=state_schema, name="citrus_native_loop")

@@ -51,10 +51,6 @@ def ensure_schema() -> None:
             )
         """)
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_source_identity "
-            "ON turn_source_ledger(session_id, request_id, origin, kind, source_key)"
-        )
-        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_turn_source_request "
             "ON turn_source_ledger(session_id, request_id, origin, id)"
         )
@@ -62,6 +58,11 @@ def ensure_schema() -> None:
             conn.execute("ALTER TABLE turn_source_ledger ADD COLUMN read_ref TEXT NOT NULL DEFAULT ''")
         if "citation_ref" not in {row[1] for row in conn.execute("PRAGMA table_info(turn_source_ledger)")}:
             conn.execute("ALTER TABLE turn_source_ledger ADD COLUMN citation_ref TEXT NOT NULL DEFAULT ''")
+        columns = {row[2] for row in conn.execute("PRAGMA index_info(uq_turn_source_identity)")}
+        if columns and "citation_ref" not in columns:
+            conn.execute("DROP INDEX uq_turn_source_identity")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_source_identity "
+                     "ON turn_source_ledger(session_id,request_id,origin,kind,source_key,citation_ref)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_turn_source_read "
                      "ON turn_source_ledger(kind,source_key)")
         conn.execute("""
@@ -241,27 +242,40 @@ def record_tool_sources(session_id: str, request_id: str, *, artifact: dict | No
                             "title": _local_title(row, _local_source_key(row)), "read_ref": ref,
                             "citation_ref": row.get("citation_ref")}))
 
-    if tool_name in {"deepseek_fetch", "deepseek_fetch_paper", "browse_web"}:
+    added = 0
+    if tool_name in {"local_hybrid_search", "search_local_candidates"}:
+        for row in (data.get("main_results") or [])[:limit]:
+            entry = row.get("read_entry") or {}
+            width = min(len(str(row.get("text") or "")), 240)
+            ref = local_read_reference({**entry, "start": 0, "end": width})
+            marker = _citation_ref(row.get("citation_ref"))
+            if ref and marker:
+                added += _insert({**common, "kind": "local", "source_key": reference_key("cite", ref),
+                                  "title": _local_title(row, _local_source_key(row)), "read_ref": ref,
+                                  "citation_ref": marker})
+
+    if tool_name in {"deepseek_search", "deepseek_fetch", "deepseek_fetch_paper", "browse_web"}:
         if tool_name == "browse_web" and not data.get("_browse_evidence"):
             return 0
         from src.core.web_output_separator import clean_web_title
         added = 0
         for row in (data.get("web_results") or [])[:limit]:
             url = safe_http_url(row.get("url"))
-            excerpt = row.get("text") or row.get("snippet")
-            if url and excerpt:
+            excerpt = row.get("text") or row.get("snippet") or row.get("summary")
+            marker = _citation_ref(row.get("citation_ref"))
+            if url and excerpt and (tool_name != "deepseek_search" or marker):
                 added += _insert({**common, "kind": "web", "source_key": url, "url": url,
                                   "title": clean_web_title(row.get("title"), url), "snippet": excerpt,
-                                  "read_ref": receipt, "citation_ref": row.get("citation_ref")})
+                                  "read_ref": receipt, "citation_ref": marker})
         return added
 
-    added = 0
     seen = set()
     for row, ref in evidence_rows(tool_name, result_text):
         key = reference_key("shared", ref)
         if key not in seen:
             added += _insert({**common, "kind": "shared", "source_key": key,
-                              "title": row.get("title"), "read_ref": ref})
+                              "title": row.get("title"), "read_ref": ref,
+                              "citation_ref": row.get("citation_ref")})
             seen.add(key)
         if len(seen) >= limit:
             break

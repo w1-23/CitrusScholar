@@ -339,6 +339,13 @@ def search_agent_corpus(query: str, limit: int = 6) -> str:
                            coverage="共享语料库自更新中，请稍后重试。",
                            summary="共享语料库自更新中，请稍后重试。")
         results = [_public_row(row) for row in (rows or []) if isinstance(row, dict)]
+        from src.core.turn_source_ledger import allocate_citation_refs
+        from src.core.tracing import get_client_request_id, get_session_id
+
+        excerpts = [row for row in results if row.get("excerpt")]
+        refs = allocate_citation_refs(get_session_id(), get_client_request_id(), "local", len(excerpts))
+        for row, ref in zip(excerpts, refs):
+            row["citation_ref"] = ref
         generation = str(getattr(runtime, "generation", "") or "")
         return _render({"query": text, "limit": size, "count": len(results),
                         "results": results},

@@ -15,7 +15,7 @@ from typing import Any
 def publish_artifact(*, owner: int, session_id: str, filename: str,
                      content: bytes, mime: str, producer_tool: str,
                      request_id: str = "", source_file_id: str = "",
-                     source_sha256: str = "") -> dict[str, Any]:
+                     source_sha256: str = "", logical_task_id: str = "") -> dict[str, Any]:
     """Publish via the existing validated, hashed, cancellation-aware service.
 
     owner/session must come from the authenticated application context; callers
@@ -35,7 +35,8 @@ def publish_artifact(*, owner: int, session_id: str, filename: str,
         tracing.set_client_request_id(request_id)
         url = _save_artifact(filename, content, mime,
                              source_file_id=source_file_id,
-                             source_sha256=source_sha256)
+                             source_sha256=source_sha256,
+                             logical_task_id=logical_task_id)
         artifact_id = url.rsplit("/", 1)[-1]
         entry = next((row for row in files.list_files(session_id, int(owner))
                       if row.get("artifact_id") == artifact_id), None)

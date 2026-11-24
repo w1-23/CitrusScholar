@@ -19,6 +19,7 @@ import re
 ROOT = Path(__file__).resolve().parents[3]
 CATALOG_PATH = "02_config/skills.catalog.json"
 HISTORY_ROOT = "02_config/skill-history"
+_REPOSITORY_RELEASE_ROOT = HISTORY_ROOT + "/repository-v3"
 PINNED = {
     "candidate-search": ("3.0.0", "6d423a6010bcceb5e88b81404499944b329941bb6f265d93868ed7b280836572"),
     "reference-verification": ("3.0.0", "04694fa7594ae4d6f553875b4a0844d4ecd8583a4fe086c0f2c7f1d01d245939"),
@@ -148,7 +149,7 @@ def _resource_roots(row):
         archived = _archived_root(row.get("id"), row.get("version"))
         if archived is not None:
             roots.append(archived)
-    roots.append(row["path"])
+    roots.append(_REPOSITORY_RELEASE_ROOT + "/" + row["path"])
     return list(dict.fromkeys(roots))
 
 

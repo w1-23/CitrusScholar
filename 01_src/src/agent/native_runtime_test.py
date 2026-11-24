@@ -48,6 +48,43 @@ def test_installed_skill_selection_uses_active_release_entries(tmp_path, monkeyp
         list_installed(active)
 
 
+def test_workspace_uses_installed_skill_inventory_and_live_policy(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import pytest
+    from src.agent.workspace_projection import read, resources
+    from src.core import capability_policy
+
+    skill_id = "data-audit"
+    version = "a" * 40
+    prefix = f"skills/{skill_id}/"
+    entry = prefix + "SKILL.md"
+    usage = prefix + "references/usage.md"
+    files = {entry: b"---\nname: data-audit\ndescription: Active audit method\n---\n",
+             usage: b"Read the selected region.\n"}
+    for name, content in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    (tmp_path / prefix / "unlisted.md").write_text("unlisted", encoding="utf-8")
+    (tmp_path / "release.json").write_text(json.dumps({skill_id: version}), encoding="utf-8")
+    (tmp_path / "inventory.json").write_text(json.dumps(
+        {name: hashlib.sha256(content).hexdigest() for name, content in files.items()}), encoding="utf-8")
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(tmp_path))
+    inventory = dict(resources("/skills"))
+    assert set(inventory) == {"/" + name for name in files}
+    descriptor = inventory["/" + usage]
+    assert descriptor["skill_version"] == version
+    assert read("/" + usage, descriptor)[0] == files[usage].decode()
+    (tmp_path / usage).write_bytes(b"Do not read changed bytes.")
+    with pytest.raises(ValueError, match="workspace_skill_integrity_mismatch"):
+        read("/" + usage, descriptor)
+    monkeypatch.setattr(capability_policy, "allows", lambda name: name != f"skill:{skill_id}")
+    assert not list(resources("/skills"))
+    with pytest.raises(PermissionError, match="skill_disabled"):
+        read("/" + usage, descriptor)
+
+
 async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
     skill_root = tmp_path / "skills"
     demo = skill_root / "demo"
@@ -295,3 +332,47 @@ def test_native_encryption_rejects_cross_account_and_tampering():
         second.loads_typed((kind, ciphertext))
     with pytest.raises(CheckpointProtectionError, match="checkpoint_authentication_failed"):
         first.loads_typed((kind, ciphertext[:-1] + bytes([ciphertext[-1] ^ 1])))
+
+
+def test_retired_skills_are_only_readable_by_historical_execution(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import pytest
+
+    from src.agent import research_skill_catalog
+    from src.agent.skill_adapter import SkillSession, scenario_catalog, validate_scenario_selection
+    from src.agent.workspace_projection import resources
+    from src.research import workspace_tools
+
+    legacy = dict(zip(('id', 'version', 'sha256'),
+                      ('candidate-search', *research_skill_catalog.PINNED['candidate-search'])))
+    identity = ExecutionIdentity(1, 'skill-test-session', 'skill-test-turn', 'skill-test-run')
+    monkeypatch.delenv('CITRUS_SKILL_RELEASE', raising=False)
+    assert scenario_catalog() == []
+    assert list(resources('/skills')) == []
+    assert not (research_skill_catalog.ROOT / 'skills').exists()
+    assert not (research_skill_catalog.ROOT / '01_src/src/prompts/skills').exists()
+    with pytest.raises(ValueError, match='selected_skill_identity_mismatch'):
+        SkillSession(identity, set).page(legacy['id'], legacy['version'], legacy['sha256'])
+    archive = SkillSession(identity, set, allow_archived=True)
+    assert archive.page(legacy['id'], legacy['version'], legacy['sha256'])['page']['text']
+
+    new_id = 'research-question-answering'
+    entry = f'skills/{new_id}/SKILL.md'
+    content = f'---\nname: {new_id}\ndescription: Current method.\n---\n'.encode()
+    path = tmp_path / entry
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    (path.parent / 'unlisted.md').write_text('legacy stray file')
+    (tmp_path / 'release.json').write_text(json.dumps({new_id: '1' * 40}))
+    (tmp_path / 'inventory.json').write_text(json.dumps({entry: hashlib.sha256(content).hexdigest()}))
+    monkeypatch.setenv('CITRUS_SKILL_RELEASE', str(tmp_path))
+    assert [row['id'] for row in scenario_catalog()] == [new_id]
+    with pytest.raises(ValueError, match='selected_skill_identity_mismatch'):
+        validate_scenario_selection([legacy])
+    monkeypatch.setattr(workspace_tools, '_identity', lambda: (1, 'skill-test-session'))
+    call = workspace_tools.research_workspace.func
+    assert [row['id'] for row in call(operation='skills')[1]['skills']] == [new_id]
+    assert call(operation='read_skill', skill_id='candidate-search')[1]['error'] == 'skill_resource_unavailable'
+    assert call(operation='read_skill', skill_id=new_id)[1]['entrypoint']['text'] == content.decode()
+    assert call(operation='read_skill_resource', skill_id=new_id, resource='unlisted.md')[1]['error'] == 'skill_resource_unavailable'

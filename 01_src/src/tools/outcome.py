@@ -88,6 +88,8 @@ _REASON_CLASS = {
     "coverage_incomplete": "coverage_incomplete",
     "audit_failed": "internal_error",
     "deliverable_rejected": "internal_error",
+    "err_data_audit_export": "internal_error",
+    "err_delivery_preflight": "input_missing",
     # Deliberate, correct behaviour — not a malfunction.
     "duplicate_request": "",
     "tool_batch_limit": "",

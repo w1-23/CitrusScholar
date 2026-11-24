@@ -1696,12 +1696,7 @@ def _prepare_chat_attachments(items: list[dict[str, str]],
             if suffix in {"csv", "tsv", "xlsx", "xls", "xlsm", "xlsb"}:
                 text_parts.append(
                     f"[表格附件：{name}；审查文件序号 {len(tables) - 1}。"
-                    "原始数据不会自动展开到上下文；用户要求数据审查时先调用 inspect_uploaded_table，"
-                    "确认工作表名、字段语义与行号，再用 audit_uploaded_data 执行默认的确定性检查"
-                    "（问题标到具体单元格，另出问题清单与审查概览，原件不改）。"
-                    "只有用户明确要求逐行给出结论时才传 annotations_json，元素形如 "
-                    '{"row":3,"verdict":"需核对","reason":"依据","field":"列名","sheet":"工作表名"}；'
-                    "多表文件必须写明 sheet。]")
+                    "原始数据不会自动展开到上下文；原件为只读。]")
             else:
                 # Keep original bytes request-local for structured-table/image audit.
                 # The normal document path below still extracts text for ordinary Q&A.
@@ -5134,6 +5129,8 @@ async def session_citations(session_id: str, request: Request):
                 refs_full = _json.loads(r["references_json"])
         except Exception:
             refs_full = None
+        if isinstance(refs_full, dict) and refs_full.get("display") == "bubble_only":
+            continue
         if (isinstance(refs_full, dict)
                 and (refs_full.get("cited") or refs_full.get("uncited")
                      or refs_full.get("web_separate"))):
@@ -5323,6 +5320,8 @@ def _promote_turn_answer(turn: dict) -> None:
             turn["answer"] = {"content": entry.get("content") or "",
                               "message_id": int(entry.get("message_id") or 0),
                               "gen_time_ms": int(entry.get("gen_time_ms") or 0)}
+            if entry.get("citation_bubbles"):
+                turn["answer"]["citation_bubbles"] = entry["citation_bubbles"]
             return
 
 
@@ -5451,6 +5450,8 @@ def build_history_turns(items: list[dict]) -> list[dict]:
                      "message_id": mid, "gen_time_ms": gen_ms,
                      "visibility": item.get("visibility", ""), "origin": item.get("origin", ""),
                      "answer_candidate": True}
+            if item.get("citation_bubbles"):
+                entry["citation_bubbles"] = item["citation_bubbles"]
             if item.get("progress") is True:
                 # Narration attached to tool calls: it was spoken right before
                 # those calls, so it sits immediately above them.
@@ -5588,6 +5589,8 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
                     generation_ms = 0
                 if generation_ms > 0:
                     item["gen_time_ms"] = generation_ms
+                if not tool_calls and metadata.get("citrus_citation_bubbles"):
+                    item["citation_bubbles"] = metadata["citrus_citation_bubbles"]
                 out.append(item)
         elif isinstance(m, ToolMessage):
             # Keep only a high-level completion state in user-visible history.
@@ -5813,6 +5816,12 @@ async def session_messages(session_id: str, request: Request, limit: int = 60,
         files_by_request = {}
     out = _history_items_from_messages(msgs, row_ids, request_ids, files_by_request)
     window, has_more, next_before = _slice_history(out, limit, before)
+    from src.core.turn_sources import visible_citation_bubbles
+    for item in window:
+        if item.get("citation_bubbles"):
+            item["citation_bubbles"] = await asyncio.to_thread(
+                visible_citation_bubbles, item["citation_bubbles"], user,
+                session_id=session_id, request_id=item["turn_request_id"])
     # P0-A: the same归属 rule the browser applies when it merges pages, so the
     # contract can be asserted without a browser (see test_trace_turn_merge.py).
     turns = build_history_turns(window)

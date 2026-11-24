@@ -86,6 +86,29 @@ class ReferenceKernelTests(unittest.TestCase):
             self.assertFalse(row['retryable'])
         self.assertIsNone(report['next_offset'])
 
+    def test_run_tolerates_read_only_include_evidence_flag(self):
+        from src.core import tracing
+        from src.research import reference_tools
+
+        def lookup(doi):
+            return 200, [{'source': 'Crossref', 'doi': doi,
+                          'title': 'Compat flag', 'year': '2024',
+                          'url': 'https://doi.org/' + doi}], ''
+
+        audit = self._audit([{'doi': '10.1234/compat', 'title': 'Compat flag',
+                              'year': '2024'}], budget=2)
+        with (patch.object(service.lit, '_crossref_work', lookup),
+              patch.object(tracing, 'get_user_id', return_value=7),
+              patch.object(tracing, 'get_session_id', return_value='kernel'),
+              patch.object(tracing, 'get_client_request_id', return_value='test')):
+            report = json.loads(reference_tools.verify_uploaded_references.invoke({
+                'audit_id': audit['audit_id'], 'operation': 'run',
+                'include_evidence': True}))
+
+        self.assertNotEqual(report['_tool_outcome']['status'], 'not_run')
+        self.assertEqual(report['result_view'], 'compact')
+        self.assertEqual(report['rows'][0]['identity'], 'matched')
+
     def test_rate_limit_is_reported_as_unconfirmed_gap(self):
         with (patch.object(service.lit, '_crossref_work', lambda doi: (429, [], '')),
               patch.object(service.lit, '_datacite_work',
@@ -189,10 +212,6 @@ class ReferenceKernelTests(unittest.TestCase):
         self.assertEqual(result['coverage']['pending'], 1)
         self.assertEqual(result['run_reason'], 'deadline')
 
-
-if __name__ == '__main__':
-    unittest.main()
-
     def test_title_lookup_stops_after_confirmed_identity(self):
         calls = []
 
@@ -221,4 +240,8 @@ if __name__ == '__main__':
         self.assertEqual(calls, ['search', 'doi'])
         self.assertEqual(result['budget']['requests_used'], 2)
         self.assertEqual(result['budget']['queries_used'], 1)
-        self.assertEqual(result['rows'][0]['identity'], 'identifier_match')
+        self.assertEqual(result['rows'][0]['identity'], 'metadata_corroborated')
+
+
+if __name__ == '__main__':
+    unittest.main()

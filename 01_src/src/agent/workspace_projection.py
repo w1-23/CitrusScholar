@@ -53,8 +53,36 @@ def bounded_bytes(path: Path, limit: int) -> bytes:
         os.close(fd)
 
 
+def _installed_resources(release, scope):
+    from src.core.capability_policy import allows
+    from .installed_skills import list_installed
+    from .workspace_storage import MAX_FILE_BYTES, virtual_path
+
+    inventory = json.loads(bounded_bytes(release / "inventory.json", MAX_FILE_BYTES * 16))
+    if not isinstance(inventory, dict):
+        raise ValueError("invalid_skill_inventory")
+    installed = {row["id"]: row for row in list_installed(release) if allows("skill:" + row["id"])}
+    for name, digest in sorted(inventory.items()):
+        mount, _, remainder = name.partition("/")
+        skill_id, _, resource = remainder.partition("/")
+        key = "/" + name
+        if mount != "skills" or skill_id not in installed or not resource or not within(key, scope):
+            continue
+        try:
+            virtual_path(key)
+            info = (release / name).stat(follow_symlinks=False)
+        except (OSError, ValueError):
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+            continue
+        row = installed[skill_id]
+        yield key, {"kind": "workspace_skill_resource", "path": key, "sha256": digest,
+                    "size_bytes": info.st_size, "skill_id": skill_id, "skill_version": row["version"],
+                    "catalog_sha256": row["sha256"], "read_only": True}
+
+
 def resources(scope):
-    """Yield exact allowed names and metadata; never read resource bodies here."""
+    """Yield allowed resource names and metadata without opening reference bodies."""
     from .workspace_storage import MAX_FILE_BYTES, virtual_path
     if scope == "/" or scope.startswith("/01_src"):
         for name in sorted(SOURCE_FILES):
@@ -63,41 +91,16 @@ def resources(scope):
                 yield key, {"kind": "workspace_source", "path": key, "read_only": True}
     if scope != "/" and not scope.startswith("/skills"):
         return
-    from . import research_skill_catalog as catalog
+    from .installed_skills import release_path
+
     try:
-        data = json.loads(bounded_bytes(catalog.ROOT / catalog.CATALOG_PATH, catalog._MAX_CATALOG_BYTES))
-        if (type(data) is not dict or data.get("schema") != "citrus.skill-catalog/1"
-                or data.get("version") != "2.0.0" or type(data.get("skills")) is not list):
-            return
-        rows = data["skills"]
-        if (len(rows) != len(catalog.PINNED) or any(type(row) is not dict for row in rows)
-                or any(type(row.get("id")) is not str for row in rows)
-                or {row["id"] for row in rows} != set(catalog.PINNED)):
+        release = release_path()
+        if release is not None:
+            yield from _installed_resources(release, scope)
             return
     except (OSError, ValueError, TypeError, KeyError):
-        return  # Release availability must not gate generic private workspace use.
-    from src.core.capability_policy import allows
-    for row in rows:
-        if not allows("skill:" + row["id"]):
-            continue
-        if scope != "/" and not within(scope, "/skills/" + row["id"]) and not within("/skills/" + row["id"], scope):
-            continue
-        try:
-            records = catalog._manifest(row)
-        except (OSError, ValueError, TypeError, KeyError):
-            continue
-        for name, record in records.items():
-            key = "/" + row["path"] + "/" + name
-            if not within(key, scope) or record["size"] > MAX_FILE_BYTES:
-                continue
-            try:
-                virtual_path(key)
-            except ValueError:
-                continue  # Only bounded supported text resources, never binary assets.
-            yield key, {"kind": "workspace_skill_resource", "path": key,
-                        "sha256": record["sha256"], "size_bytes": record["size"],
-                        "skill_id": row["id"], "skill_version": row["version"],
-                        "catalog_sha256": row["sha256"], "read_only": True}
+        return
+
 
 
 def read(key, descriptor):
@@ -108,10 +111,12 @@ def read(key, descriptor):
         root = ROOT
     else:
         from src.core.capability_policy import allows
+        from .installed_skills import release_path
         if not allows("skill:" + descriptor["skill_id"]):
             raise PermissionError("skill_disabled")
-        from . import research_skill_catalog as catalog
-        root = catalog.ROOT
+        root = release_path()
+        if root is None:
+            raise PermissionError("workspace_projection_denied")
     path = root.joinpath(*key[1:].split("/"))
     # Lexical allowlist plus ancestor link checks, never caller-selected host paths.
     data = bounded_bytes(path, MAX_FILE_BYTES)

@@ -173,6 +173,7 @@ def _local_corpus_matches(query: str) -> bool:
 _DATA_AUDIT_INTENT = re.compile(
     r"(?:审查|检查|核查|分析).{0,10}(?:原始)?(?:实验)?(?:数据|数值|表格|工作簿|源数据|CSV|TSV|Excel|XLSX|XLSM?)|"
     r"(?:实验)?(?:数据|数值|表格|工作簿|源数据|CSV|TSV|Excel|XLSX|XLSM?).{0,10}(?:异常|质量|合理性|审查|检查|核查|离群|重复|缺失)|"
+    r"(?:审查|核查|检查).{0,8}(?:sheet\s*\d+|第.{1,3}张表)|"
     r"\b(?:audit|check|review|inspect)\b.{0,18}\b(?:data|spreadsheet|table|workbook)\b",
     re.I)
 
@@ -1254,8 +1255,8 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
             if step.get("status") in {"complete", "partial"}:
                 _source_ledger.record_tool_sources(_sid, _rid, artifact=artifact,
                     reference=reference, tool_name=name, result_text=content)
-        except Exception:
-            logger.debug("persist full tool result failed", exc_info=True)
+        except Exception as exc:
+            logger.warning("Tool result or source persistence failed for %s: %s", name, type(exc).__name__)
         # ToolMessage.artifact is deliberately excluded from model-visible
         # content, but is checkpointed with the message. Persist only the
         # sanitized execution record so refresh/history can reproduce real

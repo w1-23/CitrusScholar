@@ -140,6 +140,10 @@ def test_background_fifo_cancel_and_replay(runtime):
     middle = send(runtime, "middle", "middle message")
     last = send(runtime, "last", "last message")
     assert middle["queue_seq"] + 1 == last["queue_seq"]
+    blocker = {"job_id": first["job_id"], "kind": "running", "queue_seq": first["queue_seq"]}
+    assert middle["blocked_by"] == last["blocked_by"] == blocker
+    refreshed = {turn["client_request_id"]: turn for turn in runtime.client.get(runtime.path).json()["turns"]}
+    assert refreshed["last"]["blocked_by"] == blocker
     assert state(runtime, "last") == "queued"
     cancelled = runtime.client.delete(runtime.path + "/middle")
     assert cancelled.status_code == 200, cancelled.text

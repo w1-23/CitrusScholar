@@ -493,6 +493,9 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
         if name == "run_research_figure_script":
             from src.research.script_reconciliation import capture_script_failure
             reconciliation_scope = capture_script_failure(owner, job["session_id"])
+        elif name in {"deliver_research_artifact", "audit_uploaded_data"}:
+            from src.research.delivery_reconciliation import capture_delivery
+            reconciliation_scope = capture_delivery(name, tool_call["id"])
         elif name in ZERO_WRITE_TOOL_NAMES:
             reconciliation_scope = capture_zero_write(owner, job["session_id"], job_id, name, tool_call["id"])
         with reconciliation_scope as reconciliation:
@@ -501,7 +504,8 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
         # Only this runner can attest first-party evidence bound to the invocation.
         message.additional_kwargs.pop("host_preflight_reconciled", None)
         reconciled = reconciliation is not None and reconciliation.matches(message)
-        if reconciled and reconciliation.preflight_digest:
+        if reconciled and (getattr(reconciliation, "preflight_digest", "")
+                           or getattr(reconciliation, "preflight", False)):
             import hashlib
             message.additional_kwargs["host_preflight_reconciled"] = {
                 "schema_version": 1, "operation_id": operation_id,
@@ -514,14 +518,16 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
                     and message.additional_kwargs.get("execution_dispatched")
                     and (outcome["status"] in {"failed", "cancelled", "unknown"}
                          or (outcome["status"] == "not_run" and name in ZERO_WRITE_TOOL_NAMES)
+                         or (name == "deliver_research_artifact" and outcome["status"] in {"not_run", "partial"})
                          or outcome.get("reason_code") in {"timeout", "network", "request_deadline"})
-                    and not (outcome["status"] in {"failed", "not_run"} and reconciled)):
+                    and not (outcome["status"] in {"failed", "not_run", "partial"} and reconciled)):
                 # A failed observation of a dispatched write is not evidence
                 # that no side effect occurred. Only the owning adapter can
                 # reconcile it; the generic loop must not automatically retry.
                 artifact = dict(message.artifact or {})
                 artifact["_tool_outcome"] = {
-                    "status": "unknown", "reason_code": "write_requires_reconciliation"}
+                    "status": "unknown", "reason_code": "write_requires_reconciliation",
+                    "artifacts": outcome.get("artifacts", [])}
                 from src.core.op_receipt import make_receipt
                 artifact["op_receipt"] = make_receipt(name, tool_call["id"], message.content, artifact)
                 message = message.model_copy(update={"artifact": artifact, "status": "error"})
@@ -653,9 +659,6 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
     if reject_reason:
         return ToolMessage(content=reject_reason, tool_call_id=tool_call["id"], name=tool_name, artifact={})
 
-    # content_and_artifact tools bypass pydantic below (raw_func(**args)), so a
-    # wrong keyword would surface as an unactionable TypeError. Check the
-    # declared schema first and name the legal parameters.
     from src.tools.argument_check import validate_tool_arguments
     argument_error, normalized_args = validate_tool_arguments(tool, tool_name, args)
     if argument_error:

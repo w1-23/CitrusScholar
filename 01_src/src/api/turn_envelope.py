@@ -78,7 +78,7 @@ _ALLOWED_UPLOAD_SUFFIXES = frozenset({
 _PUBLIC_TURN_KEYS = (
     "session_id", "client_request_id", "queue_seq", "state",
     "active_child_job_id", "accepted_at", "dispatch_at", "started_at",
-    "finished_at", "updated_at", "history_saved", "clear_reason",
+    "finished_at", "updated_at", "history_saved", "clear_reason", "blocked_by",
 )
 
 _HTTP_STATUS_BY_CODE = {

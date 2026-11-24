@@ -105,7 +105,8 @@ def _error(code: str, message: str) -> tuple[str, dict]:
     return f"[FIGURE_{code}] {message}", result
 
 
-def _publish(filename: str, payload: bytes, mime: str) -> dict[str, Any]:
+def _publish(filename: str, payload: bytes, mime: str,
+             logical_task_id: str = "") -> dict[str, Any]:
     """Publish one file into the account library and describe it.
 
     The bytes that are stored are the bytes that were produced. The
@@ -120,7 +121,8 @@ def _publish(filename: str, payload: bytes, mime: str) -> dict[str, Any]:
         owner=_owner(), session_id=_session(), filename=filename,
         content=payload, mime=mime,
         producer_tool=get_current_tool_name() or "create_research_figure",
-        request_id=get_client_request_id() or "")
+        request_id=get_client_request_id() or "",
+        logical_task_id=logical_task_id)
 
 
 def _register_figure(svg_bytes: bytes, alt_text: str) -> str:
@@ -565,6 +567,16 @@ def _run_research_figure_script(
     manifest["data_provenance"] = {"input_snapshots": snapshots,
                                    "snapshot_policy": source["snapshot_policy"], **analysis_meta}
     stem = output_name or title or "figure"
+    # One requested figure keeps one logical identity across re-renders of
+    # the same turn. Title is the only figure-level label the model owns, so
+    # distinct figures (which are requested with distinct titles) stay apart.
+    # The format is part of the identity: SVG and PDF never merge.
+    figure_logical = ""
+    if title.strip():
+        import hashlib as _hashlib
+        from src.core.tracing import get_client_request_id as _request_id
+        _seed = f"{_request_id() or ''}|{title.strip()}"
+        figure_logical = "figure:" + _hashlib.sha256(_seed.encode("utf-8")).hexdigest()[:32]
     published: list[dict[str, Any]] = []
     publish_failures = []
     for fmt in formats:
@@ -573,7 +585,8 @@ def _run_research_figure_script(
             publish_failures.append({"format": fmt, "error": "请求格式未导出"})
             continue
         try:
-            entry = _publish(f"{stem}.{fmt}", payload, MIME_BY_FORMAT[fmt])
+            entry = _publish(f"{stem}.{fmt}", payload, MIME_BY_FORMAT[fmt],
+                             logical_task_id=f"{figure_logical}:{fmt}" if figure_logical else "")
         except Exception as exc:  # noqa: BLE001
             publish_failures.append({"format": fmt, "error": str(exc)[:500]})
             continue

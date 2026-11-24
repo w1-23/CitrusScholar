@@ -562,6 +562,7 @@
   window.openCorpusSource = openCorpusSource;
   window.CitrusCorpusReader = {
     open: openCorpusSource,
+    openShared: openSharedSource,
     close: closeReader,
     isOpen: isOpen,
     getState: function () { return { key: state.key, view: state.view, chars: (state.data && state.data.chars) || 0 }; },

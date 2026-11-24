@@ -38,13 +38,9 @@ def skill_catalog(available_tools: set[str] | None = None, *, scenarios_only: bo
 
 def scenario_catalog() -> list[dict]:
     """Installed product methods; availability never grants execution rights."""
-    from .installed_skills import list_installed, release_path
+    from .installed_skills import active_skills
 
-    try:
-        release = release_path()
-        rows = list_installed(release) if release is not None else research_catalog.list_skills()
-    except (OSError, ValueError, KeyError):
-        rows = []
+    rows = active_skills()
     return [{key: row.get(key, [] if key in {"depends_on", "required_resources", "requires_any"} else "")
              for key in _CATALOG_FIELDS} for row in rows]
 
@@ -120,22 +116,10 @@ def directory_prompt(available_tools: set[str]) -> str:
     from deepagents.backends import StateBackend
     from deepagents.middleware.skills import SkillsMiddleware
     from langchain.agents.middleware import ModelRequest
-    rows = research_catalog.list_skills()
-    try:
-        ordinary = [entry["id"] for entry in registry._catalog()
-                    if entry["id"] not in SCENARIO_SKILLS | {"nature-figure"}]
-    except (OSError, ValueError, KeyError, TypeError):
-        ordinary = []
-    for sid in ordinary:
-        try:
-            rows.append(registry.skill_info(sid))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue  # One archived method failure does not disable other guidance.
-    from src.core.capability_policy import allows
-    rows = [row for row in rows if allows("skill:" + row["id"])]
+    rows = scenario_catalog()
     if not rows:
         return "No verified skills are available; generic authorized tools remain usable."
-    metadata = [{"name": row["id"], "description": row["description"] + " " + row["applicability"],
+    metadata = [{"name": row["id"], "description": row["description"] + " " + row.get("applicability", ""),
                  "path": row["id"], "allowed_tools": [], "metadata": {}, "license": None,
                  "compatibility": "version=" + row["version"] + " sha256=" + row["sha256"]}
                 for row in rows]
@@ -144,7 +128,7 @@ def directory_prompt(available_tools: set[str]) -> str:
         "Use load_skill(skill_id, version, sha256) for the method entry and resource index, or "
         "read_skill(skill_id, version, sha256) for declared resource pages. Follow next_start_char "
         "when more text is useful. Optional resources require exact manifest paths; vendor trees are "
-        "not loaded by default. Archived prior versions stay readable only by their exact "
+        "not loaded by default. Recovery reads archived versions by exact "
         "id/version/sha256. These ids are registry keys, not filesystem paths. "
         "Skills guide methods; missing optional files or partial reads never gate authorized tools. "
         "Read/discovery failures are local and do not block the task; skills never grant authorization.")
@@ -158,7 +142,11 @@ def _encode(value):
 
 class SkillSession:
     """Host-owned receipts persisted in the existing protected host checkpoint."""
-    def __init__(self, identity, available):
+    def __init__(self, identity, available, *, release=None, allow_archived=False):
+        from .installed_skills import release_path
+
+        self.release = release if release is not None else release_path()
+        self.allow_archived = allow_archived
         self.identity = identity
         self.available = available
         self.receipts: dict[str, dict] = {}
@@ -181,7 +169,14 @@ class SkillSession:
                 or type(max_chars) is not int or not 1 <= max_chars <= 20000):
             raise ValueError("invalid_skill_pagination")
         dependencies = []
-        if research_catalog.has_identity(skill_id, version, sha256):
+        if self.release is not None and len(version) == 40:
+            from .installed_skills import read_installed_resource
+
+            info, page = read_installed_resource(self.release, selected, resource,
+                                                 start_char=start_char, max_chars=max_chars)
+        elif not self.allow_archived:
+            raise ValueError("selected_skill_identity_mismatch")
+        elif research_catalog.has_identity(skill_id, version, sha256):
             info, page = research_catalog.read_resource(skill_id, version, sha256, resource,
                                                        start_char=start_char, max_chars=max_chars)
         else:

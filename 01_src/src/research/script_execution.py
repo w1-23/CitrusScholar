@@ -3,14 +3,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from typing import Any
+
+
+_MULTI_FIGURE_HINT_RE = re.compile(
+    r"(?i)(?:分别|各自|两张|两幅|多个|多张|"
+    r"第[二三四五六七八九十]张|"
+    r"和|与|以及|、|\band\b|\bplus\b|\balso\b|\btwo\b|\bthree\b)")
+
+
+_FIGURE_NOUN_RE = re.compile(
+    r"(?i)(?:箱线图|柱状图|折线图|散点图|"
+    r"热图|直方图|误差棒图|流程图|示意图|"
+    r"科研图|图件|图表|可视化|figure|chart|plot|diagram|visuali[sz]ation)")
 
 
 def _accept_frozen_render(item: dict, manifest: dict, parents: dict, table_hashes: dict,
                           *, owner: int, session_id: str) -> tuple[dict, list]:
     """Bind worker claims to accepted typed output bytes before publishing figures."""
-    import re
     from src.figures.projects import snapshot_script_inputs
 
     receipt = manifest.get("frozen_render_receipt")
@@ -36,6 +48,65 @@ def _accept_frozen_render(item: dict, manifest: dict, parents: dict, table_hashe
     return {"version": 1, "input_snapshots": snapshots, "receipt": receipt}, refs
 
 
+def _singleton_figure_goal(*, query: str, has_tables: bool,
+                           request_id: str, execution_id: str) -> str:
+    """Return host evidence for exactly one requested figure, else ``""``.
+
+    A one-figure *output contract* is not evidence that the user requested
+    one figure: sequential delivery may call this tool twice with two
+    one-figure contracts.  Only the host's turn-level contract may collapse
+    attempts into one active goal.  Any parse gap/ambiguity returns empty and
+    the caller falls back to the durable declared slot.
+    """
+    text = str(query or "").strip()
+    if (not text or _MULTI_FIGURE_HINT_RE.search(text)
+            or len(_FIGURE_NOUN_RE.findall(text)) != 1):
+        return ""
+    try:
+        from src.graph.task_contract import FIGURE_KINDS, contract_for_turn
+        requirements = contract_for_turn(text, has_tables=has_tables).deliverables
+        figures = [item for item in requirements
+                   if FIGURE_KINDS.intersection(item.get("kinds", []))]
+    except Exception:
+        return ""
+    if len(figures) != 1:
+        return ""
+    turn = str(request_id or execution_id or "").strip()
+    if not turn:
+        return ""
+    return f"{turn}|{text}"
+
+
+def _figure_publication_id(*, contract: dict, figure: dict, execution_id: str,
+                           fmt: str, logical_task_id: str = "",
+                           request_id: str = "", request_goal_id: str = "") -> str:
+    """Return a durable artifact identity for one declared figure slot.
+
+    With explicit host evidence that the turn has one figure goal, all its
+    successful re-renders share ``request_goal_id`` and form one version
+    chain.  Without that evidence, identity includes the declared figure
+    name, parents and formats, plus the proven request scope.  Consequently
+    two independent single-output calls in a multi-figure request stay
+    separate.  Formats are always separate chains.
+    """
+    figures = contract.get("figures") if isinstance(contract, dict) else []
+    root = str(logical_task_id or "").split(":", 1)[0].strip()
+    root = root or str(request_id or "").strip() or str(execution_id or "").strip()
+    if not root:
+        raise ValueError("figure publication requires a non-empty request scope")
+    request_scope = hashlib.sha256(root.encode("utf-8")).hexdigest()[:24]
+    goal = str(request_goal_id or "").strip() if len(figures) == 1 else ""
+    if goal:
+        goal_hash = hashlib.sha256(goal.encode("utf-8")).hexdigest()[:24]
+        return f"figure:goal-{goal_hash}:{fmt}"
+    slot = {"name": str(figure.get("name") or ""),
+            "parents": list(figure.get("parents") or []),
+            "formats": list(figure.get("formats") or [])}
+    slot_hash = hashlib.sha256(json.dumps(slot, sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    return f"figure:slot-{request_scope}:{slot_hash}:{fmt}"
+
+
 def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
                            contract: dict, source: dict, data_refs: list,
                            profile: dict, settings) -> tuple[str, dict]:
@@ -45,11 +116,23 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
     from src.research.figure_tools import _owner, _session, _error, _publish, _record_project, _register_figure, _failed_qa_checks
     from src.research.analysis_results import persist_prepared_dataset
     from src.research.tools import _safe_name
-    from src.core.tracing import get_job_id
+    from src.core.tracing import get_client_request_id, get_job_id, original_query
 
     owner = _owner()
     inputs, paths, hashes = script_replay_inputs(source, owner)
     execution_id = str(source.get("run_id") or uuid.uuid4().hex)
+    logical_task_id = ""
+    try:
+        from src.research.script_assets import get_run
+        logical_task_id = str(get_run(owner, _session(), execution_id).get("logical_task_id") or "")
+    except Exception:
+        # A retained run may already be unavailable after cleanup.  The
+        # non-empty execution id below is the safe, turn-local fallback.
+        pass
+    request_id = str(get_client_request_id() or "")
+    request_goal_id = _singleton_figure_goal(
+        query=original_query(), has_tables=bool(source.get("input_snapshots")),
+        request_id=request_id, execution_id=execution_id)
     job = SandboxJob(script=text, inputs=inputs, sources=paths,
         expected_input_sha256=hashes, qa_profile=profile,
         outputs=output_slots(contract), output_contract=contract,
@@ -191,7 +274,12 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
                     publication_started = True
                     suffix = f"_{name}.{fmt}"
                     stem = _safe_name(output_name or title, fallback="figure", max_len=80 - len(suffix))
-                    entry = _publish(f"{stem}{suffix}", payload, mime)
+                    publication_id = _figure_publication_id(
+                        contract=contract, figure=item, execution_id=execution_id,
+                        fmt=fmt, logical_task_id=logical_task_id,
+                        request_id=request_id, request_goal_id=request_goal_id)
+                    entry = _publish(f"{stem}{suffix}", payload, mime,
+                                     logical_task_id=publication_id)
                     record = {"format": fmt, **entry}
                     figure["exports"].append(record)
                     exports.append(record)

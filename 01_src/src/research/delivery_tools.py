@@ -76,6 +76,18 @@ _FORMATS = {
     "data_audit": ("xlsx", "html", "json"),
 }
 _DEFAULT_FORMAT = {kind: formats[0] for kind, formats in _FORMATS.items()}
+
+
+def _audit_format_requested(query: str, fmt: str) -> bool:
+    """Only non-default data-audit formats require an explicit user request."""
+    text = str(query or "")
+    if fmt == "json":
+        return bool(re.search(r"(?i)\bjson\b|\.json\b", text))
+    if fmt == "html":
+        return bool(re.search(r"(?i)\bhtml\b|网页版?|报告页", text))
+    return True
+
+
 LEGACY_DELIVERY_NAMES = (
     "export_paper_analysis", "export_experiment_design", "export_research_notes",
     "export_table", "export_literature_evidence", "export_corpus_gap_report",
@@ -230,6 +242,37 @@ def publish_audit_workbooks(report, *, load_source, title='', review_id=''):
     from . import tools
     from .audit_projection import iter_findings, location_cells, source_key, table_targets
 
+    if report.get("schema") == "standalone-audit-review/1":
+        from citrus_audit.api import AuditSnapshot, export_workbook
+        from citrus_audit.reporting import dumps
+
+        receipts, errors = {}, []
+        for saved in report["snapshots"]:
+            raise_if_cancelled("data_audit_workbook")
+            try:
+                name, digest = saved["source_name"], saved["source_sha256"]
+                snapshot = AuditSnapshot(load_source(saved), name, dumps(saved["report"]), digest)
+                if snapshot.report_sha256 != saved["report_sha256"]:
+                    raise ValueError("审查快照摘要不符")
+                content, stats = export_workbook(snapshot, presentation="annotated")
+                content = normalize_ooxml_bytes(content)
+                filename = tools._short_stem(name) + "_审查标注.xlsx"
+                publication_key = sha256(dumps([saved["source_file_id"], digest, snapshot.report_sha256,
+                                               "xlsx", "annotated/1"]).encode()).hexdigest()
+                url = tools._save_artifact(filename, content,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    source_file_id=saved["source_file_id"], source_sha256=digest,
+                    logical_task_id="audit_workbook:" + publication_key)
+                receipts[(saved["file_index"], digest)] = {"url": url, "filename": filename,
+                    "sha256": sha256(content).hexdigest(), "size_bytes": len(content),
+                    "source_file_id": saved["source_file_id"], "source_sha256": digest,
+                    "file_index": saved["file_index"], "cells": stats.get("marked_locations", 0)}
+            except ToolCancelled:
+                raise
+            except Exception as exc:
+                errors.append(f"{saved['source_name']}: {type(exc).__name__}: {exc}")
+        return receipts, errors
+
     groups, targets_by_location = defaultdict(list), defaultdict(list)
     errors = []
     targets = list(table_targets(report))
@@ -319,7 +362,8 @@ def _publish_data_audit(review_id: str, output_format: str, title: str = '') -> 
     if not report.get('table_results'):
         raise ValueError('该复核记录没有表格扫描结果')
     stem = tools._safe_name(title or '数据审查')
-    payload = _data_audit_payload(review)
+    standalone = report.get("schema") == "standalone-audit-review/1"
+    payload = report if standalone else _data_audit_payload(review)
     prepared = []
     if output_format in {'json', 'html'}:
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, indent=2)
@@ -329,11 +373,11 @@ def _publish_data_audit(review_id: str, output_format: str, title: str = '') -> 
             from .audit_projection import location_cells
             rows = ''.join('<tr>' + ''.join('<td>' + escape(str(value)) + '</td>' for value in (
                 loc.get('source_name', ''), loc.get('sheet', ''), loc.get('region_id', ''),
-                ', '.join(location_cells(loc).values()), item['rule'], item['severity'], item['detail'])) + '</tr>'
-                for item in payload['finding_projection']['findings'] for loc in item['locations'])
+                ', '.join(loc.get('ranges') or location_cells(loc).values()), item['rule'], item['severity'], item['detail'])) + '</tr>'
+                for item in payload.get('finding_projection', {}).get('findings', []) for loc in item['locations'])
             content = ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>' +
                 escape(title or '数据审查') + '</title></head><body><h1>' + escape(title or '数据审查') +
-                '</h1><p>' + escape(payload['interpretation']) + '</p><p>复核记录：' + escape(review_id) +
+                '</h1><p>' + escape(payload.get('interpretation') or '保存的审查范围、发现及覆盖见下方快照。') + '</p><p>复核记录：' + escape(review_id) +
                 '</p><table><thead><tr><th>文件</th><th>工作表</th><th>区域</th><th>单元格</th><th>类别</th>' +
                 '<th>严重程度</th><th>说明</th></tr></thead><tbody>' + rows +
                 '</tbody></table><details><summary>完整结果、覆盖与规则执行凭证</summary><pre>' +
@@ -468,14 +512,24 @@ def deliver_research_artifact(**kwargs) -> tuple[str, dict]:
     kind=table：columns+rows、analysis_result_ref+result_section 或 dataset_ref；CSV/TSV/XLSX。
     脚本 emit.table 已保存的 dataset_ref 可直接交付，不必重抄数据；引用不能混用行列或追加。
     kind=bibliography：明确 audit_id 导出全量审查（JSON/XLSX/RIS/BibTeX），或 references 导出显式书目（XLSX/RIS/BibTeX）；不读取最近一次核验。
-    kind=data_audit：真实 integrity_review.review_id；XLSX/HTML/JSON，直接读取同一次扫描与覆盖，勿重抄发现或重跑扫描。
+    kind=data_audit：真实 integrity_review.review_id；默认 XLSX，仅在用户明确要求时 HTML/JSON；直接读取同一次扫描与覆盖，勿重抄发现或重跑扫描。
     JSON issues 含原始 sheet/cell/cells/category/severity；XLSX 原件需仍可访问且哈希一致。每次仅发布 output_format 请求的格式。
     kind=research_notes：project_name、limit、可选 svg_code；HTML。
     kind=corpus_gap：gaps；CSV。append 仅用于报告、表格、文献、语料缺口分批追加。
     不生成缺失科学数据；Word 文档编辑请使用 word_document。
     """
+    data_audit_note = ""
+    if str(kwargs.get("kind") or "") == "data_audit":
+        requested_format = str(kwargs.get("output_format") or "").strip().lower()
+        if requested_format in {"json", "html"}:
+            from src.core.tracing import original_query
+            query = original_query() or ""
+            if query and not _audit_format_requested(query, requested_format):
+                kwargs = {**kwargs, "output_format": "xlsx"}
+                data_audit_note = "未要求 JSON/HTML；数据审查默认交付一份原表标注 XLSX。\n"
     request = DeliveryInput.model_validate(kwargs)
     from src.core.tracing import get_current_tool_name, set_current_tool_name
+    from .delivery_reconciliation import before_publication, delivery_outcome
     renderer = {"table": "export_table", "bibliography": "export_literature_evidence",
                 "research_notes": "export_research_notes", "corpus_gap": "export_corpus_gap_report",
                 "data_audit": "audit_uploaded_data"}.get(request.kind)
@@ -488,9 +542,15 @@ def deliver_research_artifact(**kwargs) -> tuple[str, dict]:
         # kinds of this model-facing entrypoint. Historical rows stay unchanged.
         set_current_tool_name(renderer)
         text = _dispatch(request)
+    except (ValueError, LookupError, PermissionError, ToolArgumentError) as exc:
+        if not before_publication():
+            raise
+        text = f"[ERR_DELIVERY_PREFLIGHT] {exc}"
     finally:
         set_current_tool_name(previous_tool)
     text = text if isinstance(text, str) else ""
+    if data_audit_note:
+        text = data_audit_note + text
     receipts, complete = _receipts(text)
     # Legacy renderers report validation/publication errors in-band, including
     # partial HTML success followed by a failed SVG companion publication.
@@ -500,12 +560,16 @@ def deliver_research_artifact(**kwargs) -> tuple[str, dict]:
     success = bool(receipts) and complete and requested_present and not error
     status = "complete" if success else "partial" if receipts else "failed"
     reason = "" if success else error.group(1).split(":")[-1].lower() if error else "delivery_not_verified"
-    if not success:
-        text = f"[DELIVERY_{status.upper()}] 成果未全部确认入库（{reason}）。\n" + text
+    outcome = delivery_outcome(status, reason, receipts)
+    if outcome["status"] != "complete":
+        status, reason = outcome["status"], outcome["reason_code"]
+        detail = {"not_run": "发布前校验或导出失败，本次未发布成果",
+                  "partial": "已登记部分成果，其余输出失败",
+                  "unknown": "部分发布结果尚未确认，请核对原操作"}.get(status, "成果未全部确认入库")
+        text = f"[DELIVERY_{status.upper()}] {detail}（{reason}）。\n" + text
     artifact = {"kind": request.kind, "purpose": request.purpose, "format": request.output_format,
                 "receipts": receipts, "file_refs": [r["file_id"] for r in receipts],
-                "_tool_outcome": {"status": status, "reason_code": reason,
-                                  "artifacts": [r["url"] for r in receipts]}}
+                "_tool_outcome": outcome}
     if request.dataset_ref:
         artifact["dataset_ref"] = request.dataset_ref.model_dump()
     if request.review_id:

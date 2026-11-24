@@ -575,6 +575,12 @@ def test_reconcile_required_blocks_session_successors_not_admission():
     # Admission is durable; only execution waits for explicit reconciliation.
     third = _turn(client="c")
     assert third["queue_seq"] == 3
+    blocker = {"job_id": reconcile["job_id"], "kind": "reconcile_required", "queue_seq": 1}
+    assert turn_queue.public_view(third)["blocked_by"] == blocker
+    queued = turn_queue.list_turns(owner_user_id=1, session_id="s1", include_terminal=False)
+    assert [turn["blocked_by"] for turn in queued if turn["state"] == "queued"] == [blocker, blocker]
+    unrelated = _turn(owner=2, client="c")
+    assert "blocked_by" not in unrelated
     with pytest.raises(turn_queue.TurnReconcileRequired):
         _claim()
 
@@ -604,6 +610,8 @@ def test_resolve_reconcile_settles_unknown_turn_and_unblocks_successor():
     assert settled["history_saved"] is False
     assert settled["clear_reason"] == "turn_reconciled_by_user"
     assert turn_queue.session_blocker(owner_user_id=1, session_id="s1") is None
+    successor = turn_queue.get_turn(owner_user_id=1, session_id="s1", client_request_id="b")
+    assert "blocked_by" not in successor
 
     claimed = _claim()
     assert claimed["client_request_id"] == "b"

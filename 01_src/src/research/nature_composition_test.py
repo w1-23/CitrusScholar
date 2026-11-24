@@ -438,10 +438,11 @@ def test_figure_methods_guidance_and_resource_stay_non_authorizing():
     assert resource_id not in system_prompt(set())
     assert resource_id not in system_prompt({"read_skill", "web_search"})
     for tool in ("create_research_figure", "run_research_figure_script", "draw_svg"):
-        assert resource_id in system_prompt({tool})
+        assert resource_id not in system_prompt({tool})
+        assert resource_id not in system_prompt({tool}, native_skills=True)
 
     resource = (Path(__file__).resolve().parents[3]
-                / "skills" / "nature-figure" / "references" / "figure-methods.md")
+                / "02_config/skill-history/repository-v3/skills/nature-figure/references/figure-methods.md")
     body = resource.read_text(encoding="utf-8")
     for token in ("bar", "line", "scatter", "errorbar", "boxplot", "histogram",
                   "Matplotlib", "Seaborn", "nature_volcano", "nature_roc",
@@ -468,7 +469,7 @@ def test_skill_session_reads_archived_nature_identity_but_selection_is_current()
         user_turn_id: str = "turn"
         run_id: str = "run"
 
-    session = SkillSession(Identity(), lambda: {"read_skill"})
+    session = SkillSession(Identity(), lambda: {"read_skill"}, allow_archived=True)
     current = catalog.PINNED["nature-figure"]
     for version, sha256 in (current, archived):
         payload = session.page("nature-figure", version, sha256, "SKILL.md", max_chars=120)

@@ -597,7 +597,7 @@ class SessionManager:
                         if diagnostics is not None and not diagnostics:
                             diagnostics.append("raw_history_incomplete")
                         continue
-                    for key in ("citrus_capability_history", "citrus_task_snapshot"):
+                    for key in ("citrus_capability_history", "citrus_task_snapshot", "citrus_citation_bubbles"):
                         if key in context_meta:
                             messages[-1].response_metadata[key] = context_meta.pop(key)
                     messages[-1].additional_kwargs = context_meta
@@ -1014,7 +1014,7 @@ class SessionManager:
         source_meta = getattr(msg, "additional_kwargs", {}) or {}
         context_meta = {key: source_meta[key] for key in allowed if key in source_meta}
         if isinstance(metadata, dict):
-            for key in ("citrus_capability_history", "citrus_task_snapshot"):
+            for key in ("citrus_capability_history", "citrus_task_snapshot", "citrus_citation_bubbles"):
                 if key in metadata:
                     context_meta[key] = metadata[key]
         if isinstance(getattr(msg, "content", None), list):

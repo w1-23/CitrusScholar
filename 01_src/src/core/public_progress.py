@@ -39,7 +39,7 @@ _ENV_FLAG = "CITRUS_PUBLIC_PROGRESS"
 _PRIVATE_TEXT_RE = re.compile(
     r'</?\s*(?:think|analysis|reasoning|tool_calls?|tool_result|calls|invoke|parameter|function)\b'
     r'|\bDSML\b|\bBearer\s+\S+|(?:\{|,)\s*"[^"]+"\s*:', re.I)
-_TOOL_MARKER_RE = re.compile(r"\[(?:TOOL_[A-Z_]+|[Ww]?\d{1,3})\]")
+_TOOL_MARKER_RE = re.compile(r"\[(?:TOOL_[A-Z_]+|[LWHClwhc]?\d{1,3})\]")
 
 # Credential-ish material must never reach the timeline.
 _SECRET_PATTERNS = (
@@ -107,6 +107,8 @@ class PublicAnswerPreview:
         self._prefix += chunk
         boundary = max(self._prefix.rfind(char) for char in "。！？!?\n ")
         if boundary < 48:
+            return
+        if re.search(r"\[[LWHClwhc]\d{0,3}$", self._prefix[:boundary + 1].rstrip()):
             return
         self._closed = True
         text = sanitize(self._prefix[:boundary + 1]) if sanitize(self._prefix) else ""

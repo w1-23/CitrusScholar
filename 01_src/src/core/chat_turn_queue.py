@@ -366,6 +366,12 @@ def _with_position(conn, view: dict) -> dict:
     view["queue_position"] = _position(
         conn, view["owner_user_id"], view["session_id"],
         view["queue_seq"], view["state"])
+    if view["state"] == QUEUED:
+        blocker = _session_blocker(conn, view["owner_user_id"], view["session_id"])
+        if blocker:
+            turn = blocker.get("turn", {})
+            view["blocked_by"] = {"job_id": turn.get("job_id") or blocker["job_id"],
+                                  "kind": blocker["kind"], "queue_seq": turn.get("queue_seq")}
     return view
 
 
@@ -373,7 +379,7 @@ def public_view(turn: dict) -> dict:
     """The bounded HTTP surface; URLs are added by the API adapter."""
     keys = (
         "session_id", "client_request_id", "job_id", "queue_seq",
-        "queue_position", "state", "active_child_job_id", "dispatch_at",
+        "queue_position", "blocked_by", "state", "active_child_job_id", "dispatch_at",
         "started_at", "finished_at", "history_saved", "clear_reason",
     )
     return {key: turn[key] for key in keys if key in turn}
@@ -743,21 +749,25 @@ def session_blocker(*, owner_user_id: int, session_id: str) -> dict | None:
     """
     _validate_identity(owner_user_id, session_id)
     with _transaction() as conn:
-        reconcile = conn.execute(
-            "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
-            "AND session_id=? AND state=? ORDER BY queue_seq LIMIT 1",
-            (owner_user_id, session_id, RECONCILE_REQUIRED),
-        ).fetchone()
-        if reconcile is not None:
-            return {"kind": "reconcile_required",
-                    "turn": _decode(reconcile)}
-        head = _head(conn, owner_user_id, session_id)
-        if head is not None and head["state"] != QUEUED:
-            return {"kind": head["state"], "turn": _decode(head)}
-        legacy = _legacy_blocker(conn, owner_user_id, session_id)
-        if legacy is not None:
-            return legacy
-        return None
+        return _session_blocker(conn, owner_user_id, session_id)
+
+
+def _reconcile_blocker(conn, owner_user_id, session_id):
+    return conn.execute(
+        "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
+        "AND session_id=? AND state=? ORDER BY queue_seq LIMIT 1",
+        (owner_user_id, session_id, RECONCILE_REQUIRED),
+    ).fetchone()
+
+
+def _session_blocker(conn, owner_user_id, session_id):
+    reconcile = _reconcile_blocker(conn, owner_user_id, session_id)
+    if reconcile is not None:
+        return {"kind": RECONCILE_REQUIRED, "turn": _decode(reconcile)}
+    head = _head(conn, owner_user_id, session_id)
+    if head is not None and head["state"] != QUEUED:
+        return {"kind": head["state"], "turn": _decode(head)}
+    return _legacy_blocker(conn, owner_user_id, session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -790,11 +800,7 @@ def claim_head(*, owner_user_id: int, session_id: str,
     """
     _validate_identity(owner_user_id, session_id)
     with _transaction() as conn:
-        reconcile = conn.execute(
-            "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
-            "AND session_id=? AND state=? ORDER BY queue_seq LIMIT 1",
-            (owner_user_id, session_id, RECONCILE_REQUIRED),
-        ).fetchone()
+        reconcile = _reconcile_blocker(conn, owner_user_id, session_id)
         if reconcile is not None:
             raise TurnReconcileRequired("reconcile_required",
                                         job_id=reconcile["root_job_id"])

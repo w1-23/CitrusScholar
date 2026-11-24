@@ -4740,7 +4740,11 @@ app.include_router(shared_corpus_router)
 
 @app.get("/figures")
 async def serve_figures_page(request: Request):
-    """The standalone figure workspace, for signed-in accounts only."""
+    return await figure_workbench_router.workbench_page(request)
+
+
+@app.get("/figures/legacy", include_in_schema=False)
+async def serve_legacy_figures_page(request: Request):
     return await figure_router.serve_figure_page(request)
 
 

@@ -829,6 +829,9 @@ async function authenticate(mode) {
       if (currentAccount.role !== 'admin') throw new Error('此页面仅管理员可访问。');
       location.replace('/admin'); return;
     }
+    if (['/figures', '/figures/legacy', '/figure-workbench'].includes(next)) {
+      location.replace(next); return;
+    }
     await startAuthenticatedApp();
   } catch (e) { if (epoch === authEpoch) { if (error) error.textContent = e.message || '请求失败'; } }
   finally { if (epoch === authEpoch) authInFlight = false; }

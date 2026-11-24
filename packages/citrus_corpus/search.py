@@ -39,12 +39,6 @@ QUERY_PREFIX = "query:"
 # Fixed, deterministic health probe used by the parent before activation.
 HEALTH_QUERY = "scientific research methods data analysis"
 
-DEFAULT_TOP_K_VECTOR = 40
-DEFAULT_TOP_K_BM25 = 40
-DEFAULT_CANDIDATE_WINDOW = 20
-DEFAULT_RRF_K = 60
-DEFAULT_DENSE_WEIGHT = 1.0
-DEFAULT_BM25_WEIGHT = 1.0
 MAX_SEARCH_LIMIT = 50
 
 
@@ -135,16 +129,6 @@ class GenerationHandle:
     def _check_open(self) -> None:
         if self._closed:
             raise GenerationHandleClosed("generation_handle_closed")
-
-    def lookup(self, chunk_id: str) -> dict[str, Any] | None:
-        """Return one detached chunk dictionary, or ``None`` when absent."""
-        if not isinstance(chunk_id, str) or not chunk_id:
-            raise ValueError("chunk_id_required")
-        self._check_open()
-        position = self._index.get(chunk_id)
-        if position is None:
-            return None
-        return deepcopy(self._rows[position])
 
     def search(self, query: str, limit: int = 6, *, eligible=None) -> list[dict[str, Any]]:
         """Hybrid cosine-vector + BM25 retrieval followed by BGE reranking.

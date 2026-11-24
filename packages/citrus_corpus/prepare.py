@@ -1,13 +1,7 @@
-"""Immutable Markdown preparation for shared-corpus candidate bytes.
+"""Immutable Markdown and metadata for the independent literature corpus.
 
-Only text candidates already archived by ``src.core.corpus_review`` may be
-prepared.  The caller supplies the corpus candidate row; this module re-reads
-the archived bytes, requires every recorded hash to match, normalizes line
-endings deterministically, and writes one immutable version directory
-``documents/<document_id>/<version_id>/{fulltext.md,metadata.json}``.
-
-Nothing here accepts a model-supplied path or URL.  All caller-visible errors
-use stable codes and never contain filesystem paths.
+The intake adapter verifies source bytes before parsing. This module normalizes
+and stores Markdown and enforces identities and byte hashes on reads.
 """
 from __future__ import annotations
 
@@ -28,8 +22,6 @@ MAX_DOCUMENT_CHARS = chunks.MAX_DOCUMENT_CHARS
 MAX_METADATA_BYTES = 256 * 1024
 MAX_ARCHIVE_METADATA_BYTES = 64 * 1024
 MAX_HEADER_CHARS = 512
-ALLOWED_SUFFIXES = frozenset({".md", ".txt"})
-
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _URL_RE = re.compile(r"(?i)\b(?:https?|ftp|file)://[^\s<>'\"]+")
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -81,29 +73,6 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _resolve_inside(path: Path, root: Path) -> Path:
-    try:
-        resolved_root = root.resolve(strict=False)
-        resolved = path.resolve(strict=False)
-    except OSError as exc:
-        raise PreparationError("candidate_path_invalid") from exc
-    if resolved_root not in resolved.parents:
-        raise PreparationError("candidate_path_invalid")
-    return resolved
-
-
-def _candidate_path(candidate: dict[str, Any], archive_root: Path) -> Path:
-    raw = str(candidate.get("stored_path") or "").strip()
-    if not raw:
-        raise PreparationError("candidate_source_unavailable")
-    path = _resolve_inside(Path(raw), archive_root)
-    if path.is_symlink():
-        raise PreparationError("candidate_path_invalid")
-    if not path.is_file():
-        raise PreparationError("candidate_source_unavailable")
-    return path
-
-
 def _read_bounded(path: Path, maximum: int) -> bytes:
     if path.is_symlink():
         raise PreparationError("candidate_path_invalid")
@@ -127,31 +96,6 @@ def _read_bounded(path: Path, maximum: int) -> bytes:
     return data
 
 
-def read_candidate_source(candidate: dict[str, Any], archive_root: Path
-                          ) -> tuple[str, str, int]:
-    """Return (normalized markdown, sha256, char_count) for one candidate."""
-    declared_raw = str(candidate.get("raw_sha256") or "").strip().casefold()
-    declared_text = str(candidate.get("content_sha256") or "").strip().casefold()
-    if not declared_raw and not declared_text:
-        raise PreparationError("candidate_hash_missing")
-    path = _candidate_path(candidate, archive_root)
-    if path.suffix.casefold() not in ALLOWED_SUFFIXES:
-        raise PreparationError("unsupported_source_format")
-    data = _read_bounded(path, MAX_SOURCE_BYTES)
-    if declared_raw and _sha256_bytes(data) != declared_raw:
-        raise PreparationError("candidate_hash_mismatch")
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise PreparationError("unsupported_source_format") from exc
-    if "\x00" in text:
-        raise PreparationError("unsupported_source_format")
-    if declared_text and _sha256_bytes(text.encode("utf-8")) != declared_text:
-        raise PreparationError("candidate_hash_mismatch")
-    text = normalize_markdown(text)
-    return text, _sha256_bytes(text.encode("utf-8")), len(text)
-
-
 def normalize_markdown(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if "\x00" in text:
@@ -161,31 +105,6 @@ def normalize_markdown(text: str) -> str:
     if len(text) > MAX_DOCUMENT_CHARS:
         raise PreparationError("document_too_large")
     return text if text.endswith("\n") else text + "\n"
-
-
-def load_archive_metadata(candidate: dict[str, Any],
-                          archive_root: Path) -> dict[str, Any]:
-    """Load the server-written sidecar for the original candidate, if any."""
-    try:
-        source = _candidate_path(candidate, archive_root)
-        meta_path = _resolve_inside(source.parent / "meta.json", archive_root)
-        if meta_path.is_symlink() or not meta_path.is_file():
-            return {}
-        payload = _read_bounded(meta_path, MAX_ARCHIVE_METADATA_BYTES)
-        record = json.loads(payload.decode("utf-8"))
-        if not isinstance(record, dict):
-            return {}
-        if candidate.get("source_kind") == "fetch_paper":
-            # Fetch rights are attested only by the sidecar bound to the saved bytes.
-            for key in ("license", "license_verified", "license_evidence", "license_source_url"):
-                record.pop(key, None)
-        evidence = _read_license(source.parent / "license.json", candidate.get("raw_sha256"))
-        if evidence:
-            record.update({key: evidence[key] for key in ("license", "license_verified", "license_evidence")})
-            record["license_source_url"] = evidence["url"]
-        return record
-    except (PreparationError, OSError, UnicodeDecodeError, ValueError):
-        return {}
 
 
 def _read_license(path: Path, digest: str) -> dict[str, Any]:
@@ -201,34 +120,6 @@ def _read_license(path: Path, digest: str) -> dict[str, Any]:
     if source == "ncbi_pmc_oa" or (source == rights.PMC_CLOUD_EVIDENCE and rights.PMC_CLOUD_METADATA_URL.fullmatch(record["url"])):
         return record
     return {}
-
-
-def document_identity(candidate: dict[str, Any], content_sha256: str
-                      ) -> tuple[str, str, str, str, str, str]:
-    try:
-        candidate_id = int(candidate.get("candidate_id"))
-    except (TypeError, ValueError) as exc:
-        raise PreparationError("candidate_id_invalid") from exc
-    if candidate_id <= 0:
-        raise PreparationError("candidate_id_invalid")
-    from citrus_refcheck.providers import norm_title, normalize_doi
-    from urllib.parse import urlsplit
-
-    title = public_text(candidate.get("title"), 512)
-    doi = public_text(normalize_doi(candidate.get("doi")), 256)
-    year = public_text(candidate.get("year"), 16)
-    source_kind = public_text(candidate.get("source_kind"), 64) or "shared_corpus"
-    paper_key = f"corpus_candidate\0{candidate_id}"
-    if source_kind == "fetch_paper":
-        url = urlsplit(str(candidate.get("url") or ""))
-        if doi:
-            paper_key = f"doi\0{doi}"
-        elif url.scheme in {"http", "https"} and url.hostname and title:
-            paper_key = "\0".join((url._replace(fragment="").geturl(), norm_title(title)))
-    document_id = "doc_" + hashlib.sha256(paper_key.encode("utf-8")).hexdigest()[:24]
-    seed = "\0".join((content_sha256, title, doi, year, source_kind))
-    version_id = "v_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
-    return document_id, version_id, title, doi, year, source_kind
 
 
 def _document_dir(documents_root: Path, document_id: str, version_id: str) -> Path:
@@ -317,32 +208,6 @@ def read_document_files(documents_root: Path, document_id: str,
     return metadata, markdown
 
 
-def public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    """Return only bounded, caller-safe document metadata."""
-    fields = (
-        "document_id",
-        "version_id",
-        "title",
-        "doi",
-        "year",
-        "source_kind",
-        "source_format",
-        "license",
-        "license_evidence",
-        "content_sha256",
-        "char_count",
-        "chunk_count",
-        "schema_version",
-        "prepared_at",
-        "section_path",
-    )
-    result = {key: metadata.get(key) for key in fields}
-    result["section_path"] = [str(item) for item in
-                              (metadata.get("section_path") or [])
-                              if str(item).strip()]
-    return result
-
-
 def _write_file(path: Path, data: bytes) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -411,103 +276,3 @@ def write_document(documents_root: Path, document_id: str, version_id: str,
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return metadata
-
-
-def prepare_document(documents_root: Path, candidate: dict[str, Any],
-                     archive_root: Path) -> dict[str, Any]:
-    """Prepare one immutable version and return its validated result."""
-    archive_meta = load_archive_metadata(candidate, archive_root)
-    decision = rights.evaluate_source_rights(archive_meta)
-    markdown, content_sha256, _char_count = read_candidate_source(
-        candidate, archive_root)
-    (document_id, version_id, title, doi, year,
-     source_kind) = document_identity(candidate, content_sha256)
-
-    target = _document_dir(documents_root, document_id, version_id)
-    if target.exists():
-        try:
-            existing, _ = read_document_files(documents_root, document_id, version_id)
-        except (FileNotFoundError, ValueError) as exc:
-            raise PreparationError("document_version_conflict") from exc
-        if str(existing.get("content_sha256") or "") != content_sha256:
-            raise PreparationError("document_version_conflict")
-        if not existing.get("license") and decision["license"] and archive_meta.get("license_source_url"):
-            from tempfile import NamedTemporaryFile
-            evidence = {"license": decision["license"], "license_verified": True,
-                        "license_evidence": archive_meta["license_evidence"],
-                        "url": archive_meta["license_source_url"],
-                        "sha256_of_saved_bytes": content_sha256}
-            with NamedTemporaryFile(dir=target, delete=False) as stream:
-                staging = Path(stream.name)
-                try:
-                    stream.write(json.dumps(evidence, ensure_ascii=False).encode())
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                    try:
-                        (target / "license.json").hardlink_to(staging)
-                    except FileExistsError:
-                        pass
-                    _sync_dir(target)
-                finally:
-                    staging.unlink(missing_ok=True)
-            existing, _ = read_document_files(documents_root, document_id, version_id)
-        return {
-            "document_id": document_id,
-            "version_id": version_id,
-            "metadata": existing,
-            "markdown": markdown,
-            "content_sha256": content_sha256,
-            "chunk_count": int(existing.get("chunk_count") or 0),
-            "section_path": list(existing.get("section_path") or []),
-            "rights": decision,
-        }
-
-    outline = chunks.section_outline(markdown)
-    section_path = [item["section_name"] for item in outline
-                    if item["section_name"] != "__preamble__"]
-    metadata: dict[str, Any] = {
-        "schema_version": chunks.SCHEMA_VERSION,
-        "document_id": document_id,
-        "version_id": version_id,
-        "title": title,
-        "doi": doi,
-        "year": year,
-        "source_kind": source_kind,
-        "source": source_kind,
-        "source_url": str(archive_meta.get("url") or ""),
-        "source_sha256": str(archive_meta.get("sha256_of_source_text") or candidate.get("raw_sha256") or ""),
-        "source_format": public_text(archive_meta.get("raw_format"), 64),
-        "conversion": public_text(archive_meta.get("conversion"), 120),
-        "license": decision["license"],
-        "license_evidence": public_text(archive_meta.get("license_evidence"), 64) if decision["license"] else "",
-        "license_source_url": str(archive_meta.get("license_source_url") or "") if decision["license"] else "",
-        "content_sha256": content_sha256,
-        "char_count": len(markdown),
-        "prepared_at": utc_now(),
-        "section_path": section_path,
-        "sections": [
-            {
-                "section_index": int(item["section_index"]),
-                "section_name": item["section_name"],
-                "section_level": int(item["section_level"]),
-                "section_path": list(item["section_path"]),
-                "start": int(item["start"]),
-                "end": int(item["end"]),
-            }
-            for item in outline
-        ],
-    }
-    records = chunks.chunk_document(metadata, markdown)
-    metadata["chunk_count"] = len(records)
-    written = write_document(documents_root, document_id, version_id,
-                             metadata, markdown)
-    return {
-        "document_id": document_id,
-        "version_id": version_id,
-        "metadata": written,
-        "markdown": markdown,
-        "content_sha256": content_sha256,
-        "chunk_count": int(written.get("chunk_count") or len(records)),
-        "section_path": list(written.get("section_path") or []),
-        "rights": decision,
-    }

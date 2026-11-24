@@ -14,9 +14,6 @@ from typing import Any
 from .contract import LEGACY, CorpusSpec
 
 SCHEMA_VERSION = 2
-CORPUS_ID = LEGACY.corpus_id
-CORPUS_FAMILY_ID = LEGACY.family_id
-
 CHUNK_TARGET = 1600
 CHUNK_MAX = 2400
 CHUNK_MIN = 240

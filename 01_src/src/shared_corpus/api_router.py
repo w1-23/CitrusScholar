@@ -1,5 +1,6 @@
 """Authorized shared literature status, preview, and administration."""
 import json
+import sqlite3
 import time
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -59,18 +60,34 @@ def preview(document_id: str, request: Request,
             index_generation: str | None = Query(default=None, max_length=96),
             version_id: str | None = Query(default=None, max_length=96),
             start: int = Query(default=0, ge=0), length: int = Query(default=12000, ge=1, le=12000),
-            md_sha256: str | None = Query(default=None, pattern=r"^[a-f0-9]{64}$")):
+            md_sha256: str | None = Query(default=None, pattern=r"^[a-f0-9]{64}$"),
+            chunk_id: str | None = Query(default=None, pattern=r"^[a-f0-9]{32}$")):
+    from citrus_corpus.contract import ISOLATED
+    from src.corpus_integration.read_access import legacy_reader, read_reference_page
+
     _actor(request)
     identity = (index_generation, version_id, md_sha256)
     if any(value is not None for value in identity) and not all(identity):
         raise HTTPException(422, "引用需要完整的索引代次、版本和内容校验值。")
     try:
-        result = _runtime().preview(document_id, generation=index_generation, version=version_id,
+        if chunk_id:
+            if not all(identity):
+                raise LookupError("shared_document_unavailable")
+            ref = {"source_family": ISOLATED.family_id, "document_id": document_id,
+                   "index_generation": index_generation, "version_id": version_id, "md_sha256": md_sha256,
+                   "start": start, "end": start + length, "chunk_id": chunk_id}
+            result = read_reference_page(ref, length=length)
+            result["exact_span"] = True
+        else:
+            reader = legacy_reader()
+            if reader is None:
+                raise LookupError("shared_document_unavailable")
+            result = reader.preview(document_id, generation=index_generation, version=version_id,
                                     start=start, length=length, digest=md_sha256)
     except MaintenanceBusy as error:
         raise HTTPException(503, {"code": "knowledge_base_updating", "message": MAINTENANCE_MESSAGE},
                             headers={"Retry-After": str(RETRY_AFTER)}) from error
-    except (LookupError, ValueError, OSError):
+    except (LookupError, ValueError, OSError, sqlite3.Error):
         return JSONResponse({"code": "citation_unavailable", "message": "该文献版本已过期或不可访问。"},
                             status_code=404, headers=_PRIVATE)
     return JSONResponse(result, headers=_PRIVATE)

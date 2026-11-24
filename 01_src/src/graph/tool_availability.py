@@ -187,10 +187,10 @@ def script_sandbox_available() -> bool:
 
 
 def shared_corpus_available() -> bool:
-    """Whether this process started the shared-corpus runtime."""
+    """Whether the selected shared-corpus search is configured."""
     try:
-        from src.shared_corpus.runtime import current_runtime
-        return current_runtime() is not None
+        from src.corpus_integration.read_access import shared_search_available
+        return shared_search_available()
     except Exception:
         return False
 
@@ -213,6 +213,10 @@ def runtime_env(*, source_scope: str = SCOPE_AUTO, attachments: int = 0,
     scope = str(source_scope or SCOPE_AUTO)
     if scope not in KNOWN_SCOPES:
         scope = SCOPE_AUTO
+    from src.corpus_integration.settings import isolated_enabled
+    denied = frozenset(denied or ())
+    if isolated_enabled():
+        denied |= {"propose_document_ingest", "prepare_document", "commit_document_index"}
     return Env(
         network=bool(network),
         local_corpus=bool(local_corpus),
@@ -222,7 +226,7 @@ def runtime_env(*, source_scope: str = SCOPE_AUTO, attachments: int = 0,
         research_tools=bool(research_tools),
         script_sandbox=(script_sandbox_available()
                         if script_sandbox is None else bool(script_sandbox)),
-        denied=frozenset(denied or ()),
+        denied=denied,
         source_scope=scope,
         retrieval=bool(retrieval),
         visualization=bool(visualization),

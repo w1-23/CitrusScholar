@@ -279,8 +279,11 @@ async def lifespan(app: FastAPI):
     from src.core import chat_turn_queue
     await asyncio.to_thread(chat_turn_queue.ensure_schema)
     await _reconcile_turn_queue_startup()
-    from src.shared_corpus.runtime import start_runtime, stop_runtime
-    shared_runtime = await asyncio.to_thread(start_runtime)
+    from src.corpus_integration.settings import legacy_enabled
+    shared_runtime = None
+    if legacy_enabled():
+        from src.shared_corpus.runtime import start_runtime
+        shared_runtime = await asyncio.to_thread(start_runtime)
     if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
         execution_coordinator_task = asyncio.create_task(coordinator.run())
     app.state.turn_queue_wake = asyncio.Event()
@@ -295,7 +298,9 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(shared_task, return_exceptions=True)
         app.state.turn_queue_consumer.cancel()
         await asyncio.gather(app.state.turn_queue_consumer, return_exceptions=True)
-        stop_runtime(shared_runtime)
+        if shared_runtime is not None:
+            from src.shared_corpus.runtime import stop_runtime
+            stop_runtime(shared_runtime)
         if execution_coordinator_task is not None:
             execution_coordinator_task.cancel()
             await asyncio.gather(execution_coordinator_task, return_exceptions=True)
@@ -396,9 +401,11 @@ def require_owned_session(session_id: str, user: dict, *,
         raise HTTPException(status_code=404, detail="会话不存在或无权访问。")
 
 
-from src.shared_corpus.activity import ActivityMiddleware  # noqa: E402
+from src.corpus_integration.settings import legacy_enabled  # noqa: E402
 
-app.add_middleware(ActivityMiddleware)
+if legacy_enabled():
+    from src.shared_corpus.activity import ActivityMiddleware
+    app.add_middleware(ActivityMiddleware)
 
 
 @app.middleware("http")
@@ -4736,6 +4743,9 @@ app.include_router(reference_router)
 from src.shared_corpus.api_router import router as shared_corpus_router  # noqa: E402
 
 app.include_router(shared_corpus_router)
+if os.getenv("CITRUS_CORPUS_MODE") == "isolated":
+    from src.corpus_integration.api_router import router as isolated_corpus_router
+    app.include_router(isolated_corpus_router)
 
 
 @app.get("/figures")

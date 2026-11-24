@@ -186,12 +186,11 @@ def _retained_shared_rows(records):
 def _project_sources(session_id: str, request_id: str, user: dict, cap: int) -> tuple[list[dict], bool]:
     from itertools import chain
     from src.shared_corpus.references import read_reference
-    from src.shared_corpus.runtime import current_runtime
+    from src.corpus_integration.read_access import reference_visible
 
     ledger = turn_source_ledger.fetch_rows(session_id, request_id)
     records = tool_results.fetch_by_request(session_id, request_id)
     stored = {row["tool_call_id"]: row for row in records}
-    runtime = current_runtime()
     sources, seen = [], set()
     counts = {"local": 0, "web": 0, "shared": 0}
     limits = {"local": MAX_LOCAL, "web": MAX_WEB, "shared": 4}
@@ -225,7 +224,7 @@ def _project_sources(session_id: str, request_id: str, user: dict, cap: int) -> 
                 continue
             item.update(source_ref=key, title="共享引用不可用")
             if (user.get("active") and user.get("approval_status") == "approved"
-                    and runtime is not None and runtime.reference_visible(ref)):
+                    and reference_visible(ref)):
                 item.update(source_status="available", title=turn_source_ledger.safe_text(row["title"], 200))
         else:
             url = turn_source_ledger.safe_http_url(row.get("url"))
@@ -428,15 +427,14 @@ _INLINE_REFERENCE = re.compile(r"\[([LWHC]\d{1,3})\]", re.I)
 
 def _visible_shared_reference(ref, user):
     from src.shared_corpus.references import read_reference
-    from src.shared_corpus.runtime import current_runtime
+    from src.corpus_integration.read_access import reference_visible
 
     if "active" not in user or "approval_status" not in user:
         from src.auth import user_by_id
         user = user_by_id(int(user.get("user_id") or 0)) or {}
     ref = read_reference({"read_ref": ref})
     if ref and user.get("active") and user.get("approval_status") == "approved":
-        runtime = current_runtime()
-        if runtime is not None and runtime.reference_visible(ref):
+        if reference_visible(ref):
             return ref
     return None
 

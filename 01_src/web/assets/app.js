@@ -2084,6 +2084,7 @@ function renderCitationBubbles(container, bubbles) {
       var ref = source.read_ref;
       var params = new URLSearchParams({version_id: ref.version_id, index_generation: ref.index_generation,
                                         md_sha256: ref.md_sha256, start: ref.start, length: ref.end - ref.start});
+      if (ref.chunk_id) params.set('chunk_id', ref.chunk_id);
       link.href = '/api/v2/shared-corpus/documents/' + encodeURIComponent(ref.document_id) + '?' + params;
       link.textContent = '本地：' + title;
       link.addEventListener('click', function (event) {

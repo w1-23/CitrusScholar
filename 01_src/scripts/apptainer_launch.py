@@ -88,6 +88,42 @@ def verified_skill_release(config, binds):
     return root
 
 
+def isolated_corpus(config, binds):
+    options = config.get('isolated_corpus')
+    if options is None:
+        return [], []
+    allowed = {'root', 'growth', 'read', 'embedding_cache', 'read_generation'}
+    if (not isinstance(options, dict) or not options.keys() <= allowed
+            or config.get('shared_literature_single_web')):
+        raise ValueError('Invalid or conflicting isolated corpus deployment')
+    growth, read = options.get('growth', False), options.get('read', False)
+    if type(growth) is not bool or type(read) is not bool:
+        raise ValueError('Isolated corpus switches must be boolean')
+    root = Path(absolute(options.get('root')))
+    if root.resolve(strict=True) != root or not root.is_dir():
+        raise ValueError('Isolated corpus needs a real, dedicated directory')
+    occupied = [Path(path).resolve() for path, _mode in binds]
+    if any(root.is_relative_to(path) or path.is_relative_to(root) for path in occupied):
+        raise ValueError('Isolated corpus root overlaps a deployment bind')
+    mounts = [(str(root), 'rw')]
+    variables = ['CITRUS_CORPUS_MODE=isolated', 'CITRUS_ISOLATED_CORPUS_ROOT=' + str(root),
+                 'CITRUS_CORPUS_FETCH_GROWTH=' + str(int(growth)), 'CITRUS_CORPUS_READ=' + str(int(read))]
+    cache = options.get('embedding_cache')
+    if read or cache is not None:
+        cache = Path(absolute(cache))
+        if (cache.resolve(strict=True) != cache or not cache.is_dir()
+                or cache.is_relative_to(root) or root.is_relative_to(cache)):
+            raise ValueError('Isolated corpus needs a separate model cache')
+        mounts.append((str(cache), 'ro'))
+        variables.append('CITRUS_ISOLATED_CORPUS_EMBEDDING_CACHE=' + str(cache))
+    generation = options.get('read_generation')
+    if generation is not None:
+        if not read or not isinstance(generation, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,95}', generation):
+            raise ValueError('Invalid isolated corpus experiment generation')
+        variables.append('CITRUS_CORPUS_READ_GENERATION=' + generation)
+    return mounts, [arg for value in variables for arg in ('--env', value)]
+
+
 def command(config, role):
     if role not in {'web', 'worker', 'prepare'}:
         raise ValueError('Unknown deployment role')
@@ -160,6 +196,9 @@ def command(config, role):
         ingress_binds, ingress_env = lan_ingress(config, port)
         binds += ingress_binds
         result += ingress_env
+        corpus_binds, corpus_env = isolated_corpus(config, binds)
+        binds += corpus_binds
+        result += corpus_env
     if role == 'web' and config.get('browse_config'):
         # Script is launched with -I; import only from this trusted source snapshot.
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

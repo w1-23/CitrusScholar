@@ -327,10 +327,16 @@ def search_agent_corpus(query: str, limit: int = 6) -> str:
     except (TypeError, ValueError):
         return _not_run("limit_invalid", "检索条数无效。")
     try:
-        _owner, _role = _identity()
-        runtime = _runtime()
+        from src.core.capability_policy import allows
+        from src.corpus_integration.read_access import isolated_search
+        from src.corpus_integration.settings import isolated_enabled
         from src.shared_corpus.activity import MaintenanceBusy
-        if runtime.unavailable or runtime.generation is None:
+
+        if not allows("local_rag"):
+            return _not_run("local_rag_disabled", "本地检索未启用。")
+        _owner, _role = _identity()
+        runtime = isolated_search() if isolated_enabled() else _runtime()
+        if runtime is None or runtime.unavailable or runtime.generation is None:
             return _not_run("shared_index_unavailable", "共享文献索引尚未就绪。")
         try:
             rows = runtime.search(text, limit=size)

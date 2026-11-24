@@ -132,6 +132,11 @@ def _compact_audit(payload):
 
 
 
+def identity_report_requested(_query):
+    """Compatibility for a running Web process still holding the previous Host."""
+    return False
+
+
 def saved_identity_report(owner, session, audit_id):
     from html import escape
     from src.core.turn_source_ledger import safe_http_url

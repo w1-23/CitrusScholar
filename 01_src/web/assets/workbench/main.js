@@ -1,6 +1,7 @@
-import { byId, element, renderInspector, renderTree } from './controls.js';
-import { CanvasView, imageAsset } from './canvas.js';
-import { initializeAssets, initializeOpenDialog } from './library.js';
+import { byId, element } from './dom.js';
+import { renderInspector, renderTree } from './controls.js?v=2';
+import { CanvasView, imageAsset } from './canvas.js?v=2';
+import { initializeAssets, initializeOpenDialog } from './library.js?v=2';
 
 const api = '/api/v2/figure-workbench';
 const state = { project: null, selected: null, expanded: new Set(), snapshots: [[]], cursor: 0,

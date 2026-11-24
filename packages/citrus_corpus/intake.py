@@ -1,6 +1,5 @@
 """The only job handlers for independent, single-work intake."""
 from hashlib import sha256
-from pathlib import Path
 
 from . import originals
 from .catalog import Catalog

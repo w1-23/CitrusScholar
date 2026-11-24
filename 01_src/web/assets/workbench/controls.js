@@ -1,11 +1,4 @@
-export const byId = (id) => document.getElementById(id);
-
-export function element(tag, text, className) {
-  const node = document.createElement(tag);
-  if (text !== undefined) node.textContent = text;
-  if (className) node.className = className;
-  return node;
-}
+import { byId, element } from './dom.js';
 
 const labels = {
   text: '文字', label: '名称', color: '系列颜色', facecolor: '填充颜色', edgecolor: '边框颜色',

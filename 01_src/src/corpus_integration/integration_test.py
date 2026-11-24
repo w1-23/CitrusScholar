@@ -37,17 +37,6 @@ def test_fetch_observation_never_archives_or_fetches_inline(tmp_path, monkeypatc
     assert fetch_submit._pending.get_nowait()[-1] is content
     assert fetch._retain_missing_paper(doi="", pmid="", title="", url="https://a.example") is None
 
-    raw = b"A permitted original saved by the fixture."
-    receipt = fetch_submit.SavedOriginal(7, "saved.txt", sha256(raw).hexdigest())
-    (root.inbox / receipt.inbox_path).write_bytes(raw)
-    with root.write():
-        assert fetch._retain_paper(winner, saved_original=receipt)["retention_status"] == "handoff_busy"
-    assert fetch._retain_paper(winner, saved_original=fetch_submit.SavedOriginal(8, "saved.txt", receipt.sha256))[
-        "retention_status"] == "receipt_denied"
-    accepted = fetch._retain_paper(winner, saved_original=receipt)
-    assert accepted["retention_status"] == "accepted" and list(root.originals.iterdir()) == []
-    assert Intake(root).queue.status(accepted["intake_id"])["state"] == "queued"
-    assert Intake(root).process_one()["state"] == "prepared"
     monkeypatch.setattr(fetch, "_enabled", lambda capability: False)
     assert fetch._retain_paper(winner) is None
 
@@ -142,6 +131,17 @@ def test_admin_explicit_intake_returns_durable_receipt(tmp_path, monkeypatch):
         assert client.get(path + "/" + job_id, headers=admin).json()["state"] == "queued"
         assert Intake(store).process_one()["error"] == "source_missing"
         assert client.get(path + "/" + job_id, headers=admin).json()["state"] == "failed"
+
+        # Exact original admission belongs to the supported admin route, not to Fetch.
+        original = b"# Admin fixture\n\nAn explicitly staged full text.\n"
+        (store.inbox / "verified.md").write_bytes(original)
+        response = client.post(path, headers=admin,
+                               json={"saved_path": "verified.md", "sha256": sha256(original).hexdigest()})
+        assert response.status_code == 202
+        job_id = response.json()["job"]["id"]
+        assert Intake(store).process_one()["state"] == "prepared"
+        assert client.get(path + "/" + job_id, headers=admin).json()["raw_sha256"] == sha256(original).hexdigest()
+
 
 
 def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monkeypatch):

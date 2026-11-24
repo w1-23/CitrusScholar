@@ -499,14 +499,14 @@ def _local_paper_exists(doi: str, title: str) -> bool:
 
 
 def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "",
-                  official: tuple[dict, str, str] | None = None, saved_original=None) -> dict | None:
-    """Deduplicate a complete online paper before enqueuing its full text."""
+                  official: tuple[dict, str, str] | None = None) -> dict | None:
+    """Dispatch fetched content to the configured retention policy."""
     from src.corpus_integration.settings import legacy_enabled
     if not legacy_enabled():
         from src.core.tracing import get_user_id
         from src.corpus_integration.fetch_submit import submit
         try:
-            return (submit(winner, owner=get_user_id(), doi=doi, title=title, saved_original=saved_original)
+            return (submit(winner, owner=get_user_id(), doi=doi, title=title)
                     if _enabled("web_fetch") else None)
         except Exception as error:
             logger.warning("Isolated Fetch handoff unavailable: %s", type(error).__name__)

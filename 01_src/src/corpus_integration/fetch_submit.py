@@ -1,10 +1,8 @@
 """Bounded, best-effort handoff of an already returned Fetch observation."""
 from contextvars import copy_context
-from dataclasses import dataclass
 import logging
 import os
 from queue import Full, Queue
-import sqlite3
 from threading import Lock, Thread
 
 from .settings import growth_enabled
@@ -16,22 +14,12 @@ _start_lock = Lock()
 _consumer = None
 
 
-@dataclass(frozen=True)
-class SavedOriginal:
-    """An original staged and authorized for this account by the host."""
-    owner: int
-    inbox_path: str
-    sha256: str
-
-
-def submit(winner, *, owner, doi="", title="", saved_original=None):
+def submit(winner, *, owner, doi="", title=""):
     if not growth_enabled() or not owner:
         return None
     root = os.getenv("CITRUS_ISOLATED_CORPUS_ROOT")
     if not root:
         return {"retention_status": "handoff_unavailable"}
-    if saved_original is not None:
-        return _submit_saved(root, saved_original, owner, doi, title, winner.get("url") or "")
     content = winner.get("content")
     if winner.get("truncated") or type(content) is not str or not 0 < len(content) <= MAX_OBSERVATION_CHARS:
         return {"retention_status": "source_out_of_bounds"}
@@ -45,24 +33,6 @@ def submit(winner, *, owner, doi="", title="", saved_original=None):
     except Full:
         return {"retention_status": "queue_full"}
     return {"retention_status": "handoff_unconfirmed"}
-
-
-def _submit_saved(root, receipt, owner, doi, title, url):
-    if type(receipt) is not SavedOriginal or receipt.owner != owner:
-        return {"retention_status": "receipt_denied"}
-    from citrus_corpus.intake import Intake
-    from citrus_corpus.store import Store
-
-    try:
-        job = Intake(Store(root, read_timeout=0.025)).submit_local(
-            receipt.inbox_path, expected_sha256=receipt.sha256, actor=f"account-{owner}",
-            doi=doi, url=url, title=title, timeout=0.025)
-    except sqlite3.OperationalError:
-        return {"retention_status": "handoff_busy"}
-    except (OSError, ValueError) as exc:
-        state = "queue_full" if str(exc) == "corpus_queue_full" else "handoff_unavailable"
-        return {"retention_status": state}
-    return {"retention_status": "accepted", "intake_id": job["id"], "intake_state": job["state"]}
 
 
 def _ensure_consumer():

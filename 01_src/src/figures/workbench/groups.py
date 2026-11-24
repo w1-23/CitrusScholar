@@ -22,7 +22,7 @@ _ALLOWED = {
     "grid": set(EDITABLE_BY_ROLE["grid"]), "spine": set(EDITABLE_BY_ROLE["spine"]),
     "errorbar": set(EDITABLE_BY_ROLE["errorbar"]), "colorbar": {"label", "offset_px", "visible"},
 }
-_LABELS = {"figure": "整张图", "title": "标题", "xlabel": "X 轴标题", "ylabel": "Y 轴标题", "legend": "图例",
+_LABELS = {"title": "标题", "xlabel": "X 轴标题", "ylabel": "Y 轴标题", "legend": "图例",
            "annot": "注释", "grid": "网格线", "spine": "坐标轴线", "errorbar": "误差棒", "colorbar": "色标"}
 _ARTISTS = {"Line2D": "曲线", "Rectangle": "柱形", "PathCollection": "散点", "PolyCollection": "填充带",
             "FillBetweenPolyCollection": "填充带", "QuadMesh": "热图", "AxesImage": "热图"}

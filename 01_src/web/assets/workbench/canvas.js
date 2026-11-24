@@ -1,4 +1,4 @@
-import { byId } from './controls.js';
+import { byId } from './dom.js';
 
 const MOVABLE = new Set(['title', 'xlabel', 'ylabel', 'legend', 'annot', 'colorbar']);
 

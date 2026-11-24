@@ -1,6 +1,6 @@
-import { byId, element } from './controls.js';
+import { byId, element } from './dom.js';
 
-export function thumbnail(project, revisionUrl) {
+function thumbnail(project, revisionUrl) {
   const format = project.exports?.svg ? 'svg' : project.exports?.png ? 'png' : '';
   if (!format) return null;
   const image = element('img', undefined, 'thumbnail');

@@ -969,7 +969,8 @@ def _confirm_edit_targets(manifest: dict[str, Any], targets: dict[str, tuple[str
 
 
 def preview_overrides(figure_id: str, owner: int, raw_overrides: Any,
-                      *, expected_revision: int | None = None, draft_revision: int = 0) -> dict[str, Any]:
+                      *, expected_revision: int | None = None, draft_revision: int = 0,
+                      confirm_targets=None) -> dict[str, Any]:
     """Render a disposable draft; authorization and integrity precede every hit."""
     from src.figures.preview_pipeline import render_preview
     project = _load_revision(figure_id, owner, expected_revision)
@@ -979,19 +980,22 @@ def preview_overrides(figure_id: str, owner: int, raw_overrides: Any,
         _assert_current(project, owner)
         _verify_sources(project, owner)
     def render():
-        merged, _, manifest, blobs = _render_edits(project, owner, entries,
+        merged, changed, manifest, blobs = _render_edits(project, owner, entries,
                                                    formats=("svg",), render_mode="preview")
         _confirm_edit_targets(manifest, targets)
         return {"figure_id": figure_id, "manifest": manifest,
                 "svg": blobs["svg"].decode("utf-8"),
-                "render_version": int(project.get("render_version") or 0), "overrides": merged}
+                "render_version": int(project.get("render_version") or 0), "overrides": merged, "changed": changed}
     result = render_preview(project, owner, raw_overrides, validate=validate,
                             render=render, is_script=_is_script(project))
-    return {**result, "draft_revision": draft_revision}
+    if confirm_targets is not None:
+        confirm_targets(result["manifest"], result["overrides"], result.get("changed", []))
+    return {**{key: value for key, value in result.items() if key != "changed"}, "draft_revision": draft_revision}
 
 
 def save_overrides(figure_id: str, owner: int, raw_overrides: Any,
-                   *, session_id: str = "", expected_revision: int | None = None) -> dict[str, Any]:
+                   *, session_id: str = "", expected_revision: int | None = None,
+                   confirm_targets=None) -> dict[str, Any]:
     """Validate the user's edits, apply them, re-render and publish.
 
     The whole batch is rejected if any entry is invalid. A partial
@@ -1008,6 +1012,8 @@ def save_overrides(figure_id: str, owner: int, raw_overrides: Any,
     merged, changed, new_manifest, blobs = _render_edits(
         project, owner, entries, formats=formats)
     _confirm_edit_targets(new_manifest, targets)
+    if confirm_targets is not None:
+        confirm_targets(new_manifest, merged, changed)
 
     stem = project.get("title") or "figure"
     published = publish_rendered(owner, session_id or project.get("session_id", ""),

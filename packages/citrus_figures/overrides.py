@@ -182,7 +182,11 @@ def validate_overrides(raw: Any, manifest: dict[str, Any]) -> list[dict[str, Any
                 f"可修改：{', '.join(sorted(editable)) or '（无）'}。")
 
         if prop in _COLOR_PROPS:
-            clean: Any = _normalise_color(value)
+            if (prop == "markerfacecolor" and manifest.get("source") == "spec"
+                    and target.get("role") == "series" and value in ("auto", "none")):
+                clean: Any = value
+            else:
+                clean = _normalise_color(value)
         elif prop == "fontsize":
             clean = _normalise_number(value, _MIN_FONTSIZE, _MAX_FONTSIZE, "字号")
         elif prop == "linewidth":
@@ -226,7 +230,7 @@ def validate_overrides(raw: Any, manifest: dict[str, Any]) -> list[dict[str, Any
             if not isinstance(value, str) or value not in FONT_WEIGHTS:
                 raise OverrideError("invalid_fontweight", "字重必须是支持的命名字重。")
             clean = value
-        elif prop in {"frameon", "visible"}:
+        elif prop in {"frameon", "visible", "transparent"}:
             if not isinstance(value, bool):
                 raise OverrideError("invalid_value", f"{prop} 必须是布尔值。")
             clean = value
@@ -269,6 +273,8 @@ def _set_colour_one(artist: Any, role: str, colour: str) -> None:
                 label.set_color(colour)
         return
     if role == "series":
+        if hasattr(artist, "_citrus_series_color"):
+            artist._citrus_series_color = colour
         state = getattr(artist, "_qa_point_style_state", None)
         if state is not None:
             from matplotlib.colors import to_rgba
@@ -415,7 +421,9 @@ def apply_overrides(rendered: RenderedFigure, manifest: dict[str, Any],
             raise OverrideError("prop_not_editable", f"对象「{gid}」不支持该修改。")
 
         try:
-            if role == "errorbar":
+            if prop == "transparent":
+                artist._citrus_transparent = value
+            elif role == "errorbar":
                 _set_error_style(members or artist, prop, value)
             elif prop in {"facecolor", "edgecolor"}:
                 from matplotlib.patches import Rectangle
@@ -517,6 +525,10 @@ def _set_marker_style(artist: Any, prop: str, value: Any) -> None:
     from matplotlib.lines import Line2D
     from citrus_figures.core import ScatterPoint
     if isinstance(artist, PathCollection):
+        if prop == "markerfacecolor":
+            artist._citrus_marker_fill_mode = value if value in ("auto", "none") else "custom"
+            if value == "auto" and not hasattr(artist, "_citrus_series_color"):
+                raise OverrideError("unsupported_artist", "此散点系列没有可追踪的自动填充颜色。")
         artist = ScatterPoint(artist, slice(None))
     if prop != "alpha" and not isinstance(artist, (Line2D, ScatterPoint)):
         raise OverrideError("unsupported_artist", "该对象不支持标记样式。")
@@ -647,6 +659,8 @@ def _sync_series_legends(links: dict[str, dict[str, Any]], overrides: list[dict[
                 _set_linewidth_one(mark, float(value))
         elif prop in LINE_STYLE_PROPS:
             for mark in (stroke_marks if prop == "linestyle" else marker_marks):
+                if prop == "markerfacecolor" and value == "auto" and isinstance(mark, PathCollection):
+                    mark._citrus_series_color = source._citrus_series_color
                 _set_marker_style(mark, prop, value)
         elif prop == "alpha":
             for mark in marks:

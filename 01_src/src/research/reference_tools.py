@@ -132,24 +132,6 @@ def _compact_audit(payload):
 
 
 
-def identity_report_requested(query):
-    import re
-    from src.graph.agent_operations import _explicit_reference_check
-    from src.graph.intent_text import intent_with_negation
-
-    if not _explicit_reference_check(query):
-        return False
-    stripped = re.sub(r"https?://[^\s，。；！？]+", "", query)
-    other_goals = re.compile(
-        r"(?:精校|逐字段|(?:查看|查阅|读取|阅读|读|查|获取|核对|核验)?\s*全文|"
-        r"论点|摘要|综述|绘图|画图|画.{0,8}(?:箱线图|热图|柱状图|散点图)|"
-        r"(?:(?:比较|对比|解释|分析|评价|评述|归纳|提炼).{0,24}(?:方法|结论|局限|观点|创新))|"
-        r"分析数据|审查数据|翻译|改写|导出|下载|投稿|"
-        r"\b(?:(?:read\s+|fetch\s+)?full\s*text|plot|summari[sz]e|export|translate|"
-        r"(?:then|also|and)\s+compare)\b)", re.I)
-    return not intent_with_negation(stripped, other_goals)
-
-
 def saved_identity_report(owner, session, audit_id):
     from html import escape
     from src.core.turn_source_ledger import safe_http_url

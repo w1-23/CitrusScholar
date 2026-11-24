@@ -168,7 +168,6 @@ class HarnessRuntime:
     resolve_execution_waits: Any = None
     acknowledge_execution_waits: Any = None
     record_rejected: Any = None
-    final_from_observations: Any = None
     check_final_after_followup: Any = None
 
     async def _publish_working_note(self, response, identity, model_step):
@@ -245,18 +244,6 @@ class HarnessRuntime:
                             "jump_to": "end"}
                 followup_used = state.get("delivery_followup_used", False)
                 notes = list(state.get("batch_notes", []))
-                if adapter.final_from_observations is not None and not followup_used:
-                    answer = await adapter.final_from_observations()
-                    if answer is not None:
-                        response = AIMessage(content=answer,
-                            additional_kwargs=identity.message_metadata("assistant"))
-                        history = tuple([*state["messages"], response])
-                        check = await adapter.check_final(response, history, identity)
-                        if check.accepted:
-                            return {"messages": [response], "stop_status": "complete",
-                                    "stop_reason": "answered", "host_state": host_snapshot(), "jump_to": "end"}
-                        notes.append(delivery_feedback(check))
-                        followup_used = True
                 if state.get("model_steps", 0) >= adapter.limits.max_model_steps:
                     return {"stop_status": "incomplete", "stop_reason": "model_step_limit", "jump_to": "end"}
                 if time.monotonic() >= adapter.limits.deadline:

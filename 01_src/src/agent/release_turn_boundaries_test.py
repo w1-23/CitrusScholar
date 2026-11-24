@@ -132,19 +132,6 @@ def test_failed_renderer_and_rejected_repair_can_be_replaced_by_same_goal_svg():
     assert not _same_repair_target(rejected, corrected, records=[failed | {"status": "unknown"}, success])
 
 
-@pytest.mark.parametrize(("query", "expected"), [
-    ("只核验以下十条文献是否真实存在，报告结果，无须查全文。", True),
-    ("核验参考文献是否存在，并阅读全文。", False),
-    ("核验这些文献，然后比较每篇的方法并给出结论。", False),
-    ("核验参考文献，不用导出；也请绘图。", False),
-    ("核验参考文献，不用导出。", True),
-])
-def test_identity_snapshot_finalizes_only_the_requested_scope(query, expected):
-    from src.research.reference_tools import identity_report_requested
-
-    assert identity_report_requested(query) is expected
-
-
 def test_saved_identity_report_separates_rate_limit_from_unprocessed(monkeypatch):
     from src.research import reference_audit, reference_tools
 
@@ -167,7 +154,7 @@ def test_saved_identity_report_separates_rate_limit_from_unprocessed(monkeypatch
 
 
 @pytest.mark.parametrize("native", [False, True])
-def test_saved_reference_batch_finishes_before_next_model_request(native, tmp_path):
+def test_reference_batch_returns_to_model_for_next_goal(native, tmp_path):
     async def exercise():
         identity = ExecutionIdentity(1, "fixture-session", "fixture-turn", "fixture-run")
         calls = []
@@ -176,29 +163,31 @@ def test_saved_reference_batch_finishes_before_next_model_request(native, tmp_pa
 
         async def model(history, current_identity, **kwargs):
             calls.append(current_identity)
-            assert len(calls) == 1
-            return AIMessage(content="", tool_calls=[call])
+            if len(calls) == 1:
+                return AIMessage(content="", tool_calls=[call])
+            if len(calls) == 2:
+                assert isinstance(history[-1], ToolMessage)
+                return AIMessage(content="", tool_calls=[{"name": "calculate", "id": "mean", "args": {}}])
+            assert history[-1].tool_call_id == "mean"
+            return AIMessage(content="文献核验完成，样本均值为 3。")
 
         async def execute(response, current_identity):
-            observations.append(ToolMessage(content="report ready", name=call["name"], tool_call_id=call["id"]))
+            proposal = response.tool_calls[0]
+            observations.append(ToolMessage(content="result ready", name=proposal["name"], tool_call_id=proposal["id"]))
             return BatchObservation(messages=(observations[-1],))
 
-        async def report():
-            return "十条已处理，三条尚未确认。" if observations else None
-
         async def accept(response, history, current_identity):
-            assert response.content == await report()
             return FinalCheck()
 
-        schemas = [{"type": "function", "function": {"name": call["name"], "description": "Fixture",
-                   "parameters": {"type": "object", "properties": {}}}}]
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas,
-                                 final_from_observations=report)
+        schemas = [{"type": "function", "function": {"name": name, "description": "Fixture",
+                    "parameters": {"type": "object", "properties": {}}}}
+                   for name in (call["name"], "calculate")]
+        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas)
         options = {"skill_root": tmp_path, "system_prompt": "fixture", "summary_model": None} if native else None
-        human = HumanMessage("请核验文献是否存在", additional_kwargs=identity.message_metadata("user"))
+        human = HumanMessage("核验这些文献，然后计算样本均值", additional_kwargs=identity.message_metadata("user"))
         result = await runtime.run(identity, [human], saver=InMemorySaver(), native_options=options)
         assert result.status == "complete"
-        assert result.messages[-1].content == "十条已处理，三条尚未确认。"
-        assert len(calls) == len(observations) == 1
+        assert result.messages[-1].content == "文献核验完成，样本均值为 3。"
+        assert len(calls) == 3 and len(observations) == 2
 
     asyncio.run(exercise())

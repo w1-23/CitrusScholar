@@ -115,6 +115,29 @@ def completion_from_answer(answer: str, records) -> CompletionEnvelope:
             for key in ("facts", "sources", "numbers", "conditions", "delivery")}))
 
 
+def claims_file_delivery(answer: str) -> bool:
+    """Detect affirmative file or figure delivery claims in ordinary answers."""
+    import re
+    from src.graph.intent_text import intent_clauses, negated_before
+
+    claim = re.compile(
+        r"(?:已|已经|成功)(?:为你|为您)?(?:生成|绘制|画好|导出|保存|交付|附上)"
+        r".{0,20}(?:图|文件|表|报告|文档|SVG|XLSX|PDF|PNG)|"
+        r"(?:图件|图片|图表|文件|工作簿|报告|文档|SVG|XLSX|PDF|PNG).{0,12}"
+        r"(?:已|已经|成功)(?:生成|绘制|导出|保存|交付|完成)|"
+        r"(?:已完成)(?:绘图|作图|出图|文件导出)|"
+        r"\[(?:点击|立即)?下载[^\]]*\]\(|"
+        r"\b(?:I (?:have )?(?:created|generated|exported|attached)|"
+        r"(?:file|figure|chart|plot) (?:is ready|has been (?:generated|exported|attached)))\b", re.I)
+    for clause in intent_clauses(answer):
+        for match in claim.finditer(clause):
+            before = clause[:match.start()].rstrip()
+            if (not negated_before(clause, match.start())
+                    and not re.search(r"(?:尚未|并未|未|是否|如果|假如|无法确认|不能确认)\s*$", before)):
+                return True
+    return False
+
+
 def artifact_goal_evidence(requirements, rows, verified_links):
     from src.graph.export_contract import deliverable_match_groups
     assets = [(row["tool_call_id"], item) for row in rows

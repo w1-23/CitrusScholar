@@ -489,7 +489,7 @@ async def _run(state, identity, ledger):
             return FinalCheck(False, ("尚未形成有效答复。需要工具时使用原生工具调用；不要用工具协议文本冒充答案。",))
         # Ordinary answers finish in this model step. Old pending-review
         # checkpoints can still consume their original envelope on recovery.
-        from src.core.turn_outcome import completion_from_answer, repairable_proposal_reason
+        from src.core.turn_outcome import claims_file_delivery, completion_from_answer, repairable_proposal_reason
         legacy_review = final_review.get("phase") == "pending"
         try:
             statement = parse_completion(text) if legacy_review else completion_from_answer(text, host.records)
@@ -526,7 +526,8 @@ async def _run(state, identity, ledger):
             if delivery_links:
                 public_answer += "\n\n已核验的交付文件\n" + "\n".join(
                     f"- [下载文件 {index}]({link})" for index, link in enumerate(delivery_links, start=1))
-            if delivery_gaps and not allow_delivery_gaps:
+            if (delivery_gaps and not verified_links and not allow_delivery_gaps
+                    and claims_file_delivery(statement.answer)):
                 return FinalCheck(False, tuple(gap["detail"] for gap in delivery_gaps))
             if delivery_gaps:
                 public_answer += "\n\n" + "\n".join(gap["detail"] for gap in delivery_gaps)
@@ -786,25 +787,6 @@ async def _run(state, identity, ledger):
     async def acknowledge_execution_waits(current_identity, wait_ids, checkpoint_ref):
         await execution_wait_boundary().acknowledge(current_identity, wait_ids, checkpoint_ref)
 
-    async def final_from_observations():
-        import json
-        from src.research.reference_tools import identity_report_requested, saved_identity_report
-
-        if (not host.messages or requirements or task_events.updates_after(identity.run_id, update_version)
-                or not identity_report_requested(state["query"])):
-            return None
-        for observation in reversed(tuple(host.messages.values())):
-            if observation.name != "verify_uploaded_references" or observation.status == "error":
-                continue
-            try:
-                data = json.loads(observation.content)
-            except (ValueError, TypeError):
-                continue
-            if isinstance(data, dict) and (data.get("audit_status") or {}).get("ready_for_report") and data.get("audit_id"):
-                return await asyncio.to_thread(saved_identity_report, identity.owner_user_id,
-                                               identity.session_id, data["audit_id"])
-        return None
-
     async def check_final_after_followup(answer, history, identity):
         return await check_final(answer, history, identity, allow_delivery_gaps=True)
 
@@ -815,7 +797,6 @@ async def _run(state, identity, ledger):
         export_host=export_host, restore_host=restore_host, validate_resume=validate_resume,
         recover_output=True, resolve_execution_waits=resolve_execution_waits,
         acknowledge_execution_waits=acknowledge_execution_waits, record_rejected=rejected,
-        final_from_observations=final_from_observations,
         check_final_after_followup=check_final_after_followup)
     checkpoint_options = {"context_scope": context_scope} if native else {}
     checkpoint_config = (native_checkpoint_scope if native else checkpoint_scope)(

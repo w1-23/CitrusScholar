@@ -2626,12 +2626,15 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
     set_job_id(job_id)
     from src.graph.general_agent_graph import request_deadline_from_settings
     def context_file_refs():
+        inherited = {str(info["file_id"]) for info in ref_infos if info.get("source") == "previous_turn"}
         refs = []
         for file_id in input_file_ids:
             info = session_files.get_account_file(file_id, int(user["user_id"]))
             if info:
-                refs.append({key: info[key] for key in
-                             ("file_id", "sha256", "filename") if key in info})
+                ref = {key: info[key] for key in ("file_id", "sha256", "filename") if key in info}
+                if file_id in inherited:
+                    ref["source"] = "previous_turn"
+                refs.append(ref)
         return refs
 
     attachment_refs = await run_account_thread(request_lease, context_file_refs)

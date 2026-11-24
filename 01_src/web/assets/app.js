@@ -1176,7 +1176,6 @@ var composerDraftPrefix = 'citrus.composer.';
 var composerDrafts = new Map();
 var composerSelections = new Map();
 var composerSupplement = null;
-var composerNewTaskJob = '';
 var composerTaskViewDisposing = false;
 var queueSyncUnavailable = false;
 var browseCheckbox = document.getElementById('browse-requested');
@@ -1239,7 +1238,6 @@ function saveComposerInput() {
 
 function clearComposerDrafts() {
   composerSupplement = null;
-  composerNewTaskJob = '';
   composerDrafts.clear();
   composerSelections.clear();
   queueSyncUnavailable = false;
@@ -1332,14 +1330,8 @@ function selectComposerSupplement(binding) {
   }
 }
 
-function composerHasNewTaskOptions() {
-  return !!(_selectedAttachments.length || window._selectedAccountFileRefs.length ||
-    browseCheckbox && browseCheckbox.checked || skillPicker && skillPicker.capture().items.length);
-}
 
 function useNewTaskComposer(moveDraft) {
-  var binding = activeSupplementBinding();
-  composerNewTaskJob = binding ? binding.store.state.job_id : '';
   var previous = leaveComposerSupplement();
   if (previous && moveDraft && !userInput.value) {
     var draft = composerDraft(previous.key);
@@ -1400,7 +1392,6 @@ if (newMessageModeButton) newMessageModeButton.addEventListener('click', functio
   else {
     var binding = activeSupplementBinding();
     if (binding) {
-      composerNewTaskJob = '';
       selectComposerSupplement(binding);
     }
   }
@@ -2689,7 +2680,6 @@ function findTurnQueueEntry(turns, requestId) {
 // Retire observers and view controls only. Navigation never sends cancellation.
 function disposeTaskView() {
   composerTaskViewDisposing = true;
-  composerNewTaskJob = '';
   leaveComposerSupplement();
   historyRestoreVersion += 1;
   abortHistoryRequests();
@@ -2789,11 +2779,6 @@ function refreshTaskComposer() {
   var activeJob = available ? available.store.state.job_id : '';
   var currentTarget = composerSupplement && available && composerSupplement.controller === available.controls && composerSupplement.jobId === activeJob;
   if (composerSupplement && !currentTarget && !userInput.value && !composerDraft(composerSupplement.key).pending) leaveComposerSupplement();
-  if (!composerSupplement && activeJob && composerNewTaskJob !== activeJob &&
-      !userInput.value && !composerHasNewTaskOptions()) {
-    selectComposerSupplement(available);
-    currentTarget = !!composerSupplement;
-  }
   var supplement = composerSupplement;
   var pendingUpdate = supplement && composerDraft(supplement.key).pending;
   var targetReachable = supplement && supplement.controller.owns() && supplement.controller.store.state.job_id === supplement.jobId;
@@ -2838,7 +2823,7 @@ function refreshTaskComposer() {
     else userInput.removeAttribute('maxlength');
     userInput.placeholder = supplement ? '给此任务补充要求（仅正文）' : awaitingQuestion
       ? '可发送新消息，答复请使用选择卡片'
-      : executing ? '有新要求？发送后会排在当前任务之后'
+      : executing ? '发送后将作为新消息处理'
       : queued ? '可继续发送，消息会按发送顺序排队'
       : '有什么想做的？(Enter 发送 / Shift+Enter 换行)';
   }
@@ -5331,8 +5316,6 @@ async function sendMsg() {
         renderAttachmentSelection();
       }
       if (window.turnRail && window.turnRail.addPending && entry.job_id) window.turnRail.addPending(clientRequestId, query);
-      if (currentRoundId === requestRoundId && composerNewTaskJob && !composerSupplement &&
-          !userInput.value && !composerHasNewTaskOptions()) composerNewTaskJob = '';
     }
     refreshTaskComposer();
     renderQueueStatus();

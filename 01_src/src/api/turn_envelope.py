@@ -496,6 +496,34 @@ def _cleanup_failed_admission(*, owner_user_id: int, session_id: str,
                            exc_info=True)
 
 
+def _inherited_inputs(owner_user_id: int, session_id: str) -> list[dict]:
+    turns = chat_turn_queue.list_turns(owner_user_id=owner_user_id, session_id=session_id, limit=1)
+    if not turns:
+        return []
+    previous = turns[-1]
+    try:
+        payload = _load_payload(previous)
+    except (chat_turn_queue.TurnNotFound, chat_turn_queue.TurnReconcileRequired):
+        return []
+    inherited = []
+    total = 0
+    for item in (payload.get("inputs") or [])[:MAX_FILES]:
+        if not isinstance(item, dict):
+            continue
+        file_id, expected = str(item.get("file_id") or ""), str(item.get("sha256") or "")
+        if not _FILE_ID_RE.fullmatch(file_id) or not _SHA256_RE.fullmatch(expected):
+            continue
+        info = session_files.get_account_file(file_id, owner_user_id)
+        if not info or info.get("sha256") != expected or not info.get("path"):
+            continue
+        size = int(info.get("size_bytes") or 0)
+        if total + size > MAX_LIBRARY_REF_BYTES or _sha256_path(Path(info["path"])) != expected:
+            continue
+        total += size
+        inherited.append(_input_metadata(info, source="previous_turn"))
+    return inherited
+
+
 def admit_turn(*, request: dict, owner_user_id: int, session_id: str,
                account_epoch: int, request_id: str,
                limits: chat_turn_queue.QueueLimits | None = None,
@@ -571,6 +599,9 @@ def admit_turn(*, request: dict, owner_user_id: int, session_id: str,
         for info in ref_infos:
             inputs.append(_input_metadata(info, source="library"))
 
+        if not inputs:
+            inputs = _inherited_inputs(owner_user_id, session_id)
+            ref_bytes = sum(item["size_bytes"] for item in inputs)
         bounded_payload = {
             "schema": PAYLOAD_SCHEMA,
             "request_fingerprint": fingerprint,
@@ -692,13 +723,18 @@ def load_dispatch_input(turn: dict) -> tuple[dict, list[dict]]:
         file_id = str(item.get("file_id") or "")
         expected = str(item.get("sha256") or "")
         info = session_files.get_account_file(file_id, owner_user_id)
+        inherited = item.get("source") == "previous_turn"
         if not info:
+            if inherited:
+                continue
             raise chat_turn_queue.TurnReconcileRequired(
                 "dispatch_input_missing", job_id=turn.get("job_id"))
         path = info.get("path")
         actual = _sha256_path(Path(path)) if path else None
         if (actual is None or actual != expected
                 or str(info.get("sha256")) != expected):
+            if inherited:
+                continue
             raise chat_turn_queue.TurnReconcileRequired(
                 "dispatch_input_checksum_changed", job_id=turn.get("job_id"))
         file_ids.append(file_id)

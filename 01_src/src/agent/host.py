@@ -217,6 +217,8 @@ async def _run(state, identity, ledger):
     pinned_skills = [row["id"] for row in selected_metadata] if native else []
     human.additional_kwargs.update(identity.message_metadata("user"), user_text=str(state.get("query") or ""),
         attachment_refs=state.get("attachment_refs") or [], selected_skills=selected_metadata)
+    if any(ref.get("source") == "previous_turn" for ref in state.get("attachment_refs") or []):
+        human.content = str(human.content) + "\n本轮只读输入来自上一轮附件，已校验文件哈希。"
     if state.get("attachment_context"):
         human.content = str(human.content) + "\n\n" + str(state["attachment_context"])
     images = state.get("image_attachments") or []

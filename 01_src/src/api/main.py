@@ -1389,9 +1389,15 @@ async def admin_corpus_candidate(candidate_id: int, request: Request):
     return item
 
 
+def _require_legacy_corpus_mutation():
+    if not legacy_enabled():
+        raise HTTPException(409, {"code": "legacy_corpus_read_only", "message": "旧文献库仅供读取，请使用第六库的管理入口。"})
+
+
 @app.post("/api/v2/admin/corpus/candidates/{candidate_id}/fulltext")
 async def admin_corpus_fulltext(candidate_id: int, request: Request):
     admin = require_admin(request)
+    _require_legacy_corpus_mutation()
     from src.core import corpus_review
     from src.shared_corpus.orchestrator import schedule
     from src.shared_corpus.prepare import MAX_SOURCE_BYTES
@@ -1423,6 +1429,7 @@ async def admin_corpus_fulltext(candidate_id: int, request: Request):
 @app.post("/api/v2/admin/corpus/candidates/{candidate_id}/approve")
 async def admin_corpus_approve(candidate_id: int, request: Request, req: CorpusReviewNote | None = None):
     admin = require_admin(request)
+    _require_legacy_corpus_mutation()
     from src.core import corpus_review
     try:
         result = await asyncio.to_thread(
@@ -1438,6 +1445,7 @@ async def admin_corpus_approve(candidate_id: int, request: Request, req: CorpusR
 @app.post("/api/v2/admin/corpus/candidates/{candidate_id}/reject")
 async def admin_corpus_reject(candidate_id: int, request: Request, req: CorpusReviewNote | None = None):
     admin = require_admin(request)
+    _require_legacy_corpus_mutation()
     from src.core import corpus_review
     try:
         result = await asyncio.to_thread(
@@ -1451,6 +1459,7 @@ async def admin_corpus_reject(candidate_id: int, request: Request, req: CorpusRe
 @app.post("/api/v2/admin/corpus/candidates/{candidate_id}/reopen")
 async def admin_corpus_reopen(candidate_id: int, request: Request, req: CorpusReviewNote | None = None):
     admin = require_admin(request)
+    _require_legacy_corpus_mutation()
     from src.core import corpus_review
     try:
         result = await asyncio.to_thread(
@@ -1593,6 +1602,8 @@ def _capture_upload_candidate(name: str, text: str, raw: bytes | None = None) ->
     只落原始资料（PDF 原字节 / 其它格式原字节 + 提取文本长度），不切块、不建索引、
     不激活语料，也不改变本轮上下文。任何异常都必须吞掉，不能让审核链路影响问答。
     """
+    if not legacy_enabled():
+        return
     try:
         from src.core import corpus_review as _corpus_review
         uid, admin_flag = _REVIEW_UPLOAD_SCOPE.get()

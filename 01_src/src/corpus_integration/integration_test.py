@@ -264,3 +264,30 @@ def test_deployment_isolates_the_corpus_root_and_pins_experiment(tmp_path):
         launch.isolated_corpus({"isolated_corpus": options, "shared_literature_single_web": True}, existing)
     with pytest.raises(ValueError, match="overlaps"):
         launch.isolated_corpus({"isolated_corpus": {**options, "root": str(base)}}, existing)
+
+
+def test_isolated_mode_blocks_legacy_candidate_write_entry_points(monkeypatch):
+    import asyncio
+    from fastapi import HTTPException
+    from src.api import main
+    from src.core import corpus_review
+
+    monkeypatch.setenv("CITRUS_CORPUS_MODE", "isolated")
+    monkeypatch.setattr(main, "require_admin", lambda request: {"user_id": 7, "id": 7})
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("isolated mode must not touch the legacy review write path")
+
+    for name in ("supplement_fulltext", "decide", "consent_enabled", "archive_upload"):
+        monkeypatch.setattr(corpus_review, name, unexpected)
+    for handler in (main.admin_corpus_fulltext, main.admin_corpus_approve,
+                    main.admin_corpus_reject, main.admin_corpus_reopen):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(handler(1, None))
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "legacy_corpus_read_only"
+    token = main._REVIEW_UPLOAD_SCOPE.set((7, 1))
+    try:
+        main._capture_upload_candidate("fixture.pdf", "fixture", b"fixture")
+    finally:
+        main._REVIEW_UPLOAD_SCOPE.reset(token)

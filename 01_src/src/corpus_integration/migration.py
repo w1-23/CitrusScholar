@@ -1,4 +1,4 @@
-"""Dry run of a legacy shared-corpus snapshot and base fingerprints."""
+"""Verify a legacy snapshot or stage verified pending works in a fresh corpus."""
 from argparse import ArgumentParser
 from contextlib import closing
 from hashlib import file_digest
@@ -49,10 +49,23 @@ def dry_run(root, base_inputs, *, limit=10):
 def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--legacy-root", required=True)
-    parser.add_argument("--base-file", action="append", required=True)
+    parser.add_argument("--base-file", action="append")
+    parser.add_argument("--pending-archive")
+    parser.add_argument("--target")
+    parser.add_argument("--expect-plan")
     parser.add_argument("--sample", type=int, default=10)
     args = parser.parse_args()
-    print(json.dumps(dry_run(args.legacy_root, args.base_file, limit=args.sample), indent=2))
+    if args.pending_archive:
+        if args.base_file:
+            parser.error("--pending-archive cannot be combined with --base-file")
+        from .pending_migration import migrate_pending
+        result = migrate_pending(args.legacy_root, args.pending_archive, target=args.target,
+                                 expected_plan=args.expect_plan)
+    else:
+        if not args.base_file or args.target or args.expect_plan:
+            parser.error("provide either five --base-file arguments or --pending-archive")
+        result = dry_run(args.legacy_root, args.base_file, limit=args.sample)
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":

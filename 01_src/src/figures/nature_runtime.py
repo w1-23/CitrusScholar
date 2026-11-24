@@ -19,7 +19,7 @@ from typing import Any, Callable
 SOURCE = "https://github.com/Yuan1z0825/nature-skills"
 COMMIT = "7bff1d0539c0dfad6c30178bb93ce6dd8a5cebf8"
 SKILL_VERSION = "2.8.0"
-_VENDOR_ROOT = Path(__file__).resolve().parents[1] / "prompts/skills/vendor/nature-skills"
+_VENDOR_ROOT = Path(__file__).resolve().parents[1] / "prompts/skill_history/vendor/nature-skills"
 _MODULES = frozenset({"validate_figure", "audit_panel_alignment", "audit_pdf_text",
                       "audit_figure_collisions", "figure_safety", "plot_templates"})
 
@@ -63,6 +63,7 @@ def _vendor_candidates():
         add(Path(project) / CURRENT_QA_VENDOR_RELATIVE)
     here = Path(__file__).resolve()
     for parent in list(here.parents)[:6]:
+        add(parent / "02_config/skill-history/repository-v3" / CURRENT_QA_VENDOR_RELATIVE)
         add(parent / CURRENT_QA_VENDOR_RELATIVE)
     root = os.environ.get("CITRUS_FIGURES_ROOT", "").strip()
     if root:

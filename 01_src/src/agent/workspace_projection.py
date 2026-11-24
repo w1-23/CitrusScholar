@@ -101,41 +101,6 @@ def resources(scope):
     except (OSError, ValueError, TypeError, KeyError):
         return
 
-    from . import research_skill_catalog as catalog
-    try:
-        data = json.loads(bounded_bytes(catalog.ROOT / catalog.CATALOG_PATH, catalog._MAX_CATALOG_BYTES))
-        if (type(data) is not dict or data.get("schema") != "citrus.skill-catalog/1"
-                or data.get("version") != "2.0.0" or type(data.get("skills")) is not list):
-            return
-        rows = data["skills"]
-        if (len(rows) != len(catalog.PINNED) or any(type(row) is not dict for row in rows)
-                or any(type(row.get("id")) is not str for row in rows)
-                or {row["id"] for row in rows} != set(catalog.PINNED)):
-            return
-    except (OSError, ValueError, TypeError, KeyError):
-        return  # Release availability must not gate generic private workspace use.
-    from src.core.capability_policy import allows
-    for row in rows:
-        if not allows("skill:" + row["id"]):
-            continue
-        if scope != "/" and not within(scope, "/skills/" + row["id"]) and not within("/skills/" + row["id"], scope):
-            continue
-        try:
-            records = catalog._manifest(row)
-        except (OSError, ValueError, TypeError, KeyError):
-            continue
-        for name, record in records.items():
-            key = "/" + row["path"] + "/" + name
-            if not within(key, scope) or record["size"] > MAX_FILE_BYTES:
-                continue
-            try:
-                virtual_path(key)
-            except ValueError:
-                continue  # Only bounded supported text resources, never binary assets.
-            yield key, {"kind": "workspace_skill_resource", "path": key,
-                        "sha256": record["sha256"], "size_bytes": record["size"],
-                        "skill_id": row["id"], "skill_version": row["version"],
-                        "catalog_sha256": row["sha256"], "read_only": True}
 
 
 def read(key, descriptor):
@@ -151,8 +116,7 @@ def read(key, descriptor):
             raise PermissionError("skill_disabled")
         root = release_path()
         if root is None:
-            from . import research_skill_catalog as catalog
-            root = catalog.ROOT
+            raise PermissionError("workspace_projection_denied")
     path = root.joinpath(*key[1:].split("/"))
     # Lexical allowlist plus ancestor link checks, never caller-selected host paths.
     data = bounded_bytes(path, MAX_FILE_BYTES)

@@ -115,12 +115,18 @@ def assemble_system_prompt(
     Unknown figure phase retains verified initial core loading. A caller with
     structured evidence of an existing-figure edit may pass ``figure_phase='edit'``.
     """
+    from src.agent.installed_skills import release_path
+
+    if release_path() is not None:
+        from src.agent.host_policy import system_prompt
+
+        return system_prompt(available_tools or set(), native_skills=True)
     prompt = get_system_prompt("supervisor")
     word_guidance = ""
     from src.graph.export_contract import deliverable_contract
     needs_word = any("docx" in r.get("formats", []) for r in deliverable_contract(query or ""))
     if needs_word and (available_tools is None or "word_document" in available_tools):
-        rules = _read_prompt_cached("skills/word-export/SKILL.md")
+        rules = _read_prompt_cached("skill_history/word-export/SKILL.md")
         if not rules:
             raise RuntimeError("Word 写作规范文件缺失，不能声明已加载该能力。")
         word_guidance = "\n\n<word_export_guidance>\n" + rules + (
@@ -185,6 +191,17 @@ def assemble_system_prompt(
 def verify_figure_prompt_loading() -> dict:
     """Exercise the production assembler, not merely the files on disk."""
     import hashlib
+    from src.agent.installed_skills import list_installed, read_installed_resource, release_path
+
+    release = release_path()
+    if release is not None:
+        info = next((row for row in list_installed(release) if row["id"] == "nature-figure"), None)
+        if info is None:
+            raise ValueError("nature_skill_release_missing")
+        _, page = read_installed_resource(release, info, "SKILL.md", start_char=0, max_chars=65536)
+        return {"commit": info["version"], "prompt_loaded": True,
+                "load_policy": "installed_release_on_demand", "scope": "installed_release",
+                "assembled_prompt_chars": page["total_chars"], "assembled_prompt_sha256": page["sha256"]}
     from src.prompts.nature_figure import guidance, status
     prompt = assemble_system_prompt(mode="expert", query="",
                                     available_tools={"run_research_figure_script"})

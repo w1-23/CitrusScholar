@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 from src.prompts import skill_registry
 
-ROOT = Path(__file__).resolve().parent / "skills/vendor/nature-skills"
+ROOT = Path(__file__).resolve().parent / "skill_history/vendor/nature-skills"
 COMMIT = "7bff1d0539c0dfad6c30178bb93ce6dd8a5cebf8"
 GUIDANCE_FILES = ("skills/nature-figure/SKILL.md", "skills/nature-figure/static/core/contract.md",
                   "skills/nature-figure/static/core/stance.md",

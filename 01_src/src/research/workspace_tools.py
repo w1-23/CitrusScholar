@@ -94,7 +94,6 @@ def research_workspace(
     from src.research.script_presets import list_presets, get_preset, capability_catalog
     try:
         owner, session = _identity()
-        from src.prompts.skill_registry import list_skills, skill_info, read_resource
         if operation == "task_state":
             from src.core.task_state import current
             from src.core.tracing import get_job_id
@@ -164,17 +163,23 @@ def research_workspace(
                 raise ValueError("Research intent exceeds its size limit")
             return _result({"research_intent": json.loads(encoded),
                             "intent_status": "model_proposed_not_authorization"})
+        from src.agent.installed_skills import active_skills, read_installed_resource, release_path
         if operation == "skills":
-            return _result({"skills": list_skills()})
-        if operation == "read_skill":
-            return _result({"skill": skill_info(skill_id),
-                            "entrypoint": read_resource(skill_id, start_char=start_char, max_chars=max_chars)})
-        if operation == "read_skill_resource":
-            return _result(read_resource(skill_id, resource, start_char=start_char, max_chars=max_chars))
+            return _result({"skills": active_skills()})
+        if operation in {"read_skill", "read_skill_resource"}:
+            release = release_path()
+            selected = next((row for row in active_skills() if row["id"] == skill_id), None)
+            if release is None or selected is None:
+                raise ValueError("skill_resource_unavailable")
+            if type(start_char) is not int or start_char < 0 or type(max_chars) is not int or max_chars <= 0:
+                raise ValueError("invalid_skill_pagination")
+            info, page = read_installed_resource(release, selected, resource if operation == "read_skill_resource" else "",
+                                                  start_char=start_char, max_chars=min(max_chars, 20000))
+            return _result(page if operation == "read_skill_resource" else {"skill": info, "entrypoint": page})
         if operation == "list":
             return _result({"workspace": "current_session", "capabilities": capability_catalog(),
                             "presets": list_presets(), "scripts": assets.list_scripts(owner, session),
-                            "skills": list_skills(),
+                            "skills": active_skills(),
                             "reuse_order": ["existing_tool", "existing_script_parameters", "local_revision", "new_script_if_needed"]})
         if operation == "runs":
             return _result({"runs": assets.list_runs(owner, session, script_ref=script_ref)})

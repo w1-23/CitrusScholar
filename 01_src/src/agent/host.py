@@ -116,7 +116,6 @@ async def _run(state, identity, ledger):
     skill_root = None
     if native:
         from .installed_skills import list_installed, model_directory, release_path
-        from .research_skill_catalog import ROOT
 
         saved_release = state.get("native_skill_release", "") if resume else None
         if saved_release is None:
@@ -125,8 +124,8 @@ async def _run(state, identity, ledger):
             configured = Path(saved_release) if saved_release else None
         release = configured.resolve(strict=True) if configured is not None else None
         state["native_skill_release"] = str(release) if release is not None else ""
-        installed_rows = list_installed(release) if release is not None else None
-        skill_root = model_directory(release) if release is not None else ROOT / "skills"
+        installed_rows = list_installed(release) if release is not None else []
+        skill_root = model_directory(release) if release is not None else None
     # A fresh composer request is a new script task, even when the session still
     # carries an older task's assets. Only a durable question child can inherit
     # its parent's scope; same-job recovery restores it from the checkpoint below.
@@ -193,7 +192,7 @@ async def _run(state, identity, ledger):
     refresh_allowed()
     from .skill_adapter import SkillSession, validate_scenario_selection, validate_selected_skills
     from .skill_tools import register_skill_reader, skill_execution_context
-    skills = None if native else SkillSession(identity, refresh_allowed)
+    skills = None if native else SkillSession(identity, refresh_allowed, allow_archived=resume)
     if skills is not None:
         register_skill_reader(catalog)
     # Host readiness remains independent of method loading; new generic tools
@@ -210,7 +209,7 @@ async def _run(state, identity, ledger):
             # Historical request metadata keeps its exact archived identity.
             # New requests are checked against the current catalog at the API.
             selected_metadata = await asyncio.to_thread(
-                validate_selected_skills, state.get("selected_skills"))
+                validate_selected_skills, state.get("selected_skills")) if resume and not native else []
         except (OSError, ValueError, KeyError):
             selected_metadata = []
         human.content = str(human.content) + "\n所选历史技能不是当前场景发行物；可继续使用其他已授权能力，不得声称已加载该方法。"

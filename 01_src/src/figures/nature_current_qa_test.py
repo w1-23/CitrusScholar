@@ -33,7 +33,7 @@ from src.figures.sandbox import LocalBackend, SandboxJob
 from src.figures.script_outputs import output_slots
 
 ROOT = Path(__file__).resolve().parents[3]
-VENDOR = ROOT / "skills/nature-figure/vendor/nature-skills"
+VENDOR = ROOT / "02_config/skill-history/repository-v3/skills/nature-figure/vendor/nature-skills"
 
 SEVEN = {"format_integrity", "source_preflight", "panel_alignment", "pdf_text",
          "pdf_collisions", "svg_schematic", "visual"}

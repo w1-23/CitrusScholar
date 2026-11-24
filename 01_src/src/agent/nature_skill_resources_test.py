@@ -27,9 +27,9 @@ from src.agent import research_skill_catalog
 from src.prompts import skill_registry
 
 ROOT = Path(__file__).resolve().parents[3]
-SKILL_ROOT = ROOT / "skills/nature-figure"
+SKILL_ROOT = ROOT / "02_config/skill-history/repository-v3/skills/nature-figure"
 VENDOR = SKILL_ROOT / "vendor/nature-skills"
-LEGACY_VENDOR = ROOT / "01_src/src/prompts/skills/vendor/nature-skills"
+LEGACY_VENDOR = ROOT / "01_src/src/prompts/skill_history/vendor/nature-skills"
 CATALOG = ROOT / "02_config/skills.catalog.json"
 
 VENDOR_COMMIT = "7bff1d0539c0dfad6c30178bb93ce6dd8a5cebf8"
@@ -262,7 +262,7 @@ def test_superseded_method_bundles_preserve_exact_resources(skill_id, retired_ve
             assert hashlib.sha256(content).hexdigest() == record["sha256"]
     current = next(item for item in research_skill_catalog.list_skills() if item["id"] == skill_id)
     current_row, current_records, _ = research_skill_catalog.resolve(skill_id, current["version"], current["sha256"])
-    _assert_records(ROOT / current_row["path"], list(current_records.values()))
+    _assert_records(ROOT / research_skill_catalog._resource_roots(current_row)[0], list(current_records.values()))
 
 
 def test_runtime_pin_is_wired_to_current_identity():

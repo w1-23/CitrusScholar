@@ -125,9 +125,9 @@
     var footNote = document.getElementById('crFootNote');
     if (footNote) {
       footNote.textContent = d.kind === 'stored_markdown'
-        ? '已保存 Markdown 全文 · ' + (d.title || '共享文献') + ' · 字符 ' + (d.start + 1) + '–' + d.end + ' / ' + d.total_chars
+        ? (d.exact_span ? '已保存 Markdown 引用片段 · ' : '已保存 Markdown 全文 · ') + (d.title || '共享文献') + ' · 字符 ' + (d.start + 1) + '–' + d.end + ' / ' + d.total_chars
         : '基于分块重建 · 本地语料 ' + (d.corpus || '');
-      document.getElementById('crPreviousBtn').hidden = !(state.shared && d.start > 0);
+      document.getElementById('crPreviousBtn').hidden = !(state.shared && !d.exact_span && d.start > 0);
       document.getElementById('crNextBtn').hidden = !(state.shared && d.next_start != null);
     }
   }
@@ -240,6 +240,11 @@
   function loadSharedPage(ref, start) {
     var params = new URLSearchParams({version_id: ref.version_id, index_generation: ref.index_generation,
                                       md_sha256: ref.md_sha256, start: start, length: PAGE_CHARS});
+    if (ref.chunk_id) {
+      params.set('chunk_id', ref.chunk_id);
+      params.set('start', ref.start);
+      params.set('length', ref.end - ref.start);
+    }
     loadSource('/api/v2/shared-corpus/documents/' + encodeURIComponent(ref.document_id) + '?' + params, 'shared');
   }
 

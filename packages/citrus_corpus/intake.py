@@ -15,12 +15,13 @@ class Intake:
         self.queue = queue or IntakeQueue(store)
         self.catalog = Catalog(store)
 
-    def submit_local(self, path, *, expected_sha256, actor, doi="", url="", title="", local_key=""):
+    def submit_local(self, path, *, expected_sha256, actor, doi="", url="", title="",
+                     local_key="", timeout=0.2):
         path = str(originals.inbox_relative(path))
         identity = work_identity(doi=doi, url=url, local_key=local_key or path)
         return self.queue.submit(identity, {"kind": "saved", "path": path, "format": source_format(path),
                                            "title": public_text(title)}, actor=actor,
-                                 expected_sha256=expected_sha256)
+                                 expected_sha256=expected_sha256, timeout=timeout)
 
     def submit_explicit(self, *, actor, doi="", url="", title="", expected_sha256=None, revision=""):
         if bool(doi) == bool(url):

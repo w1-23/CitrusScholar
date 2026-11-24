@@ -58,7 +58,7 @@ class IntakeQueue:
         self.store = store
         self.now = now
 
-    def submit(self, identity, request, *, actor, expected_sha256=None, revision="", persist=None):
+    def submit(self, identity, request, *, actor, expected_sha256=None, revision="", persist=None, timeout=0.2):
         if expected_sha256 is not None and not SHA256.fullmatch(expected_sha256):
             raise ValueError("source_sha256_invalid")
         if expected_sha256 is None and request["kind"] != "explicit":
@@ -74,7 +74,7 @@ class IntakeQueue:
         fingerprint = sha256(json.dumps([identity, expected_sha256 or revision],
                                        ensure_ascii=False).encode()).hexdigest()
         now = self.now()
-        with self.store.write() as conn:
+        with self.store.write(timeout=timeout) as conn:
             existing = conn.execute("SELECT * FROM intake WHERE fingerprint=?", (fingerprint,)).fetchone()
             if existing and existing["state"] not in {"failed", "expired"}:
                 return self._view(existing)

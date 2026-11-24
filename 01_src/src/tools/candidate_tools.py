@@ -144,6 +144,7 @@ def _list_candidates(gap: str = "", limit: int = 6, lang: str = "",
 
 def _read_shared_source(source_ref: str, offset: int, max_chars: int) -> Tuple[str, dict]:
     import json
+    import sqlite3
 
     from src.core.capability_policy import allows
     from src.core.tracing import get_client_request_id, get_session_id, get_user_id
@@ -151,30 +152,26 @@ def _read_shared_source(source_ref: str, offset: int, max_chars: int) -> Tuple[s
     from src.auth import user_by_id
     from src.shared_corpus.activity import MaintenanceBusy
     from src.shared_corpus.references import read_reference
-    from src.shared_corpus.runtime import current_runtime
+    from src.corpus_integration.read_access import read_reference_page
 
     unavailable = ("[EVIDENCE_UNAVAILABLE] Shared source is unavailable.",
                    {"_tool_outcome": _outcome("not_run", "evidence_scope_unavailable")})
     if not allows("local_rag") or not get_user_id():
         return unavailable
     user = user_by_id(int(get_user_id())) or {}
-    runtime = current_runtime()
-    if not user.get("active") or user.get("approval_status") != "approved" or runtime is None:
+    if not user.get("active") or user.get("approval_status") != "approved":
         return unavailable
     for row in fetch_rows(get_session_id(), get_client_request_id()):
         if row.get("kind") != "shared" or row.get("source_key") != source_ref:
             continue
         try:
             ref = read_reference({"read_ref": json.loads(row["read_ref"])})
-            if not ref or reference_key("shared", ref) != source_ref or not runtime.reference_visible(ref):
+            if not ref or reference_key("shared", ref) != source_ref:
                 return unavailable
             if not 0 <= offset < ref["end"] - ref["start"]:
                 return unavailable
-            start = ref["start"] + offset
-            page = runtime.preview(ref["document_id"], generation=ref["index_generation"],
-                                   version=ref["version_id"], start=start, digest=ref["md_sha256"],
-                                   length=min(max(1, max_chars), 6000, ref["end"] - start))
-        except (LookupError, ValueError, OSError, MaintenanceBusy):
+            page = read_reference_page(ref, offset=offset, length=min(max(1, max_chars), 6000))
+        except (LookupError, ValueError, OSError, sqlite3.Error, MaintenanceBusy):
             return unavailable
         next_offset = page["end"] - ref["start"] if page["end"] < ref["end"] else None
         marker = row.get("citation_ref") or ""

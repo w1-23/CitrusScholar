@@ -73,13 +73,17 @@ class CorpusRegistry:
         return str(item.get("display_name") or family_id)
 
     def describe_families(self, active: set[str] | None = None) -> str:
+        from citrus_corpus.contract import ISOLATED
+        from src.corpus_integration.settings import reader_root
+
         ids = sorted((active if active is not None else self.family_ids) & self.family_ids)
         if not ids:
             return "当前没有可检索的本地语料类别。"
-        return "\n".join(
-            f"- `{family_id}`：{self.display_name(family_id)}。{self.families[family_id].get('description', '')}"
-            for family_id in ids
-        )
+        lines = [f"- `{family_id}`：{self.display_name(family_id)}。{self.families[family_id].get('description', '')}"
+                 for family_id in ids]
+        if reader_root() and (active is None or ISOLATED.family_id in active):
+            lines.append(f"- `{ISOLATED.family_id}`：独立文献库。检索已核准共享的文献及可验证的引用片段。")
+        return "\n".join(lines)
 
     def matching_families(self, query: object) -> set[str]:
         text = str(query or "").casefold()

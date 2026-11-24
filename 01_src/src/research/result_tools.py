@@ -69,7 +69,7 @@ def _read_rejected(status: str, reason: str, message: str, **details) -> str:
 
 def _shared_result_accessible(row, text, fetch_result) -> bool:
     from src.shared_corpus.references import read_reference, source_rows
-    from src.shared_corpus.runtime import current_runtime
+    from src.corpus_integration.read_access import reference_visible
 
     visited = set()
     while row.get("tool_name") == "read_tool_result":
@@ -117,10 +117,7 @@ def _shared_result_accessible(row, text, fetch_result) -> bool:
     if not rows:
         return name == "local_hybrid_search" or (isinstance(payload, dict)
                                                   and not payload.get("results"))
-    runtime = current_runtime()
-    if runtime is None:
-        return False
-    return all((reference := read_reference(item)) is not None and runtime.reference_visible(reference)
+    return all((reference := read_reference(item)) is not None and reference_visible(reference)
                for item in rows)
 
 

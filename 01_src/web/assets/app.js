@@ -245,7 +245,7 @@ function renderAgentAvatar(container) {
   if (!container) return;
   var image = document.createElement('img');
   image.className = 'agent-avatar-image';
-  image.src = '/assets/citrus-mark.svg';
+  image.src = '/assets/citrusscholar-mascot.png';
   image.alt = 'CitrusScholar 助手';
   image.width = 36;
   image.height = 36;
@@ -4240,7 +4240,7 @@ async function clearSession(silent) {
   try {
     await accountFetch('/api/v1/session/' + sessionId + '/clear', { method: 'POST' });
     if (epoch !== authEpoch) return;
-    chatContainer.innerHTML = '<div class="message bot"><div class="avatar"><img class="agent-avatar-image" src="/assets/citrus-mark.svg" alt="CitrusScholar 助手" width="36" height="36"></div><div class="content">您好！有什么想了解的？</div></div>';
+    chatContainer.innerHTML = '<div class="message bot"><div class="avatar"><img class="agent-avatar-image" src="/assets/citrusscholar-mascot.png" alt="CitrusScholar 助手" width="36" height="36"></div><div class="content">您好！有什么想了解的？</div></div>';
     sidebarContent.innerHTML = '<div class="empty-sidebar">提交问题后文献将在此展示</div>';
     citationCount.textContent = '0';
     _historyMsgs = [];

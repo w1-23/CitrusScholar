@@ -172,6 +172,11 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
         assert pinned.search("leaf")[0]["index_generation"] == generation0
         with Reader(Store(store.root)).pin(**models) as changed:
             assert changed.search("randomized blocks")[0]["version_id"] == revised["version_id"]
+        with reader.pin(**models, generation=generation0) as experiment:
+            assert experiment.search("leaf")[0]["index_generation"] == generation0
+        with pytest.raises(LookupError, match="corpus_generation_unknown"):
+            with reader.pin(**models, generation="g" + "0" * 30):
+                pytest.fail("Unknown experiment generation must not fall back")
         monkeypatch.setattr(Publisher, "_mark_published", original_mark)
         assert publisher.publish()["generation"] == generation1
         chunks_path = store.root / "generations" / generation1 / "chunks.jsonl"
@@ -182,6 +187,8 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
         chunks_path.write_bytes(original_chunks)
         grant(intake.catalog, initial, "revoked")
         assert pinned.search("leaf") == []
+        with reader.pin(**models, generation=generation0) as experiment:
+            assert experiment.search("leaf") == []
         with pytest.raises(LookupError):
             reader.reference(row0["read_ref"])
     assert publisher.rollback(generation0)["generation"] == generation0

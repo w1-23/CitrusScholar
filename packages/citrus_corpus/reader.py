@@ -6,7 +6,7 @@ import json
 from .catalog import Catalog
 from .chunks import chunk_document
 from .contract import ISOLATED
-from .generations import GenerationError, load_generation
+from .generations import GenerationError, load_generation, valid_generation
 from .pointers import read_pointer
 
 
@@ -26,13 +26,19 @@ class Reader:
                 for item in json.loads(row["selection"])}
 
     @contextmanager
-    def pin(self, *, embedder, reranker):
-        generation = read_pointer(self.store.root)
+    def pin(self, *, embedder, reranker, generation=None):
+        fixed = generation is not None
+        if fixed and not valid_generation(generation):
+            raise ValueError("corpus_generation_invalid")
+        if not fixed:
+            generation = read_pointer(self.store.root)
         if not generation:
             raise LookupError("corpus_generation_unavailable")
         try:
             handle, membership = self._open(generation, embedder, reranker)
-        except GenerationError:
+        except (GenerationError, LookupError):
+            if fixed:
+                raise
             with self.store.read() as conn:
                 prior = conn.execute("""SELECT generation FROM publications WHERE published IS NOT NULL
                                      AND generation<>? ORDER BY published DESC, seq DESC LIMIT 1""",

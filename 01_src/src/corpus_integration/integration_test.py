@@ -235,3 +235,32 @@ def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monke
     monkeypatch.setattr(runtime, "retrieval_reader", nullcontext)
     _, legacy = fetch._local_hybrid_search_impl("citrus soil", ["agent_literature"], render=False, progress=False)
     assert legacy["shared_generation"] == "legacy_generation"
+
+
+def test_deployment_isolates_the_corpus_root_and_pins_experiment(tmp_path):
+    from importlib.util import module_from_spec, spec_from_file_location
+    from pathlib import Path
+
+    launcher = Path(__file__).resolve().parents[2] / "scripts" / "apptainer_launch.py"
+    spec = spec_from_file_location("corpus_launch_fixture", launcher)
+    launch = module_from_spec(spec)
+    spec.loader.exec_module(launch)
+    base = tmp_path / "base"
+    base.mkdir()
+    cache = tmp_path / "encoder"
+    cache.mkdir()
+    isolated = Store.initialize(tmp_path / "independent")
+    generation = "g" + "7" * 30
+    options = {"root": str(isolated.root), "read": True, "growth": False,
+               "embedding_cache": str(cache), "read_generation": generation}
+    existing = [(str(base), "ro")]
+    assert launch.isolated_corpus({}, existing) == ([], [])
+    mounts, env = launch.isolated_corpus({"isolated_corpus": options}, existing)
+    assert mounts == [(str(isolated.root), "rw"), (str(cache), "ro")]
+    assert "CITRUS_CORPUS_MODE=isolated" in env
+    assert "CITRUS_CORPUS_FETCH_GROWTH=0" in env
+    assert f"CITRUS_CORPUS_READ_GENERATION={generation}" in env
+    with pytest.raises(ValueError, match="conflicting"):
+        launch.isolated_corpus({"isolated_corpus": options, "shared_literature_single_web": True}, existing)
+    with pytest.raises(ValueError, match="overlaps"):
+        launch.isolated_corpus({"isolated_corpus": {**options, "root": str(base)}}, existing)

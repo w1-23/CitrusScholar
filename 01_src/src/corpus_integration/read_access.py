@@ -20,13 +20,19 @@ def _embedder(cache):
 
 
 class IsolatedSearch:
-    def __init__(self, root, cache):
+    def __init__(self, root, cache, *, generation=None):
         self.root = root
         self.cache = cache
         self.unavailable = False
+        self.fixed_generation = generation
+        from citrus_corpus.generations import valid_generation
         from citrus_corpus.store import Store
         from citrus_corpus.pointers import read_pointer
-        self.generation = read_pointer(Store(root).root)
+
+        store = Store(root)
+        if generation is not None and not valid_generation(generation):
+            raise ValueError("corpus_generation_invalid")
+        self.generation = generation if generation is not None else read_pointer(store.root)
 
     def search(self, query, *, limit):
         from citrus_corpus.models import FusedRank
@@ -36,7 +42,8 @@ class IsolatedSearch:
 
         if reader_root() != self.root or not allows("local_rag"):
             return []
-        with Reader(Store(self.root)).pin(embedder=_embedder(self.cache), reranker=FusedRank()) as reader:
+        with Reader(Store(self.root)).pin(embedder=_embedder(self.cache), reranker=FusedRank(),
+                                          generation=self.fixed_generation) as reader:
             self.generation = reader.generation
             rows = reader.search(query, limit)
         if reader_root() != self.root or not allows("local_rag"):
@@ -58,7 +65,7 @@ def isolated_search():
     if not user.get("active") or user.get("approval_status") != "approved":
         return None
     try:
-        return IsolatedSearch(root, cache)
+        return IsolatedSearch(root, cache, generation=os.getenv("CITRUS_CORPUS_READ_GENERATION") or None)
     except (sqlite3.Error, OSError, ValueError):
         return None
 

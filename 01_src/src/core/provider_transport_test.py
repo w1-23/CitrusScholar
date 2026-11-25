@@ -17,7 +17,8 @@ from langchain_openai import ChatOpenAI
 from langsmith import tracing_context
 
 from .provider_protocol import _DeepSeekMessage, _ProtocolState
-from .llm_pool import _new_client, is_thinking_rejected
+from .llm_pool import _new_client
+from .provider_protocol import thinking_rejected
 from .provider_transport import AsyncDeepSeekTransport, DeepSeekTransport, async_deepseek_attempt, deepseek_attempt
 
 BASE = "https://api.deepseek.com/v1"
@@ -251,7 +252,7 @@ class ProviderWireTests(unittest.IsolatedAsyncioTestCase):
                         await model.ainvoke(messages, config={"callbacks": [cb]})
                 error = caught.exception
                 self.assertTrue(any(isinstance(item, BadRequestError) for item in cb.records))
-                self.assertEqual(is_thinking_rejected(error), fallback)
+                self.assertEqual(thinking_rejected(error.status_code, error.body), fallback)
                 self.assert_public([cb.records, str(error), error.response.text, error.response.headers,
                                     error.request.content, error.response.request.content])
 
@@ -287,7 +288,7 @@ class ProviderWireTests(unittest.IsolatedAsyncioTestCase):
             bypass = {"NO_PROXY": "", "no_proxy": ""}
 
             async def send_both(error):
-                model = _new_client(MODEL, "fixture", BASE, 0.0, 2, None, None)
+                model = _new_client(MODEL, "fixture", BASE, 0.0, 2, max_tokens=None)
                 self.assertIs(type(model.http_client), httpx.Client)
                 self.assertIs(type(model.http_async_client), httpx.AsyncClient)
                 with model.http_client as sync_client:
@@ -331,7 +332,7 @@ class ProviderWireTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("src.core.provider_transport.DeepSeekTransport", sync), \
                 patch("src.core.provider_transport.AsyncDeepSeekTransport", async_):
-            model = _new_client(MODEL, "fixture", BASE, 0.0, 2, None, None)
+            model = _new_client(MODEL, "fixture", BASE, 0.0, 2, max_tokens=None)
         with model.http_client:
             async with model.http_async_client:
                 self.assertIs(type(model), ChatOpenAI)
@@ -345,7 +346,7 @@ class ProviderWireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([current["read"] for current in extensions], [2, 2])
         self.assertEqual([url for url, _ in self.requests], [BASE + "/chat/completions"] * 2)
 
-        gateway = _new_client(MODEL, "fixture", "https://gateway.invalid/v1", 0.0, 2, None, None)
+        gateway = _new_client(MODEL, "fixture", "https://gateway.invalid/v1", 0.0, 2, max_tokens=None)
         with gateway.http_client:
             async with gateway.http_async_client:
                 self.assertIs(type(gateway.http_client), DefaultHttpxClient)

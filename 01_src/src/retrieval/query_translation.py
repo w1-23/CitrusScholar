@@ -7,7 +7,6 @@ import re
 import threading
 
 from src.config import settings
-from src.core.llm_pool import is_thinking_rejected
 
 logger = logging.getLogger(__name__)
 _CACHE: dict[str, str] = {}
@@ -78,7 +77,6 @@ def _generate_english_translation(text: str) -> str | None:
         # 翻译是确定性辅助任务，不需要推理；也不再向 provider 发送
         # reasoning/thinking 关闭参数——部分网关会以 BadRequestError 拒绝，
         # 反而让每一次本地检索都先失败一次再重试。
-        off_body = {}
         answer = ""
 
         def invoke_translation(kwargs):
@@ -113,17 +111,7 @@ def _generate_english_translation(text: str) -> str | None:
                 "temperature": 0.0,
                 "max_tokens": max(64, int(getattr(settings, "HYDE_MAX_TOKENS", 512))),
             }
-            if off_body:
-                kwargs["extra_body"] = off_body
-            try:
-                response = invoke_translation(kwargs)
-            except Exception as exc:
-                if not off_body or not is_thinking_rejected(exc):
-                    raise
-                logger.warning("Translation provider rejected reasoning flag; retrying without it")
-                off_body = {}
-                kwargs.pop("extra_body", None)
-                response = invoke_translation(kwargs)
+            response = invoke_translation(kwargs)
             answer = str(response.choices[0].message.content or "").strip()
             if answer:
                 break

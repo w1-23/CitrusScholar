@@ -7,7 +7,6 @@ same run; resuming one explicitly safe operation remains a separate action.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import hashlib
 import json
 import time
@@ -16,7 +15,6 @@ from contextlib import closing, contextmanager
 
 PROTOCOL = "citrus-task/1"
 LIVE_QUEUE_SIZE = 128
-_active_model_attempt = contextvars.ContextVar("task_model_attempt", default="")
 
 
 class TaskConflict(ValueError):
@@ -717,19 +715,12 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
     from src.core.context_snapshot import build_context_snapshot, emit_context_snapshot
     phase = _epoch.get()
     parent = _observation.get()
-    # A fallback is a new physical attempt of the same logical call. Publish
-    # the rejected parent before the fallback, not after its successful result.
-    if parent and parent.get("redirected") and not parent.get("context_settled"):
-        publisher = parent.get("publish_context")
-        if publisher:
-            publisher(status="failed", error=parent.get("transport_error", ""))
-            parent["context_settled"] = True
     logical_call_id = _logical_call.get() or (parent or {}).get("logical_call_id") or uuid.uuid4().hex
     payload, estimate = model_request(model, messages, output_tokens=output_tokens)
     limit = model_input_limit(estimate["output_tokens"])
     scope = {"purpose": purpose, "attempt_id": "", "logical_call_id": logical_call_id,
              "epoch": phase.number if phase else 0,
-             "change_reason": "protocol_fallback" if parent and parent.get("redirected") else phase.reason if phase else "initial",
+             "change_reason": phase.reason if phase else "initial",
              "history_load_status": phase.history_load_status if phase else "unknown",
              "history_load_reason": phase.history_load_reason if phase else "",
              "estimate": estimate, "model": str(payload.get("model", "")),
@@ -766,7 +757,6 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
     scope["attempt_id"] = attempt_id or uuid.uuid4().hex
     scope["reservation_id"] = attempt_id
     publish_context()
-    scope_token = _active_model_attempt.set(attempt_id)
     observation_token = _observation.set(scope)
     response, error = None, ""
     invoked_at = time.monotonic()
@@ -781,13 +771,12 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
     finally:
         from src.core.public_delivery import duration_ms
         scope["attempt_elapsed_ms"] = duration_ms((time.monotonic() - invoked_at) * 1000)
-        redirected = scope.get("redirected", False)
-        usage = {} if redirected else extract_usage(response) or {}
+        usage = extract_usage(response) or {}
         denied = scope.get("pre_transport_denial", "")
-        error = denied or scope.get("transport_error", error)
+        error = denied or error
         finish_attempt(attempt_id, usage, error=error, observation=_attempt_response(
-            scope, None if redirected else response, error), unsent=bool(denied))
-        if response is not None and not redirected:
+            scope, response, error), unsent=bool(denied))
+        if response is not None:
             emit_usage_from_response(usage_session_id or get_session_id(), purpose, response,
                 attempt_id=scope["attempt_id"], logical_call_id=scope["logical_call_id"],
                 epoch=scope["epoch"], parent_purpose=scope["parent_purpose"])
@@ -797,7 +786,6 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
             publish_context(usage=usage, status=status, error=error)
             scope["context_settled"] = True
         _observation.reset(observation_token)
-        _active_model_attempt.reset(scope_token)
         snapshot = scope.get("snapshot")
         if snapshot:
             snapshot.update(estimate=scope["estimate"], parent_purpose=scope["parent_purpose"],

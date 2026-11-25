@@ -17,7 +17,6 @@ from contextlib import closing, contextmanager
 PROTOCOL = "citrus-task/1"
 LIVE_QUEUE_SIZE = 128
 _active_model_attempt = contextvars.ContextVar("task_model_attempt", default="")
-_checkpoint_scope = contextvars.ContextVar("turn_checkpoint_scope", default=None)
 
 
 class TaskConflict(ValueError):
@@ -772,9 +771,7 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
     response, error = None, ""
     invoked_at = time.monotonic()
     try:
-        maintenance = _checkpoint_scope.get()
-        remaining = (max(0.0, maintenance["deadline"] - time.monotonic())
-                     if maintenance else remaining_seconds(get_job_id()))
+        remaining = remaining_seconds(get_job_id())
         response = (await invoke() if remaining == float("inf") else
                     await asyncio.wait_for(invoke(), timeout=remaining))
         return response
@@ -822,47 +819,6 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
                 pass
 
 
-async def counted_ainvoke(model, messages, *, purpose, usage_session_id=None, **kwargs):
-    token = None
-    if purpose == "turn_checkpoint" and _checkpoint_scope.get() is None:
-        token = _checkpoint_scope.set({"key": "checkpoint:" + uuid.uuid4().hex,
-                                       "deadline": time.monotonic() + 30.0})
-    try:
-        return await run_model_attempt(model, messages,
-            lambda: model.ainvoke(messages, **kwargs), purpose=purpose,
-            output_tokens=kwargs.get("max_tokens"), usage_session_id=usage_session_id)
-    finally:
-        if token is not None:
-            _checkpoint_scope.reset(token)
-
-
-def _reserve_checkpoint_attempt(job_id, purpose, estimated_tokens, scope):
-    """A single bounded maintenance group per job, metered independently."""
-    from src.config import settings
-    if not job_id or time.monotonic() >= scope["deadline"]:
-        raise TaskConflict("checkpoint_budget_unavailable")
-    tokens = max(1, int(estimated_tokens))
-    with transaction() as conn:
-        _job(conn, job_id)
-        rows = conn.execute("SELECT * FROM task_model_attempts WHERE job_id=? AND budget_scope LIKE 'checkpoint:%'",
-                            (job_id,)).fetchall()
-        if any(row["budget_scope"] != scope["key"] for row in rows) or len(rows) >= 2:
-            raise TaskConflict("checkpoint_attempt_limit")
-        spent = 0
-        for row in rows:
-            usage = json.loads(row["usage"] or "{}")
-            measured = usage.get("total_tokens")
-            if measured is None and all(usage.get(k) is not None for k in ("input_tokens", "output_tokens")):
-                measured = int(usage["input_tokens"]) + int(usage["output_tokens"])
-            spent += max(0, int(measured)) if measured is not None else row["reserved_tokens"]
-        if spent + tokens > settings.CONTEXT_CHECKPOINT_MAX_TOKENS:
-            raise TaskConflict("checkpoint_token_limit")
-        attempt_id = uuid.uuid4().hex
-        conn.execute("INSERT INTO task_model_attempts(attempt_id,job_id,purpose,status,reserved_tokens,created_at,budget_scope) VALUES (?,?,?,'running',?,?,?)",
-                     (attempt_id, job_id, purpose, tokens, time.time(), scope["key"]))
-        return attempt_id
-
-
 def init_budget(job_id, deadline, max_calls=64, max_tokens=None):
     if max_tokens is None:
         from src.config import settings
@@ -874,9 +830,6 @@ def init_budget(job_id, deadline, max_calls=64, max_tokens=None):
 
 def reserve_attempt(job_id, purpose, estimated_tokens):
     """Reserve every attempt, including failures with unknown provider usage."""
-    maintenance = _checkpoint_scope.get()
-    if maintenance is not None:
-        return _reserve_checkpoint_attempt(job_id, purpose, estimated_tokens, maintenance)
     if not job_id:
         return ""
     with transaction() as conn:
@@ -992,17 +945,6 @@ def _usage_totals(conn, job_id):
             totals["unknown_attempts"] += 1
             totals["unknown_reserved_tokens"] += int(row["reserved_tokens"])
     return totals
-
-
-def protect_finalization(job_id, tokens, calls=1):
-    """Keep enough remaining calls and tokens for a bounded final receipt."""
-    if not job_id:
-        return
-    with transaction() as conn:
-        row = conn.execute("SELECT max_calls FROM task_budgets WHERE job_id=?", (job_id,)).fetchone()
-        if row:
-            conn.execute("UPDATE task_budgets SET final_tokens=?,final_calls=? WHERE job_id=?",
-                         (max(0, int(tokens)), min(max(0, int(calls)), row[0]), job_id))
 
 
 def release_finalization(job_id):

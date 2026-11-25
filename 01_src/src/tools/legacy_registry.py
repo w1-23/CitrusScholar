@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from src.core.tool_catalog import TOOL_METADATA
 from src.tools.registry import (
-    PartitionedToolNode,
     clear_tool_registry,
     cleanup_offload_files,
     get_offload_file_list,
@@ -75,10 +74,7 @@ _TOOL_DECLARATIONS = (
     (browse_web, "web", "browse_web", "session_artifact", ("network", "session"), (), ""),
     (deepseek_fetch_paper, "web", "deepseek_fetch_paper", None, ("network",), (), ""),
     (local_hybrid_search, "rag", "local_hybrid_search", None, ("local_corpus",), (), ""),
-    # Candidate tools read the request-scoped candidate pool that the
-    # candidate_prefetch node filled before the model saw the turn. They are
-    # visible only when a pool exists for this request, so the model can never
-    # call them for a pool that was never built.
+    # Candidate tools require an authorized request-scoped pool.
     (read_candidate, "rag", "candidate_pool", None,
      ("local_corpus", "candidate_pool"), (), ""),
     (search_candidates, "rag", "candidate_pool", None,
@@ -164,7 +160,7 @@ for _tool, _category, _key, _write_scope, _requires, _produces, _authorization i
     )
 
 __all__ = [
-    "register_tool", "get_tool_spec", "PartitionedToolNode", "clear_tool_registry",
+    "register_tool", "get_tool_spec", "clear_tool_registry",
     "get_tools_by_category", "cleanup_offload_files", "get_offload_file_list",
     "get_tool_names", "_TOOL_REGISTRY", "_TOOL_REGISTRY_BY_NAME", "_TOOL_BINDINGS",
 ]

@@ -314,6 +314,9 @@ class SessionManager:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_visible_page ON sessions("
                              "owner_user_id, COALESCE(updated_at, '') DESC, session_id DESC) "
                              "WHERE deleted_at = '' OR deleted_at IS NULL")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_session_id ON messages(session_id, id) "
+                             "WHERE msg_type='human'")
                 conn.commit()
         except Exception as e:
             logger.debug(f"[SessionManager] schema migration: {e}")
@@ -500,126 +503,136 @@ class SessionManager:
         """读回会话历史。with_ids=True 时返回 (messages, row_ids)，
         row_ids 与 messages 一一对应（压缩 checkpoint 定位用）。"""
         import sqlite3
+        with closing(_connect_db(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            return self._decode_history_rows(self._history_rows(conn, session_id), session_id,
+                with_ids=with_ids, for_display=for_display, with_request_ids=with_request_ids,
+                diagnostics=diagnostics)
+
+    _HISTORY_REQUEST_KEY = "COALESCE(NULLIF(client_request_id,''), idempotency_key)"
+    _HISTORY_VISIBLE_TYPES = "('human','ai','AIMessageChunk','tool')"
+
+    def _history_rows(self, conn, session_id, *, bounds="", values=(), display_page=False, descending=False):
+        content = ("CASE WHEN msg_type='tool' AND history_tool_status(typeof(content),execution_json,"
+                   "context_metadata_json) THEN '' ELSE content END" if display_page else "content")
+        return conn.execute(
+            f"SELECT id,msg_type,{content} AS content,tool_call_id,tool_calls_json,name,"
+            f"generation_ms,execution_json,context_metadata_json,{self._HISTORY_REQUEST_KEY} AS request_key "
+            f"FROM messages WHERE session_id=? {bounds} ORDER BY id {'DESC' if descending else 'ASC'}",
+            (session_id, *values))
+
+    def _decode_history_rows(self, rows, session_id, *, with_ids=False, for_display=False,
+                             with_request_ids=False, diagnostics=None):
         messages: List[BaseMessage] = []
         row_ids: List[int] = []
         request_ids: list[str] = []
-        with _connect_db(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT id, msg_type, content, tool_call_id, tool_calls_json, name, reasoning, "
-                "generation_ms, execution_json, context_metadata_json, "
-                "COALESCE(NULLIF(client_request_id,''), idempotency_key) AS request_key "
-                "FROM messages WHERE session_id = ? ORDER BY id ASC",
-                (session_id,),
-            )
-            ai_tool_pending = 0   # v8.7 INV-01 防御：待配对的工具结果数（跨行保持）
-            for row in cur.fetchall():
-                msg_type = row["msg_type"] or ""
-                content = row["content"] or ""
-                tool_call_id = row["tool_call_id"]
-                tool_calls_json = row["tool_calls_json"]
-                name = row["name"]
-                reasoning = row["reasoning"] if "reasoning" in row.keys() else None
-                generation_ms = row["generation_ms"] if "generation_ms" in row.keys() else None
-                execution_json = (row["execution_json"]
-                                  if "execution_json" in row.keys() else None)
+        ai_tool_pending = 0  # A tool result must have a matching prior call round.
+        for row in rows:
+            msg_type = row["msg_type"] or ""
+            content = row["content"] or ""
+            tool_call_id = row["tool_call_id"]
+            tool_calls_json = row["tool_calls_json"]
+            name = row["name"]
+            generation_ms = row["generation_ms"] if "generation_ms" in row.keys() else None
+            execution_json = (row["execution_json"]
+                              if "execution_json" in row.keys() else None)
 
+            try:
                 try:
-                    try:
-                        context_meta = json.loads(row["context_metadata_json"] or "{}")
-                        if not isinstance(context_meta, dict):
-                            context_meta = {}
-                    except (ValueError, TypeError):
+                    context_meta = json.loads(row["context_metadata_json"] or "{}")
+                    if not isinstance(context_meta, dict):
                         context_meta = {}
-                    content_format = context_meta.pop("_content_format", "")
-                    if content_format == "blocks":
-                        parsed = json.loads(content)
-                        if isinstance(parsed, list):
-                            content = parsed
-                    if msg_type == "human":
-                        messages.append(HumanMessage(content=content))
-                        ai_tool_pending = 0
-                    elif msg_type in ("ai", "AIMessageChunk"):
-                        # v8.7: "AIMessageChunk" 为 v8.4.13 流式化后的旧数据
-                        # 类型残留（保存端已归一化为 "ai"）——按 ai 还原，避免
-                        # 其 ToolMessage 配对消息因跳过而孤立（API 400 根因）。
-                        # Provider reasoning is private internal model output;
-                        # do not restore it into conversation context.
-                        # 读侧兼容：历史上写入的回答里可能残留 `paper_<hash>...`
-                        # 内部键（写入侧 v9.7 才清洗）。这里统一转成可读短语，
-                        # 既让旧会话刷新后不再显示编号，也避免编号进入模型上下文。
-                        # for_display 仅供前端渲染：保留原始键以便点击打开原文；
-                        # 模型上下文（for_display=False）仍走清洗，避免编号污染提示词。
-                        shown = (scrub_partial_keys(content) if for_display
-                                 else scrub_internal_keys(content))
-                        kw = {"content": shown, "name": name or None}
+                except (ValueError, TypeError):
+                    context_meta = {}
+                content_format = context_meta.pop("_content_format", "")
+                if content_format == "blocks":
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        content = parsed
+                if msg_type == "human":
+                    messages.append(HumanMessage(content=content))
+                    ai_tool_pending = 0
+                elif msg_type in ("ai", "AIMessageChunk"):
+                    # v8.7: "AIMessageChunk" 为 v8.4.13 流式化后的旧数据
+                    # 类型残留（保存端已归一化为 "ai"）——按 ai 还原，避免
+                    # 其 ToolMessage 配对消息因跳过而孤立（API 400 根因）。
+                    # Provider reasoning is private internal model output;
+                    # do not restore it into conversation context.
+                    # 读侧兼容：历史上写入的回答里可能残留 `paper_<hash>...`
+                    # 内部键（写入侧 v9.7 才清洗）。这里统一转成可读短语，
+                    # 既让旧会话刷新后不再显示编号，也避免编号进入模型上下文。
+                    # for_display 仅供前端渲染：保留原始键以便点击打开原文；
+                    # 模型上下文（for_display=False）仍走清洗，避免编号污染提示词。
+                    shown = (scrub_partial_keys(content) if for_display
+                             else scrub_internal_keys(content))
+                    kw = {"content": shown, "name": name or None}
+                    try:
+                        persisted_generation_ms = int(generation_ms or 0)
+                    except (TypeError, ValueError):
+                        persisted_generation_ms = 0
+                    if persisted_generation_ms > 0:
+                        kw["response_metadata"] = {
+                            "citrus_generation_ms": persisted_generation_ms}
+                    if tool_calls_json:
                         try:
-                            persisted_generation_ms = int(generation_ms or 0)
-                        except (TypeError, ValueError):
-                            persisted_generation_ms = 0
-                        if persisted_generation_ms > 0:
-                            kw["response_metadata"] = {
-                                "citrus_generation_ms": persisted_generation_ms}
-                        if tool_calls_json:
-                            try:
-                                tool_calls = [
-                                    {"id": tc["id"], "name": tc["name"],
-                                     "args": tc.get("args", {})}
-                                    for tc in json.loads(tool_calls_json)
-                                ]
-                                kw["tool_calls"] = tool_calls
-                            except Exception:
-                                if diagnostics is not None and not diagnostics:
-                                    diagnostics.append("raw_history_incomplete")
-                        messages.append(AIMessage(**{k: v for k, v in kw.items() if v is not None}))
-                        # v8.7 INV-01 防御：记录待配对工具结果数（孤立 ToolMessage 防护）
-                        ai_tool_pending = len(kw.get("tool_calls") or [])
-                    elif msg_type == "tool":
-                        # v8.7 INV-01 协议配对防御：tool 消息前必须存在带 tool_calls
-                        # 的 AI 消息（预算跳过/熔断/压缩切割任何路径破坏配对时，
-                        # 宁可丢弃也不让非法消息列表进入 API 触发 400）
-                        if ai_tool_pending <= 0 and diagnostics is None:
-                            logger.warning(
-                                f"[SessionManager] 丢弃孤立 ToolMessage "
-                                f"(session={session_id[:8]}, id={row['id']}, "
-                                f"tc_id={(tool_call_id or '')[:12]})")
-                            continue
-                        ai_tool_pending -= 1
-                        # 旧库里的超长 tool 行不在写入时改写（不迁移、不删），
-                        # 但读历史时必须按模型预算收敛，否则每轮都重新灌进去。
-                        tool_content = scrub_internal_keys(content)
-                        tool_kw = {"content": tool_content,
-                                   "tool_call_id": tool_call_id or "unknown",
-                                   "name": name or None}
-                        if execution_json:
-                            try:
-                                rec = json.loads(execution_json)
-                                if isinstance(rec, dict) and rec:
-                                    tool_kw["artifact"] = {"_citrus_execution": rec}
-                            except Exception:
-                                pass
-                        messages.append(ToolMessage(**tool_kw))
-                    elif msg_type == "system":
-                        messages.append(SystemMessage(content=content))
-                    else:
-                        if diagnostics is not None and not diagnostics:
-                            diagnostics.append("raw_history_incomplete")
+                            tool_calls = [
+                                {"id": tc["id"], "name": tc["name"],
+                                 "args": tc.get("args", {})}
+                                for tc in json.loads(tool_calls_json)
+                            ]
+                            kw["tool_calls"] = tool_calls
+                        except Exception:
+                            if diagnostics is not None and not diagnostics:
+                                diagnostics.append("raw_history_incomplete")
+                    messages.append(AIMessage(**{k: v for k, v in kw.items() if v is not None}))
+                    # v8.7 INV-01 防御：记录待配对工具结果数（孤立 ToolMessage 防护）
+                    ai_tool_pending = len(kw.get("tool_calls") or [])
+                elif msg_type == "tool":
+                    # v8.7 INV-01 协议配对防御：tool 消息前必须存在带 tool_calls
+                    # 的 AI 消息（预算跳过/熔断/压缩切割任何路径破坏配对时，
+                    # 宁可丢弃也不让非法消息列表进入 API 触发 400）
+                    if ai_tool_pending <= 0 and diagnostics is None:
+                        logger.warning(
+                            f"[SessionManager] 丢弃孤立 ToolMessage "
+                            f"(session={session_id[:8]}, id={row['id']}, "
+                            f"tc_id={(tool_call_id or '')[:12]})")
                         continue
-                    for key in ("citrus_capability_history", "citrus_task_snapshot", "citrus_citation_bubbles"):
-                        if key in context_meta:
-                            messages[-1].response_metadata[key] = context_meta.pop(key)
-                    messages[-1].additional_kwargs = context_meta
-                    messages[-1].additional_kwargs["source_id"] = str(row["id"])
-                    row_ids.append(row["id"])
-                    if with_request_ids and msg_type == "human":
-                        key = str(row["request_key"] or "")
-                        if str(row["content"] or "").startswith(_SYNTH_FORCE_FINAL_MARK):
-                            key = ""
-                        request_ids.append(key.removeprefix("crid:"))
-                except Exception as exc:
+                    ai_tool_pending -= 1
+                    # 旧库里的超长 tool 行不在写入时改写（不迁移、不删），
+                    # 但读历史时必须按模型预算收敛，否则每轮都重新灌进去。
+                    tool_content = scrub_internal_keys(content)
+                    tool_kw = {"content": tool_content,
+                               "tool_call_id": tool_call_id or "unknown",
+                               "name": name or None}
+                    if execution_json:
+                        try:
+                            rec = json.loads(execution_json)
+                            if isinstance(rec, dict) and rec:
+                                tool_kw["artifact"] = {"_citrus_execution": rec}
+                        except Exception:
+                            pass
+                    messages.append(ToolMessage(**tool_kw))
+                elif msg_type == "system":
+                    messages.append(SystemMessage(content=content))
+                else:
                     if diagnostics is not None and not diagnostics:
                         diagnostics.append("raw_history_incomplete")
-                    logger.debug("[SessionManager] skipped unparseable message: %s", type(exc).__name__)
+                    continue
+                for key in ("citrus_capability_history", "citrus_task_snapshot", "citrus_citation_bubbles"):
+                    if key in context_meta:
+                        messages[-1].response_metadata[key] = context_meta.pop(key)
+                messages[-1].additional_kwargs = context_meta
+                messages[-1].additional_kwargs["source_id"] = str(row["id"])
+                row_ids.append(row["id"])
+                if with_request_ids and msg_type == "human":
+                    key = str(row["request_key"] or "")
+                    if str(row["content"] or "").startswith(_SYNTH_FORCE_FINAL_MARK):
+                        key = ""
+                    request_ids.append(key.removeprefix("crid:"))
+            except Exception as exc:
+                if diagnostics is not None and not diagnostics:
+                    diagnostics.append("raw_history_incomplete")
+                logger.debug("[SessionManager] skipped unparseable message: %s", type(exc).__name__)
         if with_request_ids:
             return messages, row_ids, request_ids
         if with_ids:
@@ -630,6 +643,129 @@ class SessionManager:
         """Read display messages, row IDs and aligned human keys together."""
         return await asyncio.to_thread(self._get_messages_sync, session_id,
                                        for_display=True, with_request_ids=True)
+
+    async def get_display_history_page(self, session_id: str, limit: int, before: int, *, render, slice_items):
+        """Read only a suffix sufficient to render the next whole-turn history page."""
+        return await asyncio.to_thread(self._get_display_history_page_sync,
+            session_id, limit, before, render, slice_items)
+
+    @staticmethod
+    def _has_display_tool_status(content_type, execution, metadata):
+        """Only elide content when verified display metadata already determines status."""
+        from src.core.progress_bus import public_tool_status
+        if content_type not in {"null", "text"} or not execution:
+            return False
+        try:
+            execution = json.loads(execution)
+            metadata = json.loads(metadata or "{}")
+        except (TypeError, ValueError, RecursionError):
+            return False
+        if not isinstance(execution, dict) or (isinstance(metadata, dict) and metadata.get("_content_format") == "blocks"):
+            return False
+        return public_tool_status(execution.get("status"), default="") not in {"", "running", "resuming"}
+
+    def _display_saved_keys(self, conn, session_id, *, first_only=False):
+        """Read the minimal cross-page key projection for task rediscovery."""
+        mark = _SYNTH_FORCE_FINAL_MARK
+        rows = conn.execute(
+            f"SELECT id,{self._HISTORY_REQUEST_KEY} AS request_key,"
+            "substr(content,1,?) AS prefix,typeof(content) AS storage,context_metadata_json "
+            "FROM messages WHERE session_id=? AND msg_type='human' "
+            f"AND {self._HISTORY_REQUEST_KEY} IS NOT NULL ORDER BY id DESC", (len(mark), session_id))
+        saved = set()
+        for row in rows:
+            key = str(row["request_key"] or "").removeprefix("crid:")
+            if not key or row["prefix"] == mark:
+                continue
+            try:
+                metadata = json.loads(row["context_metadata_json"] or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            except RecursionError:
+                continue  # The full legacy decoder also skips this row.
+            if (row["storage"] not in {"null", "text"}
+                    or (isinstance(metadata, dict) and metadata.get("_content_format") == "blocks")):
+                # Old non-text rows need exact validation, but still read only
+                # this one candidate human row and never older tool payloads.
+                candidate = self._history_rows(conn, session_id, bounds="AND id=?", values=(row["id"],))
+                _, _, keys = self._decode_history_rows(candidate, session_id, for_display=True, with_request_ids=True)
+                if keys != [key]:
+                    continue
+            saved.add(key)
+            if first_only:
+                break
+        return saved
+
+    def _display_page_start(self, conn, session_id, floor, identity_known):
+        """Find the real user boundary (or a verified legacy protocol reset)."""
+        bounds = "AND msg_type='human' AND id<=?"
+        if identity_known:
+            # Missing keys never open a turn when this history has identities.
+            bounds += f" AND {self._HISTORY_REQUEST_KEY} NOT IN ('', 'crid:')"
+        candidates = self._history_rows(conn, session_id, bounds=bounds, values=(floor,), descending=True)
+        anchor, anchor_key = None, ""
+        for row in candidates:
+            messages, _, keys = self._decode_history_rows([row], session_id, for_display=True, with_request_ids=True)
+            if not messages or (identity_known and not keys[0]):
+                continue
+            meta = messages[0].additional_kwargs
+            if (meta.get("context_trusted") is True and meta.get("context_origin") == "internal_control"):
+                continue
+            if not self._rail_turn_text(str(messages[0].content or "").strip()):
+                continue
+            if anchor is not None and (not anchor_key or keys[0] != anchor_key):
+                return anchor, True
+            anchor, anchor_key = int(row["id"]), keys[0]
+        if anchor is not None:
+            return anchor, False
+        # A preface with no real question still needs accurate tool pairing.
+        # Start at the nearest successfully decoded Human/AI reset, not at an
+        # arbitrary tool row that would be misclassified as an orphan.
+        resets = self._history_rows(conn, session_id,
+            bounds="AND msg_type IN ('human','ai','AIMessageChunk') AND id<=?", values=(floor,), descending=True)
+        for row in resets:
+            if self._decode_history_rows([row], session_id, for_display=True):
+                return int(row["id"]), False
+        return floor, False
+
+    def _get_display_history_page_sync(self, session_id, limit, before, render, slice_items):
+        import sqlite3
+        max_id = (1 << 63) - 1
+        count = max(1, min(int(limit or 0), max_id))
+        ceiling = max(0, min(int(before) - 1, max_id)) if before else max_id
+        with closing(_connect_db(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.create_function("history_tool_status", 3, self._has_display_tool_status, deterministic=True)
+            conn.execute("BEGIN")  # Boundaries, saved keys and page rows share one snapshot.
+            saved = self._display_saved_keys(conn, session_id, first_only=bool(before))
+            probe_ceiling, probe_count = ceiling, count
+            while probe_ceiling:
+                floor = conn.execute(
+                    "SELECT min(id) FROM (SELECT id FROM messages WHERE session_id=? AND id<=? "
+                    f"AND msg_type IN {self._HISTORY_VISIBLE_TYPES} ORDER BY id DESC LIMIT ?)",
+                    (session_id, probe_ceiling, probe_count)).fetchone()[0]
+                if floor is None:
+                    break
+                start, older_visible_user = self._display_page_start(conn, session_id, floor, bool(saved))
+                rows = self._history_rows(conn, session_id,
+                    bounds=f"AND id BETWEEN ? AND ? AND msg_type IN {self._HISTORY_VISIBLE_TYPES}",
+                    values=(start, ceiling), display_page=True)
+                msgs, ids, keys = self._decode_history_rows(rows, session_id, for_display=True, with_request_ids=True)
+                items = render(msgs, ids, keys, identity_known=bool(saved))
+                window, more, cursor = slice_items(items, count)
+                if more:
+                    return window, more, cursor, saved
+                if len(window) >= count and older_visible_user:
+                    return window, True, int(window[0]["message_id"]), saved
+                # Only sparse or unverified prefixes need another probe. The
+                # geometrically grown probes are keyset bounded, never offsets.
+                probe_ceiling = start - 1
+                probe_count = min(probe_count * 2, max_id)
+                if probe_ceiling <= 0 or not conn.execute(
+                        f"SELECT 1 FROM messages WHERE session_id=? AND id<=? AND msg_type IN {self._HISTORY_VISIBLE_TYPES} LIMIT 1",
+                        (session_id, probe_ceiling)).fetchone():
+                    return window, False, 0, saved
+            return [], False, 0, saved
 
     async def get_messages_with_ids(self, session_id: str, for_display: bool = False, *,
                                     diagnostics: list[str] | None = None):

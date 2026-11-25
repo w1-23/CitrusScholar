@@ -6,9 +6,8 @@ are conservative configurable placeholders, not a claim about any vendor tokeniz
 from __future__ import annotations
 
 import contextvars
-import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 _observation = contextvars.ContextVar("model_request_observation", default=None)
 _epoch = contextvars.ContextVar("model_context_epoch", default=None)
@@ -32,8 +31,9 @@ def message_dict(message):
     if isinstance(message, dict):
         return message
     try:
-        from langchain_openai.chat_models.base import _convert_message_to_dict
-        return _convert_message_to_dict(message)
+        from langchain_core.messages import convert_to_openai_messages
+        text_format = "block" if isinstance(getattr(message, "content", None), list) else "string"
+        return convert_to_openai_messages(message, text_format=text_format, pass_through_unknown_blocks=True)
     except (TypeError, AttributeError, ValueError):
         data = {"role": str(getattr(message, "type", "unknown")),
                 "content": getattr(message, "content", "")}
@@ -99,90 +99,85 @@ def model_request(model, messages, output_tokens=None):
         value = getattr(base, "max_tokens", None)
         output = value if isinstance(value, (int, float)) else 512
     output = max(1, int(output))
-    # This is the same LangChain conversion used at its SDK boundary. Observation
-    # is disabled here; admission is not a physical provider attempt.
-    method = getattr(base, "_get_request_payload", None)
-    if callable(method) and isinstance(getattr(base, "model_name", None), str):
-        token = _observation.set(None)
-        try:
-            payload = method(messages, **(kwargs | {"max_tokens": output}))
-        finally:
-            _observation.reset(token)
-    else:
-        payload = {"messages": [message_dict(m) for m in messages],
-                   "tools": kwargs.get("tools", []), "max_tokens": output}
+    # A public conversion is used for deterministic preflight. The HTTPX
+    # hook checks the actual, fully serialized body before transport.
+    rows = [message_dict(message) for message in messages]
+    from langchain_openai import ChatOpenAI
+    from src.core.provider_protocol import attach_current_tool_reasoning, current_tool_reasoning, model_deepseek_scope
+    if isinstance(base, ChatOpenAI):
+        # These Chat Completions fields do not enter the provider request.
+        rows = [row.copy() for row in rows]
+        for row in rows:
+            if row.get("role") == "tool":
+                row.pop("name", None)
+            elif row.get("role") == "assistant" and (row.get("tool_calls") or row.get("function_call")):
+                if not row.get("content"):
+                    row["content"] = None
+    payload = {**kwargs, "messages": rows, "max_tokens": output,
+               "model": str(getattr(base, "model_name", ""))}
+    replay = current_tool_reasoning(messages, model_deepseek_scope(model, kwargs))
+    attach_current_tool_reasoning(rows, replay)
     return payload, estimate_request(payload, output_tokens=output)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ContextEpoch:
-    """Request-local, bounded deterministic projections, frozen until a checkpoint."""
+    """Persisted timing and diagnostic labels, not a message or context view."""
     number: int = 0
-    layout: str = ""
     reason: str = "initial"
-    projections: dict = field(default_factory=dict)
-    covered_count: int = 0
-    covered_hash: str = ""
-    frozen_prefix: list = field(default_factory=list)
-    working_state: dict = field(default_factory=dict)
-    # Populated from the session loader; absence is not evidence of success.
     history_load_status: str = "unknown"
     history_load_reason: str = ""
 
-    def apply_prefix(self, messages):
-        if not self.covered_count:
-            return list(messages)
-        digest = hashlib.sha256(_json([message_dict(m) for m in messages[:self.covered_count]]).encode()).hexdigest()
-        if len(messages) >= self.covered_count and digest == self.covered_hash:
-            return self.frozen_prefix + list(messages[self.covered_count:])
-        self.covered_count = 0
-        self.frozen_prefix = []
-        self.number += 1
-        self.reason = "instructions_changed"
-        return list(messages)
 
-    def freeze(self, original, compacted):
-        self.covered_count = len(original)
-        self.covered_hash = hashlib.sha256(_json([message_dict(m) for m in original]).encode()).hexdigest()
-        self.frozen_prefix = list(compacted)
-        self.checkpoint()
-
-    def project(self, messages, layout):
-        from src.core.model_context import project_tool_message
-        if self.layout and layout != self.layout:
-            self.number += 1
-            self.reason = "request_layout_changed"
-            self.projections.clear()
-        self.layout = layout
-        result = []
-        for message in messages:
-            if getattr(message, "type", "") == "tool":
-                key = hashlib.sha256(_json(message_dict(message)).encode()).hexdigest()
-                if key not in self.projections:
-                    self.projections[key] = project_tool_message(message)
-                message = self.projections[key]
-            result.append(message)
-        return result
-
-    def checkpoint(self):
-        self.number += 1
-        self.reason = "working_set_compacted"
-        self.projections.clear()
-
-
-def observe_prepared_request(payload):
-    """Called only by the actual model client while a counted attempt is active."""
+def observe_provider_request(request):
+    """Public HTTPX request hook, after SDK serialization and before transport."""
     scope = _observation.get()
-    if scope is None:
+    if scope is None or request.method != "POST":
         return
+    from src.core.task_events import TaskConflict, adjust_model_reservation, model_input_limit
     from src.core.turn_context import capture_request
+    from src.agent.runtime import AdmissionStopped
+
+    def blocked(reason):
+        if not scope.get("provider_request_admitted"):
+            scope["pre_transport_denial"] = reason
+        if scope["purpose"] == "main_loop":
+            raise AdmissionStopped(reason)
+        raise TaskConflict(reason)
+
+    if not request.url.path.endswith("/chat/completions"):
+        blocked("unexpected_provider_request_endpoint")
+    if scope.get("provider_request_admitted"):
+        blocked("duplicate_provider_request")
+    try:
+        payload = json.loads(request.content)
+        if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+            raise ValueError("invalid chat request body")
+        prepared = estimate_request(payload, model_window=scope["estimate"].get("model_window"))
+    except (TypeError, ValueError):
+        blocked("model_request_body_unavailable")
+    if prepared["estimated_input_tokens"] > model_input_limit(prepared["output_tokens"]):
+        blocked("context_budget_exhausted")
+    if (scope["purpose"] == "main_loop"
+            and not 0 < prepared["output_tokens"] <= scope["estimate"]["output_tokens"]):
+        blocked("model_output_budget_mismatch")
+    if prepared["estimated_total_tokens"] > scope["estimate"]["estimated_total_tokens"]:
+        try:
+            adjust_model_reservation(scope.get("reservation_id"), prepared["estimated_total_tokens"])
+        except TaskConflict as exc:
+            blocked(str(exc))
     scope["snapshot"] = capture_request(payload, model=str(payload.get("model", "")),
         purpose=scope["purpose"], attempt_id=scope["attempt_id"],
         epoch=scope.get("epoch", 0), logical_call_id=scope.get("logical_call_id", ""),
         change_reason=scope.get("change_reason", ""))
-    prepared = estimate_request(payload, model_window=(scope.get("estimate") or {}).get("model_window"))
     changed = prepared != scope.get("estimate")
     scope["estimate"] = prepared
     scope["model"] = str(payload.get("model", scope.get("model", "")))
     if changed and scope.get("publish_context"):
         scope["publish_context"]()
+    scope["provider_request_admitted"] = True
+
+
+async def observe_async_provider_request(request):
+    # The OpenAI SDK sends an already-built JSON body; no request is made here.
+    observe_provider_request(request)

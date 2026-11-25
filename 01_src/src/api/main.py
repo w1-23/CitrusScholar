@@ -38,6 +38,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from src.api.lan_ingress import load_lan_ingress
 from src.config import PROJECT_ROOT, WEB_DIR, settings
 from src.guardrails.memory import memory_store
+from src.runtime_status import (
+    RuntimeEvidence, observe_runtime, optional_call, public_readiness, required_capabilities_ready,
+    set_web_model_evidence,
+)
 from src.session.manager import session_manager
 from src.logger import setup_logging
 
@@ -90,36 +94,219 @@ class RequestBodyLimitMiddleware:
             await response(scope, receive, send)
 
 
+_UNVERIFIED_MODELS = {"ready": False, "status": "unavailable", "reason_code": "not_verified"}
+_UNVERIFIED_WORKER = {"verified": False, "status": "unverified", "reason_code": "not_verified"}
+
+
+def _initialize_core_stores():
+    from src.admin_audit import init_store as init_admin_audit, mark_interrupted_requests
+    from src.auth import init_store
+    from src.core.jobs import mark_interrupted_jobs
+    from src.session import files as session_files
+
+    init_store()
+    init_admin_audit()
+    session_files.init_store()
+    mark_interrupted_requests()
+    mark_interrupted_jobs()
+
+
+def _recover_publications():
+    from src.core.publication_reconcile import reconcile_publications
+    from src.research.tools import _db_path, cleanup_expired_artifacts
+
+    try:
+        _db_path()
+        recovered = reconcile_publications(limit=50)
+        logger.info("[Lifespan] publication registration recovery: %s", recovered)
+    except Exception as exc:
+        logger.warning("[Lifespan] publication recovery incomplete: %s", type(exc).__name__)
+    try:
+        cleanup_expired_artifacts()
+    except Exception as exc:
+        logger.warning("[Lifespan] initial artifact cleanup failed: %s", type(exc).__name__)
+
+
+def _warm_retrieval():
+    from src.retrieval import eager_load_rag
+
+    return eager_load_rag()
+
+
+def _read_model_evidence():
+    from src.engine.hardware import runtime_readiness
+
+    return runtime_readiness()
+
+
+def _retrieval_not_ready(state):
+    evidence = state.model_evidence.read()
+    if state.retrieval_ready and evidence.get("ready"):
+        return None
+    if state.retrieval_error is not None:
+        return state.retrieval_error
+    if evidence.get("reason_code") == "not_verified":
+        return ("retrieval_warming", False)
+    return ("retrieval_unavailable", False)
+
+
+async def _serve_model_runtime(state):
+    from src.retrieval.runtime import RetrievalUnavailable
+
+    try:
+        state.rag_runtime = await optional_call("rag-warmup", _warm_retrieval)
+        state.retrieval_ready = True
+        logger.info("[Lifespan] RAG engine warmed up")
+    except Exception as exc:
+        state.retrieval_error = ((exc.reason_code, exc.empty_allowed) if isinstance(exc, RetrievalUnavailable)
+                                 else ("retrieval_unavailable", False))
+        logger.error("[Lifespan] RAG warm-up failed: %s", type(exc).__name__)
+    await observe_runtime("model-evidence", state.model_evidence.publish, _read_model_evidence,
+                          _UNVERIFIED_MODELS)
+
+
+def _warm_fixed_prompts():
+    from src.prompts.loader import ensure_fixed_prompts
+
+    prompts = ensure_fixed_prompts()
+    logger.info("[Lifespan] fixed prompts warmed: %s",
+                ", ".join(f"{name}={len(text)}chars" for name, text in prompts.items()))
+
+
+def _read_figure_prompt():
+    from src.prompts.loader import verify_figure_prompt_loading
+
+    return verify_figure_prompt_loading()
+
+
+async def _serve_figure_prompt(state):
+    try:
+        state.figure_skill_readiness = await optional_call("figure-prompt", _read_figure_prompt)
+        details = state.figure_skill_readiness
+        logger.info("[Lifespan] nature-figure prompt loaded: commit=%s sha256=%s chars=%s",
+                    details["commit"], details["assembled_prompt_sha256"], details["assembled_prompt_chars"])
+    except Exception as exc:
+        logger.warning("[Lifespan] nature-figure prompt verification failed: %s", type(exc).__name__)
+        state.figure_skill_readiness = {"prompt_loaded": False, "reason_code": "figure_method_unavailable"}
+
+
+def _select_figure_worker(options):
+    if options["backend"] == "apptainer":
+        # verify_worker already runs the isolated availability check for Apptainer.
+        from src.figures.apptainer import ApptainerBackend
+
+        return ApptainerBackend(image=options["image"], image_sha256=options["image_sha256"],
+                                runtime=options["runtime"])
+    from src.figures.sandbox import select_backend
+
+    return select_backend(**options, allow_local=False, startup_probe=True)
+
+
+async def _serve_figure_runtime(state):
+    from src.figures.sandbox import backend_identity
+
+    backend = str(settings.FIGURES_SANDBOX_BACKEND or "off").strip().lower()
+    evidence = state.worker_evidence
+    if backend in {"", "off", "none", "disabled"}:
+        state.worker_readiness = {"backend": backend, "status": "disabled", "verified": False}
+        return
+    options = {"backend": backend, "image": str(settings.FIGURES_SANDBOX_IMAGE or ""),
+               "image_sha256": str(settings.FIGURES_SANDBOX_IMAGE_SHA256 or ""),
+               "runtime": str(settings.FIGURES_SANDBOX_RUNTIME or ""),
+               "wsl_distribution": str(getattr(settings, "FIGURES_SANDBOX_WSL_DISTRO", "Ubuntu-24.04"))}
+    identity = backend_identity(**options)
+    try:
+        runner = await asyncio.wait_for(optional_call("figure-backend", _select_figure_worker, options), timeout=30)
+        if runner is None:
+            raise RuntimeError("figure_backend_unavailable")
+        if backend in {"wsl-docker", "apptainer"}:
+            from src.figures.readiness import verify_worker, worker_snapshot
+
+            verified = await asyncio.wait_for(optional_call("figure-verify", verify_worker, settings, runner),
+                                              timeout=150)
+            state.verified_figure_runner = (identity, runner)
+            evidence.publish(verified)
+            await observe_runtime("figure-evidence", evidence.publish,
+                lambda: worker_snapshot(settings) or _UNVERIFIED_WORKER, _UNVERIFIED_WORKER)
+        else:
+            state.verified_figure_runner = (identity, runner)
+            state.worker_readiness = {"backend": backend, "status": "ready", "verified": True}
+    except Exception as exc:
+        state.verified_figure_runner = None
+        logger.warning("[Lifespan] figure worker unavailable: %s", type(exc).__name__)
+        state.worker_readiness = {"backend": backend, "status": "unavailable", "verified": False,
+                                 "error": str(exc)[-2500:] or type(exc).__name__}
+
+
+async def _serve_core_runtime(state):
+    shared_runtime = execution_task = shared_task = None
+    consumer = None
+    try:
+        await asyncio.to_thread(_initialize_core_stores)
+        state.task_stores_ready = True
+        logger.info("[Lifespan] account, audit and session stores ready")
+        state.agent_readiness = await asyncio.to_thread(_agent_runtime_readiness)
+        if not state.agent_readiness["ready"]:
+            logger.error("[Lifespan] Agent runtime unavailable: %s", state.agent_readiness["errors"])
+        await asyncio.to_thread(_recover_publications)
+        from src.core import chat_turn_queue
+        await asyncio.to_thread(chat_turn_queue.ensure_schema)
+        await _reconcile_turn_queue_startup()
+        if legacy_enabled():
+            from src.shared_corpus.runtime import start_runtime
+            shared_runtime = await asyncio.to_thread(start_runtime)
+        if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
+            from src.agent.execution_coordinator import ExecutionCompletionCoordinator
+            from src.config import get_deepseek_model
+            coordinator = ExecutionCompletionCoordinator(PROJECT_ROOT / "state",
+                (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()),
+                dispatch=_resume_execution_segment, settle=_settle_coordinator_turn,
+                busy=_turn_execution_busy)
+            execution_task = asyncio.create_task(coordinator.run())
+        state.turn_queue_wake = asyncio.Event()
+        consumer = state.turn_queue_consumer = asyncio.create_task(_consume_chat_turns(
+            state.turn_queue_wake, health=state.turn_queue_health))
+        if shared_runtime is not None:
+            shared_task = asyncio.create_task(shared_runtime.run(state.turn_queue_wake))
+        state.core_accepting_requests = True
+        await consumer
+    except Exception as exc:
+        logger.exception("[Lifespan] core runtime unavailable: %s", type(exc).__name__)
+    finally:
+        tasks = [task for task in (shared_task, consumer, execution_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if shared_runtime is not None:
+            from src.shared_corpus.runtime import stop_runtime
+            await asyncio.to_thread(stop_runtime, shared_runtime)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.lan_ingress = load_lan_ingress()
-    logger.info("[Lifespan] starting...")
-    from src.graph.general_agent_graph import _model_timeout
-    logger.info("[Lifespan] timeouts: task=%ss (0 disables deadline), model=%ss; "
-                "settings=AGENT_REQUEST_TIMEOUT_SEC/AGENT_MODEL_TIMEOUT_SEC (environment or agent configuration)",
-                settings.AGENT_REQUEST_TIMEOUT_SEC, _model_timeout())
-    app.state.task_stores_ready = False
-    app.state.retrieval_ready = False
-    app.state.worker_readiness = {"status": "unverified", "verified": False}
-    # Resolve the lazy execution and Skill/context middleware imports before
-    # readiness can advertise that chat is usable. No model request is made.
-    app.state.agent_readiness = _agent_runtime_readiness()
-    if not app.state.agent_readiness["ready"]:
-        logger.error("[Lifespan] Agent runtime unavailable: %s", app.state.agent_readiness["errors"])
+    state = app.state
+    state.lan_ingress = load_lan_ingress()
+    state.task_stores_ready = False
+    state.core_accepting_requests = False
+    state.turn_queue_consumer = None
+    state.turn_queue_health = {"last_scan": None, "consecutive_failures": 0}
+    state.agent_readiness = {"ready": False, "errors": []}
+    state.retrieval_ready = False
+    state.retrieval_error = None
+    state.rag_runtime = None
+    state.figure_skill_readiness = {"prompt_loaded": False}
+    state.worker_readiness = None
+    state.verified_figure_runner = None
+    state.model_evidence = RuntimeEvidence(_UNVERIFIED_MODELS)
+    state.worker_evidence = RuntimeEvidence(_UNVERIFIED_WORKER)
+    logger.info("[Lifespan] starting (task deadline: %ss, model timeout: %ss)",
+                settings.AGENT_REQUEST_TIMEOUT_SEC, settings.AGENT_MODEL_TIMEOUT_SEC)
     try:
-        from src.auth import init_store
-        init_store()
-        from src.admin_audit import init_store as init_admin_audit
-        init_admin_audit()
-        from src.admin_audit import mark_interrupted_requests
-        mark_interrupted_requests()
-        from src.core.jobs import mark_interrupted_jobs
-        mark_interrupted_jobs()
-        from src.engine.hardware import runtime_readiness
-        logger.info("[Lifespan] ONNX runtime snapshot: %s", runtime_readiness())
+        from src.core import loop_watchdog
+        loop_watchdog.install()
     except Exception as exc:
-        logger.exception("[Lifespan] account store initialization failed: %s", exc)
-        raise
+        logger.warning("[Lifespan] loop watchdog install failed: %s", type(exc).__name__)
+
     async def _artifact_cleanup_loop():
         while True:
             await asyncio.sleep(3600)
@@ -169,173 +356,62 @@ async def lifespan(app: FastAPI):
             logger.warning("[Lifespan] session activity read failed: %s", exc)
         return rows
 
-    try:
-        from src.session import files as session_files
-        await asyncio.to_thread(session_files.init_store)
-        logger.info("[Lifespan] session file store ready")
-        app.state.task_stores_ready = True
-    except Exception as exc:
-        logger.warning("[Lifespan] session file store init failed: %s", exc)
-
-    try:
-        from src.research.tools import _db_path
-        from src.core.publication_reconcile import reconcile_publications
-        await asyncio.to_thread(_db_path)
-        recovered = await asyncio.to_thread(reconcile_publications, limit=50)
-        logger.info("[Lifespan] publication registration recovery: %s", recovered)
-    except Exception as exc:
-        logger.warning("[Lifespan] publication recovery incomplete: %s", type(exc).__name__)
-    try:
-        from src.research.tools import cleanup_expired_artifacts
-        await asyncio.to_thread(cleanup_expired_artifacts)
-    except Exception as exc:
-        logger.warning("[Lifespan] initial artifact cleanup failed: %s", exc)
-    artifact_cleanup_task = asyncio.create_task(_artifact_cleanup_loop())
-    try:
-        from src.retrieval import eager_load_rag
-        eager_load_rag()
-        logger.info("[Lifespan] RAG engine warmed up")
-        app.state.retrieval_ready = True
-    except Exception as e:
-        logger.error("[Lifespan] RAG warm-up failed: %s: %s", type(e).__name__, e)
-    # Cache the expensive runner verification at startup. Readiness requests
-    # only inspect this evidence and never launch a probe or initialize models.
-    worker_backend = str(settings.FIGURES_SANDBOX_BACKEND or "off").lower()
-    if worker_backend in {"", "off", "none", "disabled"}:
-        app.state.worker_readiness = {"backend": worker_backend, "status": "disabled", "verified": False}
-    else:
+    async def warm_fixed_prompts():
         try:
-            from src.figures.sandbox import select_backend
-            runner = await asyncio.wait_for(asyncio.to_thread(select_backend,
-                backend=worker_backend, image=settings.FIGURES_SANDBOX_IMAGE,
-                image_sha256=getattr(settings, "FIGURES_SANDBOX_IMAGE_SHA256", ""),
-                runtime=settings.FIGURES_SANDBOX_RUNTIME, allow_local=False,
-                wsl_distribution=getattr(settings, "FIGURES_SANDBOX_WSL_DISTRO", "Ubuntu-24.04")), timeout=30)
-            if worker_backend in {"wsl-docker", "apptainer"} and runner is not None:
-                from src.figures.readiness import verify_worker
-                app.state.worker_readiness = await asyncio.wait_for(
-                    asyncio.to_thread(verify_worker, settings, runner), timeout=150)
-            else:
-                app.state.worker_readiness = {"backend": worker_backend,
-                    "status": "ready" if runner is not None else "unavailable",
-                    "verified": runner is not None}
+            await optional_call("fixed-prompts", _warm_fixed_prompts)
         except Exception as exc:
-            app.state.worker_readiness = {"backend": worker_backend, "status": "unavailable",
-                "verified": False, "error": str(exc)[-2500:]}
-    if os.getenv("CITRUS_REQUIRE_FIGURE_WORKER") == "1" and not app.state.worker_readiness.get("verified"):
-        raise RuntimeError(f"Required drawing sandbox failed startup: {app.state.worker_readiness}")
-    if os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1":
-        from src.engine.hardware import get_device_status
-        from src.runtime_status import complete_model_evidence
-        if (not app.state.task_stores_ready or not app.state.retrieval_ready
-                or not complete_model_evidence(get_device_status())):
-            raise RuntimeError("Complete local startup requires ready stores, retrieval and both warmed models.")
-    # v9.0: 启动时一次性拼接固定 system prompt（Supervisor/Retrieve/Write/Lite/…）
-    # 之后每次请求复用同一字符串，不再拼接、不再动态选择格式模板（KV cache 最大化复用）
-    try:
-        from src.prompts.loader import ensure_fixed_prompts
-        _prompts = ensure_fixed_prompts()
-        logger.info("[Lifespan] fixed prompts warmed: "
-                    + ", ".join(f"{k}={len(v)}chars" for k, v in _prompts.items()))
-    except Exception as e:
-        logger.error(f"[Lifespan] fixed prompts build failed: {e}")
-    # Validate the same prompt assembly used on every figure-capable request.
-    try:
-        from src.prompts.loader import verify_figure_prompt_loading
-        app.state.figure_skill_readiness = verify_figure_prompt_loading()
-        logger.info("[Lifespan] nature-figure prompt loaded: commit=%s sha256=%s chars=%s",
-                    app.state.figure_skill_readiness["commit"],
-                    app.state.figure_skill_readiness["assembled_prompt_sha256"],
-                    app.state.figure_skill_readiness["assembled_prompt_chars"])
-    except Exception:
-        logger.exception("[Lifespan] nature-figure prompt verification failed")
-        app.state.figure_skill_readiness = {"prompt_loaded": False, "reason_code": "figure_method_unavailable"}
-        if os.getenv("CITRUS_REQUIRE_FIGURE_WORKER") == "1" or os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1":
-            raise
-    # Log registered capabilities. Per-request tool filtering happens inside
-    # the General Agent; opt-in tools may not be advertised on ordinary turns.
-    try:
-        from src.graph.general_agent_graph import _toolset
-        _active_tools, _ = _toolset()
-        logger.info("[Lifespan] registered general-agent capabilities: "
-                    + ", ".join(tool.name for tool in _active_tools))
-    except Exception as e:
-        logger.warning(f"[Lifespan] active agent tools snapshot failed: {e}")
-    # A1: 事件循环卡顿看门狗。只读观测——它不参与请求、不改变状态，只在循环
-    # 被同步重活占住时记下"是哪一帧占住的"。关掉它不会改变任何业务行为。
-    try:
-        from src.core import loop_watchdog
-        loop_watchdog.install()
-    except Exception as exc:  # noqa: BLE001 - 诊断不得影响启动
-        logger.warning("[Lifespan] loop watchdog install failed: %s", exc)
-    execution_coordinator_task = None
-    if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
-        from src.agent.execution_coordinator import ExecutionCompletionCoordinator
-        from src.config import get_deepseek_model
-        coordinator = ExecutionCompletionCoordinator(PROJECT_ROOT / "state",
-            (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()),
-            dispatch=_resume_execution_segment, settle=_settle_coordinator_turn,
-            busy=_turn_execution_busy)
-    from src.core import chat_turn_queue
-    await asyncio.to_thread(chat_turn_queue.ensure_schema)
-    await _reconcile_turn_queue_startup()
-    from src.corpus_integration.settings import legacy_enabled
-    shared_runtime = None
-    if legacy_enabled():
-        from src.shared_corpus.runtime import start_runtime
-        shared_runtime = await asyncio.to_thread(start_runtime)
-    if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
-        execution_coordinator_task = asyncio.create_task(coordinator.run())
-    app.state.turn_queue_wake = asyncio.Event()
-    app.state.turn_queue_health = {"last_scan": time.monotonic(), "consecutive_failures": 0}
-    app.state.turn_queue_consumer = asyncio.create_task(_consume_chat_turns(
-        app.state.turn_queue_wake, health=app.state.turn_queue_health))
-    shared_task = (asyncio.create_task(shared_runtime.run(app.state.turn_queue_wake))
-                   if shared_runtime else None)
+            logger.warning("[Lifespan] fixed prompts unavailable: %s", type(exc).__name__)
+
+    from src.figures.sandbox import set_web_worker_readiness
+    from src.retrieval.runtime import set_web_readiness
+
+    def verified_figure_runner(identity):
+        active = state.verified_figure_runner
+        if active is not None and active[0] == identity:
+            evidence = _figure_worker_snapshot(state)
+            if evidence.get("backend") == identity[0] and evidence.get("verified"):
+                return active[1]
+        return None
+
+    set_web_model_evidence(state.model_evidence)
+    set_web_worker_readiness(verified_figure_runner)
+    set_web_readiness(lambda: _retrieval_not_ready(state))
+    tasks = [asyncio.create_task(service) for service in (
+        _serve_core_runtime(state), _serve_model_runtime(state), _serve_figure_prompt(state),
+        _serve_figure_runtime(state), warm_fixed_prompts(), _artifact_cleanup_loop())]
     try:
         yield
     finally:
-        if shared_task is not None:
-            shared_task.cancel()
-            await asyncio.gather(shared_task, return_exceptions=True)
-        app.state.turn_queue_consumer.cancel()
-        await asyncio.gather(app.state.turn_queue_consumer, return_exceptions=True)
-        if shared_runtime is not None:
-            from src.shared_corpus.runtime import stop_runtime
-            stop_runtime(shared_runtime)
-        if execution_coordinator_task is not None:
-            execution_coordinator_task.cancel()
-            await asyncio.gather(execution_coordinator_task, return_exceptions=True)
-    try:
-        from src.core import loop_watchdog
-        loop_watchdog.uninstall()
-    except Exception:  # noqa: BLE001
-        pass
-    artifact_cleanup_task.cancel()
-    try:
-        await artifact_cleanup_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        from src.retrieval.multi_retriever import MultiBatchRetriever
-        MultiBatchRetriever().close()
-    except Exception as e:
-        logger.debug(f"[Lifespan] Qdrant close: {e}")
-    # v8.4.4: 清理工具大结果 offload 临时文件（workspace/tmp/，避免累积）
-    try:
-        from src.tools.registry import cleanup_offload_files
-        n = cleanup_offload_files()
-        if n:
-            logger.info(f"[Lifespan] 清理 offload 临时文件 {n} 个")
-    except Exception as e:
-        logger.debug(f"[Lifespan] offload cleanup: {e}")
-    # v8.3.7: 等待在途后台历史写入落库（防关服务丢历史）
-    try:
-        from src.core.background import drain
-        await drain(timeout=5.0)
-    except Exception as e:
-        logger.debug(f"[Lifespan] background drain: {e}")
-    logger.info("[Lifespan] shutdown complete")
+        state.task_stores_ready = False
+        state.core_accepting_requests = False
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        set_web_readiness(None)
+        set_web_worker_readiness(None)
+        set_web_model_evidence(None)
+        del state.core_accepting_requests
+        try:
+            from src.core import loop_watchdog
+            loop_watchdog.uninstall()
+        except Exception:
+            pass
+        if state.rag_runtime is not None:
+            try:
+                await asyncio.wait_for(optional_call("rag-close", state.rag_runtime.close), timeout=5)
+            except Exception as exc:
+                logger.debug("[Lifespan] retrieval close: %s", type(exc).__name__)
+        try:
+            from src.tools.registry import cleanup_offload_files
+            await asyncio.to_thread(cleanup_offload_files)
+        except Exception as exc:
+            logger.debug("[Lifespan] offload cleanup: %s", type(exc).__name__)
+        try:
+            from src.core.background import drain
+            await drain(timeout=5.0)
+        except Exception as exc:
+            logger.debug("[Lifespan] background drain: %s", type(exc).__name__)
+        logger.info("[Lifespan] shutdown complete")
 
 
 # v8.4.5: 版本单源（settings.VERSION）——UI/健康检查/API 元数据共用
@@ -418,6 +494,11 @@ async def account_auth_guard(request: Request, call_next):
         if denied is not None:
             return denied
     path = request.url.path
+    if (getattr(request.app.state, "core_accepting_requests", None) is False
+            and (path in {"/admin", "/figures", "/figure-workbench"} or path.startswith(("/api/", "/jobs/", "/sessions/", "/figures/")))
+            and request.method != "OPTIONS"):
+        return JSONResponse({"detail": {"code": "core_runtime_unavailable"}}, status_code=503,
+                            headers={"Cache-Control": "no-store"})
     if ingress is None and request.method not in {"GET", "HEAD", "OPTIONS"}:
         origin = request.headers.get("origin")
         has_auth_cookie = bool(request.cookies.get("citrus_auth"))
@@ -1929,7 +2010,7 @@ def _load_account_file_references(infos: list[dict], *, frozen_owner: int | None
 @app.get("/api/v2/skills")
 async def available_skills(request: Request):
     current_user(request)
-    from src.agent.skill_adapter import scenario_catalog
+    from src.agent.installed_skills import scenario_catalog
     return JSONResponse({"skills": scenario_catalog()}, headers={"Cache-Control": "no-store"})
 
 
@@ -2184,7 +2265,7 @@ def _turn_segment_phase(job: dict) -> str:
         return ""
 
 
-async def _reconcile_startup_wait(job):
+def _reconcile_startup_wait(job):
     """Classify a crashed wake by its exact protected checkpoint, without a model."""
     from src.agent.checkpoint_store import CheckpointProtectionError
     from src.agent.execution_segments import ExecutionSegments
@@ -2200,14 +2281,17 @@ async def _reconcile_startup_wait(job):
     snapshot = segments.snapshot()
     root = PROJECT_ROOT / "state"
     lease = acquire_account_lease(identity.owner_user_id, expected_epoch=snapshot["account_epoch"])
+    async def read_state(wait):
+        return await run_account_async(lease, load_recovery_state(root, identity,
+            (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()),
+            execution_wait=wait, discover_execution_wait=wait is None))
+
     try:
         with execution_lock(root / "agent_locks", (identity.owner_user_id, identity.session_id)):
             try:
                 wait_ids = json.loads(snapshot["wait_ids"])
                 wait = {"checkpoint_ref": snapshot["checkpoint_ref"], "wait_ids": wait_ids} if wait_ids else None
-                state = await run_account_async(lease, load_recovery_state(root, identity,
-                    (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()),
-                    execution_wait=wait, discover_execution_wait=wait is None))
+                state = asyncio.run(read_state(wait))
                 segments.classify_restart_wait(snapshot, execution_wait=wait or state["agent_recovery_execution_wait"])
             except (ValueError, LookupError, CheckpointProtectionError, TaskConflict):
                 segments.classify_restart_wait(snapshot)
@@ -2244,6 +2328,25 @@ def _retry_terminal_turn_inputs():
         cursor = page[-1]["cleanup_cursor"]
 
 
+def _reconcile_startup_page(turns):
+    from src.core import chat_turn_queue as queue
+
+    for turn in turns:
+        state = turn["state"]
+        if state == queue.CLAIMED and not turn["dispatch_at"]:
+            queue.release_claim(**_turn_fence(turn))
+        elif state in {queue.RUNNING, queue.SETTLING, queue.AWAITING_INPUT, queue.RECONCILE_REQUIRED}:
+            job = _turn_job(turn)
+            phase = _turn_segment_phase(job)
+            if phase in {"parked", "cancel_parked"}:
+                if state == queue.RECONCILE_REQUIRED:
+                    queue.restore_parked_turn(**_turn_fence(turn), job_id=job["job_id"])
+                continue
+            if job and _settle_dispatched_turn(turn, job["job_id"]):
+                continue
+            queue.mark_reconcile_required(**_turn_fence(turn), reason="turn_dispatch_interrupted")
+
+
 async def _reconcile_turn_queue_startup():
     from src.agent.execution_segments import ExecutionSegments
     from src.core import chat_turn_queue as queue
@@ -2252,7 +2355,7 @@ async def _reconcile_turn_queue_startup():
     while candidates := await asyncio.to_thread(ExecutionSegments.candidates, after=after_job, restart_only=True):
         for job in candidates:
             try:
-                await _reconcile_startup_wait(job)
+                await asyncio.to_thread(_reconcile_startup_wait, job)
             except AccountUnavailable:
                 # Closed accounts cannot reopen an execution or expose its checkpoint.
                 continue
@@ -2260,20 +2363,7 @@ async def _reconcile_turn_queue_startup():
     cursor = None
     while True:
         page = await asyncio.to_thread(queue.scan_open_turns, after=cursor)
-        for turn in page["turns"]:
-            state = turn["state"]
-            if state == queue.CLAIMED and not turn["dispatch_at"]:
-                queue.release_claim(**_turn_fence(turn))
-            elif state in {queue.RUNNING, queue.SETTLING, queue.AWAITING_INPUT, queue.RECONCILE_REQUIRED}:
-                job = _turn_job(turn)
-                phase = _turn_segment_phase(job)
-                if phase in {"parked", "cancel_parked"}:
-                    if state == queue.RECONCILE_REQUIRED:
-                        queue.restore_parked_turn(**_turn_fence(turn), job_id=job["job_id"])
-                    continue
-                if job and _settle_dispatched_turn(turn, job["job_id"]):
-                    continue
-                queue.mark_reconcile_required(**_turn_fence(turn), reason="turn_dispatch_interrupted")
+        await asyncio.to_thread(_reconcile_startup_page, page["turns"])
         if not page["has_more"]:
             break
         cursor = page["next_cursor"]
@@ -2290,6 +2380,8 @@ def _turn_queue_health(state, *, now=None):
         reason = "consumer_stopped"
     elif failures:
         reason = "scan_retry"
+    elif health and last_scan is None:
+        reason = "scan_pending"
     elif age is not None and age > 15:
         reason = "scan_stalled"
     else:
@@ -2469,7 +2561,9 @@ async def _dispatch_queued_turn(owner: int, sid: str):
                                             queued_payload_bytes=turn["attachment_bytes"])
                 acquired = True
                 data, refs = await run_account_thread(lease, load_dispatch_input, turn)
-                req = ChatRequest.model_validate(data)
+                from src.agent.installed_skills import stored_release_pin
+                skill_pin = stored_release_pin(data)
+                req = ChatRequest.model_validate({key: value for key, value in data.items() if key not in skill_pin})
                 from src.core.account_leases import current_store
                 if not current_store().check_epoch(owner, lease.epoch):
                     raise AccountUnavailable("account_authorization_changed")
@@ -2498,7 +2592,8 @@ async def _dispatch_queued_turn(owner: int, sid: str):
             dispatched = True
             token = _job_tokens[job_id] = CancelToken()
             worker = await _start_claimed_chat(req, lease, user, sid, job["request_id"], job_id,
-                token, refs, turn["attachment_bytes"], observe=False, capacity_acquired=True)
+                token, refs, turn["attachment_bytes"], observe=False, capacity_acquired=True,
+                skill_release_pin=skill_pin)
             acquired = reserved = False  # Ownership passed to the retained graph task.
         lease.release()
         await asyncio.shield(worker)
@@ -2624,7 +2719,7 @@ async def _start_claimed_chat(req: ChatRequest, request_lease,
                               *, continuation_state: dict | None = None, quota_reserved: bool = True,
                               recovery_state: dict | None = None, recovery_cursor: int = 0,
                               execution_segment_claim=None, observe: bool = True,
-                              capacity_acquired: bool = False):
+                              capacity_acquired: bool = False, skill_release_pin: dict | None = None):
     from src.agent.identity import ExecutionIdentity
     identity = ExecutionIdentity(int(user["user_id"]), sid, rid, job_id)
     if execution_segment_claim is not None and execution_segment_claim.identity != identity:
@@ -2635,7 +2730,7 @@ async def _start_claimed_chat(req: ChatRequest, request_lease,
             continuation_state=continuation_state, quota_reserved=quota_reserved,
             recovery_state=recovery_state, recovery_cursor=recovery_cursor,
             execution_segment_claim=execution_segment_claim, observe=observe,
-            capacity_acquired=capacity_acquired)
+            capacity_acquired=capacity_acquired, skill_release_pin=skill_release_pin)
     except BaseException:
         # Setup can fail before the retained graph task takes ownership. Keep a
         # claimed wake retryable under the original run and budget in that case.
@@ -2660,7 +2755,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                 *, continuation_state: dict | None = None, quota_reserved: bool = True,
                                 recovery_state: dict | None = None, recovery_cursor: int = 0,
                                 execution_segment_claim=None, observe: bool = True,
-                              capacity_acquired: bool = False):
+                              capacity_acquired: bool = False, skill_release_pin: dict | None = None):
     from src.core.account_leases import run_account_async, run_account_thread
     from src.core.cancel import reset_current_token, set_current_token
     from src.core import jobs as jobs_mod
@@ -2792,10 +2887,10 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
         "browse_requested": req.browse_requested,
         "context_compression": bool(req.context_compression),
         "selected_skills": [item.model_dump() for item in req.selected_skills],
+        **(skill_release_pin or {}),
         # Same source as the graph's own budget: a disabled request timeout
         # must not leave a hard-coded ceiling behind in the API layer.
         "request_deadline": request_deadline_from_settings(),
-        "agent_no_prefetch_hints": True,
         "session_id": sid,
         "user_id": int(user["user_id"]),
         "mode": mode,
@@ -3706,14 +3801,11 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                 event_queue.put_nowait(None)
 
         async def run_graph_segment():
-            from src.core import turn_maintenance
-
-            maintenance_offers = []
             # This is the sole retained-handle owner. Parking becomes resumable
             # only after every inner finally and the handle release succeeded.
             cleanup_complete = False
             try:
-                await turn_maintenance.capture(process_with_capacity(), maintenance_offers)
+                await process_with_capacity()
                 cleanup_complete = True
             finally:
                 graph_lease.release()
@@ -3734,9 +3826,6 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                     segments.release_park(segment_claim)
             if queue_turn is not None:
                 _settle_dispatched_turn(queue_turn, job_id)
-                if maintenance_offers:
-                    turn_maintenance.schedule(queue_turn, job_id, callback=maintenance_offers[-1],
-                                              session_lock=_turn_session_lock(sid))
 
         from src.core.chat_turn_queue import find_turn_by_job
         queue_turn = find_turn_by_job(owner_user_id=identity.owner_user_id, session_id=sid, job_id=job_id)
@@ -4909,8 +4998,8 @@ async def health_check():
 def _agent_runtime_readiness():
     from importlib import import_module
     errors = []
-    for name in ("src.agent.harness", "src.agent.post_turn_compaction", "deepagents.backends",
-                 "deepagents.middleware.skills", "src.agent.skill_adapter"):
+    for name in ("src.agent.harness", "langchain.agents.middleware.context_editing", "deepagents.backends",
+                 "deepagents.middleware.skills", "src.agent.installed_skills"):
         try:
             import_module(name)
         except Exception as exc:
@@ -4925,34 +5014,45 @@ def _agent_runtime_readiness():
     return {"ready": not errors, "errors": errors}
 
 
-def _runtime_snapshot():
-    from src.engine.hardware import runtime_readiness
-    models = runtime_readiness()
-    worker = dict(getattr(app.state, "worker_readiness", {"status": "unverified", "verified": False}))
-    if settings.FIGURES_SANDBOX_BACKEND in {"wsl-docker", "apptainer"}:
-        from src.figures.readiness import worker_snapshot
-        worker = worker_snapshot(settings) or {"status": "unverified", "verified": False}
-    return {"models": models, "worker": worker,
-            "stores": bool(getattr(app.state, "task_stores_ready", False)),
-            "retrieval": bool(getattr(app.state, "retrieval_ready", False)),
-            "figure_skill": dict(getattr(app.state, "figure_skill_readiness", {})),
-            "agent": getattr(app.state, "agent_readiness", None) or _agent_runtime_readiness()}
+def _figure_worker_snapshot(state):
+    worker = getattr(state, "worker_readiness", None)
+    if worker is not None:
+        return dict(worker)
+    evidence = getattr(state, "worker_evidence", None)
+    return evidence.read() if evidence is not None else dict(_UNVERIFIED_WORKER)
 
 
-async def _readiness_details(*, snapshot=None, include_code_worker=True):
-    from src.runtime_status import public_readiness
-    if snapshot is None:
-        snapshot = await asyncio.to_thread(_runtime_snapshot)
+def _runtime_snapshot(state):
+    model_evidence = getattr(state, "model_evidence", None)
+    return {"models": model_evidence.read() if model_evidence is not None else dict(_UNVERIFIED_MODELS),
+            "worker": _figure_worker_snapshot(state),
+            "stores": bool(getattr(state, "task_stores_ready", False)),
+            "retrieval": bool(getattr(state, "retrieval_ready", False)),
+            "figure_skill": dict(getattr(state, "figure_skill_readiness", {})),
+            "agent": dict(getattr(state, "agent_readiness", {"ready": False, "errors": []}))}
+
+
+def _readiness_requirements():
+    return {"full": os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1",
+            "worker_required": os.getenv("CITRUS_REQUIRE_FIGURE_WORKER", "0").strip().lower()
+            in {"1", "true", "yes", "on"}}
+
+
+def _readiness_state(state, snapshot):
     status = public_readiness(**snapshot, version=settings.VERSION,
-        model_configured=bool(settings.RESOLVED_MAIN_API_KEY),
-        full=os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1",
-        worker_required=os.getenv("CITRUS_REQUIRE_FIGURE_WORKER", "0").strip().lower() in {"1", "true", "yes", "on"})
-    queue_health = _turn_queue_health(app.state)
+        model_configured=bool(settings.RESOLVED_MAIN_API_KEY), **_readiness_requirements())
+    queue_health = _turn_queue_health(state)
     status["turn_queue"] = queue_health
     status["capabilities"]["turn_queue"] = queue_health
     if not queue_health["ready"]:
         status.update(ready=False, status="unavailable")
         status["capabilities"]["chat"] = {"ready": False, "reason_code": "turn_queue_unavailable"}
+    return status
+
+
+async def _readiness_details(*, snapshot=None, include_code_worker=True, state=None):
+    state = app.state if state is None else state
+    status = _readiness_state(state, _runtime_snapshot(state) if snapshot is None else snapshot)
     if not include_code_worker:
         return status
     code_enabled = os.getenv("CITRUS_CODE_EXECUTION") == "offline-development"
@@ -4971,9 +5071,16 @@ async def _readiness_details(*, snapshot=None, include_code_worker=True):
     return status
 
 
+@app.api_route("/live", methods=["GET", "HEAD"], include_in_schema=False)
+async def liveness_check():
+    return JSONResponse({"live": True}, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/ready", include_in_schema=False)
-async def readiness_check():
-    ready = bool((await _readiness_details(include_code_worker=False))["ready"])
+async def readiness_check(request: Request):
+    state = request.app.state
+    ready = _turn_queue_health(state)["ready"] and required_capabilities_ready(
+        **_runtime_snapshot(state), **_readiness_requirements())
     return JSONResponse({"ready": ready}, status_code=200 if ready else 503,
                         headers={"Cache-Control": "no-store"})
 
@@ -4981,8 +5088,8 @@ async def readiness_check():
 @app.get("/api/v2/admin/runtime")
 async def runtime_diagnostics(request: Request):
     require_admin(request)
-    snapshot = await asyncio.to_thread(_runtime_snapshot)
-    snapshot["readiness"] = await _readiness_details(snapshot=snapshot)
+    snapshot = _runtime_snapshot(request.app.state)
+    snapshot["readiness"] = await _readiness_details(snapshot=snapshot, state=request.app.state)
     return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
 
 
@@ -5712,7 +5819,7 @@ def _is_real_user_question(content: str) -> bool:
 
 
 def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
-                                 files_by_request: dict) -> list[dict]:
+                                 files_by_request: dict | None = None, *, identity_known: bool | None = None) -> list[dict]:
     """Flatten stored LangChain messages into the public history items.
 
     P0-A: every item carries the logical turn key (``turn_request_id``) and
@@ -5735,7 +5842,9 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
     # a request identity; the agent loop's own human-shaped nudges (budget
     # extension, reflection, tool top-up, truncation retry) are written without
     # one. Legacy sessions with no identities at all keep the text rule.
-    identity_known = any(str(item or "") for item in (request_ids or ()))
+    if identity_known is None:
+        identity_known = any(str(item or "") for item in (request_ids or ()))
+    files_by_request = files_by_request or {}
     for _idx, m in enumerate(msgs):
         try:
             message_id = int(row_ids[_idx]) if _idx < len(row_ids) else 0
@@ -5884,8 +5993,20 @@ def _slice_history(items: list[dict], limit: int, before: int = 0) -> tuple[list
     start = max(0, len(seq) - n)
     if seq and start > 0:
         head_key = _history_turn_key(seq[start])
-        while head_key and start > 0 and _history_turn_key(seq[start - 1]) == head_key:
-            start -= 1
+        if head_key:
+            while start > 0 and _history_turn_key(seq[start - 1]) == head_key:
+                start -= 1
+        else:
+            # Old unkeyed turns have a verified user boundary rather than a
+            # request ID. A preface without a user retains bounded row paging.
+            for index in range(start, -1, -1):
+                if _history_turn_key(seq[index]):
+                    break
+                if seq[index].get("role") == "user":
+                    start = index
+                    break
+            while start > 0 and seq[start - 1].get("message_id") == seq[start].get("message_id"):
+                start -= 1
     window = seq[start:]
     has_more = start > 0
     next_before = 0
@@ -6001,7 +6122,7 @@ async def session_messages(session_id: str, request: Request, limit: int = 60,
                            before: int = 0):
     """读取会话历史对话轮 + 上下文快照，供前端刷新/重开恢复渲染。
 
-    返回顺序与库内一致（id 升序）；limit 为对话消息条数上限（默认 200 → 100 轮）。
+    返回顺序与库内一致（id 升序）；limit 默认 60，必要时扩展到完整逻辑轮次。
     v8.4.10: 响应附加 context 快照（与请求期 context_status 事件同构）——
     刷新后上下文概览面板无需等下一次提问即可恢复显示。
     v8.7: user 消息只返回 <user_query> 原文（内部上下文块不显示）。
@@ -6012,7 +6133,8 @@ async def session_messages(session_id: str, request: Request, limit: int = 60,
     user = current_user(request)
     require_owned_session(session_id, user)
     try:
-        msgs, row_ids, request_ids = await session_manager.get_display_history(session_id)
+        window, has_more, next_before, saved_ids = await session_manager.get_display_history_page(
+            session_id, limit, before, render=_history_items_from_messages, slice_items=_slice_history)
     except Exception as exc:
         logger.warning("[API] session history read failed: %s", type(exc).__name__)
         turns = []
@@ -6023,17 +6145,18 @@ async def session_messages(session_id: str, request: Request, limit: int = 60,
                 logger.warning("[API] session task discovery failed: %s", type(jobs_exc).__name__)
         return JSONResponse({"code": "history_unavailable", "session_id": session_id, "turns": turns},
                             status_code=503, headers={"Cache-Control": "no-store"})
+    request_ids = list(dict.fromkeys(item["request_id"] for item in window if item["role"] == "user"))
     try:
         from src.session import files as session_files
         files_by_request = await asyncio.to_thread(
-            session_files.list_turn_files, session_id, int(user["user_id"]), request_ids)
+            session_files.list_turn_files, session_id, int(user["user_id"]), request_ids) if request_ids else {}
     except Exception as exc:
         logger.warning("[session_files] history attachment lookup failed: %s", type(exc).__name__)
         files_by_request = {}
-    out = _history_items_from_messages(msgs, row_ids, request_ids, files_by_request)
-    window, has_more, next_before = _slice_history(out, limit, before)
     from src.core.turn_sources import visible_citation_bubbles
     for item in window:
+        if item["role"] == "user":
+            item["attachments"] = files_by_request.get(item["request_id"], [])
         if item.get("citation_bubbles"):
             item["citation_bubbles"] = await asyncio.to_thread(
                 visible_citation_bubbles, item["citation_bubbles"], user,
@@ -6043,17 +6166,16 @@ async def session_messages(session_id: str, request: Request, limit: int = 60,
     turns = build_history_turns(window)
     turns = await asyncio.to_thread(
         _history_with_jobs, turns, session_id, int(user["user_id"]),
-        saved_request_ids=request_ids, include_pending=not before)
+        saved_request_ids=saved_ids, include_pending=not before)
     durable_turns = {turn["turn_request_id"] for turn in turns if turn.get("job_id")}
     window = [item for item in window if not (item.get("progress") and item.get("turn_request_id") in durable_turns)]
     return {"session_id": session_id, "messages": window, "count": len(window),
             "has_more": has_more, "next_before": next_before,
             "turns": turns,
-            "context": _build_context_snapshot(msgs, session_id,
-                turns[-1].get("context_snapshot") if turns else None)}
+            "context": _build_context_snapshot(session_id, turns[-1].get("context_snapshot") if turns else None)}
 
 
-def _build_context_snapshot(msgs: list, session_id: str = "", persisted: dict | None = None) -> dict:
+def _build_context_snapshot(session_id: str = "", persisted: dict | None = None) -> dict:
     """Restore an observed request, never reconstruct it from saved chat text.
 
     Old sessions have no identified snapshot. Keep that absence explicit rather

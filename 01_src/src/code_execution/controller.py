@@ -261,6 +261,9 @@ class ExecutionController:
                     pass
             if collection_phase == "outputs" and isinstance(exc, OutputRejected):
                 reason = "execution_output_rejected"
+                if exc.missing_paths:
+                    observation["missing_output_paths"] = list(exc.missing_paths)
+                    observation["declared_output_paths"] = list(request.outputs)
             elif collection_phase == "outputs":
                 reason = "execution_output_collection_unconfirmed"
             elif collection_phase == "diagnostics":

@@ -10,7 +10,7 @@ def eager_load_rag():
     from src.retrieval.runtime import get_rag
     t0 = time.perf_counter()
     try:
-        get_rag()  # Validate data capability before importing optional model backends.
+        rag = get_rag(warmup=True)  # Validate data before importing optional model backends.
         logger.info(f"[RAG] MultiBatchRetriever loaded ({time.perf_counter()-t0:.1f}s)")
     except Exception as e:
         logger.error(f"[RAG] MultiBatchRetriever preload failed: {e}")
@@ -37,3 +37,4 @@ def eager_load_rag():
 
     total = time.perf_counter() - t0
     logger.info(f"[RAG] Preload complete ({total:.1f}s)")
+    return rag

@@ -215,7 +215,8 @@ function makeBrowser() {
     navigator: {}, sessionStorage: storage(), localStorage: storage(),
     setTimeout: () => 0, clearTimeout() {}, requestAnimationFrame: () => 0,
     addEventListener() {}, confirm: () => true, alert() {},
-    URL: {createObjectURL: () => 'blob:test', revokeObjectURL() {}},
+    URL: class extends URL { static createObjectURL() { return 'blob:test'; } static revokeObjectURL() {} },
+    URLSearchParams,
     uiIcon() { return '<svg aria-hidden="true"></svg>'; },
     showBanner(message) { context.banners.push(message); },
     banners: []
@@ -618,6 +619,25 @@ test('account library accepts an actual SVG selection and uses image-only previe
   assert.equal(stage.querySelector('svg'), null);
   assert.equal(stage.querySelector('object'), null);
   assert.equal(b.get('sessionFilePreviewDownload').href, file.download_url);
+  const image = stage.querySelector('img');
+  image.naturalWidth = 400;
+  image.naturalHeight = 200;
+  image.parentNode.clientWidth = 240;
+  image.parentNode.clientHeight = 280;
+  image.listeners.load.forEach(handler => handler());
+  stage.querySelector('[aria-label="原始大小 100%"]').click();
+  assert.equal(image.style.width, '400px');
+  assert.equal(image.style.height, '200px');
+  stage.querySelector('[aria-label="放大图片"]').click();
+  assert.equal(image.style.width, '500px');
+  assert.equal(image.style.height, '250px');
+  stage.querySelector('[aria-label="缩小图片"]').click();
+  assert.equal(image.style.width, '400px');
+  stage.querySelector('[aria-label="适应窗口"]').click();
+  assert.equal(image.style.width, '');
+  assert.equal(image.style.height, '');
+  assert.equal(image.getAttribute('src'), file.preview_url);
+
 });
 
 test('real range links target one merged anchor even when the audit sheet name collides', async () => {
@@ -698,4 +718,91 @@ test('pinned deletes preserve the catalog and older GET cannot resurrect a delet
   await old;
   assert.equal(b.get('sessionFilesUploaded').querySelectorAll('.session-file-item').length, 0);
   assert.equal(b.context._selectedAccountFileRefs.length, 0);
+});
+
+
+const importedFigure = 'b'.repeat(32);
+const producerSvg = fileRecord({filename: 'output.svg', mime_type: 'image/svg+xml', kind: 'svg',
+  origin: 'generated', producer_tool: 'code_deliver', sha256: 'c'.repeat(64),
+  source_session_id: 'producer-session', turn_request_id: 'producer-turn'});
+
+function sourceHandoff(file = producerSvg) {
+  return {project: importedFigure, file: file.file_id, sha: file.sha256, account: '17',
+    session: file.source_session_id, turn: file.turn_request_id};
+}
+
+function libraryDocumentAction(browser, button) {
+  assert.ok(button, 'action displayed');
+  browser.document.listeners.click[0]({target: button, preventDefault() {}});
+}
+
+test('generated SVG uses a server-gated import and binds only the exact verified receipt', async () => {
+  const b = makeBrowser();
+  const navigations = [];
+  b.context.location = {pathname: '/', origin: 'https://fixture.invalid', assign: url => navigations.push(url)};
+  b.context.currentAccount = {user_id: 17};
+  const other = fileRecord({file_id: 'e'.repeat(32), filename: 'legacy.svg', kind: 'svg', origin: 'generated',
+    mime_type: 'image/svg+xml', producer_tool: 'not_code', sha256: 'd'.repeat(64),
+    download_url: '/api/v2/files/' + 'e'.repeat(32) + '/download'});
+  let receipt = {origin: 'code_output', editable: true, publication_state: 'ready', figure_id: importedFigure,
+    workbench_url: '/figure-workbench?project=' + importedFigure,
+    original_exports: {'output.svg': {file_id: producerSvg.file_id, sha256: 'f'.repeat(64)}}};
+  b.fetchHandler = (url, opt) => {
+    if (url === '/api/v2/files') return jsonResponse({generated: [producerSvg, other]});
+    assert.equal(url, '/api/v2/figure-workbench/import-svg');
+    assert.equal(opt.method, 'POST');
+    assert.deepEqual(JSON.parse(opt.body), {file_id: producerSvg.file_id, expected_sha256: producerSvg.sha256});
+    return jsonResponse(receipt);
+  };
+  b.document.listeners.DOMContentLoaded[0]();
+  await b.context.loadSessionFiles();
+  const list = b.get('sessionFilesUploaded');
+  const original = list.querySelector('[data-file-id="' + producerSvg.file_id + '"]');
+  assert.equal(original.children[0].classList.contains('session-file-thumb'), true);
+  assert.equal(original.children[2].classList.contains('session-file-actions'), true);
+  assert.equal(list.querySelectorAll('[data-file-act="edit-svg-copy"]').length, 1);
+  const edit = original.querySelector('[data-file-act="edit-svg-copy"]');
+  libraryDocumentAction(b, edit);
+  libraryDocumentAction(b, edit);
+  await flush();
+  assert.equal(b.requests.filter(r => r.options.method === 'POST').length, 1);
+  assert.deepEqual(navigations, []);
+  assert.equal(b.context.sessionStorage.getItem('citrus:figure-source'), null);
+  receipt.original_exports['output.svg'].sha256 = producerSvg.sha256;
+  receipt.workbench_url = '//example.invalid/figure-workbench?project=' + importedFigure;
+  libraryDocumentAction(b, edit);
+  await flush();
+  assert.deepEqual(navigations, []);
+  receipt.workbench_url = '/figure-workbench?project=' + importedFigure;
+  libraryDocumentAction(b, edit);
+  await flush();
+  assert.deepEqual(navigations, [receipt.workbench_url]);
+  assert.deepEqual(JSON.parse(b.context.sessionStorage.getItem('citrus:figure-source')), sourceHandoff());
+});
+
+test('return jumps only to the exact pair revalidated in the current account catalog', async () => {
+  for (const scenario of ['match', 'different account', 'different digest', 'different turn', 'forged query']) {
+    const b = makeBrowser();
+    const jumps = [];
+    const replaces = [];
+    const source = scenario === 'forged query' ? 'e'.repeat(32) : producerSvg.file_id;
+    b.context.location = new URL('https://fixture.invalid/?files=1&source=' + source);
+    b.context.history = {replaceState: (_, __, url) => replaces.push(url.search)};
+    b.context.currentAccount = {user_id: scenario === 'different account' ? 29 : 17};
+    b.get('authGate').hidden = true;
+    b.context.sessionStorage.setItem('citrus:figure-source', JSON.stringify(sourceHandoff()));
+    const current = {...producerSvg};
+    if (scenario === 'different digest') current.sha256 = 'e'.repeat(64);
+    if (scenario === 'different turn') current.turn_request_id = 'other-turn';
+    b.fetchHandler = url => {
+      assert.equal(url, '/api/v2/files');
+      return jsonResponse({generated: [current]});
+    };
+    b.context.jumpToFileTurn = (...pair) => { jumps.push(pair); return true; };
+    b.document.listeners.DOMContentLoaded[0]();
+    await flush();
+    assert.deepEqual(replaces, [''], scenario);
+    assert.deepEqual(jumps, scenario === 'match' ? [['producer-session', 'producer-turn']] : [], scenario);
+    assert.equal(b.get('sessionFilesPanel').hidden, scenario === 'match', scenario);
+  }
 });

@@ -67,8 +67,7 @@ def clear_request_journal() -> None:
 
 
 # ── D-A1: turn scope (session + request id) for the payload recorder ──
-# _call_llm needs to know which session/request a model call belongs to; the
-# graph has neither. Bound by the API layer next to set_request_journal.
+# Bind the request identity for model-attempt recording next to set_request_journal.
 _current_turn_scope: contextvars.ContextVar = contextvars.ContextVar(
     "progress_turn_scope", default=None)
 # A fresh mutable journal is bound once per request. Child asyncio tasks inherit
@@ -500,6 +499,7 @@ def _fields(data: dict, *, tokens=(), numbers=()) -> dict:
 PUBLIC_WORK_NOTES = {
     "agent_prepare": "正在准备本轮上下文",
     "agent_model_wait": "已开始请求模型，正在等待输出",
+    "agent_model_connected": "模型已开始返回数据。答复仍在准备中。",
     "table_processed": "已完成表格处理。",
     "checking_references": "正在核验文献来源。",
     "figure_registered": "图件已登记，可查看或下载。",

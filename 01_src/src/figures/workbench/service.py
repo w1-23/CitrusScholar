@@ -1,8 +1,10 @@
 """Adapt authorized figure revisions into the workbench's group vocabulary."""
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
+
 from citrus_figures.workbench_styles import COLORMAPS
-from src.figures import projects, store
+from src.figures import projects, store, svg_projects
 from src.figures.declarative_snapshot import SnapshotError, load_snapshot
 from src.figures.document import SCHEMA, _digest
 from src.figures.workbench import artifacts, nature_vectors
@@ -11,6 +13,22 @@ from src.figures.workbench.groups import Inventory, invalid
 _OPTIONS = {"fontfamily": "font_families", "fontweight": "font_weights", "fontstyle": "font_styles",
             "horizontalalignment": "horizontalalignment_options", "loc": "legend_loc_options",
             "marker": "marker_options", "linestyle": "linestyle_options"}
+
+
+def _ordinary_svg_editor(project, owner):
+    if project.get("source_kind") != "svg" or nature_vectors.is_plot(project):
+        return None
+    source = project.get("source_json")
+    if not isinstance(source, dict) or not isinstance(source.get("svg"), str):
+        return None
+    try:
+        export = artifacts.read_entry(artifacts.entries(project, owner).get("svg"), owner, "svg")
+        if (export.digest == source.get("svg_sha256") and export.body == source["svg"].encode("utf-8")
+                and svg_projects.editable_svg_targets(source["svg"])):
+            return svg_projects.svg_editor_url(project["figure_id"])
+    except (ET.ParseError, UnicodeError, projects.ProjectError):
+        pass
+    return None
 
 
 def list_assets(owner, *, limit, offset, query="", kind="", chart="", access=""):
@@ -33,14 +51,15 @@ def list_assets(owner, *, limit, offset, query="", kind="", chart="", access="")
             chart_type = ("multipanel" if spec.get("panels") else spec.get("chart")) if isinstance(spec, dict) else None
             if chart and chart != chart_type:
                 continue
-            editable = None
+            editor_url = _ordinary_svg_editor(row, owner) if source_kind == "svg" else None
+            editable = bool(editor_url) if source_kind == "svg" and not nature_vectors.is_plot(row) else None
             if access:
                 if nature_vectors.is_plot(row):
                     try:
                         editable = bool(nature_vectors.detail(row, owner)["groups"])
                     except projects.ProjectError:
                         editable = False
-                else:
+                elif editable is None:
                     _, inventory = _inventory(row, owner)
                     editable = not inventory.disabled and any(group.props for group in inventory.groups.values())
                 if editable != (access == "editable"):
@@ -51,6 +70,7 @@ def list_assets(owner, *, limit, offset, query="", kind="", chart="", access="")
             exports = row.get("exports_json")
             result.append({"figure_id": row["figure_id"], "title": title, "render_version": row["render_version"],
                            "source_kind": source_kind, "chart_type": chart_type, "editable": editable,
+                           **({"editor_url": editor_url} if editor_url else {}),
                            "exports": {fmt: True for fmt in ("svg", "png") if isinstance(exports, dict) and exports.get(fmt)}})
             if len(result) == limit + 1:
                 break
@@ -155,6 +175,9 @@ def detail(figure_id, owner, revision):
     manifest, inventory = _inventory(project, owner)
     capabilities = artifacts.capabilities(project, owner, replayable=not inventory.disabled and bool(project.get("session_id")))
     result = _present(project, manifest, inventory, formats=capabilities)
+    editor_url = _ordinary_svg_editor(project, owner)
+    if editor_url:
+        result.update(editor_url=editor_url, read_only_reason="此 SVG 的对象编辑在独立 SVG 编辑器中。")
     projects._assert_current(project, owner)
     return result
 

@@ -12,7 +12,7 @@ from importlib import import_module
 from src.core.tool_catalog import TOOL_METADATA
 
 _REGISTRY_EXPORTS = frozenset({
-    "register_tool", "get_tool_spec", "PartitionedToolNode", "clear_tool_registry",
+    "register_tool", "get_tool_spec", "clear_tool_registry",
     "get_tools_by_category", "cleanup_offload_files", "get_offload_file_list",
 })
 _LEGACY_EXPORTS = frozenset({

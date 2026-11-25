@@ -113,6 +113,7 @@ var skillPicker = window.CitrusSkillPicker ? window.CitrusSkillPicker.create({
   menu: document.getElementById('skill-picker-menu'), list: document.getElementById('skill-picker-list'),
   status: document.getElementById('skill-picker-status'), summary: document.getElementById('selected-skills'),
   retry: document.getElementById('skill-picker-refresh'), fetch: accountFetch,
+  research: document.getElementById('research-method'), researchStatus: document.getElementById('research-method-status'),
   scope: function () { return currentAccount && sessionId && !accountDocumentRetired ? authEpoch + ':' + sessionId : ''; }
 }) : null;
 function advanceAuthEpoch() {
@@ -1993,7 +1994,7 @@ function displayToolName(name) {
     deepseek_fetch_paper: '获取论文全文',
     local_hybrid_search: '本地检索', local_bm25_search: '本地检索',
     local_dense_search: '本地检索', citrus_rag_search: '本地检索',
-    read_account_file: '查阅资料', update_task_plan: '更新工作计划',
+    read_account_file: '查阅资料', update_task_plan: '更新工作计划', write_todos: '更新工作计划',
     draw_svg: '绘图',
     inspect_uploaded_table: '读取表格', audit_uploaded_table: '数据审查',
     audit_uploaded_data_bundle: '数据审查', audit_uploaded_data: '数据审查',
@@ -2600,22 +2601,6 @@ function mascotSay(name) {
   try { if (window.CitrusMascot) window.CitrusMascot.setState(name); } catch (_) {}
 }
 
-function syncThemePicker() {
-  var current = window.CitrusTheme.current();
-  document.querySelectorAll('[data-theme-pick]').forEach(function (card) {
-    var on = card.getAttribute('data-theme-pick') === current;
-    card.classList.toggle('is-active', on);
-    card.setAttribute('aria-pressed', String(on));
-  });
-}
-if (window.CitrusTheme) {
-  syncThemePicker();
-  window.addEventListener('citrus:themechange', syncThemePicker);
-}
-function pickTheme(name) {
-  if (window.CitrusTheme && window.CitrusTheme.names.indexOf(name) !== -1) window.CitrusTheme.set(name);
-}
-
 /* ─── AbortController for SSE (cancel inflight on new send) ─── */
 var currentAbortController = null;
 var activeTurnCancel = null;
@@ -2923,7 +2908,7 @@ function toggleSidebar() {
   });
 })();
 
-var SIDEBAR_MIN = 218, SIDEBAR_MAX = 480, SIDEBAR_DEFAULT = 248;
+var SIDEBAR_MIN = 218, SIDEBAR_MAX = 480, SIDEBAR_DEFAULT = 280;
 function applySidebarWidth(width, persist) {
   var shell = document.getElementById('mainContainer');
   var value = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, Math.round(width)));
@@ -2945,24 +2930,25 @@ function applySidebarWidth(width, persist) {
   var sidebar = document.getElementById('appSidebar');
   if (!handle || !shell || !sidebar) return;
   var dragging = false, startX = 0, startW = 0;
+  function interfaceScale() { return window.CitrusTheme ? window.CitrusTheme.scale.effective() : 1; }
   handle.addEventListener('pointerdown', function(event) {
     if (event.button !== 0) return;
     dragging = true; startX = event.clientX;
-    startW = sidebar.getBoundingClientRect().width;
+    startW = sidebar.getBoundingClientRect().width / interfaceScale();
     shell.classList.add('sidebar-resizing');
     try { handle.setPointerCapture(event.pointerId); } catch (err) {}
     event.preventDefault();
   });
   handle.addEventListener('pointermove', function(event) {
     if (!dragging) return;
-    applySidebarWidth(startW + (event.clientX - startX), false);
+    applySidebarWidth(startW + (event.clientX - startX) / interfaceScale(), false);
   });
   function finish(event) {
     if (!dragging) return;
     dragging = false;
     shell.classList.remove('sidebar-resizing');
     try { handle.releasePointerCapture(event.pointerId); } catch (err) {}
-    applySidebarWidth(sidebar.getBoundingClientRect().width, true);
+    applySidebarWidth(sidebar.getBoundingClientRect().width / interfaceScale(), true);
     setSidebarVisible(true);
   }
   handle.addEventListener('pointerup', finish);
@@ -2971,7 +2957,7 @@ function applySidebarWidth(width, persist) {
   handle.addEventListener('keydown', function(event) {
     if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return;
     event.preventDefault();
-    var current = sidebar.getBoundingClientRect().width || SIDEBAR_DEFAULT;
+    var current = sidebar.getBoundingClientRect().width / interfaceScale() || SIDEBAR_DEFAULT;
     applySidebarWidth(event.key === 'Home' ? SIDEBAR_DEFAULT : current + (event.key === 'ArrowRight' ? 16 : -16), true);
   });
 })();
@@ -3511,6 +3497,10 @@ function createResearchProcessPanel(goal) {
 /* ─── Chat ─── */
 /* v8.10: 反馈栏默认不随气泡创建（回答生成完成后由 appendFeedback 追加，主流时序）；
    历史恢复的 bot 消息同样不带反馈 */
+function followChatTail(force) {
+  if (window.turnRail && window.turnRail.follow) window.turnRail.follow(force);
+  else chatContainer.scrollTop = chatContainer.scrollHeight;
+}
 function addMessage(role, html, before, fresh) {
   var div = document.createElement('div');
   div.className = 'message ' + role + (fresh ? ' message-enter' : '');
@@ -3519,7 +3509,7 @@ function addMessage(role, html, before, fresh) {
   if (role === 'user') renderAvatarImage(div.querySelector('.avatar'), currentAccount, 'message-avatar-image', '我的头像');
   else renderAgentAvatar(div.querySelector('.avatar'));
   chatContainer.insertBefore(div, before || null);
-  if (fresh && !before) chatContainer.scrollTop = chatContainer.scrollHeight;
+  if (fresh && !before) followChatTail(role === 'user');
   return div.querySelector('.content');
 }
 
@@ -3637,9 +3627,9 @@ async function fetchTurnGeneratedFiles(sid, requestId, producerJobId, artifactId
 
 function syncHistoryTurnFiles() {
   if (!window.loadSessionFiles || !sessionId) return;
-  var epoch = authEpoch, sid = sessionId;
+  var view = captureSessionView(), sid = view.id;
   window.loadSessionFiles().then(function(payload) {
-    if (epoch !== authEpoch || sid !== sessionId || !payload) return;
+    if (!view.owns() || !payload) return;
     chatContainer.querySelectorAll('.content').forEach(function(content) {
       if (!content.closest('.bot') || content.dataset.sessionId !== sid || !content.dataset.requestId) return;
       turnFileScopes(content).forEach(function (producer) {
@@ -4343,7 +4333,8 @@ async function sendMsg(paperVerification) {
           for (var qi = 0; qi < qs.length; qi++) { (function(qt){var c=document.createElement('button');c.className='follow-up-chip';c.textContent=qt;c.onclick=function(){handleSendFollowUp(qt)};cd.appendChild(c)})(qs[qi]); }
           cc.appendChild(cd); answerDiv.appendChild(cc);
         }
-        if (ownsControls()) chatContainer.scrollTop = chatContainer.scrollHeight; renderPending = false;
+        if (ownsControls()) followChatTail(false);
+        renderPending = false;
       });
     }
   }
@@ -5390,11 +5381,11 @@ function highlightTurnNode(node, opts) {
 // to the turn that uploaded/produced it. Returns true only when the anchor was
 // actually found and highlighted (no silent "jumped" claims).
 window.jumpToFileTurn = async function (targetSessionId, requestId) {
-  var epoch = authEpoch;
   if (!targetSessionId || !requestId) return false;
   if (targetSessionId !== sessionId) switchSession(targetSessionId);
+  var view = captureSessionView();
   if (!_historyMsgs.length) await restoreSessionHistory();
-  if (epoch !== authEpoch || targetSessionId !== sessionId) return false;
+  if (!view.owns()) return false;
   var version = historyRestoreVersion;
   function mountedProducer() {
     return Array.prototype.find.call(chatContainer.querySelectorAll('.content'), function (content) {
@@ -5409,7 +5400,7 @@ window.jumpToFileTurn = async function (targetSessionId, requestId) {
   if (!target) {
     // The turn may sit in an older page: walk back a bounded number of pages.
     for (var guard = 0; guard < 8 && _historyHasMore && !target; guard++) {
-      if (!await loadEarlierHistory() || epoch !== authEpoch || targetSessionId !== sessionId || version !== historyRestoreVersion) return false;
+      if (!await loadEarlierHistory() || !view.owns() || version !== historyRestoreVersion) return false;
       if (highlightTurnNode(mountedProducer(), {})) return true;
       for (var j = 0; j < _historyMsgs.length; j++) {
         if (String(_historyMsgs[j].request_id || '') === String(requestId)) { target = _historyMsgs[j]; break; }
@@ -6221,7 +6212,7 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
   syncEarlierHistoryButton();
   syncHistoryTurnFiles();
   // Reading scrollHeight for every restored message forces a layout per row.
-  if (!placement || placement.append) chatContainer.scrollTop = chatContainer.scrollHeight;
+  if (!placement || placement.append) followChatTail(!placement);
 }
 
 /* v8.10: 无会话时自动创建默认会话（主流行为）——打开即有一个会话，历史回答有处可存，

@@ -120,7 +120,7 @@ class DeterministicCheckpointTests(unittest.TestCase):
             reopened = manager.SessionManager()
             loader = ContextManager(session_manager=reopened, memory_store=memory)
             return asyncio.run(loader.load(self.sid, "follow-up", "general_agent",
-                                          user_id=user_id or self.owner, generate_hints=False,
+                                          user_id=user_id or self.owner,
                                           capability_policy=capability_policy))
 
     def test_old_schema_falls_back_and_even_verified_schema_never_replaces_raw_history(self):

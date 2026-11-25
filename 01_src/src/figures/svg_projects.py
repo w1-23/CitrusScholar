@@ -320,7 +320,12 @@ def _reject_security(security: list) -> None:
                            f"SVG 安全检查未通过：{kinds}。", 400)
 
 
-def _links(figure_id: str, revision: int, exports: Any) -> dict[str, Any]:
+def svg_editor_url(figure_id: str, *, plot: bool = False) -> str:
+    route = "/figure-workbench" if plot else "/figures/legacy"
+    return f"{route}?project={figure_id}"
+
+
+def _links(figure_id: str, revision: int, exports: Any, *, plot: bool = False) -> dict[str, Any]:
     entry = exports.get("svg") if isinstance(exports, dict) else None
     file_entry: dict[str, Any] = {}
     if isinstance(entry, dict) and entry.get("file_id"):
@@ -333,7 +338,7 @@ def _links(figure_id: str, revision: int, exports: Any) -> dict[str, Any]:
         "revision": int(revision),
         "file": file_entry,
         "project_api_url": f"/api/v2/figures/projects/{figure_id}",
-        "workbench_url": f"/figures?project={figure_id}",
+        "workbench_url": svg_editor_url(figure_id, plot=plot),
     }
 
 
@@ -452,7 +457,7 @@ def create_svg_project(*, owner: Any, session_id: Any, svg: Any,
         "render_version": revision,
         "svg_sha256": digest,
         "exports": published,
-        "links": _links(figure_id, revision, published),
+        "links": _links(figure_id, revision, published, plot=plot_provenance is not None),
         "initial_receipt_id": receipt.get("receipt_id"),
         "current_receipt_id": receipt.get("receipt_id"),
         "receipt": receipt,
@@ -547,7 +552,7 @@ def apply_svg_project_edits(*, figure_id: Any, owner: Any, edits: Any,
         "render_version": new_revision,
         "svg_sha256": digest,
         "exports": published,
-        "links": _links(figure_id, new_revision, published),
+        "links": _links(figure_id, new_revision, published, plot=plot),
         "changed": [item["target"] for item in normalized],
         "accepted_edits": accepted,
         "svg_targets": editable_svg_targets(new_text, plot=plot),

@@ -186,11 +186,29 @@ def _bool_or(value, name: str, default: bool) -> bool:
     return value
 
 
-def _validated_selected_skills(value) -> list[dict[str, str]]:
-    from src.agent.skill_adapter import validate_scenario_selection
+def _selected_skill_identities(value) -> list[dict[str, str]]:
+    """Check request shape independently of the active release for idempotent replay."""
+    if value is None:
+        return []
+    fields = {"id", "version", "sha256"}
+    if (type(value) is not list or len(value) > 4
+            or any(type(row) is not dict or set(row) != fields
+                   or any(type(row[key]) is not str for key in fields) for row in value)):
+        raise _http(409, "所选技能标识无效，请刷新技能目录后重新选择。", code="skill_selection_changed")
+    return value
+
+
+def _pin_selected_skill_release(selected: list[dict[str, str]]) -> dict[str, str]:
+    from src.agent.installed_skills import active_skills, release_path, release_pin, validate_scenario_selection
+
+    if not selected:
+        return {}
     try:
-        return validate_scenario_selection(value or [])
-    except ValueError as exc:
+        pin = release_pin(release_path())
+        root = pin["native_skill_release"]
+        validate_scenario_selection(selected, catalog=active_skills(Path(root)) if root else [])
+        return pin
+    except (OSError, ValueError, KeyError) as exc:
         raise _http(409, "所选技能已变更或不可用，请刷新技能目录后重新选择。",
                     code="skill_selection_changed") from exc
 
@@ -231,7 +249,7 @@ def _validate_request(*, request, owner_user_id, session_id,
     }
     if _bool_or(request.get("browse_requested"), "browse_requested", False):
         options["browse_requested"] = True
-    selected_skills = _validated_selected_skills(request.get("selected_skills"))
+    selected_skills = _selected_skill_identities(request.get("selected_skills"))
 
     attachments = request.get("attachments") or []
     file_refs = request.get("file_refs") or []
@@ -527,6 +545,7 @@ def admit_turn(*, request: dict, owner_user_id: int, session_id: str,
     if existing is not None:
         return _replay_existing(existing, session_id=session_id, fingerprint=fingerprint)
 
+    skill_pin = _pin_selected_skill_release(req["selected_skills"])
     ref_infos = _resolve_library_refs(file_refs, owner_user_id)
     ref_bytes = sum(int(info.get("size_bytes") or 0) for info in ref_infos)
     if ref_bytes > MAX_LIBRARY_REF_BYTES:
@@ -565,6 +584,7 @@ def admit_turn(*, request: dict, owner_user_id: int, session_id: str,
             "query": req["query"],
             "options": req["options"],
             "selected_skills": req["selected_skills"],
+            **skill_pin,
             "inputs": inputs,
             "attachment_bytes": upload_bytes + ref_bytes,
         }
@@ -706,6 +726,8 @@ def load_dispatch_input(turn: dict) -> tuple[dict, list[dict]]:
             "kind": str(info.get("kind") or ""),
         })
 
+    from src.agent.installed_skills import stored_release_pin
+
     request_dict = {
         "session_id": session_id,
         "query": query,
@@ -716,6 +738,7 @@ def load_dispatch_input(turn: dict) -> tuple[dict, list[dict]]:
         "context_compression": bool(options.get("context_compression", True)),
         "browse_requested": options.get("browse_requested") is True,
         "selected_skills": selected_skills,
+        **stored_release_pin(payload),
         "attachments": [],
         "file_refs": file_ids,
     }

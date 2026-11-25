@@ -88,6 +88,12 @@ def test_edit_real_native_style_preview_save_and_reopen(tmp_path, monkeypatch, b
     assert {row["native_tag"] for row in detail["groups"]} >= {"text", "path" if backend == "python" else "line"}
     text = next(row for row in detail["groups"] if row["native_tag"] == "text")
     assert "n = 6" in text["label"]
+    assert not text["pick_ids"]  # Glyph layout is not approximated.
+    shapes = [item for group in detail["groups"] for item in group["pick_ids"]]
+    assert shapes == [row["gid"] for row in detail["hit_manifest"]["objects"]]
+    assert shapes and all("bbox" not in row for row in detail["hit_manifest"]["objects"])
+    source_ids = {node.get("id") for node in ET.fromstring(normalize_nature_svg(svg, backend)).iter()}
+    assert set(shapes) <= source_ids
     before = client.get(result["preview_url"]).content
     assert b"stroke-linejoin=\"round\"" in before and b"<style" not in before
     if backend == "r":
@@ -257,3 +263,37 @@ def test_actual_owned_uploads_have_truthful_origin(tmp_path, monkeypatch, backen
     assert client.get(detail, params={"revision": 2}).json()["original_exports"] == summary["original_exports"]
     assert library.files[file["file_id"]]["path"].read_bytes() == original
     assert hashlib.sha256(original).hexdigest() == result["original_exports"][name]["sha256"]
+
+
+def test_actual_fixed_r_marginal_paint_pick_and_originals(tmp_path, monkeypatch):
+    fixture = os.environ.get("CITRUS_FIXED_R_MARGINAL")
+    if not fixture:
+        pytest.skip("Genuine fixed R marginal output fixture is not mounted")
+    data = Path(fixture)
+    source = next(data.glob("*.qa.json"))
+    stem = source.name.removesuffix(".qa.json")
+    import json
+    qa = json.loads(source.read_bytes())
+    assert qa["rows_input"] == qa["rows_plotted"] == 60
+    assert qa["excluded_rows"] == qa["excluded_entities"] == 0
+    assert qa["figure_geometry"]["alignment"] == "PASS"
+    originals = {stem + "." + ext: (data / (stem + "." + ext)).read_bytes() for ext in ("svg", "pdf", "tiff")}
+    library = configure(tmp_path, monkeypatch)
+    result, entries = instant_plot(library, "r", stem + ".svg", originals)
+    fid = result["figure_id"]
+    client = TestClient(library.app(monkeypatch))
+    path = f"/api/v2/figure-workbench/projects/{fid}"
+    before = client.get(path).json()
+    assert len(before["groups"]) == 149
+    target = next(group for group in before["groups"] if group["native_tag"] == "circle" and group["pick_ids"])
+    assert target["pick_ids"][0] in {row["gid"] for row in before["hit_manifest"]["objects"]}
+    old_svg = client.get(path + "/preview/svg?revision=1").content
+    reply = client.post(path + "/save", json={"expected_revision": 1,
+        "commands": [{"group_id": target["id"], "property": "facecolor", "value": "#3a7c8f"}]})
+    assert reply.status_code == 200, reply.text
+    after = reply.json()
+    assert after["render_version"] == 2 and after["hit_manifest"] == before["hit_manifest"]
+    assert geometry(old_svg) == geometry(client.get(path + "/preview/svg?revision=2").content)
+    assert after["original_exports"] == before["original_exports"]
+    for name, entry in entries.items():
+        assert library.files[entry["file_id"]]["path"].read_bytes() == originals[name]

@@ -30,8 +30,8 @@
   function create(doc) {
     const el = id => doc.getElementById(id);
     const drawer = el('ctxDrawer'), backdrop = el('ctxBackdrop'), trigger = el('ctxCircleBtn');
-    const close = el('ctxClose'), ringMode = el('ctxViewRing'), gridMode = el('ctxViewGrid');
-    const ring = el('ctxRing'), grid = el('ctxGrid'), headerArc = el('ctxBtnFg'), panelArc = el('ctxPanelFg');
+    const close = el('ctxClose'), bubbleMode = el('ctxViewBubble'), gridMode = el('ctxViewGrid');
+    const bubble = el('ctxBubble'), grid = el('ctxGrid'), headerArc = el('ctxBtnFg'), bubbleFill = el('ctxBubbleFill');
     let current = project(null);
     const cells = Array.from({length: CELL_COUNT}, () => doc.createElement('i'));
     grid.replaceChildren(...cells);
@@ -42,24 +42,26 @@
     function render() {
       const {used, capacity, ratio, state, historical} = current;
       const gridOn = gridMode.checked && ratio != null;
+      const bubbleOn = bubbleMode.checked && ratio != null;
       const percentage = percent(ratio);
       drawer.dataset.level = trigger.dataset.level = state;
-      ring.hidden = gridOn;
+      bubble.hidden = !bubbleOn;
       grid.hidden = !gridOn;
-      gridMode.disabled = ratio == null;
-      if (ratio == null) ringMode.checked = true;
+      gridMode.disabled = bubbleMode.disabled = ratio == null;
       const visibleCells = ratio == null ? 0 : Math.round(Math.min(ratio, 1) * CELL_COUNT);
       cells.forEach((cell, index) => cell.classList.toggle('is-used', index < visibleCells));
-      arc(headerArc, ratio); arc(panelArc, ratio);
-      el('ctxRingPct').textContent = percentage;
+      arc(headerArc, ratio);
+      // Bubble area, not radius, is proportional to the same measured ratio.
+      bubbleFill.setAttribute('r', 54 * Math.sqrt(Math.min(ratio ?? 0, 1)));
+      el('ctxTriggerPct').textContent = percentage;
       el('ctxUsed').textContent = short(used) + (capacity == null ? '' : ' / ' + short(capacity));
       el('ctxUsed').title = used == null ? '' : `${used.toLocaleString()}${capacity == null ? '' : ' / ' + capacity.toLocaleString()} tokens`;
       el('ctxStatus').textContent = {healthy:'健康', warning:'接近容量', critical:'占用较高', unknown:''}[state];
       el('ctxStatus').hidden = state === 'unknown';
       el('ctxValueNote').textContent = used == null ? '占用量暂不可用' : historical ? '历史估算 · 容量未知'
         : capacity == null ? '已用上下文（估算） · 容量未知' : '已用上下文 / 窗口容量（估算）';
-      el('ctxGridPct').textContent = gridOn ? '占用 ' + percentage : '';
-      el('ctxGridPct').hidden = !gridOn;
+      el('ctxGridPct').textContent = ratio == null ? '' : '占用 ' + percentage;
+      el('ctxGridPct').hidden = ratio == null;
       trigger.setAttribute('aria-label', used == null ? '上下文用量' : `上下文已用 ${short(used)}${ratio == null ? '，容量未知' : `，占用 ${percentage}`}`);
       trigger.title = trigger.getAttribute('aria-label');
     }
@@ -71,7 +73,7 @@
       if (focus) (open ? close : trigger).focus({preventScroll: true});
       if (open) render();
     }
-    ringMode.addEventListener('change', render);
+    bubbleMode.addEventListener('change', render);
     gridMode.addEventListener('change', render);
     doc.addEventListener('keydown', event => {
       if (event.key !== 'Escape' || event.defaultPrevented || drawer.inert) return;

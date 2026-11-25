@@ -73,7 +73,47 @@ def run(browser, origin, fixtures):
         native = next(group for group in detail["groups"] if group["native_tag"] == "text")
         vectors = page.get_by_role("treeitem", name="原生矢量对象", exact=True)
         expect(vectors).to_have_attribute("aria-expanded", "false")
-        vectors.locator(":scope > .tree-row > .tree-arrow").click()
+        circles = [group for group in detail["groups"] if group["native_tag"] == "circle" and group["pick_ids"]]
+        if circles:
+            page.locator('[data-ui-scale-pick="150"]').click()
+            page.get_by_label("自定义画布缩放百分比").fill("175")
+            page.get_by_role("button", name="应用画布缩放").click()
+            expect(page.locator("#zoomLevel")).to_have_text("175%")
+            point = page.evaluate('''async ([href, groups, manifest]) => {
+              const svg = new DOMParser().parseFromString(await (await fetch(href)).text(), 'image/svg+xml');
+              const hitScene = new FigureHitScene(svg, manifest, true);
+              const image = document.querySelector('#preview'), canvas = document.querySelector('#canvas');
+              const viewport = canvas.getBoundingClientRect();
+              const [vx,vy,vw,vh] = hitScene.viewBox;
+              for (const group of groups) {
+                const gid = group.pick_ids[0];
+                const primitive = hitScene.primitives.find(item => item.owners.includes(gid));
+                if (!primitive?.bounds) continue;
+                const [x0,y0,x1,y1] = primitive.bounds;
+                const p = primitive.matrix.transformPoint({x:(x0+x1)/2, y:(y0+y1)/2});
+                function point() {
+                  const box = image.getBoundingClientRect();
+                  return {x:box.left+(p.x-vx)*box.width/vw, y:box.top+(p.y-vy)*box.height/vh};
+                }
+                const aim = point();
+                const scale = CitrusTheme.scale.effective();
+                canvas.scrollLeft += (aim.x - (viewport.left+viewport.right)/2) / scale;
+                canvas.scrollTop += (aim.y - (viewport.top+viewport.bottom)/2) / scale;
+                const {x,y} = point();
+                if (document.elementFromPoint(x,y) !== image || hitScene.hits(p,false)[0] !== gid) continue;
+                return {x,y,label:group.label};
+              }
+              throw new Error('Unable to sample a visible authored native circle');
+            }''', [project["preview_url"], circles, detail["hit_manifest"]])
+            page.mouse.click(point["x"], point["y"])
+            expect(page.get_by_role("treeitem", name=point["label"], exact=True)).to_have_attribute("aria-selected", "true")
+            expect(page.locator("#outline")).to_be_visible()
+            expect(page.get_by_role("heading", name=point["label"], exact=True)).to_be_visible()
+            print(f"{primary} exact native circle selection at canvas 175% / UI 150%", flush=True)
+            page.get_by_role("button", name="适合窗口").click()
+
+        if vectors.get_attribute("aria-expanded") == "false":
+            vectors.locator(":scope > .tree-row > .tree-arrow").click()
         page.get_by_role("treeitem", name=native["label"], exact=True).click()
         page.get_by_label("颜色", exact=True).fill("#a11566")
         page.get_by_role("button", name="应用到此组").click()

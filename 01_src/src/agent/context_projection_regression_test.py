@@ -2,13 +2,20 @@
 import asyncio
 import hashlib
 
+import aiosqlite
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.checkpoint.serde.encrypted import EncryptedSerializer
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 
-from src.agent.checkpoint_store import (WORKING_CONTEXT_ARCHIVE_NAMESPACE, checkpoint_scope,
-    native_checkpoint_path, native_checkpoint_scope, open_checkpoint, open_native_checkpoint)
+from src.agent.checkpoint_store import (
+    WORKING_CONTEXT_ARCHIVE_NAMESPACE, _AesGcm, _NativeEncryptedSerializer, _binding,
+    _native_binding, _prepare_database, checkpoint_path, checkpoint_scope, native_checkpoint_path,
+    native_checkpoint_scope,
+)
 from src.agent.context_projection import ArchiveReference, EncryptedContextArchiveReader
 from src.agent.deep_agent_runtime import LEGACY_NATIVE_EXECUTOR_ID
 from src.agent.harness import HarnessState
@@ -30,13 +37,26 @@ def test_archive_opens_without_writing_or_publishing_protocol_state(tmp_path):
         proposal.tool_calls[0].update(_host_logical_key="host:" + "a" * 32, _attempt=1)
         tool = ToolMessage(content="原始证据", name="read_data", tool_call_id="legacy-call",
                            additional_kwargs={"host_preflight_reconciled": {"schema_version": 1}})
-        raw = [HumanMessage("original"), proposal, tool]
+        tag = "__citrus_checkpoint_v1__"
+        raw = [HumanMessage("original"), {tag: "deepseek", "public": proposal.model_dump(),
+            "private": {"scope": list(private.scope), "reasoning": private.reasoning}}, tool]
         config = {"configurable": {**checkpoint_scope(identity, SCOPE),
                                     "checkpoint_ns": WORKING_CONTEXT_ARCHIVE_NAMESPACE}}
         checkpoint = empty_checkpoint()
         checkpoint["channel_values"] = {"messages": raw}
         checkpoint["channel_versions"] = {"messages": 1}
-        async with open_checkpoint(tmp_path, identity, SCOPE) as saver:
+        path, key = _prepare_database(checkpoint_path(tmp_path, identity, SCOPE))
+        async with aiosqlite.connect(str(path)) as connection:
+            binding = _binding(identity, SCOPE)
+            delegate = JsonPlusSerializer(pickle_fallback=False, allowed_json_modules=[], allowed_msgpack_modules=[])
+
+            class ArchiveFixture:
+                def dumps_typed(self, value):
+                    typ, payload = delegate.dumps_typed({"version": 1, "binding": binding, "value": value})
+                    assert typ == "msgpack"
+                    return "citrus-checkpoint-v1", payload
+
+            saver = AsyncSqliteSaver(connection, serde=EncryptedSerializer(_AesGcm(key, binding), ArchiveFixture()))
             saved = await saver.aput(config, checkpoint, {"source": "input", "step": 0}, {"messages": 1})
         reference = ArchiveReference(config["configurable"]["thread_id"], saved["configurable"]["checkpoint_id"], 3)
         reader = EncryptedContextArchiveReader(tmp_path, identity, SCOPE)
@@ -63,7 +83,9 @@ def test_terminal_orphan_admits_only_paired_and_settled_old_thread(tmp_path, mon
         previous_job = jobs.claim_job("session", "previous", owner_user_id=2, client_request_id="previous", payload={})
         previous = ExecutionIdentity(2, "session", "previous", previous_job.job_id)
         next_turn = ExecutionIdentity(2, "session", "new", "new-job")
-        async with open_native_checkpoint(tmp_path, previous, SCOPE) as saver:
+        path, key = _prepare_database(native_checkpoint_path(tmp_path, previous, SCOPE))
+        async with aiosqlite.connect(str(path)) as connection:
+            saver = AsyncSqliteSaver(connection, serde=_NativeEncryptedSerializer(key, _native_binding(previous, SCOPE)))
             old_graph = StateGraph(HarnessState)
             old_graph.add_node("model", lambda state: {})
             old_graph.add_edge(START, "model")

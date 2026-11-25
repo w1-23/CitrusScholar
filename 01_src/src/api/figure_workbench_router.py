@@ -37,17 +37,19 @@ class GroupBatch(BaseModel):
 class ImportSvgRequest(BaseModel):
     model_config = {"extra": "forbid"}
     file_id: str = Field(pattern=r"^[a-f0-9]{32}$", strict=True)
+    expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
 @router.post("/import-svg")
-async def import_uploaded_svg(body: ImportSvgRequest, request: Request):
-    """Opt in to an editable copy of a compatible SVG from the owner's library."""
-    from src.figures.nature_plot_project import import_uploaded_nature_svg
+async def import_svg(body: ImportSvgRequest, request: Request):
+    """Opt in to a copy of a compatible upload or verified generated SVG."""
+    from src.figures.nature_plot_project import import_library_svg
 
     owner = _owner(request)
     with _write_scope(owner) as lease:
         try:
-            result = await run_account_thread(lease, import_uploaded_nature_svg, owner, body.file_id)
+            result = await run_account_thread(lease, import_library_svg, owner, body.file_id,
+                                              expected_sha256=body.expected_sha256)
         except projects.ProjectError as exc:
             return _fail(exc)
     return JSONResponse(result, headers=_HEADERS)

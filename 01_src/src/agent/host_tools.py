@@ -33,11 +33,73 @@ class HostTools:
     published_resolutions: dict[str, str] = field(default_factory=dict)
     pending_result_reads: dict[str, str] = field(default_factory=dict)
     skill_release: Path | None = None
+    turn_skills: "TurnSkills | None" = None
+    # Populated only by the send seam after native context editing and admission.
+    historical_result_offers: set[str] = field(default_factory=set)
+
+    def historical_result_reference(self, message):
+        """Prove exact older inline bytes are available through the existing reader."""
+        from sqlite3 import Error as StorageError
+        from src.core import jobs, tool_results
+        from .installed_skills import is_rqa_tool_result
+
+        if is_rqa_tool_result(message.name, message.content):
+            return None
+        meta = message.additional_kwargs
+        record, ref = meta.get("host_publication"), meta.get("result_reference")
+        if (meta.get("context_trusted") is not True or meta.get("context_origin") != "tool"
+                or meta.get("session_id") != self.identity.session_id
+                or not isinstance(record, dict) or not isinstance(ref, dict)
+                or record.get("tool_call_id") != message.tool_call_id
+                or record.get("status") not in {"complete", "partial", "no_results", "failed", "not_run"}
+                or record.get("reason_code") == "batch_observation_not_stored"
+                or meta.get("operation_uncertain") or meta.get("model_delivery_issue")
+                or not isinstance(message.content, str)):
+            return None
+        artifact = message.artifact if isinstance(message.artifact, dict) else {}
+        if artifact.get("user_question") or artifact.get("_code_execution_id") or any(
+                isinstance(artifact.get(key), dict) and artifact[key].get("status") in
+                {"unknown", "pending", "waiting", "running", "unfinished", "submitted"}
+                for key in ("_tool_outcome", "op_receipt")):
+            return None
+        try:
+            from src.research.result_tools import _shared_result_accessible
+
+            origin = ExecutionIdentity(self.identity.owner_user_id, self.identity.session_id,
+                                       meta["context_turn_id"], meta["run_id"])
+            if origin.turn_key == self.identity.turn_key or origin.run_id == self.identity.run_id:
+                return None
+            key = tool_results.execution_receipt_key(origin, message.tool_call_id)
+            if ref.get("tool_call_id") != key or ref.get("provider_call_id") != message.tool_call_id:
+                return None
+            job = jobs.get_job(origin.run_id)
+            if (not job or job["owner_user_id"] != origin.owner_user_id
+                    or job["session_id"] != origin.session_id or job["request_id"] != origin.user_turn_id
+                    or job["status"] not in jobs.TERMINAL_STATUS - {"awaiting_input"}):
+                return None
+            row = tool_results.fetch_for_current_request(key, strict=True)
+            if (not row or row["tool_call_id"] != key or row["provider_call_id"] != message.tool_call_id
+                    or row["session_id"] != origin.session_id or row["tool_name"] != message.name
+                    or row["request_id"] != (job.get("client_request_id") or origin.user_turn_id)
+                    or ref.get("request_id") != row["request_id"]
+                    or row["status"] != record["status"] or row["result_text"] != message.content
+                    or not row["pinned"] or not tool_results.storage_integrity(row)["complete"]
+                    or ref.get("full_sha256") != row["full_sha256"]
+                    or not _shared_result_accessible(row, message.content, tool_results.fetch_for_current_request,
+                                                     allow_rqa=False)):
+                return None
+        except (ImportError, KeyError, OSError, StorageError, TypeError, ValueError, RecursionError):
+            return None
+        return {"tool_call_id": key, "full_sha256": row["full_sha256"],
+                "original_chars": len(message.content), "execution_status": row["status"]}
 
     def result_readbacks(self):
         """Collect the last committed page for each selection of a clipped result."""
-        eligible = {cid: {} for cid, message in self.messages.items()
-                    if message.additional_kwargs.get("first_delivery_reference") is True}
+        from src.core.tool_results import observation_receipt_key
+
+        eligible = {key: {} for key in self.historical_result_offers}
+        eligible.update({observation_receipt_key(message): {} for message in self.messages.values()
+                         if message.additional_kwargs.get("first_delivery_reference") is True})
         for message in self.messages.values():
             if message.name != "read_tool_result":
                 continue
@@ -234,7 +296,7 @@ class HostTools:
         if identity != self.identity:
             raise ValueError("operation_identity_mismatch")
         self.assert_context()
-        from src.tools.registry import _run_single_tool
+        from src.tools.registry import run_tool_operation
         from src.core.execution_ledger import current_execution_ledger
         from src.core.progress_bus import emit_tool_call_start, emit_tool_executing
         from src.tools.interaction import bind_question_context, reset_question_context
@@ -284,7 +346,7 @@ class HostTools:
             from .code_tools import CODE_TOOL_NAMES, EXECUTION_WAIT_TOOL_NAMES, code_execution_context
             from .fusion_tools import FUSION_TOOL_NAMES, FUSION_WAIT_TOOLS
             from .nature_skill_tools import NATURE_TOOL_NAMES, NATURE_WAIT_TOOLS
-            from .workspace_projection import bind_skill_release
+            from .installed_skills import TurnSkills, bind_turn_skills
             binding = (code_execution_context(identity, call['id'], skill_release=self.skill_release)
                        if call['name'] in (CODE_TOOL_NAMES | FUSION_TOOL_NAMES | NATURE_TOOL_NAMES) or call['name'] == 'audit_uploaded_data'
                        else nullcontext())
@@ -292,8 +354,8 @@ class HostTools:
             if retry_target:
                 from src.tools.browse_web import bind_navigation_retry
                 retry_binding = bind_navigation_retry(retry_target)
-            with binding, retry_binding, bind_skill_release(self.skill_release):
-                message = await _run_single_tool(tool, call, require_durable=True,
+            with binding, retry_binding, bind_turn_skills(self.turn_skills or TurnSkills(self.skill_release)):
+                message = await run_tool_operation(tool, call, require_durable=True,
                                                  on_dispatch=dispatched, retry_of=retry_of or None,
                                                  logical_key=logical_key, attempt=attempt)
         except TaskConflict as exc:
@@ -491,7 +553,10 @@ class HostTools:
 
     def question_context(self):
         working = self.working_state()
+        from .installed_skills import stored_release_pin
+
         return {"query": str(self.state.get("query") or ""),
+            **stored_release_pin(self.state),
             "context_working_state": working,
             **{key: working.get(key, []) for key in ("source_refs", "dataset_refs", "script_refs", "run_refs")},
             "attachment_refs": self.state.get("attachment_refs") or [],

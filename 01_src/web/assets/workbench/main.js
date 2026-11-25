@@ -1,7 +1,8 @@
 import { byId, element } from './dom.js';
 import { renderInspector, renderTree } from './controls.js?v=3';
-import { CanvasView, imageAsset } from './canvas.js?v=3';
-import { initializeLibrary } from './library.js?v=3';
+import { CanvasView, imageAsset } from './canvas.js?v=4';
+import { initializeLibrary } from './library.js?v=4';
+import { legacyEditorUrl, sourceReturnUrl } from './navigation.js?v=1';
 import { categoryValues, displayGroups } from './categories.js?v=1';
 
 const api = '/api/v2/figure-workbench';
@@ -17,7 +18,7 @@ const status = (message, error = false) => {
   byId('status').textContent = message;
   byId('status').dataset.error = String(error);
 };
-const canvas = new CanvasView((id) => selectGroup(id, false, true), (id, x, y) => {
+const canvas = new CanvasView((id) => { showSideTab('objects'); selectGroup(id, false, true); }, (id, x, y) => {
   if (state.saving) return;
   const group = state.groups.find((entry) => entry.id === id);
   if (!group?.properties.includes('offset_px')) return;
@@ -59,6 +60,29 @@ function openDrawer(side, open) {
   sidebar.classList.toggle('open', open);
   button.setAttribute('aria-expanded', String(open));
 }
+
+const sideTabs = [byId('libraryTab'), byId('objectsTab')];
+function showSideTab(tab, focus = false) {
+  for (const button of sideTabs) {
+    const active = button.id === `${tab}Tab`;
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
+    byId(button.getAttribute('aria-controls')).hidden = !active;
+    if (active && focus) button.focus();
+  }
+}
+sideTabs.forEach((button, index) => {
+  button.addEventListener('click', () => showSideTab(index === 0 ? 'library' : 'objects'));
+  button.addEventListener('keydown', (event) => {
+    let next;
+    if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = 1;
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') next = 1 - index;
+    else return;
+    event.preventDefault();
+    showSideTab(next === 0 ? 'library' : 'objects', true);
+  });
+});
 
 function selectGroup(id, focus, reveal) {
   const group = state.groups.find((entry) => entry.id === id);
@@ -103,6 +127,16 @@ function renderToolbar() {
   byId('openLibrary').disabled = saving;
   byId('figureTitle').textContent = project?.title || '未打开图件';
   byId('revision').textContent = project ? `版本 ${project.render_version}${changed() ? ' · 草稿' : ''}` : '';
+  const editor = byId('legacyEditor');
+  const legacy = legacyEditorUrl(project);
+  editor.hidden = !legacy;
+  if (legacy) editor.href = legacy;
+  else editor.removeAttribute('href');
+  const back = byId('returnSession');
+  const source = sourceReturnUrl(project);
+  byId('returnFiles').hidden = !source;
+  back.href = source || '/?files=1';
+  back.textContent = source ? '← 返回来源会话' : '← 返回资料库';
 }
 
 function renderExports() {
@@ -201,7 +235,7 @@ function activate(project, asset, { preserveFocus = false } = {}) {
   state.cursor = 0;
   if (!preserveFocus) state.expanded = new Set();
   if (!preserveFocus || !state.groups.some((group) => group.id === state.selected)) {
-    state.selected = state.groups[0]?.id || null;
+    state.selected = null;
   }
   canvas.show(asset, project, !preserveFocus);
   canvas.focus(state.selected);
@@ -209,7 +243,7 @@ function activate(project, asset, { preserveFocus = false } = {}) {
   renderProperties();
   renderExports();
   renderToolbar();
-  status(project.read_only_reason || project.presentation_note || '请选择对象组。');
+  status(project.read_only_reason || project.presentation_note || '请选择对象或对象组。');
 }
 
 function applyChanges(entries) {
@@ -300,7 +334,7 @@ async function save() {
       state.snapshots = [[]];
       state.cursor = 0;
       state.previewOk = false;
-      byId('frame').hidden = true;
+      byId('canvasSheet').hidden = true;
       byId('canvasEmpty').hidden = false;
       byId('canvasEmpty').querySelector('span').textContent = '请重新打开查看保存的图件。';
       renderGroups();
@@ -362,6 +396,7 @@ const library = initializeLibrary({ request, api, revisionUrl, loadAsset, activa
   switchToken: () => `${state.epoch}:${state.draft}`,
   setStatus: status,
   onOpened: () => {
+    showSideTab('objects');
     if (matchMedia('(max-width: 920px)').matches) openDrawer('left', false);
     byId('canvas').focus({ preventScroll: true });
   },
@@ -370,19 +405,4 @@ const requested = starting.get('figure_id') ?? starting.get('project');
 if (requested !== null) {
   const revision = starting.get('revision');
   library.open({ figure_id: requested, render_version: revision === null ? undefined : /^\d+$/.test(revision) ? Number(revision) : NaN });
-}
-
-const theme = window.CitrusTheme;
-if (theme) {
-  const choice = byId('themeChoice');
-  for (const name of theme.names) {
-    const option = element('option', theme.labels[name]);
-    option.value = name;
-    choice.append(option);
-  }
-  const syncTheme = () => { choice.value = theme.current(); };
-  choice.addEventListener('change', () => theme.set(choice.value));
-  window.addEventListener('citrus:themechange', syncTheme);
-  syncTheme();
-  choice.hidden = false;
 }

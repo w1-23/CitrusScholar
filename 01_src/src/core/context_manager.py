@@ -24,41 +24,14 @@ from src.core.context_budget import ContextBudget, ContextBudgetConfig
 logger = logging.getLogger(__name__)
 
 
-# ── v9.2 P6: supervisor 装配/预算守卫共享收敛 ────────────────────────
-# 原 expert_graph._guard_supervisor_budget 中预算构造（1148-1156）与
-# light_graph supervisor 循环内每轮重建 ContextBudget（228-233）两份同构；
-# LoadedContext 构造与消息装配（System + 历史 + [历史检索证据] + 本轮 human）
-# 也在两图 supervisor 内逐项重复。收敛到此处单一真源，两图行为保持不变。
-
 def build_context_budget():
-    """supervisor 预算守卫构造收敛（expert/light 共用）。
-
-    构造失败 → None（与原两图 try/except 吞错语义一致；None 时守卫跳过）。
-    构造确定性且无状态，light 原"每轮重建"改为一次构造后复用，判定语义不变。
-    """
+    """Configure the history-size estimate exposed by the context UI."""
     try:
+        maximum = settings.CONTEXT_WORKING_MAX_INPUT_TOKENS
         return ContextBudget(ContextBudgetConfig(
-            max_tokens=getattr(settings, "CONTEXT_WORKING_MAX_INPUT_TOKENS", 64000),
-            soft_threshold=(getattr(settings, "CONTEXT_WORKING_SOFT_TOKENS", 48000)
-                            / max(getattr(settings, "CONTEXT_WORKING_MAX_INPUT_TOKENS", 64000), 1)),
-            hard_threshold=1.0,
-            target_ratio=(getattr(settings, "CONTEXT_WORKING_TARGET_TOKENS", 32000)
-                          / max(getattr(settings, "CONTEXT_WORKING_MAX_INPUT_TOKENS", 64000), 1)),
-            protect_recent_turns=settings.CONTEXT_BUDGET_PROTECT_RECENT_TURNS,
-            enabled=settings.CONTEXT_BUDGET_ENABLED,
+            max_tokens=maximum,
+            soft_threshold=settings.CONTEXT_WORKING_SOFT_TOKENS / max(maximum, 1),
         ))
-    except Exception:
-        return None
-
-
-def budget_usage_ratio(budget, messages) -> float | None:
-    """预算占用率 estimate/max_tokens；budget 为 None 或估算异常 → None
-    （调用方按"不触发阈值"处理，与原两图 except 吞错语义一致）。"""
-    if budget is None:
-        return None
-    try:
-        est = budget.estimate_tokens(messages)
-        return est / budget.config.max_tokens
     except Exception:
         return None
 
@@ -137,33 +110,9 @@ def prompt_working_state(working_state) -> dict:
 
 
 class ContextManager:
-    def __init__(
-        self,
-        session_manager=None,
-        memory_store=None,
-        budget: ContextBudget | None = None,
-    ):
+    def __init__(self, session_manager=None, memory_store=None):
         self._session = session_manager
         self._memory = memory_store
-        self._budget = budget
-        # v8.16.3: format_hint 会话级缓存（(session_id, mode) → 非 fallback 格式），
-        # 追问轮直接复用，省一次 fast 调用；上限 256 防会话膨胀
-        self._hint_fmt_cache: dict[tuple, str] = {}
-        # The loader has no compression path. ContextBudget only estimates size.
-
-    def _get_fast_llm(self, thinking_off: bool = False):
-        # v8.17.19: hints 属高频低价值 fast 调用——关思维链经 llm_pool extra_body
-        # 通道（fail-soft 自动去参回退）；旧实测日志 hints_ms 38s 即 v4-flash
-        # 思维链吃掉整个 load 段。失败向下游 except 兜底（fail-soft）。
-        from src.core.llm_pool import get_llm as _pool_get_llm
-        transport = settings.model_transport(fast=True)
-        if not transport.api_key:
-            raise RuntimeError("Fast model credential is not configured for this endpoint")
-        return _pool_get_llm(
-            model=transport.model, api_key=transport.api_key, base_url=transport.base_url,
-            provider_headers=transport.headers, temperature=0, timeout=12,
-            thinking_off=thinking_off,
-        )
 
     async def load(
         self,
@@ -172,7 +121,6 @@ class ContextManager:
         mode: str,
         *,
         user_id: int = 0,
-        generate_hints: bool = True,
         capability_policy=None,
     ) -> LoadedContext:
         ctx = LoadedContext(
@@ -182,9 +130,6 @@ class ContextManager:
             query=query,
         )
 
-        # v8.16.2: load 分段计时（load_done 24s 类问题的第一现场——
-        # DB 读取 / LTM 召回 / hints(2×fast-LLM) 三段占比一眼可辨，
-        # 供 v8.16.2 Phase 3 提速决策使用）
         _t_load = time.perf_counter()
         _t_db0 = time.perf_counter()
 
@@ -255,12 +200,6 @@ class ContextManager:
             logger.warning("[ContextManager] account file catalog unavailable: %s", type(exc).__name__)
 
         _db_ms = (time.perf_counter() - _t_db0) * 1000
-        # v8.16.4: LTM ∥ hints 并行——hints 只依赖 (query, session_id, mode)，
-        # 与 LTM/resident/prefs 无依赖；先调度 hints 协程，LTM 块 await 期间并发推进，
-        # load 总耗时 ≈ db + max(LTM 块, hints) 而非二者之和（预计再省 0.5-0.8s）
-        _t_hints0 = time.perf_counter()
-        hints_task = (asyncio.create_task(self._generate_hints(query, session_id, mode))
-                      if generate_hints else None)
         _t_ltm0 = time.perf_counter()
         if self._memory and (capability_policy is None or not capability_policy.history_key):
             try:
@@ -292,28 +231,9 @@ class ContextManager:
                 logger.debug(f"[ContextManager] preferences skipped: {e}")
 
         _ltm_ms = (time.perf_counter() - _t_ltm0) * 1000
-        if hints_task is not None:
-            try:
-                # Existing expert/light flows keep their optional precomputed hints.
-                suggestions, format_hint = await hints_task
-            except Exception as e:
-                logger.warning(f"[ContextManager] hints parallel await failed: {e}")
-                suggestions, format_hint = [], ""
-        else:
-            suggestions, format_hint = [], ""
-
-        if suggestions:
-            ctx.search_suggestions = suggestions
-        if format_hint:
-            ctx.format_hint = format_hint
-
-        # v8.16.2: 分段耗时落 diag（agent/logs/diag 可查）——load 提速
-        # （Phase 3）的唯一决策依据：db_ms 若 <1s 则"预加载 DB"方案无意义；
-        # hints_ms 若占大头（2×fast-LLM + v4-flash 推理）则合并/关推理/缓存
         try:
             from src.core.diag import diag
             diag("load_stages", db_ms=round(_db_ms, 1), ltm_ms=round(_ltm_ms, 1),
-                 hints_ms=round((time.perf_counter() - _t_hints0) * 1000, 1),
                  total_ms=round((time.perf_counter() - _t_load) * 1000, 1),
                  compacted=bool(ctx.compacted))
         except Exception:
@@ -385,95 +305,6 @@ class ContextManager:
                 additional_kwargs={"context_origin": "working_state", "context_trusted": True}))
         return view_msgs, False
 
-    async def _generate_hints(
-        self, query: str, session_id: str | None = None, mode: str | None = None,
-    ) -> tuple[list[str], str | None]:
-        """v8.16.3: 检索建议 + 格式预判。
-
-        合并为一次 fast 调用（JSON 双键输出）；format_hint 按 (session, mode)
-        缓存——追问轮省去 format 部分（原两条快 LLM 并行链 → 首轮 1 次调用、
-        追问轮 1 次调用）。两条都 fail-soft：异常 → 空建议 / fallback。
-        fallback 不缓存（闲聊/不确定抢锁会话格式会污染后续实质问题的预判）。
-        """
-        async def gen_suggestions() -> list[str]:
-            try:
-                llm = self._get_fast_llm(thinking_off=True)
-                from src.core.task_events import counted_ainvoke
-                resp = await counted_ainvoke(llm, [
-                    SystemMessage(content=(
-                        "Extract 2-3 English search angles (5-15 keywords each) "
-                        "from the user's query. Output a JSON array. "
-                        "If the input is a greeting or chitchat, output []. "
-                        'Format: ["keywords...", "keywords..."]'
-                    )),
-                    HumanMessage(content=query),
-                ], purpose="context_hints", usage_session_id=session_id)
-                import json, re
-                content = resp.content.strip()
-                content = re.sub(r"```\w*\n?", "", content)
-                content = re.sub(r"\n```", "", content)
-                data = json.loads(content)
-                if isinstance(data, list):
-                    return [s for s in data[:3] if s and isinstance(s, str)]
-                return []
-            except Exception as e:
-                logger.debug(f"[ContextManager] suggestions gen failed: {e}")
-                return []
-
-        async def gen_merged() -> tuple[list[str], str | None]:
-            """一次调用同轮输出 suggestions + format（省一条 fast LLM 往返）。"""
-            try:
-                llm = self._get_fast_llm(thinking_off=True)
-                from src.core.task_events import counted_ainvoke
-                resp = await counted_ainvoke(llm, [
-                    SystemMessage(content=(
-                        "From the user's query, extract search angles and "
-                        "classify output format. Output a JSON object with "
-                        "exactly two keys:\n"
-                        '{"suggestions": ["2-3 English search angles (5-15 '
-                        'keywords each)", ...], "format": "one_of"}\n'
-                        "If the input is greeting/chitchat, suggestions must be [].\n"
-                        'format values: "fact" factual query | "compare" comparison | '
-                        '"method" mechanism/pathway | "design" experiment design | '
-                        '"review" paper/review writing | "task" file operations | '
-                        '"fallback" uncertain or chitchat\n'
-                        'Example: {"suggestions": ["citrus HLB integrated control", '
-                        '"vector psyllid management economics"], "format": "method"}'
-                    )),
-                    HumanMessage(content=query),
-                ], purpose="context_hints", usage_session_id=session_id)
-                import json, re
-                content = resp.content.strip()
-                content = re.sub(r"```\w*\n?", "", content)
-                content = re.sub(r"\n```", "", content)
-                data = json.loads(content)
-                if not isinstance(data, dict):
-                    return [], None
-                suggestions_raw = data.get("suggestions", [])
-                suggestions = ([s for s in suggestions_raw[:3]
-                                if isinstance(s, str) and s]
-                               if isinstance(suggestions_raw, list) else [])
-                valid = {"fact", "compare", "method", "design", "review", "task", "fallback"}
-                fmt = str(data.get("format", "")).strip().lower()
-                return suggestions, (fmt if fmt in valid else "fallback")
-            except Exception as e:
-                logger.debug(f"[ContextManager] merged hints gen failed: {e}")
-                return [], None
-
-        cache_key = (session_id, mode) if (session_id and mode) else None
-        cached_fmt = self._hint_fmt_cache.get(cache_key) if cache_key else None
-        if cached_fmt:
-            # 追问轮：format 已缓存 → 只补 suggestons（1 次调用，省 format 段 100%）
-            suggestions = await gen_suggestions()
-            return suggestions, cached_fmt
-
-        suggestions, fmt = await gen_merged()
-        if cache_key and fmt and fmt != "fallback":
-            if len(self._hint_fmt_cache) >= 256:
-                self._hint_fmt_cache.pop(next(iter(self._hint_fmt_cache)))
-            self._hint_fmt_cache[cache_key] = fmt
-        return suggestions, fmt
-
 
 def build_human_message(
     ctx: LoadedContext,
@@ -524,7 +355,7 @@ def build_human_message(
         items = "\n".join(f"- {s}" for s in ctx.search_suggestions[:3])
         blocks.append(
             f"<search_suggestions>\n"
-            f"System-generated search angle suggestions. "
+            f"Available search angle suggestions. "
             f"You may adopt, modify, or ignore them:\n"
             f"{items}\n"
             f"</search_suggestions>"

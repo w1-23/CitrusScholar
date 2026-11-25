@@ -5,8 +5,7 @@ requested page/reference or a bounded search, with the private-store link rules.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
+from .installed_skills import TurnSkills, bind_turn_skills, current_turn_skills
 import hashlib
 import json
 import os
@@ -21,33 +20,15 @@ SOURCE_FILES = frozenset({
     "01_src/src/agent/identity.py", "01_src/src/agent/host_tools.py",
     "01_src/src/agent/workspace_storage.py", "01_src/src/agent/workspace_tools.py",
     "01_src/src/agent/workspace_projection.py", "01_src/src/agent/research_skill_catalog.py",
-    "01_src/src/agent/skill_tools.py", "01_src/src/research/tools.py",
+    "01_src/src/research/tools.py",
     "01_src/src/research/reference_extraction.py", "01_src/src/research/data_audit_rules.py",
     "01_src/src/retrieval/candidate_pool.py", "01_src/src/retrieval/bm25.py",
     "01_src/src/figures/spec.py", "01_src/src/figures/manifest.py",
 })
 ROOTS = ("/input", "/data", "/skills", "/01_src", "/workspace", "/outputs")
-_UNBOUND = object()
-_skill_release = ContextVar("workspace_projection_skill_release", default=_UNBOUND)
-
-
-@contextmanager
 def bind_skill_release(release: Path | None):
-    """Expose the host's authenticated release snapshot to this tool call."""
-    token = _skill_release.set(release)
-    try:
-        yield
-    finally:
-        _skill_release.reset(token)
-
-
-def _projection_release():
-    release = _skill_release.get()
-    if release is _UNBOUND:
-        # Standalone projection callers have no task checkpoint to restore.
-        from .installed_skills import release_path
-        return release_path()
-    return release  # Explicit None must not pick up a newly activated release.
+    """Bind an unselected release for standalone File callers."""
+    return bind_turn_skills(TurnSkills(release))
 
 
 def within(key, scope):
@@ -76,15 +57,14 @@ def bounded_bytes(path: Path, limit: int) -> bytes:
         os.close(fd)
 
 
-def _installed_resources(release, scope):
-    from src.core.capability_policy import allows
-    from .installed_skills import list_installed
+def _installed_resources(view, scope):
+    release = view.release
     from .workspace_storage import MAX_FILE_BYTES, virtual_path
 
     inventory = json.loads(bounded_bytes(release / "inventory.json", MAX_FILE_BYTES * 16))
     if not isinstance(inventory, dict):
         raise ValueError("invalid_skill_inventory")
-    installed = {row["id"]: row for row in list_installed(release) if allows("skill:" + row["id"])}
+    installed = {row["id"]: row for row in view.rows()}
     for name, digest in sorted(inventory.items()):
         mount, _, remainder = name.partition("/")
         skill_id, _, resource = remainder.partition("/")
@@ -117,10 +97,9 @@ def resources(scope):
     if scope != "/" and not scope.startswith("/skills"):
         return
     try:
-        release = _projection_release()
-        if release is not None:
-            yield from _installed_resources(release, scope)
-            return
+        view = current_turn_skills()
+        if view.release is not None:
+            yield from _installed_resources(view, scope)
     except (OSError, ValueError, TypeError, KeyError):
         return
 
@@ -133,10 +112,12 @@ def read(key, descriptor):
             raise PermissionError("workspace_projection_denied")
         root = ROOT
     else:
-        from src.core.capability_policy import allows
-        if not allows("skill:" + descriptor["skill_id"]):
+        view = current_turn_skills()
+        if not any(row["id"] == descriptor["skill_id"]
+                   and row["version"] == descriptor["skill_version"]
+                   and row["sha256"] == descriptor["catalog_sha256"] for row in view.rows()):
             raise PermissionError("skill_disabled")
-        root = _projection_release()
+        root = view.release
         if root is None:
             raise PermissionError("workspace_projection_denied")
     path = root.joinpath(*key[1:].split("/"))

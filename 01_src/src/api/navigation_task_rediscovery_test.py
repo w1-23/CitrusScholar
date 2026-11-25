@@ -197,3 +197,40 @@ def test_missing_or_zero_detach_grace_does_not_schedule_cancellation(monkeypatch
     monkeypatch.setattr(api.asyncio, "create_task", scheduled)
     api._schedule_detach_grace("navigation-task", object())
     scheduled.assert_not_called()
+
+
+def test_clarification_child_reuses_original_server_skill_pin(runtime, tmp_path, monkeypatch):
+    import hashlib
+    import json
+
+    from src.agent.installed_skills import RQA_ID, release_pin, stored_release_pin, task_release
+
+    release = tmp_path / "original-frozen-skill"
+    entry = release / "skills" / RQA_ID / "SKILL.md"
+    entry.parent.mkdir(parents=True)
+    entry.write_text(f"---\nname: {RQA_ID}\ndescription: Original research method.\n---\n")
+    digest = hashlib.sha256(entry.read_bytes()).hexdigest()
+    (release / "inventory.json").write_text(json.dumps({str(entry.relative_to(release)): digest}))
+    entry_id = {"id": RQA_ID, "version": "a" * 40, "sha256": digest}
+    pin = release_pin(release)
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(tmp_path / "active-release-changed"))
+
+    async def scenario():
+        rt = runtime
+        sid = await session(rt, "skill-clarification-session")
+        parent = claim(rt, sid, key="skill-parent")
+        context = {"query": "Fixture question", "selected_skills": [entry_id], **pin}
+        question = user_questions.create_question(parent, owner_user_id=rt.owner, session_id=sid,
+            prompt="Clarify scope", options=[], allow_text=True, context=context)
+        with pytest.raises(user_questions.QuestionConflict, match="question_skill_release_mismatch"):
+            user_questions.save_question_context(parent, dict(context, native_skill_release="/different/release"))
+        user_questions.save_question_context(parent, dict(context))
+        assert jobs.update_job(parent, status="awaiting_input")
+        answered = user_questions.answer_question(parent, question["id"], owner_user_id=rt.owner,
+            session_id=sid, version=1, text="Clarification", client_request_id="skill-answer")
+        child = user_questions.get_continuation(answered["child_job_id"], owner_user_id=rt.owner, session_id=sid)
+        assert child["selected_skills"] == [entry_id]
+        assert task_release({}, resume=False, continuation_pin=stored_release_pin(child["continuation_context"])) == release
+        assert str(release) not in json.dumps(get_history(rt, sid))
+
+    asyncio.run(scenario())

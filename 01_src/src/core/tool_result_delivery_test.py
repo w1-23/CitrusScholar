@@ -17,11 +17,13 @@ from langchain_openai import ChatOpenAI
 from src.agent.execution import ToolExecution
 from src.agent.host_tools import HostTools
 from src.agent.identity import ExecutionIdentity
+from src.agent.framework_test_support import invoke_model_once
 from src.agent.model import ModelDriver
 from src.agent.runtime import AdmissionStopped
 from src.core import jobs, progress_bus, task_events, tool_results, tracing
 from src.core.context_manager import ContextManager
-from src.core.llm_pool import _ObservedDeepSeekChatOpenAI
+from src.core.provider_transport import AsyncDeepSeekTransport
+from langchain_openai import ChatOpenAI
 from src.core.provider_protocol import _DeepSeekMessage, _ProtocolState
 from src.core.request_context import model_request
 from src.core.tool_result_view import FIRST_DELIVERY_BYTES, first_delivery
@@ -147,12 +149,12 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         identity = ExecutionIdentity(7, self.sid, "request", "run")
         model = ChatOpenAI(model="fixture", api_key="fixture", max_retries=0, max_tokens=4096,
                           base_url="http://127.0.0.1:9/v1")
-        driver = ModelDriver(model, FixtureCatalog(), lambda _: {"analyze"})
+        driver = ModelDriver(FixtureCatalog())
         for count in (10, 30):
             with self.subTest(count=count):
                 view = [HumanMessage(content="Analyze synthetic data"),
                         AIMessage(content="", tool_calls=calls[:count]), *messages[:count]]
-                payload, estimate = model_request(model.bind_tools(driver.schemas_for(identity)), view)
+                payload, estimate = model_request(model.bind_tools(driver._schemas_for({"analyze"})), view)
                 self.assertTrue(payload["tools"][0]["function"]["strict"])
                 self.assertEqual(estimate["tool_message_count"], count)
                 self.assertEqual(estimate["output_tokens"], 4096)
@@ -352,14 +354,13 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
             calls.append(request)
             raise AssertionError("hard context cap must block transport")
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected_dispatch)) as transport:
-            model = _ObservedDeepSeekChatOpenAI(model="deepseek-fixture", api_key="fixture",
+        async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(FixtureArchive.provider_scope[0], httpx.MockTransport(unexpected_dispatch))) as transport:
+            model = ChatOpenAI(use_responses_api=False, model="deepseek-fixture", api_key="fixture",
                 base_url=FixtureArchive.provider_scope[0], max_retries=0, max_tokens=4096,
                 http_async_client=transport)
-            driver = ModelDriver(model, FixtureCatalog(), lambda _: {"analyze"})
             with patch.object(settings, "CONTEXT_ACTIVE_MAX_INPUT_TOKENS", 5000):
                 with self.assertRaisesRegex(AdmissionStopped, "context_budget_exhausted:tool_observations") as halted:
-                    await driver(view, identity)
+                    await invoke_model_once(model, FixtureCatalog(), {"analyze"}, view, identity)
         self.assertEqual(calls, [])
         ledger = ExecutionLedger(session_id=self.sid, request_id="request")
         result = await _finish({"query": "Read synthetic evidence"}, identity, ledger, host,
@@ -442,10 +443,9 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "model": model_name, "created": 1, **chunk}) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
             return httpx.Response(200, text=stream, headers={"Content-Type": "text/event-stream"})
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond), trust_env=False) as transport:
-            model = _ObservedDeepSeekChatOpenAI(model=model_name, api_key="fixture", base_url=base,
+        async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(base, httpx.MockTransport(respond)), trust_env=False) as transport:
+            model = ChatOpenAI(use_responses_api=False, model=model_name, api_key="fixture", base_url=base,
                 max_retries=0, max_tokens=4096, stream_usage=True, http_async_client=transport)
-            driver = ModelDriver(model, FixtureCatalog(), lambda _: {"analyze"})
             call = {"name": "analyze", "args": {}, "id": "native-call"}
             raw = oversized_controls()
             observation = ToolMessage(content=raw, tool_call_id=call["id"], name=call["name"],
@@ -461,7 +461,7 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
             native = _DeepSeekMessage(content="", tool_calls=[call],
                                       provider_protocol=_ProtocolState((base, model_name), "synthetic private protocol"))
             messages = (HumanMessage(content="Read the attached data"), native, content)
-            response = await driver(messages, identity)
+            response = await invoke_model_once(model, FixtureCatalog(), {"analyze"}, messages, identity)
             self.assertEqual(response.usage_metadata["total_tokens"], 116)
             self.assertEqual(len(wire_requests), 1)
             wire = wire_requests[0]
@@ -472,7 +472,7 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(self.serialized(wire["messages"][2]["content"]), FIRST_DELIVERY_BYTES)
             oversized = messages + (HumanMessage(content="x" * 700_000),)
             with self.assertRaisesRegex(task_events.TaskConflict, "context_budget_exhausted"):
-                await driver(oversized, identity)
+                await invoke_model_once(model, FixtureCatalog(), {"analyze"}, oversized, identity)
             self.assertEqual(len(wire_requests), 1)
             budget = task_events.projection(claim.job_id)["budget"]
             self.assertEqual((budget["calls"], budget["tokens"]), (1, 116))

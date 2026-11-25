@@ -105,11 +105,10 @@ async def _run(state, identity, ledger):
         from src.core.jobs import bind_native_context_scope
         if not await asyncio.to_thread(bind_native_context_scope, identity, context_scope):
             raise task_events.TaskConflict("recovery_identity_mismatch")
-    from .installed_skills import list_installed, model_directory, task_release
+    from .installed_skills import (RQA_ID, TurnSkills, list_installed, model_directory,
+                                   stored_release_pin, task_release, validate_scenario_selection)
 
-    release = task_release(state, resume=resume)
-    installed_rows = list_installed(release) if release is not None else []
-    skill_root = model_directory(release) if release is not None else None
+    continuation_pin = None
     # A fresh composer request is a new script task, even when the session still
     # carries an older task's assets. Only a durable question child can inherit
     # its parent's scope; same-job recovery restores it from the checkpoint below.
@@ -126,16 +125,20 @@ async def _run(state, identity, ledger):
                 or parent["session_id"] != identity.session_id):
             raise task_events.TaskConflict("script_budget_identity_conflict")
         authorized_question_parent = parent_id
+        continuation_pin = stored_release_pin(continuation["continuation_context"]) or None
+        state["selected_skills"] = continuation["selected_skills"]
         state["script_budget_scope"] = str(
             (continuation.get("context_working_state") or {}).get("script_budget_scope")
             or parent["request_id"])
+    exact_skill_release = continuation_pin if continuation_pin is not None else stored_release_pin(state)
+    release = task_release(state, resume=resume, continuation_pin=continuation_pin)
+    installed_rows = list_installed(release) if release is not None else []
+    skill_root = model_directory(release) if release is not None else None
     deadline = float(state.get("request_deadline") or request_deadline_from_settings())
     figures.begin_request()
     catalog = build_preset_catalog()
     from .context_tools import register_context_reader
     register_context_reader(catalog)
-    from .plan_tools import register_plan_tools, PLAN_TOOL_NAMES
-    register_plan_tools(catalog)
     from .workspace_tools import register_workspace_tools, WORKSPACE_TOOL_NAMES
     register_workspace_tools(catalog)
     from .code_tools import register_code_tools, CODE_TOOL_NAMES
@@ -197,7 +200,6 @@ async def _run(state, identity, ledger):
             from src.graph.tool_availability import retrieval_tool_names
             host.allowed_names.difference_update(retrieval_tool_names())
         host.allowed_names.update(WORKSPACE_TOOL_NAMES)
-        host.allowed_names.update(PLAN_TOOL_NAMES)
         if external_release or external_required:
             # Old analyzers are reachable only by exact historical releases.
             host.allowed_names.difference_update(REPLACED_TOOLS)
@@ -224,7 +226,6 @@ async def _run(state, identity, ledger):
         tracing.set_request_authorizations(executor_authorizations(current_query), note_target=explicit_note_target(current_query))
         return set(host.allowed_names)
     refresh_allowed()
-    from .skill_adapter import validate_scenario_selection
     # Host readiness remains independent of method loading; new generic tools
     # registered by the application must not inherit a scientific allowlist.
     loaded = build_loaded_context(state, mode="general_agent", format_hint=state.get("format_hint"))
@@ -238,6 +239,10 @@ async def _run(state, identity, ledger):
         selected_metadata = []
         human.content = str(human.content) + "\n所选历史技能不是当前场景发行物；可继续使用其他已授权能力，不得声称已加载该方法。"
     selected_metadata = [row for row in selected_metadata if policy.allows("skill:" + row["id"])]
+    if not exact_skill_release.get("native_skill_release") and any(row["id"] == RQA_ID for row in selected_metadata):
+        selected_metadata = [row for row in selected_metadata if row["id"] != RQA_ID]
+        human.content = str(human.content) + "\n不能核验本轮所选科研问答技能的原始发行物；可继续用已授权工具。"
+    host.turn_skills = TurnSkills.from_selection(release, selected_metadata)
     pinned_skills = [row["id"] for row in selected_metadata]
     human.additional_kwargs.update(identity.message_metadata("user"), user_text=str(state.get("query") or ""),
         attachment_refs=state.get("attachment_refs") or [], selected_skills=selected_metadata)
@@ -253,7 +258,7 @@ async def _run(state, identity, ledger):
                 for image in images if image.get("url")]
         else:
             human.content = str(human.content) + "\n当前主模型不支持图片输入；不可声称已看到原图。"
-    prompt = await asyncio.to_thread(system_prompt, host.allowed_names, native_skills=True)
+    prompt = await asyncio.to_thread(system_prompt, host.allowed_names)
     prompt += ("\nFile 是基础能力。按任务需要自主列举、搜索、读取已授权输入，在当前会话工作区创建或编辑中间文件。"
                "不依赖所选 Skill、任务类型或逐次确认。读取已有文件版本后再编辑；不要修改输入原件。")
     if external_required and not (host.allowed_names & FUSION_TOOL_NAMES):
@@ -269,16 +274,14 @@ async def _run(state, identity, ledger):
     if host.allowed_names & NATURE_TOOL_NAMES:
         prompt += ("\n使用已安装上游 Nature Skill。固定模板可用 run_nature_plot 然后 collect_nature_plot。"
                    "以实收产物和工作台编辑能力为准。用户明确要求 R 而当前 Worker 不支持时，说明限制，不替换成 Python。")
-    local_families = ()
-    registry = None
+    if RQA_ID in pinned_skills:
+        prompt += "\n用户本轮选择了 research-question-answering，请按已挂载的 Skill 方法判断证据是否足够。"
     if "local_hybrid_search" in host.allowed_names:
         try:
             from src.retrieval.corpus_registry import load_corpus_registry
-            registry = load_corpus_registry()
-            local_families = tuple(registry.family_ids)
-            prompt += "\n已登记的本地资料类别（选择工具时使用真实family id）：\n" + registry.describe_families()
-        except Exception:
-            prompt += "\n本地资料类别目录暂不可用；不得猜测family id。"
+            prompt += "\n已登记的本地资料类别（选择工具时使用真实 family id）：\n" + load_corpus_registry().describe_families()
+        except (OSError, ValueError, ImportError):
+            prompt += "\n本地资料类别目录暂不可用；不得猜测 family id。"
     # Keep the brief public introduction after the internal tool directories.
     intro_capabilities = [description for names, description in (
         ({"browse_web"}, "浏览公开网页"),
@@ -293,6 +296,24 @@ async def _run(state, identity, ledger):
                "资料库类别或追问。可以参考这样的长度和用词：" + intro_example + "。")
     messages, trace_start = assemble_supervisor_messages(prompt, state, human)
     messages = ops._sanitize_history_tool_protocol(messages)
+    import re
+    history = messages
+    query = str(state.get("query") or "")
+    # Only authenticated human text may ground a follow-up topic.
+    earlier = [str(m.additional_kwargs.get("user_text") or m.content) for m in history
+               if isinstance(m, HumanMessage)
+               and m.additional_kwargs.get("context_origin") == "user"
+               and m.additional_kwargs.get("context_trusted") is True
+               and m.additional_kwargs.get("run_id") != identity.run_id]
+    previous_report_query = earlier[-1] if earlier else ""
+    audit_topic = re.compile(r"审查|核验|科研诚信|造假|造价|重复(?:区段|区块|数据)|\b(?:integrity|audit|verification)\b", re.I)
+    report_history_verified = (bool(audit_topic.search(query)) or any(audit_topic.search(text) for text in earlier[-3:])
+        or any(isinstance(m, ToolMessage) and m.name in {"collect_external_skill", "resolve_external_report"}
+               for m in history[-60:]))
+    if report_followup():
+        read_only = "resolve_external_report" in refresh_allowed()
+        prompt += ("\n请用 resolve_external_report 读取已接受的审查报告，按真实检查范围答复。"
+                   if read_only else "\n现有审查报告无法读取。说明限制，不得推断位置或重做。")
     messages = messages[1:]
     trace_start -= 1
     if not transport.api_key:
@@ -302,8 +323,7 @@ async def _run(state, identity, ledger):
         max_tokens=settings.MAX_TOKENS, timeout=_model_timeout())
     # Provisional answers are not streamed as accepted answers. The final
     # accepted bytes are published once, then passed to session_save unchanged.
-    model_allowed = set()
-    driver = ModelDriver(model, catalog, lambda _: set(model_allowed),
+    driver = ModelDriver(catalog,
         max_output_tokens=getattr(settings, "AGENT_MAX_OUTPUT_TOKENS", 16384))
 
     from src.retrieval.turn_dedup import RetrievalLedger
@@ -344,8 +364,7 @@ async def _run(state, identity, ledger):
             "budget": {"max_output_tokens": settings.MAX_TOKENS,
                        "working_max_input_tokens": settings.CONTEXT_WORKING_MAX_INPUT_TOKENS,
                        "working_soft_tokens": settings.CONTEXT_WORKING_SOFT_TOKENS},
-            "retrieval": {"candidate_prefetch": bool(settings.CANDIDATE_PREFETCH_ENABLED and policy.allows("local_rag")),
-                          "rrf_k": settings.RRF_K, "candidate_window": settings.CANDIDATE_WINDOW,
+            "retrieval": {"rrf_k": settings.RRF_K, "candidate_window": settings.CANDIDATE_WINDOW,
                           "top_k_vector": settings.TOP_K_VECTOR, "query_cache": bool(settings.RAG_CACHE_ENABLED)},
             "skill_runtime": runtime_provenance(),
         }
@@ -370,8 +389,7 @@ async def _run(state, identity, ledger):
                 "records": host.records,
                 "main_results": host.main_results, "web_results": host.web_results,
                 "pending_question": host.pending_question,
-                "messages": list(host.messages.values()), "dispatched": host.dispatched,
-                "model_output_tokens": getattr(driver, "output_tokens", None)}
+                "messages": list(host.messages.values()), "dispatched": host.dispatched}
 
     def restore_host(saved):
         nonlocal update_version, original_request_state, trace_start, requirements, previous_report_query, report_history_verified
@@ -431,8 +449,6 @@ async def _run(state, identity, ledger):
         host.pending_question = saved.get("pending_question")
         host.messages = {m.tool_call_id: m for m in saved.get("messages", [])}
         host.dispatched = dict(saved.get("dispatched", {}))
-        driver.output_tokens = max(int(getattr(driver, "output_tokens", 0) or 0),
-                                   int(saved.get("model_output_tokens") or 0)) or None
         tracing.set_original_query(state["query"])
         refresh_allowed()
 
@@ -448,7 +464,6 @@ async def _run(state, identity, ledger):
         if is_cancelled():
             raise asyncio.CancelledError()
         host.assert_context()
-        _epoch.get().working_state = host.working_state()
 
     async def prepare(_):
         nonlocal update_version, requirements
@@ -533,43 +548,6 @@ async def _run(state, identity, ledger):
                          "pending_question": execution.pending_question,
                          "execution_waits": list(execution.execution_waits)}
 
-    async def seed_retrieval(history):
-        nonlocal previous_report_query, report_history_verified
-        import hashlib
-        import re
-        from src.graph.retrieval_router import attachment_processing_only, plan_retrieval, topic_for_retrieval
-        query = str(state.get("query") or "")
-        # Only authenticated human text may ground a follow-up topic.
-        earlier = [str(m.additional_kwargs.get("user_text") or m.content) for m in history
-                   if isinstance(m, HumanMessage)
-                   and m.additional_kwargs.get("context_origin") == "user"
-                   and m.additional_kwargs.get("context_trusted") is True
-                   and m.additional_kwargs.get("run_id") != identity.run_id]
-        previous_report_query = earlier[-1] if earlier else ""
-        audit_topic = re.compile(r"审查|核验|科研诚信|造假|造价|重复(?:区段|区块|数据)|\b(?:integrity|audit|verification)\b", re.I)
-        report_history_verified = (bool(audit_topic.search(query)) or any(audit_topic.search(text) for text in earlier[-3:])
-            or any(isinstance(m, ToolMessage) and m.name in {"collect_external_skill", "resolve_external_report"}
-                   for m in history[-60:]))
-        if report_followup() and "resolve_external_report" in refresh_allowed():
-            return [{"name": "resolve_external_report", "args": {"findings_offset": 0},
-                     "id": "citrus_report_" + hashlib.sha256(identity.run_id.encode()).hexdigest()[:24],
-                     "type": "tool_call"}], ("本轮先读取已接受的审查报告。按真实检查范围答复；"
-                                             "如证据不可用或报告有多个，请明确说明，不得推断位置或重做。")
-        topic = topic_for_retrieval(query, earlier)
-        matching = tuple(registry.matching_families(topic)) if topic and registry else ()
-        plan = plan_retrieval(query, allowed_names=refresh_allowed(), recent_user_queries=earlier,
-                              local_families=matching or local_families, records=host.records,
-                              local_corpus_match=bool(matching),
-                              attachment_only=attachment_processing_only(query, has_source=bool(state.get("attachment_refs") or tables),
-                                                                          browse_requested=state.get("browse_requested") is True))
-        seed_names = {"local_hybrid_search", "deepseek_search"}
-        if any(call["name"] not in seed_names or catalog.execution_mode(call["name"]) != "parallel"
-               for call in plan.calls):
-            raise ValueError("invalid_retrieval_seed_plan")
-        return [dict(call, id="citrus_retrieval_" + hashlib.sha256(
-                f"{identity.run_id}:{call['name']}".encode()).hexdigest()[:24], type="tool_call")
-                for call in plan.calls], plan.guidance
-
     async def check_final(answer, history, _, *, allow_delivery_gaps=False):
         notes = await prepare(identity)
         if notes:
@@ -585,12 +563,11 @@ async def _run(state, identity, ledger):
             emit_progress('browse_phase', {'phase': 'organizing'})
         public_answer = statement.answer
         if settings.RESEARCH_ROUTE_NOTICE_ENABLED:
-            from .research_routes import explicitly_requests_both_sources, research_route_gate
-            if explicitly_requests_both_sources(state["query"]):
-                route_gate = research_route_gate(host.records, host.allowed_names, explicit=True)
-                if route_gate.notice and route_gate.notice not in public_answer:
-                    public_answer += "\n\n" + route_gate.notice
-                    statement = statement.model_copy(update={"answer": public_answer})
+            from .research_routes import dual_source_notice
+            notice = dual_source_notice(state["query"], host.records)
+            if notice and notice not in public_answer:
+                public_answer += "\n\n" + notice
+                statement = statement.model_copy(update={"answer": public_answer})
         delivery_gaps, artifact_contract = [], None
         if requirements:
             from src.core.task_result import effective_tool_records
@@ -753,16 +730,15 @@ async def _run(state, identity, ledger):
 
     announced_model_request = False
 
-    async def metered_model(history, current_identity, *, native_schemas=()):
+    async def metered_model(request, handler, current_identity, host_tools):
         nonlocal announced_model_request
-        # One schema snapshot for both the send-view estimate and ModelDriver.
-        model_allowed.clear()
-        model_allowed.update(refresh_allowed())
+        model_allowed = set(refresh_allowed())
+        historical_readback = (host if "read_tool_result" in model_allowed
+            and policy.allows("summarization") and state.get("context_compression") is not False else None)
         if not host.has_result_readback():
             model_allowed.discard("read_tool_result")
         # before_model's host_state watermark is already synchronously committed.
         task_events.acknowledge_updates(identity.run_id, update_version)
-        view = history
         if not announced_model_request:
             emit_public_progress("", category="agent_model_wait",
                                  note_id=f"{identity.run_id}:first-model", job_id=identity.run_id)
@@ -770,8 +746,13 @@ async def _run(state, identity, ledger):
         from src.core.public_progress import PublicAnswerPreview
         preview = PublicAnswerPreview() if not requirements and not host.messages and not resume else None
         try:
-            return await driver(view, current_identity, native_schemas=native_schemas,
-                                on_delta=preview.append if preview is not None else None)
+            from .installed_skills import project_rqa_history
+            history = project_rqa_history(request.messages, current_identity, host.turn_skills,
+                                          parent_run_id=authorized_question_parent)
+            return await driver(request.override(messages=list(history)), handler, current_identity,
+                                allowed=model_allowed, host_tools=host_tools,
+                                on_delta=preview.append if preview is not None else None,
+                                historical_readback=historical_readback)
         finally:
             if preview is not None:
                 preview.clear()
@@ -788,25 +769,10 @@ async def _run(state, identity, ledger):
                 retrieval_ledger.settle(message.name, call["args"], message.tool_call_id,
                                         status=record.get("status", ""), reason=record.get("reason", ""))
 
-    def working_view(messages, context):
-        if context is None or not policy.allows("summarization"):
-            return None
-        from .post_turn_compaction import select_working_messages
-        return select_working_messages(messages, context)
-
     def validate_resume():
         host.assert_context()
         for message in host.messages.values():
             host.validate_observation(message)
-
-    def seed_message(proposal, metadata):
-        if uses_deepseek_protocol(provider_scope[1], provider_scope[0]):
-            from src.core.provider_protocol import _DeepSeekMessage, _ProtocolState
-            # The planner emitted no reasoning. Retain an empty protocol field
-            # so DeepSeek receives a complete paired tool turn, not invented thought.
-            return _DeepSeekMessage(content="", tool_calls=proposal, additional_kwargs=metadata,
-                                    provider_protocol=_ProtocolState((provider_scope[0].rstrip("/"), provider_scope[1]), ""))
-        return AIMessage(content="", tool_calls=proposal, additional_kwargs=metadata)
 
     # Construct the storage-backed boundary only when Harness actually wakes a
     # suspended execution. Ordinary requests do not need workspace/account stores.
@@ -829,17 +795,40 @@ async def _run(state, identity, ledger):
     async def check_final_after_followup(answer, history, identity):
         return await check_final(answer, history, identity, allow_delivery_gaps=True)
 
-    runtime = HarnessRuntime(metered_model, execute, admit, check_final,
+    parked_execution = None
+
+    def verify_parked_snapshot(snapshot, result):
+        from .execution_outcome import validate_execution_suspension
+        from .runtime import _pending_calls
+        nonlocal parked_execution
+        values = snapshot.values
+        signals = list((values.get("operation_signals") or {}).values())
+        wake = values.get("execution_wake") or []
+        pending_waits = list(dict.fromkeys(wait for item in signals for wait in item.get("execution_waits", ())))
+        waits = wake or pending_waits
+        if ((values.get("host_state") or {}).get("identity") != asdict(identity)
+                or values.get("active_run_id") != identity.run_id
+                or waits != list(result.execution_waits) or (wake and pending_waits)
+                or any(item.get("uncertain") for item in signals)
+                or host.pending_question or result.unknown_operations or result.pending_tool_calls
+                or _pending_calls(values.get("messages", ()))):
+            raise ValueError("execution_suspension_checkpoint_invalid")
+        reference = snapshot.config.get("configurable", {}).get("checkpoint_id")
+        parked_execution = validate_execution_suspension({"identity": asdict(identity),
+            "checkpoint_ref": reference, "wait_ids": waits}, identity)
+
+    runtime = HarnessRuntime(model, execute, admit, check_final,
         RunLimits(max_model_steps=settings.AGENT_MAX_MODEL_CALLS, deadline=deadline),
         schemas=catalog.schemas({row["name"] for row in catalog.describe()}),
         on_event=event, checkpoint=checkpoint, prepare=prepare,
         export_host=export_host, restore_host=restore_host, validate_resume=validate_resume,
         recover_output=True, resolve_execution_waits=resolve_execution_waits,
-        acknowledge_execution_waits=acknowledge_execution_waits, record_rejected=rejected,
+        acknowledge_execution_waits=acknowledge_execution_waits, validate_parked_snapshot=verify_parked_snapshot,
+        record_rejected=rejected,
         check_final_after_followup=check_final_after_followup, tool_mode=catalog.execution_mode,
         not_run=not_run, check_terminal_orphan=lambda values: is_terminal_orphan(identity, values),
-        seed_plan=seed_retrieval, seed_message=seed_message, working_view=working_view,
-        restore_tool_observation=restore_tool_observation, authorized_question_parent=authorized_question_parent)
+        restore_tool_observation=restore_tool_observation, authorized_question_parent=authorized_question_parent,
+        model_call=metered_model)
     checkpoint_options = {"context_scope": context_scope}
     checkpoint_config = framework_checkpoint_scope(identity, provider_scope, **checkpoint_options)
     try:
@@ -853,29 +842,11 @@ async def _run(state, identity, ledger):
             async with open_framework_checkpoint(state_root, identity, provider_scope, **checkpoint_options) as saver:
                 result = await runtime.run(identity, messages, saver=saver, resume=resume,
                     checkpoint_config=checkpoint_config, agent_options={"skill_root": skill_root,
-                        "system_prompt": prompt, "capability_policy": policy}, pinned_skills=pinned_skills)
+                        "system_prompt": prompt, "capability_policy": policy, "turn_skills": host.turn_skills}, pinned_skills=pinned_skills)
                 if result.status == "suspended" and result.reason == "execution_pending":
-                    from .execution_outcome import validate_execution_suspension
-                    from .runtime import _pending_calls
-                    committed = await saver.aget_tuple({"configurable": checkpoint_config})
-                    values = committed.checkpoint["channel_values"] if committed else {}
-                    signals = list((values.get("operation_signals") or {}).values())
-                    wake = values.get("execution_wake") or []
-                    pending_waits = list(dict.fromkeys(wait for item in signals for wait in item.get("execution_waits", ())))
-                    waits = wake or pending_waits
-                    if ((values.get("host_state") or {}).get("identity") != asdict(identity)
-                            or values.get("active_run_id") != identity.run_id
-                            or waits != list(result.execution_waits) or (wake and pending_waits)
-                            or any(item.get("uncertain") for item in signals)
-                            or host.pending_question or result.unknown_operations
-                            or result.pending_tool_calls or _pending_calls(result.messages)):
+                    if parked_execution is None:
                         raise ValueError("execution_suspension_checkpoint_invalid")
-                    reference = committed.config["configurable"]["checkpoint_id"]
-                    if committed.checkpoint["id"] != reference:
-                        raise ValueError("execution_suspension_checkpoint_invalid")
-                    suspension = validate_execution_suspension({"identity": asdict(identity),
-                        "checkpoint_ref": reference, "wait_ids": waits}, identity)
-                    return {"job_id": identity.run_id, "execution_suspension": suspension}
+                    return {"job_id": identity.run_id, "execution_suspension": parked_execution}
     except Exception as exc:
         # Never restart the loop or retry a possibly dispatched operation here.
         # Log frame locations, never exception text/locals that can contain
@@ -907,13 +878,8 @@ async def _run(state, identity, ledger):
     trace_start = next((index for index, message in enumerate(result.messages)
         if message.additional_kwargs.get("context_origin") == "user"
         and message.additional_kwargs.get("run_id") == identity.run_id), len(result.messages))
-    delivery = await _finish(state, identity, ledger, host, result, trace_start, started,
-                             final_review=final_review)
-    if result.status == "complete" and delivery.get("turn_outcome", {}).get("status") in {"complete", "partial"}:
-        if policy.allows("summarization") and state.get("context_compression") is not False:
-            from src.core.turn_maintenance import offer
-            offer(_maintenance_offer(state_root, identity, provider_scope, context_scope))
-    return delivery
+    return await _finish(state, identity, ledger, host, result, trace_start, started,
+                         final_review=final_review)
 
 
 def _same_audit_target(original, replacement):
@@ -993,11 +959,20 @@ def _same_repair_target(rejected, corrected, *, records=()):
 
 def _settled_trace(messages, host, result):
     """Keep actual call IDs and observed outcomes when stopping mid-batch."""
+    from .plan_tools import NATIVE_PLAN_TOOL
+
     by_id = {m.tool_call_id: m for m in messages if isinstance(m, ToolMessage)}
     trace = []
     for message in messages:
         if isinstance(message, ToolMessage):
             continue  # paired immediately after its issuing assistant below
+        if isinstance(message, AIMessage) and any(call["name"] == NATIVE_PLAN_TOOL for call in message.tool_calls):
+            calls = [call for call in message.tool_calls if call["name"] != NATIVE_PLAN_TOOL]
+            if not calls:
+                continue
+            # Private todo entry text belongs only to the live checkpoint.
+            extra = {key: value for key, value in message.additional_kwargs.items() if key != "tool_calls"}
+            message = message.model_copy(update={"tool_calls": calls, "additional_kwargs": extra})
         trace.append(message)
         if not isinstance(message, AIMessage):
             continue
@@ -1191,35 +1166,3 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
             "model_steps": result.model_steps, "task_result": task_result.as_dict(),
             "artifact_delivery": delivery,
             "summary": f"{result.model_steps} model steps; {result.reason}"}}
-
-
-def _maintenance_offer(root, identity, provider_scope, context_scope):
-    """Bind identities only. No request savers, resources or chat budget survive."""
-    async def maintenance(session_lock, is_busy):
-        from src.config import settings
-        from src.core.llm_pool import get_llm
-        from .deep_agent_runtime import metered_maintenance_model
-        from .harness import open_terminal_graph
-        from .post_turn_compaction import compact_post_turn
-
-        base, model_name = provider_scope
-        current = settings.model_transport()
-        if not current.api_key or (base, model_name) != (current.base_url, current.model):
-            return "ineligible"
-        transport = get_llm(model_name, current.api_key, base, provider_headers=current.headers, temperature=0,
-                            timeout=25, max_tokens=min(2048, settings.AGENT_FINAL_OUTPUT_TOKENS))
-        trigger = min(settings.CONTEXT_WORKING_SOFT_TOKENS,
-                      settings.CONTEXT_CHECKPOINT_MAX_TOKENS - 2048)
-        keep = min(settings.CONTEXT_WORKING_TARGET_TOKENS, trigger - 256)
-        async with open_terminal_graph(root, identity, provider_scope, context_scope=context_scope) as (graph, config, check_committed):
-            try:
-                async with asyncio.timeout(25):
-                    return await compact_post_turn(graph, config,
-                        summary_model=metered_maintenance_model(transport, identity),
-                        trigger_tokens=trigger, keep_tokens=keep, session_lock=session_lock,
-                        is_busy=is_busy, expected_run_id=identity.run_id, check_committed=check_committed,
-                        execution_guard=lambda: execution_lock(root / "agent_locks",
-                            (identity.owner_user_id, identity.session_id)))
-            except TimeoutError:
-                return "failed"
-    return maintenance

@@ -4,6 +4,7 @@ from langchain_core.messages import AIMessage, HumanMessage, add_notification_me
 
 from src.agent.checkpoint_store import framework_checkpoint_scope, open_framework_checkpoint
 from src.agent.harness import HarnessRuntime
+from src.agent.framework_test_support import ScriptedModel
 from src.agent.identity import ExecutionIdentity
 from src.agent.runtime import FinalCheck, RunLimits
 from src.core.provider_protocol import current_tool_loop_start
@@ -19,7 +20,7 @@ def test_installed_skill_selection_uses_active_release_entries(tmp_path, monkeyp
     import pytest
 
     from src.agent.installed_skills import list_installed, model_directory
-    from src.agent.skill_adapter import scenario_catalog, validate_scenario_selection
+    from src.agent.installed_skills import scenario_catalog, validate_scenario_selection
 
     active = tmp_path / "first-release"
     entry = active / "skills" / "additional-method" / "SKILL.md"
@@ -97,7 +98,7 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
 
     async def model(history, identity, *, native_schemas):
         histories.append(history)
-        assert {entry["function"]["name"] for entry in native_schemas} == {"read_file", "ls", "glob", "grep"}
+        assert {entry["function"]["name"] for entry in native_schemas} == {"read_file", "ls", "glob", "grep", "write_todos"}
         if len(histories) == 1:
             assert any("Read-only demo" in str(message.content) for message in history)
             return AIMessage(content="", tool_calls=[{"id": "read-1", "name": "read_file",
@@ -124,7 +125,7 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
         events.append(value)
 
     request = {}
-    runtime = HarnessRuntime(model, unexpected_dispatch, admit, accept, RunLimits(), [],
+    runtime = HarnessRuntime(ScriptedModel(script=model), unexpected_dispatch, admit, accept, RunLimits(), [],
                              on_event=capture_event,
                              export_host=lambda: {"original_request_state": dict(request)})
     provider = ("https://example.test", "example-model")
@@ -189,7 +190,7 @@ def test_native_thread_accepts_new_turn_after_cancelling_model(tmp_path):
         async def accept(*args):
             return FinalCheck()
 
-        runtime = HarnessRuntime(model, None, lambda *args: None, accept, RunLimits(), [],
+        runtime = HarnessRuntime(ScriptedModel(script=model), None, lambda *args: None, accept, RunLimits(), [],
                                  check_terminal_orphan=lambda _: asyncio.sleep(0, result=True))
         provider = ("https://example.test", "fixture")
         for index, (job_id, status) in enumerate((("cancelled", "cancelled"), ("next", "complete"))):
@@ -238,7 +239,7 @@ def test_native_experiment_scope_discards_prior_context_and_summary(tmp_path, mo
         async def accept(*args):
             return FinalCheck()
 
-        runtime = HarnessRuntime(model, None, lambda *args: None, accept, RunLimits(), [],
+        runtime = HarnessRuntime(ScriptedModel(script=model), None, lambda *args: None, accept, RunLimits(), [],
                                  export_host=lambda: {"original_request_state": dict(request)})
         local_history = [message for index in range(42) for message in (
             HumanMessage(f"question {index} " + "context-value " * 180),
@@ -293,28 +294,26 @@ def test_native_encryption_rejects_cross_account_and_tampering():
         first.loads_typed((kind, ciphertext[:-1] + bytes([ciphertext[-1] ^ 1])))
 
 
-def test_retired_skills_are_only_readable_by_historical_execution(tmp_path, monkeypatch):
+def test_retired_skills_do_not_leak_into_current_method_interfaces(tmp_path, monkeypatch):
     import hashlib
     import json
     import pytest
 
     from src.agent import research_skill_catalog
-    from src.agent.skill_adapter import SkillSession, scenario_catalog, validate_scenario_selection
-    from src.agent.workspace_projection import resources
+    from src.agent.installed_skills import scenario_catalog, validate_scenario_selection
+    from src.agent.workspace_projection import read, resources
+    from src.agent.installed_skills import (TurnSkills, bind_turn_skills, release_pin, task_release)
+    from src.agent.deep_agent_runtime import ScopedSkillBackend
+    from src.core.capability_policy import CapabilityPolicy, bind_policy
     from src.research import workspace_tools
 
     legacy = dict(zip(('id', 'version', 'sha256'),
                       ('candidate-search', *research_skill_catalog.PINNED['candidate-search'])))
-    identity = ExecutionIdentity(1, 'skill-test-session', 'skill-test-turn', 'skill-test-run')
     monkeypatch.delenv('CITRUS_SKILL_RELEASE', raising=False)
     assert scenario_catalog() == []
     assert list(resources('/skills')) == []
     assert not (research_skill_catalog.ROOT / 'skills').exists()
     assert not (research_skill_catalog.ROOT / '01_src/src/prompts/skills').exists()
-    with pytest.raises(ValueError, match='selected_skill_identity_mismatch'):
-        SkillSession(identity, set).page(legacy['id'], legacy['version'], legacy['sha256'])
-    archive = SkillSession(identity, set, allow_archived=True)
-    assert archive.page(legacy['id'], legacy['version'], legacy['sha256'])['page']['text']
 
     new_id = 'research-question-answering'
     entry = f'skills/{new_id}/SKILL.md'
@@ -331,63 +330,83 @@ def test_retired_skills_are_only_readable_by_historical_execution(tmp_path, monk
         validate_scenario_selection([legacy])
     monkeypatch.setattr(workspace_tools, '_identity', lambda: (1, 'skill-test-session'))
     call = workspace_tools.research_workspace.func
-    assert [row['id'] for row in call(operation='skills')[1]['skills']] == [new_id]
-    assert call(operation='read_skill', skill_id='candidate-search')[1]['error'] == 'skill_resource_unavailable'
-    assert call(operation='read_skill', skill_id=new_id)[1]['entrypoint']['text'] == content.decode()
-    assert call(operation='read_skill_resource', skill_id=new_id, resource='unlisted.md')[1]['error'] == 'skill_resource_unavailable'
+    assert call(operation="skills")[1]["skills"] == []
+    assert call(operation="read_skill", skill_id=new_id)[1]["error"] == "skill_resource_unavailable"
+    assert not list(resources("/skills/" + new_id))
+    policy = CapabilityPolicy()
+    sdk = ScopedSkillBackend(tmp_path / "skills", policy)
+    assert sdk.read("/" + entry.removeprefix("skills/")).error
+    selected = validate_scenario_selection([{key: scenario_catalog()[0][key]
+        for key in ("id", "version", "sha256")}])
+    with pytest.raises(ValueError, match="selected_skill_identity_mismatch"):
+        validate_scenario_selection([dict(selected[0], sha256="0" * 64)])
+    pin = release_pin(tmp_path)
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(tmp_path / "unrelated"))
+    assert task_release(dict(pin), resume=True) == tmp_path
+    assert task_release({}, resume=False, continuation_pin=pin) == tmp_path
+    view = TurnSkills.from_selection(tmp_path, selected)
+    with bind_turn_skills(view):
+        assert [row["id"] for row in call(operation="skills")[1]["skills"]] == [new_id]
+        assert call(operation="read_skill", skill_id=new_id)[1]["entrypoint"]["text"] == content.decode()
+        assert call(operation="read_skill_resource", skill_id=new_id, resource="unlisted.md")[1]["error"] == "skill_resource_unavailable"
+        key, descriptor = next(resources("/" + entry))
+        assert read(key, descriptor)[0] == content.decode()
+        sdk = ScopedSkillBackend(tmp_path / "skills", policy, view)
+        assert sdk.read("/" + entry.removeprefix("skills/")).error is None
+    with bind_turn_skills(TurnSkills(tmp_path)):
+        with pytest.raises(PermissionError, match="skill_disabled"):
+            read(key, descriptor)
+        assert not list(resources("/skills/" + new_id))
+    revoked = CapabilityPolicy(revoked=("skill:" + new_id,))
+    with bind_policy(revoked), bind_turn_skills(view):
+        assert not list(resources("/skills/" + new_id))
+        assert call(operation="skills")[1]["skills"] == []
+        assert ScopedSkillBackend(tmp_path / "skills", revoked, view).read("/" + entry.removeprefix("skills/")).error
 
 
-def test_framework_seed_uses_parallel_toolnode_without_charging_model_steps(tmp_path):
+def test_framework_waits_for_model_and_uses_only_the_selected_source():
     async def scenario():
         from langchain_core.messages import ToolMessage
-        from src.core.provider_protocol import _DeepSeekMessage, _ProtocolState
-        from src.agent.recovery import _checkpoint_reader
+        from langgraph.checkpoint.memory import InMemorySaver
 
-        i = ExecutionIdentity(1, "s", "t", "j")
-        provider = ("https://api.deepseek.com/v1", "deepseek-fixture")
-        admitted = asyncio.Event()
-        entered, model_calls = set(), []
+        identity = ExecutionIdentity(1, "session-fixture", "turn-fixture", "run-fixture")
         names = {"local_hybrid_search", "deepseek_search"}
-        proposal = [{"name": name, "id": name, "args": {}} for name in sorted(names)]
-
-        async def seed(history):
-            return proposal, "Read only."
+        sequence = []
 
         async def execute(call, _):
-            entered.add(call["name"])
-            if entered == names:
-                admitted.set()
-            await asyncio.wait_for(admitted.wait(), timeout=2)
-            return ToolMessage("real observation", name=call["name"], tool_call_id=call["id"]), {}
+            sequence.append(call["name"])
+            return ToolMessage("observed evidence", name=call["name"], tool_call_id=call["id"]), {}
 
         async def model(history, _, **kwargs):
-            model_calls.append(history)
-            assert {m.tool_call_id for m in history if isinstance(m, ToolMessage)} == names
-            assert any(m.content == "Read only." for m in history)
-            assert any(isinstance(m, _DeepSeekMessage) and m.provider_protocol.reasoning == ""
-                       for m in history)
+            sequence.append("model")
+            if not any(isinstance(message, ToolMessage) for message in history):
+                return AIMessage("", tool_calls=[{"name": "deepseek_search", "id": "web-first", "args": {}}])
             return AIMessage("answered")
 
-        async def accept(*args):
+        async def accept(*_):
             return FinalCheck()
 
         schemas = [{"function": {"name": name, "description": name, "parameters": {"type": "object"}}}
                    for name in names]
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(1), schemas,
-            seed_plan=seed, seed_message=lambda proposal, metadata: _DeepSeekMessage(
-                "", tool_calls=proposal, additional_kwargs=metadata,
-                provider_protocol=_ProtocolState(provider, "")))
-        async with open_framework_checkpoint(tmp_path, i, provider) as saver:
-            config = framework_checkpoint_scope(i, provider)
-            result = await runtime.run(i, [HumanMessage("request", additional_kwargs=i.message_metadata("user"))],
-                                       saver=saver, checkpoint_config=config)
-            snapshot = await _checkpoint_reader(saver).aget_state({"configurable": config})
-            stored = next(m for m in snapshot.values["messages"] if isinstance(m, _DeepSeekMessage))
-            assert stored.provider_protocol.reasoning == ""
-        assert result.status == "complete" and result.model_steps == len(model_calls) == 1
-        assert entered == names
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(2), schemas)
+        result = await runtime.run(identity, [HumanMessage("rwp基因如何调控胚性")], saver=InMemorySaver())
+        assert result.status == "complete" and result.model_steps == 2
+        assert sequence == ["model", "deepseek_search", "model"]
 
     asyncio.run(scenario())
+
+
+def test_legacy_synthetic_tool_call_must_already_be_paired():
+    from langchain_core.messages import ToolMessage
+    from src.agent.harness import _unsettled_legacy_seed
+
+    call = {"name": "local_hybrid_search", "id": "legacy", "args": {}}
+    synthetic = AIMessage("", tool_calls=[call], additional_kwargs={"citrus_retrieval_seed": True})
+    paired = ToolMessage("stored observation", tool_call_id="legacy")
+    assert _unsettled_legacy_seed({"seed_proposal": [call]})
+    assert _unsettled_legacy_seed({"messages": [synthetic]})
+    assert not _unsettled_legacy_seed({"messages": [synthetic, paired], "seed_proposal": [call]})
+    assert not _unsettled_legacy_seed({"messages": [AIMessage("", tool_calls=[call])]})
 
 
 @pytest.mark.parametrize("resume_mode", ["normal", "expired", "ack_crash"])
@@ -437,7 +456,7 @@ def test_framework_interrupt_parks_after_pair_and_reopens_without_redispatch(tmp
 
         schemas = [{"function": {"name": proposal["name"], "description": "Fixture",
                                  "parameters": {"type": "object"}}}]
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas,
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(), schemas,
             export_host=lambda: {"original_request_state": original, "identity": asdict(i)},
             resolve_execution_waits=resolve, acknowledge_execution_waits=acknowledge)
         config = framework_checkpoint_scope(i, provider)
@@ -498,7 +517,7 @@ def test_unknown_operation_never_executes_sibling_or_next_turn():
 
         schemas = [{"function": {"name": "write_fixture", "description": "Fixture",
                                  "parameters": {"type": "object"}}}]
-        runtime = HarnessRuntime(model, operation, lambda *_: None, not_final, RunLimits(), schemas,
+        runtime = HarnessRuntime(ScriptedModel(script=model), operation, lambda *_: None, not_final, RunLimits(), schemas,
                                  tool_mode=lambda _: "sequential")
         saver = InMemorySaver()
         config = {"thread_id": "same-session"}
@@ -541,7 +560,7 @@ def test_only_authenticated_answered_question_child_can_start_new_turn():
 
         schemas = [{"function": {"name": question["name"], "description": "Fixture question",
                                  "parameters": {"type": "object"}}}]
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas)
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(), schemas)
         saver = InMemorySaver()
         config = {"thread_id": "same-session"}
         assert (await runtime.run(parent, [HumanMessage("request")], saver=saver,
@@ -606,7 +625,7 @@ def test_framework_recovers_retained_receipt_without_running_tool_twice(tmp_path
             return FinalCheck()
 
         schemas = [{"function": {"name": proposal["name"], "description": "Fixture", "parameters": {"type": "object"}}}]
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas,
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(), schemas,
             export_host=lambda: {"identity": asdict(identity), "original_request_state": original},
             restore_host=lambda _: None,
             restore_tool_observation=lambda message, call: restored.append((message.tool_call_id, call["id"])))
@@ -660,7 +679,7 @@ def test_quarantined_head_cannot_replay_pending_tool_into_new_turn():
             return "quarantined"
 
         schemas = [{"function": {"name": proposal["name"], "description": "Fixture", "parameters": {"type": "object"}}}]
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas,
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(), schemas,
                                  check_terminal_orphan=quarantined)
         saver = InMemorySaver()
         config = {"thread_id": "session"}
@@ -698,7 +717,7 @@ def test_protected_reviewed_answer_is_delivered_without_model_when_deadline_elap
         async def execute(*_):
             pytest.fail("A reviewed-answer recovery cannot invoke tools")
 
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), (),
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(), (),
             export_host=lambda: {"identity": asdict(identity), "original_request_state": original})
         config = framework_checkpoint_scope(identity, provider)
         async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
@@ -712,5 +731,109 @@ def test_protected_reviewed_answer_is_delivered_without_model_when_deadline_elap
             result = await runtime.run(identity, [], saver=saver, checkpoint_config=config, resume=True)
         assert result.status == "complete" and result.answer.content == "already accepted"
         assert model_calls == [True]
+
+    asyncio.run(scenario())
+
+
+def test_rqa_method_projection_retains_tool_pairing_and_nonmethod_evidence(tmp_path):
+    import json
+    from langchain_core.messages import ToolMessage
+
+    from src.agent.installed_skills import RQA_ID, TurnSkills, project_rqa_history
+    from src.research.result_tools import _shared_result_accessible
+
+    parent = ExecutionIdentity(3, "scope-session", "parent-turn", "parent-run")
+    current = ExecutionIdentity(3, "scope-session", "natural-turn", "natural-run")
+    selected = TurnSkills.from_selection(tmp_path, [{"id": RQA_ID, "version": "a" * 40, "sha256": "f" * 64}])
+    call_data = [("sdk", "read_file", {"file_path": f"/skills/{RQA_ID}/references/host-capabilities.md"}),
+                 ("file", "workspace_read", {"path": f"/skills/{RQA_ID}/SKILL.md"}),
+                 ("workspace", "research_workspace", {"operation": "read_skill_resource", "skill_id": RQA_ID}),
+                 ("evidence", "deepseek_search", {"query": "fixture public question"}),
+                 ("readback", "read_tool_result", {"tool_call_id": "receipt-workspace"})]
+    request = AIMessage("", tool_calls=[{"name": name, "id": cid, "args": args} for cid, name, args in call_data])
+    observations = [ToolMessage("prior method" if cid != "readback" else json.dumps({
+        "tool_name": "research_workspace", "tool_result_ref": {"tool_call_id": "receipt-workspace"},
+        "result_text": "prior method page"}), tool_call_id=cid, name=name,
+        artifact={"result": "prior method bytes"}, additional_kwargs={**parent.message_metadata("tool"),
+        "result_reference": {"tool_call_id": "receipt-" + cid}}) for cid, name, _ in call_data]
+    original = tuple([request, *observations])
+    outgoing = project_rqa_history(original, current, TurnSkills(tmp_path))
+    assert outgoing[0] is request
+    assert [item.tool_call_id for item in outgoing[1:]] == [item.tool_call_id for item in observations]
+    assert outgoing[4] is observations[3]  # real public evidence remains as-is
+    assert all(item.artifact is None and not item.additional_kwargs for item in (*outgoing[1:4], outgoing[5]))
+    assert "prior method" in original[1].content and original[1].artifact
+    assert project_rqa_history(original, current, selected, parent_run_id=parent.run_id) == original
+    assert project_rqa_history(original, current, selected)[1].content == outgoing[1].content
+    row = {"tool_name": "research_workspace", "result_text": json.dumps({"text": "legacy method page"}),
+           "args_json": json.dumps({"operation": "read_skill_resource", "skill_id": RQA_ID})}
+    pointer = {"tool_name": "read_tool_result"}
+    outer = json.dumps({"tool_result_ref": {"tool_call_id": "receipt-workspace"}})
+    fetch = lambda *_a, **_kw: row
+    assert _shared_result_accessible(pointer, outer, fetch)
+    assert not _shared_result_accessible(pointer, outer, fetch, allow_rqa=False)
+
+
+def test_selected_sdk_method_is_available_but_does_not_carry_to_fresh_turn(tmp_path):
+    import hashlib
+    import json
+    from langchain_core.messages import ToolMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from src.agent.installed_skills import RQA_ID, TurnSkills, project_rqa_history
+    from src.core.capability_policy import CapabilityPolicy
+
+    entry = tmp_path / "skills" / RQA_ID / "SKILL.md"
+    entry.parent.mkdir(parents=True)
+    raw = f"---\nname: {RQA_ID}\ndescription: Exact method specimen.\n---\nScope specimen 9651.\n"
+    entry.write_text(raw)
+    version = "a" * 40
+    sha = hashlib.sha256(raw.encode()).hexdigest()
+    (tmp_path / "release.json").write_text(json.dumps({RQA_ID: version}))
+    (tmp_path / "inventory.json").write_text(json.dumps({str(entry.relative_to(tmp_path)): sha}))
+    selected = TurnSkills.from_selection(tmp_path, [{"id": RQA_ID, "version": version, "sha256": sha}])
+    unselected = TurnSkills(tmp_path)
+
+    async def scenario():
+        parent = ExecutionIdentity(1, "thread", "first", "selected")
+        current = ExecutionIdentity(1, "thread", "second", "unselected")
+        saver = InMemorySaver()
+        histories = []
+
+        async def model(history, identity, **_):
+            view = selected if identity == parent else unselected
+            outgoing = project_rqa_history(history, identity, view)
+            histories.append(outgoing)
+            if identity == parent and len(histories) == 1:
+                assert any("Exact method specimen" in str(message.content) for message in outgoing)
+                return AIMessage("", tool_calls=[{"name": "read_file", "id": "rqa-native", "args": {
+                    "file_path": f"/skills/{RQA_ID}/SKILL.md"}}])
+            observations = [message for message in outgoing if isinstance(message, ToolMessage)]
+            if identity == parent:
+                assert any("Scope specimen 9651." in str(message.content) for message in observations)
+            else:
+                leaked = [(type(message).__name__, getattr(message, "name", ""), message.content,
+                           message.additional_kwargs) for message in outgoing if "Scope specimen 9651." in str(message.content)]
+                assert not leaked
+                assert all("Exact method specimen" not in str(message.content) for message in outgoing)
+                assert any(message.tool_call_id == "rqa-native" for message in observations)
+            return AIMessage("ordinary answer")
+
+        async def execute(*_):
+            raise AssertionError("Native Skill File call reached business dispatch")
+
+        async def accept(*_):
+            return FinalCheck()
+
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(3), [])
+        config = {"thread_id": "same-thread"}
+        for identity, view in ((parent, selected), (current, unselected)):
+            result = await runtime.run(identity, [HumanMessage(identity.user_turn_id,
+                additional_kwargs=identity.message_metadata("user"))], saver=saver, checkpoint_config=config,
+                agent_options={"skill_root": tmp_path / "skills", "capability_policy": CapabilityPolicy(),
+                               "turn_skills": view, "system_prompt": "Fixture"},
+                pinned_skills=[RQA_ID] if identity == parent else [])
+            assert result.status == "complete"
+        assert len(histories) == 3
 
     asyncio.run(scenario())

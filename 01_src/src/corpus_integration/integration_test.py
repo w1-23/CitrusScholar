@@ -204,7 +204,7 @@ def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monke
 
     _, output = fetch._local_hybrid_search_impl("citrus soil", ["agent_literature"], render=False, progress=False)
     row = output["shared_results"][0]
-    from src.graph.retrieval_router import plan_retrieval
+    from src.graph.retrieval_router import decide_retrieval, required_route_groups
     from src.tools.outcome import normalize_tool_outcome, safe_tool_step
 
     # Exercise the public tool function, exact evidence parser, status adapter,
@@ -218,14 +218,8 @@ def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monke
     outcome = normalize_tool_outcome("local_hybrid_search", content, artifact)
     assert outcome.status == "complete" and outcome.coverage == "1 条本地候选"
     assert safe_tool_step("local_hybrid_search", content, artifact)["summary"] == "找到 1 条候选资料"
-    route_options = {"allowed_names": ["local_hybrid_search", "deepseek_search"],
-                     "local_families": ["agent_literature"], "local_corpus_match": True}
     query = "请解释柑橘土壤有机质对根系吸收的影响和机制"
-    assert not plan_retrieval(query, **route_options,
-        records=[{"name": "local_hybrid_search", "status": outcome.status}]).calls
-    if_dry = plan_retrieval(query, **route_options,
-        records=[{"name": "local_hybrid_search", "status": "no_results"}])
-    assert if_dry.calls[0]["name"] == "deepseek_search"
+    assert not required_route_groups(decide_retrieval(query))
 
     direct = json.loads(tool_adapter.search_agent_corpus.invoke({"query": "citrus soil"}))
     assert direct["results"][0]["source_family"] == "agent_literature"

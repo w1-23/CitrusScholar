@@ -174,21 +174,6 @@ def _classify_error(e: Exception, tool: BaseTool | None = None) -> str:
     return f"[ERR_PARSE] 工具执行异常: {e}。建议: 检查参数是否合理"
 
 
-def _offload_large_result(result: str, tool_name: str) -> str:
-    """Preserve raw output until the graph records it, then clamps the model copy.
-
-    ``_run_regular_calls`` publishes the original result to ``tool_results``
-    before applying ``clamp_for_model``. The existing authenticated
-    ``/api/v2/session/{session_id}/tool-result/{tool_call_id}`` endpoint reads
-    that evidence record (including its retention/truncation metadata).
-    Shortening here would make that endpoint store only an offload notice.
-
-    Keep this call-site shim, but never replace content with a tmp path: those
-    files are not account-library objects and have no registered reader tool.
-    """
-    return result
-
-
 def get_offload_file_list() -> list[Path]:
     return list(_offload_created_files)
 
@@ -457,8 +442,9 @@ def _recovery_inputs(tool_name, args, owner):
     return "never", []
 
 
-async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: bool = False,
+async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable: bool = False,
                            on_dispatch=None, retry_of=None, logical_key="", attempt=1) -> ToolMessage:
+    """Lease, reconcile and record one ToolNode-selected business operation."""
     from src.core.tracing import get_job_id, get_user_id
     from src.core import jobs, task_events
     job_id, owner = get_job_id(), get_user_id()
@@ -717,7 +703,7 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
         result = await asyncio.wait_for(_invoke_tool_with_ctx(ctx, tool, invocation),
                                         timeout=exec_timeout)
     except asyncio.TimeoutError:
-        logger.error(f"[PartitionedNode] 工具 {tool.name} 执行超时(>{exec_timeout}s)")
+        logger.error(f"[ToolOperation] 工具 {tool.name} 执行超时(>{exec_timeout}s)")
         return ToolMessage(
             content=_timeout_message(tool.name, exec_timeout, args),
             tool_call_id=tool_call["id"], name=tool.name, artifact={})
@@ -725,7 +711,7 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
         if _is_cancel_exc(e):
             _note_late_result(tool_name, "standard_branch_exc")
             return _cancel_receipt(tool_name, tool_call["id"], "cancelled_in_tool", token)
-        logger.error(f"[PartitionedNode] 工具 {tool.name} 执行失败: {e}")
+        logger.error(f"[ToolOperation] 工具 {tool.name} 执行失败: {e}")
         error_msg = _classify_error(e, tool)
         return ToolMessage(content=error_msg, tool_call_id=tool_call["id"], name=tool.name, artifact={})
 
@@ -745,9 +731,6 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
     artifact["op_receipt"] = make_receipt(tool_name, tool_call["id"], result.content, artifact)
     artifact.setdefault("_tool_outcome", artifact["op_receipt"]["coverage"]["_tool_outcome"])
     result = result.model_copy(update={"artifact": artifact})
-    if isinstance(result.content, str) and tool_name not in {
-            "deepseek_search", "deepseek_fetch", "deepseek_fetch_paper", "local_hybrid_search"}:
-        result.content = _offload_large_result(result.content, tool_name)
     return result
 
 async def run_tool_checked(tool: BaseTool, args: dict) -> str:
@@ -762,104 +745,6 @@ async def run_tool_checked(tool: BaseTool, args: dict) -> str:
     Returns: content 字符串。以 [ERR_* 或 "Error:" 前缀判失败。
     """
     import uuid
-    result = await _run_single_tool(tool, {
+    result = await run_tool_operation(tool, {
         "id": f"checked-{uuid.uuid4().hex}", "name": tool.name, "args": args})
     return result.content if isinstance(result.content, str) else str(result.content)
-
-
-class PartitionedToolNode:
-    """Partitioned concurrency tool node — LangGraph compatible"""
-
-    def __init__(self, tools: list[BaseTool]):
-        self.tools_by_name: dict[str, BaseTool] = {t.name: t for t in tools}
-
-    async def _execute_group(self, group: list[dict]) -> list[ToolMessage]:
-        results = []
-        for tc in group:
-            tool = self.tools_by_name.get(tc.get("name", ""))
-            if tool is None:
-                logger.warning(f"[PartitionedNode] 未知工具: {tc.get('name')}")
-                results.append(ToolMessage(
-                    content=f"[ERR_UNKNOWN_TOOL] 工具 '{tc.get('name')}' 不存在。可用工具: {list(self.tools_by_name.keys())}",
-                    tool_call_id=tc.get("id", "unknown"),
-                    name=tc.get("name", "unknown"),
-                    artifact={},
-                ))
-                continue
-            t_tool = time.perf_counter()
-            msg = await _run_single_tool(tool, tc)
-            dt_tool = (time.perf_counter() - t_tool) * 1000
-            logger.info(f"[PartitionedNode] tool {tool.name} done ({dt_tool:.0f}ms)")
-            # v8.4.6 B8: 结构化结果 envelope——熔断/统计只读 _meta 字段，
-            # 不解析自由文本（书 §1.2.2"验证：输入隔离"）
-            try:
-                _content = str(getattr(msg, "content", "") or "")
-                _meta = {"tool": tool.name, "status": "ok", "code": "OK"}
-                if _content.startswith("[DEDUP]"):
-                    _meta.update(status="skipped", code="DEDUP")
-                elif _content.startswith("[ERR") or _content.startswith("[Error"):
-                    _m = re.match(r"\[([A-Z_]+)\]", _content)
-                    _meta.update(status="error",
-                                 code=_m.group(1) if _m else "ERR_UNKNOWN")
-                _art = getattr(msg, "artifact", None) or {}
-                if isinstance(_art, dict):
-                    _art = dict(_art)
-                else:
-                    _art = {}
-                _art["_meta"] = _meta
-                msg.artifact = _art
-            except Exception:
-                pass
-            # v8.4.1: 业务日志——工具级事件（成功/失败/结果长度，排查检索与工具问题）
-            try:
-                from src.core.business_logger import blog
-                content = str(getattr(msg, "content", ""))
-                blog("tool_done", name=tool.name,
-                     ms=int(dt_tool),
-                     err=content.startswith("[ERR") or content.startswith("[Error"),
-                     chars=len(content))
-            except Exception:
-                pass
-            results.append(msg)
-        return results
-
-    async def _execute(self, tool_calls: list[dict]) -> list[ToolMessage]:
-        if not tool_calls:
-            return []
-        groups: dict[str, list[dict]] = {}
-        for tc in tool_calls:
-            name = tc.get("name", "")
-            key = concurrency_key_for(name) or name
-            groups.setdefault(key, []).append(tc)
-        logger.info(f"[PartitionedNode] {len(tool_calls)} 个工具调用, {len(groups)} 个并发组: {list(groups.keys())}")
-        t_groups = time.perf_counter()
-        tasks = [self._execute_group(group) for group in groups.values()]
-        group_results = await asyncio.gather(*tasks)
-        dt_groups = (time.perf_counter() - t_groups) * 1000
-        all_results = []
-        for grp in group_results:
-            all_results.extend(grp)
-        logger.info(f"[PartitionedNode] all {len(tool_calls)} tools done ({dt_groups:.0f}ms)")
-        return all_results
-
-    async def execute_tools(self, tool_calls: list[dict]) -> list[ToolMessage]:
-        return await self._execute(tool_calls)
-
-    async def ainvoke(self, inputs: dict) -> dict:
-        messages = inputs.get("messages", [])
-        if not messages:
-            return {"messages": []}
-        last_msg = messages[-1]
-        tool_calls = getattr(last_msg, "tool_calls", None)
-        if not tool_calls:
-            return {"messages": []}
-        results = await self._execute(tool_calls)
-        return {"messages": results}
-
-    def __call__(self, inputs: dict) -> dict:
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-        return loop.run_until_complete(self.ainvoke(inputs))

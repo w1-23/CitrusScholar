@@ -49,6 +49,10 @@ class OCIError(RuntimeError):
 class OutputRejected(OCIError):
     """Trusted collector rejected the requested file snapshot without returning bytes."""
 
+    def __init__(self, code, missing_paths=()):
+        super().__init__(code)
+        self.missing_paths = tuple(missing_paths)
+
 
 _OUTPUT_REJECTIONS = frozenset({
     "execution_declared_output_missing", "execution_output_type_denied",
@@ -56,11 +60,23 @@ _OUTPUT_REJECTIONS = frozenset({
 })
 
 
-def _raise_output_rejection(record):
-    # An output key is always a validated absolute logical path, never "error".
-    if (type(record) is dict and set(record) == {"error"}
-            and type(record["error"]) is str and record["error"] in _OUTPUT_REJECTIONS):
-        raise OutputRejected(record["error"])
+def _raise_output_rejection(record, declared=()):
+    # Error records cannot be confused with an absolute logical path key. The
+    # collector may only name exact declared slots, never discovered files.
+    if type(record) is not dict or "error" not in record:
+        return
+    code = record["error"]
+    if type(code) is not str or code not in _OUTPUT_REJECTIONS:
+        return
+    if set(record) == {"error"}:
+        raise OutputRejected(code)  # Compatible with older retained workers.
+    paths = record.get("missing_paths")
+    if (set(record) != {"error", "missing_paths"} or code != "execution_declared_output_missing"
+            or type(paths) is not list or not 1 <= len(paths) <= len(declared)
+            or any(type(path) is not str for path in paths)
+            or paths != [path for path in declared if path in paths]):
+        raise OCIError("invalid_collected_output_rejection")
+    raise OutputRejected(code, paths)
 
 
 class UnsupportedExecution(OCIError):
@@ -403,47 +419,61 @@ def open_output(path, flags, *, dir_fd):
         raise
 
 
+def read_output(path, remaining):
+    parts = path.split('/')[1:]
+    if parts[0] not in ('workspace', 'outputs'): raise ValueError('invalid_root')
+    directory = os.open('/' + parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directories = [(directory, metadata(os.fstat(directory)))]
+    try:
+        for component in parts[1:-1]:
+            directory = open_output(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            directories.append((directory, metadata(os.fstat(directory))))
+        fd = open_output(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            info = os.fstat(fd)
+            before = metadata(info)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise Rejected('execution_output_type_denied')
+            if info.st_size > remaining:
+                raise Rejected('execution_output_byte_limit')
+            with os.fdopen(fd, 'rb', closefd=False) as source: data = source.read(remaining + 1)
+            if len(data) > remaining: raise Rejected('execution_output_byte_limit')
+            try:
+                current = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                raise Rejected('execution_output_changed') from None
+            if (len(data) != info.st_size or before != metadata(os.fstat(fd))
+                    or before != metadata(current)
+                    or any(saved != metadata(os.fstat(d)) for d, saved in directories)):
+                raise Rejected('execution_output_changed')
+            return data
+        finally: os.close(fd)
+    finally:
+        for d, _ in reversed(directories): os.close(d)
+
+
 def collect():
     remaining = c['bytes']
     result = {}
+    missing = []
     for path in c['paths']:
-        parts = path.split('/')[1:]
-        if parts[0] not in ('workspace', 'outputs'): raise ValueError('invalid_root')
-        directory = os.open('/' + parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        directories = [(directory, metadata(os.fstat(directory)))]
         try:
-            for component in parts[1:-1]:
-                directory = open_output(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-                directories.append((directory, metadata(os.fstat(directory))))
-            fd = open_output(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-            try:
-                info = os.fstat(fd)
-                before = metadata(info)
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                    raise Rejected('execution_output_type_denied')
-                if info.st_size > remaining:
-                    raise Rejected('execution_output_byte_limit')
-                with os.fdopen(fd, 'rb', closefd=False) as source: data = source.read(remaining + 1)
-                if len(data) > remaining: raise Rejected('execution_output_byte_limit')
-                try:
-                    current = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
-                except FileNotFoundError:
-                    raise Rejected('execution_output_changed') from None
-                if (len(data) != info.st_size or before != metadata(os.fstat(fd))
-                        or before != metadata(current)
-                        or any(saved != metadata(os.fstat(d)) for d, saved in directories)):
-                    raise Rejected('execution_output_changed')
-                remaining -= len(data)
-                result[path] = base64.b64encode(data).decode('ascii')
-            finally: os.close(fd)
-        finally:
-            for d, _ in reversed(directories): os.close(d)
+            data = read_output(path, remaining)
+        except Rejected as exc:
+            if str(exc) != 'execution_declared_output_missing':
+                raise
+            missing.append(path)
+            continue
+        remaining -= len(data)
+        result[path] = base64.b64encode(data).decode('ascii')
+    if missing:
+        return {'error': 'execution_declared_output_missing', 'missing_paths': missing}
     return result
 
 try:
     record = collect()
 except Rejected as exc:
-    # No filenames, partial bytes or OS exception text cross the boundary.
+    # No partial bytes or OS exception text cross the boundary.
     record = {'error': str(exc)}
 sys.stdout.write(json.dumps(record, separators=(',', ':')))
 sys.stdout.flush()
@@ -711,7 +741,7 @@ class OfflineOCIBackend:
                 raise OCIError("output_collection_unconfirmed")
             try:
                 raw = json.loads(response.stdout, object_pairs_hook=_unique_object)
-                _raise_output_rejection(raw)
+                _raise_output_rejection(raw, request.outputs)
                 if not isinstance(raw, dict) or set(raw) != set(request.outputs):
                     raise ValueError("output_manifest_mismatch")
                 for path, value in raw.items():

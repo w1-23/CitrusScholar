@@ -1,6 +1,5 @@
 'use strict';
 (function () {
-  try { var theme=localStorage.getItem('citrus_theme'); if(['light','dark','cartoon'].includes(theme))document.documentElement.dataset.theme=theme; } catch (_) {}
   var epoch = 0, findingEpoch = 0, review = null, selected = null, controller = null;
   var activeReviewId = '', activeFindingId = '', pendingSaves = new Map();
   var labels = {pending:'待复核',needs_context:'需要更多材料',explained:'已有合理解释',confirmed_discrepancy:'人工确认差异',dismissed:'不采纳该线索'};
@@ -9,11 +8,11 @@
   function status(text) { node('ir-status').textContent = text; }
   function element(tag, text) { var el=document.createElement(tag); if(text!==undefined)el.textContent=text; return el; }
   function clearPrivate(){review=null;selected=null;findingEpoch+=1;node('ir-save').disabled=true;['ir-sources','ir-findings','ir-context','ir-history'].forEach(function(id){node(id).replaceChildren();});node('ir-title').textContent='选择一条线索';node('ir-summary').textContent='';node('ir-evidence').textContent='';node('ir-note').value='';node('ir-form').hidden=true;}
-  async function api(path, options) {
+  async function api(path, options, ownsView) {
     var requestEpoch=epoch;
     var response=await fetch(path,Object.assign({credentials:'same-origin',cache:'no-store',signal:controller.signal},options||{}));
-    if(requestEpoch!==epoch){var stale=new Error('stale review response');stale.name='AbortError';throw stale;}
-    if(response.status===401) { clearPrivate();node('ir-reviews').replaceChildren();throw new Error('登录已失效，请返回工作台重新登录。'); }
+    if(requestEpoch!==epoch || (ownsView && !ownsView())){var stale=new Error('stale review response');stale.name='AbortError';throw stale;}
+    if(response.status===401) { var message='登录已失效，请返回工作台重新登录。';clearPrivate();node('ir-reviews').replaceChildren();status(message);throw new Error(message); }
     if(!response.ok) { if(response.status===409)throw new Error('记录已改变。请重新读取后核对，再保存决定。'); var err=await response.json().catch(function(){return {};}); throw new Error(typeof err.detail==='string'?err.detail:'读取失败，请重新读取。'); }
     return response;
   }
@@ -51,7 +50,7 @@
     node('ir-sources').append(pane);
     if(!loc.file_id){pane.append(element('p','原始文件未登记，无法预览；请依据位置核对原件。'));return;}
     var path=base(id)+'/findings/'+encodeURIComponent(item.finding_id)+'/sources/'+index;
-    try {var response=await api(path);if(!ownsFinding(owner))return;
+    try {var response=await api(path,undefined,function(){return ownsFinding(owner);});if(!ownsFinding(owner))return;
       if((response.headers.get('content-type')||'').startsWith('image/')) {var blob=await response.blob();if(!ownsFinding(owner))return; var image=element('img');image.alt='来源 '+(index+1)+' 的证据区域';var url=URL.createObjectURL(blob);image.onload=image.onerror=function(){URL.revokeObjectURL(url);};image.src=url;pane.append(image);}
       else {var data=await response.json();if(!ownsFinding(owner))return;var wrap=element('div');wrap.className='ir-table-wrap';var table=element('table');var head=element('tr');head.append(element('th','原行'));data.columns.forEach(function(col){head.append(element('th',col.name));});var thead=element('thead');thead.append(head);table.append(thead);var body=element('tbody');data.rows.forEach(function(row){var tr=element('tr');tr.append(element('th',String(row.row)));row.values.forEach(function(value){tr.append(element('td',value));});body.append(tr);});table.append(body);wrap.append(table);pane.append(wrap,element('p',data.coverage));}
     } catch(error){if(ownsFinding(owner)&&error.name!=='AbortError')pane.append(element('p',error.message));}
@@ -77,7 +76,7 @@
     var body=JSON.stringify({state:node('ir-state').value,note:node('ir-note').value,expected_revision:item.review.revision});
     pendingSaves.set(key,token); node('ir-save').disabled=true;
     try {
-      await api(base(id)+'/findings/'+encodeURIComponent(item.finding_id),{method:'PUT',headers:{'Content-Type':'application/json'},body:body});
+      await api(base(id)+'/findings/'+encodeURIComponent(item.finding_id),{method:'PUT',headers:{'Content-Type':'application/json'},body:body},function(){return ownsFinding(owner);});
       if(!ownsFinding(owner))return;
       pendingSaves.delete(key);
       await openReview(id,item.finding_id,true);

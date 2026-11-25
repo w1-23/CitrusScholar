@@ -5,6 +5,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from src.agent.harness import HarnessRuntime
+from src.agent.framework_test_support import ScriptedModel
 from src.agent.host import _same_repair_target
 from src.agent.identity import ExecutionIdentity
 from src.agent.runtime import FinalCheck, RunLimits
@@ -19,7 +20,7 @@ def test_unconfigured_skill_release_never_activates_archived_prompts(monkeypatch
 
     monkeypatch.delenv("CITRUS_SKILL_RELEASE", raising=False)
     tools = {"run_research_figure_script", "research_workspace"}
-    assert assemble_system_prompt(mode="expert", available_tools=tools) == system_prompt(tools, native_skills=True)
+    assert assemble_system_prompt(mode="expert", available_tools=tools) == system_prompt(tools)
     with pytest.raises(ValueError, match="skill_release_not_configured"):
         verify_figure_prompt_loading()
 
@@ -29,7 +30,7 @@ def test_request_to_check_both_sources_preserves_authorized_search(monkeypatch):
     from src.core import tracing
     from src.core.capability_policy import CapabilityPolicy
     from src.graph import tool_availability
-    from src.graph.retrieval_router import plan_retrieval, retrieval_denied, source_scope
+    from src.graph.retrieval_router import decide_retrieval, required_route_groups, retrieval_denied, source_scope
 
     monkeypatch.setattr(tracing, "web_search_enabled", lambda: True)
     monkeypatch.setattr(tool_availability, "provider_denials", lambda settings: frozenset())
@@ -41,9 +42,7 @@ def test_request_to_check_both_sources_preserves_authorized_search(monkeypatch):
     state = {"query": query, "capability_snapshot": CapabilityPolicy().snapshot()}
     available = allowed_presets(state, has_tables=False, has_pool=False)
     assert {"local_hybrid_search", "deepseek_search"} <= available
-    plan = plan_retrieval(query, allowed_names=available, local_families=("citrus",))
-    assert {call["name"] for call in plan.calls} == {"local_hybrid_search", "deepseek_search"}
-    assert len(plan.calls) == 2
+    assert len(required_route_groups(decide_retrieval(query))) == 2
 
 
 def test_attachment_plot_needs_a_downloadable_svg():
@@ -183,7 +182,7 @@ def test_reference_batch_returns_to_model_for_next_goal(tmp_path):
         schemas = [{"type": "function", "function": {"name": name, "description": "Fixture",
                     "parameters": {"type": "object", "properties": {}}}}
                    for name in (call["name"], "calculate")]
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas)
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(), schemas)
         options = {"skill_root": tmp_path, "system_prompt": "fixture"}
         human = HumanMessage("核验这些文献，然后计算样本均值", additional_kwargs=identity.message_metadata("user"))
         result = await runtime.run(identity, [human], saver=InMemorySaver(), agent_options=options)
@@ -192,3 +191,41 @@ def test_reference_batch_returns_to_model_for_next_goal(tmp_path):
         assert len(calls) == 3 and len(observations) == 2
 
     asyncio.run(exercise())
+
+
+def test_generic_public_network_fallback_respects_readiness_scope_and_browser_selection(monkeypatch):
+    from types import SimpleNamespace
+
+    from src.agent.host_policy import allowed_presets, system_prompt
+    from src.agent.preset_catalog import build_preset_catalog
+    from src.core import tracing
+    from src.core.capability_policy import CapabilityPolicy
+    from src.graph import tool_availability
+
+    real_provider_denials = tool_availability.provider_denials
+    monkeypatch.setattr(tracing, "web_search_enabled", lambda: True)
+    monkeypatch.setattr("src.browse.service.enabled", lambda: True)
+    provider = SimpleNamespace(RESOLVED_WEB_SEARCH_PROVIDER="zhipu_web_search",
+                               RESOLVED_ZHIPU_API_KEY="", RESOLVED_DEEPSEEK_WEB_API_KEY="ready")
+    monkeypatch.setattr(tool_availability, "provider_denials", lambda _: real_provider_denials(provider))
+    state = {"query": "What recent external evidence is available?", "session_id": "fixture-session",
+             "capability_snapshot": CapabilityPolicy().snapshot()}
+    ready = allowed_presets(state, has_tables=False, has_pool=False)
+    assert {"deepseek_fetch", "deepseek_fetch_paper", "search_literature", "local_hybrid_search"} <= ready
+    assert not {"deepseek_search", "browse_web"} & ready
+    prompt = system_prompt(ready)
+    assert "优先用本轮已授权的公开网络 Search" in prompt
+    assert "不必两路都查或比较搜索提供方" in prompt
+    assert "已知公开 URL 可 Fetch" in prompt and "不得把私有附件原文" in prompt
+    catalog = build_preset_catalog()
+    assert catalog.resolve("deepseek_fetch", ready).name == "deepseek_fetch"
+    assert catalog.resolve("search_literature", ready).name == "search_literature"
+    assert catalog.resolve("research_workspace", ready).name == "research_workspace"
+    assert "browse_web" in allowed_presets(dict(state, browse_requested=True), has_tables=False, has_pool=False)
+    provider.RESOLVED_ZHIPU_API_KEY = "ready"
+    assert "deepseek_search" in allowed_presets(state, has_tables=False, has_pool=False)
+    private = dict(state, query="分析上传数据，请勿将附件外发", attachment_refs=[{"file_id": "fixture"}])
+    assert not {"deepseek_search", "deepseek_fetch", "search_literature", "browse_web"} & allowed_presets(
+        private, has_tables=True, has_pool=False)
+    web_only = dict(state, query="Search only the web for calibration")
+    assert "local_hybrid_search" not in allowed_presets(web_only, has_tables=False, has_pool=False)

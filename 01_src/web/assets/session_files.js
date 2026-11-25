@@ -13,6 +13,9 @@
   var fileCache = Object.create(null);
   var libraryRows = [];
   var retentionIdleDays = 0;
+  var FILE_ID = /^[a-f0-9]{32}$/;
+  var SHA256 = /^[a-f0-9]{64}$/;
+  var FIGURE_SOURCE_KEY = 'citrus:figure-source';
   var catalogScope = 0;
   var catalogRequestSerial = 0, latestCatalogRequest = null;
   var defaultReferenceLimits = {max_turn_files: 8, max_reference_bytes: 20 * 1024 * 1024};
@@ -20,6 +23,7 @@
 
   function resetSessionFiles() {
     catalogScope += 1;
+    try { window.sessionStorage.removeItem(FIGURE_SOURCE_KEY); } catch (_) {}
     latestCatalogRequest = null;
     referenceLimits = defaultReferenceLimits;
     clearTableTiles();
@@ -87,9 +91,6 @@
     var jump = (f.turn_request_id && f.source_session_id);
     var menuId = 'session-file-menu-' + String(f.file_id || '');
     var lastAccess = fmtTime(f.last_accessed_at);
-    var stamp = Number(f.last_accessed_at || f.created_at || 0);
-    var date = stamp && isFinite(stamp) ? new Date(stamp * 1000) : null;
-    var dateLabel = date && isFinite(date.getTime()) ? date.toLocaleDateString() : '';
     var ext = (String(f.filename || '').match(/\.([^.]+)$/) || ['', ''])[1].toUpperCase().slice(0, 5);
     var thumbnail = (kind === 'image' || kind === 'svg') &&
       Number(f.size_bytes) <= 2*1024*1024 && safePreviewUrl(f.preview_url);
@@ -110,8 +111,7 @@
       '  <div class="session-file-open">' +
       '    <span class="session-file-name" title="' + esc(f.filename) + '">' + esc(f.filename) + '</span>' +
       '    <div class="session-file-sub" title="' + esc((lastAccess ? '最近使用 ' + lastAccess : fmtTime(f.created_at))) + '">' +
-      '      <span class="session-file-badge k-' + esc(kind) + '">' + esc(label) + '</span> ' + esc(fmtSize(f.size_bytes)) +
-             (dateLabel ? '<span class="session-file-date"> · ' + esc(dateLabel) + '</span>' : '') + '</div>' +
+      '      <span class="session-file-badge k-' + esc(kind) + '">' + esc(label) + '</span> ' + esc(fmtSize(f.size_bytes)) + '</div>' +
       '  </div>' +
       '  <div class="session-file-actions">' +
       '    <button type="button" class="session-file-preview-btn" data-file-act="preview" data-file-id="' +
@@ -132,8 +132,8 @@
       (svg
         ? '    <button type="button" role="menuitem" data-file-act="copy-svg" data-file-id="' + esc(f.file_id) + '">复制 SVG 源码</button>'
         : '') +
-      (svg && deletable && registeredSvgUrl(f)
-        ? '    <button type="button" role="menuitem" data-file-act="edit-svg-copy" data-file-id="' + esc(f.file_id) + '">在图件工作台创建 SVG 样式副本</button>'
+      (canImportSvg(f)
+        ? '    <button type="button" role="menuitem" data-file-act="edit-svg-copy" data-file-id="' + esc(f.file_id) + '">尝试创建可编辑 SVG 副本</button>'
         : '') +
       (jump
         ? '    <button type="button" role="menuitem" data-file-act="jump" data-file-id="' + esc(f.file_id) + '">定位到来源会话</button>'
@@ -432,9 +432,11 @@
       toggle.classList.toggle('active', want);
     }
     if (want) {
-      syncLibraryBounds(); scheduleLibraryColumns(); loadSessionFiles();
+      syncLibraryBounds(); scheduleLibraryColumns();
+      var request = loadSessionFiles();
       var close = p.querySelector('.session-files-close');
       if (close && isDrawerMode()) close.focus();
+      return request;
     } else {
       clearTableTiles();
       closeMoreMenus(null);
@@ -453,7 +455,7 @@
     if (!o || o.hidden) return;
     o.hidden = true;
     var stage = el('sessionFilePreviewStage');
-    if (stage) stage.innerHTML = '';
+    if (stage) { stage.innerHTML = ''; delete stage.dataset.previewKind; }
     var back = previewReturnFocus;
     previewReturnFocus = null;
     if (back && typeof back.focus === 'function' && document.contains(back)) {
@@ -470,9 +472,7 @@
       // 执行），绝不把源码 innerHTML 注入聊天页；要看源码请用「复制 SVG 源码」。
       return '<div class="sf-image-wrap"><img class="sf-preview-image" src="' +
              esc(url) + '" alt="' + esc(file.filename) + '"></div>' +
-             '<div class="sf-preview-note" data-preview-error hidden></div>' +
-             '<div class="sf-preview-note">SVG 以隔离图片方式渲染（脚本不会执行）；' +
-             '需要源码请用上方「复制 SVG 源码」。</div>';
+             '<div class="sf-preview-note" data-preview-error hidden></div>';
     }
     if (kind === 'pdf') {
       if (!url) return unsafePreviewHtml(dl);
@@ -852,6 +852,11 @@
         if (!previewStillCurrent(request, node)) throw new Error('stale');
         if (!buf || !buf.byteLength) throw new Error('empty');
         if (!pdfMagic(buf)) throw new Error('not-pdf');
+        if (navigator.pdfViewerEnabled === false) {
+          endPreviewRequest(request);
+          fail('PDF 已读取，但此浏览器没有内嵌 PDF 阅读器。可在新窗口打开或下载原件。');
+          return;
+        }
         var blobUrl = URL.createObjectURL(new Blob([buf], { type: 'application/pdf' }));
         _previewObjectUrls.push(blobUrl);
         if (!previewStillCurrent(request, node)) {
@@ -1501,6 +1506,7 @@
     }
     el('sessionFilePreviewMeta').textContent = previewMetaText(file);
     var stage = el('sessionFilePreviewStage');
+    stage.dataset.previewKind = displayKind(file);
     stage.innerHTML = previewStageHtml(file);
     var pnode = stage.querySelector('.sf-pdf-wrap');
     if (pnode) loadPdfPreview(pnode);
@@ -1510,7 +1516,7 @@
     if (gnode) loadTablePreview(gnode);
     bindDirectPreview(stage);
     var image = stage.querySelector('.sf-preview-image');
-    if (image) enableImageZoom(image);
+    if (image) enableImageZoom(image, file);
     // 打开后把焦点交给关闭按钮：Tab 顺序从弹窗开始，Esc 随时可退
     var closeBtn = overlay.querySelector('.overlay-close');
     if (closeBtn && typeof closeBtn.focus === 'function') {
@@ -1531,6 +1537,7 @@
     image.className = 'sf-preview-image';
     image.alt = file.name;
     wrap.appendChild(image);
+    stage.dataset.previewKind = 'image';
     stage.replaceChildren(wrap);
     enableImageZoom(image);
     image.src = url;
@@ -1539,27 +1546,66 @@
     el('sessionFilePreviewDownload').hidden = false;
   }
 
-  function enableImageZoom(image) {
+  function enableImageZoom(image, file) {
     var wrap = image.parentElement;
-    var button = document.createElement('button');
-    button.className = 'api-secondary';
-    button.type = 'button';
-    button.textContent = '放大图片';
-    button.setAttribute('aria-pressed', 'false');
-    wrap.before(button);
-    button.addEventListener('click', function () {
-      var zoomed = button.getAttribute('aria-pressed') !== 'true';
-      button.setAttribute('aria-pressed', String(zoomed));
-      button.textContent = zoomed ? '适应窗口' : '放大图片';
-      image.style.width = zoomed ? Math.max(image.naturalWidth, image.clientWidth * 2) + 'px' : '';
-      image.style.flex = zoomed ? 'none' : '';
-      wrap.style.justifyContent = zoomed ? 'flex-start' : '';
-      wrap.style.alignItems = zoomed ? 'flex-start' : '';
-      image.style.maxWidth = zoomed ? 'none' : '';
-      image.style.maxHeight = zoomed ? 'none' : '';
-      wrap.style.overflow = zoomed ? 'auto' : '';
-      if (!zoomed) { wrap.scrollLeft = 0; wrap.scrollTop = 0; }
-    });
+    var toolbar = document.createElement('div');
+    toolbar.className = 'sf-image-toolbar';
+    toolbar.setAttribute('role', 'group');
+    toolbar.setAttribute('aria-label', '图片缩放');
+    var controls = {};
+    var scale = null;
+    function button(key, text, label, action) {
+      var node = document.createElement('button');
+      node.type = 'button';
+      node.className = 'api-secondary';
+      node.textContent = text;
+      node.setAttribute('aria-label', label);
+      node.addEventListener('click', action);
+      controls[key] = node;
+      toolbar.appendChild(node);
+      return node;
+    }
+    function fittedScale() {
+      return Math.min(1, (wrap.clientWidth - 32) / image.naturalWidth,
+        (wrap.clientHeight - 32) / image.naturalHeight);
+    }
+    function apply(next) {
+      if (!image.naturalWidth || !image.naturalHeight) return;
+      scale = next;
+      image.style.width = scale === null ? '' : image.naturalWidth * scale + 'px';
+      image.style.height = scale === null ? '' : image.naturalHeight * scale + 'px';
+      wrap.classList.toggle('is-scaled', scale !== null);
+      wrap.scrollLeft = (wrap.scrollWidth - wrap.clientWidth) / 2;
+      wrap.scrollTop = (wrap.scrollHeight - wrap.clientHeight) / 2;
+      render();
+    }
+    function change(factor) {
+      apply(Math.min(8, Math.max(.05, (scale === null ? fittedScale() : scale) * factor)));
+    }
+    function render() {
+      var ready = !!image.naturalWidth;
+      ['out', 'in', 'fit', 'actual'].forEach(function (key) { controls[key].disabled = !ready; });
+      controls.out.disabled = !ready || scale !== null && scale <= .05;
+      controls.in.disabled = !ready || scale !== null && scale >= 8;
+      controls.fit.setAttribute('aria-pressed', String(scale === null));
+      controls.actual.setAttribute('aria-pressed', String(scale === 1));
+      output.textContent = ready && scale !== null ? Math.round(scale * 100) + '%' : '适应窗口';
+    }
+    button('out', '−', '缩小图片', function () { change(1 / 1.25); });
+    button('fit', '适应', '适应窗口', function () { apply(null); });
+    button('actual', '100%', '原始大小 100%', function () { apply(1); });
+    button('in', '＋', '放大图片', function () { change(1.25); });
+    var output = document.createElement('output');
+    output.setAttribute('aria-label', '预览缩放');
+    toolbar.appendChild(output);
+    if (canImportSvg(fileCache[file && file.file_id])) {
+      var edit = button('edit', '尝试创建可编辑副本', '尝试创建可编辑 SVG 副本', function () { createSvgCopy(file.file_id); });
+      edit.classList.add('sf-create-copy');
+    }
+    wrap.before(toolbar);
+    image.addEventListener('load', render);
+    image.addEventListener('error', render);
+    render();
   }
 
   function queueAccountFileReference(fileId) {
@@ -1618,8 +1664,12 @@
   function initSessionFiles() {
     panelEl = el('sessionFilesPanel');
     if (!panelEl) return;
+    var filters = panelEl.querySelector('.library-filters');
+    var body = el('sessionFilesBody');
+    if (filters && body && filters.parentNode === body && panelEl.insertBefore) panelEl.insertBefore(filters, body);
     bindLibraryResizer();
     bindLibraryUpload();
+    bindLibraryReturnRoute();
     el('librarySearch').addEventListener('input', renderFilteredLibrary);
     el('libraryKind').addEventListener('change', renderFilteredLibrary);
     el('librarySort').addEventListener('change', renderFilteredLibrary);
@@ -1661,6 +1711,11 @@
   var libWidth = LIB_DEFAULT_W;
   var libDragging = false;
 
+  function uiScale() {
+    var scale = window.CitrusTheme && window.CitrusTheme.scale;
+    return scale ? scale.effective() : 1;
+  }
+
   function viewportWidth() {
     return Math.max(0, window.innerWidth || 0, document.documentElement.clientWidth || 0);
   }
@@ -1685,11 +1740,11 @@
       var main = document.querySelector('.main-container');
       if (main) edge = main.getBoundingClientRect().left;
     }
-    return Math.max(0, edge);
+    return Math.max(0, edge / uiScale());
   }
 
   function libraryMaxWidth() {
-    var vw = viewportWidth();
+    var vw = viewportWidth() / uiScale();
     if (!vw) return LIB_DEFAULT_W;
     var available = vw - sidebarRightEdge();
     var geometryMax = available - LIB_GAP;         // 贴到左侧栏右边界，保留 24px 安全间隙
@@ -1752,7 +1807,7 @@
       if (event.button !== 0 || isDrawerMode()) return;
       libDragging = true;
       startX = event.clientX;
-      startW = libWidth;
+      startW = el('sessionFilesPanel').clientWidth || libWidth;
       document.body.classList.add('session-files-resizing');
       try { handle.setPointerCapture(event.pointerId); } catch (err) { /* 忽略 */ }
       event.preventDefault();
@@ -1760,7 +1815,7 @@
     handle.addEventListener('pointermove', function (event) {
       if (!libDragging) return;
       // 面板贴住右侧：指针左移（clientX 变小）→ 变宽
-      applyLibraryWidth(startW + (startX - event.clientX), false);
+      applyLibraryWidth(startW + (startX - event.clientX) / uiScale(), false);
     });
     function finish(event) {
       if (!libDragging) return;
@@ -2011,7 +2066,9 @@
         copySvgBtn.setAttribute('data-file-id', previewFileId);
       }
       el('sessionFilePreviewMeta').textContent = previewMetaText(file);
-      el('sessionFilePreviewStage').innerHTML = fileInfoHtml(file);
+      var stage = el('sessionFilePreviewStage');
+      delete stage.dataset.previewKind;
+      stage.innerHTML = fileInfoHtml(file);
       var closeBtn = overlay.querySelector('.overlay-close');
       if (closeBtn && typeof closeBtn.focus === 'function') {
         try { closeBtn.focus({ preventScroll: true }); } catch (err) { closeBtn.focus(); }
@@ -2056,9 +2113,10 @@
     menu.style.bottom = 'auto';
     var width = menu.offsetWidth || 152;
     var height = menu.offsetHeight || 150;
-    var left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
-    var top = rect.bottom + 4;
-    if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - 4);
+    var scale = uiScale();
+    var left = Math.max(8, Math.min(rect.right / scale - width, window.innerWidth / scale - width - 8));
+    var top = rect.bottom / scale + 4;
+    if (top + height > window.innerHeight / scale - 8) top = Math.max(8, rect.top / scale - height - 4);
     menu.style.left = Math.round(left) + 'px';
     menu.style.top = Math.round(top) + 'px';
   }
@@ -2107,6 +2165,7 @@
     var overlay = el('sessionFilePreviewOverlay');
     var stage = el('sessionFilePreviewStage');
     if (!overlay || !stage) return Promise.resolve();
+    delete stage.dataset.previewKind;
     var serial = ++exportViewSerial;
     releasePreviewResources();
     previewReturnFocus = document.activeElement;
@@ -2171,25 +2230,89 @@
       });
   }
 
+  function canImportSvg(file) {
+    return !!file && file.visibility !== 'internal' && registeredSvgUrl(file) &&
+      (file.origin === 'uploaded' || file.origin === 'generated' && file.producer_tool === 'code_deliver' && SHA256.test(file.sha256));
+  }
+
+  function currentAccountKey() {
+    var account = window.currentAccount;
+    var id = account && account.user_id;
+    return Number.isSafeInteger(id) && id > 0 ? String(id) : '';
+  }
+
+  function sourceMatches(file, handoff) {
+    return !!file && file.visibility !== 'internal' && file.file_id === handoff.file && file.sha256 === handoff.sha &&
+      typeof file.source_session_id === 'string' && file.source_session_id && file.source_session_id === handoff.session &&
+      typeof file.turn_request_id === 'string' && file.turn_request_id && file.turn_request_id === handoff.turn;
+  }
+
+  function bindLibraryReturnRoute() {
+    if (window.location?.pathname !== '/' || new URLSearchParams(window.location.search).get('files') !== '1') return;
+    var gate = el('authGate');
+    var observer;
+    function enter() {
+      if (!currentAccountKey() || gate && !gate.hidden) return;
+      if (observer) observer.disconnect();
+      var url = new URL(window.location.href);
+      var source = url.searchParams.get('source') || '';
+      url.searchParams.delete('files');
+      url.searchParams.delete('source');
+      window.history.replaceState(window.history.state, '', url);
+      var request = toggleSessionFiles(true);
+      if (!FILE_ID.test(source)) return;
+      var handoff;
+      try { handoff = JSON.parse(window.sessionStorage.getItem(FIGURE_SOURCE_KEY) || 'null'); }
+      catch (_) { return; }
+      if (handoff?.file !== source || handoff.account !== currentAccountKey()) return;
+      var scope = catalogScope;
+      Promise.resolve(request).then(function (payload) {
+        if (scope !== catalogScope || handoff.account !== currentAccountKey() || !payload ||
+            !sourceMatches(fileCache[source], handoff) || typeof window.jumpToFileTurn !== 'function') return;
+        return Promise.resolve(window.jumpToFileTurn(handoff.session, handoff.turn)).then(function (found) {
+          if (found && scope === catalogScope && handoff.account === currentAccountKey()) toggleSessionFiles(false);
+          else if (!found && scope === catalogScope) toast('来源轮次不在当前可加载的历史里。');
+        });
+      }).catch(function () { if (scope === catalogScope) toast('定位到来源会话失败。'); });
+    }
+    if (gate && window.MutationObserver) {
+      observer = new MutationObserver(enter);
+      observer.observe(gate, {attributes: true, attributeFilter: ['hidden']});
+    }
+    enter();
+  }
+
   var svgCopyPending = new Set();
   function createSvgCopy(fileId) {
     var file = fileCache[fileId];
-    if (!file || file.origin !== 'uploaded' || !registeredSvgUrl(file) || svgCopyPending.has(fileId)) return;
+    if (!canImportSvg(file) || svgCopyPending.has(fileId)) return;
     var scope = catalogScope;
+    var account = currentAccountKey();
     svgCopyPending.add(fileId);
     toast('正在检查 SVG 是否可以安全创建样式副本…');
-    fetch(apiBase + '/api/v2/figure-workbench/import-svg', {
+    var input = { file_id: fileId };
+    if (SHA256.test(file.sha256)) input.expected_sha256 = file.sha256;
+    return (window.accountFetch || fetch)(apiBase + '/api/v2/figure-workbench/import-svg', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ file_id: fileId })
+      body: JSON.stringify(input)
     }).then(exportJson).then(function (result) {
-      if (scope !== catalogScope) return;
-      if (result.origin === 'uploaded' && result.editable === true &&
-          /^\/figure-workbench\?project=[a-f0-9]{32}$/.test(result.workbench_url || '')) {
-        window.location.assign(result.workbench_url);
-      } else {
+      if (scope !== catalogScope || account !== currentAccountKey()) return;
+      var original = Object.values(result.original_exports || {}).find(function (item) {
+        return item && item.file_id === fileId && SHA256.test(item.sha256) && (!input.expected_sha256 || item.sha256 === input.expected_sha256);
+      });
+      if (!original || result.editable !== true || result.publication_state !== 'ready' ||
+          result.origin !== (file.origin === 'generated' ? 'code_output' : 'uploaded') ||
+          !FILE_ID.test(result.figure_id) || result.workbench_url !== '/figure-workbench?project=' + result.figure_id) {
         toast(result.edit_limitation || '此文件不可创建可编辑副本，仍可预览或下载原件。');
+        return;
       }
+      var handoff = { project: result.figure_id, file: fileId, sha: original.sha256, account: account,
+        session: file.source_session_id, turn: file.turn_request_id };
+      if (account && sourceMatches(file, handoff)) {
+        try { window.sessionStorage.setItem(FIGURE_SOURCE_KEY, JSON.stringify(handoff)); } catch (_) {}
+      }
+      window.location.assign(result.workbench_url);
     }).catch(function (error) {
       if (scope === catalogScope) toast(error.message || '无法创建 SVG 样式副本，请重试。');
     }).finally(function () { svgCopyPending.delete(fileId); });
@@ -2318,6 +2441,7 @@
     var bodyEl = el('sessionFilesBody');
     if (bodyEl) bodyEl.addEventListener('scroll', function () { closeMoreMenus(null); }, { passive: true });
     window.addEventListener('resize', function () { closeMoreMenus(null); });
+    window.addEventListener('citrus:scalechange', function () { closeMoreMenus(null); syncLibraryBounds(); });
     var copySvgBtn = el('sessionFilePreviewCopySvg');
     if (copySvgBtn) {
       copySvgBtn.addEventListener('click', function () {
@@ -2342,16 +2466,28 @@
     return button;
   }
 
+  function syncTurnSourceActions(box, file, fileId) {
+    var jump = box.querySelector('[data-file-act="jump"]');
+    if (file?.turn_request_id && file.source_session_id) {
+      if (!jump) box.appendChild(turnCardAction('jump', fileId, '↗', '定位到生成它的会话'));
+    } else if (jump) jump.remove();
+    var edit = box.querySelector('[data-file-act="edit-svg-copy"]');
+    if (canImportSvg(file)) {
+      if (!edit) box.appendChild(turnCardAction('edit-svg-copy', fileId, '副本', '尝试创建可编辑 SVG 副本'));
+    } else if (edit) edit.remove();
+  }
+
   function decorateTurnCards(root) {
     var scope = (root && typeof root.querySelectorAll === 'function') ? root : document;
     var cards = scope.querySelectorAll('.turn-file-card[data-file-id]');
     Array.prototype.forEach.call(cards, function (card) {
-      if (card.querySelector('.turn-file-extra')) return;
       var fileId = String(card.dataset.fileId || '');
       if (!fileId) return;
       var nameEl = card.querySelector('.turn-file-name');
       var name = nameEl ? String(nameEl.textContent || '') : '';
       var cached = fileCache[fileId];
+      var existing = card.querySelector('.turn-file-extra');
+      if (existing) { syncTurnSourceActions(existing, cached, fileId); return; }
       var svg = SVG_EXT_RE.test(name) || isSvgFile(cached);
       // Normalize the badge for attachment cards restored from before `kind: svg`.
       if (svg) {
@@ -2366,9 +2502,7 @@
       box.dataset.fileId = fileId;
       if (svg) box.appendChild(turnCardAction('copy-svg', fileId, '⧉', '复制 SVG 源码'));
       box.appendChild(turnCardAction('export', fileId, '导出', '导出已有成果'));
-      if (cached && cached.turn_request_id && cached.source_session_id) {
-        box.appendChild(turnCardAction('jump', fileId, '↗', '定位到生成它的会话'));
-      }
+      syncTurnSourceActions(box, cached, fileId);
       if (svg) box.appendChild(turnCardAction('info', fileId, 'ⓘ', '文件信息'));
       card.appendChild(box);
     });

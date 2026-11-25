@@ -44,14 +44,21 @@ jobs:
             01_src/src/api/chat_turn_queue_admission_test.py \
             01_src/src/api/chat_turn_queue_http_test.py \
             01_src/src/core/chat_turn_queue_test.py \
-            01_src/src/core/turn_maintenance_test.py \
             01_src/src/core/public_delivery_test.py \
             01_src/src/agent/context_projection_regression_test.py \
             01_src/src/agent/context_schema_budget_test.py \
             01_src/src/agent/host_runtime_contract_test.py \
             01_src/src/agent/research_routes_test.py \
             01_src/src/agent/native_runtime_test.py \
-            01_src/src/agent/post_turn_compaction_test.py \
+            01_src/src/agent/native_send_budget_test.py \
+            01_src/src/agent/checkpoint_store_compat_test.py \
+            01_src/src/agent/plan_tools_test.py \
+            01_src/src/api/runtime_health_test.py \
+            04_scripts/watchdog_8043_test.py \
+            01_src/src/core/model_progress_test.py \
+            01_src/src/core/provider_transport_test.py \
+            01_src/scripts/configured_local_test.py \
+            01_src/src/api/navigation_task_rediscovery_test.py \
             01_src/src/graph/retrieval_routing_test.py \
             01_src/src/agent/skill_provenance_test.py \
             01_src/src/agent/release_turn_boundaries_test.py \

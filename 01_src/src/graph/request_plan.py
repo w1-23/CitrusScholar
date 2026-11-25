@@ -76,9 +76,7 @@ class RequestFacts:
     has_session: bool = True
     has_history_evidence: bool = False
     recent_turn_seqs: tuple[int, ...] = ()
-    local_corpus_match: bool = False
-    # Set by the supervisor after the request-scoped prefetch finished. It is a
-    # runtime fact, not a topic guess: candidate tools cannot run without a pool.
+    # Candidate tools require an actual request-scoped pool.
     has_candidate_pool: bool = False
 
 
@@ -98,7 +96,6 @@ class RequestPlan:
     executor_authorizations: tuple[str, ...] = ()
     deliverables: tuple[dict[str, Any], ...] = ()
     availability_reasons: dict[str, str] = field(default_factory=dict)
-    legacy_router_mode: str = "advisory"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -125,7 +122,6 @@ def build_request_plan(
         q, effective_scope,
         has_history_evidence=facts.has_history_evidence,
         recent_turn_seqs=facts.recent_turn_seqs,
-        local_corpus_match=facts.local_corpus_match,
     )
     policy: ToolPolicy = resolve_tool_policy(q, effective_scope,
                                              paper_only=paper_only)
@@ -172,34 +168,7 @@ def build_request_plan(
         executor_authorizations=executor_authorizations(q),
         deliverables=deliverables,
         availability_reasons=explain(env),
-        legacy_router_mode=decision.router_mode,
     )
-
-
-def bounded_tool_context(messages: list, *, max_tokens: int, output_tokens: int = 0,
-                         model=None, epoch=None) -> tuple[list, dict]:
-    """Admit a complete active turn without rewriting already returned evidence.
-
-    Historical compaction belongs to ContextManager at the next user-turn
-    boundary. A hard-cap refusal is explicit; it never authorizes midturn loss.
-    """
-    from src.config import settings
-    from src.core.request_context import estimate_request, model_request, _epoch
-    phase = epoch or _epoch.get()
-    view = list(messages)
-    status = (model_request(model, view, output_tokens=output_tokens)[1]
-              if model is not None else estimate_request(view, output_tokens=output_tokens))
-    limit = max(0, min(int(settings.CONTEXT_ACTIVE_MAX_INPUT_TOKENS),
-                      int(max_tokens) - max(0, int(output_tokens)) - int(settings.CONTEXT_SAFETY_MARGIN_TOKENS)))
-    soft = min(int(settings.CONTEXT_WORKING_SOFT_TOKENS), int(limit * 0.75))
-    tokens = status["estimated_input_tokens"]
-    status.update(original_input_tokens=tokens, input_limit=limit,
-                  tool_results_shortened=False, fits=tokens <= limit,
-                  working_soft_tokens=soft,
-                  working_target_tokens=min(int(settings.CONTEXT_WORKING_TARGET_TOKENS), int(limit * 0.5)),
-                  epoch=phase.number if phase else 0,
-                  change_reason="active_turn_preserved")
-    return view, status
 
 
 def merge_task_instructions(query: str, updates: list[dict]) -> str:

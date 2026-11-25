@@ -20,11 +20,12 @@
   var MAX_PAGES = 5;         // bounded fetch: up to 2000 turns listed at once
   var WALK_LIMIT = 80;       // bounded history walk when locating an old turn
   var DENSE_AT = 40;         // above this many ticks, tighten spacing
+  var TAIL_DISTANCE = 36;
 
-  var railEl = null, trackEl = null, tipEl = null;
+  var railEl = null, trackEl = null, tipEl = null, latestEl = null, statusEl = null;
   var ticks = [];
-var focusedIdx = -1;
-var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动动画把高亮甩到别的轮次
+  var following = true, lastTop = 0;
+  var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动动画把高亮甩到别的轮次
   var activeMid = '';
   var buildTimer = 0, rafPending = false, busy = false;
   var turnsCache = [];       // oldest → newest, from the server index
@@ -34,7 +35,7 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
 
   function chatBox() {
     if (typeof chatContainer !== 'undefined' && chatContainer) return chatContainer;
-    return document.getElementById('chatMessages') || document.getElementById('chatArea');
+    return document.getElementById('chat-container');
   }
 
   function currentSession() {
@@ -43,6 +44,7 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
 
   function ensureRail() {
     if (railEl && document.body.contains(railEl)) return railEl;
+    var panel = chatBox().parentElement;
     railEl = document.createElement('nav');
     railEl.id = 'turnRail';
     railEl.className = 'turn-rail';
@@ -54,8 +56,17 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
     tipEl.id = 'turnRailTip';
     tipEl.className = 'turn-rail-tip';
     tipEl.setAttribute('role', 'tooltip');
-    document.body.appendChild(railEl);
-    document.body.appendChild(tipEl);
+    latestEl = document.createElement('button');
+    latestEl.type = 'button'; latestEl.className = 'turn-return-latest'; latestEl.hidden = true;
+    latestEl.textContent = '↓ 返回最新';
+    latestEl.addEventListener('click', function () {
+      follow(true);
+      chatBox().focus({preventScroll: true});
+    });
+    statusEl = document.createElement('p'); statusEl.className = 'turn-rail-status'; statusEl.hidden = true;
+    statusEl.setAttribute('role', 'status');
+    panel.append(railEl, tipEl, statusEl);
+    panel.querySelector('footer').prepend(latestEl);
     return railEl;
   }
 
@@ -95,11 +106,13 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
     var sid = currentSession();
     var epoch = accountEpoch();
     if (sid === loadedSession && epoch === loadedEpoch) { build(); return; }
+    ensureRail();
     if (indexReads) indexReads.abort();
     indexReads = new AbortController();
     var version = ++generation;
     loadedSession = sid; loadedEpoch = epoch;
-    busy = false;
+    busy = false; following = true; lastTop = 0; activeMid = ''; activeLockUntil = 0;
+    latestEl.hidden = statusEl.hidden = true;
     turnsCache = [];
     pendingTurns = [];
     hasMoreTurns = false;
@@ -125,7 +138,7 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
     ensureRail();
     trackEl.innerHTML = '';
     ticks = [];
-    if (!turnsCache.length) {
+    if (!turnsCache.length && !pendingTurns.length) {
       railEl.classList.add('is-empty');
       hideTip();
       return;
@@ -164,9 +177,7 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
       b.dataset.tip = '第 ' + (i + 1) + ' 次提问 · ' + shortText(t.text);
       b.setAttribute('aria-label', '定位到第 ' + (i + 1) + ' 次提问：' + shortText(t.text));
       b.addEventListener('click', function () { focusTurn(this.dataset.mid); });
-      b.addEventListener('mouseenter', (function (idx) {
-        return function () { applyFisheye(idx); showTip(this); };
-      })(i));
+      b.addEventListener('mouseenter', function () { showTip(this); });
       b.addEventListener('focus', function () { showTip(this); });
       b.addEventListener('mouseleave', hideTip);
       b.addEventListener('blur', hideTip);
@@ -189,8 +200,7 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
       trackEl.appendChild(pb);
       ticks.push({ mid: pb.dataset.mid, el: pb, pending: true });
     }
-    layoutTicks();
-    bindRailInteractions();
+    markActive();
     syncActive();
   }
 
@@ -223,61 +233,12 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
       if (!data || !belongs(sid, epoch, version)) return false;
       var known = turnsCache.length;
       mergeIndex(data.turns || []);
-      if (pendingCrid && (data.turns || []).some(function (turn) { return turn.request_id === pendingCrid; })) dropPending(pendingCrid);
+      if (pendingCrid && (data.turns || []).some(function (turn) { return turn.request_id === pendingCrid; })) {
+        pendingTurns = pendingTurns.filter(function (turn) { return turn.crid !== pendingCrid; });
+      }
       build();
       return turnsCache.length > known;
     });
-  }
-
-  /* 按轮次数量算刻度间距与高度：轮次少时稀疏、多了自动压缩、再多就滚动。
-     间距上限 28px 避免两三个轮次时轨道出现大片空白。 */
-  function layoutTicks() {
-    var n = ticks.length;
-    if (!n) return;
-    var avail = Math.max(160, Math.min(Math.round(window.innerHeight * 0.72), 620) - 16);
-    var tickH = n > 90 ? 2 : 3;
-    var gap = n > 1 ? (avail - n * tickH) / (n - 1) : 0;
-    gap = Math.max(2, Math.min(28, gap));
-    trackEl.style.setProperty('--rail-tick-h', tickH + 'px');
-    trackEl.style.setProperty('--rail-gap', (Math.round(gap * 10) / 10) + 'px');
-    trackEl.classList.toggle('is-dense', n > 90);
-  }
-
-  /* 鱼眼：悬停刻度 i 时，它和上下各两级邻居局部放大，其余保持原样。     鼠标按下到松开之间锁布局，防止目标在点击瞬间位移导致误点。 */
-  function applyFisheye(index) {
-    if (trackEl.classList.contains('is-locked')) return;
-    focusedIdx = index;
-    for (var i = 0; i < ticks.length; i++) {
-      var d = Math.abs(i - index);
-      var el = ticks[i].el;
-      el.classList.toggle('is-focus', d === 0);
-      el.classList.toggle('is-near-1', d === 1);
-      el.classList.toggle('is-near-2', d === 2);
-    }
-  }
-
-  function clearFisheye() {
-    if (trackEl.classList.contains('is-locked')) return;
-    focusedIdx = -1;
-    for (var i = 0; i < ticks.length; i++) {
-      ticks[i].el.classList.remove('is-focus', 'is-near-1', 'is-near-2');
-    }
-  }
-
-  function bindRailInteractions() {
-    if (!trackEl || trackEl.dataset.fisheyeBound === '1') return;
-    trackEl.dataset.fisheyeBound = '1';
-    trackEl.addEventListener('mouseleave', clearFisheye);
-    trackEl.addEventListener('pointerdown', function () {
-      trackEl.classList.add('is-locked');
-    });
-    var unlock = function () {
-      if (!trackEl.classList.contains('is-locked')) return;
-      trackEl.classList.remove('is-locked');
-      if (focusedIdx >= 0) applyFisheye(focusedIdx);
-    };
-    window.addEventListener('pointerup', unlock);
-    window.addEventListener('pointercancel', unlock);
   }
 
   function scheduleBuild() {
@@ -286,7 +247,7 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
       buildTimer = 0;
       var sid = currentSession();
       if (sid !== loadedSession || loadedEpoch !== accountEpoch()) loadTurns();
-      else build();
+      else onScroll();
     }, 120);
   }
 
@@ -294,7 +255,9 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
     if (!tipEl) return;
     tipEl.textContent = el.dataset.tip || '';
     var r = el.getBoundingClientRect();
-    tipEl.style.top = Math.round(r.top + r.height / 2) + 'px';
+    var origin = railEl.parentElement.getBoundingClientRect().top;
+    var scale = window.CitrusTheme ? window.CitrusTheme.scale.effective() : 1;
+    tipEl.style.top = Math.round((r.top + r.height / 2 - origin) / scale) + 'px';
     tipEl.classList.add('is-visible');
   }
 
@@ -306,6 +269,8 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
     for (var i = 0; i < ticks.length; i++) {
       var on = ticks[i].mid === activeMid;
       ticks[i].el.classList.toggle('is-active', on);
+      if (on) ticks[i].el.setAttribute('aria-current', 'location');
+      else ticks[i].el.removeAttribute('aria-current');
       if (on && trackEl.scrollHeight > trackEl.clientHeight) {
         // keep the current turn visible inside a scrolling rail
         var el = ticks[i].el;
@@ -324,27 +289,49 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
     var rect = box.getBoundingClientRect();
     var center = rect.top + rect.height / 2;
     var best = '', bestD = Infinity;
-    for (var i = 0; i < ticks.length; i++) {
-      var node = box.querySelector('[data-message-id="' + ticks[i].mid + '"]');
-      if (!node) continue;
+    box.querySelectorAll('.message.user[data-message-id], .message.user > [data-message-id]').forEach(function (node) {
       var nr = node.getBoundingClientRect();
       var d = Math.abs((nr.top + nr.bottom) / 2 - center);
-      if (d < bestD) { bestD = d; best = ticks[i].mid; }
-    }
+      if (d < bestD) { bestD = d; best = node.dataset.messageId; }
+    });
     if (best && best !== activeMid) { activeMid = best; markActive(); }
   }
 
+  function updateScroll() {
+    var box = chatBox();
+    if (!box || !latestEl) return;
+    var nearTail = box.scrollHeight - box.clientHeight - box.scrollTop <= TAIL_DISTANCE;
+    if (nearTail) following = true;
+    else if (box.scrollTop < lastTop - 1) following = false;
+    latestEl.hidden = following || nearTail;
+    lastTop = box.scrollTop;
+  }
+
   function onScroll() {
+    updateScroll();
     if (rafPending) return;
     rafPending = true;
     requestAnimationFrame(function () { rafPending = false; syncActive(); });
+  }
+
+  function follow(force) {
+    var box = chatBox();
+    if (!box || (!force && !following)) return;
+    following = true;
+    box.scrollTop = box.scrollHeight;
+    lastTop = box.scrollTop;
+    onScroll();
   }
 
   function notify(msg) {
     if (typeof showBanner === 'function') {
       try { showBanner(msg); return; } catch (e) { /* fall through */ }
     }
-    console.warn('[turn-rail] ' + msg);
+    if (statusEl) {
+      statusEl.hidden = false; statusEl.textContent = msg;
+      clearTimeout(notify.timer);
+      notify.timer = setTimeout(function () { statusEl.hidden = true; }, 7000);
+    }
   }
 
   function findInHistory(mid) {
@@ -359,10 +346,9 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
     activeMid = String(mid);
     activeLockUntil = Date.now() + 2200;
     markActive();
-    // 跳转会重建刻度（新 DOM 节点），高亮需要在新节点上再钉两次
-    [800, 2000].forEach(function (ms) {
-      setTimeout(function () { activeMid = String(mid); markActive(); }, ms);
-    });
+    // Re-evaluate after the scroll animation without mutating a newer session.
+    var sid = currentSession(), epoch = accountEpoch(), version = generation;
+    setTimeout(function () { if (belongs(sid, epoch, version)) onScroll(); }, 2300);
   }
 
   /* 目标已在视口里时滚不动是正常的，但必须给出可见反馈，不能像“没反应”。 */
@@ -414,15 +400,18 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
   }
 
   function boot() {
-    ensureRail();
     var box = chatBox();
+    if (!box) return;
+    ensureRail();
     if (box) {
+      box.setAttribute('tabindex', '0');
       box.addEventListener('scroll', onScroll, { passive: true });
       if (typeof MutationObserver === 'function') {
         new MutationObserver(scheduleBuild).observe(box, { childList: true });
       }
     }
-    window.addEventListener('resize', function () { layoutTicks(); onScroll(); }, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    window.addEventListener('citrus:scalechange', onScroll);
     window.addEventListener('citrus:session-changed', loadTurns);
     loadTurns();
     // app.js restores history asynchronously; re-check once it settles.
@@ -432,7 +421,7 @@ var activeLockUntil = 0;   // 跳转后短暂锁定当前刻度，避免滚动�
 
   window.turnRail = {
     refresh: scheduleBuild, focus: focusTurn, reload: loadTurns,
-    addPending: addPending, dropPending: dropPending, sync: sync
+    addPending: addPending, dropPending: dropPending, sync: sync, follow: follow
   };
 
   if (document.readyState === 'loading') {

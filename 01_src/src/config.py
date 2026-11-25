@@ -236,14 +236,6 @@ class Settings(BaseSettings):
     # v9.4 (P0#1 论文参数化): RRF 融合后精排候选窗口（原 multi_retriever.py _fuse_rerank_select
     # 隐式 top_k_final*2=20 硬编码）。行为不变：config.yaml candidate_window: 20。
     CANDIDATE_WINDOW: int = Field(default_factory=lambda: _yaml_val("retrieval", "candidate_window", default=20))
-    # Request-scoped candidate pool. A synchronous local prefetch fills an
-    # in-memory pool; its text never enters the model context. Only bounded
-    # candidate tools can read it. Disable per deployment with the env/YAML
-    # switch; the model can always fall back to local_hybrid_search.
-    CANDIDATE_PREFETCH_ENABLED: bool = Field(
-        default_factory=lambda: _yaml_val("retrieval", "candidate_prefetch_enabled", default=True))
-    CANDIDATE_PREFETCH_TIMEOUT_SEC: int = Field(
-        default_factory=lambda: _yaml_val("retrieval", "candidate_prefetch_timeout_sec", default=45))
     CANDIDATE_POOL_SIZE: int = Field(
         default_factory=lambda: _yaml_val("retrieval", "candidate_pool_size", default=12))
     CANDIDATE_POOL_MAX: int = Field(
@@ -291,8 +283,8 @@ class Settings(BaseSettings):
     TEMPERATURE_MAIN: float = Field(default_factory=lambda: _yaml_val("chat", "temperature_main", default=0.2))
     TEMPERATURE_FAST: float = Field(default_factory=lambda: _yaml_val("chat", "temperature_fast", default=0.0))
     MAX_TOKENS: int = Field(default_factory=lambda: _yaml_val("chat", "max_tokens", default=4096))
-    # A truncated proposal may be regenerated in the same loop with a larger
-    # output allowance. This cap does not extend the original task budget.
+    # Additional safety ceiling for the main call. The fixed allowance is the
+    # smaller of this and chat.max_tokens, including after recovery.
     AGENT_MAX_OUTPUT_TOKENS: int = Field(default_factory=lambda: _yaml_val(
         "agent", "max_output_tokens", default=16384), ge=1)
     # Cumulative per-request use is separate from the single-call context window.

@@ -6,7 +6,6 @@ import logging
 import math
 import time
 
-from src.config import settings
 from src.graph.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -36,23 +35,23 @@ async def load_session_context(state: AgentState) -> dict:
         ctx_mgr = ContextManager(
             session_manager=session_manager,
             memory_store=memory_store,
-            budget=budget,
         )
         started = time.perf_counter()
         load_coro = ctx_mgr.load(
             session_id, query, mode,
             user_id=int(state.get("user_id") or 0),
-            generate_hints=not bool(state.get("agent_no_prefetch_hints")) and not capability_policy.history_key,
             capability_policy=capability_policy)
         deadline = float(state.get("request_deadline") or 0.0)
-        if (state.get("agent_no_prefetch_hints") and deadline
-                and math.isfinite(deadline)):
+        if deadline and math.isfinite(deadline):
             # An unbounded request budget must stay unbounded here too;
             # asyncio.wait_for(inf) would still arm a timer for no reason.
             remaining = max(0.1, deadline - time.monotonic() - 25.0)
             ctx = await asyncio.wait_for(load_coro, timeout=remaining)
         else:
             ctx = await load_coro
+        # Keep explicit caller metadata without deriving a route during history load.
+        ctx.search_suggestions = state.get("search_suggestions") or []
+        ctx.format_hint = state.get("format_hint")
         result = finalize_load_result(
             ctx,
             session_manager=session_manager,

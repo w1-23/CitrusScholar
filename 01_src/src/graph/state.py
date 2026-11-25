@@ -26,9 +26,6 @@ class AgentState(TypedDict, total=False):
     request_tables: list[dict]
     request_deadline: float
     request_started_at: float
-    # Only controls whether history "prefetch hints" are generated. It is NOT a
-    # switch for the request-scoped candidate pool declared below.
-    agent_no_prefetch_hints: bool
     session_id: str
     job_id: str
     parent_job_id: str

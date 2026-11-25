@@ -9,6 +9,7 @@ import threading
 logger = logging.getLogger(__name__)
 _RAG_INSTANCE = None
 _RAG_LOCK = threading.Lock()
+_web_readiness = None
 
 
 class RetrievalUnavailable(RuntimeError):
@@ -20,6 +21,10 @@ class RetrievalUnavailable(RuntimeError):
             guidance = ": reload all local retrieval readers for the verified active generation"
         elif reason_code == "base_index_pointer_invalid":
             guidance = ": validate or restore the active index pointer and registry"
+        elif reason_code == "retrieval_warming":
+            guidance = ": local index and model verification is still running"
+        elif reason_code == "retrieval_unavailable":
+            guidance = ": local index or configured inference device is not verified"
         else:
             guidance = (": local retrieval is unavailable in explicit empty-data mode" if empty_allowed else
                         ": configure corpus data or CITRUSQA_ALLOW_EMPTY_DATA=1")
@@ -61,9 +66,20 @@ def require_current_rag(rag) -> None:
         raise RetrievalUnavailable("base_index_reload_required", empty_allowed=False)
 
 
-def get_rag():
+def set_web_readiness(check):
+    """Install the ASGI lifespan guard; standalone readers retain lazy startup."""
+    global _web_readiness
+    _web_readiness = check
+
+
+def get_rag(*, warmup=False):
     """Load the shared corpus/index/models once per service process."""
     global _RAG_INSTANCE
+    check = _web_readiness
+    if check is not None and not warmup:
+        if failure := check():
+            code, empty_allowed = failure
+            raise RetrievalUnavailable(code, empty_allowed=empty_allowed)
     if _RAG_INSTANCE is None:
         with _RAG_LOCK:
             if _RAG_INSTANCE is None:

@@ -121,7 +121,7 @@ class ScriptRuntimeRegistryProofTests(unittest.IsolatedAsyncioTestCase):
                            side_effect=ValueError("bad input")),
               patch("src.research.script_assets.save_script") as save,
               patch.object(registry, "_execute_single_tool", execute)):
-            message = await registry._run_single_tool(tool, call, require_durable=True)
+            message = await registry.run_tool_operation(tool, call, require_durable=True)
         save.assert_not_called()
         self.assertEqual(message.artifact["_tool_outcome"], {
             "status": "not_run", "reason_code": "script_execution_rejected", "artifacts": []})

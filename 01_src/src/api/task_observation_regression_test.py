@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from src.api import main
 from src.core import jobs, task_events
@@ -49,7 +49,7 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual(jobs.get_job(self.claim.job_id)['status'], 'running')
 
     def test_history_failure_still_discovers_tasks_and_signals_retry(self):
-        with patch.object(self.sessions, 'get_display_history', side_effect=OSError('internal detail')):
+        with patch.object(self.sessions, 'get_display_history_page', side_effect=OSError('internal detail')):
             response = self.client.get(f'/sessions/{self.sid}/messages')
         self.assertEqual(response.status_code, 503, response.text)
         result = response.json()
@@ -75,6 +75,83 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual([turn['turn_request_id'] for turn in response.json()['turns']],
                          ['original-client-request', 'later-client'])
+
+    def test_display_page_avoids_older_bodies_and_projects_only_proven_tool_status(self):
+        old_secret = "synthetic older unprojected evidence " * 3000
+        new_secret = "synthetic newest protected evidence " * 3000
+        modern = ToolMessage(content=new_secret, tool_call_id="modern", name="read_tool_result",
+            artifact={"_citrus_execution": {"status": "complete", "reason_code": "complete",
+                        "completed_at_ms": 20, "elapsed_ms": 5, "result_id": "tr_" + "a" * 64}})
+        legacy = ToolMessage(content="[ERR_TIMEOUT] synthetic legacy timeout", tool_call_id="legacy",
+                             name="read_tool_result")
+
+        async def save():
+            for i in range(15):
+                cid = f"old-{i}"
+                await self.sessions.save_messages(self.sid, [HumanMessage(f"Question {i}"),
+                    AIMessage(content="", tool_calls=[{"name": "read_tool_result", "id": cid, "args": {}}]),
+                    ToolMessage(content=old_secret, name="read_tool_result", tool_call_id=cid),
+                    AIMessage("Older answer")], idempotency_key=f"crid:old-{i}")
+            await self.sessions.save_messages(self.sid, [HumanMessage("Newest question"),
+                AIMessage(content="I am reading the selected evidence now.",
+                    tool_calls=[{"name": "read_tool_result", "id": m.tool_call_id, "args": {}}
+                                for m in (modern, legacy)]), modern, legacy,
+                HumanMessage("A loop-only prompt", additional_kwargs={
+                    "context_origin": "internal_control", "context_trusted": True}),
+                AIMessage("Newest answer")], idempotency_key="crid:newest")
+
+        asyncio.run(save())
+        msgs, ids, keys = asyncio.run(self.sessions.get_display_history(self.sid))
+        expected, expected_more, expected_cursor = main._slice_history(
+            main._history_items_from_messages(msgs, ids, keys, {}), 1)
+        read_tools = {}
+        decode = self.sessions._decode_history_rows
+
+        def observe_rows(rows, *args, **kwargs):
+            materialized = list(rows)
+            read_tools.update((row["tool_call_id"], row["content"]) for row in materialized if row["msg_type"] == "tool")
+            return decode(materialized, *args, **kwargs)
+
+        with patch.object(self.sessions, "_decode_history_rows", side_effect=observe_rows), \
+                patch("src.session.files.list_turn_files", return_value={}) as attachments:
+            response = self.client.get(f"/sessions/{self.sid}/messages", params={"limit": 1})
+        self.assertEqual(response.status_code, 200, response.text)
+        page = response.json()
+        self.assertEqual((page["messages"], page["has_more"], page["next_before"]),
+                         (expected, expected_more, expected_cursor))
+        self.assertEqual(read_tools, {"modern": "", "legacy": legacy.content})
+        attachments.assert_called_once_with(self.sid, self.owner, ["newest"])
+        self.assertNotIn(new_secret, response.text)
+        self.assertNotIn("A loop-only prompt", response.text)
+        self.assertEqual(page["turns"][0]["answer"]["content"], "Newest answer")
+        step = next(step for step in page["turns"][0]["trace"] if step.get("tool_call_id") == "modern")
+        self.assertEqual(step["result_id"], "tr_" + "a" * 64)
+        older = self.client.get(f"/sessions/{self.sid}/messages",
+                                params={"limit": 1, "before": page["next_before"]}).json()
+        self.assertEqual([t["turn_request_id"] for t in older["turns"]], ["old-14"])
+        self.assertLess(max(m["message_id"] for m in older["messages"]), page["next_before"])
+
+    def test_unkeyed_legacy_page_uses_real_user_boundary_and_exclusive_cursor(self):
+        async def save():
+            await self.sessions.save_messages(self.sid, [
+                HumanMessage("Earlier legacy question"), AIMessage("Earlier legacy answer"),
+                HumanMessage("Latest legacy question"),
+                HumanMessage("上一轮回答因输出长度上限被截断，请重试。"),
+                AIMessage("Latest legacy answer"),
+            ])
+
+        asyncio.run(save())
+        newest = self.client.get(f"/sessions/{self.sid}/messages", params={"limit": 1}).json()
+        self.assertEqual([m["content"] for m in newest["messages"]],
+                         ["Latest legacy question", "Latest legacy answer"])
+        self.assertTrue(newest["has_more"])
+        older = self.client.get(f"/sessions/{self.sid}/messages", params={
+            "limit": 1, "before": newest["next_before"]}).json()
+        self.assertEqual([m["content"] for m in older["messages"]],
+                         ["Earlier legacy question", "Earlier legacy answer"])
+        self.assertFalse(older["has_more"])
+        self.assertEqual(older["next_before"], 0)
+        self.assertFalse(any(turn.get("history_pending") for turn in older["turns"]))
 
     def test_history_and_replay_use_the_same_public_note_identity(self):
         from src.core.progress_bus import PUBLIC_WORK_NOTES

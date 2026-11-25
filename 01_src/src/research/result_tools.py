@@ -67,7 +67,7 @@ def _read_rejected(status: str, reason: str, message: str, **details) -> str:
                        "_tool_outcome": _outcome("not_run", reason, message), **details}, ensure_ascii=False)
 
 
-def _shared_result_accessible(row, text, fetch_result) -> bool:
+def _shared_result_accessible(row, text, fetch_result, *, allow_rqa=True) -> bool:
     from src.shared_corpus.references import read_reference, source_rows
     from src.corpus_integration.read_access import reference_visible
 
@@ -88,6 +88,15 @@ def _shared_result_accessible(row, text, fetch_result) -> bool:
         text = str(row.get("result_text") or "")
 
     name = row.get("tool_name")
+    if not allow_rqa:
+        from src.agent.installed_skills import is_rqa_tool_result
+
+        try:
+            args = json.loads(row.get("args_json") or "null")
+        except (TypeError, ValueError, RecursionError):
+            args = None
+        if is_rqa_tool_result(name, text, args if isinstance(args, dict) else None):
+            return False
     if name in {"inspect_candidates", "search_candidates", "read_candidate", "read_local_evidence",
                 "search_agent_corpus", "local_hybrid_search"}:
         from src.core.capability_policy import allows
@@ -183,7 +192,10 @@ def read_tool_result(tool_call_id: str, start_char: int = 0,
 
     text = str(row.get("result_text") or "")
     try:
-        accessible = _shared_result_accessible(row, text, fetch_for_current_request)
+        from src.agent.installed_skills import RQA_ID, current_turn_skills
+
+        accessible = _shared_result_accessible(row, text, fetch_for_current_request,
+                                              allow_rqa=current_turn_skills().allows(RQA_ID))
     except (PermissionError, sqlite3.Error, OSError, ValueError):
         accessible = False
     if not accessible:

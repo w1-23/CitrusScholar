@@ -21,11 +21,6 @@ class FakeSession:
                 "working_state": self.working_state}
 
 
-class ExplodingBudget:
-    def check(self, *args, **kwargs):
-        raise AssertionError("load-time model compaction must not run")
-
-
 def document():
     return {
         "schema": checkpoint_restore.SCHEMA,
@@ -54,8 +49,7 @@ class SendViewTests(unittest.TestCase):
         self.ids = [1, 2, 3, 4]
 
     def view(self, summary, *, valid=None, working_state=None):
-        manager = ContextManager(session_manager=FakeSession(summary, working_state),
-                                 budget=ExplodingBudget())
+        manager = ContextManager(session_manager=FakeSession(summary, working_state))
         reason = "source_integrity_failed" if valid is False else None
         context = patch.object(checkpoint_restore, "checkpoint_rejection", return_value=reason)
         with context as validator:
@@ -126,3 +120,59 @@ def test_experiment_turns_keep_scope_and_task_snapshot_after_sqlite_readback(tmp
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionLoadPolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_hints_are_preserved_without_model_or_finite_timer_when_unbounded(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from src.core.context_manager import LoadedContext, build_human_message
+        from src.graph.session_nodes import load_session_context
+
+        context = LoadedContext(session_id="s", user_id=5, mode="general_agent", query="q")
+        policy = SimpleNamespace(history_key="test", allows=lambda name: False)
+        with (patch("src.core.capability_policy.policy_for_state", return_value=policy),
+              patch.object(ContextManager, "load", new_callable=AsyncMock, return_value=context) as load,
+              patch("src.core.llm_pool.get_llm", side_effect=AssertionError("no model during history load")),
+              patch("src.graph.session_nodes.asyncio.wait_for", side_effect=AssertionError("no finite timer"))):
+            result = await load_session_context({"session_id": "s", "user_id": 5, "query": "q",
+                "request_deadline": float("inf"), "search_suggestions": ["provided"], "format_hint": "table"})
+        load.assert_awaited_once_with("s", "q", "general_agent", user_id=5, capability_policy=policy)
+        self.assertEqual(result["search_suggestions"], ["provided"])
+        self.assertEqual(result["format_hint"], "table")
+        self.assertIn("<search_suggestions>", build_human_message(context).content)
+        self.assertIn("<format_hint>", build_human_message(context).content)
+
+    async def test_finite_deadline_is_enforced_without_the_retired_flag(self):
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from src.core.context_manager import LoadedContext
+        from src.graph.session_nodes import load_session_context
+
+        context = LoadedContext(session_id="s", user_id=5, mode="general_agent", query="q")
+        policy = SimpleNamespace(history_key="test", allows=lambda name: False)
+        async def bounded(coro, *, timeout):
+            self.assertGreater(timeout, 8)
+            self.assertLessEqual(timeout, 10)
+            return await coro
+        with (patch("src.core.capability_policy.policy_for_state", return_value=policy),
+              patch.object(ContextManager, "load", new_callable=AsyncMock, return_value=context),
+              patch("src.graph.session_nodes.asyncio.wait_for", side_effect=bounded) as wait):
+            result = await load_session_context({"session_id": "s", "user_id": 5, "query": "q",
+                "request_deadline": time.monotonic() + 35.0})
+        wait.assert_awaited_once()
+        self.assertEqual(result["search_suggestions"], [])
+        self.assertIsNone(result["format_hint"])
+
+    def test_old_checkpoint_hint_switch_is_accepted_but_never_reemitted(self):
+        from src.agent.identity import ExecutionIdentity
+        from src.agent.recovery import capture_original_request_state, validate_original_request_state
+
+        identity = ExecutionIdentity(5, "s", "request", "job")
+        fields = {"user_id": 5, "session_id": "s", "request_id": "request", "job_id": "job",
+                  "client_request_id": "client", "query": "q", "idempotency_key": "idem",
+                  "search_suggestions": ["provided"], "format_hint": "table"}
+        legacy = dict(fields, agent_no_prefetch_hints=True)
+        self.assertEqual(capture_original_request_state(legacy), fields)
+        self.assertEqual(validate_original_request_state(legacy, identity), fields)

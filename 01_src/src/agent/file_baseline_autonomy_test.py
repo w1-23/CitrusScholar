@@ -12,6 +12,7 @@ from src.agent.batch_journal import require_unclaimed_call
 from src.agent.capabilities import CapabilityCatalog
 from src.agent.checkpoint_store import framework_checkpoint_scope, open_framework_checkpoint
 from src.agent.harness import HarnessRuntime
+from src.agent.framework_test_support import ScriptedModel
 from src.agent.host_tools import HostTools
 from src.agent.identity import ExecutionIdentity
 from src.agent.runtime import FinalCheck, RunLimits
@@ -210,7 +211,7 @@ def test_framework_no_skill_file_dispatch_and_replay(tmp_path, file_run, interru
         async def accept(*args):
             return FinalCheck()
 
-        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(4), schemas,
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(4), schemas,
             export_host=lambda: {"fixture": True}, restore_host=lambda state: None,
             restore_tool_observation=restore_observation, tool_mode=catalog.execution_mode)
         async with open_framework_checkpoint(tmp_path, file_run, provider) as saver:

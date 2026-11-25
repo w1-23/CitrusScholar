@@ -439,7 +439,6 @@ def test_figure_methods_guidance_and_resource_stay_non_authorizing():
     assert resource_id not in system_prompt({"read_skill", "web_search"})
     for tool in ("run_research_figure_script", "draw_svg"):
         assert resource_id not in system_prompt({tool})
-        assert resource_id not in system_prompt({tool}, native_skills=True)
 
     resource = (Path(__file__).resolve().parents[3]
                 / "02_config/skill-history/repository-v3/skills/nature-figure/references/figure-methods.md")
@@ -452,32 +451,21 @@ def test_figure_methods_guidance_and_resource_stay_non_authorizing():
         assert token in body
 
 
-def test_skill_session_reads_archived_nature_identity_but_selection_is_current():
-    """The root reader accepts archived guidance; new selection stays current."""
+def test_read_only_archive_resolves_nature_identity_but_selection_is_current():
+    """Archived guidance is readable without admitting the old Skill for execution."""
     pytest.importorskip("langchain_core")
-    from dataclasses import dataclass
     from src.agent import research_skill_catalog as catalog
-    from src.agent.skill_adapter import SkillSession, validate_scenario_selection
+    from src.agent.installed_skills import validate_scenario_selection
 
     archived = catalog._ARCHIVED_NATURE_IDENTITY
     assert catalog.has_identity("nature-figure", *archived)
-
-    @dataclass
-    class Identity:
-        user_id: int = 1
-        session_id: str = "session"
-        user_turn_id: str = "turn"
-        run_id: str = "run"
-
-    session = SkillSession(Identity(), lambda: {"read_skill"}, allow_archived=True)
     current = catalog.PINNED["nature-figure"]
     for version, sha256 in (current, archived):
-        payload = session.page("nature-figure", version, sha256, "SKILL.md", max_chars=120)
-        assert payload["skill"]["version"] == version
-        assert payload["page"]["resource"] == "SKILL.md"
-        assert payload["page"]["text"]
-    methods = session.page("nature-figure", *current, "references/figure-methods.md", max_chars=20000)
-    assert methods["page"]["sha256"] == hashlib.sha256(methods["page"]["text"].encode()).hexdigest()
+        info, page = catalog.read_resource("nature-figure", version, sha256, "SKILL.md", max_chars=120)
+        assert info["version"] == version and page["resource"] == "SKILL.md" and page["text"]
+    _, methods = catalog.read_resource("nature-figure", *current, "references/figure-methods.md", max_chars=20000)
+    assert methods["sha256"] == hashlib.sha256(methods["text"].encode()).hexdigest()
+
     with pytest.raises(ValueError):
         validate_scenario_selection([
             {"id": "nature-figure", "version": archived[0], "sha256": archived[1]}])

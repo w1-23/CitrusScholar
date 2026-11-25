@@ -426,9 +426,29 @@ class LocalBackend:
 
 
 # ── Choosing a backend ────────────────────────────────────────────────────
+_web_worker_lookup = None
+
+
+def set_web_worker_readiness(lookup):
+    """Bind selection to the Web lifespan's verified runner, if any."""
+    global _web_worker_lookup
+    _web_worker_lookup = lookup
+
+
+def backend_identity(*, backend, image, image_sha256, runtime, wsl_distribution):
+    """Match all runner inputs without touching the filesystem or subprocesses."""
+    return (str(backend or "").strip().lower(), image, image_sha256, runtime, wsl_distribution)
+
+
+def web_backend_selection(identity):
+    """Distinguish a managed but unavailable backend from standalone selection."""
+    lookup = _web_worker_lookup
+    return (False, None) if lookup is None or identity[0] == "local" else (True, lookup(identity))
+
+
 def select_backend(*, backend: str = "", image: str = "", runtime: str = "",
                    allow_local: bool = False, image_sha256: str = "",
-                   wsl_distribution: str = "Ubuntu-24.04") -> SandboxRunner | None:
+                   wsl_distribution: str = "Ubuntu-24.04", startup_probe: bool = False) -> SandboxRunner | None:
     """Pick the sandbox to use, or ``None`` when scripts cannot be run.
 
     The mapping is deliberate:
@@ -448,6 +468,11 @@ def select_backend(*, backend: str = "", image: str = "", runtime: str = "",
     name = str(backend or "").strip().lower()
     if name in {"", "off", "none", "disabled"}:
         return None
+    if not startup_probe:
+        managed, verified = web_backend_selection(backend_identity(backend=name, image=image,
+            image_sha256=image_sha256, runtime=runtime, wsl_distribution=wsl_distribution))
+        if managed:
+            return verified
     if name == "docker":
         runner = DockerBackend(image=image, runtime=runtime)
         return runner if runner.available() else None

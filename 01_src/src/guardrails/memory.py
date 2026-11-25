@@ -461,10 +461,14 @@ class MemoryStore:
         try:
             if int(owner_user_id or 0) <= 0:
                 return ""
-            return self._recall_semantic(query, top_k, int(owner_user_id), max_chars)
+            from src.runtime_status import web_model_ready
+
+            if web_model_ready("embedder"):
+                return self._recall_semantic(query, top_k, int(owner_user_id), max_chars)
+            logger.debug("[Memory] semantic model unavailable; using keyword recall")
         except Exception as e:
             logger.debug(f"[Memory] 语义召回失败, 回退关键词: {e}")
-            return self._recall_keyword_fallback(query, top_k, int(owner_user_id or 0), max_chars)
+        return self._recall_keyword_fallback(query, top_k, int(owner_user_id or 0), max_chars)
 
     # v8.9 记忆域化参数：跨域（全局共享）事实的排序权重（本会话域事实 1.0）
     CROSS_DOMAIN_WEIGHT = 0.9

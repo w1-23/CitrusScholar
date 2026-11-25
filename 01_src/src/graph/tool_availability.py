@@ -153,7 +153,8 @@ def script_sandbox_available() -> bool:
     sandbox: a caller that wants a different answer passes
     ``script_sandbox=`` explicitly.
 
-    The answer is cached per configuration tuple. Probing means starting a
+    Web uses live startup evidence without probing or caching a pending result.
+    Outside Web, the answer is cached per configuration tuple. Probing means starting a
     ``docker version`` subprocess, and this function runs once per request;
     against a stopped daemon that subprocess waits out its timeout. The
     configuration only changes on restart, and keying on its values keeps
@@ -167,6 +168,12 @@ def script_sandbox_available() -> bool:
         image_sha256 = str(getattr(settings, "FIGURES_SANDBOX_IMAGE_SHA256", "") or "")
         allow_local = bool(getattr(settings, "FIGURES_SANDBOX_ALLOW_LOCAL", False))
         distribution = str(getattr(settings, "FIGURES_SANDBOX_WSL_DISTRO", "Ubuntu-24.04"))
+        from src.figures.sandbox import backend_identity, web_backend_selection
+
+        managed, runner = web_backend_selection(backend_identity(backend=backend, image=image,
+            image_sha256=image_sha256, runtime=runtime, wsl_distribution=distribution))
+        if managed:
+            return runner is not None
         if backend == "wsl-docker":
             from src.figures.readiness import worker_snapshot
             evidence = worker_snapshot(settings)

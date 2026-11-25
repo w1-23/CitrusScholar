@@ -315,6 +315,12 @@ def save_question_context(job_id, context):
             raise QuestionConflict("pending_question_not_found")
         previous = json.loads(row["context"])
         context = dict(context)
+        from src.agent.installed_skills import stored_release_pin
+        previous_pin = stored_release_pin(previous)
+        if previous_pin and previous_pin != stored_release_pin(context):
+            raise QuestionConflict("question_skill_release_mismatch")
+        if previous.get("selected_skills", []) != context.get("selected_skills", []):
+            raise QuestionConflict("question_skill_selection_mismatch")
         datasets = list(context.get("dataset_refs") or [])
         for ref in previous.get("dataset_refs") or []:
             if ref not in datasets:

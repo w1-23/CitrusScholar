@@ -45,9 +45,11 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(collect_outputs({**settings, "outputs": (OUTPUT,)}), {"outputs": valid})
             self.assertEqual(collect_outputs({**settings, "outputs": (OUTPUT, extra)}),
                              {"outputs": {**valid, extra: base64.b64encode(b"extra").decode()}})
-            for paths in [(absent,), (OUTPUT, absent), ("/outputs/sub/absent.txt",)]:
+            for paths in [(absent,), (OUTPUT, absent), (absent, "/outputs/sub/absent.txt")]:
                 with self.subTest(paths=paths):
-                    self.assertEqual(collect_outputs({**settings, "outputs": paths}), {"collection_error": MISSING})
+                    self.assertEqual(collect_outputs({**settings, "outputs": paths}),
+                                     {"collection_error": MISSING,
+                                      "missing_paths": [path for path in paths if path != OUTPUT]})
             self.assertEqual(collect_outputs({**settings, "outputs": (OUTPUT, extra), "output_bytes": 10}),
                              {"collection_error": "execution_output_byte_limit"})
 
@@ -92,7 +94,13 @@ class ApptainerCollectionTests(unittest.TestCase):
         response = dict(identity=self.identity, phase="retained", summary=self.summary, collection_error=MISSING)
         with self.assertRaisesRegex(OutputRejected, MISSING):
             self.collect_payload(response)
+        with self.assertRaises(OutputRejected) as result:
+            self.collect_payload({**response, "missing_paths": [OUTPUT]})
+        self.assertEqual(result.exception.missing_paths, (OUTPUT,))
         cases = [
+            ({**response, "missing_paths": ["/outputs/undeclared.txt"]}, "invalid_collected_output_rejection"),
+            ({**response, "missing_paths": [OUTPUT, OUTPUT]}, "invalid_collected_output_rejection"),
+            ({**response, "missing_paths": []}, "invalid_collected_output_rejection"),
             ({k: v for k, v in response.items() if k != "identity"}, "apptainer_control_identity_unconfirmed"),
             ({**response, "identity": {**self.identity, "invocation": "b" * 32}}, "apptainer_control_identity_unconfirmed"),
             ({**response, "identity": {**self.identity, "device": True}}, "invalid_apptainer_runtime_identity"),
@@ -154,11 +162,14 @@ class ControllerCollectionTests(unittest.TestCase):
             return result
 
     def test_preserves_diagnostics_and_never_accepts_partial_outputs(self):
-        self.worker.backend.collect.side_effect = [self.diagnostics, OutputRejected(MISSING)]
+        self.worker.backend.collect.side_effect = [self.diagnostics, OutputRejected(MISSING, [OUTPUT])]
         result = self.run_worker()
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["receipt"]["reason"], "execution_output_rejected")
         self.assertEqual(result["receipt"]["error_code"], MISSING)
+        self.assertEqual(result["receipt"]["missing_output_paths"], [OUTPUT])
+        self.assertEqual(result["receipt"]["declared_output_paths"], [OUTPUT])
+        self.assertNotIn("files", result["receipt"])
         self.assertEqual(result["receipt"]["stdout"]["log_ref"], {"execution_id": EXECUTION_ID, "fence": 1})
         self.assertTrue(result["receipt"]["process_stopped"])
         self.worker.logs.store.assert_called_once_with(self.row, stdout=b"script out", stderr=b"script err", capture_truncated=False)

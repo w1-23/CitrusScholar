@@ -163,23 +163,25 @@ def research_workspace(
                 raise ValueError("Research intent exceeds its size limit")
             return _result({"research_intent": json.loads(encoded),
                             "intent_status": "model_proposed_not_authorization"})
-        from src.agent.installed_skills import active_skills, read_installed_resource, release_path
+        from src.agent.installed_skills import current_turn_skills, read_installed_resource
         if operation == "skills":
-            return _result({"skills": active_skills()})
+            return _result({"skills": current_turn_skills().rows()})
         if operation in {"read_skill", "read_skill_resource"}:
-            release = release_path()
-            selected = next((row for row in active_skills() if row["id"] == skill_id), None)
+            view = current_turn_skills()
+            release = view.release
+            selected = next((row for row in view.rows() if row["id"] == skill_id), None)
             if release is None or selected is None:
                 raise ValueError("skill_resource_unavailable")
             if type(start_char) is not int or start_char < 0 or type(max_chars) is not int or max_chars <= 0:
                 raise ValueError("invalid_skill_pagination")
             info, page = read_installed_resource(release, selected, resource if operation == "read_skill_resource" else "",
                                                   start_char=start_char, max_chars=min(max_chars, 20000))
-            return _result(page if operation == "read_skill_resource" else {"skill": info, "entrypoint": page})
+            return _result({**page, "skill_id": info["id"]}
+                           if operation == "read_skill_resource" else {"skill": info, "entrypoint": page})
         if operation == "list":
             return _result({"workspace": "current_session", "capabilities": capability_catalog(),
                             "presets": list_presets(), "scripts": assets.list_scripts(owner, session),
-                            "skills": active_skills(),
+                            "skills": current_turn_skills().rows(),
                             "reuse_order": ["existing_tool", "existing_script_parameters", "local_revision", "new_script_if_needed"]})
         if operation == "runs":
             return _result({"runs": assets.list_runs(owner, session, script_ref=script_ref)})

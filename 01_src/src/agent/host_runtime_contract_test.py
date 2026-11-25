@@ -1,4 +1,5 @@
 """Synthetic regressions for host-owned execution, stream and context boundaries."""
+import asyncio
 from contextlib import nullcontext
 import hashlib
 import json
@@ -11,16 +12,18 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import NodeCancelledError
 
 from src.agent import code_tools, workspace_tools
 from src.agent.context_projection import ArchiveReference, EncryptedContextArchiveReader
 from src.agent.harness import HarnessRuntime
+from src.agent.framework_test_support import ScriptedModel, invoke_model_once
 from src.agent.identity import ExecutionIdentity
-from src.agent.model import ModelDriver
 from src.agent.runtime import BatchObservation, FinalCheck, RunLimits
-from src.agent.skill_adapter import SkillSession
 from src.core import jobs, task_events, tracing
-from src.core.provider_protocol import DeepSeekChatOpenAI, _DeepSeekMessage, _ProtocolState
+from src.core.provider_protocol import _DeepSeekMessage, _ProtocolState
+from src.core.provider_transport import AsyncDeepSeekTransport
+from langchain_openai import ChatOpenAI
 from src.tools import registry
 from src.workspaces import WorkspaceConflict
 
@@ -101,7 +104,7 @@ class DeliveryDispatchTests(unittest.IsolatedAsyncioTestCase):
                       patch.object(delivery_tools, "_receipts", return_value=(
                           [] if scenario == "preflight" else [link], scenario != "preflight")),
                       patch.object(tools, "_save_artifact") as save):
-                    message = await registry._run_single_tool(producer, {
+                    message = await registry.run_tool_operation(producer, {
                         "name": producer.name, "id": CALL["id"],
                         "args": {"kind": "data_audit", "review_id": "c" * 32, "output_format": "xlsx"},
                     }, require_durable=True)
@@ -133,7 +136,7 @@ class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_tool, call, **_kwargs):
             return invoke(call)
         with patch.object(registry, "_execute_single_tool", execute), code_tools.code_execution_context(IDENTITY, CALL["id"]):
-            return await registry._run_single_tool(SimpleNamespace(name=tool_name),
+            return await registry.run_tool_operation(SimpleNamespace(name=tool_name),
                 {"name": tool_name, "id": CALL["id"], "args": {}}, require_durable=True)
 
     def code_write(self, call):
@@ -231,7 +234,7 @@ class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):
             "path": "data/book.xlsx", "file_id": "b" * 32, "sha256": "c" * 64}}
         with (patch.object(task_events, "start_operation", start),
               patch.object(registry, "_execute_single_tool", execute)):
-            await registry._run_single_tool(tool, call, require_durable=True)
+            await registry.run_tool_operation(tool, call, require_durable=True)
         self.assertEqual(start.call_args.args[3]["path"], "/input/data/book.xlsx")
         self.assertEqual(seen["executor"]["path"], "/input/data/book.xlsx")
 
@@ -263,12 +266,12 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             return await invoke()
 
         catalog = SimpleNamespace(schemas=lambda _names: [SCHEMA], execution_mode=lambda _name: "parallel")
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond), trust_env=False) as client:
-            model = DeepSeekChatOpenAI(model=SCOPE[1], api_key="synthetic", base_url=SCOPE[0],
+        async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(SCOPE[0], httpx.MockTransport(respond)), trust_env=False) as client:
+            model = ChatOpenAI(use_responses_api=False, model=SCOPE[1], api_key="synthetic", base_url=SCOPE[0],
                 max_retries=0, stream_usage=True, http_async_client=client)
-            driver = ModelDriver(model, catalog, lambda _identity: {CALL["name"]}, allow_tool_stop=allow_tool_stop)
             with patch.object(task_events, "run_model_attempt", attempt):
-                return await driver((HumanMessage(content="synthetic"),), IDENTITY)
+                return await invoke_model_once(model, catalog, {CALL["name"]}, [HumanMessage("synthetic")],
+                                               IDENTITY, allow_tool_stop=allow_tool_stop)
 
     @staticmethod
     def native(arguments):
@@ -311,12 +314,34 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             response = await self.wire([(self.native("{}"), None), ({}, "stop")], allow_tool_stop=compatibility)
             self.assertEqual(bool(response.response_metadata.get("citrus_stream_terminal_unconfirmed")), not compatibility)
 
+    async def test_native_provider_internal_cancel_remains_a_cancel(self):
+        def cancel(_request):
+            raise asyncio.CancelledError()
+
+        cancelled = []
+
+        async def attempt(_model, _messages, invoke, **_kwargs):
+            try:
+                return await invoke()
+            except asyncio.CancelledError as error:
+                cancelled.append(type(error).__name__)
+                raise
+
+        catalog = SimpleNamespace(schemas=lambda _names: [SCHEMA], execution_mode=lambda _name: "parallel")
+        async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(SCOPE[0], httpx.MockTransport(cancel)), trust_env=False) as client:
+            model = ChatOpenAI(use_responses_api=False, model=SCOPE[1], api_key="fixture", base_url=SCOPE[0],
+                max_retries=0, stream_usage=True, http_async_client=client)
+            with patch.object(task_events, "run_model_attempt", attempt):
+                with self.assertRaises(NodeCancelledError):
+                    await invoke_model_once(model, catalog, {CALL["name"]}, [HumanMessage("fixture")], IDENTITY)
+        self.assertEqual(cancelled, ["CancelledError"])
+
     async def test_harness_rejects_unconfirmed_before_final_or_tool_execution(self):
         for tool_calls in ([], [CALL]):
             model = AsyncMock(return_value=AIMessage(content="provisional", tool_calls=tool_calls,
                 response_metadata={"citrus_stream_terminal_unconfirmed": True}))
             execute, check, progress = AsyncMock(), AsyncMock(), Mock()
-            harness = HarnessRuntime(model, execute, AsyncMock(), check, RunLimits(2, time.monotonic() + 5),
+            harness = HarnessRuntime(ScriptedModel(script=model), execute, AsyncMock(), check, RunLimits(2, time.monotonic() + 5),
                 [SCHEMA], on_public_progress=progress)
             result = await harness.run(IDENTITY, [HumanMessage(content="request")], saver=InMemorySaver())
             self.assertEqual((result.status, result.reason), ("incomplete", "model_stream_unconfirmed"))
@@ -330,7 +355,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             model = AsyncMock(return_value=AIMessage(content="answer", tool_calls=tool_calls,
                 response_metadata={"finish_reason": reason}))
             execute, check = AsyncMock(), AsyncMock(return_value=FinalCheck())
-            harness = HarnessRuntime(model, execute, AsyncMock(), check, RunLimits(2, time.monotonic() + 5), [SCHEMA])
+            harness = HarnessRuntime(ScriptedModel(script=model), execute, AsyncMock(), check, RunLimits(2, time.monotonic() + 5), [SCHEMA])
             result = await harness.run(IDENTITY, [HumanMessage(content="request")], saver=InMemorySaver())
             self.assertEqual(result.status, status)
             model.assert_awaited_once()
@@ -343,7 +368,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             response_metadata={"finish_reason": "tool_calls"}), AIMessage(content="final")])
         observe = AsyncMock(return_value=BatchObservation((receipt(CALL, "invalid_tool_arguments"),)))
         execute = AsyncMock()
-        harness = HarnessRuntime(model, execute, AsyncMock(), AsyncMock(return_value=FinalCheck()),
+        harness = HarnessRuntime(ScriptedModel(script=model), execute, AsyncMock(), AsyncMock(return_value=FinalCheck()),
             RunLimits(2, time.monotonic() + 5), [SCHEMA], recover_output=True, record_rejected=observe)
         result = await harness.run(IDENTITY, [HumanMessage(content="request")], saver=InMemorySaver())
         self.assertEqual(result.status, "complete")
@@ -362,16 +387,14 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("host_preflight_reconciled", rows[0]["data"]["additional_kwargs"])
         self.assertIn("host_preflight_reconciled", observation.additional_kwargs)
 
-    def test_locked_skill_receipt_survives_projection_without_claiming_visibility(self):
-        skill = SkillSession(IDENTITY, lambda: {CALL["name"]})
-        selected = {"id": "fixture-skill", "version": "1", "sha256": "a" * 64}
-        payload = {"skill": selected, "page": {"resource": "", "start_char": 0, "text": "method", "sha256": "b" * 64,
-                    "total_chars": 6}, "required_resources": [""], "dependencies": []}
-        message = ToolMessage(content=json.dumps(payload), name="read_skill", tool_call_id="skill-page")
-        skill.receipts["skill-page"] = skill._receipt("tool", "skill-page", message.content, payload)
-        with patch.object(skill, "page", return_value=payload):
-            self.assertEqual(skill.verify_view([message]), {"fixture-skill"})
-            self.assertEqual(skill.verify_view([]), set())
-            self.assertIn("skill-page", skill.export()["receipts"])
-            self.assertEqual(skill.verify_view([message]), {"fixture-skill"})
-        self.assertEqual(skill.allowed({CALL["name"]}), {CALL["name"]})
+    def test_historical_skill_payload_still_decodes_as_guidance(self):
+        from src.core.model_context import is_skill_result
+        from src.core.tool_catalog import HOST_TOOL_LABELS
+
+        page = {"resource": "SKILL.md", "start_char": 0, "text": "method",
+                "content_origin": "installed_skill_guidance"}
+        self.assertTrue(is_skill_result(ToolMessage(content=json.dumps({"page": page}),
+            name="read_skill", tool_call_id="legacy-skill-page")))
+        self.assertTrue(is_skill_result(ToolMessage(content=json.dumps({"skill_load": [{"page": page}]}),
+            name="load_skill", tool_call_id="legacy-skill-load")))
+        self.assertTrue(HOST_TOOL_LABELS["read_skill"] and HOST_TOOL_LABELS["load_skill"])

@@ -1,5 +1,7 @@
 import { byId, element } from './dom.js';
 
+import { legacyEditorUrl } from './navigation.js?v=1';
+
 const DRAG_TYPE = 'application/x-citrus-workbench-figure';
 const validId = (id) => typeof id === 'string' && /^[a-f0-9]{32}$/.test(id);
 const validVersion = (value) => Number.isSafeInteger(value) && value >= 0;
@@ -52,6 +54,13 @@ export function initializeLibrary({ request, api, revisionUrl, loadAsset, activa
         });
         button.addEventListener('dragend', () => { dragged = null; canvas.classList.remove('drop-ready'); });
         row.append(button);
+        const legacy = legacyEditorUrl(project);
+        if (legacy) {
+          const editor = element('a', '旧版 SVG 编辑器', 'asset-editor');
+          editor.href = legacy;
+          editor.setAttribute('aria-label', `在旧版 SVG 编辑器打开 ${project.title || '未命名图件'}`);
+          row.append(editor);
+        }
         list.append(row);
       }
       offset += projects.length;

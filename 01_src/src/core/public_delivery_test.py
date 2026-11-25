@@ -1,5 +1,4 @@
 """Public delivery, private snapshot, and first-packet regression contracts."""
-import asyncio
 from contextlib import contextmanager
 import importlib.util
 import json
@@ -135,31 +134,30 @@ class PublicDeliveryTests(unittest.TestCase):
             "seq": exported["events"][-1]["seq"], "status": "compacted", "elapsed_ms": 55})
         conn.close()
 
-    def test_first_provider_packet_precedes_any_text(self):
-        from langchain_core.messages import AIMessageChunk
+    def test_native_first_packet_is_recorded_before_preview_and_never_exposes_reasoning(self):
+        from langchain_core.messages import AIMessage, AIMessageChunk
+        from langchain_core.outputs import ChatGenerationChunk
+        from src.agent.model import _StreamEvidence
         from src.core.request_context import _observation
-        from src.core.stream_llm import stream_llm_response
 
-        observed = []
-        class Model:
-            async def astream(self, messages):
-                yield AIMessageChunk(content="", additional_kwargs={"reasoning_content": "private fixture"})
-                yield AIMessageChunk(content="public text")
-                yield AIMessageChunk(content="", response_metadata={"finish_reason": "stop"})
-        async def run():
-            scope = {}
-            token = _observation.set(scope)
-            try:
-                response = await stream_llm_response(Model(), [], verify_terminal=True,
-                    on_text=lambda chunk: observed.append(("text", chunk)),
-                    on_provider_first_packet=lambda elapsed: observed.append(("packet", elapsed)))
-                self.assertEqual(scope["provider_first_packet_ms"], observed[0][1])
-                self.assertEqual(response.content, "public text")
-                self.assertNotIn("reasoning_content", response.additional_kwargs)
-            finally:
-                _observation.reset(token)
-        asyncio.run(run())
-        self.assertEqual([kind for kind, _ in observed], ["packet", "text"])
+        observed, scope = [], {}
+        saved = _observation.set(scope)
+        try:
+            evidence = _StreamEvidence(lambda piece: observed.append((scope["provider_first_packet_ms"], piece)))
+            evidence.on_llm_new_token("", chunk=ChatGenerationChunk(message=AIMessageChunk(
+                content="", additional_kwargs={"reasoning_content": "private fixture"})))
+            packet = scope["provider_first_packet_ms"]
+            self.assertEqual(observed, [])
+            evidence.on_llm_new_token("preview text", chunk=ChatGenerationChunk(message=AIMessageChunk(
+                content="preview text", response_metadata={"finish_reason": "stop"})))
+            response = evidence.check(AIMessage(content="preview text", additional_kwargs={
+                "reasoning_content": "private fixture"}), allow_tool_stop=False, output_limit=None)
+            self.assertEqual(observed, [(packet, "preview text")])
+            self.assertEqual(response.content, "preview text")
+            self.assertNotIn("reasoning_content", response.additional_kwargs)
+            self.assertEqual(project_public_event("text", {"content": response.content, "phase": "draft"}), {})
+        finally:
+            _observation.reset(saved)
 
     def test_exporter_retains_receipt_and_user_prose_not_nested_secret(self):
         path = Path(__file__).resolve().parents[3] / "04_scripts" / "export_8043_turns.py"

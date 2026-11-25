@@ -498,11 +498,18 @@ class OfflineApptainerBackend:
             if not include_outputs or "outputs" in response:
                 raise OCIError("apptainer_collector_record_invalid")
             code = response["collection_error"]
-            _raise_output_rejection({"error": code})
+            rejection = {"error": code}
+            if "missing_paths" in response:
+                rejection["missing_paths"] = response["missing_paths"]
+            _raise_output_rejection(rejection, handle.request.outputs)
+            if "missing_paths" in response:
+                raise OCIError("apptainer_collector_record_invalid")
             if type(code) is str and code in {
                     "apptainer_collector_timeout", "apptainer_collector_unconfirmed",
                     "apptainer_collection_record_limit", "apptainer_collector_record_invalid"}:
                 raise OCIError(code)
+            raise OCIError("apptainer_collector_record_invalid")
+        if "missing_paths" in response:
             raise OCIError("apptainer_collector_record_invalid")
         raw = response.get("outputs")
         expected = set(handle.request.outputs) if include_outputs else set()

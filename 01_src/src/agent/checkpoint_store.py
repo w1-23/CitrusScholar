@@ -18,6 +18,7 @@ import os
 from pathlib import Path, PurePath
 import re
 import stat
+import struct
 import tempfile
 from typing import Any, AsyncIterator
 
@@ -32,20 +33,17 @@ from langchain_core.messages import (
 from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.encrypted import EncryptedSerializer
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-# DeepAgentState uses this private LangGraph snapshot type; pin the SDK version.
-from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.types import Interrupt, Overwrite, Send
+from langgraph.types import Interrupt, Overwrite, Send, TimeoutPolicy
 
 from src.agent.identity import ExecutionIdentity
-from src.core.provider_protocol import _DeepSeekMessage, _DeepSeekMessageChunk, _ProtocolState
-
-import logging
-
-logger = logging.getLogger(__name__)
+from src.core.provider_protocol import (
+    _checkpoint_protocol, _DeepSeekMessage, _DeepSeekMessageChunk, _ProtocolState,
+)
 
 _TAG = "__citrus_checkpoint_v1__"
-_FORMAT = "citrus-checkpoint-v1"
+_LEGACY_FORMAT = "citrus-checkpoint-v1"
+_FORMAT = "citrus-checkpoint-v2"
 _CIPHER = "aesgcm-v1"
 WORKING_CONTEXT_ARCHIVE_NAMESPACE = "working-context-archive-v1"
 _MESSAGES = (
@@ -75,6 +73,8 @@ _CHECKPOINT_REASONS = {
     "checkpoint_authentication_failed": "checkpoint_authentication_failed",
     "private_protocol_state_missing": "private_protocol_state_missing",
     "invalid_legacy_tool_call": "invalid_legacy_tool_call",
+    "legacy_delta_requires_reconciliation": "recovery_requires_reconciliation",
+    "checkpoint_value_round_trip_mismatch": "unsupported_checkpoint_value",
     "unsupported_checkpoint_value": "unsupported_checkpoint_value",
     "unsupported_checkpoint_key": "unsupported_checkpoint_value",
     "nested_message_in_public_fields": "unsupported_public_message_field",
@@ -120,6 +120,8 @@ def _batch_observation_type():
     so a resumed task re-raises it instead of replaying the work."""
     from .batch_journal import BatchObservationNotStored
     return BatchObservationNotStored
+
+
 def _admission_reason(value: Any) -> str:
     reason = getattr(value, "reason", None)
     if type(reason) is not str or not reason or len(reason) > 200 or any(ord(c) < 32 for c in reason):
@@ -190,18 +192,24 @@ def checkpoint_path(root: Path, identity: ExecutionIdentity,
 
 
 class _PrivateMessages(SerializerProtocol):
-    """Transform private messages explicitly; delegate ordinary types to JsonPlus.
+    """Protected application envelope using JsonPlus for SDK-owned values.
 
-    No application class is in the revival allowlist. Only the built-in safe
-    JsonPlus types are enabled, pickle/legacy JSON decoding are never accepted.
-    Tuple tags preserve tuples (JsonPlus otherwise projects them into lists).
+    Revival allows only upstream built-ins and the two app-owned message
+    classes. No pickle or legacy SDK JSON decoding is accepted. Application
+    tuple tags preserve ordinary tuples, which JsonPlus projects into lists.
     """
 
-    def __init__(self, binding: dict):
+    def __init__(self, binding: dict, *, scrub_graph_errors: bool = False):
         self.binding = binding
         self.scope = (binding["provider"].rstrip("/"), binding["model"])
+        self.scrub_graph_errors = scrub_graph_errors
         self.delegate = JsonPlusSerializer(
-            pickle_fallback=False, allowed_json_modules=[], allowed_msgpack_modules=[])
+            pickle_fallback=False, allowed_json_modules=[],
+            allowed_msgpack_modules=[_DeepSeekMessage, _DeepSeekMessageChunk],
+        )
+        self.legacy_delegate = JsonPlusSerializer(
+            pickle_fallback=False, allowed_json_modules=[], allowed_msgpack_modules=[],
+        )
 
     def _state(self, value: Any) -> _ProtocolState:
         if (type(value) is not dict or set(value) != {"scope", "reasoning"}
@@ -239,47 +247,25 @@ class _PrivateMessages(SerializerProtocol):
             restored.append({key: value for key, value in call.items() if key in native})
         return {**public, "tool_calls": restored}
 
-    def _walk(self, value: Any, *, reading: bool = False) -> Any:
-        if type(value) is Overwrite:
-            if reading:
-                raise CheckpointProtectionError("unexpected_overwrite_revival")
-            return {_TAG: "overwrite", "value": self._walk(value.value)}
-        if type(value) is _DeltaSnapshot:
-            if reading:
-                raise CheckpointProtectionError("unexpected_delta_snapshot_revival")
-            # Recurse before serialization so private protocol fields survive
-            # inside snapshots without enabling JsonPlus class revival.
-            return {_TAG: "delta_snapshot", "value": self._walk(value.value)}
-        if type(value) in (_DeepSeekMessage, _DeepSeekMessageChunk):
-            if reading:
-                raise CheckpointProtectionError("unexpected_private_message_revival")
-            state = value.provider_protocol
-            private = None if state is None else {"scope": list(state.scope), "reasoning": state.reasoning}
-            if private is not None:
-                self._state(private)
-            for name, field in value.__dict__.items():
-                if name != "provider_protocol":
-                    self._check_public_field(field)
-            return {_TAG: "deepseek_chunk" if type(value) is _DeepSeekMessageChunk else "deepseek",
-                    "public": self._walk(value.model_dump()), "private": private}
+    def _walk(self, value: Any, *, reading: bool = False, legacy: bool = False) -> Any:
         if type(value) is dict:
             if _TAG in value:
                 if not reading:
                     raise CheckpointProtectionError("reserved_checkpoint_tag")
                 kind = value[_TAG]
-                if kind == "overwrite" and set(value) == {_TAG, "value"}:
-                    return Overwrite(self._walk(value["value"], reading=True))
-                if kind == "delta_snapshot" and set(value) == {_TAG, "value"}:
-                    return _DeltaSnapshot(self._walk(value["value"], reading=True))
+                if legacy and kind == "overwrite" and set(value) == {_TAG, "value"}:
+                    return Overwrite(self._walk(value["value"], reading=True, legacy=legacy))
+                if kind == "delta_snapshot":
+                    raise CheckpointProtectionError("legacy_delta_requires_reconciliation", structure="value.tag")
                 if kind == "bytearray" and set(value) == {_TAG, "value"} and type(value["value"]) is bytes:
                     return bytearray(value["value"])
                 if kind in ("tuple", "set", "frozenset") and set(value) == {_TAG, "items"} and type(value["items"]) is list:
                     cls = {"tuple": tuple, "set": set, "frozenset": frozenset}[kind]
-                    return cls(self._walk(v, reading=True) for v in value["items"])
-                if kind == "message" and set(value) == {_TAG, "class", "public"}:
+                    return cls(self._walk(v, reading=True, legacy=legacy) for v in value["items"])
+                if legacy and kind == "message" and set(value) == {_TAG, "class", "public"}:
                     classes = {cls.__name__: cls for cls in _MESSAGES}
                     cls = classes.get(value["class"])
-                    public = self._walk(value["public"], reading=True)
+                    public = self._walk(value["public"], reading=True, legacy=legacy)
                     if cls is None or type(public) is not dict:
                         raise CheckpointProtectionError("invalid_public_message")
                     self._check_public_field(public)
@@ -299,9 +285,9 @@ class _PrivateMessages(SerializerProtocol):
                         raise CheckpointProtectionError("invalid_checkpoint_payload",
                                                         structure="value.tag")
                     return _admission_stopped_type()(reason)
-                if kind in ("deepseek", "deepseek_chunk") and set(value) == {_TAG, "public", "private"}:
+                if legacy and kind in ("deepseek", "deepseek_chunk") and set(value) == {_TAG, "public", "private"}:
                     state = self._state(value["private"]) if value["private"] is not None else None
-                    public = self._walk(value["public"], reading=True)
+                    public = self._walk(value["public"], reading=True, legacy=legacy)
                     if type(public) is not dict or "provider_protocol" in public:
                         raise CheckpointProtectionError("invalid_private_message_public_fields")
                     cls = _DeepSeekMessage if kind == "deepseek" else _DeepSeekMessageChunk
@@ -314,28 +300,22 @@ class _PrivateMessages(SerializerProtocol):
                 raise CheckpointProtectionError("invalid_checkpoint_tag", structure="value.tag")
             if any(type(k) not in (str, int, float, bool, bytes, type(None)) for k in value):
                 raise CheckpointProtectionError("unsupported_checkpoint_key", structure="value.mapping_key")
-            return {k: self._walk(v, reading=reading) for k, v in value.items()}
+            return {k: self._walk(v, reading=reading, legacy=legacy) for k, v in value.items()}
         if type(value) is tuple:
             if reading:
-                return tuple(self._walk(v, reading=True) for v in value)
+                return tuple(self._walk(v, reading=True, legacy=legacy) for v in value)
             return {_TAG: "tuple", "items": [self._walk(v) for v in value]}
         if type(value) in (set, frozenset) and not reading:
             return {_TAG: type(value).__name__, "items": [self._walk(v) for v in value]}
         if type(value) in (list, set, frozenset):
-            return type(value)(self._walk(v, reading=reading) for v in value)
-        if type(value) is Send:
-            return Send(value.node, self._walk(value.arg, reading=reading), timeout=value.timeout)
-        if type(value) is Interrupt:
-            return replace(value, value=self._walk(value.value, reading=reading))
-        if type(value) in _MESSAGES:
-            # Public message fields may contain data, but never embedded private
-            # message instances whose excluded fields model_dump would discard.
-            for field in value.__dict__.values():
-                self._check_public_field(field)
-            if reading:
-                return value  # Compatibility with earlier public-message checkpoints.
-            return {_TAG: "message", "class": type(value).__name__,
-                    "public": self._walk(value.model_dump())}
+            return type(value)(self._walk(v, reading=reading, legacy=legacy) for v in value)
+        if legacy and type(value) is Send:
+            return Send(value.node, self._walk(value.arg, reading=True, legacy=True), timeout=value.timeout)
+        if legacy and type(value) in (Interrupt, Overwrite):
+            return replace(value, value=self._walk(value.value, reading=True, legacy=True))
+        if type(value) in (*_MESSAGES, _DeepSeekMessage, _DeepSeekMessageChunk, Send, Interrupt, Overwrite) or isinstance(value, tuple):
+            self._check_native(value)
+            return value
         if type(value) is bytearray and not reading:
             return {_TAG: "bytearray", "value": bytes(value)}
         if value is None or type(value) in (str, bool, int, float, bytes, bytearray):
@@ -348,9 +328,44 @@ class _PrivateMessages(SerializerProtocol):
             reason = _admission_reason(value)
             if reason:
                 return {_TAG: "admission_stopped", "reason": reason}
-        logger.warning("checkpoint value unsupported: %s", type(value).__name__)
         raise CheckpointProtectionError("unsupported_checkpoint_value", structure="envelope.value",
                                         value_kind=_value_kind(value))
+
+    def _check_native(self, value: Any) -> None:
+        """Validate opaque native values without rebuilding SDK-owned objects."""
+        if type(value) in (*_MESSAGES, _DeepSeekMessage, _DeepSeekMessageChunk):
+            for name, field in value.__dict__.items():
+                if name != "provider_protocol" or type(value) in _MESSAGES:
+                    self._check_public_field(field)
+                elif field is not None:
+                    if type(field) is not _ProtocolState:
+                        raise CheckpointProtectionError("private_protocol_state_missing", structure="message.private")
+                    self._state({"scope": list(field.scope), "reasoning": field.reasoning})
+        elif type(value) is dict:
+            if _TAG in value:
+                raise CheckpointProtectionError("reserved_checkpoint_tag", structure="value.tag")
+            if any(type(k) not in (str, int, float, bool, bytes, type(None)) for k in value):
+                raise CheckpointProtectionError("unsupported_checkpoint_key", structure="value.mapping_key")
+            for child in value.values():
+                self._check_native(child)
+        elif type(value) in (list, set, frozenset) or isinstance(value, tuple):
+            for child in value:
+                self._check_native(child)
+        elif type(value) is Send:
+            self._check_native(value.node)
+            self._check_native(value.arg)
+            self._check_native(value.timeout)
+        elif type(value) is Interrupt:
+            self._check_native(value.value)
+            self._check_native(value.id)
+            self._check_native(value.response_schema)
+        elif type(value) is Overwrite:
+            self._check_native(value.value)
+            self._check_native(value.type)
+        elif (value is not None and type(value) not in
+              (str, bool, int, float, bytes, bytearray, TimeoutPolicy)):
+            raise CheckpointProtectionError("unsupported_checkpoint_value", structure="envelope.value",
+                                            value_kind=_value_kind(value))
 
     def _check_public_field(self, value: Any) -> None:
         if isinstance(value, BaseMessage):
@@ -368,20 +383,56 @@ class _PrivateMessages(SerializerProtocol):
             raise CheckpointProtectionError("unsupported_public_message_field", structure="message.public",
                                             value_kind=_value_kind(value))
 
+    def _read_legacy_value(self, value: Any) -> Any:
+        # The deployed DeepAgentState has exactly one delta channel, messages.
+        # Public DeltaChannel.from_checkpoint accepts its plain accumulated seed.
+        # Only unwrap the historical marker in that exact authenticated v4
+        # checkpoint slot. Never reinterpret a marker from a pending write or
+        # another channel, and never update the old rows while reading.
+        if (self.binding.get("namespace") == _FRAMEWORK_NAMESPACE
+                and type(value) is dict and type(value.get("v")) is int and value["v"] == 4
+                and type(value.get("id")) is str and type(value.get("ts")) is str
+                and all(type(value.get(key)) is dict for key in ("channel_versions", "versions_seen"))
+                and "messages" in value["channel_versions"]
+                and type(value.get("channel_values")) is dict):
+            channels = value["channel_values"]
+            seed = channels.get("messages")
+            if type(seed) is dict and seed.get(_TAG) == "delta_snapshot":
+                if set(seed) != {_TAG, "value"} or type(seed["value"]) is not list:
+                    raise CheckpointProtectionError("legacy_delta_requires_reconciliation", structure="value.tag")
+                messages = self._walk(seed["value"], reading=True, legacy=True)
+                if not all(type(message) in (*_MESSAGES, _DeepSeekMessage, _DeepSeekMessageChunk)
+                           for message in messages):
+                    raise CheckpointProtectionError("legacy_delta_requires_reconciliation", structure="value.tag")
+                value = {**value, "channel_values": {**channels, "messages": messages}}
+        return self._walk(value, reading=True, legacy=True)
+
     def dumps_typed(self, obj: Any) -> tuple[str, bytes]:
-        envelope = {"version": 1, "binding": self.binding, "value": self._walk(obj)}
-        typ, payload = self.delegate.dumps_typed(envelope)
-        if typ != "msgpack":
-            raise CheckpointProtectionError("unsupported_checkpoint_format")
-        return _FORMAT, payload
+        try:
+            if self.scrub_graph_errors and isinstance(obj, BaseException) and type(obj) not in (
+                    _admission_stopped_type(), _batch_observation_type()):
+                obj = _admission_stopped_type()("checkpoint_node_error")
+            envelope = {"version": 2, "binding": self.binding, "value": self._walk(obj)}
+            with _checkpoint_protocol(self.scope):
+                typ, payload = self.delegate.dumps_typed(envelope)
+            restored = self.delegate.loads_typed((typ, payload))
+            if typ != "msgpack" or not _same_native_value(envelope, restored):
+                raise CheckpointProtectionError("checkpoint_value_round_trip_mismatch", structure="envelope.value")
+            return _FORMAT, payload
+        except CheckpointProtectionError:
+            raise
+        except Exception:
+            raise CheckpointProtectionError("unsupported_checkpoint_value", structure="envelope.value") from None
 
     def loads_typed(self, data: tuple[str, bytes]) -> Any:
-        if data[0] != _FORMAT:
+        expected_version = {_LEGACY_FORMAT: 1, _FORMAT: 2}.get(data[0])
+        if expected_version is None:
             raise CheckpointProtectionError("unsupported_checkpoint_format")
         try:
-            envelope = self.delegate.loads_typed(("msgpack", data[1]))
+            delegate = self.legacy_delegate if expected_version == 1 else self.delegate
+            envelope = delegate.loads_typed(("msgpack", data[1]))
             if (type(envelope) is not dict or set(envelope) != {"version", "binding", "value"}
-                    or type(envelope["version"]) is not int or envelope["version"] != 1
+                    or type(envelope["version"]) is not int or envelope["version"] != expected_version
                     or type(envelope["binding"]) is not dict
                     or set(envelope["binding"]) != set(self.binding)):
                 raise CheckpointProtectionError("invalid_checkpoint_payload", structure="envelope")
@@ -392,6 +443,8 @@ class _PrivateMessages(SerializerProtocol):
                 raise CheckpointProtectionError("checkpoint_binding_mismatch", structure="envelope.binding")
             if (saved_binding["provider"], saved_binding["model"]) != (self.binding["provider"], self.binding["model"]):
                 raise CheckpointProtectionError("checkpoint_provider_scope_mismatch", structure="envelope.binding")
+            if expected_version == 1:
+                return self._read_legacy_value(envelope["value"])
             return self._walk(envelope["value"], reading=True)
         except CheckpointProtectionError:
             raise
@@ -399,10 +452,35 @@ class _PrivateMessages(SerializerProtocol):
             raise CheckpointProtectionError("invalid_checkpoint_payload", structure="envelope.value") from None
 
 
+def _same_native_value(left: Any, right: Any) -> bool:
+    """Reject lossy native encodings before a saver can persist them."""
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return len(left) == len(right) and all(
+            _same_native_value(k, rk) and _same_native_value(v, rv)
+            for (k, v), (rk, rv) in zip(left.items(), right.items()))
+    if type(left) is list or isinstance(left, tuple):
+        return len(left) == len(right) and all(_same_native_value(lv, rv) for lv, rv in zip(left, right))
+    if isinstance(left, BaseMessage):
+        return _same_native_value(left.__dict__, right.__dict__) and left == right
+    if type(left) is Send:
+        return all(_same_native_value(lv, rv) for lv, rv in zip(
+            (left.node, left.arg, left.timeout), (right.node, right.arg, right.timeout)))
+    if type(left) is Interrupt:
+        return all(_same_native_value(lv, rv) for lv, rv in zip(
+            (left.value, left.id, left.response_schema), (right.value, right.id, right.response_schema)))
+    if type(left) is Overwrite:
+        return _same_native_value(left.value, right.value) and left.type == right.type
+    if type(left) is float:
+        return struct.pack("!d", left) == struct.pack("!d", right)
+    return left == right
+
+
 class _AesGcm:
     def __init__(self, key: bytes, binding: dict):
         self.aes = AESGCM(key)
-        self.aad = _FORMAT.encode() + b"\0" + _canonical(binding)
+        self.aad = _LEGACY_FORMAT.encode() + b"\0" + _canonical(binding)
 
     def encrypt(self, plaintext: bytes) -> tuple[str, bytes]:
         nonce = os.urandom(12)
@@ -421,13 +499,13 @@ class ProtectedCheckpointSerializer(EncryptedSerializer):
     """Encrypted-only public serializer, also used for every pending write."""
 
     def __init__(self, key: bytes, identity: ExecutionIdentity, provider_scope: tuple[str, str], *,
-                 context_binding=None):
+                 context_binding=None, scrub_graph_errors=False):
         binding = context_binding if context_binding is not None else _binding(identity, provider_scope)
-        super().__init__(_AesGcm(key, binding), _PrivateMessages(binding))
+        super().__init__(_AesGcm(key, binding), _PrivateMessages(binding, scrub_graph_errors=scrub_graph_errors))
 
     def loads_typed(self, data: tuple[str, bytes]) -> Any:
         # Upstream EncryptedSerializer accepts plaintext. This boundary does not.
-        if data[0] != f"{_FORMAT}+{_CIPHER}":
+        if data[0] not in {f"{_FORMAT}+{_CIPHER}", f"{_LEGACY_FORMAT}+{_CIPHER}"}:
             raise CheckpointProtectionError("encrypted_checkpoint_required", structure="ciphertext")
         return super().loads_typed(data)
 
@@ -492,18 +570,12 @@ def _load_key(directory: Path) -> bytes:
 
 
 class _ProtectedSqliteSaver(AsyncSqliteSaver):
-    scrub_graph_errors = False
     async def aget_tuple(self, config):
         with _checkpoint_operation("read", config["configurable"].get("checkpoint_ns", "")):
             return await super().aget_tuple(config)
 
     async def aput_writes(self, config, writes, task_id, task_path=""):
         with _checkpoint_operation("write_pending", config["configurable"].get("checkpoint_ns", "")):
-            if self.scrub_graph_errors:
-                from .runtime import AdmissionStopped
-                writes = [(channel, AdmissionStopped("checkpoint_node_error")
-                           if channel == "__error__" and type(value) is not AdmissionStopped else value)
-                          for channel, value in writes]
             await super().aput_writes(config, writes, task_id, task_path)
 
     async def aput(self, config, checkpoint, metadata, new_versions):
@@ -519,10 +591,6 @@ class _ProtectedSqliteSaver(AsyncSqliteSaver):
                                         if k in {"thread_id", "checkpoint_ns", "checkpoint_id"}}}
         with _checkpoint_operation("write", safe_config["configurable"].get("checkpoint_ns", "")):
             return await super().aput(safe_config, checkpoint, safe_metadata, new_versions)
-
-
-def _prepare(root: Path, identity: ExecutionIdentity, provider_scope: tuple[str, str]):
-    return _prepare_database(checkpoint_path(root, identity, provider_scope))
 
 
 def _prepare_database(path: Path):
@@ -545,24 +613,6 @@ def _prepare_database(path: Path):
     else:
         os.close(fd)
     return path, key
-
-
-@asynccontextmanager
-async def open_checkpoint(root: Path, identity: ExecutionIdentity,
-                          provider_scope: tuple[str, str]) -> AsyncIterator[AsyncSqliteSaver]:
-    """Open protected storage under caller-owned state root; closes on failure.
-
-    Use config={"configurable": checkpoint_scope(identity, provider_scope)}.
-    Root must be a trusted, local service state directory (Windows ACLs remain
-    the deployment owner's responsibility). Metadata is limited to source/step;
-    arbitrary metadata and parent-namespace indexes are intentionally omitted.
-    """
-    with _checkpoint_operation("prepare"):
-        _binding(identity, provider_scope)  # Validate before creating any state.
-        path, key = await asyncio.to_thread(_prepare, Path(root), identity, provider_scope)
-    async with aiosqlite.connect(str(path)) as connection:
-        yield _ProtectedSqliteSaver(
-            connection, serde=ProtectedCheckpointSerializer(key, identity, provider_scope))
 
 
 _NATIVE_NAMESPACE = "native-session-v1"
@@ -607,18 +657,6 @@ class _NativeEncryptedSerializer(EncryptedSerializer):
             raise CheckpointProtectionError("invalid_checkpoint_payload", structure="envelope.value") from None
 
 
-@asynccontextmanager
-async def open_native_checkpoint(root: Path, identity: ExecutionIdentity,
-                                 provider_scope: tuple[str, str], *,
-                                 context_scope: str = "") -> AsyncIterator[AsyncSqliteSaver]:
-    binding = _native_binding(identity, provider_scope, context_scope)
-    with _checkpoint_operation("prepare"):
-        path, key = await asyncio.to_thread(_prepare_database,
-            native_checkpoint_path(root, identity, provider_scope, context_scope=context_scope))
-    async with aiosqlite.connect(str(path)) as connection:
-        yield _ProtectedSqliteSaver(connection, serde=_NativeEncryptedSerializer(key, binding))
-
-
 _FRAMEWORK_NAMESPACE = "framework-session-v2"
 
 
@@ -638,8 +676,9 @@ def framework_checkpoint_path(root, identity, provider_scope, *, context_scope="
 
 class _ReadOnlyCheckpointSaver(_ProtectedSqliteSaver):
     async def setup(self):
-        # Existing schemas only. The normal saver initializes tables and PRAGMAs.
-        self.is_setup = True
+        # The read-only URI enforces an existing schema. The public setup
+        # override intentionally skips the SDK's writable PRAGMA and DDL.
+        return None
 
 
 def _existing_checkpoint(path):
@@ -679,9 +718,8 @@ async def open_framework_checkpoint(root, identity, provider_scope, *, context_s
     binding = _framework_binding(identity, provider_scope, context_scope)
 
     def serializer(key):
-        # Unlike native-v1 this stores protocol-private DeepSeek reasoning in
-        # the existing closed codec inside an authenticated session envelope.
-        return ProtectedCheckpointSerializer(key, identity, provider_scope, context_binding=binding)
+        return ProtectedCheckpointSerializer(
+            key, identity, provider_scope, context_binding=binding, scrub_graph_errors=True)
 
     if read_only:
         async with _open_reader(path, serializer) as saver:
@@ -690,6 +728,4 @@ async def open_framework_checkpoint(root, identity, provider_scope, *, context_s
     with _checkpoint_operation("prepare"):
         path, key = await asyncio.to_thread(_prepare_database, path)
     async with aiosqlite.connect(str(path)) as connection:
-        saver = _ProtectedSqliteSaver(connection, serde=serializer(key))
-        saver.scrub_graph_errors = True
-        yield saver
+        yield _ProtectedSqliteSaver(connection, serde=serializer(key))

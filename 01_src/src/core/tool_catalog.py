@@ -126,6 +126,7 @@ def capability_groups() -> dict[str, frozenset[str]]:
 # their presentation metadata here without changing any permission groups.
 HOST_TOOL_LABELS = {
     "update_task_plan": "更新工作计划",
+    "write_todos": "更新工作计划",
     "read_skill": "读取科研方法",
     "load_skill": "加载科研方法",
     "read_context_evidence": "回读对话证据",

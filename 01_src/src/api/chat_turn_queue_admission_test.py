@@ -390,3 +390,32 @@ def test_browse_opt_in_is_persisted_and_changes_request_identity():
         _admit({**base, "browse_requested": True})
     requested = _admit({**_request(cid="browse-turn"), "browse_requested": True})
     assert turn_envelope.load_dispatch_input(requested)[0]["browse_requested"] is True
+
+
+def test_skill_release_is_pinned_at_admission_without_leaking_into_public_view(tmp_path, monkeypatch):
+    import json
+
+    from src.agent.installed_skills import RQA_ID, list_installed, release_pin
+
+    release = tmp_path / "immutable-skill-release"
+    entry = release / "skills" / RQA_ID / "SKILL.md"
+    entry.parent.mkdir(parents=True)
+    entry.write_text(f"---\nname: {RQA_ID}\ndescription: Research method.\n---\n")
+    inventory = {str(entry.relative_to(release)): hashlib.sha256(entry.read_bytes()).hexdigest()}
+    (release / "inventory.json").write_text(json.dumps(inventory))
+    (release / "release.json").write_text(json.dumps({RQA_ID: "e" * 40}))
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(release))
+    selected = {k: list_installed(release)[0][k] for k in ("id", "version", "sha256")}
+    request = _request(skills=[selected])
+    turn = _admit(request)
+    pin = release_pin(release)
+    assert all(turn["bounded_payload"][key] == value for key, value in pin.items())
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(release / "unrelated"))
+    assert _admit(request)["created"] is False  # receipt, not a new admission
+    data, _ = turn_envelope.load_dispatch_input(turn)
+    assert data["selected_skills"] == [selected]
+    assert all(data[key] == value for key, value in pin.items())
+    assert str(release) not in json.dumps(turn_envelope.present_turn(turn))
+    fresh = _admit(_request(cid="client-fresh"))
+    assert fresh["bounded_payload"]["selected_skills"] == []
+    assert not any(key in fresh["bounded_payload"] for key in pin)

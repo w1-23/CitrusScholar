@@ -126,11 +126,13 @@ def _bound_derivative(result, owner, sid, backend, binding):
 
 
 def _create_derivative(*, result, owner, sid, title, backend, vector, primary, vendor_root,
-                       binding=None, request_id=None):
+                       binding=None, request_id=None, source_receipt=None):
     dialect = "svglite" if backend == "r" else "matplotlib"
     provenance = {"version": 1, "backend": backend, "vector_dialect": dialect,
                   "origin": result["origin"], "mode": "locked_vector_paint",
                   "primary_svg": primary, "original_exports": result["original_exports"]}
+    if source_receipt is not None:
+        provenance["source_receipt"] = source_receipt
     try:
         try:
             created = svg_projects.create_svg_project(owner=owner, session_id=sid, svg=vector,
@@ -141,6 +143,8 @@ def _create_derivative(*, result, owner, sid, title, backend, vector, primary, v
         if binding is not None:
             return _bound_derivative(result, owner, sid, backend, binding)
     except (projects.ProjectError, ValueError, OSError, sqlite3.Error) as exc:
+        if getattr(exc, "code", "") == "plot_execution_binding_mismatch":
+            raise
         if getattr(exc, "code", "") in {"plot_svg_unsupported", "svg_invalid", "svg_security"}:
             return _unsupported(result)
         logging.getLogger(__name__).warning("Nature editable copy registration deferred", exc_info=True)
@@ -218,4 +222,64 @@ def import_uploaded_nature_svg(owner, file_id, *, vendor_root=None):
                 continue
             return _create_derivative(result=result, owner=owner, sid=sid, title=Path(filename).stem,
                                       backend=backend, vector=vector, primary=filename, vendor_root=vendor_root)
+    return _unsupported(result)
+
+
+def import_library_svg(owner, file_id, *, expected_sha256=None, vendor_root=None):
+    """Open an owned upload or an exact public Code SVG as an editable copy."""
+    from src.code_execution.figure_sources import verify_delivered_svg
+    from src.session import files
+
+    owner = svg_projects._valid_owner(owner)
+    row = files.get_account_file(file_id, owner) if isinstance(file_id, str) and _FILE_ID.fullmatch(file_id) else None
+    if not row:
+        raise projects.ProjectError("plot_upload_not_found", "找不到可访问的 SVG 原件。", 404)
+    if row.get("origin") == files.ORIGIN_UPLOADED:
+        if expected_sha256 is not None and row.get("sha256") != expected_sha256:
+            raise projects.ProjectError("plot_source_identity_conflict", "原件摘要与文件列表不一致。", 409)
+        return import_uploaded_nature_svg(owner, file_id, vendor_root=vendor_root)
+    if row.get("origin") != files.ORIGIN_GENERATED or row.get("producer_tool") != "code_deliver":
+        raise projects.ProjectError("plot_upload_not_found", "找不到可导入的 SVG 原件。", 404)
+    filename, sha, size = (row.get(key) for key in ("filename", "sha256", "size_bytes"))
+    if (not isinstance(filename, str) or not filename.lower().endswith(".svg")
+            or row.get("mime_type") != "image/svg+xml"):
+        raise projects.ProjectError("plot_upload_not_svg", "只有 SVG 矢量原件可创建样式副本。", 422)
+    if not isinstance(expected_sha256, str) or not _DIGEST.fullmatch(expected_sha256):
+        raise projects.ProjectError("plot_source_identity_required", "需要确认资料库 SVG 的当前摘要。", 422)
+    if expected_sha256 != sha:
+        raise projects.ProjectError("plot_source_identity_conflict", "原件摘要与文件列表不一致。", 409)
+    sid = svg_projects._require_session(owner, row.get("session_id"))
+    if type(size) is not int or not 0 < size <= projects.MAX_RENDER_BYTES:
+        raise projects.ProjectError("plot_original_unverified", "生成原件大小超限。", 422)
+    try:
+        proof = verify_delivered_svg(owner, sid, row)
+        blob = _file_blob(row, size, sha, capture=True)
+    except (LookupError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        raise projects.ProjectError("plot_original_unverified", "无法核对生成原件和已验收的执行结果。", 409) from exc
+    originals = {filename: _descriptor(file_id, filename, sha, size, files.ORIGIN_GENERATED)}
+    result = _link_result(originals, filename, origin="code_output")
+    # Reuse atomic binding/publication without conflating per-execution Nature
+    # results with per-publication Code files belonging to a different scope.
+    binding_key = hashlib.sha256(f"code-svg:{file_id}".encode()).hexdigest()[:32]
+    fingerprint = hashlib.sha256(json.dumps([proof, originals], sort_keys=True).encode()).hexdigest()
+    binding = binding_key, fingerprint
+    if blob is not None:
+        for backend in ("r", "python"):
+            try:
+                vector = normalize_nature_svg(blob, backend)
+            except ValueError:
+                continue
+            try:
+                prior = _bound_derivative(result, owner, sid, backend, binding)
+            except projects.ProjectError as exc:
+                if exc.code == "plot_execution_binding_mismatch":
+                    raise
+                return _retryable(result)
+            except (ValueError, OSError, sqlite3.Error):
+                return _retryable(result)
+            if prior is not None:
+                return prior
+            return _create_derivative(result=result, owner=owner, sid=sid, title=Path(filename).stem,
+                backend=backend, vector=vector, primary=filename, vendor_root=vendor_root,
+                binding=binding, source_receipt=proof)
     return _unsupported(result)

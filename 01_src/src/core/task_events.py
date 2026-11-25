@@ -666,7 +666,7 @@ _FINISH_REASONS = frozenset({"stop", "end_turn", "stop_sequence", "tool_calls", 
 def _attempt_provider(model):
     # Use only configured provider identifiers, not arbitrary endpoints/headers.
     from src.config import settings
-    from src.core.provider_protocol import DeepSeekChatOpenAI
+    from src.core.provider_protocol import uses_deepseek_protocol
     primary = getattr(model, "primary", model)
     client = getattr(primary, "bound", primary)
     url = str(getattr(client, "openai_api_base", None) or "").rstrip("/")
@@ -674,7 +674,9 @@ def _attempt_provider(model):
     if (url and url == settings.RESOLVED_MAIN_BASE_URL.rstrip("/") and isinstance(provider, str)
             and 0 < len(provider) <= 40 and provider.replace("_", "").replace("-", "").isalnum()):
         return provider
-    return "deepseek_compatible" if isinstance(client, DeepSeekChatOpenAI) else "openai_compatible" if url else "unknown"
+    if uses_deepseek_protocol(getattr(client, "model_name", ""), url):
+        return "deepseek_compatible"
+    return "openai_compatible" if url else "unknown"
 
 
 def _attempt_response(scope, response, error):
@@ -763,6 +765,7 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
         publish_context(status="not_admitted", error=str(exc))
         raise
     scope["attempt_id"] = attempt_id or uuid.uuid4().hex
+    scope["reservation_id"] = attempt_id
     publish_context()
     scope_token = _active_model_attempt.set(attempt_id)
     observation_token = _observation.set(scope)
@@ -783,15 +786,18 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
         scope["attempt_elapsed_ms"] = duration_ms((time.monotonic() - invoked_at) * 1000)
         redirected = scope.get("redirected", False)
         usage = {} if redirected else extract_usage(response) or {}
-        error = scope.get("transport_error", error)
+        denied = scope.get("pre_transport_denial", "")
+        error = denied or scope.get("transport_error", error)
         finish_attempt(attempt_id, usage, error=error, observation=_attempt_response(
-            scope, None if redirected else response, error))
+            scope, None if redirected else response, error), unsent=bool(denied))
         if response is not None and not redirected:
             emit_usage_from_response(usage_session_id or get_session_id(), purpose, response,
                 attempt_id=scope["attempt_id"], logical_call_id=scope["logical_call_id"],
                 epoch=scope["epoch"], parent_purpose=scope["parent_purpose"])
         if not scope.get("context_settled"):
-            publish_context(usage=usage, status="cancelled" if error == "CancelledError" else "failed" if error else "complete", error=error)
+            status = ("not_admitted" if denied else "cancelled" if error == "CancelledError"
+                      else "failed" if error else "complete")
+            publish_context(usage=usage, status=status, error=error)
             scope["context_settled"] = True
         _observation.reset(observation_token)
         _active_model_attempt.reset(scope_token)
@@ -901,7 +907,32 @@ def reserve_attempt(job_id, purpose, estimated_tokens):
         return attempt_id
 
 
-def finish_attempt(attempt_id, usage=None, error="", *, observation=None):
+def adjust_model_reservation(attempt_id, tokens):
+    """Revalidate an increase between preflight and the actual outbound body."""
+    if not attempt_id:
+        return
+    with transaction() as conn:
+        row = conn.execute("SELECT * FROM task_model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        if row is None or row["status"] != "running":
+            raise TaskConflict("model_attempt_not_active")
+        extra = tokens - row["reserved_tokens"]
+        if extra <= 0:
+            return
+        if row["budget_scope"] != "execution":
+            raise TaskConflict("model_request_changed_after_admission")
+        budget = conn.execute("SELECT * FROM task_budgets WHERE job_id=?", (row["job_id"],)).fetchone()
+        if not budget or budget["deadline"] <= time.time():
+            raise TaskConflict("model_budget_exhausted:deadline")
+        if budget["tokens"] + extra > budget["max_tokens"]:
+            raise TaskConflict("model_budget_exhausted:tokens")
+        if (not row["purpose"].startswith("final_synthesis")
+                and budget["final_tokens"] and budget["tokens"] + extra + budget["final_tokens"] > budget["max_tokens"]):
+            raise TaskConflict("model_budget_reserved:finalization")
+        conn.execute("UPDATE task_budgets SET tokens=tokens+? WHERE job_id=?", (extra, row["job_id"]))
+        conn.execute("UPDATE task_model_attempts SET reserved_tokens=? WHERE attempt_id=?", (tokens, attempt_id))
+
+
+def finish_attempt(attempt_id, usage=None, error="", *, observation=None, unsent=False):
     if not attempt_id:
         return
     usage = usage or {}
@@ -914,6 +945,16 @@ def finish_attempt(attempt_id, usage=None, error="", *, observation=None):
         if row is None or row["status"] != "running":
             return
         # Unknown usage retains the reservation instead of silently charging zero.
+        if unsent:
+            if row["budget_scope"] == "execution":
+                conn.execute("UPDATE task_budgets SET calls=calls-1,tokens=tokens-? WHERE job_id=?",
+                             (row["reserved_tokens"], row["job_id"]))
+            conn.execute("UPDATE task_model_attempts SET status='not_sent',usage='{}',error=?,observation=? WHERE attempt_id=?",
+                         (error, canonical(observation or {}), attempt_id))
+            _append(conn, row["job_id"], "model_attempt", {"attempt_id": attempt_id,
+                "purpose": row["purpose"], "status": "not_sent", "usage_status": "not_sent",
+                "charged_tokens": 0, "error": error, "observation": observation or {}})
+            return
         if reported and row["budget_scope"] == "execution":
             conn.execute("UPDATE task_budgets SET tokens=tokens+? WHERE job_id=?", (measured-row["reserved_tokens"], row["job_id"]))
         observation = observation or {}
@@ -935,6 +976,8 @@ def _usage_totals(conn, job_id):
     # the logical task's reported usage includes every closed ancestor segment.
     for row in conn.execute("WITH RECURSIVE lineage(job_id) AS (SELECT ? UNION SELECT j.parent_job_id FROM task_jobs j JOIN lineage l ON j.job_id=l.job_id WHERE j.parent_job_id<>'') SELECT usage,reserved_tokens,status FROM task_model_attempts WHERE job_id IN (SELECT job_id FROM lineage)", (job_id,)):
         usage = json.loads(row["usage"] or "{}")
+        if row["status"] == "not_sent":
+            continue
         if row["status"] == "running":
             totals["in_flight_attempts"] += 1
             totals["in_flight_reserved_tokens"] += int(row["reserved_tokens"])

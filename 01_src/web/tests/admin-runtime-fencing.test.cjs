@@ -26,13 +26,15 @@ function harness(script, fetch) {
     if (!elements.has(id)) elements.set(id, create());
     return elements.get(id);
   };
-  const location = {search:'', replace(){}, reload(){}};
+  const replacements = [];
+  const location = {search:'', replace(url){replacements.push(url);}, reload(){}};
   const window = {addEventListener(name, fn) { listeners.set(name, fn); }};
   const document = {getElementById:id => id === 'corpusList' ? null : el(id), createElement:create,
     addEventListener(name, fn) { listeners.set(name, fn); }};
   vm.runInNewContext(readFileSync(join(__dirname,'..','assets',script),'utf8'),
     {fetch, window, document, location, AbortController, URLSearchParams, setTimeout:()=>1, clearTimeout(){}});
   if (listeners.has('DOMContentLoaded')) listeners.get('DOMContentLoaded')();
+  el.replacements = replacements;
   return el;
 }
 
@@ -120,4 +122,51 @@ test('review save preserves the second finding, exposes a failed refresh, and fe
   assert.equal(el('ir-summary').textContent,'b1');
   assert.doesNotMatch(el('ir-status').textContent,/决定已保存/);
   assert.ok(writes.every(item=>item.url.endsWith('/a/findings/a2') && item.body.expected_revision===2));
+});
+
+const unauthorized = () => ({ok:false, status:401, json:async () => ({})});
+
+test('late admin 401 after A → B → A cannot redirect, current 401 still redirects', async () => {
+  const oldest = deferred(), middle = deferred(), latest = deferred();
+  const reads = [oldest, middle, latest];
+  const el = harness('admin.js', (url) => {
+    if (url.endsWith('/auth/me')) return ok({user:{role:'admin', username:'fixture'}});
+    if (url.endsWith('/config')) return ok({model:{main:'fixture'}});
+    if (url.includes('/applications?')) return reads.shift().promise;
+    return ok({});
+  });
+  await tick();
+  el('applicationStatus').value='approved'; el('applicationStatus').onchange();
+  el('applicationStatus').value='pending'; el('applicationStatus').onchange();
+  oldest.resolve(unauthorized()); middle.resolve(unauthorized());
+  await tick();
+  assert.deepEqual(el.replacements, []);
+  latest.resolve(unauthorized());
+  await tick();
+  assert.deepEqual(el.replacements, ['/?next=%2Fadmin']);
+});
+
+test('late finding 401 after A → B → A cannot clear the resumed review', async () => {
+  const firstA=deferred(), secondA=deferred();
+  let aReads=0;
+  const findings=['a','b'].map(id=>({finding_id:id,rule:'exact_column',summary:id,
+    review:{state:'pending',note:'',revision:1},review_history:[],
+    locations:[{file_id:'fixture'}],applicability:[],counterexamples:[]}));
+  const el=harness('integrity-review.js',(url) => {
+    if (url.endsWith('/reviews')) return ok({reviews:[{review_id:'fixture'}]});
+    if (url.endsWith('/fixture')) return ok({review_id:'fixture', report:{common_findings:findings}});
+    if (url.includes('/findings/a/')) return (++aReads===1 ? firstA : secondA).promise;
+    if (url.includes('/findings/b/')) return ok({columns:[],rows:[]});
+    throw Error(url);
+  });
+  await tick();
+  el('ir-findings').children[1].onclick(); el('ir-findings').children[0].onclick();
+  firstA.resolve(unauthorized());
+  await tick();
+  assert.equal(el('ir-summary').textContent,'a');
+  assert.equal(el('ir-findings').children.length,2);
+  secondA.resolve(unauthorized());
+  await tick();
+  assert.equal(el('ir-findings').children.length,0);
+  assert.match(el('ir-status').textContent,/登录已失效/);
 });

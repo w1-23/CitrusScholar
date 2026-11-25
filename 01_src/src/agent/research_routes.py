@@ -1,83 +1,31 @@
-"""Compute observed research source coverage without steering execution."""
+"""Report observed coverage only when the user explicitly requested both sources."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-import re
-from typing import Iterable, Mapping
+from collections.abc import Iterable, Mapping
 
-LOCAL_DISCOVERY = frozenset({"local_hybrid_search", "search_candidates", "search_agent_corpus"})
-LOCAL_REUSE = frozenset({"read_candidate", "read_local_evidence"})
-WEB_SEARCH = frozenset({"deepseek_search"})
+from src.core.tool_catalog import capability_groups
+from src.graph.retrieval_router import parse_request_constraints
 
-_NOT_RUN = frozenset({"not_run", "rejected"})
-_SUCCESS = frozenset({"complete", "partial"})
-
-
-def _attempted(records: Iterable[object], names: frozenset[str]) -> bool:
-    for row in records or ():
-        if not isinstance(row, Mapping) or row.get("inherited_from_job_id"):
-            continue
-        if str(row.get("name") or "") not in names:
-            continue
-        if str(row.get("status") or "").strip().lower() in _NOT_RUN:
-            continue
-        return True
-    return False
-
-
-def _succeeded(records: Iterable[object], names: frozenset[str]) -> bool:
-    for row in records or ():
-        if not isinstance(row, Mapping) or row.get("inherited_from_job_id"):
-            continue
-        if str(row.get("name") or "") not in names:
-            continue
-        if str(row.get("status") or "").strip().lower() in _SUCCESS:
-            return True
-    return False
-
-
-def _notice(missing: tuple[str, ...]) -> str:
-    labels = {"local": "本地检索", "web": "DeepSeek 网络 Search"}
-    return "覆盖说明：本轮" + "、".join(labels[item] for item in missing) + "未完成；回答仅基于已实际取得的证据。"
-
-
-@dataclass(frozen=True)
-class RouteGate:
-    active: bool = False
-    missing: tuple[str, ...] = ()
-    message: str = ""
-    notice: str = ""
-    challenge: bool = False
+_GROUPS = capability_groups()
+_LOCAL_TOOLS = _GROUPS["route_local"] | {"read_candidate", "read_local_evidence", "search_candidates", "search_agent_corpus"}
+_WEB_TOOLS = _GROUPS["web_retrieval"] | {"search_literature"}
+_OBSERVED = frozenset({"complete", "partial", "no_results"})
 
 
 def explicitly_requests_both_sources(query: str) -> bool:
-    from src.graph.retrieval_router import retrieval_denied, source_scope
-
-    scope = source_scope(query, exclusive_only=True)
-    if scope in {"local", "web"} or retrieval_denied(query, scope):
-        return False
-    local = r"本地|知识库|\blocal\b"
-    web = r"公开网|联网|网络|网上|网页|\b(?:web|internet|online)\b"
-    request = r"分别|同时|都要|都查|都用|都搜|一起查|交叉核对|结合|请.{0,12}(?:查|搜索|检索)|\bboth\b"
-    return all(re.search(pattern, query, re.I) for pattern in (local, web, request))
+    constraints = parse_request_constraints(query)
+    return constraints.source_policy == "required" and constraints.requested_mode == "fusion"
 
 
-def research_route_gate(records: Iterable[object], allowed: Iterable[str], *,
-                        explicit: bool = False) -> RouteGate:
-    """Report missing coverage without generating a model instruction."""
-    allowed_names = {str(item) for item in (allowed or ())}
-    local_authorized = bool(allowed_names & LOCAL_DISCOVERY)
-    web_authorized = bool(allowed_names & WEB_SEARCH)
-    if not explicit and not (local_authorized or web_authorized):
-        return RouteGate()
-    if not explicit and not _attempted(records, LOCAL_DISCOVERY | WEB_SEARCH):
-        return RouteGate()
-    local_done = _attempted(records, LOCAL_DISCOVERY) or _succeeded(records, LOCAL_REUSE)
-    web_done = _attempted(records, WEB_SEARCH)
-    missing = tuple(route for route, authorized, done in (
-        ("local", local_authorized, local_done),
-        ("web", web_authorized, web_done),
-    ) if (authorized or explicit) and not done)
+def dual_source_notice(query: str, records: Iterable[object]) -> str:
+    """No route parity requirement, provider preference or retry instructions."""
+    if not explicitly_requests_both_sources(query):
+        return ""
+    used = {row.get("name") for row in records
+            if isinstance(row, Mapping) and not row.get("inherited_from_job_id")
+            and row.get("status") in _OBSERVED}
+    missing = [label for names, label in ((_LOCAL_TOOLS, "本地检索"), (_WEB_TOOLS, "公开网络检索"))
+               if not used.intersection(names)]
     if not missing:
-        return RouteGate()
-    return RouteGate(active=True, missing=missing, notice=_notice(missing))
+        return ""
+    return "覆盖说明：本轮" + "、".join(missing) + "未完成；回答仅基于已实际取得的证据。"

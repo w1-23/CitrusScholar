@@ -110,8 +110,9 @@ def collect_outputs(c):
         record = json.loads(result.stdout, object_pairs_hook=unique_object)
     except (ValueError, RecursionError):
         return {"collection_error": "apptainer_collector_record_invalid"}
-    if type(record) is dict and set(record) == {"error"}:
-        return {"collection_error": record["error"]}
+    if type(record) is dict and set(record) in ({"error"}, {"error", "missing_paths"}):
+        return {"collection_error": record["error"],
+                **({"missing_paths": record["missing_paths"]} if "missing_paths" in record else {})}
     return {"outputs": record}
 
 

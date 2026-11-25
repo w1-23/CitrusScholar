@@ -291,3 +291,164 @@ def test_export_cas_after_staging_rejects_changed_revision_without_orphan(runtim
     assert staged and store.get_revision_export(fid, OWNER, 1, "pdf") is None
     _verify_hidden(staged)
     assert files.get_account_file(staged[0]["file_id"], OWNER, allow_internal=True) is None
+
+
+@pytest.fixture
+def code_runtime(runtime, monkeypatch):
+    from types import SimpleNamespace
+    from src import config
+    from src.code_execution import results, service
+    from src.core import account_leases
+
+    @contextmanager
+    def lease(owner):
+        assert owner in {OWNER, OTHER}
+        yield SimpleNamespace(epoch=1)
+
+    monkeypatch.setattr(config, "PROJECT_ROOT", runtime)
+    monkeypatch.setattr(account_leases, "account_lease", lease)
+    monkeypatch.setattr(service, "account_lease", lease)
+    def acquire(owner, *, expected_epoch):
+        assert owner == OWNER and expected_epoch == 1
+        return SimpleNamespace(release=lambda: None)
+    monkeypatch.setattr(account_leases, "acquire_account_lease", acquire)
+    monkeypatch.setattr(results, "acquire_account_lease", acquire)
+    return runtime
+
+
+def _deliver_code_output(runtime, monkeypatch, payload, filename="candidate.svg"):
+    from src.agent import code_tools
+    from src.agent.identity import ExecutionIdentity
+    from src.code_execution.figure_sources import delivery_key
+    from src.code_execution.protocol import ExecutionRequest, FileSnapshot
+    from src.code_execution.repository import ExecutionRepository
+    from src.code_execution.results import OutputBlob, accept_outputs
+    from src.code_execution.service import ExecutionService
+    from src.workspaces import TaskWorkspaceService
+
+    identity = ExecutionIdentity(OWNER, SESSION, REQUEST, "fixture-run")
+    workspace = TaskWorkspaceService(OWNER, SESSION)
+    task = "code_fixture"
+    current = workspace.create(task_id=task, request_id=task)
+    path = "/outputs/" + filename
+    request = ExecutionRequest(identity, task, current["workspace_id"], current["revision"], task, task,
+        FileSnapshot("/workspace/demo.py", "1" * 32, 1, "2" * 64, 1), outputs=(path,))
+    repository = ExecutionRepository(runtime / "state" / "code_executions.sqlite3")
+    queued = repository.submit(request)
+    eid = queued["execution_id"]
+    assert repository.claim("fixture")["execution_id"] == eid
+    repository.transition(eid, "fixture", 1, "running")
+    repository.transition(eid, "fixture", 1, "collecting")
+
+    def accept():
+        return {**accept_outputs(request, execution_id=eid, fence=1, blobs=(OutputBlob(path, payload),),
+                                workspace_repository=workspace.repository),
+                "request_fingerprint": request.fingerprint, "process_stopped": True}
+
+    receipt = repository.complete_success(eid, "fixture", 1, process_stopped=True, accept_result=accept)
+    ref = receipt["files"][0]
+    with monkeypatch.context() as patch:
+        patch.setattr(code_tools, "_identity", lambda: (identity, "fixture-deliver"))
+        patch.setattr(code_tools, "_service", lambda identity: ExecutionService(identity,
+            repository=repository, workspace_service=workspace))
+        with code_tools.code_execution_context(identity, "fixture-deliver"):
+            _, delivered = code_tools._dispatch("deliver", execution_id=eid, path=path)
+    assert delivered["_tool_outcome"]["reason_code"] == "code_output_delivered", delivered
+    assert delivered["filename"] == filename and delivered["source_sha256"] == ref["sha256"]
+    assert delivered["file_id"] != ref["file_id"]
+    public = artifacts.publish_artifact(owner=OWNER, session_id=SESSION, filename=filename, content=payload,
+        mime=ref["mime_type"], producer_tool="code_deliver", request_id=REQUEST,
+        source_file_id=ref["file_id"], source_sha256=ref["sha256"],
+        logical_task_id=delivery_key(eid, ref["path"], ref["sha256"]))
+    assert delivered["file_id"] == public["file_id"] and delivered["artifact_url"] == public["artifact_url"]
+    return eid, ref, public
+
+
+def test_verified_code_import_identity_and_idempotent_vector_copy(code_runtime, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from src.api import figure_workbench_router as router
+    from src.figures.workbench import service
+
+    eid, ref, public = _deliver_code_output(code_runtime, monkeypatch, R_SVG)
+    assert files.get_account_file(ref["file_id"], OWNER) is None
+    app = FastAPI()
+    app.include_router(router.router)
+    # Only authenticate the synthetic owner. Keep the endpoint, registry, queue,
+    # immutable files, derivatives and edit CAS real.
+    monkeypatch.setattr(router, "_owner", lambda req: int(req.headers.get("fixture-owner", str(OWNER))))
+    from contextlib import nullcontext
+    monkeypatch.setattr(router, "_write_scope", nullcontext)
+    async def thread(lease, fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(router, "run_account_thread", thread)
+    client = TestClient(app)
+    endpoint = "/api/v2/figure-workbench/import-svg"
+    payload = {"file_id": public["file_id"], "expected_sha256": public["sha256"]}
+    assert client.post(endpoint, json={"file_id": public["file_id"]}).status_code == 422
+    assert client.post(endpoint, json={**payload, "expected_sha256": "0" * 64}).status_code == 409
+    assert client.post(endpoint, json=payload, headers={"fixture-owner": str(OTHER)}).status_code == 404
+    assert client.post(endpoint, json={**payload, "file_id": ref["file_id"]}).status_code == 404
+    from src.code_execution.figure_sources import delivery_key
+    forged = artifacts.publish_artifact(owner=OWNER, session_id=SESSION, filename="another.svg", content=R_SVG,
+        mime="image/svg+xml", producer_tool="code_deliver", request_id=REQUEST,
+        source_file_id=ref["file_id"], source_sha256=ref["sha256"],
+        logical_task_id=delivery_key(eid, ref["path"], ref["sha256"]))
+    assert client.post(endpoint, json={**payload, "file_id": forged["file_id"]}).status_code == 409
+    assert store.count_projects(OWNER) == 0
+    with ThreadPoolExecutor(2) as pool:
+        replies = list(pool.map(lambda _: client.post(endpoint, json=payload), range(2)))
+    assert all(reply.status_code == 200 for reply in replies), [reply.text for reply in replies]
+    opened = replies[0].json()
+    assert opened == replies[1].json() == client.post(endpoint, json=payload).json()
+    assert opened["editable"] and opened["origin"] == "code_output" and "backend" not in opened
+    assert opened["original_exports"]["candidate.svg"]["file_id"] == public["file_id"]
+    fid = opened["figure_id"]
+    project = store.get_project(fid, OWNER)
+    assert project["source_json"]["nature_plot"]["source_receipt"]["execution_id"] == eid
+    assert store.count_projects(OWNER) == 1
+    before = service.detail(fid, OWNER, 1)
+    shape = next(group for group in before["groups"] if group["pick_ids"])
+    service.edit(fid, OWNER, 1, [{"group_id": shape["id"], "property": "edgecolor", "value": "#3399cc"}], save=True)
+    assert client.post(endpoint, json=payload).json() == opened
+    assert service.detail(fid, OWNER, 2)["hit_manifest"] == before["hit_manifest"]
+    source_file = files.get_account_file(public["file_id"], OWNER)["path"]
+    assert source_file.read_bytes() == R_SVG
+    source_file.write_bytes(R_SVG.replace(b"n = 6", b"n = 7"))
+    assert client.post(endpoint, json=payload).status_code == 409
+    assert store.count_projects(OWNER) == 1
+
+
+@pytest.mark.parametrize("payload,filename", [
+    (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="9" height="9"/></svg>', "unsupported.svg"),
+    (b'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aencAAAAASUVORK5CYII=', "raster.png"),
+])
+def test_noneditable_code_outputs_do_not_create_project(code_runtime, monkeypatch, payload, filename):
+    if filename.endswith(".png"):
+        from base64 import b64decode
+        payload = b64decode(payload)
+    _, _, entry = _deliver_code_output(code_runtime, monkeypatch, payload, filename)
+    if filename.endswith(".svg"):
+        result = nature_plot_project.import_library_svg(OWNER, entry["file_id"], expected_sha256=entry["sha256"])
+        assert result["reason_code"] == "plot_svg_unsupported" and not result["editable"]
+        assert "workbench_url" not in result
+    else:
+        with pytest.raises(projects.ProjectError) as error:
+            nature_plot_project.import_library_svg(OWNER, entry["file_id"], expected_sha256=entry["sha256"])
+        assert error.value.code == "plot_upload_not_svg"
+    assert store.count_projects(OWNER) == 0
+
+
+def test_ordinary_editable_svg_has_exact_editor_link_in_workbench(runtime):
+    from src.figures.workbench import service
+
+    original = _create_svg()
+    fid = original["figure_id"]
+    url = f"/figures/legacy?project={fid}"
+    detail = service.detail(fid, OWNER, 1)
+    assert original["links"]["workbench_url"] == detail["editor_url"] == url
+    assert all(not item["properties"] and not item["pick_ids"] for item in detail["groups"])
+    assert detail["hit_manifest"]["objects"] == []
+    [editable] = service.list_assets(OWNER, limit=5, offset=0, kind="svg", access="editable")["projects"]
+    assert editable["figure_id"] == fid and editable["editor_url"] == url
+    assert service.list_assets(OWNER, limit=5, offset=0, kind="svg", access="read_only")["projects"] == []

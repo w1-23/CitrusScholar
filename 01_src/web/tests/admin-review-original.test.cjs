@@ -20,14 +20,16 @@ function harness(fetch) {
     });
     return elements.get(id);
   };
-  const scope = {el, fetch, AbortController, esc: String,
+  const replacements = [];
+  const scope = {el, fetch, AbortController, esc: String, adminEpoch:0,
+    location:{replace(url){replacements.push(url);}},
     jsonRequest() { throw new Error('unexpected JSON or mutation request'); },
     notify(message) { throw new Error(message); }};
   vm.runInNewContext(source.slice(start, end), scope);
   const button = {dataset: {id: '1', corpus: 'open'},
     closest: () => ({querySelector: () => ({textContent: 'fixture title'})})};
   const action = () => scope.handleCorpusAction({target: {closest: () => button}});
-  return {el, scope, action, button};
+  return {el, scope, action, button, replacements};
 }
 
 function candidates() {
@@ -96,4 +98,15 @@ test('PDF offers open and download links without decoding binary as text', async
   assert.equal(h.el('corpusOriginalPdf').href, '/api/v2/admin/corpus/candidates/1/raw');
   assert.equal(h.el('corpusOriginalPdf').hidden, false);
   assert.equal(h.el('corpusOriginalDownload').hidden, false);
+});
+
+
+test('old raw-original auth failure cannot redirect after admin view retirement', async () => {
+  let finish;
+  const h = harness(() => new Promise(resolve=>{finish=resolve;}));
+  const opening = h.action();
+  h.scope.adminEpoch++;
+  finish({ok:false,status:401});
+  await opening;
+  assert.deepEqual(h.replacements,[]);
 });

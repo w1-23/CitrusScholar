@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 LOOPBACK = '127.0.0.1'
 READ_METHODS = frozenset({'GET', 'HEAD', 'OPTIONS'})
-LOCAL_HEALTH_PATHS = frozenset({'/health', '/ready'})
+LOCAL_HEALTH_PATHS = frozenset({'/health', '/live', '/ready'})
 
 
 def _denied(status: int, detail: str) -> JSONResponse:

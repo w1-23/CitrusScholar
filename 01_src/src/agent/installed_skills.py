@@ -1,6 +1,9 @@
 """Read metadata for the same immutable Skill directory mounted by DeepAgents."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -8,6 +11,15 @@ import re
 from pathlib import Path
 
 import yaml
+
+
+RQA_ID = "research-question-answering"
+_PIN_FIELDS = ("native_skill_release", "skill_release_inventory_sha256")
+_IDENTITY_FIELDS = ("id", "version", "sha256")
+_CATALOG_FIELDS = (*_IDENTITY_FIELDS, "description", "applicability", "depends_on",
+                   "required_resources", "requires_any")
+_USE_ACTIVE_RELEASE = object()
+_turn_skills = ContextVar("installed_turn_skills", default=None)
 
 
 def release_path() -> Path | None:
@@ -20,32 +32,146 @@ def release_path() -> Path | None:
     return path
 
 
-def task_release(state: dict, *, resume: bool) -> Path | None:
-    """Pin one server-side release for method discovery and Code access."""
-    saved = state.get("native_skill_release") if resume else None
-    configured = Path(saved) if saved else None
-    if not resume:
-        configured = release_path()
-    if configured is None:
-        if resume and (state.get("skill_release_inventory_sha256")
-                       or (state.get("capability_runtime") or {}).get("skill_release_inventory_sha256")):
-            raise ValueError("skill_release_missing_during_recovery")
-        state["native_skill_release"] = ""
-        state["skill_release_inventory_sha256"] = ""
-        return None
-    if not configured.is_absolute():
+def release_pin(release: Path | None) -> dict[str, str]:
+    """Capture the existing server release and its inventory identity together."""
+    if release is None:
+        return dict.fromkeys(_PIN_FIELDS, "")
+    if not release.is_absolute():
         raise ValueError("skill_release_path_must_be_absolute")
-    root = configured.resolve(strict=True)
+    root = release.resolve(strict=True)
     model_directory(root)
     from .research_skill_catalog import _bytes, _path, _MAX_RESOURCE_BYTES
 
     digest = hashlib.sha256(_bytes(_path(root, "inventory.json"), _MAX_RESOURCE_BYTES)).hexdigest()
-    expected = state.get("skill_release_inventory_sha256") if resume else None
-    if expected and expected != digest:
-        raise ValueError("skill_release_changed_during_recovery")
-    state["native_skill_release"] = str(root)
-    state["skill_release_inventory_sha256"] = digest
-    return root
+    return dict(zip(_PIN_FIELDS, (str(root), digest)))
+
+
+def stored_release_pin(state: dict) -> dict:
+    """Return only the existing release fields from trusted persisted state."""
+    return {key: state[key] for key in _PIN_FIELDS if key in state}
+
+
+def task_release(state: dict, *, resume: bool, continuation_pin: dict | None = None) -> Path | None:
+    """Restore a server-frozen release for queued input, clarification or recovery."""
+    saved = stored_release_pin(state) if resume or continuation_pin is None else continuation_pin
+    if not saved and not resume and continuation_pin is None:
+        actual = release_pin(release_path())
+    else:
+        path, digest = (saved.get(key, "") for key in _PIN_FIELDS)
+        if (type(path) is not str or type(digest) is not str or bool(path) != bool(digest)
+                or (digest and not re.fullmatch(r"[a-f0-9]{64}", digest))):
+            raise ValueError("skill_release_pin_invalid")
+        actual = release_pin(Path(path) if path else None)
+        if path and (actual[_PIN_FIELDS[0]] != path or actual[_PIN_FIELDS[1]] != digest):
+            raise ValueError("skill_release_changed_during_recovery")
+        if resume and not path and (state.get("capability_runtime") or {}).get(_PIN_FIELDS[1]):
+            raise ValueError("skill_release_missing_during_recovery")
+    state.update(actual)
+    return Path(actual[_PIN_FIELDS[0]]) if actual[_PIN_FIELDS[0]] else None
+
+
+@dataclass(frozen=True)
+class TurnSkills:
+    """One authorized method view for the SDK, File and research workspace."""
+
+    release: Path | None
+    rqa_identity: tuple[str, ...] = ()
+
+    @classmethod
+    def from_selection(cls, release, selected):
+        pinned = next((row for row in selected if row["id"] == RQA_ID), None)
+        return cls(release, tuple(pinned[key] for key in _IDENTITY_FIELDS) if pinned else ())
+
+    def allows(self, skill_id: str) -> bool:
+        from src.core.capability_policy import allows
+
+        return ((skill_id != RQA_ID or bool(self.rqa_identity)) and allows("skill:" + skill_id))
+
+    def rows(self) -> list[dict]:
+        if self.release is None:
+            return []
+        return [row for row in list_installed(self.release) if self.allows(row["id"])
+                and (row["id"] != RQA_ID or tuple(row[key] for key in _IDENTITY_FIELDS) == self.rqa_identity)]
+
+
+@contextmanager
+def bind_turn_skills(view: TurnSkills):
+    token = _turn_skills.set(view)
+    try:
+        yield
+    finally:
+        _turn_skills.reset(token)
+
+
+def current_turn_skills() -> TurnSkills:
+    bound = _turn_skills.get()
+    return bound if bound is not None else TurnSkills(release_path())
+
+
+_RQA_READ_TOOLS = frozenset({"ls", "glob", "grep", "read_file", "workspace_list", "workspace_glob",
+                             "workspace_search", "workspace_read", "research_workspace", "load_skill", "read_skill"})
+_RQA_PATH = re.compile(r"(?:^|/)skills/" + RQA_ID + r"(?:$|/|[\s\"'])")
+
+
+def is_rqa_tool_result(name, content, args=None) -> bool:
+    if name not in _RQA_READ_TOOLS:
+        return False
+    args = args or {}
+    if args.get("skill_id") == RQA_ID or any(_RQA_PATH.search(value) for key in ("path", "file_path")
+            if isinstance(value := args.get(key), str)):
+        return True
+    return RQA_ID in str(content or "")
+
+
+def project_rqa_history(messages, identity, view: TurnSkills | None, *, parent_run_id: str = ""):
+    """Redact only RQA method observations in the model's outgoing message view."""
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, get_notification_metadata
+
+    permitted = view is not None and view.release is not None and view.allows(RQA_ID)
+    permitted_runs = {identity.run_id, parent_run_id} - {""} if permitted else frozenset()
+    cutoff = max((index for index, message in enumerate(messages) if isinstance(message, HumanMessage)
+                  and message.additional_kwargs.get("context_trusted") is True
+                  and message.additional_kwargs.get("context_origin") == "user"
+                  and message.additional_kwargs.get("run_id") == identity.run_id), default=len(messages))
+    calls, hidden = {}, set()
+    result = []
+    for index, message in enumerate(messages):
+        if isinstance(message, HumanMessage):
+            notification = get_notification_metadata(message)
+            skill = message.additional_kwargs.get("skill")
+            if (notification and notification["source"] == "pinned_skill"
+                    and isinstance(skill, dict) and skill.get("name") == RQA_ID
+                    and (not permitted or index < cutoff)):
+                continue
+        if isinstance(message, AIMessage):
+            calls.update((call["id"], call["args"]) for call in message.tool_calls)
+        if isinstance(message, ToolMessage):
+            meta = message.additional_kwargs
+            if (meta.get("context_trusted") is True
+                    and meta.get("session_id") == identity.session_id
+                    and meta.get("run_id") in permitted_runs):
+                result.append(message)
+                continue
+            method = is_rqa_tool_result(message.name, message.content, calls.get(message.tool_call_id))
+            if message.name == "read_tool_result" and isinstance(message.content, str):
+                try:
+                    data = json.loads(message.content)
+                    origin = data.get("tool_result_ref", {}).get("tool_call_id")
+                    method = (isinstance(origin, str) and origin in hidden
+                              or is_rqa_tool_result(data.get("tool_name"), data.get("result_text")))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            if method:
+                hidden.add(message.tool_call_id)
+                receipt = meta.get("result_reference")
+                if isinstance(receipt, dict) and isinstance(receipt.get("tool_call_id"), str):
+                    hidden.add(receipt["tool_call_id"])
+                # Keep the provider's paired result but not the retired method,
+                # attached bytes, or any pointers that expose its stored copy.
+                message = message.model_copy(update={"content": "本轮不可使用这条技能方法回执。",
+                    "artifact": None, "additional_kwargs": {}})
+        result.append(message)
+    return tuple(result)
 
 
 def model_directory(release: Path) -> Path:
@@ -96,15 +222,48 @@ def list_installed(release: Path) -> list[dict]:
     return rows
 
 
-def active_skills():
+def active_skills(release=_USE_ACTIVE_RELEASE):
+    """Public current-release catalog for the Skill picker and turn admission."""
     from src.core.capability_policy import allows
 
     try:
-        release = release_path()
+        if release is _USE_ACTIVE_RELEASE:
+            release = release_path()
         rows = list_installed(release) if release is not None else []
     except (OSError, ValueError, KeyError):
         return []
     return [row for row in rows if allows("skill:" + row["id"])]
+
+
+def scenario_catalog() -> list[dict]:
+    """Installed product methods; availability never grants execution rights."""
+    rows = active_skills()
+    return [{key: row.get(key, [] if key in {"depends_on", "required_resources", "requires_any"} else "")
+             for key in _CATALOG_FIELDS} for row in rows]
+
+
+def validate_scenario_selection(value, *, catalog=None) -> list[dict[str, str]]:
+    """Accept only exact current release identities for a new product request.
+
+    Archived identities are not upgraded or accepted as a current selection.
+    """
+    if value is None or (type(value) is list and not value):
+        return []
+    if type(value) is not list or len(value) > 4:
+        raise ValueError("invalid_selected_skills")
+    rows = {row["id"]: row for row in (scenario_catalog() if catalog is None else catalog)}
+    result, seen = [], set()
+    for selected in value:
+        if (type(selected) is not dict or set(selected) != set(_IDENTITY_FIELDS)
+                or any(type(selected[key]) is not str for key in _IDENTITY_FIELDS)):
+            raise ValueError("invalid_selected_skill_identity")
+        sid = selected["id"]
+        row = rows.get(sid)
+        if sid in seen or row is None or any(selected[key] != row[key] for key in _IDENTITY_FIELDS):
+            raise ValueError("selected_skill_identity_mismatch")
+        seen.add(sid)
+        result.append({key: row[key] for key in _IDENTITY_FIELDS})
+    return result
 
 
 def read_installed_resource(release, selected, resource, *, start_char, max_chars):

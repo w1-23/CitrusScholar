@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from hashlib import sha256
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 
 from playwright.sync_api import expect, sync_playwright
@@ -46,11 +46,18 @@ def pick_geometry(page, target):
       const project = await (await fetch(window.fixtureDetail)).json();
       const wanted = project.groups.find(g => g.label === target);
       const geometry = new window.FigureHitScene(xml, project.hit_manifest, true);
-      const box = image.getBoundingClientRect(), [vx,vy,vw,vh] = geometry.viewBox;
+      let box = image.getBoundingClientRect();
+      const [vx,vy,vw,vh] = geometry.viewBox;
       const available = viewport.getBoundingClientRect();
       const rows = project.hit_manifest.objects.filter(x => wanted.pick_ids.includes(x.gid) && x.bbox);
+      const uiScale = window.CitrusTheme.scale.effective();
       for (const row of rows) {
         const {x0,x1,y0,y1} = row.bbox;
+        const aimX = box.left + ((x0+x1)/2-vx)*box.width/vw;
+        const aimY = box.top + ((y0+y1)/2-vy)*box.height/vh;
+        viewport.scrollLeft += (aimX - (available.left+available.right)/2) / uiScale;
+        viewport.scrollTop += (aimY - (available.top+available.bottom)/2) / uiScale;
+        box = image.getBoundingClientRect();
         for (let py=y0;py<=y1;py+=0.7) for (let px=x0;px<=x1;px+=0.7) {
           const x=Math.round(box.left+(px-vx)*box.width/vw), y=Math.round(box.top+(py-vy)*box.height/vh);
           const hit = geometry.hits(geometry.point(x, y, box), false)[0];
@@ -72,7 +79,17 @@ def run(browser, origin, output):
     page.goto(origin + "/figure-workbench")
     expect(page.get_by_role("heading", name="未打开图件")).to_be_visible()
     assert page.get_by_text("从资料库导入").count() == 0
+    library_tab = page.get_by_role("tab", name="图件库")
+    objects_tab = page.get_by_role("tab", name="对象", exact=True)
     assets = page.locator("#assetList")
+    expect(library_tab).to_have_attribute("aria-selected", "true")
+    expect(page.get_by_role("link", name="返回资料库")).to_have_attribute("href", "/?files=1")
+    library_tab.focus()
+    page.keyboard.press("ArrowRight")
+    expect(objects_tab).to_be_focused()
+    expect(assets).not_to_be_visible()
+    page.keyboard.press("ArrowLeft")
+    expect(library_tab).to_be_focused()
     expect(assets.get_by_role("button", name="Synthetic overlap")).to_be_visible()
     assert page.get_by_label("类型", exact=True).count() == 0
     assert page.get_by_label("编辑权限", exact=True).count() == 0
@@ -93,6 +110,8 @@ def run(browser, origin, output):
     expect(page.get_by_role("heading", name="Synthetic overlap")).to_be_visible(timeout=15000)
     expect(page.get_by_role("dialog")).not_to_be_visible()
     expect(page.get_by_role("tree", name="对象组")).to_be_visible()
+    expect(objects_tab).to_have_attribute("aria-selected", "true")
+    expect(assets).not_to_be_visible()
     expect(page.locator("#preview")).to_be_visible()
     detail = next(url for method, url in reversed(requests) if method == "GET" and "/projects/" in url and "/preview/" not in url)
     page.evaluate("url => {window.fixtureDetail = url}", detail)
@@ -151,7 +170,17 @@ def run(browser, origin, output):
     page.evaluate("() => {window.fixtureDetail = window.fixtureDetail.replace('revision=1', 'revision=2')}")
 
     page.get_by_role("button", name="画布选取").click()
-    page.get_by_role("button", name="放大").click()
+    zoom = page.get_by_label("自定义画布缩放百分比")
+    zoom.fill("201")
+    page.get_by_role("button", name="应用画布缩放").click()
+    expect(page.get_by_role("button", name="适合窗口")).to_have_attribute("aria-pressed", "true")
+    zoom.fill("150")
+    page.get_by_role("button", name="应用画布缩放").click()
+    expect(page.locator("#zoomLevel")).to_have_text("150%")
+    expect(page.locator("html")).to_have_attribute("data-ui-scale", "125")
+    page.locator('[data-ui-scale-pick="150"]').click()
+    expect(page.locator("html")).to_have_attribute("data-ui-scale", "150")
+    expect(page.locator("#zoomLevel")).to_have_text("150%")
     expect(page.get_by_role("button", name="画布选取")).to_have_attribute("aria-pressed", "true")
     point = pick_geometry(page, "X 轴刻度文字")
     page.mouse.click(**point)
@@ -212,6 +241,7 @@ def run(browser, origin, output):
       if (canvas.dispatchEvent(drop)) throw new Error('Untrusted drop default was not cancelled');
     }""")
     expect(page.get_by_role("heading", name="Synthetic overlap")).to_be_visible()
+    library_tab.click()
     assets.get_by_role("button", name="Five independent groups").drag_to(page.locator("#canvas"))
     expect(page.get_by_role("heading", name="Five independent groups")).to_be_visible(timeout=15000)
     expect(group(page, "子图 1")).to_have_attribute("aria-expanded", "false")
@@ -222,15 +252,46 @@ def run(browser, origin, output):
         expect(page.get_by_role("heading", name=name, exact=True)).to_be_visible()
         expect(page.get_by_label("系列颜色", exact=True)).to_be_visible()
 
-    theme = page.get_by_role("combobox", name="界面主题")
-    expect(theme).to_be_visible()
-    theme.select_option("navy")
-    expect(page.locator("html")).to_have_attribute("data-theme", "navy")
+    expect(page.locator("html")).to_have_attribute("data-theme", "porcelain")
     page.reload()
     expect(page.get_by_role("heading", name="Five independent groups")).to_be_visible(timeout=15000)
-    expect(theme).to_have_value("navy")
-    page.screenshot(path=str(output / "workbench-navy.png"))
-    theme.select_option("sage")
+    expect(page.locator("html")).to_have_attribute("data-ui-scale", "150")
+    expect(page.get_by_role("button", name="适合窗口")).to_have_attribute("aria-pressed", "true")
+    assert page.viewport_size["width"] == 1360
+    expect(zoom).to_have_value("")
+    expect(zoom).to_have_attribute("placeholder", "缩放 %")
+    expect(zoom).to_have_accessible_description("输入 50 至 200 之间的整数。")
+    zoom_layout = """input => {
+      const panel = input.closest('.canvas-toolbar').getBoundingClientRect();
+      const controls = [...input.closest('.view-controls').querySelectorAll('button, input, output')];
+      const boxes = controls.map(node => node.getBoundingClientRect());
+      const overlap = boxes.flatMap((box, index) => boxes.slice(index + 1).flatMap((other, offset) =>
+        Math.min(box.right, other.right) - Math.max(box.left, other.left) > .5 &&
+        Math.min(box.bottom, other.bottom) - Math.max(box.top, other.top) > .5 ?
+          [[controls[index].id, controls[index + 1 + offset].id]] : []));
+      const outside = boxes.flatMap((box, index) =>
+        box.left < panel.left - .5 || box.right > panel.right + .5 ? [controls[index].id] : []);
+      const style = getComputedStyle(input);
+      const ctx = document.createElement('canvas').getContext('2d');
+      ctx.font = `${style.fontSize} ${style.fontFamily}`;
+      const room = input.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      const text = ctx.measureText(input.value || input.placeholder).width;
+      return {appearance: style.appearance, text, room, overlap, outside};
+    }"""
+    def check_zoom_layout():
+        metrics = zoom.evaluate(zoom_layout)
+        assert metrics["appearance"] == "textfield" and metrics["text"] + 2 < metrics["room"], metrics
+        assert not metrics["overlap"] and not metrics["outside"], metrics
+
+    check_zoom_layout()
+    page.screenshot(path=str(output / "workbench-150.png"))
+    zoom.fill("200")
+    page.get_by_role("button", name="应用画布缩放").click()
+    expect(zoom).to_have_value("200")
+    expect(page.locator("#zoomLevel")).to_have_text("200%")
+    check_zoom_layout()
+    page.screenshot(path=str(output / "workbench-150-value.png"))
+    page.locator('[data-ui-scale-pick="125"]').click()
 
     page.set_viewport_size({"width": 390, "height": 760})
     choose(page, "Separate bar groups")
@@ -264,6 +325,21 @@ def run(browser, origin, output):
     expect(page.get_by_role("button", name="SVG", exact=True)).to_be_enabled()
     expect(page.get_by_role("button", name="PNG", exact=True)).to_be_disabled()
     expect(page.get_by_role("button", name="PDF", exact=True)).to_be_disabled()
+    project_id = parse_qs(urlparse(page.url).query)["project"][0]
+    example_legacy = f"/figures/legacy?project={project_id}"
+    current_editor_url = example_legacy
+
+    def legacy_fixture(route):
+        response = route.fetch()
+        route.fulfill(response=response, json={**response.json(), "editor_url": current_editor_url})
+
+    page.route(f"**/api/v2/figure-workbench/projects/{project_id}?revision=1", legacy_fixture)
+    page.reload()
+    expect(page.get_by_role("link", name="旧版 SVG 编辑器")).to_have_attribute("href", example_legacy)
+    current_editor_url = f"/figures/legacy?project={'e' * 32}"
+    page.reload()
+    expect(page.get_by_role("heading", name="Static only")).to_be_visible(timeout=15000)
+    expect(page.get_by_role("link", name="旧版 SVG 编辑器")).not_to_be_visible()
     assert not errors, errors
     context.close()
     print("Chromium A01/A02/A03/A04/A07 passed")

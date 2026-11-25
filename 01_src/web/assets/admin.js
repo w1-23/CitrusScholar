@@ -84,7 +84,7 @@
   var pendingResetUserId = '';
   var pendingResetName = '';
   var resetGeneration = 0;
-  var panelGenerations = Object.create(null);
+  var panelGenerations = Object.create(null), adminEpoch = 0;
   var accountMutations = new Map(), applicationMutations = new Map();
   var applicationView = 0;
   var overview = {queue: null, config: null, providers: []};
@@ -94,10 +94,10 @@
     return panelGenerations[panel];
   }
   async function loadPanel(panel, request, render, matches) {
-    var generation = nextPanel(panel);
-    var isCurrent = function () { return generation === panelGenerations[panel] && (!matches || matches()); };
+    var generation = nextPanel(panel), epoch = adminEpoch;
+    var isCurrent = function () { return epoch === adminEpoch && generation === panelGenerations[panel] && (!matches || matches()); };
     try {
-      var data = await request();
+      var data = await request(function (url, options) { return jsonRequest(url, options, isCurrent); });
       if (isCurrent()) render(data);
     } catch (error) { if (isCurrent()) throw error; }
   }
@@ -117,9 +117,13 @@
     box.textContent = message; box.classList.add('visible');
     clearTimeout(toastTimer); toastTimer = setTimeout(function () { box.classList.remove('visible'); }, 3000);
   }
-  async function jsonRequest(url, options) {
+  async function jsonRequest(url, options, ownsView) {
+    var epoch = adminEpoch;
     var response = await fetch(url, options || {credentials:'same-origin'});
     var data = await response.json().catch(function () { return {}; });
+    if (epoch !== adminEpoch || (ownsView && !ownsView())) {
+      var stale = new Error('stale admin response'); stale.name = 'AbortError'; throw stale;
+    }
     if (response.status === 401) { location.replace('/?next=%2Fadmin'); throw new Error('登录已失效'); }
     if (response.status === 403) throw new Error('仅管理员可访问');
     if (!response.ok) {
@@ -174,7 +178,7 @@
       (queue ? '<span class="service-chip neutral">处理 ' + esc(queue.active) + ' · 排队 ' + esc(queue.queued) + '</span>' : '');
   }
   function loadUsers() {
-    return loadPanel('users', function () { return jsonRequest('/api/v2/admin/users'); }, function (data) {
+    return loadPanel('users', function (read) { return read('/api/v2/admin/users'); }, function (data) {
       var users = data.users || [];
       el('userCount').textContent = users.length;
       el('requestCount').textContent = users.reduce(function (sum, user) { return sum + (Number(user.requests_today) || 0); }, 0);
@@ -182,7 +186,7 @@
     });
   }
   function loadQueue() {
-    return loadPanel('queue', function () { return jsonRequest('/api/v2/admin/queue'); }, function (queue) {
+    return loadPanel('queue', function (read) { return read('/api/v2/admin/queue'); }, function (queue) {
       overview.queue = queue;
       el('activeCount').textContent = queue.active + ' / ' + queue.max_active;
       el('queuedCount').textContent = queue.queued + ' / ' + queue.max_pending;
@@ -190,8 +194,8 @@
     });
   }
   function loadModel() {
-    return loadPanel('model', function () {
-      return Promise.all([jsonRequest('/api/v2/config'), jsonRequest('/api/v2/config/providers')]);
+    return loadPanel('model', function (read) {
+      return Promise.all([read('/api/v2/config'), read('/api/v2/config/providers')]);
     }, function (data) {
       var config = overview.config = data[0], providers = overview.providers = data[1].providers || [];
       var activeProvider = providers.find(function (provider) { return provider.id === config.model.provider_id; });
@@ -203,7 +207,7 @@
   }
   function loadDevice() {
     if (deviceMutation) return;
-    return loadPanel('device', function () { return jsonRequest('/api/v2/admin/onnx/device'); },
+    return loadPanel('device', function (read) { return read('/api/v2/admin/onnx/device'); },
       function (device) { renderDevice(device, deviceDirty); });
   }
   function renderDevice(device, preserveSelection) {
@@ -223,8 +227,8 @@
   }
   function loadAudit() {
     var query = (el('auditQuery').value || '').trim(), page = offset;
-    return loadPanel('audit', function () {
-      return jsonRequest('/api/v2/admin/requests?limit=' + pageSize + '&offset=' + page + '&q=' + encodeURIComponent(query));
+    return loadPanel('audit', function (read) {
+      return read('/api/v2/admin/requests?limit=' + pageSize + '&offset=' + page + '&q=' + encodeURIComponent(query));
     }, function (data) {
       renderAudit(data.items || []);
       var total = Number(data.total) || 0;
@@ -394,7 +398,7 @@
     var query = '?status=' + encodeURIComponent(status) + '&limit=50';
     if (status === 'fulltext_missing') query += '&order=newest';
     if (before) query += '&before_id=' + encodeURIComponent(before);
-    return loadPanel('corpus', function () { return jsonRequest('/api/v2/admin/corpus/candidates' + query); },
+    return loadPanel('corpus', function (read) { return read('/api/v2/admin/corpus/candidates' + query); },
       renderCorpusCandidates, function () { return status === corpusFilter() && before === (status === 'fulltext_missing' && corpusBefore); });
   }
   function resetCorpusOriginal() {
@@ -409,8 +413,9 @@
   }
   async function openCorpusOriginal(button) {
     resetCorpusOriginal();
-    var request = new AbortController();
+    var request = new AbortController(), epoch = adminEpoch;
     corpusOriginalRequest = request;
+    function ownsOriginal() { return epoch === adminEpoch && corpusOriginalRequest === request && !request.signal.aborted; }
     var url = corpusCandidateUrl(button.dataset.id) + '/raw';
     var dialog = el('corpusOriginalDialog');
     var status = el('corpusOriginalStatus');
@@ -419,7 +424,7 @@
     if (!dialog.open) dialog.showModal();
     try {
       var response = await fetch(url, {credentials:'same-origin', cache:'no-store', signal:request.signal});
-      if (request.signal.aborted) return;
+      if (!ownsOriginal()) return;
       if (response.status === 401) { location.replace('/?next=%2Fadmin'); return; }
       if (!response.ok) {
         status.textContent = response.status === 404 || response.status === 410
@@ -435,7 +440,7 @@
       }
       if (isText) {
         var text = await response.text();
-        if (request.signal.aborted) return;
+        if (!ownsOriginal()) return;
         el('corpusOriginalText').textContent = text;
         el('corpusOriginalText').hidden = false;
         status.textContent = '正在显示归档文件的原始文字。';
@@ -451,7 +456,7 @@
       el('corpusOriginalDownload').href = url + '?download=true';
       el('corpusOriginalDownload').hidden = false;
     } catch (_error) {
-      if (!request.signal.aborted) status.textContent = '无法读取归档原件，请稍后重试。';
+      if (ownsOriginal()) status.textContent = '无法读取归档原件，请稍后重试。';
     }
   }
   async function handleCorpusAction(event) {
@@ -535,8 +540,8 @@
   }
   function loadApplications() {
     var status = appStatus, page = appOffset;
-    return loadPanel('applications', function () {
-      return jsonRequest('/api/v2/admin/applications' + CitrusAdminContract.pageQuery(status, appPageSize, page));
+    return loadPanel('applications', function (read) {
+      return read('/api/v2/admin/applications' + CitrusAdminContract.pageQuery(status, appPageSize, page));
     }, renderApplications, function () { return status === appStatus && page === appOffset; });
   }
   async function handleApplicationAction(event) {
@@ -564,7 +569,7 @@
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(CitrusAdminContract.decisionBody(decision, reason))
-      });
+      }, isCurrent);
       if (!isCurrent()) return;
       await loadApplications();
       if (isCurrent()) notify(decision === 'approve' ? '已通过该申请' : '已拒绝该申请');
@@ -609,8 +614,8 @@
   }
   function loadInvites() {
     var page = inviteOffset;
-    return loadPanel('invites', function () {
-      return jsonRequest('/api/v2/admin/invites' + CitrusAdminContract.invitesQuery(invitePageSize, page));
+    return loadPanel('invites', function (read) {
+      return read('/api/v2/admin/invites' + CitrusAdminContract.invitesQuery(invitePageSize, page));
     }, renderInvites, function () { return page === inviteOffset; });
   }
   function showOneTimeInvite(code) {
@@ -715,8 +720,8 @@
   }
   async function submitReset(event) {
     event.preventDefault();
-    var targetId = pendingResetUserId, generation = resetGeneration;
-    var isCurrent = function () { return generation === resetGeneration && targetId === pendingResetUserId; };
+    var targetId = pendingResetUserId, generation = resetGeneration, epoch = adminEpoch;
+    var isCurrent = function () { return epoch === adminEpoch && generation === resetGeneration && targetId === pendingResetUserId; };
     var error = el('adminResetError');
     var button = el('adminResetSubmit');
     if (!targetId || button.disabled) return;
@@ -798,6 +803,7 @@
       if (event.key === 'Escape' && !el('adminResetDialog').hidden) closeResetDialog();
     });
     window.addEventListener('pagehide', function () {
+      adminEpoch++;
       closeResetDialog(); discardOneTimeInvite(); discardAdminSecret(); accountMutations.clear(); applicationMutations.clear();
       Object.keys(panelGenerations).forEach(nextPanel);
     });
@@ -810,7 +816,7 @@
     });
     el('olderButton').addEventListener('click', function () { offset += pageSize; loadAudit().catch(function (e) { notify(e.message); }); });
     el('newerButton').addEventListener('click', function () { offset = Math.max(0, offset - pageSize); loadAudit().catch(function (e) { notify(e.message); }); });
-    el('logoutButton').addEventListener('click', async function () { await fetch('/api/v2/auth/logout', {method:'POST'}); location.replace('/'); });
+    el('logoutButton').addEventListener('click', async function () { adminEpoch++; await fetch('/api/v2/auth/logout', {method:'POST'}); location.replace('/'); });
     if (el('corpusList')) {
       el('corpusList').addEventListener('click', function (event) { handleCorpusAction(event).catch(function (e) { notify(e.message); }); });
       el('corpusNewest').addEventListener('click', function () { corpusBefore = null; loadCorpus().catch(function (e) { notify(e.message); }); });

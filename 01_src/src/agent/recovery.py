@@ -6,15 +6,18 @@ account lease and worker lifecycle; the jobs transaction owns the dispatch CAS.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from copy import deepcopy
 import json
 import math
 from pathlib import Path
 import time
 
+from langgraph.checkpoint.base import INTERRUPT
+
 from .identity import ExecutionIdentity
 from .checkpoint_store import (
-    checkpoint_path, framework_checkpoint_path, framework_checkpoint_scope,
+    CheckpointProtectionError, checkpoint_path, framework_checkpoint_path, framework_checkpoint_scope,
     native_checkpoint_path, native_checkpoint_scope, open_framework_checkpoint,
     open_legacy_native_reader,
 )
@@ -26,13 +29,15 @@ _REQUEST_FIELDS = frozenset({
     "query", "request_id", "client_request_id", "session_id", "user_id", "job_id",
     "idempotency_key", "visualization_enabled", "context_compression", "selected_skills", "attachment_refs", "attachment_context",
     "browse_requested", "image_attachments", "has_paper_attachment", "request_tables", "mode",
-    "agent_no_prefetch_hints", "parent_job_id", "question_answer", "continuation_context",
+    "parent_job_id", "question_answer", "continuation_context",
     "no_replay", "script_budget_scope", "context_working_state", "history_summary",
     "long_term_memory", "resident_cards", "user_preferences", "account_files",
-    "history_evidence_block", "history_load_status", "history_load_reason", "history_load_error", "format_hint",
+    "history_evidence_block", "history_load_status", "history_load_reason", "history_load_error", "search_suggestions", "format_hint",
     "candidate_pool", "candidate_pool_notice", "request_plan", "task_contract",
     "native_skill_release", "skill_release_inventory_sha256", "capability_snapshot", "capability_runtime",
 })
+# Accepted only to decode original requests from older authenticated checkpoints.
+_RETIRED_REQUEST_FIELDS = frozenset({"agent_no_prefetch_hints"})
 
 
 def capture_original_request_state(state: dict) -> dict:
@@ -42,7 +47,7 @@ def capture_original_request_state(state: dict) -> dict:
 
 
 def validate_original_request_state(value, identity: ExecutionIdentity) -> dict:
-    if type(value) is not dict or set(value) - _REQUEST_FIELDS:
+    if type(value) is not dict or set(value) - (_REQUEST_FIELDS | _RETIRED_REQUEST_FIELDS):
         raise TaskConflict("recovery_original_request_missing")
     if (type(value.get("user_id")) is not int
             or value["user_id"] != identity.owner_user_id
@@ -56,22 +61,16 @@ def validate_original_request_state(value, identity: ExecutionIdentity) -> dict:
             or not isinstance(value.get("idempotency_key"), str)
             or not value["idempotency_key"]):
         raise TaskConflict("recovery_original_request_missing")
-    return deepcopy(value)
+    return deepcopy({key: item for key, item in value.items() if key in _REQUEST_FIELDS})
 
 
-def _checkpoint_reader(saver, *, maintenance=False):
+def _checkpoint_reader(saver):
     from langgraph.graph import END, START, StateGraph
     from .harness import HarnessState
 
-    # The reader and optional terminal update access storage only. There are
-    # no model nodes, callable tools, business middleware, or replay actions.
+    # Storage-only graph. No model nodes, tools, middleware, or replay actions.
     reader = StateGraph(HarnessState)
-    if maintenance:
-        reader.add_node("maintenance", lambda state: {})
-        reader.add_edge(START, "maintenance")
-        reader.add_edge("maintenance", END)
-    else:
-        reader.add_edge(START, END)
+    reader.add_edge(START, END)
     return reader.compile(checkpointer=saver)
 
 
@@ -129,7 +128,7 @@ async def validate_legacy_native_head(root, identity, provider_scope, *, context
             channels = saved.checkpoint.get("channel_values") or {}
             pending_tool = any(k.startswith("branch:to:") and "tool" in k for k in channels)
             pending_tool |= any(isinstance(v, Send) and "tool" in v.node for _, _, v in pending)
-            pending_tool |= any(channel == "__interrupt__" for _, channel, _ in pending)
+            pending_tool |= any(channel == INTERRUPT for _, channel, _ in pending)
             answered_question = (authorized_question_parent == values.get("active_run_id")
                                  and values.get("stop_status") == "waiting"
                                  and values.get("stop_reason") == "user_input_required")
@@ -191,6 +190,16 @@ async def committed_tool_receipts(identity, messages):
     return await asyncio.to_thread(read)
 
 
+@contextmanager
+def _checkpoint_reconciliation():
+    try:
+        yield
+    except CheckpointProtectionError as error:
+        if str(error) == "legacy_delta_requires_reconciliation":
+            raise TaskConflict("recovery_requires_reconciliation") from None
+        raise
+
+
 async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                               provider_scope: tuple[str, str], *,
                               execution_wait: dict | None = None, discover_execution_wait=False) -> dict:
@@ -211,17 +220,18 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                        for scope in {options["context_scope"], ""})):
             raise TaskConflict("executor_checkpoint_incompatible")
         raise TaskConflict("recovery_checkpoint_missing")
-    async with open_framework_checkpoint(root, identity, provider_scope, **options, read_only=True) as saver:
-        saved = await saver.aget_tuple({"configurable": framework_checkpoint_scope(identity, provider_scope, **options)})
-        if saved is None:
-            raise TaskConflict("recovery_checkpoint_missing")
-        raw = saved.checkpoint.get("channel_values", {})
-        if raw.get("executor_id") != EXECUTOR_ID:
-            raise TaskConflict("executor_checkpoint_incompatible")
-        if raw.get("active_run_id") != identity.run_id:
-            raise TaskConflict("recovery_identity_mismatch")
-        values = (await _checkpoint_reader(saver).aget_state(saved.config)).values
-        pending_interrupts = [value for _, channel, value in saved.pending_writes or () if channel == "__interrupt__"]
+    with _checkpoint_reconciliation():
+        async with open_framework_checkpoint(root, identity, provider_scope, **options, read_only=True) as saver:
+            saved = await saver.aget_tuple({"configurable": framework_checkpoint_scope(identity, provider_scope, **options)})
+            if saved is None:
+                raise TaskConflict("recovery_checkpoint_missing")
+            raw = saved.checkpoint.get("channel_values", {})
+            if raw.get("executor_id") != EXECUTOR_ID:
+                raise TaskConflict("executor_checkpoint_incompatible")
+            if raw.get("active_run_id") != identity.run_id:
+                raise TaskConflict("recovery_identity_mismatch")
+            values = (await _checkpoint_reader(saver).aget_state(saved.config)).values
+            pending_interrupts = [value for _, channel, value in saved.pending_writes or () if channel == INTERRUPT]
     if not isinstance(values, dict) or not values.get("messages"):
         raise TaskConflict("recovery_checkpoint_invalid")
     status = values.get("stop_status")

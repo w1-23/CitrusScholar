@@ -176,7 +176,7 @@ def expand(text: str) -> str:
         links = []
         for key, label, pattern in (
             ("download_url", "下载 SVG", r"/api/v2/[A-Za-z0-9_./?=&%+-]+"),
-            ("workbench_url", "在图件工作台打开", r"/figures\?project=[a-f0-9]{32}"),
+            ("workbench_url", "在图件工作台打开", r"/figures(?:/legacy)?\?project=[a-f0-9]{32}"),
         ):
             url = figure[key]
             if url and re.fullmatch(pattern, url):

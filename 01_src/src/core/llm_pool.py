@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import threading
 
 from langchain_openai import ChatOpenAI
 
 from src.config import settings
-from src.core.provider_protocol import DeepSeekChatOpenAI, uses_deepseek_protocol
+from src.core.provider_protocol import thinking_rejected, uses_deepseek_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -33,27 +32,7 @@ def is_thinking_rejected(exc: Exception) -> bool:
     Protocol-state failures (notably missing reasoning_content), invalid tool
     messages, unavailable models and ordinary HTTP errors must reach the caller.
     """
-    status = getattr(exc, "status_code", None)
-    if status is not None and status not in (400, 404, 422):
-        return False
-    body = getattr(exc, "body", None)
-    detail = f"{exc} {body or ''}".lower()
-    if "reasoning_content" in detail:
-        return False
-    field = r"\b(?:thinking(?:\.type)?|enable_thinking|reasoning_effort)\b"
-    error = body.get("error", body) if isinstance(body, dict) else {}
-    if isinstance(error, dict) and re.fullmatch(field, str(error.get("param", ""))):
-        if error.get("code") in {"unsupported_parameter", "unknown_parameter", "unrecognized_parameter"}:
-            return True
-    # Require the option itself to be rejected, not merely a nearby mention of
-    # thinking mode in an unsupported model/image/tool error.
-    return bool(re.search(
-        r"(?:unsupported|unknown|unrecognized|unexpected)\s+"
-        r"(?:(?:request|keyword|body)\s+)?(?:parameter|argument|field|option|key)"
-        r"(?:\s+supplied)?[\s:'\"`=]*" + field, detail)
-        or re.search(field + r"['\"`]*\s*(?:(?:parameter|argument|field|option)\s+)?"
-                     r"(?:is\s+)?(?:unsupported|not supported|not permitted|not allowed)\b", detail)
-        or re.search(field + r"['\"`:\s]*extra inputs are not permitted\b", detail))
+    return thinking_rejected(getattr(exc, "status_code", None), getattr(exc, "body", None), str(exc))
 
 
 class _ThinkingOffWrapper:
@@ -138,25 +117,22 @@ class _ThinkingOffWrapper:
                 raise
 
 
-class _ObservedChatOpenAI(ChatOpenAI):
-    def _get_request_payload(self, input_, *, stop=None, **kwargs):
-        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-        from src.core.request_context import observe_prepared_request
-        observe_prepared_request(payload)
-        return payload
-
-
-class _ObservedDeepSeekChatOpenAI(_ObservedChatOpenAI, DeepSeekChatOpenAI):
-    """Observe the final vendor payload, after private protocol state is added."""
-
-
 def _new_client(model, api_key, base_url, temperature, timeout, max_tokens,
                 extra_body: dict | None, default_headers: dict | None = None):
     from openai import DefaultAsyncHttpxClient, DefaultHttpxClient
-    kw: dict = {
-        "http_client": DefaultHttpxClient(follow_redirects=False),
-        "http_async_client": DefaultAsyncHttpxClient(follow_redirects=False),
-    }
+    from src.core.request_context import observe_async_provider_request, observe_provider_request
+    if uses_deepseek_protocol(model, base_url):
+        import httpx
+        from src.core.provider_transport import AsyncDeepSeekTransport, DeepSeekTransport
+
+        sync_client = httpx.Client(transport=DeepSeekTransport(base_url), follow_redirects=False)
+        async_client = httpx.AsyncClient(transport=AsyncDeepSeekTransport(base_url), follow_redirects=False)
+    else:
+        sync_client = DefaultHttpxClient(follow_redirects=False,
+            event_hooks={"request": [observe_provider_request]})
+        async_client = DefaultAsyncHttpxClient(follow_redirects=False,
+            event_hooks={"request": [observe_async_provider_request]})
+    kw = {"http_client": sync_client, "http_async_client": async_client, "use_responses_api": False}
     if extra_body:
         # v8.17.19: 关闭字段必须经 extra_body 原样透传网关——langchain-openai
         # 把 model_kwargs 里的 extra_body 提取为显式构造参数（UserWarning 实证：
@@ -166,10 +142,7 @@ def _new_client(model, api_key, base_url, temperature, timeout, max_tokens,
         kw["extra_body"] = dict(extra_body)
     if default_headers:
         kw["default_headers"] = dict(default_headers)
-    client_class = _ObservedDeepSeekChatOpenAI if uses_deepseek_protocol(model, base_url) else _ObservedChatOpenAI
-    if client_class is _ObservedDeepSeekChatOpenAI:
-        kw["use_responses_api"] = False
-    return client_class(
+    return ChatOpenAI(
         model=model,
         api_key=api_key,
         base_url=base_url,

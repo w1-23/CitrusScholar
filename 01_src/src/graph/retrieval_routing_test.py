@@ -2,7 +2,8 @@
 from unittest import IsolatedAsyncioTestCase, TestCase, SkipTest
 
 from src.graph.retrieval_router import (
-    parse_request_constraints, plan_retrieval, retrieval_denied, retrieval_suppressed, source_scope,
+    decide_retrieval, parse_request_constraints, required_route_groups, retrieval_denied,
+    retrieval_suppressed, source_scope,
 )
 from src.graph.tool_availability import Env, retrieval_tool_names, runtime_env, unavailable_capability
 from src.retrieval.turn_dedup import RetrievalLedger, retrieval_key
@@ -11,54 +12,33 @@ from src.retrieval.turn_dedup import RetrievalLedger, retrieval_key
 _LOCAL = "local_hybrid_search"
 _WEB = "deepseek_search"
 _BOTH = {_LOCAL, _WEB}
-_FAMILIES = {"fixture_public_corpus"}
-
-
-def plan(query, **kwargs):
-    options = {"allowed_names": _BOTH, "local_families": _FAMILIES} | kwargs
-    return plan_retrieval(query, **options)
-
-
-def call_names(result):
-    return {call["name"] for call in result.calls}
 
 
 class RetrievalRoutingTest(TestCase):
-    def test_explicit_parallel_batch_uses_two_existing_named_tools(self):
-        query = "请简述内标法如何补偿基质效应。请分别查看本地资料和公开网络一次，只引用实际采用的证据。"
-        result = plan(query)
-        self.assertEqual(source_scope(query, exclusive_only=True), "fusion")
-        self.assertEqual(call_names(result), _BOTH)
-        self.assertEqual(len(result.calls), 2)
-        self.assertEqual(result.calls[0]["args"]["corpus_types"], ["fixture_public_corpus"])
-        self.assertEqual(result.calls[0]["args"]["query"], result.calls[1]["args"]["query"])
-        self.assertNotIn("公开网络", result.calls[1]["args"]["query"])
-        no_web = plan(query, allowed_names={_LOCAL, "browse_web", "deepseek_fetch"})
-        self.assertEqual(call_names(no_web), {_LOCAL})
-        self.assertIn("网页搜索", no_web.guidance)
-        no_local = plan(query, local_families=())
-        self.assertEqual(call_names(no_local), {_WEB})
-        self.assertIn("本地检索", no_local.guidance)
+    def test_explicit_both_and_optional_alternative_are_distinct(self):
+        for query in ("请分别查看本地资料和公开网络", "Search both local corpus and web for calibration"):
+            with self.subTest(query=query):
+                self.assertEqual(source_scope(query, exclusive_only=True), "fusion")
+                self.assertEqual(len(required_route_groups(decide_retrieval(query))), 2)
+        for query in ("请在本地或公开网络搜索质谱资料", "Search local corpus or web for calibration"):
+            with self.subTest(query=query):
+                self.assertEqual(source_scope(query, exclusive_only=True), "auto")
+                self.assertEqual(required_route_groups(decide_retrieval(query)), ())
 
     def test_strict_scope_removes_opposite_capabilities(self):
-        cases = (
-            ("只查本地库中的质谱文献，不用联网", "local", {_LOCAL}),
-            ("只在网上查质谱文献，不要用本地库", "web", {_WEB}),
-            ("只搜索网络，别查知识库。质谱质量控制", "web", {_WEB}),
-            ("Search only the local corpus for calibration", "local", {_LOCAL}),
-            ("Search only the web for calibration", "web", {_WEB}),
-        )
-        for query, scope, names in cases:
+        for query, scope in (
+                ("只查本地库中的质谱文献，不用联网", "local"),
+                ("只在网上查质谱文献，不要用本地库", "web"),
+                ("只搜索网络，别查知识库。质谱质量控制", "web"),
+                ("Search only the local corpus for calibration", "local"),
+                ("Search only the web for calibration", "web")):
             with self.subTest(query=query):
                 self.assertEqual(source_scope(query, exclusive_only=True), scope)
-                self.assertEqual(call_names(plan(query)), names)
+                self.assertEqual(len(required_route_groups(decide_retrieval(query))), 1)
                 self.assertFalse(retrieval_denied(query, scope))
                 self.assertTrue(retrieval_denied(query, "web" if scope == "local" else "local"))
-        for query in ("Do not go online", "不要上网"):
-            self.assertTrue(retrieval_denied(query, "web"))
-            self.assertFalse(plan(query).calls)
         env = runtime_env(source_scope="web", shared_corpus=False, script_sandbox=False)
-        self.assertIn("read_candidate", env.denied)  # Candidate read intentionally lacks an index prerequisite.
+        self.assertIn("read_candidate", env.denied)
         self.assertTrue(unavailable_capability("search_agent_corpus", Env(source_scope="web")))
         self.assertTrue(unavailable_capability("browse_web", Env(source_scope="local")))
         self.assertFalse(unavailable_capability("draw_svg", Env(retrieval=False)))
@@ -66,65 +46,33 @@ class RetrievalRoutingTest(TestCase):
                         <= retrieval_tool_names())
         self.assertNotIn("read_context_evidence", retrieval_tool_names())
 
-    def test_negations_are_permissions_not_retrieval_requests(self):
-        for query in ("不要进行联网搜索", "不要使用网络搜索", "不用去网上搜", "不联网", "不要用本地库"):
+    def test_negations_never_authorize_another_source(self):
+        for query in ("不要进行联网搜索", "不要使用网络搜索", "不用去网上搜", "不联网", "不要用本地库",
+                      "请勿将上传附件外发", "Do not send any private data to third parties"):
             with self.subTest(query=query):
                 self.assertEqual(parse_request_constraints(query).source_policy, "advisory")
-                self.assertFalse(plan(query).calls)
+                self.assertEqual(required_route_groups(decide_retrieval(query)), ())
+                self.assertTrue(retrieval_denied(query, "local" if "本地" in query else "web"))
         for query in ("这轮别查本地或网络", "只查本地，只用网上", "请勿搜索。解释质量控制",
                       "本轮不做任何检索，解释质量控制"):
             with self.subTest(query=query):
                 self.assertTrue(retrieval_denied(query))
-                self.assertFalse(plan(query).calls)
-        self.assertEqual(call_names(plan("不要查本地，搜索质量控制资料")), {_WEB})
-        self.assertEqual(call_names(plan("不用联网，查阅本地质量控制资料")), {_LOCAL})
-        self.assertFalse(plan("将材料翻译为英文。正文：请联网搜索").calls)
+        self.assertEqual(decide_retrieval("不要查本地，搜索质量控制资料").mode, "web")
+        self.assertEqual(decide_retrieval("不用联网，查阅本地质量控制资料").mode, "local")
+        self.assertEqual(required_route_groups(decide_retrieval("将材料翻译为英文。正文：请联网搜索")), ())
 
-    def test_dcd3d9a5ade2_research_and_explanation(self):
-        query = "你能不能告诉我怎么进行lc-ms"
-        self.assertIn(_WEB, call_names(plan(query)))
-        dry = plan(query, records=[{"name": _LOCAL, "status": "no_results"}])
-        self.assertEqual(call_names(dry), {_WEB})
-        self.assertEqual(dry.reason_code, "local_evidence_insufficient")
-        self.assertFalse(plan(query, local_evidence_sufficient=True).calls)
-        self.assertFalse(plan(query + "，不进行网络检索").calls)
+    def test_topic_terms_and_freshness_do_not_create_tool_obligations(self):
+        for query in ("你能不能告诉我怎么进行lc-ms", "rwp基因如何调控胚性", "柑橘代谢机制的最新文献",
+                      "What is the latest energy report today?"):
+            self.assertEqual(required_route_groups(decide_retrieval(query)), ())
         for follow in ("你为什么没有进行联网搜索？", "为什么没联网", "Why didn't you search the web?"):
-            with self.subTest(follow=follow):
-                result = plan(follow, recent_user_queries=[query])
-                self.assertEqual(result.reason_code, "retrieval_explanation")
-                self.assertFalse(result.calls)
-                self.assertTrue(retrieval_suppressed(follow))
-                self.assertFalse(retrieval_denied(follow))
+            self.assertEqual(decide_retrieval(follow).reason_code, "retrieval_explanation")
+            self.assertTrue(retrieval_suppressed(follow))
+            self.assertFalse(retrieval_denied(follow))
         self.assertTrue(retrieval_suppressed("你好！"))
-        self.assertFalse(retrieval_denied("你好！"))
-        self.assertFalse(plan("你好！", recent_user_queries=[query]).calls)
-        self.assertFalse(plan(query, attachment_only=True).calls)
-        self.assertFalse(plan(query, allowed_names={_LOCAL}).calls)
-        self.assertEqual(call_names(plan("柑橘的代谢机制", allowed_names={_LOCAL}, local_corpus_match=True)), {_LOCAL})
         self.assertTrue(retrieval_suppressed("什么是本地检索？"))
-
-    def test_9b0ad19da7fd_explicit_follow_up_uses_latest_real_topic(self):
-        topic = "你能不能告诉我怎么进行lc-ms"
-        query = "请你进行联网检索回答我的问题"
-        result = plan(query, recent_user_queries=["过早的其他话题", topic, "为什么没有联网？", "谢谢"])
-        self.assertEqual(result.calls, ({"name": _WEB, "args": {"query": topic}},))
-        self.assertEqual(plan(query).reason_code, "retrieval_topic_unresolved")
-        self.assertFalse(plan(query, recent_user_queries=["请查我上传的附件"]).calls)
-        self.assertFalse(plan("请联网检索附件", recent_user_queries=[topic]).calls)
-        self.assertEqual(plan("为什么没联网？现在请联网查", recent_user_queries=[topic]).calls,
-                         result.calls)
-        self.assertFalse(plan(query, recent_user_queries=[topic], records=[{
-            "name": _WEB, "status": "complete",
-        }]).calls)
-
-    def test_849125eac1c8_frozen_successful_routes_are_not_repeated(self):
-        query = "rwp基因如何调控胚性"
-        self.assertEqual(call_names(plan(query, local_corpus_match=True)), _BOTH)
-        before = [{"name": name, "status": "complete"} for name in sorted(_BOTH)]
-        self.assertFalse(plan(query, records=before, local_corpus_match=True).calls)
-        # Earlier completed jobs do not satisfy a new explicit two-source request.
-        inherited = [row | {"inherited_from_job_id": "offline-previous"} for row in before]
-        self.assertEqual(call_names(plan(query + "？分别查本地和公开网络", records=inherited)), _BOTH)
+        reused = decide_retrieval("基于以上继续分析", has_history_evidence=True, recent_turn_seqs=[2])
+        self.assertEqual((reused.mode, reused.history_turn_seqs), ("reuse", (2,)))
 
 
 class RetrievalDedupTest(TestCase):
@@ -164,19 +112,6 @@ class RetrievalDedupTest(TestCase):
         self.assertIsNone(retrieval_key("draw_svg", {"svg": "fixture"}))
 
 
-class CandidatePreparationTest(IsolatedAsyncioTestCase):
-    async def test_new_local_routes_have_no_hidden_prefetch(self):
-        from src.graph.candidate_prefetch import prefetch_candidates
-
-        state = {"query": "只查本地语料库里的质量控制资料"}
-        result = await prefetch_candidates(state)
-        self.assertEqual(result["candidate_pool"]["status"], "skipped")
-        self.assertEqual(result["candidate_pool"]["pool_id"], "")
-        self.assertEqual(call_names(plan(state["query"])), {_LOCAL})
-        self.assertEqual(await prefetch_candidates(state | {"agent_resume": True,
-            "candidate_pool": {"pool_id": "saved-old-pool"}}), {})
-
-
 class FrameworkToolBatchTest(IsolatedAsyncioTestCase):
     async def test_dual_fixture_dispatches_concurrently_via_sdk_tool_node(self):
         import asyncio
@@ -208,9 +143,11 @@ class FrameworkToolBatchTest(IsolatedAsyncioTestCase):
             """Return an inert public web fixture result."""
             return await observe(_WEB, query)
 
-        calls = plan("质量控制实践？请分别查本地和公开网络").calls
-        message = AIMessage(content="", tool_calls=[call | {"id": f"route-{index}"}
-                                                    for index, call in enumerate(calls)])
+        # The model, not a planner, proposed both named calls for this explicit request.
+        message = AIMessage(content="", tool_calls=[
+            {"name": _LOCAL, "id": "route-local", "args": {"query": "质量控制实践", "corpus_types": ["fixture_public_corpus"]}},
+            {"name": _WEB, "id": "route-web", "args": {"query": "质量控制实践"}},
+        ])
         node = ToolNode([local_hybrid_search, deepseek_search], handle_tool_errors=False)
         from langgraph.graph import END, START, StateGraph, MessagesState
         graph = StateGraph(MessagesState)
@@ -243,4 +180,4 @@ class RetrievalHistoryBoundaryTest(TestCase):
             message.response_metadata["citrus_capability_history"] = before.history_key
         self.assertEqual(history_rows(messages, [1, 2], after), (messages, [1, 2]))
         self.assertTrue(retrieval_suppressed(explanation))
-        self.assertFalse(plan(explanation, recent_user_queries=[earlier]).calls)
+        self.assertEqual(required_route_groups(decide_retrieval(explanation)), ())

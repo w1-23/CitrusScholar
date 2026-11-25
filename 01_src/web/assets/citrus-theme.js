@@ -1,36 +1,47 @@
-/* Applied before any product page paints, with one storage key across routes. */
+/* Applied before any product page paints. Scaling never sets a figure's zoom. */
 (function (root) {
   'use strict';
-  var storageKey = 'citrus_theme';
-  var names = Object.freeze(['sage', 'paper', 'navy']);
-  var labels = Object.freeze({ sage: '浅绿白', paper: '暖纸白', navy: '夜间蓝' });
-  var aliases = { light: 'sage', cartoon: 'paper', dark: 'navy', night: 'navy' };
   var html = document.documentElement;
+  var key = 'citrus_ui_scale';
+  var desktop = root.matchMedia('(min-width: 1025px)');
+  var preference = 125;
+  html.setAttribute('data-theme', 'porcelain');
+  try {
+    var oldTheme = root.localStorage.getItem('citrus_theme');
+    if (oldTheme && oldTheme !== 'porcelain') root.localStorage.setItem('citrus_theme', 'porcelain');
+  } catch (_) {}
 
-  function normalize(value) {
-    if (names.indexOf(value) !== -1) return value;
-    return Object.hasOwn(aliases, value) ? aliases[value] : 'sage';
+  function effective() { return desktop.matches ? preference / 100 : 1; }
+  function updateControls() {
+    document.querySelectorAll('[data-ui-scale-pick]').forEach(function (button) {
+      button.setAttribute('aria-pressed', String(Number(button.dataset.uiScalePick) === preference));
+    });
   }
-  function current() { return normalize(html.getAttribute('data-theme')); }
-  function apply(value, persist) {
-    var next = normalize(value);
-    var changed = html.getAttribute('data-theme') !== next;
-    html.setAttribute('data-theme', next);
+  function set(value, persist) {
+    preference = Number(value) === 150 ? 150 : 125;
+    html.setAttribute('data-ui-scale', String(preference));
     if (persist) {
-      try { root.localStorage.setItem(storageKey, next); } catch (_) {}
+      try { root.localStorage.setItem(key, String(preference)); } catch (_) {}
     }
-    if (changed) root.dispatchEvent(new CustomEvent('citrus:themechange', { detail: next }));
-    return next;
+    updateControls();
+    root.dispatchEvent(new CustomEvent('citrus:scalechange', {detail: {preference: preference, scale: effective()}}));
+    return preference;
   }
   function read() {
-    try { return root.localStorage.getItem(storageKey); } catch (_) { return null; }
+    try { return root.localStorage.getItem(key); } catch (_) { return null; }
   }
-  var initial = read();
-  root.CitrusTheme = Object.freeze({ names: names, labels: labels, normalize: normalize,
-    current: current, set: function (name) { return apply(name, true); } });
-  apply(initial, initial != null && initial !== normalize(initial));
+  root.CitrusTheme = Object.freeze({ current: function () { return 'porcelain'; },
+    scale: Object.freeze({ get: function () { return preference; }, effective: effective,
+      set: function (value) { return set(value, true); } }) });
+  set(read(), false);
+  desktop.addEventListener('change', function () { set(preference, false); });
+  document.addEventListener('DOMContentLoaded', updateControls);
+  document.addEventListener('click', function (event) {
+    var button = event.target.closest && event.target.closest('[data-ui-scale-pick]');
+    if (button) set(button.dataset.uiScalePick, true);
+  });
   root.addEventListener('storage', function (event) {
-    if (event.key !== storageKey && event.key !== null) return;
-    try { if (event.storageArea === root.localStorage) apply(read(), false); } catch (_) {}
+    if (event.key !== key && event.key !== null) return;
+    try { if (event.storageArea === root.localStorage) set(read(), false); } catch (_) {}
   });
 })(window);

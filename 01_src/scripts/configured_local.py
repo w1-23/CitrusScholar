@@ -104,9 +104,8 @@ def configure(args):
             os.environ.pop(name, None)
     sys.path.insert(0, str(ROOT / '01_src'))
     if getattr(args, 'offline_code', False):
-        from src.code_execution.presence import worker_available
-        if not worker_available(state / 'code_executions.sqlite3'):
-            raise ValueError('Start the independent offline Code Worker for this runtime first')
+        # Declare Code capability without gating Web boot on its independent Worker.
+        # Job admission checks availability; release qualification uses wait-worker.
         os.environ['CITRUS_CODE_EXECUTION'] = 'offline-development'
     else:
         os.environ.pop('CITRUS_CODE_EXECUTION', None)
@@ -170,7 +169,7 @@ def main():
     parser.add_argument('--port', type=int, default=8167)
     parser.add_argument('--require-full', action='store_true')
     parser.add_argument('--offline-code', action='store_true',
-                        help='Enable trusted local offline Code after its independent Worker starts')
+                        help='Configure offline Code; execution requires its independent Worker')
     parser.add_argument('--prepare-only', action='store_true',
                         help='Initialize an independent runtime for Worker startup, without a server')
     parser.add_argument('--without-source-web-search', action='store_true',

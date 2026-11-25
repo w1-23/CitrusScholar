@@ -106,7 +106,7 @@ def completion_from_answer(answer: str, records) -> CompletionEnvelope:
     refs = [row["tool_call_id"] for row in effective_tool_records(records)
             if row.get("tool_call_id") and row.get("status") == "complete"
             and (row.get("name") or row.get("tool_name")) not in
-                {"load_skill", "read_skill", "update_task_plan"}]
+                {"load_skill", "read_skill", "update_task_plan", "write_todos"}]
     return CompletionEnvelope(schema_version=1, answer=answer, status="completed",
         goals=[CompletionGoal(goal="当前用户请求", kind="answer",
             evidence_call_ids=refs, artifact_links=[])], remaining=[],
@@ -180,7 +180,7 @@ def completion_errors(statement: CompletionEnvelope, records, missing=(), *, ver
         errors.append("ambiguous_evidence_identity")
     # Method loading is not evidence that the user's substantive task was done.
     evidence = {cid for cid, row in by_id.items() if row.get("status") == "complete"
-                and (row.get("name") or row.get("tool_name")) not in {"load_skill", "read_skill", "update_task_plan"}}
+                and (row.get("name") or row.get("tool_name")) not in {"load_skill", "read_skill", "update_task_plan", "write_todos"}}
     delivery_evidence = evidence | {cid for cid, row in by_id.items()
                                     if row.get("status") == "partial"
                                     and any(item.get("valid") and item.get("request_matches") is True

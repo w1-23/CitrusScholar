@@ -155,7 +155,7 @@ def test_create_publishes_hash_bound_project_with_initial_and_current_receipt(is
     assert export["sha256"] == digest and export["file_id"] in isolated.entries
     assert isolated.entries[export["file_id"]]["path"].read_bytes() == blob
     assert result["links"]["file"]["download_url"] == export["download_url"]
-    assert result["links"]["workbench_url"] == f"/figures?project={figure_id}"
+    assert result["links"]["workbench_url"] == f"/figures/legacy?project={figure_id}"
     assert manifest["initial_svg_receipt"]["receipt_id"] == \
         manifest["current_qa_receipt"]["receipt_id"]
     assert manifest["initial_svg_receipt"]["artifacts"][0]["sha256"] == digest
@@ -342,7 +342,8 @@ def test_draw_svg_saves_an_authorized_project_and_returns_links(isolated):
     saved = store.list_projects(OWNER)
     assert len(saved) == 1
     figure_id = saved[0]["figure_id"]
-    assert f"/figures?project={figure_id}" in text
+    assert f"/figures/legacy?project={figure_id}" in text
+    assert f"](/figures/legacy?project={figure_id})" in figures.expand("[[FIGURE:1]]")
     export = saved[0]["exports_json"]["svg"]
     assert f"下载：{export['download_url']}" in text
     assert export["sha256"] == saved[0]["source_json"]["svg_sha256"]
@@ -365,3 +366,19 @@ def test_draw_svg_keeps_the_existing_chat_placeholder_without_auth_context():
     assert "[[FIGURE:1]]" in text
     assert "（图示说明：Synthetic architecture）" in text
     assert "工作台：" not in text
+
+
+def test_chat_figure_link_allowlist_keeps_historical_and_exact_legacy_routes():
+    from src.core import figures
+
+    figures.begin_request()
+    figure_id = "a" * 32
+    for url, accepted in (
+        (f"/figures?project={figure_id}", True),
+        (f"/figures/legacy?project={figure_id}", True),
+        (f"/figures/legacy?project={figure_id}&next=/", False),
+        (f"//figures/legacy?project={figure_id}", False),
+        (f"/figures/legacy?project={figure_id[:-1]}", False),
+    ):
+        _, placeholder = figures.register(_architecture_svg(), "Synthetic", workbench_url=url)
+        assert (f"]({url})" in figures.expand(placeholder)) is accepted

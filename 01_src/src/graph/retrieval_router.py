@@ -6,10 +6,8 @@ the UI derives chips from actual tool artifacts and selected history evidence.
 """
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
-from typing import Iterable, Mapping
 
 from src.core.tool_catalog import capability_groups
 
@@ -45,21 +43,6 @@ _SOCIAL = re.compile(
 _MEMORY_COMMAND = re.compile(
     r"^\s*(?:请|帮我|麻烦)?(?:记住|记一下|记下来|保存到(?:账号)?记忆)|"
     r"^\s*(?:从)?以后(?:都|请|默认).{0,120}(?:回答|使用|保留|记住)",
-    re.I,
-)
-_LITERATURE = re.compile(
-    r"文献|论文|参考文献|相关研究|研究进展|学术|期刊|综述|元分析|"
-    r"literature|papers?|studies|references?|review|meta-analysis",
-    re.I,
-)
-# Domain words are deliberately absent. A topic keyword may make web evidence a
-# useful *suggestion*, but it never becomes a required route or a hard gate.
-# Only generic research-method vocabulary is used here, and its decision remains
-# advisory unless the user explicitly constrained the source.
-_FACT_LOOKUP = re.compile(
-    r"实验|试验|机制|表型|代谢|转录|测序|统计|显著性|离群|缺失值|"
-    r"科研|学术|基因|蛋白|protocol|experiment|mechanism|genome|protein|"
-    r"trial|assay|statistic|(?<![a-z0-9])(?:[a-z]{2,5}[-–‑]ms(?:/ms)?|hplc|gcms|lcms|qpcr)(?![a-z0-9])",
     re.I,
 )
 _LATEST = re.compile(
@@ -104,9 +87,13 @@ _ONLY_SOURCE = re.compile(
 _SOURCE_ACTION = re.compile(
     rf"{_SOURCE}[^，。！？；,!?.;\n]{{0,14}}?{_ACTION}|"
     rf"{_ACTION}[^，。！？；,!?.;\n]{{0,18}}?{_SOURCE}", re.I)
-_BOTH_ACTION = re.compile(
-    rf"{_ACTION}|分别|同时|都要|都用|结合|交叉核对|对照|\bboth\b", re.I)
-_GENERIC_FUSION = re.compile(r"融合(?:搜索|检索|查询)|同时(?:查|搜)|一起(?:查|搜)", re.I)
+_BOTH_ACTION = re.compile(r"分别|同时|都要|都用|结合|交叉核对|对照|\bboth\b", re.I)
+_PAIR_JOIN = re.compile(rf"{_SOURCE}\s*(?:以及|和|与|及|并|、|\band\b)\s*{_SOURCE}", re.I)
+_PAIR_ALTERNATIVE = re.compile(rf"{_SOURCE}\s*(?:或者|或|/|\bor\b)\s*{_SOURCE}", re.I)
+_GENERIC_FUSION = re.compile(r"融合(?:搜索|检索|查询)", re.I)
+_PRIVATE_EGRESS_DENIAL = re.compile(
+    r"(?:不要|禁止|不得|请勿|别|不许)\s*(?:将.{0,24}?)?(?:外发|外传|上传到(?:公网|互联网|第三方))|"
+    r"\b(?:do not|don['’]t|never)\s+(?:send|upload|share)\b.{0,60}\b(?:externally|outside|online|third parties)\b", re.I)
 _SOURCE_EXPLANATION = re.compile(
     rf"(?:为什么|为何|怎么|\bwhy\b)[^。！？；!?;\n]{{0,30}}?"
     rf"(?:没(?:有)?|未|不曾|did(?:\s+not|n['’]t)|haven['’]t)[^。！？；!?;\n]{{0,18}}?"
@@ -120,6 +107,7 @@ _SCOPE_VALUES = {"auto", "local", "web", "fusion"}
 class _SourceIntent:
     requested: str = "auto"
     exclusive: str = "auto"
+    either: bool = False
     blocked: frozenset[str] = frozenset()
     explanation: bool = False
     action_text: str = ""
@@ -146,6 +134,8 @@ def _source_intent(query: str) -> _SourceIntent:
     positive = _SOURCE_BAN.sub(" ", action_text)
     if _SEARCH_BAN.search(positive):
         blocked.update(("local", "web"))
+    if _PRIVATE_EGRESS_DENIAL.search(positive):
+        blocked.add("web")
     exclusive_clauses = [{name for name in ("local", "web") if _has_source(match[0], name)}
                          for match in _ONLY_SOURCE.finditer(positive)]
     for names in exclusive_clauses:
@@ -153,11 +143,12 @@ def _source_intent(query: str) -> _SourceIntent:
     exclusive_names = set().union(*exclusive_clauses)
     allowed = {"local", "web"} - blocked
     requested = set(exclusive_names)
-    if _GENERIC_FUSION.search(positive) or (
-        all(_has_source(positive, name) for name in ("local", "web")) and _BOTH_ACTION.search(positive)
-    ):
+    mentions_both = all(_has_source(positive, name) for name in ("local", "web"))
+    either = bool(mentions_both and _PAIR_ALTERNATIVE.search(positive) and not _BOTH_ACTION.search(positive))
+    if not either and (_GENERIC_FUSION.search(positive) or (mentions_both and (
+            _BOTH_ACTION.search(positive) or (_PAIR_JOIN.search(positive) and _ACTION.search(positive))))):
         requested.update(("local", "web"))
-    else:
+    elif not either:
         for match in _SOURCE_ACTION.finditer(positive):
             requested.update(name for name in ("local", "web") if _has_source(match[0], name))
         # “请联网回答” requests a web operation even without a search verb.
@@ -166,7 +157,7 @@ def _source_intent(query: str) -> _SourceIntent:
             requested.add("web")
     return _SourceIntent(_route_for(requested & allowed),
                          _route_for(allowed) if len(allowed) == 1 else "auto",
-                         frozenset(blocked), explanation, positive)
+                         either, frozenset(blocked), explanation, positive)
 
 
 def source_scope(query: str, *, exclusive_only: bool = False) -> str:
@@ -237,7 +228,7 @@ def parse_request_constraints(
     if mode == "auto" and selected_scope in {"local", "web", "fusion"}:
         chosen = {"local", "web"} if selected_scope == "fusion" else {selected_scope}
         mode = _route_for(chosen - intent.blocked)
-    if mode == "auto" and explicit:
+    if mode == "auto" and explicit and not intent.either:
         mode = intent.exclusive if intent.exclusive != "auto" else "web"
     if mode != "auto":
         groups = {"local": (LOCAL_GROUP,), "web": (WEB_GROUP,), "fusion": (WEB_GROUP, LOCAL_GROUP)}
@@ -276,7 +267,6 @@ class RetrievalDecision:
     history_turn_seqs: tuple[int, ...] = ()
     reason_code: str = "default"
     policy: str = "advisory"
-    router_mode: str = "advisory"
 
     def as_diagnostic(self) -> dict:
         return {
@@ -285,18 +275,12 @@ class RetrievalDecision:
             "history_turn_seqs": list(self.history_turn_seqs),
             "reason_code": self.reason_code,
             "policy": self.policy,
-            "router_mode": self.router_mode,
         }
 
 
 def required_route_groups(decision: RetrievalDecision) -> tuple[frozenset[str], ...]:
-    """Return only groups that are allowed to gate completion.
-
-    Advisory routing still informs the model prompt, but cannot turn a keyword
-    suggestion into an obligatory tool call. The compatibility ``enforce``
-    mode intentionally restores that legacy behavior.
-    """
-    if decision.policy == "required" or decision.router_mode == "enforce":
+    """Only an explicit user source request can produce required route groups."""
+    if decision.policy == "required":
         return tuple(decision.required_tool_groups)
     return ()
 
@@ -324,22 +308,18 @@ def decide_retrieval(
     *,
     has_history_evidence: bool = False,
     recent_turn_seqs: list[int] | tuple[int, ...] = (),
-    local_corpus_match: bool = False,
 ) -> RetrievalDecision:
-    """Choose none/reuse/local/web/fusion without asking the model to decide."""
+    """Describe user scope and reusable evidence without selecting tool calls."""
     q = str(query or "").strip()
     scope = str(scope or "auto").strip().casefold()
     if scope not in {"auto", "local", "web", "fusion"}:
         scope = "auto"
-    router_mode = os.environ.get("CITRUS_RETRIEVAL_ROUTER_MODE", "advisory").strip().lower()
-    if router_mode not in {"advisory", "enforce"}:
-        router_mode = "advisory"
     recent = tuple(sorted({
         int(turn) for turn in (recent_turn_seqs or ()) if int(turn) > 0
     }))
 
     def decision(mode, groups=(), history=(), reason="default", policy="advisory"):
-        return RetrievalDecision(mode, tuple(groups), history, reason, policy, router_mode)
+        return RetrievalDecision(mode, tuple(groups), history, reason, policy)
 
     constraints = parse_request_constraints(query, scope)
     if constraints.source_policy == "deny":
@@ -369,150 +349,6 @@ def decide_retrieval(
     if _PURE_TRANSFORM.search(q):
         return decision("none", (), (), "transformation_from_context", policy)
 
-    literature = bool(_LITERATURE.search(q))
-    research = bool(_FACT_LOOKUP.search(q))
-    latest = bool(_LATEST.search(q))
-    if latest or new_evidence:
-        return decision("web", (WEB_GROUP,), (), "time_sensitive_web", policy)
-    if literature:
-        if local_corpus_match:
-            return decision(
-                "fusion", (WEB_GROUP, LOCAL_GROUP), (), "new_literature_fusion", policy)
-        return decision("web", (WEB_GROUP,), (), "new_literature_web", policy)
-    if research:
-        if local_corpus_match:
-            return decision(
-                "fusion", (WEB_GROUP, LOCAL_GROUP), (), "research_fact_fusion", policy)
-        return decision("web", (WEB_GROUP,), (), "research_fact_web", policy)
-    return decision("none", (), (), "no_external_source_needed", policy)
-
-
-# A seed is a small business proposal for the framework's existing tool node.
-# It never invokes tools, marks coverage, or obtains new source permissions.
-_SEARCH_TOOLS = {"local": "local_hybrid_search", "web": "deepseek_search"}
-_LOCAL_DISCOVERY = frozenset({"local_hybrid_search", "search_candidates", "search_agent_corpus"})
-_DEFERRED = frozenset({"not_run", "rejected", "skipped", "cancelled"})
-_DRY_LOCAL = frozenset({"no_results", "failed", "partial"})
-_ROUTING_PREFIX = re.compile(
-    rf"^\s*(?:(?:{_SOURCE}|{_ACTION}|{_EXCLUSIVE}|{_LOCATION}|{_CONNECT}|"
-    r"请问|请|麻烦|帮我|你|给我|先|再|现在|继续|重新|分别|同时|一起|融合|一下|一次|都要|"
-    r"回答|解答|说明|解释|关于|\b(?:please|both|for|answer|the)\b)\s*)+", re.I)
-_TOPIC_REFERENCE = re.compile(
-    r"(?:(?:请|并|回答|解答|解释|查阅|查看|查一下|检索|搜索|核实|for|about|answer)\s*)*"
-    r"(?:(?:我(?:刚才|之前|上个|这个|的)?|刚才的?|前面的?|上一轮的?|之前的?|上述(?:的)?|"
-    r"上面(?:的)?|这个|那个|原来(?:的)?|原|同一个|刚刚|my\s+|the\s+|that\s+|"
-    r"previous\s+|last\s+|same\s+)*(?:问题|提问|主题|话题|内容|question|topic)|"
-    r"前者|后者|上述|上面|继续|这些|刚才的|之前的|it|that|this|them)\s*(?:吧|好吗|呢|吗)?", re.I)
-_CONTROL_CLAUSE = re.compile(
-    r"^(?:只|仅|务必|请|不要)?\s*(?:引用|采用|使用|给出|附上|列出|返回|提供|cite|provide|include)"
-    r"[^。！？.!?]{0,48}(?:证据|来源|链接|资料|文献|结果|sources?|citations?|references?|links?)\s*$"
-    r"|^(?:详细一点|简短一点|用中文(?:回答)?|用英文(?:回答)?|be (?:brief|concise)|briefly)\s*$", re.I)
-_DO_NOT_PROJECT = re.compile(
-    r"```|(?:上传|附件|账号文件|私有|保密|密码|账号|访问令牌|api\s*key|credentials?|password|"
-    r"access\s+token|private\s+(?:data|file)|attached\s+(?:file|document))", re.I)
-
-
-def topic_for_retrieval(query: str, recent_user_queries: Iterable[str] = ()) -> str:
-    """Extract a topic from user text only. An action-only follow-up uses the latest topic."""
-    from src.graph.intent_text import intent_clauses
-
-    def topic(text: str) -> str:
-        if (_DO_NOT_PROJECT.search(text) or _SOCIAL.fullmatch(text.strip())
-                or _MEMORY_COMMAND.search(text) or len(text) > 400):
-            return ""
-        pieces = []
-        for clause in intent_clauses(text):
-            if _SOURCE_EXPLANATION.search(clause) or _CONTROL_CLAUSE.search(clause):
-                continue
-            clean = _SEARCH_BAN.sub("", _SOURCE_BAN.sub("", clause)).strip()
-            if _source_intent(clause).requested != "auto" or _REQUIRED.search(clean):
-                clean = _ROUTING_PREFIX.sub("", clean).strip(" \t:：,，。.!！?？-—")
-            clean = re.sub(r"^(?:请简述|请描述|请问|请简要说明)\s*", "", clean)
-            if clean and not _TOPIC_REFERENCE.fullmatch(clean):
-                pieces.append(clean)
-        return " ".join(" ".join(pieces).split()).strip()[:300]
-
-    query = str(query or "")
-    if _DO_NOT_PROJECT.search(query) or len(query) > 400:
-        return ""
-    current = topic(query)
-    if current:
-        return current
-    for earlier in reversed(tuple(recent_user_queries)[-8:]):
-        if isinstance(earlier, str) and not _PURE_TRANSFORM.search(earlier) and (found := topic(earlier)):
-            return found
-    return ""
-
-
-@dataclass(frozen=True)
-class RetrievalPlan:
-    calls: tuple[dict, ...] = ()
-    reason_code: str = "no_external_source_needed"
-    guidance: str = ""
-
-
-def plan_retrieval(
-    query: str, *, allowed_names: Iterable[str], recent_user_queries: Iterable[str] = (),
-    local_families: Iterable[str] = (), records: Iterable[Mapping] = (),
-    local_evidence_sufficient: bool | None = None, attachment_only: bool = False,
-    local_corpus_match: bool = False,
-) -> RetrievalPlan:
-    """Plan at most one discovery per eligible source, through the ordinary tool batch."""
-    constraints = parse_request_constraints(query)
-    if constraints.reason_code == "retrieval_explanation":
-        return RetrievalPlan(reason_code=constraints.reason_code,
-            guidance="用户在问先前为何未联网。按可核实的历史说明；不要现在发起检索，也不要猜测原因。")
-    if attachment_only or constraints.source_policy == "deny":
-        return RetrievalPlan(reason_code="attachment_only" if attachment_only else constraints.reason_code)
-    if constraints.reason_code == "data_audit_only" or (constraints.pure_transform and constraints.source_policy != "required"):
-        return RetrievalPlan(reason_code=constraints.reason_code)
-    intent = _source_intent(query)
-    rows = tuple(row for row in records if isinstance(row, Mapping) and not row.get("inherited_from_job_id"))
-    local = tuple(row for row in rows if row.get("name") in _LOCAL_DISCOVERY)
-    # Even failure/zero hits settle the bounded seed. A policy rejection is
-    # also not a reason to propose the same unavailable tool indefinitely.
-    tried = {"local"} if local else set()
-    if any(row.get("name") == _SEARCH_TOOLS["web"] for row in rows):
-        tried.add("web")
-    local_short = local_evidence_sufficient is False or any(row.get("status") in _DRY_LOCAL for row in local)
-    local_ready = (local_evidence_sufficient is True or
-                   (local_evidence_sufficient is None and any(row.get("status") == "complete" for row in local)))
-    reason = constraints.reason_code
-    if constraints.source_policy == "required":
-        routes = {"local", "web"} if constraints.requested_mode == "fusion" else {constraints.requested_mode}
-    else:
-        evaluated_query = intent.action_text if intent.blocked else query
-        decision = decide_retrieval(evaluated_query.lstrip("， ,"), local_corpus_match=local_corpus_match)
-        reason = decision.reason_code
-        fresh = reason == "time_sensitive_web"
-        researched = decision.mode in {"web", "fusion"} and not reason.endswith("_optional")
-        if local_short and not local_ready and (researched or any(row.get("status") not in _DEFERRED for row in local)):
-            routes, reason = {"web"}, "local_evidence_insufficient"
-        elif researched and (fresh or not local_ready):
-            routes = {"local", "web"} if decision.mode == "fusion" else {"web"}
-        else:
-            return RetrievalPlan(reason_code=reason)
-    routes -= intent.blocked | tried
-    if not routes:
-        return RetrievalPlan(reason_code=reason)
-    topic = topic_for_retrieval(query, recent_user_queries if constraints.source_policy == "required" else ())
-    if not topic:
-        return RetrievalPlan(reason_code="retrieval_topic_unresolved" if constraints.source_policy == "required" else reason,
-            guidance="没有可安全用作检索词的明确主题。必要时确认本轮要查的主题，不要猜测或外发附件内容。")
-    available = set(allowed_names)
-    families = sorted(set(local_families))
-    calls = []
-    missing = []
-    for route, tool in _SEARCH_TOOLS.items():
-        if route not in routes:
-            continue
-        if tool not in available or (route == "local" and not families):
-            missing.append("本地检索" if route == "local" else "网页搜索")
-            continue
-        args = {"query": topic}
-        if route == "local":
-            args["corpus_types"] = families
-        calls.append({"name": tool, "args": args})
-    guidance = ("本轮无法启动" + "、".join(missing) + "；只能基于实际取得的证据作答。"
-                if missing and constraints.source_policy == "required" else "")
-    return RetrievalPlan(tuple(calls), reason, guidance)
+    if _LATEST.search(q) or new_evidence:
+        return decision("web", reason="time_sensitive_web", policy=policy)
+    return decision("auto", reason="automatic_advice", policy=policy)

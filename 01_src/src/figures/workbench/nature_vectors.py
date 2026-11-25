@@ -8,6 +8,8 @@ from src.figures.plot_vectors import PLOT_PROPERTIES, plot_objects
 from src.figures.workbench import artifacts
 from src.figures.workbench.groups import _group_id
 
+_PICKABLE_SHAPES = frozenset({"path", "rect", "circle", "ellipse", "line", "polyline", "polygon"})
+
 
 def is_plot(project):
     source = project.get("source_json")
@@ -25,20 +27,28 @@ def _snapshot(project, owner, new_svg=None):
             or provenance != manifest.get("nature_plot") or blob.digest != source.get("svg_sha256")
             or not isinstance(source.get("svg"), str) or blob.body != source["svg"].encode("utf-8")):
         raise projects.ProjectError("plot_source_unverified", "无法验证原图与当前样式副本的绑定。", 409)
-    groups, targets = [], {}
+    groups, targets, hits = [], {}, []
     for ident, tag, label, values in plot_objects(new_svg if new_svg is not None else source["svg"]):
         group_id = _group_id(project["figure_id"], ("nature_plot_native", ident))
         targets[group_id] = ident, values
+        # The browser's detached SVG hit scene handles these native shapes.
+        # Do not proxy text (svglite textLength differs from Canvas metrics),
+        # resources, clips or a raster with approximate hit boxes.
+        pick_ids = [ident] if tag in _PICKABLE_SHAPES else []
+        if pick_ids:
+            hits.append({"gid": ident, "role": "vector", "artist": tag})
         groups.append({"id": group_id, "kind": "vector", "label": f"{label} · {ident}" if label else ident,
-                       "parent": None, "pick_ids": [], "properties": sorted(values), "values": values,
+                       "parent": None, "pick_ids": pick_ids, "properties": sorted(values), "values": values,
                        "reason": "", "line_marker_fill": False, "native_tag": tag})
     note = "仅可调整原图对象的颜色和线宽。数据、几何、原始文字和原始文件不变。"
     if provenance.get("origin") == "uploaded":
         note = "来自资料库上传（" + provenance["vector_dialect"] + " 样式）。平台未执行绘图或验证原始分析。" + note
+    elif provenance.get("origin") == "code_output":
+        note = "来自已验收的代码 SVG 输出。平台未验证原始分析。" + note
     return {"figure_id": project["figure_id"], "title": project.get("title") or "科研图件",
             "render_version": project["render_version"], "read_only_reason": "" if groups else "未发现可编辑的原生对象。",
             "groups": groups, "format_capabilities": artifacts.capabilities(project, owner, replayable=False),
-            "hit_manifest": {"objects": []}, "figure_size": None, "options": {}, "marker_fill_states": [],
+            "hit_manifest": {"objects": hits}, "figure_size": None, "options": {}, "marker_fill_states": [],
             "original_exports": provenance["original_exports"],
             "presentation_note": note}, targets
 

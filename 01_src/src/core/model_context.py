@@ -127,9 +127,23 @@ def _history_payload(message):
     return result
 
 
-def _keep_digest(text):
-    from src.core.context_budget import _keep_identifiers
-    return _keep_identifiers(text, max_chars=1100)
+def _keep_digest(content: str) -> str:
+    """Bound a historical tool digest while retaining its source anchors."""
+    max_chars = 1100
+    if not content:
+        return content
+    ident_lines: list[str] = []
+    for line in content.splitlines():
+        if re.search(
+            r"\b(doi|evidence_id|artifact_id|chunk_id|source_id|pmid|url)\b",
+            line, re.IGNORECASE) or re.match(r"^\s*\[?\d+\]?\s", line):
+            ident_lines.append(line[:200])
+    head = content[:max_chars]
+    body = (f"{head}\n[TRUNCATED: 原始 {len(content)} 字符，仅保留前 {max_chars} 字符；"
+            f"完整内容已被发送视图压缩规则截断]") if len(content) > max_chars else content
+    if ident_lines:
+        body += "\n[保留标识符]\n" + "\n".join(ident_lines[:20])
+    return body
 
 
 def statistical_send_view(message):
@@ -264,7 +278,7 @@ def historical_send_view(messages: list) -> list:
     """One output per input in the same order, suitable for row-ID checkpoints.
 
     Only trusted metadata unwraps server-generated user envelopes. Legacy rows
-    and literal XML requests are preserved. Group folding is a separate API.
+    and literal XML requests are preserved.
     """
     view = []
     for message in messages:
@@ -342,92 +356,3 @@ def _outcome(message, data):
     if isinstance(message.content, str) and re.match(r"\[(?:[A-Z_]*(?:ERROR|EMPTY|ARG|FAIL)[A-Z_]*)\]", message.content):
         return "error"
     return "returned; execution outcome not reported"
-
-
-def fold_completed_tool_groups(messages: list, *, preserve_latest_results: bool = False) -> list:
-    """Replace only complete contiguous AI/tool groups by historical AI facts.
-
-    Leaves pending/malformed groups and protocol messages intact. No tool calls
-    or synthetic ToolMessages are emitted, no source message is mutated, and
-    script/document arguments are never copied into the historical summary.
-    Active compaction can retain the latest batch's projected results so a fresh
-    response is not reduced to a digest before its first model read.
-    """
-    from src.core.context_budget import _keep_identifiers
-    output = []
-    latest_group = None
-    index = 0
-    while index < len(messages):
-        message = messages[index]
-        calls = getattr(message, "tool_calls", None) if isinstance(message, AIMessage) else None
-        ids = [call.get("id") for call in calls or []]
-        end = index + 1
-        while end < len(messages) and isinstance(messages[end], ToolMessage):
-            end += 1
-        results = messages[index + 1:end]
-        complete = (bool(ids) and all(ids) and len(ids) == len(set(ids))
-                    and len(results) == len(ids)
-                    and {item.tool_call_id for item in results} == set(ids))
-        if not complete:
-            output.append(message)
-            index += 1
-            continue
-        names = {call["id"]: str(call.get("name") or "unknown")[:120] for call in calls}
-        facts = []
-        result_payloads = []
-        for result in results:
-            projected = project_tool_message(result)
-            data = _data(projected)
-            result_payloads.append(data or projected.content)
-            fact = {"tool_name": names[result.tool_call_id], "tool_call_id": result.tool_call_id,
-                    "status": projected.additional_kwargs["context_projection"]["execution_status"],
-                    "result_refs": projected.additional_kwargs["context_projection"]["result_refs"],
-                    "completeness": projected.additional_kwargs["context_projection"]["completeness"]}
-            if result.name == "analyze_research_data":
-                fact["result"] = data or projected.content
-            else:
-                text = projected.content if isinstance(projected.content, str) else json.dumps(projected.content, ensure_ascii=False)
-                fact["result_digest"] = _keep_identifiers(text, max_chars=1100)
-                details = projected.additional_kwargs["context_projection"].get("semantic_details", [])
-                if details:
-                    fact["semantic_details"] = details
-            facts.append(fact)
-        summary = {"notice": "历史已返回的工具结果事实摘要；不是本轮工具调用或重新执行。",
-                   "results": facts}
-        if message.content:
-            summary["assistant_note"] = _keep_identifiers(str(message.content), max_chars=800)
-        latest_group = (len(output), summary, result_payloads)
-        output.append(AIMessage(content=json.dumps(summary, ensure_ascii=False),
-                                additional_kwargs={"context_origin": "completed_tool_group",
-                                                   "context_trusted": True,
-                                                   "context_projection_version": PROJECTION_VERSION}))
-        index = end
-    if preserve_latest_results and latest_group is not None:
-        position, summary, payloads = latest_group
-        # Frozen epochs may already contain a previously protected batch. Once
-        # newer results arrive, that older batch can become a digest as usual;
-        # otherwise preserved payloads would accumulate across every checkpoint.
-        for earlier, item in enumerate(output[:position]):
-            meta = item.additional_kwargs or {}
-            if (not isinstance(item, AIMessage) or not meta.get("context_latest_results")
-                    or meta.get("context_origin") != "completed_tool_group"
-                    or meta.get("context_trusted") is not True):
-                continue
-            prior = _data(item)
-            for fact in prior.get("results", []):
-                if "result" in fact and fact.get("tool_name") != "analyze_research_data":
-                    value = fact.pop("result")
-                    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-                    fact["result_digest"] = _keep_identifiers(text, max_chars=1100)
-            prior["notice"] = "历史已返回的工具结果事实摘要；不是本轮工具调用或重新执行。"
-            output[earlier] = item.model_copy(update={
-                "content": json.dumps(prior, ensure_ascii=False),
-                "additional_kwargs": dict(meta, context_latest_results=False)})
-        for fact, payload in zip(summary["results"], payloads):
-            fact.pop("result_digest", None)
-            fact["result"] = payload
-        summary["notice"] = "最近一批已返回工具结果；保留完整发送视图，仅省略调用参数。不是重新执行。"
-        output[position] = output[position].model_copy(update={
-            "content": json.dumps(summary, ensure_ascii=False),
-            "additional_kwargs": dict(output[position].additional_kwargs, context_latest_results=True)})
-    return output

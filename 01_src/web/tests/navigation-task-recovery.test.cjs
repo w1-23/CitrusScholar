@@ -107,3 +107,18 @@ test('pending approvals and operation controls return through the original task 
   assert.equal(b.document.body.querySelectorAll('.perm-card').length, 1);
   assert.equal(chats(b).length, 0);
 });
+
+
+test('old file-turn action cannot jump in a resumed session after A → B → A', async () => {
+  const b=browser();
+  let resolveRestore, jumps=0;
+  b.context.restoreSessionHistory=()=>new Promise(resolve=>{resolveRestore=resolve;});
+  b.context.highlightTurnNode=()=>{jumps++; return true;};
+  const paused=b.context.jumpToFileTurn('session','request');
+  const finish=resolveRestore;
+  b.context.switchSession('other',true);
+  b.context.switchSession('session',true);
+  finish(true);
+  assert.equal(await paused,false);
+  assert.equal(jumps,0);
+});

@@ -110,7 +110,7 @@ def assemble_system_prompt(
     """Expose the current static host prompt to context diagnostics."""
     from src.agent.host_policy import system_prompt
 
-    return system_prompt(available_tools or set(), native_skills=True)
+    return system_prompt(available_tools or set())
 
 
 def verify_figure_prompt_loading() -> dict:

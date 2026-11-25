@@ -20,6 +20,7 @@ from typing import Annotated, Literal
 from langchain_core.tools import tool
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from src.code_execution.figure_sources import delivery_key
 from src.code_execution.protocol import ExecutionLimits, logical_path
 from .identity import ExecutionIdentity
 from .workspace_reconciliation import observe_code_rejection
@@ -136,7 +137,9 @@ class ExecuteArgs(_Args):
     expected_revision: int = Field(ge=1, le=2**31 - 1)
     script_path: Path
     inputs: list[Path] = Field(default_factory=list, max_length=128)
-    outputs: list[Path] = Field(default_factory=list, max_length=32)
+    outputs: list[Path] = Field(default_factory=list, max_length=32,
+        description="Exact logical output file slots required for success. Relative names mean /outputs/<name>. "
+                    "Declare only the paths the script itself writes. Files are not discovered or inferred.")
     argv: list[Argument] = Field(default_factory=list, max_length=32)
     environment_id: Task | None = None
     environment_revision: int | None = Field(default=None, ge=1, le=2**31 - 1)
@@ -541,6 +544,7 @@ def _dispatch(operation, **args):
                 status = _public(service.status(row["execution_id"]))
                 return _result({**status, "_code_execution_id": row["execution_id"],
                     "completion_scope": "submission_only",
+                    "declared_output_paths": args["outputs"],
                     "environment_id": environment_id,
                     "environment_revision": environment_revision}, reason="execution_submitted")
             if operation == "environment_install":
@@ -645,10 +649,15 @@ def _dispatch(operation, **args):
                             "eof": end == len(data), "data_base64": base64.b64encode(chunk).decode("ascii"),
                             "text_preview": chunk.decode("utf-8", errors="replace"),
                             "text_preview_encoding": "utf-8-replace"}, reason="code_output_read")
-                    from src.research.tools import _save_artifact, validate_artifact_links
-                    link = _save_artifact(ref["path"].rsplit("/", 1)[-1], data, ref["mime_type"],
+                    from src.core.tracing import get_client_request_id
+                    from src.research.artifacts import publish_artifact
+                    from src.research.tools import validate_artifact_links
+                    published = publish_artifact(owner=identity.owner_user_id, session_id=identity.session_id,
+                        producer_tool="code_deliver", request_id=get_client_request_id() or identity.user_turn_id,
+                        filename=ref["path"].rsplit("/", 1)[-1], content=data, mime=ref["mime_type"],
                         source_file_id=ref["file_id"], source_sha256=ref["sha256"],
-                        logical_task_id="code_" + _key(execution_id, ref["path"], ref["sha256"]))
+                        logical_task_id=delivery_key(execution_id, ref["path"], ref["sha256"]))
+                    link = published["artifact_url"]
                     if not re.fullmatch(r"/api/v2/session/[A-Za-z0-9_-]{8,128}/artifacts/[a-f0-9]{32}", link):
                         raise ValueError("code_artifact_url_unverified")
                     checked = validate_artifact_links([link], session_id=identity.session_id,
@@ -657,7 +666,7 @@ def _dispatch(operation, **args):
                         raise ValueError("code_artifact_url_unverified")
                     return _result({"execution_id": execution_id, "path": ref["path"],
                         "filename": checked[0]["filename"], "mime": checked[0]["mime"],
-                        "artifact_url": link, "source_sha256": ref["sha256"],
+                        "artifact_url": link, "file_id": published["file_id"], "source_sha256": ref["sha256"],
                         "source_size_bytes": ref["size_bytes"]}, reason="code_output_delivered", artifacts=[link])
             if operation == "log":
                 return _result(service.read_log(execution_id, **args))
@@ -721,7 +730,7 @@ def code_bind_input(task_id: str, workspace_id: str, expected_revision: int, pat
 def code_execute(task_id: str, workspace_id: str, expected_revision: int, script_path: str,
                  inputs: list[str] | None = None, outputs: list[str] | None = None, argv: list[str] | None = None,
                  environment_id: str | None = None, environment_revision: int | None = None):
-    """Submit a bound .py snapshot for offline execution. The default environment is fixed base revision 1 with the existing Python standard library and worker-installed base packages only. To use a published environment, pass the exact environment_id and environment_revision returned by code_environment_publish; only an immutable revision published for this task is selectable. Select bound logical input paths and declared logical outputs; argv are Python script arguments, never a shell command. Default limits: 120 s, 1024 MiB, 1 CPU, 128 PIDs, 64 MiB scratch/output, 1 MiB logs, 32 outputs, constrained by the original task deadline. Worker controls image/backend/device. Complete means submission recorded, not code or analysis success. Use code_status/log/wait for real execution evidence."""
+    """Submit a bound .py snapshot for offline execution. The default environment is fixed base revision 1 with the existing Python standard library and worker-installed base packages only. To use a published environment, pass the exact environment_id and environment_revision returned by code_environment_publish; only an immutable revision published for this task is selectable. Select bound logical input paths and declare exact files the script writes. Relative declarations mean /outputs/<name>; pass these exact paths in argv when supported. No filename discovery occurs. A verified missing slot is reported as missing_output_paths, and no partial result is accepted. argv are Python script arguments, never a shell command. Default limits: 120 s, 1024 MiB, 1 CPU, 128 PIDs, 64 MiB scratch/output, 1 MiB logs, 32 outputs, constrained by the original task deadline. Worker controls image/backend/device. Complete means submission recorded, not code or analysis success. Use code_status/log/wait for real execution evidence."""
     return _dispatch("execute", task_id=task_id, workspace_id=workspace_id,
                      expected_revision=expected_revision, script_path=script_path,
                      inputs=inputs or [], outputs=outputs or [], argv=argv or [],
@@ -759,7 +768,7 @@ def code_read(execution_id: str, path: str, start_byte: int = 0, max_bytes: int 
 
 @tool(args_schema=OutputArgs, response_format="content_and_artifact")
 def code_deliver(execution_id: str, path: str):
-    """Publish one declared, accepted output from a succeeded execution through the existing artifact registry. Rechecks original account epoch, task binding, owner/session and file bytes/hash. Return only a verified /api/v2/session/.../artifacts/... URL and bounded source metadata. Repeated delivery of the same accepted source within this turn reuses publication; accepted private file IDs are never download URLs. Delivery does not certify scientific correctness or register a wait."""
+    """Publish one declared, accepted output from a succeeded execution through the existing artifact registry. Rechecks original account epoch, task binding, owner/session and file bytes/hash. Return a verified /api/v2/session/.../artifacts/... URL, the public File Library file_id, and bounded source metadata. Repeated delivery of the same accepted source within this turn reuses publication; accepted private file IDs are never download URLs. Delivery does not certify scientific correctness or register a wait."""
     return _dispatch("deliver", execution_id=execution_id, path=path)
 
 

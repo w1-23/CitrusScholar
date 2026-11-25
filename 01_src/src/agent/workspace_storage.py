@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import time
 
 from deepagents.backends.store import StoreBackend
 from langgraph.store.memory import InMemoryStore
@@ -77,11 +78,6 @@ class WorkspaceStorage:
             _no_links(Path(str(files.DB_PATH) + suffix))
         _no_links(files.FILES_ROOT)
         files.init_store()
-        with files._connect() as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS workspace_file_versions (
-                owner INTEGER NOT NULL, session TEXT NOT NULL, path TEXT NOT NULL,
-                version INTEGER NOT NULL, file_id TEXT NOT NULL, sha256 TEXT NOT NULL,
-                PRIMARY KEY(owner,session,path,version), UNIQUE(file_id))""")
 
     def _reference(self, row, path=None, version=None):
         internal = row["visibility"] == "internal"
@@ -193,6 +189,7 @@ class WorkspaceStorage:
         namespace = (str(self.owner), self.session)
         backend = StoreBackend(store=store, namespace=lambda _: namespace)
         refs, size = {}, 0
+        read_versions = []
         if path and path.startswith(("/skills/", "/01_src/")):
             from . import workspace_projection as projection
             if version is not None:
@@ -219,6 +216,13 @@ class WorkspaceStorage:
             store.put(namespace, key, {"content": text, "encoding": "utf-8",
                                       "created_at": timestamp, "modified_at": timestamp})
             refs[key] = self._reference(row)
+            if row["visibility"] == "internal":
+                read_versions.append(row["file_id"])
+        if read_versions:
+            with self.files._connect() as conn:
+                conn.executemany("UPDATE session_files SET last_accessed_at=? "
+                                 "WHERE file_id=? AND owner_user_id=? AND session_id=?",
+                                 [(time.time(), fid, self.owner, self.session) for fid in read_versions])
         return backend, refs
 
     def index(self, scope="/"):
@@ -308,6 +312,11 @@ class WorkspaceStorage:
         return ({"kind": "workspace_file", "path": path, "file_id": row["file_id"],
                  "version": row["version"], "sha256": row["sha256"]} if row else None)
 
+    def _require_writable_scope(self, conn):
+        if conn.execute("SELECT 1 FROM workspace_file_closed_sessions WHERE owner=? AND session=?",
+                        (self.owner, self.session)).fetchone():
+            raise PermissionError("workspace_session_closed")
+
     @staticmethod
     def _cas(latest, version, sha256):
         if type(version) is not int or version < 0 or not isinstance(sha256, str):
@@ -324,6 +333,7 @@ class WorkspaceStorage:
 
         virtual_path(path, writable=True)
         with self.files._connect() as conn:
+            self._require_writable_scope(conn)
             self._cas(self._latest(conn, path), expected_version, expected_sha256)
         backend, refs = self.view(path=path)
         if old_string is None:
@@ -365,6 +375,7 @@ class WorkspaceStorage:
         try:
             with self.files._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                self._require_writable_scope(conn)
                 latest = self._latest(conn, path)
                 self._cas(latest, expected_version, expected_sha256)
                 count = conn.execute("SELECT COUNT(DISTINCT path) FROM workspace_file_versions "

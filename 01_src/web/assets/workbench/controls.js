@@ -1,4 +1,4 @@
-import { byId, element } from './dom.js';
+import { element } from './dom.js';
 
 const labels = {
   text: '文字', label: '名称', color: '系列颜色', facecolor: '填充颜色', edgecolor: '边框颜色',
@@ -116,7 +116,7 @@ function addControl(form, prop, value, snapshot, group) {
     form.append(box);
     return { events: [x, y], read: () => [x.valueAsNumber, y.valueAsNumber] };
   }
-  if (prop === 'markerfacecolor') return markerFill(form, value, group.line_marker_fill ? ['auto', 'none', 'custom'] : snapshot.marker_fill_states);
+  if (prop === 'markerfacecolor') return markerFill(form, value, (group.line_marker_fill || group.members?.every((member) => member.line_marker_fill)) ? ['auto', 'none', 'custom'] : snapshot.marker_fill_states);
   if (prop.endsWith('color')) {
     input = colorField(form, name, value);
   } else {
@@ -145,7 +145,11 @@ export function renderInspector(container, snapshot, group, values, update) {
     container.append(element('p', '选择对象组以查看可用属性。', 'muted'));
     return;
   }
+  const members = group.members || [group];
+  const batch = group.kind === 'category';
+  container.append(element('p', batch ? `批量属性 · ${members.length} 个对象` : '单项属性', 'property-eyebrow'));
   container.append(element('h3', values.label || group.label));
+  if (batch) container.append(element('p', '批量修改此类别的共有属性。展开对象组可单独编辑。', 'muted'));
   if (snapshot.read_only_reason || group.reason) container.append(element('p', snapshot.read_only_reason || group.reason, 'muted'));
   const properties = propertyOrder.filter((prop) => group.properties.includes(prop));
   if (!properties.length) {
@@ -153,10 +157,10 @@ export function renderInspector(container, snapshot, group, values, update) {
     return;
   }
   const form = element('form');
-  form.dataset.kind = group.kind;
+  form.dataset.kind = group.styleKind || group.kind;
   const controls = new Map();
   const touched = new Set();
-  const apply = element('button', '应用到此组', 'primary');
+  const apply = element('button', batch ? '应用到类别' : '应用到此组', 'primary');
   apply.disabled = true;
   for (const prop of properties) {
     const control = addControl(form, prop, values[prop], snapshot, group);
@@ -175,7 +179,9 @@ export function renderInspector(container, snapshot, group, values, update) {
       const value = controls.get(prop).read();
       if (typeof value === 'number' && !Number.isFinite(value)) continue;
       if (value === '' && !['text', 'label'].includes(prop)) continue;
-      if (JSON.stringify(value) !== JSON.stringify(values[prop])) entries.push({ group_id: group.id, property: prop, value });
+      if (JSON.stringify(value) !== JSON.stringify(values[prop])) {
+        for (const member of members) entries.push({ group_id: member.id, property: prop, value });
+      }
     }
     if (entries.length) update(entries);
     else apply.disabled = true;
@@ -199,6 +205,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
       const item = element('li');
       item.setAttribute('role', 'treeitem');
       item.dataset.group = group.id;
+      item.dataset.kind = group.kind;
       item.setAttribute('aria-selected', String(group.id === selected));
       item.tabIndex = group.id === selected ? 0 : -1;
       nodes.set(group.id, item);
@@ -222,6 +229,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
         row.append(swatch);
       }
       row.append(element('span', caption, 'tree-name'));
+      if (group.members) row.append(element('span', String(group.members.length), 'tree-count'));
       item.setAttribute('aria-label', caption);
       item.append(row);
       if (branch) {

@@ -74,6 +74,26 @@ def _support_files(packages=SUPPORT_PACKAGES) -> dict[str, bytes]:
     return result
 
 
+def nature_method_identity() -> dict[str, str]:
+    """Identify the same exact vendor methods copied into the Worker bundle."""
+    from .nature_runtime import released_vendor_root
+
+    root = released_vendor_root()
+    if root is None:
+        root = Path(__file__).resolve().parents[1] / "prompts/skill_history/vendor/nature-skills"
+        raw = (root / "provenance.json").read_bytes()
+        saved = json.loads(raw)
+        if saved.get("source") != SOURCE or saved.get("commit") != COMMIT:
+            raise ValueError("Worker skill provenance identity mismatch")
+        commit = COMMIT
+    else:
+        from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT, validate_vendor
+        saved = validate_vendor(root, verify_files=True, expected_commit=RELEASE_VENDOR_COMMIT)
+        raw = (json.dumps(saved, sort_keys=True) + "\n").encode()
+        commit = RELEASE_VENDOR_COMMIT
+    return {"nature_skill_commit": commit, "nature_method_manifest_sha256": hashlib.sha256(raw).hexdigest()}
+
+
 def bundle_files() -> dict[str, bytes]:
     source = Path(__file__).resolve().parents[1]
     result = {f"src/figures/{name}": (source / "figures" / name).read_bytes()

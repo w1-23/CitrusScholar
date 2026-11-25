@@ -9,7 +9,7 @@ from citrus_corpus.intake import Intake
 from citrus_corpus.models import FusedRank
 from citrus_corpus.pointers import read_pointer
 from citrus_corpus.prepare import PreparationError
-from citrus_corpus.publication import Publisher
+from citrus_corpus.publication import Publisher, resume_publication
 from citrus_corpus.queue import IntakeQueue, LEASE_SECONDS
 from citrus_corpus.reader import Reader
 from citrus_corpus.store import Store
@@ -193,7 +193,8 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
         original_chunks = chunks_path.read_bytes()
         chunks_path.write_bytes(original_chunks + b"\n")
         with reader.pin(**models) as fallback:
-            assert fallback.generation == generation0
+            assert fallback.generation == generation0 and fallback.requested_generation == generation1
+            assert fallback.fallback_reason == "active_generation_integrity_invalid"
         chunks_path.write_bytes(original_chunks)
         grant(intake.catalog, initial, "revoked")
         assert pinned.search("leaf") == []
@@ -203,10 +204,80 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
             reader.reference(row0["read_ref"])
         with pytest.raises(LookupError):
             reader.reference(row0["read_ref"], full=True)
-    assert publisher.rollback(generation0)["generation"] == generation0
+    now[0] += 301
+    assert publisher.rollback(generation0) == {"state": "publication_held", "generation": generation0,
+        "rollback_generation": generation0, "rollback_pending": False}
     with reader.pin(**models) as restored:
+        assert restored.requested_generation == restored.generation == generation0
+        assert restored.fallback_reason is None
         assert restored.search("leaf") == []
+    watcher = Publisher(Store(store.root), now=lambda: now[0], **models)
+    assert watcher.publish()["state"] == "publication_held"  # No ready generation.
+    assert read_pointer(store.root) == generation0
     assert len(intake.catalog.versions()) == 2
+    assert resume_publication(Store(store.root))["state"] == "publication_resumed"
+    assert read_pointer(store.root) == generation0
+    assert watcher.publish()["generation"] == generation1
+
+
+
+def test_interrupted_rollback_holds_ready_generation_until_explicit_resume(store, monkeypatch):
+    from citrus_corpus import __main__ as cli, publication
+
+    intake = Intake(store)
+    model, now, idle = FixtureEmbedder(), [1000], [True]
+    models = {"embedder": model, "reranker": FusedRank()}
+    publisher = Publisher(store, now=lambda: now[0], **models)
+    saved(intake, "paper.md", b"# Methods\n\nCitrus sampling in the first trial.")
+    first = intake.process_one()
+    grant(intake.catalog, first)
+    initial = publisher.publish()["generation"]
+    saved(intake, "rev.md", b"# Methods\n\nCitrus sampling in the second trial.")
+    grant(intake.catalog, intake.process_one())
+    now[0] += 301
+    previous = publisher.publish()["generation"]
+    saved(intake, "third.md", b"# Methods\n\nCitrus sampling in the third trial.")
+    grant(intake.catalog, intake.process_one())
+    now[0] += 301
+    defer = Publisher(store, now=lambda: now[0], idle=lambda: idle.pop(0) if idle else False, **models)
+    staged = defer.publish()
+    assert staged["state"] == "waiting_for_idle" and staged["generation"] != previous
+
+    def fail_pointer(*args):
+        raise OSError("simulated failure before pointer replacement")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(publication, "write_pointer", fail_pointer)
+        with pytest.raises(OSError):
+            publisher.rollback(initial)
+    watcher = Publisher(Store(store.root), now=lambda: now[0], **models)
+    assert watcher.publish() == {"state": "publication_held", "generation": previous,
+        "rollback_generation": initial, "rollback_pending": True}
+    with pytest.raises(ValueError, match="corpus_rollback_incomplete"):
+        resume_publication(store)
+    from citrus_corpus.publication import _event
+    def lose_rollback_ack(conn, generation, state, now, detail=None):
+        if state == "rolled_back":
+            raise OSError("simulated failure after pointer replacement")
+        return _event(conn, generation, state, now, detail)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(publication, "_event", lose_rollback_ack)
+        with pytest.raises(OSError):
+            watcher.rollback(initial)
+    assert watcher.publish()["rollback_pending"] is True
+    assert read_pointer(store.root) == initial
+    with pytest.raises(ValueError, match="corpus_rollback_incomplete"):
+        resume_publication(store)
+    assert watcher.rollback(initial)["rollback_pending"] is False
+    grant(intake.catalog, first, "revoked")
+    assert watcher.publish()["generation"] == initial
+    with Reader(store).pin(**models) as pinned:
+        assert pinned.search("Citrus") == []
+    args = cli.parser().parse_args(["--root", str(store.root), "resume-publication"])
+    assert cli._run(args)["state"] == "publication_resumed"
+    assert read_pointer(store.root) == initial
+    assert watcher.publish()["generation"] == staged["generation"]
 
 
 def test_publication_window_reacts_to_load_disk_and_marker(tmp_path, monkeypatch):

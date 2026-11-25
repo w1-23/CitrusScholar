@@ -70,16 +70,25 @@ class ScopedSkillBackend(HostOnlyBackend):
 
         self.policy = policy
         self.routes = {}
+        self.required_capability = {}
         for entrypoint in sorted(Path(root).glob("*/SKILL.md")):
             directory = entrypoint.parent
             if not directory.is_symlink() and not entrypoint.is_symlink():
                 self.routes[directory.name] = FilesystemBackend(root_dir=directory, virtual_mode=True)
+                self.required_capability[directory.name] = "skill:" + directory.name
+        # Upstream text is preserved byte for byte and refers to this sibling.
+        # The sibling provides files only, never a discoverable Skill entry.
+        shared = Path(root) / "nature-shared"
+        if ("nature-figure" in self.routes and shared.is_dir() and not shared.is_symlink()
+                and not (shared / "SKILL.md").exists()):
+            self.routes["nature-shared"] = FilesystemBackend(root_dir=shared, virtual_mode=True)
+            self.required_capability["nature-shared"] = "skill:nature-figure"
 
     def _backend(self):
         from deepagents.backends import CompositeBackend
         return CompositeBackend(default=EmptySkillBackend(None), routes={
             f"/{name}/": backend for name, backend in self.routes.items()
-            if self.policy.allows("skill:" + name)})
+            if self.policy.allows(self.required_capability[name])})
 
     def ls(self, path):
         return self._backend().ls(path)

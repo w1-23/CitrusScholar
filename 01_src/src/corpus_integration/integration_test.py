@@ -180,7 +180,9 @@ def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monke
     intake.catalog.decide(prepared["document_id"], prepared["version_id"], decision="granted", actor="operator",
                           reason="Fixture license reviewed", evidence="fixture:rights")
     model = Model()
-    Publisher(store, embedder=model, reranker=FusedRank()).publish()
+    now = [1000]
+    publisher = Publisher(store, embedder=model, reranker=FusedRank(), now=lambda: now[0])
+    first_generation = publisher.publish()["generation"]
     monkeypatch.setenv("CITRUS_CORPUS_MODE", "isolated")
     monkeypatch.setenv("CITRUS_CORPUS_READ", "1")
     monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_ROOT", str(store.root))
@@ -202,6 +204,29 @@ def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monke
 
     _, output = fetch._local_hybrid_search_impl("citrus soil", ["agent_literature"], render=False, progress=False)
     row = output["shared_results"][0]
+    from src.graph.retrieval_router import plan_retrieval
+    from src.tools.outcome import normalize_tool_outcome, safe_tool_step
+
+    # Exercise the public tool function, exact evidence parser, status adapter,
+    # public tool-step summary, and the final route using the same result.
+    content, artifact = fetch.local_hybrid_search.func("citrus soil", ["agent_literature"])
+    view = json.loads(content)
+    assert view["count"] == len(view["candidates"]) == artifact["selected_result_count"] == 1
+    assert artifact["main_results"] == [] and len(artifact["shared_results"]) == 1
+    assert view["candidates"][0]["source_ref"].startswith("shared:")
+    assert list(references.evidence_rows("local_hybrid_search", content))[0][1] == row["read_ref"]
+    outcome = normalize_tool_outcome("local_hybrid_search", content, artifact)
+    assert outcome.status == "complete" and outcome.coverage == "1 条本地候选"
+    assert safe_tool_step("local_hybrid_search", content, artifact)["summary"] == "找到 1 条候选资料"
+    route_options = {"allowed_names": ["local_hybrid_search", "deepseek_search"],
+                     "local_families": ["agent_literature"], "local_corpus_match": True}
+    query = "请解释柑橘土壤有机质对根系吸收的影响和机制"
+    assert not plan_retrieval(query, **route_options,
+        records=[{"name": "local_hybrid_search", "status": outcome.status}]).calls
+    if_dry = plan_retrieval(query, **route_options,
+        records=[{"name": "local_hybrid_search", "status": "no_results"}])
+    assert if_dry.calls[0]["name"] == "deepseek_search"
+
     direct = json.loads(tool_adapter.search_agent_corpus.invoke({"query": "citrus soil"}))
     assert direct["results"][0]["source_family"] == "agent_literature"
     assert direct["_tool_outcome"]["coverage"].startswith("shared_agent_literature:")
@@ -209,6 +234,45 @@ def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monke
     assert ref["source_family"] == "agent_literature" and ref["chunk_id"] == row["chunk_id"]
     assert read_access.read_reference_page(ref)["markdown"] == row["excerpt"]
     assert references.read_reference({"read_ref": {**ref, "chunk_id": "invalid"}}) is None
+
+    raw = b"# Methods\n\nUpdated citrus soil measurements used four replicates."
+    (store.inbox / "update.md").write_bytes(raw)
+    intake.submit_local("update.md", expected_sha256=sha256(raw).hexdigest(), actor="fixture")
+    update = intake.process_one()
+    intake.catalog.decide(update["document_id"], update["version_id"], decision="granted", actor="operator",
+                          reason="Fixture license reviewed", evidence="fixture:rights")
+    now[0] += 301
+    next_generation = publisher.publish()["generation"]
+    assert next_generation != first_generation
+    path = store.root / "generations" / next_generation / "chunks.jsonl"
+    original = path.read_bytes()
+    path.write_bytes(original + b"\n")
+    content, fallback = fetch.local_hybrid_search.func("citrus soil", ["agent_literature"])
+    shown = json.loads(content)
+    assert shown["shared_requested_generation"] == next_generation
+    assert shown["shared_generation"] == first_generation
+    assert shown["shared_degradation_reason"] == "active_generation_integrity_invalid"
+    assert fallback["shared_results"][0]["read_ref"]["index_generation"] == first_generation
+    assert normalize_tool_outcome("local_hybrid_search", content, fallback).status == "partial"
+    direct_fallback = json.loads(tool_adapter.search_agent_corpus.invoke({"query": "citrus soil"}))
+    assert direct_fallback["shared_generation"] == first_generation
+    assert direct_fallback["_tool_outcome"]["reason_code"] == "active_generation_integrity_invalid"
+    with monkeypatch.context() as patch:
+        patch.setenv("CITRUS_CORPUS_READ_GENERATION", next_generation)
+        _, fixed = fetch.local_hybrid_search.func("citrus soil", ["agent_literature"])
+        assert fixed["shared_generation"] is None and not fixed["shared_results"]
+    path.write_bytes(original)
+    assert publisher.rollback(first_generation)["state"] == "publication_held"
+    _, restored = fetch.local_hybrid_search.func("citrus soil", ["agent_literature"])
+    assert restored["shared_requested_generation"] == restored["shared_generation"] == first_generation
+    assert restored["shared_degradation_reason"] is None
+    held_path = store.root / "generations" / first_generation / "chunks.jsonl"
+    held_original = held_path.read_bytes()
+    held_path.write_bytes(held_original + b"\n")
+    _, unavailable = fetch.local_hybrid_search.func("citrus soil", ["agent_literature"])
+    assert unavailable["shared_requested_generation"] == first_generation
+    assert unavailable["shared_generation"] is None and not unavailable["shared_results"]
+    held_path.write_bytes(held_original)
 
     old = {key: value for key, value in ref.items() if key not in ("chunk_id", "source_family")}
     assert references.read_reference({"read_ref": old}) == old

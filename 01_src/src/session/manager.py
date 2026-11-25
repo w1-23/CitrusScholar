@@ -14,6 +14,7 @@ import time
 import uuid
 import asyncio
 from pathlib import Path
+from contextlib import closing
 from datetime import datetime
 from typing import List, Optional
 
@@ -36,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 STATE_DIR = PROJECT_ROOT / "state"
 DB_PATH = STATE_DIR / "sessions.db"
+
+
+class SessionHistoryBusy(RuntimeError):
+    """Live or unresolved work must settle before history can be cleared."""
 
 
 # ── v10.6（分离输出架构）：跨轮历史通道不得携带联网条目 ─────────────────────
@@ -306,6 +311,9 @@ class SessionManager:
                             logger.info(f"[SessionManager] added column: {col}")
                         except Exception:
                             pass
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_visible_page ON sessions("
+                             "owner_user_id, COALESCE(updated_at, '') DESC, session_id DESC) "
+                             "WHERE deleted_at = '' OR deleted_at IS NULL")
                 conn.commit()
         except Exception as e:
             logger.debug(f"[SessionManager] schema migration: {e}")
@@ -1102,25 +1110,52 @@ class SessionManager:
                 )
                 conn.commit()
 
-    async def clear_session(self, session_id: str):
-        await asyncio.to_thread(self._clear_session_sync, session_id)
+    async def clear_session(self, session_id: str, *, owner_user_id: int | None = None):
+        await asyncio.to_thread(self._clear_session_sync, session_id, owner_user_id)
 
-    def _clear_session_sync(self, session_id: str):
-        import sqlite3
-        # v8.13 SQL-2: 清会话与历史写入同锁——此前无锁，与并发 save_messages 交错
-        lock = _get_session_lock(session_id)
-        with lock:
-            with _connect_db(self.db_path) as conn:
-                conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-                conn.execute("DELETE FROM session_evidence WHERE session_id = ?", (session_id,))
-                conn.execute(
-                    "UPDATE sessions SET updated_at = ?, checkpoint_msg_id = 0, "
-                    "checkpoint_summary = '', checkpoint_watermark = 0, "
-                    "context_working_state_json = '{}', checkpoint_revision = checkpoint_revision + 1 "
-                    "WHERE session_id = ?",
-                    (datetime.now().isoformat(), session_id),
-                )
-                conn.commit()
+    def _clear_session_sync(self, session_id: str, owner_user_id: int | None = None):
+        """Clear conversation content and hide old tasks without deleting execution records."""
+        from src.core import chat_turn_queue, jobs
+
+        with _get_session_lock(session_id), closing(_connect_db(self.db_path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT owner_user_id,deleted_at FROM sessions WHERE session_id=?",
+                               (session_id,)).fetchone()
+            if (row is None or row[1] or
+                    (owner_user_id is not None and row[0] != owner_user_id)):
+                raise LookupError("session unavailable for history clear")
+            owner = row[0]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "chat_turn_queue" in tables and conn.execute(
+                    "SELECT 1 FROM chat_turn_queue WHERE session_id=? AND owner_user_id=? "
+                    "AND COALESCE(state,'')<>? LIMIT 1", (session_id, owner, chat_turn_queue.TERMINAL)).fetchone():
+                raise SessionHistoryBusy("a queued turn has not settled")
+            if "task_jobs" in tables:
+                # An older schema is upgraded under the same writer lock.
+                if "history_hidden" not in {r[1] for r in conn.execute("PRAGMA table_info(task_jobs)")}:
+                    jobs._migrate(conn)
+                scope = "session_id=? AND (owner_user_id=? OR owner_user_id IS NULL)"
+                unsettled = jobs.unsettled_history_job_sql(conn, tables)
+                if conn.execute(f"SELECT 1 FROM task_jobs j WHERE {scope} AND {unsettled} LIMIT 1",
+                                (session_id, owner)).fetchone():
+                    raise SessionHistoryBusy("a task has not settled")
+                if "task_operations" in tables and conn.execute(
+                        "SELECT 1 FROM task_operations o JOIN task_jobs j ON j.job_id=o.job_id "
+                        "WHERE j.session_id=? AND o.owner_user_id=? "
+                        "AND o.status IN ('running','interrupted','unknown') LIMIT 1",
+                        (session_id, owner)).fetchone():
+                    raise SessionHistoryBusy("an operation has not settled")
+                conn.execute(f"UPDATE task_jobs SET history_hidden=1 WHERE {scope}", (session_id, owner))
+            if "memory_store" in tables:
+                conn.execute("DELETE FROM memory_store WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM session_evidence WHERE session_id=?", (session_id,))
+            conn.execute(
+                "UPDATE sessions SET updated_at=?, checkpoint_msg_id=0, checkpoint_summary='', "
+                "checkpoint_updated_at='', checkpoint_watermark=0, context_working_state_json='{}', "
+                "checkpoint_revision=checkpoint_revision+1 WHERE session_id=?",
+                (datetime.now().isoformat(), session_id),
+            )
 
     # ── v8.9 会话管理（列表 / 首问自动命名 / 重命名 / 软删除）──
 
@@ -1186,6 +1221,34 @@ class SessionManager:
             logger.warning(f"[SessionManager] list_sessions failed: {e}")
             return []
 
+    def list_session_page(self, owner_user_id: int, limit: int,
+                          before: tuple[str, str] | None = None) -> tuple[list[dict], bool]:
+        """Read one owner-visible page with a deterministic timestamp/id keyset."""
+        import sqlite3
+        if not 1 <= limit <= 100:
+            raise ValueError("invalid session page size")
+        where = ""
+        params: tuple = (int(owner_user_id),)
+        if before is not None:
+            where = " AND (COALESCE(s.updated_at, ''), s.session_id) < (?, ?)"
+            params += before
+        with _connect_db(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT s.session_id, s.title, s.created_at, s.updated_at,
+                          (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.session_id) AS msg_count
+                   FROM sessions s
+                   WHERE s.owner_user_id=? AND (s.deleted_at = '' OR s.deleted_at IS NULL)"""
+                + where + " ORDER BY COALESCE(s.updated_at, '') DESC, s.session_id DESC LIMIT ?",
+                params + (limit + 1,),
+            ).fetchall()
+        return [
+            {"session_id": row["session_id"], "title": (row["title"] or "").strip() or "新会话",
+             "created_at": row["created_at"] or "", "updated_at": row["updated_at"] or "",
+             "msg_count": int(row["msg_count"] or 0)}
+            for row in rows[:limit]
+        ], len(rows) > limit
+
     def rename_session(self, session_id: str, title: str) -> bool:
         try:
             import sqlite3
@@ -1204,8 +1267,8 @@ class SessionManager:
         （LTM 为跨会话资产，不能级联删），仅从列表隐藏。
 
         Account-library files remain available to their owner for 30 days.
-        Only this conversation's file-to-turn links are removed; its history
-        and research notes remain governed by their existing retention rules.
+        File-to-turn links are removed and settled, unused private workspace
+        versions are retired. History and research notes retain their own lifetimes.
         Newly persisted retrieval snapshots under workspace/evidence are removed
         for this owner/session; their stable references become unavailable.
         """
@@ -1226,8 +1289,10 @@ class SessionManager:
                 from src.session import files as session_files
                 if owner_user_id:
                     session_files.unlink_session_turns(session_id, owner_user_id)
+                    session_files.retire_closed_workspace(owner_user_id, session_id,
+                                                          sessions_db=self.db_path)
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[SessionManager] session file purge failed: {exc}")
+                logger.warning(f"[SessionManager] session file cleanup deferred: {exc}")
             try:
                 if owner_user_id:
                     from src.retrieval.evidence_adapter import purge_session_evidence

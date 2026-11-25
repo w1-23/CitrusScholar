@@ -6,7 +6,12 @@ import json
 import os
 import logging
 import re
+import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Dict, Any, Optional
 from pydantic import Field
@@ -92,6 +97,91 @@ def _yaml_val(*keys: str, default=None):
         else:
             return default
     return val if val is not None else default
+
+
+MODEL_PROVIDER_BASES = {
+    "deepseek": "https://api.deepseek.com",
+    "opencode_go": "https://opencode.ai/inference/go/openai/v1",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "aliyun_bailian": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+}
+MODEL_PROVIDER_ORIGINS = {
+    "deepseek": "https://api.deepseek.com",
+    "opencode_go": "https://opencode.ai",
+    "zhipu": "https://open.bigmodel.cn",
+    "aliyun_bailian": "https://dashscope.aliyuncs.com",
+}
+_MODEL_ACTIVATION_LOCK = threading.RLock()
+
+
+def model_origin(base_url: str) -> str:
+    """Exact scheme, hostname and effective port; invalid/ambiguous URLs have no origin."""
+    if not base_url or re.search(r"[\s\x00-\x1f\x7f\\?#]", base_url):
+        return ""
+    try:
+        url = urlsplit(base_url)
+        if (url.scheme not in {"http", "https"} or not url.hostname or "@" in url.netloc
+                or "%" in url.netloc or url.netloc.endswith(":")):
+            return ""
+        host = url.hostname.encode("idna").decode("ascii").lower()
+        if ":" in host:
+            host = f"[{host}]"
+        port = url.port
+        if port is not None and port != (443 if url.scheme == "https" else 80):
+            host += f":{port}"
+        return f"{url.scheme}://{host}"
+    except (ValueError, UnicodeError):
+        return ""
+
+
+@dataclass(frozen=True)
+class ModelTransport:
+    provider_id: str
+    model: str
+    base_url: str
+    api_key: str = field(repr=False)
+    headers: dict[str, str] = field(repr=False)
+
+
+@contextmanager
+def _model_file_lock(path: Path):
+    """Serialize compare-and-replace across serving processes on the same state volume."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _atomic_private_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    if os.name != "nt":
+        # The atomic replacement is already visible. Never report failure after
+        # that commit point, even on filesystems that cannot fsync directories.
+        try:
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            logging.getLogger(__name__).warning("Could not fsync runtime state directory")
 
 
 class Settings(BaseSettings):
@@ -404,13 +494,17 @@ class Settings(BaseSettings):
     # 持久化到 state/api_key（gitignore 内，不入仓库）；.env 保持不动
     _runtime_api_key: str = ""
     _runtime_provider_api_keys: Dict[str, str] = {}
+    _readonly_model_keys: dict[tuple[str, str], str] = {}
     _runtime_configured_model_providers: set[str] = set()
     # DeepSeek Search/Fetch has a separate runtime credential from the main model.
     _runtime_deepseek_web_api_key: str = ""
+    _runtime_zhipu_web_api_key: str = ""
     _runtime_web_search_cfg: Dict[str, str] = {}
 
     def _load_runtime_api_key(self) -> None:
-        """启动时从 state/api_key 读取（WebUI 填写的 key 跨重启保留）。"""
+        """The historical generic key has no inherent provider/origin binding."""
+        if not model_origin(os.getenv("CITRUS_LEGACY_MODEL_API_KEY_ORIGIN", "")):
+            return
         try:
             p = PROJECT_ROOT / "state" / "api_key"
             if p.exists():
@@ -419,22 +513,6 @@ class Settings(BaseSettings):
                     self._runtime_api_key = v
         except Exception:
             pass
-
-    def save_runtime_api_key(self, api_key: str) -> bool:
-        """持久化 WebUI 填写的 key（state/api_key，权限收紧）。"""
-        try:
-            p = PROJECT_ROOT / "state" / "api_key"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(api_key.strip(), encoding="utf-8")
-            try:
-                import os
-                os.chmod(p, 0o600)
-            except Exception:
-                pass
-            self._runtime_api_key = api_key.strip()
-            return True
-        except Exception:
-            return False
 
     def _load_runtime_provider_api_keys(self) -> None:
         try:
@@ -448,29 +526,19 @@ class Settings(BaseSettings):
                     }
         except Exception:
             self._runtime_provider_api_keys = {}
-        # 并行 lane 用：同一个 state 文件可以被多份实例共读，但每份实例可以
-        # 通过环境变量指定自己的被测模型 key（不改文件、不影响已有配置）。
-        env_key = os.getenv("CITRUS_PROVIDER_API_KEY", "").strip()
-        if env_key:
-            pid = os.getenv("CITRUS_PROVIDER_ID", "").strip() or "opencode_go"
-            self._runtime_provider_api_keys[pid] = env_key
-
-    def save_runtime_provider_api_key(self, provider_id: str, api_key: str) -> bool:
-        if not re.fullmatch(r"[a-z][a-z0-9_]{1,40}", str(provider_id or "")):
-            return False
-        keys = dict(self._runtime_provider_api_keys)
-        keys[provider_id] = api_key.strip()
+    def _load_runtime_zhipu_web_api_key(self) -> None:
         try:
-            p = PROJECT_ROOT / "state" / "provider_api_keys.json"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(keys, ensure_ascii=False, indent=2), encoding="utf-8")
-            try:
-                os.chmod(p, 0o600)
-            except Exception:
-                pass
-            self._runtime_provider_api_keys = keys
+            path = PROJECT_ROOT / "state" / "zhipu_web_api_key.json"
+            self._runtime_zhipu_web_api_key = json.loads(path.read_text(encoding="utf-8"))["key"].strip()
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+
+    def save_runtime_zhipu_web_api_key(self, key: str) -> bool:
+        try:
+            _atomic_private_json(PROJECT_ROOT / "state" / "zhipu_web_api_key.json", {"key": key})
+            self._runtime_zhipu_web_api_key = key
             return True
-        except Exception:
+        except OSError:
             return False
 
     def _load_runtime_configured_model_providers(self) -> None:
@@ -492,37 +560,21 @@ class Settings(BaseSettings):
             provider_id for provider_id in self._runtime_provider_api_keys
             if provider_id != "zhipu"
         )
-        # Migrate legacy state: the active provider's working key is configured.
-        if self.RESOLVED_MAIN_API_KEY and self.RESOLVED_PROVIDER_ID:
-            self._runtime_configured_model_providers.add(self.RESOLVED_PROVIDER_ID)
-
-    def save_runtime_configured_model_provider(self, provider_id: str) -> bool:
-        if not re.fullmatch(r"[a-z][a-z0-9_]{1,40}", str(provider_id or "")):
-            return False
-        configured = set(self._runtime_configured_model_providers)
-        configured.add(provider_id)
-        try:
-            p = PROJECT_ROOT / "state" / "configured_model_providers.json"
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(sorted(configured), ensure_ascii=False, indent=2), encoding="utf-8")
-            try:
-                os.chmod(p, 0o600)
-            except Exception:
-                pass
-            self._runtime_configured_model_providers = configured
-            return True
-        except Exception:
-            return False
+    @property
+    def configured_model_providers(self) -> set[str]:
+        store = self._runtime_model_activation
+        configured = self._runtime_configured_model_providers | set(store.get("keys", {}))
+        if self.model_transport().api_key:
+            configured.add(self.RESOLVED_PROVIDER_ID)
+        return configured
 
     @property
     def RESOLVED_PROVIDER_ID(self) -> str:
-        return self._runtime_model_cfg.get("provider_id") or "deepseek"
+        return self._current_model_config().get("provider_id") or "deepseek"
 
-    @property
-    def RESOLVED_PROVIDER_HEADERS(self) -> Dict[str, str]:
-        if self.RESOLVED_PROVIDER_ID != "opencode_go":
+    def _provider_headers(self, provider_id: str, base_url: str) -> Dict[str, str]:
+        if provider_id != "opencode_go" or model_origin(base_url) != MODEL_PROVIDER_ORIGINS[provider_id]:
             return {}
-        # 并行 lane：允许每个实例用自己的 session id（网关要求请求头带它）
         env_session = os.getenv("CITRUS_OPENCODE_SESSION", "").strip()
         if env_session:
             return {"x-opencode-session": env_session}
@@ -533,10 +585,18 @@ class Settings(BaseSettings):
             else:
                 session_id = str(uuid.uuid4())
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(session_id, encoding="utf-8")
-            return {"x-opencode-session": session_id}
-        except Exception:
+                try:
+                    with p.open("x", encoding="utf-8") as stream:
+                        stream.write(session_id)
+                except FileExistsError:
+                    session_id = p.read_text(encoding="utf-8").strip()
+            return {"x-opencode-session": session_id or "citrusqa-local"}
+        except OSError:
             return {"x-opencode-session": "citrusqa-local"}
+
+    @property
+    def RESOLVED_PROVIDER_HEADERS(self) -> Dict[str, str]:
+        return self.model_transport().headers
 
     def _load_runtime_deepseek_web_api_key(self) -> None:
         """Load the separately configured Search/Fetch key from local state."""
@@ -611,46 +671,178 @@ class Settings(BaseSettings):
         except Exception:
             self._runtime_model_cfg = {}
 
-    def save_runtime_model_config(self, *, main: str = "", fast: str = "",
-                                  main_base_url: str = "", fast_base_url: str = "",
-                                  context_window_tokens: int | str = "",
-                                  provider_id: str = "") -> bool:
-        cfg = {}
-        for k, v in (("main_model", main), ("fast_model", fast),
-                     ("main_base_url", main_base_url), ("fast_base_url", fast_base_url),
-                     ("context_window_tokens", context_window_tokens),
-                     ("provider_id", provider_id)):
-            value = str(v or "").strip()
-            if value:
-                cfg[k] = value
+    # A separate writable record holds both the selection and any operator-typed
+    # keys. Read-only deployment dotenv/legacy sources remain source-only.
+    _runtime_model_activation: dict = {}
+
+    def _load_runtime_model_activation(self) -> None:
         try:
-            p = PROJECT_ROOT / "state" / "model_config.json"
-            if not cfg:
-                p.unlink(missing_ok=True)
-            else:
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._runtime_model_cfg = cfg
-            return True
-        except Exception:
-            return False
+            self._runtime_model_activation = self._read_model_activation()
+        except (OSError, ValueError):
+            # Do not silently revive a legacy credential after a corrupt activation.
+            logging.getLogger(__name__).error("Could not load runtime model activation")
+            self._runtime_model_activation = {"invalid": True}
+
+    @staticmethod
+    def _read_model_activation(root: Path | None = None) -> dict:
+        try:
+            path = (root if root is not None else PROJECT_ROOT) / "state" / "model_activation.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        if (not isinstance(data, dict) or not isinstance(data.get("revision"), str)
+                or not isinstance(data.get("model"), dict) or not isinstance(data.get("keys"), dict)
+                or any(not isinstance(v, str) for v in data["model"].values())
+                or any(not isinstance(keys, dict) or any(not isinstance(k, str) for k in keys.values())
+                       for keys in data["keys"].values())):
+            raise ValueError("Invalid model activation record")
+        return data
+
+    @property
+    def model_activation_revision(self) -> str:
+        return self._runtime_model_activation.get("revision", "")
+
+    def activate_model(self, *, revision: str, provider_id: str, main: str, main_base_url: str,
+                       fast: str = "", fast_base_url: str = "", context_window_tokens: int = 0,
+                       new_key: str = "") -> bool:
+        """Commit a preflighted configuration; false means the preflight snapshot went stale."""
+        origin = model_origin(main_base_url)
+        if not origin or not main or not re.fullmatch(r"[a-z][a-z0-9_]{1,40}", provider_id):
+            raise ValueError("Invalid model activation")
+        path = PROJECT_ROOT / "state" / "model_activation.json"
+        with _MODEL_ACTIVATION_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with _model_file_lock(path.with_suffix(".lock")):
+                old = self._read_model_activation()
+                if revision != old.get("revision", "") or revision != self.model_activation_revision:
+                    return False
+                keys = dict(old.get("keys", {}))
+                if new_key:
+                    keys[provider_id] = {**keys.get(provider_id, {}), origin: new_key}
+                cfg = {"provider_id": provider_id, "main_model": main, "main_base_url": main_base_url,
+                       "fast_model": fast, "fast_base_url": fast_base_url,
+                       "context_window_tokens": str(context_window_tokens or "")}
+                next_state = {"revision": uuid.uuid4().hex, "model": cfg, "keys": keys}
+                _atomic_private_json(path, next_state)
+                self._runtime_model_activation = next_state
+        return True
+
+    def _current_model_config(self, store: dict | None = None) -> dict:
+        if store is None:
+            store = self._runtime_model_activation
+        return store.get("model", {} if store.get("invalid") else self._runtime_model_cfg)
+
+    def _main_base_url(self, cfg: dict) -> str:
+        provider_id = cfg.get("provider_id")
+        if provider_id == "opencode_go":
+            return MODEL_PROVIDER_BASES[provider_id]
+        return cfg.get("main_base_url") or MODEL_PROVIDER_BASES.get(provider_id) or self.MAIN_BASE_URL
+
+    def _credential_for(self, provider_id: str, base_url: str, store: dict) -> str:
+        origin = model_origin(base_url)
+        if not origin or store.get("invalid"):
+            return ""
+        official = MODEL_PROVIDER_ORIGINS.get(provider_id)
+        stored = store.get("keys", {}).get(provider_id, {}).get(origin)
+        if stored:
+            return stored
+        lane_provider = os.getenv("CITRUS_PROVIDER_ID", "").strip() or "opencode_go"
+        lane_origin = model_origin(os.getenv("CITRUS_PROVIDER_BASE_URL", "")) or official
+        if provider_id == lane_provider and origin == lane_origin:
+            key = os.getenv("CITRUS_PROVIDER_API_KEY", "").strip()
+            if key:
+                return key
+        # Provider-only legacy keys can be used only at the provider's known
+        # origin. An unbound legacy custom key has no trustworthy provenance.
+        if origin == official and (provider_id != "zhipu"
+                or provider_id in self._runtime_configured_model_providers
+                or self._runtime_model_cfg.get("provider_id") == "zhipu"):
+            key = self._runtime_provider_api_keys.get(provider_id)
+            if key:
+                return key
+        bound_source = self._readonly_model_keys.get((provider_id, origin))
+        if bound_source:
+            return bound_source
+        if provider_id == "deepseek":
+            if origin == model_origin(self.MAIN_BASE_URL) and self.MAIN_API_KEY:
+                return self.MAIN_API_KEY
+            if origin == official:
+                if self._runtime_api_key and origin == model_origin(os.getenv("CITRUS_LEGACY_MODEL_API_KEY_ORIGIN", "")):
+                    return self._runtime_api_key
+                return self.DEEPSEEK_API_KEY
+        return ""
+
+    def bind_readonly_model_source(self, source: Path) -> None:
+        """Read only the active, origin-matched credential from an authorized source."""
+        target = self.model_transport(include_headers=False)
+        if target.api_key:
+            return
+        origin = model_origin(target.base_url)
+        try:
+            store = self._read_model_activation(source)
+            cfg = store.get("model")
+            if cfg is None:
+                cfg = json.loads((source / "state" / "model_config.json").read_text(encoding="utf-8"))
+            provider = cfg.get("provider_id")
+            configured_base = cfg.get("main_base_url") or MODEL_PROVIDER_BASES.get(provider, "")
+            if not origin or provider != target.provider_id or model_origin(configured_base) != origin:
+                return
+            key = store.get("keys", {}).get(provider, {}).get(origin)
+            if not key and origin == MODEL_PROVIDER_ORIGINS.get(provider):
+                # Provider-only legacy keys have a subject only at fixed catalog origins.
+                keys = json.loads((source / "state" / "provider_api_keys.json").read_text(encoding="utf-8"))
+                key = keys.get(provider)
+            if isinstance(key, str) and key.strip():
+                self._readonly_model_keys = {(provider, origin): key.strip()}
+        except (OSError, ValueError, TypeError, AttributeError):
+            logging.getLogger(__name__).warning("Could not read an origin-bound model credential from the configured source")
+
+    def model_credential_for(self, provider_id: str, base_url: str) -> str:
+        return self._credential_for(provider_id, base_url, self._runtime_model_activation)
+
+    def model_transport(self, *, fast: bool = False, include_headers: bool = True) -> ModelTransport:
+        """Capture one generation for the model, endpoint, credential and routing headers."""
+        store = self._runtime_model_activation
+        cfg = self._current_model_config(store)
+        provider_id = cfg.get("provider_id") or "deepseek"
+        main_base = self._main_base_url(cfg)
+        main_model = cfg.get("main_model") or self.MAIN_MODEL
+        key = self._credential_for(provider_id, main_base, store)
+        base, model = main_base, main_model
+        if fast:
+            base = cfg.get("fast_base_url") or (main_base if store.get("revision") else
+                                                self.FAST_BASE_URL or main_base)
+            model = cfg.get("fast_model") or (main_model if cfg.get("main_model") else self.FAST_MODEL)
+            if cfg.get("fast_base_url") or not store.get("revision"):
+                key = self.fast_credential_for(base, main_base, key)
+        return ModelTransport(provider_id, model, base, key,
+                              self._provider_headers(provider_id, base) if include_headers and key else {})
+
+    def fast_credential_for(self, base: str, main_base: str, main_key: str) -> str:
+        origin = model_origin(base)
+        if not origin:
+            return ""
+        if self.FAST_API_KEY and origin == model_origin(self.FAST_BASE_URL or self.MAIN_BASE_URL):
+            return self.FAST_API_KEY
+        return main_key if origin == model_origin(main_base) else ""
 
     @property
     def has_model_overrides(self) -> bool:
-        return bool(self._runtime_model_cfg)
+        return bool(self._current_model_config())
 
     @property
     def RESOLVED_MAIN_MODEL(self) -> str:
-        return self._runtime_model_cfg.get("main_model") or self.MAIN_MODEL
+        return self.model_transport(include_headers=False).model
 
     @property
     def RESOLVED_MAIN_MODEL_IMAGE_INPUT(self) -> Optional[bool]:
         from src.core.model_capabilities import model_supports_images
-        return model_supports_images(self.RESOLVED_PROVIDER_ID, self.RESOLVED_MAIN_MODEL)
+        model = self.model_transport(include_headers=False)
+        return model_supports_images(model.provider_id, model.model)
 
     @property
     def RESOLVED_CONTEXT_BUDGET_MAX_TOKENS(self) -> int:
-        value = self._runtime_model_cfg.get("context_window_tokens")
+        value = self._current_model_config().get("context_window_tokens")
         try:
             return min(max(int(value), 4096), 1_000_000) if value else self.CONTEXT_BUDGET_MAX_TOKENS
         except (TypeError, ValueError):
@@ -658,38 +850,15 @@ class Settings(BaseSettings):
 
     @property
     def RESOLVED_FAST_MODEL(self) -> str:
-        explicit_fast = self._runtime_model_cfg.get("fast_model")
-        if explicit_fast:
-            return explicit_fast
-        # When a user switches the main Provider, do not send the default
-        # DeepSeek fast-model ID to that Provider. Blank fast-model means follow main.
-        if self._runtime_model_cfg.get("main_model"):
-            return self.RESOLVED_MAIN_MODEL
-        return self.FAST_MODEL
+        return self.model_transport(fast=True, include_headers=False).model
 
     @property
     def RESOLVED_MAIN_BASE_URL(self) -> str:
-        provider_id = self.RESOLVED_PROVIDER_ID
-        if provider_id == "opencode_go":
-            return "https://opencode.ai/inference/go/openai/v1"
-        if provider_id == "deepseek" and self._runtime_model_cfg.get("provider_id"):
-            return "https://api.deepseek.com"
-        return self._runtime_model_cfg.get("main_base_url") or self.MAIN_BASE_URL
+        return self.model_transport(include_headers=False).base_url
 
     @property
     def RESOLVED_MAIN_API_KEY(self) -> str:
-        provider_key = self._runtime_provider_api_keys.get(self.RESOLVED_PROVIDER_ID)
-        if provider_key:
-            return provider_key
-        if self.RESOLVED_PROVIDER_ID == "opencode_go":
-            return ""
-        if self._runtime_api_key:
-            return self._runtime_api_key
-        if self.MAIN_API_KEY:
-            return self.MAIN_API_KEY
-        if "api.deepseek.com" in self.RESOLVED_MAIN_BASE_URL.lower():
-            return self.DEEPSEEK_API_KEY
-        return ""
+        return self.model_transport(include_headers=False).api_key
 
     @property
     def RESOLVED_DEEPSEEK_WEB_API_KEY(self) -> str:
@@ -699,8 +868,9 @@ class Settings(BaseSettings):
         dedicated = (self.DEEPSEEK_WEB_API_KEY or self.DEEPSEEK_API_KEY or "").strip()
         if dedicated:
             return dedicated
-        if "api.deepseek.com" in self.RESOLVED_MAIN_BASE_URL.lower():
-            return self.RESOLVED_MAIN_API_KEY
+        transport = self.model_transport(include_headers=False)
+        if transport.provider_id == "deepseek" and model_origin(transport.base_url) == MODEL_PROVIDER_ORIGINS["deepseek"]:
+            return transport.api_key
         return ""
 
     @property
@@ -710,10 +880,12 @@ class Settings(BaseSettings):
 
     @property
     def RESOLVED_ZHIPU_API_KEY(self) -> str:
-        if self._runtime_provider_api_keys.get("zhipu"):
-            return self._runtime_provider_api_keys["zhipu"]
-        if self.RESOLVED_PROVIDER_ID == "zhipu":
-            return self.RESOLVED_MAIN_API_KEY
+        dedicated = self._runtime_zhipu_web_api_key or self._runtime_provider_api_keys.get("zhipu", "")
+        if dedicated:
+            return dedicated
+        transport = self.model_transport(include_headers=False)
+        if transport.provider_id == "zhipu" and model_origin(transport.base_url) == MODEL_PROVIDER_ORIGINS["zhipu"]:
+            return transport.api_key
         return ""
 
     @property
@@ -723,13 +895,11 @@ class Settings(BaseSettings):
 
     @property
     def RESOLVED_FAST_API_KEY(self) -> str:
-        return self.FAST_API_KEY or self.RESOLVED_MAIN_API_KEY
+        return self.model_transport(fast=True, include_headers=False).api_key
 
     @property
     def RESOLVED_FAST_BASE_URL(self) -> str:
-        return (self._runtime_model_cfg.get("fast_base_url")
-                or self.FAST_BASE_URL
-                or self.RESOLVED_MAIN_BASE_URL)
+        return self.model_transport(fast=True, include_headers=False).base_url
 
 def load_runtime_settings(*, worker: bool = False):
     # Worker controllers use storage/authorization configuration, never provider
@@ -745,6 +915,8 @@ def load_runtime_settings(*, worker: bool = False):
     instance._load_runtime_provider_api_keys()
     instance._load_runtime_model_config()
     instance._load_runtime_configured_model_providers()
+    instance._load_runtime_zhipu_web_api_key()
+    instance._load_runtime_model_activation()
     instance._load_runtime_web_search_config()
     return instance
 

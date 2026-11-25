@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import json
 import logging
 import os
 import re
@@ -51,6 +52,7 @@ KIND_BY_MIME = {
     "image/jpeg": "image",
     "image/webp": "image",
     "image/gif": "image",
+    "image/svg+xml": "svg",
     "text/html": "html",
     "text/csv": "table",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "table",
@@ -63,7 +65,7 @@ KIND_BY_MIME = {
 }
 KIND_BY_SUFFIX = {
     ".pdf": "pdf", ".png": "image", ".jpg": "image", ".jpeg": "image",
-    ".webp": "image", ".gif": "image", ".html": "html", ".htm": "html",
+    ".webp": "image", ".gif": "image", ".svg": "svg", ".html": "html", ".htm": "html",
     ".csv": "table", ".xlsx": "table", ".xls": "table",
     ".docx": "docx", ".doc": "docx", ".txt": "text", ".ris": "text",
     ".bib": "text", ".bibtex": "text", ".md": "text",
@@ -135,6 +137,13 @@ def init_store() -> None:
             conn.execute("ALTER TABLE session_files ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_files_dedupe "
                      "ON session_files(session_id, dedupe_key)")
+        if "upload_identity" not in cols:
+            try:
+                conn.execute("ALTER TABLE session_files ADD COLUMN upload_identity TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                # Another initializing process may have won the migration.
+                if "upload_identity" not in {row[1] for row in conn.execute("PRAGMA table_info(session_files)")}:
+                    raise
         conn.execute("""
             CREATE TABLE IF NOT EXISTS session_file_turn_refs (
                 session_id TEXT NOT NULL,
@@ -160,6 +169,12 @@ def init_store() -> None:
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_resource_refs_file "
                      "ON session_file_resource_refs(file_id, owner_user_id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS workspace_file_versions (
+            owner INTEGER NOT NULL, session TEXT NOT NULL, path TEXT NOT NULL,
+            version INTEGER NOT NULL, file_id TEXT NOT NULL, sha256 TEXT NOT NULL,
+            PRIMARY KEY(owner,session,path,version), UNIQUE(file_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS workspace_file_closed_sessions (
+            owner INTEGER NOT NULL, session TEXT NOT NULL, PRIMARY KEY(owner, session))""")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS session_activity (
                 session_id  TEXT PRIMARY KEY,
@@ -533,6 +548,10 @@ def _link_turn(conn: sqlite3.Connection, *, session_id: str, owner_user_id: int,
              str(client_request_id)[:64], file_id, now))
 
 
+class FilePinnedError(Exception):
+    """An indexed file is still referenced by a live resource."""
+
+
 class StorageQuotaExceeded(ValueError):
     """Account library capacity is checked in the indexing write transaction."""
 
@@ -636,18 +655,18 @@ def register_file(*, session_id: str, owner_user_id: int, filename: str,
         raise ValueError("invalid session id")
 
     safe = _safe_name(filename)
+    display = safe
     dedupe_key = str(dedupe_key or "")[:64]
+    upload_identity = ""
     if content is not None:
         digest = hashlib.sha256(content).hexdigest()
-        if client_request_id:
-            with _connect() as conn:
-                existing = conn.execute(
-                    "SELECT * FROM session_files WHERE owner_user_id=? "
-                    "AND client_request_id=? AND sha256=? AND origin=? AND visibility=? LIMIT 1",
-                    (int(owner_user_id or 0), str(client_request_id)[:64], digest, origin, visibility),
-                ).fetchone()
-            if existing:
-                return _row_to_public(existing)
+        if origin == ORIGIN_UPLOADED and client_request_id:
+            # Hash the requested identity, not just the sanitized disk name:
+            # distinct names (or MIME declarations) may share digest or basename.
+            material = json.dumps([str(filename or ""), mime, digest], ensure_ascii=True)
+            upload_identity = hashlib.sha256(material.encode("ascii")).hexdigest()
+            if visibility == "public":
+                display = _upload_display_name(filename) or safe
         root = _session_dir(session_id, owner_user_id)
         _make_private_dir(root)
         file_id = uuid.uuid4().hex
@@ -682,6 +701,15 @@ def register_file(*, session_id: str, owner_user_id: int, filename: str,
                 existing = conn.execute(
                     "SELECT * FROM session_files WHERE session_id=? AND artifact_id=?",
                     (session_id, artifact_id)).fetchone()
+            if existing is None and upload_identity:
+                # Match under the writer lock so concurrent exact retries can
+                # share a reference, but cannot adopt a different session/name.
+                existing = conn.execute(
+                    "SELECT * FROM session_files WHERE owner_user_id=? AND session_id=? "
+                    "AND client_request_id=? AND upload_identity=? AND origin=? "
+                    "AND visibility=? ORDER BY created_at LIMIT 1",
+                    (int(owner_user_id or 0), session_id, str(client_request_id)[:64],
+                     upload_identity, origin, visibility)).fetchone()
             if existing is None and dedupe_key:
                 # P0-B：同一逻辑产物（会话 + 工具 + 目标文件名）再次登记时认回
                 # 既有那一行。自动重试的 client_request_id 是新的，靠它去重会漏。
@@ -723,12 +751,12 @@ def register_file(*, session_id: str, owner_user_id: int, filename: str,
                 "INSERT INTO session_files(file_id, session_id, owner_user_id, filename,"
                 " origin, mime_type, size_bytes, sha256, storage_path, artifact_id,"
                 " created_at, last_accessed_at, client_request_id, producer_tool,"
-                " dedupe_key, visibility) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (file_id, session_id, int(owner_user_id or 0), safe, origin,
-                 mime or _guess_mime(safe), size, digest, str(path), artifact_id,
+                " dedupe_key, visibility, upload_identity) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (file_id, session_id, int(owner_user_id or 0), display, origin,
+                 mime or _guess_mime(display), size, digest, str(path), artifact_id,
                  now, now, str(client_request_id or "")[:64],
-                 str(producer_tool or "")[:64], str(dedupe_key or "")[:64], visibility))
+                 str(producer_tool or "")[:64], dedupe_key, visibility, upload_identity))
             # 生成物在登记时就绑定本轮，不等轮末补链接：否则"本轮产出了什么"
             # 在轮内不可判定，只能靠扩展名猜。
             _link_turn(conn, session_id=session_id, owner_user_id=owner_user_id,
@@ -749,6 +777,28 @@ def register_file(*, session_id: str, owner_user_id: int, filename: str,
     return _row_to_public(row)
 
 
+def promote_figure_files(owner: int, session_id: str, request_id: str,
+                         entries: list[dict[str, Any]]) -> None:
+    """Publish a project-authorized render batch without a partially visible set."""
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for entry in entries:
+            row = conn.execute("SELECT * FROM session_files WHERE file_id=? AND owner_user_id=? "
+                "AND session_id=? AND artifact_id=? AND origin=? AND producer_tool='figure_workspace' "
+                "AND dedupe_key=?", (entry["file_id"], owner, session_id, entry["artifact_id"],
+                                      ORIGIN_GENERATED, "figure-stage:" + entry["artifact_id"])).fetchone()
+            if row is None or row["sha256"] != entry["sha256"] or row["size_bytes"] != entry["size"]:
+                raise ValueError("staged figure file no longer matches the committed project")
+            path = Path(row["storage_path"])
+            if (path.is_symlink() or not _allowed_file_path(session_id, path, ORIGIN_GENERATED, owner)
+                    or _sha256_file(path) != entry["sha256"]):
+                raise ValueError("staged figure file bytes are unavailable or changed")
+            conn.execute("UPDATE session_files SET visibility='public',client_request_id=? WHERE file_id=?",
+                         (request_id[:64], entry["file_id"]))
+            _link_turn(conn, session_id=session_id, owner_user_id=owner,
+                       client_request_id=request_id, file_id=entry["file_id"], now=time.time())
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -761,6 +811,12 @@ def _safe_name(name: str) -> str:
     stem = Path(str(name or "")).name
     stem = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", stem).strip(" .")
     return (stem[:180] or "file")
+
+
+def _upload_display_name(name: str) -> str:
+    """Display basename only, without folding punctuation into the disk name."""
+    basename = str(name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return re.sub(r"[\x00-\x1f\x7f]+", "_", basename).strip(" .")[:180]
 
 
 def _guess_mime(name: str) -> str:
@@ -813,6 +869,7 @@ def _row_to_public(row: sqlite3.Row | dict) -> dict[str, Any]:
                                        "mime_type", "size_bytes", "sha256", "visibility")}
     d.pop("storage_path", None)
     d.pop("owner_user_id", None)
+    d.pop("upload_identity", None)
     d["mime_type"] = _canonical_mime(d.get("filename", ""), d.get("mime_type", ""))
     d["kind"] = kind_for(d.get("filename", ""), d.get("mime_type", ""))
     # S3: expose the normalized turn key so the UI can jump from a file back to
@@ -1216,7 +1273,8 @@ def list_turn_files(session_id: str, owner_user_id: int,
     return grouped
 
 
-def _delete_indexed_file(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[bool, int]:
+def _delete_indexed_file(conn: sqlite3.Connection, row: sqlite3.Row, *,
+                         report_pins: bool = False) -> tuple[bool, int]:
     """Delete under an already-held BEGIN IMMEDIATE writer lock.
 
     Check pins, unlink uploaded bytes, then remove index/turn refs and commit
@@ -1229,6 +1287,8 @@ def _delete_indexed_file(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[bo
     fid = row["file_id"]
     if conn.execute("SELECT 1 FROM session_file_resource_refs WHERE file_id=? LIMIT 1",
                     (fid,)).fetchone():
+        if report_pins:
+            raise FilePinnedError(fid)
         return False, 0
     removed = 0
     if row["origin"] == ORIGIN_UPLOADED:
@@ -1251,10 +1311,10 @@ def _delete_indexed_file(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[bo
     return True, removed
 
 
-def delete_account_file(file_id: str, owner_user_id: int) -> bool:
+def delete_account_file(file_id: str, owner_user_id: int, *, report_pins: bool = False) -> bool:
     """Delete an upload, or return False if unavailable/pinned/unlink failed.
 
-    Call file_dependencies(file_id, owner_user_id) to explain a pin refusal.
+    HTTP callers can request a typed pin conflict from the same writer lock.
     """
     from src.figures.store import migrate_resource_references
     migrate_resource_references()
@@ -1269,12 +1329,12 @@ def delete_account_file(file_id: str, owner_user_id: int) -> bool:
             (file_id, uid)).fetchone()
         if row is None or row["origin"] != ORIGIN_UPLOADED:
             return False
-        return _delete_indexed_file(conn, row)[0]
+        return _delete_indexed_file(conn, row, report_pins=report_pins)[0]
 
 
 def delete_file(session_id: str, file_id: str, *,
                 allow_generated: bool = False,
-                owner_user_id: int = 0) -> bool:
+                owner_user_id: int = 0, report_pins: bool = False) -> bool:
     """Delete an unpinned upload or, if allowed, a generated index entry.
 
     Generated bytes remain owned by the research pipeline. The legacy owner=0
@@ -1294,7 +1354,7 @@ def delete_file(session_id: str, file_id: str, *,
             return False
         if row["origin"] == ORIGIN_GENERATED and not allow_generated:
             return False
-        return _delete_indexed_file(conn, row)[0]
+        return _delete_indexed_file(conn, row, report_pins=report_pins)[0]
 
 
 # --------------------------------------------------------------- cleanup
@@ -1376,6 +1436,9 @@ def _purge_session_locked(conn: sqlite3.Connection, session_id: str, *,
     for table in ("session_file_resource_refs", "session_file_turn_refs"):
         conn.execute(f"DELETE FROM {table} WHERE file_id IN "
                      f"(SELECT file_id FROM session_files WHERE {scope})", params)
+    version_scope = "session=?" if owner_user_id is None else "session=? AND owner=?"
+    for table in ("workspace_file_versions", "workspace_file_closed_sessions"):
+        conn.execute(f"DELETE FROM {table} WHERE {version_scope}", params)
     if owner_user_id is None:
         conn.execute("DELETE FROM session_files WHERE session_id=?", (session_id,))
         conn.execute("DELETE FROM session_file_turn_refs WHERE session_id=?", (session_id,))
@@ -1388,6 +1451,52 @@ def _purge_session_locked(conn: sqlite3.Connection, session_id: str, *,
         conn.execute("DELETE FROM session_activity WHERE session_id=? AND owner_user_id=?",
                      (session_id, int(owner_user_id)))
     return removed
+
+
+def purge_account_files(owner_user_id: int, session_ids: Iterable[str] = ()) -> None:
+    """Purge the exact account library after its writers and resource owners drain."""
+    if type(owner_user_id) is not int or owner_user_id <= 0:
+        raise ValueError("invalid account id")
+    from shutil import rmtree
+
+    known = set(session_ids)
+    init_store()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        known.update(row[0] for row in conn.execute(
+            "SELECT DISTINCT session_id FROM session_files WHERE owner_user_id=?", (owner_user_id,)))
+        for session_id in known:
+            if not valid_session(session_id):
+                raise ValueError("account contains an invalid session identifier")
+        for table in ("session_file_resource_refs", "session_file_turn_refs"):
+            if conn.execute(f"SELECT 1 FROM {table} r JOIN session_files f ON f.file_id=r.file_id "
+                            "WHERE f.owner_user_id=? AND r.owner_user_id<>? LIMIT 1",
+                            (owner_user_id, owner_user_id)).fetchone():
+                raise ValueError("account file index has conflicting ownership")
+            # Includes a turn pin whose source file or session row is already gone.
+            conn.execute(f"DELETE FROM {table} WHERE owner_user_id=?", (owner_user_id,))
+        for session_id in known:
+            _purge_session_locked(conn, session_id, strict=True, owner_user_id=owner_user_id)
+        conn.execute("DELETE FROM session_activity WHERE owner_user_id=?", (owner_user_id,))
+        # The immutable version index predates foreign-key-backed cleanup. Also
+        # remove orphaned version metadata that has no corresponding library row.
+        for table in ("workspace_file_versions", "workspace_file_closed_sessions"):
+            conn.execute(f"DELETE FROM {table} WHERE owner=?", (owner_user_id,))
+        root = _account_dir(owner_user_id)
+        if root.exists():
+            rmtree(root)
+
+
+def retire_closed_workspace(owner_user_id: int, session_id: str, *,
+                            sessions_db: Path) -> None:
+    """Retire one soft-deleted workspace, with the usual TTL handling bytes."""
+    if type(owner_user_id) is not int or owner_user_id <= 0 or not valid_session(session_id):
+        raise ValueError("invalid workspace scope")
+    from .workspace_retention import release_expired_workspace_versions
+    init_store()
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        release_expired_workspace_versions(conn, sessions_db, scope=(owner_user_id, session_id))
 
 
 def cleanup_idle_sessions(idle_days: int = DEFAULT_IDLE_DAYS,
@@ -1418,6 +1527,13 @@ def cleanup_idle_sessions(idle_days: int = DEFAULT_IDLE_DAYS,
     cutoff = time.time() - idle_days * 86400
     removed = expired = 0
     affected: set[str] = set()
+    from .workspace_retention import release_expired_workspace_versions
+    try:
+        with _connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            release_expired_workspace_versions(conn, PROJECT_ROOT / "state" / "sessions.db", cutoff=cutoff)
+    except sqlite3.Error as exc:
+        logging.getLogger(__name__).warning("workspace retention deferred: %s", type(exc).__name__)
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(

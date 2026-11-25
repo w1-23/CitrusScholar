@@ -14,9 +14,14 @@
   var libraryRows = [];
   var retentionIdleDays = 0;
   var catalogScope = 0;
+  var catalogRequestSerial = 0, latestCatalogRequest = null;
+  var defaultReferenceLimits = {max_turn_files: 8, max_reference_bytes: 20 * 1024 * 1024};
+  var referenceLimits = defaultReferenceLimits;
 
   function resetSessionFiles() {
     catalogScope += 1;
+    latestCatalogRequest = null;
+    referenceLimits = defaultReferenceLimits;
     clearTableTiles();
     closeMoreMenus(null);
     fileCache = Object.create(null);
@@ -86,7 +91,8 @@
     var date = stamp && isFinite(stamp) ? new Date(stamp * 1000) : null;
     var dateLabel = date && isFinite(date.getTime()) ? date.toLocaleDateString() : '';
     var ext = (String(f.filename || '').match(/\.([^.]+)$/) || ['', ''])[1].toUpperCase().slice(0, 5);
-    var thumbnail = kind === 'image' && Number(f.size_bytes) <= 2*1024*1024 && safePreviewUrl(f.preview_url);
+    var thumbnail = (kind === 'image' || kind === 'svg') &&
+      Number(f.size_bytes) <= 2*1024*1024 && safePreviewUrl(f.preview_url);
     var tableTile = kind === 'table' && /^[a-f0-9]{32}$/i.test(String(f.file_id || ''));
     var thumbnailHtml = '<span class="session-file-thumb-fallback">' +
       window.uiIcon(kind === 'table' ? 'table' : kind === 'svg' ? 'canvas' : 'file') +
@@ -303,6 +309,10 @@
       return f.visibility !== 'internal';
     });
     retentionIdleDays = Math.max(0, Math.floor(Number(payload.retention_idle_days) || 0));
+    var limits = payload.reference_limits;
+    referenceLimits = limits && Number.isSafeInteger(limits.max_turn_files) && limits.max_turn_files > 0 &&
+      Number.isSafeInteger(limits.max_reference_bytes) && limits.max_reference_bytes > 0
+      ? limits : defaultReferenceLimits;
     fileCache = Object.create(null);
     libraryRows.forEach(function(file) { fileCache[file.file_id] = file; });
     el('sessionFilesStats').textContent = '共 ' + libraryRows.length + ' 份资料 · ' +
@@ -315,7 +325,7 @@
   function bindLibraryUpload() {
     var input = el('libraryUploadInput'), button = el('libraryUploadButton');
     var zone = el('libraryUploadZone'), status = el('libraryUploadStatus');
-    var formats = /\.(?:csv|tsv|xlsx|xls|xlsm|xlsb|pdf|docx|jpe?g|png|webp|gif|txt|md)$/i;
+    var formats = /\.(?:csv|tsv|xlsx|xls|xlsm|xlsb|pdf|docx|jpe?g|png|webp|gif|svg|txt|md)$/i;
     button.addEventListener('click', function () { input.click(); });
     input.addEventListener('change', function () {
       upload(Array.from(input.files)); input.value = '';
@@ -363,7 +373,8 @@
   }
 
   function loadSessionFiles() {
-    var scope = catalogScope;
+    var scope = catalogScope, serial = ++catalogRequestSerial;
+    function ownsList() { return scope === catalogScope && serial === catalogRequestSerial; }
     var fetchCatalog = window.accountFetch || fetch;
     var empty = el('sessionFilesEmpty');
     var hasFiles = (el('sessionFilesUploaded') && el('sessionFilesUploaded').children.length)
@@ -373,8 +384,8 @@
       empty.classList.remove('session-files-error');
       empty.textContent = '正在加载资料库…';
     }
-    return fetchCatalog(apiBase + '/api/v2/files',
-                 { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
+    var request = fetchCatalog(apiBase + '/api/v2/files',
+                 { credentials: 'same-origin', cache: 'no-store', headers: { 'Accept': 'application/json' } })
       .then(function (r) {
         if (!r.ok) {
           var err = new Error('library-unavailable');
@@ -384,7 +395,7 @@
         return r.json();
       })
       .then(function (d) {
-        if (scope !== catalogScope) return;
+        if (!ownsList()) return scope === catalogScope ? latestCatalogRequest : undefined;
         renderList(d || {});
         listLoaded = true;
         decorateTurnCards();
@@ -393,7 +404,8 @@
         return d || {};
       })
       .catch(function (err) {
-        if (scope !== catalogScope || err && err.name === 'AbortError') return;
+        if (!ownsList()) return scope === catalogScope ? latestCatalogRequest : undefined;
+        if (err && err.name === 'AbortError') return;
         var empty = el('sessionFilesEmpty');
         if (empty) {
           empty.hidden = false;
@@ -403,6 +415,8 @@
             : '资料库暂时无法加载，请稍后重试。';
         }
       });
+    latestCatalogRequest = request;
+    return request;
   }
 
   function toggleSessionFiles(show) {
@@ -420,7 +434,7 @@
     if (want) {
       syncLibraryBounds(); scheduleLibraryColumns(); loadSessionFiles();
       var close = p.querySelector('.session-files-close');
-      if (close && window.innerWidth <= 900) close.focus();
+      if (close && isDrawerMode()) close.focus();
     } else {
       clearTableTiles();
       closeMoreMenus(null);
@@ -447,15 +461,15 @@
     }
   }
   function previewStageHtml(file, meta) {
-    var kind = file.kind;
+    var kind = displayKind(file);
     var url = safePreviewUrl(file.preview_url);
-    var dl = safePreviewUrl(file.download_url) || url;
-    if (isSvgFile(file)) {
-      if (!dl) return unsafePreviewHtml('');
+    var dl = safePreviewUrl(file.download_url);
+    if (kind === 'svg') {
+      if (!url) return unsafePreviewHtml(dl);
       // 安全边界：SVG 只以 <img> 载入（图片上下文里脚本、外链、事件处理器都不
       // 执行），绝不把源码 innerHTML 注入聊天页；要看源码请用「复制 SVG 源码」。
       return '<div class="sf-image-wrap"><img class="sf-preview-image" src="' +
-             esc(dl) + '" alt="' + esc(file.filename) + '"></div>' +
+             esc(url) + '" alt="' + esc(file.filename) + '"></div>' +
              '<div class="sf-preview-note" data-preview-error hidden></div>' +
              '<div class="sf-preview-note">SVG 以隔离图片方式渲染（脚本不会执行）；' +
              '需要源码请用上方「复制 SVG 源码」。</div>';
@@ -1240,80 +1254,75 @@
         return String(c[0].t || '').trim();
       }
 
-      var _ISSUE_SHEET = '问题清单';
       var pendingFocus = null;
+      var utils = window.XLSX.utils;
+      var a1Range = /^\$?[A-Z]{1,3}\$?[1-9]\d{0,6}(?::\$?[A-Z]{1,3}\$?[1-9]\d{0,6})?$/i;
 
-      function bindIssueList(body) {
-        var rows = body.querySelectorAll('tr');
-        Array.prototype.forEach.call(rows, function (tr) {
-          var cells = tr.querySelectorAll('td');
-          if (cells.length < 3) return;   // 表头行是 th
-          var sheetName = (cells[1].textContent || '').trim();
-          var target = (cells[2].textContent || '').trim();
-          if (!sheetName) return;
-          tr.classList.add('sf-issue-row');
-          tr.title = '跳到 ' + sheetName + ' · ' + target;
-          tr.addEventListener('click', function () {
-            var ref = /^([A-Z]+)(\d+)$/.test(target) ? target : '';
-            var rowMatch = target.match(/第\s*(\d+)\s*行/);
-            var rowNum = rowMatch ? parseInt(rowMatch[1], 10)
-              : (ref ? parseInt(ref.replace(/^[A-Z]+/, ''), 10) : 0);
-            pendingFocus = {
-              sheet: sheetName,
-              ref: ref,
-              row: rowMatch ? parseInt(rowMatch[1], 10) : 0
-            };
-            // Make sure the referenced row is inside the rendered page.
-            if (rowNum > 0) {
-              state.visibleRows = Math.max(state.visibleRows,
-                Math.min(rowNum, XLSX_PARSE_ROW_CAP, TABLE_MAX_RENDERED_ROWS));
-            }
-            var tab = null;
-            node.querySelectorAll('.sf-sheet-tab').forEach(function (b) {
-              if (b.getAttribute('data-sheet') === sheetName) tab = b;
-            });
-            if (!tab) return;
-            node.querySelectorAll('.sf-sheet-tab').forEach(function (b) {
-              b.classList.remove('active');
-            });
-            tab.classList.add('active');
-            showSheet(sheetName);
-          });
-        });
+      function inside(point, range) {
+        return point.r >= range.s.r && point.r <= range.e.r && point.c >= range.s.c && point.c <= range.e.c;
+      }
+
+      function workbookLocation(sheet, address) {
+        if (!a1Range.test(String(address || '')) || sheets.indexOf(sheet) < 0) return null;
+        var targetSheet = wb.Sheets[sheet];
+        if (!targetSheet || !targetSheet['!ref']) return null;
+        var normal = address.replace(/\$/g, '').toUpperCase();
+        var location = normal.includes(':') ? utils.decode_range(normal) : {s: utils.decode_cell(normal)};
+        var parsed = utils.decode_range(targetSheet['!ref']);
+        var extent = utils.decode_range(targetSheet['!fullref'] || targetSheet['!ref']);
+        if (!inside(location.s, extent) || location.e && (!inside(location.e, extent) ||
+            location.s.r > location.e.r || location.s.c > location.e.c)) return null;
+        var merge = (targetSheet['!merges'] || []).find(function (m) { return inside(location.s, m); });
+        var anchor = merge ? merge.s : location.s;
+        var visibleRows = anchor.r - parsed.s.r + 1;
+        if (!inside(anchor, parsed) || visibleRows > TABLE_MAX_RENDERED_ROWS) return null;
+        return {sheet: sheet, address: normal, ref: utils.encode_cell(anchor), visibleRows: visibleRows,
+          isRange: !!location.e, merged: anchor.r !== location.s.r || anchor.c !== location.s.c};
       }
 
       function auditCellTarget(cell) {
         var link = cell && cell.l && cell.l.Target;
         if (typeof link !== 'string') return null;
-        var match = /^#(?:'((?:[^']|'')+)'|([^!'\[\]]+))!\$?([A-Z]{1,3})\$?([1-9]\d{0,6})$/i.exec(link);
+        var match = /^#(?:'((?:[^']|'')+)'|([^!'\[\]]+))!([^!]+)$/.exec(link);
         if (!match) return null;
         var sheet = match[1] ? match[1].replace(/''/g, "'") : match[2];
-        if (sheets.indexOf(sheet) < 0 || !wb.Sheets[sheet]['!ref']) return null;
-        var ref = match[3].toUpperCase() + match[4];
-        var coord = window.XLSX.utils.decode_cell(ref);
-        var range = window.XLSX.utils.decode_range(wb.Sheets[sheet]['!ref']);
-        var visibleRows = coord.r - range.s.r + 1;
-        if (visibleRows < 1 || visibleRows > TABLE_MAX_RENDERED_ROWS || coord.r > range.e.r ||
-            coord.c < range.s.c || coord.c > range.e.c) return null;
-        return { sheet: sheet, ref: ref, visibleRows: visibleRows };
+        return workbookLocation(sheet, match[3]);
+      }
+
+      function cellsText(ws, row, col) {
+        var cell = ws[utils.encode_cell({r: row, c: col})];
+        return cell && cell.v != null ? String(cell.v).trim() : '';
+      }
+
+      function issueMetadata(ws, range) {
+        // Both persisted issue tables declare their exact coordinate column.
+        // Never parse a human-readable explanation into an inferred target.
+        var field = function (i) { return cellsText(ws, range.s.r, range.s.c + i); };
+        if (field(0) !== '序号' || field(1) !== '工作表') return null;
+        var index = field(2) === '区域' ? 3 : 2;
+        if (field(index) !== '单元格' || field(index + 1) !== '行' || field(index + 2) !== '列') return null;
+        return {sheet: range.s.c + 1, address: range.s.c + index};
       }
 
       function applyPendingFocus(body) {
         if (!pendingFocus) return;
-        var target = null;
-        if (pendingFocus.ref) {
-          target = body.querySelector('[data-ref="' + pendingFocus.ref + '"]');
-        } else if (pendingFocus.row) {
-          target = body.querySelector('[data-row="' + pendingFocus.row + '"]');
-        }
+        var location = pendingFocus;
         pendingFocus = null;
+        var target = body.querySelector('[data-ref="' + location.ref + '"]');
+        var note = document.createElement('div');
+        note.className = 'sf-preview-note';
+        note.setAttribute('role', 'status');
+        note.textContent = target ? '已定位到 ' + location.sheet + '!' + location.address +
+          (location.isRange ? '（仅定位到范围起点）' : '') +
+          (location.merged ? '（显示合并单元格 ' + location.ref + '）' : '') : '该位置无法在预览中显示，请下载原件。';
+        body.appendChild(note);
         if (!target) return;
         target.classList.add('sf-cell-focus');
+        target.setAttribute('tabindex', '-1');
         try {
-          target.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        } catch (err) {
-          target.scrollIntoView();
-        }
+          target.focus({preventScroll: true});
+          target.scrollIntoView({block: 'center'});
+        } catch (_) { /* older browser */ }
         window.setTimeout(function () { target.classList.remove('sf-cell-focus'); }, 2400);
       }
 
@@ -1338,14 +1347,15 @@
         (ws['!merges'] || []).forEach(function (m) {
           var key = m.s.r + ':' + m.s.c;
           anchors[key] = { rows: m.e.r - m.s.r + 1, cols: m.e.c - m.s.c + 1 };
-          for (var r = m.s.r; r <= m.e.r; r++) {
-            for (var c = m.s.c; c <= m.e.c; c++) {
+          for (var r = Math.max(m.s.r, range.s.r); r <= Math.min(m.e.r, range.s.r + visible - 1); r++) {
+            for (var c = Math.max(m.s.c, range.s.c); c <= Math.min(m.e.c, range.e.c); c++) {
               if (r === m.s.r && c === m.s.c) continue;
               covered[r + ':' + c] = true;
             }
           }
         });
         var jumps = [];
+        var issues = issueMetadata(ws, range);
         var html = '<table class="sf-table sf-table-styled">';
         for (var r = range.s.r; r < range.s.r + visible; r++) {
           html += '<tr>';
@@ -1376,10 +1386,15 @@
             if (style) attrs += ' style="' + style + '"';
             var tag = (r === range.s.r) ? 'th' : 'td';
             var cellText = esc(text);
-            var jump = name === '审查结果' && c === range.s.c ? auditCellTarget(cell) : null;
+            var jump = auditCellTarget(cell);
+            if (!jump && issues && r > range.s.r && c === issues.address) {
+              jump = workbookLocation(cellsText(ws, r, issues.sheet), cellsText(ws, r, issues.address));
+            }
             if (jump) {
+              var locationLabel = '定位到 ' + jump.sheet + '!' + jump.address;
               cellText = '<button type="button" class="sf-audit-jump" data-jump-index="' +
-                         jumps.push(jump) + '">' + cellText + '</button>';
+                         jumps.push(jump) + '" title="' + esc(locationLabel) + '">' +
+                         (cellText || esc(locationLabel)) + '</button>';
             }
             html += '<' + tag + ' class="' + cls + '"' + attrs + '>' + cellText +
                     (note ? '<span class="sf-cell-mark" aria-hidden="true">!</span>' : '') +
@@ -1409,7 +1424,6 @@
           html += '<div class="sf-preview-note">已按原始合并单元格还原显示。</div>';
         }
         body.innerHTML = html;
-        if (name === _ISSUE_SHEET) bindIssueList(body);
         body.querySelectorAll('.sf-audit-jump').forEach(function (button) {
           button.addEventListener('click', function () {
             var target = jumps[Number(button.getAttribute('data-jump-index')) - 1];
@@ -1417,7 +1431,7 @@
             tabs.forEach(function (tab) {
               tab.classList.toggle('active', tab.getAttribute('data-sheet') === target.sheet);
             });
-            pendingFocus = { ref: target.ref };
+            pendingFocus = target;
             state.visibleRows = Math.max(TABLE_PAGE_ROWS, target.visibleRows);
             showSheet(target.sheet);
           });
@@ -1475,10 +1489,11 @@
     overlay.hidden = false;
     el('sessionFilePreviewTitle').textContent = file.filename || '文件预览';
     previewFileId = String(file.file_id || '');
-    var downloadUrl = safePreviewUrl(file.download_url) ||
-      safePreviewUrl(file.preview_url) || '#';
-    el('sessionFilePreviewDownload').href = downloadUrl;
-    el('sessionFilePreviewDownload').setAttribute('download', '');
+    var download = el('sessionFilePreviewDownload');
+    var downloadUrl = safePreviewUrl(file.download_url);
+    download.hidden = !downloadUrl;
+    download.href = downloadUrl || '#';
+    download.setAttribute('download', '');
     var copySvgBtn = el('sessionFilePreviewCopySvg');
     if (copySvgBtn) {
       copySvgBtn.hidden = !isSvgFile(file);
@@ -1521,6 +1536,7 @@
     image.src = url;
     el('sessionFilePreviewDownload').href = url;
     el('sessionFilePreviewDownload').download = file.name;
+    el('sessionFilePreviewDownload').hidden = false;
   }
 
   function enableImageZoom(image) {
@@ -1552,8 +1568,13 @@
     if (!file) return;
     var refs = window._selectedAccountFileRefs || (window._selectedAccountFileRefs = []);
     if (refs.some(function(item) { return item.file_id === file.file_id; })) return;
-    if (refs.length + (window._selectedAttachments || []).length >= 8) {
-      if (window.showBanner) window.showBanner('每轮最多上传或引用 8 个文件。');
+    if (refs.length + (window._selectedAttachments || []).length >= referenceLimits.max_turn_files) {
+      toast('每轮最多上传或引用 ' + referenceLimits.max_turn_files + ' 个文件。');
+      return;
+    }
+    var refBytes = refs.reduce(function (total, item) { return total + (Number(item.size_bytes) || 0); }, 0);
+    if (refBytes + (Number(file.size_bytes) || 0) > referenceLimits.max_reference_bytes) {
+      toast('引用资料总大小不能超过 ' + fmtSize(referenceLimits.max_reference_bytes) + '。');
       return;
     }
     refs.push(file);
@@ -1562,12 +1583,36 @@
   }
 
   function deleteSessionFile(fileId) {
-    if (!confirm('删除这个上传文件？此操作不可撤销。')) return;
-    fetch(apiBase + '/api/v2/files/' + encodeURIComponent(fileId),
+    if (!confirm('删除这个上传文件？此操作不可撤销。')) return Promise.resolve(false);
+    var scope = catalogScope;
+    return (window.accountFetch || fetch)(apiBase + '/api/v2/files/' + encodeURIComponent(fileId),
           { method: 'DELETE', credentials: 'same-origin' })
-      .then(function (r) { return r.ok; })
-      .then(function (ok) { if (ok) loadSessionFiles(); })
-      .catch(function () { /* 忽略 */ });
+      .then(function (r) {
+        if (scope !== catalogScope) return false;
+        if (!r.ok) {
+          return r.json().catch(function () { return {}; }).then(function (body) {
+            if (scope !== catalogScope) return false;
+            var detail = body && body.detail;
+            toast((detail && detail.message) || (typeof detail === 'string' ? detail : '') || '删除未完成，请重试。');
+            return false;
+          });
+        }
+        // Removing a listing is not reversible by a GET begun before deletion.
+        delete fileCache[fileId];
+        libraryRows = libraryRows.filter(function (file) { return file.file_id !== fileId; });
+        renderFilteredLibrary();
+        var refs = window._selectedAccountFileRefs || [];
+        var selected = refs.findIndex(function (file) { return file.file_id === fileId; });
+        if (selected >= 0) {
+          refs.splice(selected, 1);
+          if (window.renderAttachmentSelection) window.renderAttachmentSelection();
+        }
+        return loadSessionFiles().then(function () { return scope === catalogScope; });
+      })
+      .catch(function () {
+        if (scope === catalogScope) toast('删除未完成，请重试。');
+        return false;
+      });
   }
 
   function initSessionFiles() {
@@ -1620,7 +1665,7 @@
     return Math.max(0, window.innerWidth || 0, document.documentElement.clientWidth || 0);
   }
 
-  function isDrawerMode() { return viewportWidth() <= 900; }
+  function isDrawerMode() { return viewportWidth() <= 1024; }
 
   function sidebarRightEdge() {
     var edge = 0;
@@ -1747,7 +1792,7 @@
     }
     window.addEventListener('resize', function () {
       syncLibraryBounds();     // 桌面端：夹紧宽度上限
-      scheduleLibraryColumns(); // 抽屉模式（≤900px）下也要重算列数
+      scheduleLibraryColumns(); // 抽屉模式（≤1024px）下也要重算列数
     });
     // 首屏布局稳定后再同步一次：刷新时先在旧上限下渲染，稳定后应该回到用户宽度
     window.setTimeout(syncLibraryBounds, 0);
@@ -1818,8 +1863,8 @@
 
   function isSvgFile(file) {
     if (!file) return false;
-    if (SVG_EXT_RE.test(String(file.filename || ''))) return true;
-    return /svg/i.test(String(file.mime_type || ''));
+    return file.kind === 'svg' || SVG_EXT_RE.test(String(file.filename || '')) ||
+      /^image\/svg\+xml(?:\s*;|$)/i.test(String(file.mime_type || ''));
   }
 
   function displayKind(file) {
@@ -1955,7 +2000,11 @@
       previewFileId = String(file.file_id || '');
       el('sessionFilePreviewTitle').textContent = '文件信息 · ' + (file.filename || '');
       var download = el('sessionFilePreviewDownload');
-      if (download) download.href = file.download_url || '#';
+      if (download) {
+        var url = safePreviewUrl(file.download_url);
+        download.href = url || '#';
+        download.hidden = !url;
+      }
       var copySvgBtn = el('sessionFilePreviewCopySvg');
       if (copySvgBtn) {
         copySvgBtn.hidden = !isSvgFile(file);
@@ -2066,6 +2115,7 @@
     el('sessionFilePreviewTitle').textContent = '导出已有成果';
     el('sessionFilePreviewMeta').textContent = '资料库文件';
     el('sessionFilePreviewDownload').href = fileDownloadUrl(id);
+    el('sessionFilePreviewDownload').hidden = false;
     var copy = el('sessionFilePreviewCopySvg');
     if (copy) copy.hidden = true;
     stage.textContent = '正在核对已生成格式…';
@@ -2303,8 +2353,7 @@
       var name = nameEl ? String(nameEl.textContent || '') : '';
       var cached = fileCache[fileId];
       var svg = SVG_EXT_RE.test(name) || isSvgFile(cached);
-      // app.js 的徽标是按 kind 取前几位（SVG 的后端 kind 是 download，会显示成 DOWNLOAD
-      // 并在 34px 宽的徽标里竖向折行）；这里只改这一张卡片的徽标文案，不动 app.js。
+      // Normalize the badge for attachment cards restored from before `kind: svg`.
       if (svg) {
         var typeEl = card.querySelector('.turn-file-type');
         if (typeEl) {

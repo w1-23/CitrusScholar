@@ -10,6 +10,7 @@ from .generations import encoder_fingerprint, load_generation, read_generation_m
 from .pointers import read_pointer, write_pointer
 from .prepare import read_document_files
 from .search import HEALTH_QUERY
+from .store import publication_hold
 
 MAX_DOCUMENTS = 100
 MAX_CHUNKS = 5000
@@ -25,6 +26,27 @@ def _selection_payload(rows):
     return json.dumps(rows, sort_keys=True, separators=(",", ":"))
 
 
+def _rollback_complete(conn, hold, active):
+    return active == hold["generation"] and conn.execute("""SELECT 1 FROM publication_events
+        WHERE seq>? AND generation=? AND state='rolled_back' LIMIT 1""", (hold["seq"], active)).fetchone() is not None
+
+
+def resume_publication(store, *, now=time.time):
+    """Release an operator hold without activating or building a generation."""
+    with store.writer(), store.write(timeout=2) as conn:
+        held = publication_hold(conn)
+        active = read_pointer(store.root)
+        if held is None:
+            return {"state": "publication_enabled", "generation": active}
+        if not _rollback_complete(conn, held, active):
+            raise ValueError("corpus_rollback_incomplete_retry_rollback")
+        row = conn.execute("SELECT published FROM publications WHERE generation=?", (active,)).fetchone()
+        if row is None or row["published"] is None:
+            raise ValueError("corpus_rollback_generation_unpublished")
+        _event(conn, active, "publication_resumed", now())
+    return {"state": "publication_resumed", "generation": active}
+
+
 class Publisher:
     def __init__(self, store, *, embedder, reranker, idle=lambda: True, now=time.time):
         self.store = store
@@ -36,6 +58,10 @@ class Publisher:
 
     def publish(self):
         with self.store.writer():
+            with self.store.read() as conn:
+                hold = publication_hold(conn)
+                if hold is not None:
+                    return self._held_status(conn, hold)
             self._recover()
             if not self.idle():
                 return {"state": "waiting_for_idle"}
@@ -143,6 +169,11 @@ class Publisher:
                      (now, generation))
         _event(conn, generation, "published", now)
 
+    def _held_status(self, conn, hold):
+        active = read_pointer(self.store.root)
+        return {"state": "publication_held", "generation": active, "rollback_generation": hold["generation"],
+                "rollback_pending": not _rollback_complete(conn, hold, active)}
+
     def rollback(self, generation):
         """Pin a known published generation. Current rights still govern readers."""
         with self.store.writer():
@@ -152,9 +183,13 @@ class Publisher:
                 if not row or row["published"] is None:
                     raise LookupError("corpus_generation_unknown")
             self._health(generation)
+            # Persist the hold before the pointer write. A hard exit between
+            # these commits must never give the watch loop permission to publish.
             with self.store.write(timeout=2) as conn:
+                _event(conn, generation, "publication_held", self.now())
                 _event(conn, generation, "rollback_requested", self.now())
             write_pointer(self.store.root, generation)
             with self.store.write(timeout=2) as conn:
                 _event(conn, generation, "rolled_back", self.now())
-        return {"state": "active", "generation": generation}
+            with self.store.read() as conn:
+                return self._held_status(conn, publication_hold(conn))

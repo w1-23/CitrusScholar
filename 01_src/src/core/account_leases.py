@@ -150,7 +150,7 @@ def account_lease(owner: int) -> Iterator[AccountLease]:
 
 
 @contextmanager
-def deletion_lock(owner: int):
+def deletion_lock(owner: int, *, claim_factory=None):
     """Single persistent cleanup owner, reentrant only in its originating thread.
 
     Normal exit relinquishes the claim but never reopens admission. Process
@@ -163,9 +163,11 @@ def deletion_lock(owner: int):
     if claims is None:
         claims = _deletion_context.claims = {}
     if key in claims:
+        if claim_factory is not None:
+            raise AccountDeletionPending("the current cleanup already owns a claim")
         yield claims[key]
         return
-    claim = store.claim_deletion(owner)
+    claim = store.claim_deletion(owner) if claim_factory is None else claim_factory(store)
     claims[key] = claim
     try:
         yield claim

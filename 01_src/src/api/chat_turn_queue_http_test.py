@@ -91,6 +91,10 @@ def runtime(monkeypatch, tmp_path):
     for path, handler, method in (
         ("/api/v2/sessions", main.list_sessions, "GET"),
         (root + "/messages", main.session_messages, "GET"),
+        ("/api/v1/session/{session_id}/clear", main.clear_session_endpoint, "POST"),
+        ("/sessions/{session_id}/jobs", main.list_session_jobs, "GET"),
+        (root + "/turn-queue/{client_request_id}/reconcile", main.reconcile_chat_turn, "POST"),
+        ("/api/v2/chat/jobs/{job_id}/recover-agent", main.recover_chat_agent, "POST"),
         (root + "/turn-queue", main.enqueue_chat_turn, "POST"),
         (root + "/turn-queue", main.list_chat_turns, "GET"),
         (root + "/turn-queue/{client_request_id}", main.cancel_chat_turn, "DELETE"),
@@ -332,3 +336,291 @@ def test_graph_exception_commits_one_failed_terminal_and_advances_queue(runtime)
     assert done[0]["data"]["answer"] == ""
     assert done[0]["data"]["history_saved"] is False
     assert runtime.started == ["provider-error", "after-error"]
+
+
+def test_clear_blocks_active_work_then_hides_task_projections(runtime, monkeypatch):
+    async def pause_dispatch(*_):
+        return
+
+    monkeypatch.setattr(main, "_dispatch_queued_turn", pause_dispatch)
+    sid = runtime.sid
+    clear = f"/api/v1/session/{sid}/clear"
+    messages = f"/api/v2/session/{sid}/messages"
+    jobs_url = f"/sessions/{sid}/jobs"
+    old = send(runtime, "old-visible", "synthetic old question")
+    assert state(runtime, "old-visible") == "queued"
+    assert runtime.client.post(clear).status_code == 409
+    assert runtime.client.delete(runtime.path + "/old-visible").status_code == 200
+    assert any(t.get("job_id") == old["job_id"] for t in runtime.client.get(messages).json()["turns"])
+    cleared = runtime.client.post(clear)
+    assert cleared.status_code == 200, cleared.text
+    assert runtime.client.get(messages).json()["turns"] == []
+    assert runtime.client.get(runtime.path).json()["turns"] == []
+    assert runtime.client.get(jobs_url).json()["jobs"] == []
+    assert runtime.client.get("/api/v2/sessions").json()["sessions"][0]["has_tasks"] is False
+    assert jobs.get_job(old["job_id"])["history_hidden"] == 1
+    new = send(runtime, "new-visible", "synthetic new question")
+    assert runtime.client.delete(runtime.path + "/new-visible").status_code == 200
+    assert [t["job_id"] for t in runtime.client.get(messages).json()["turns"]] == [new["job_id"]]
+    assert [t["job_id"] for t in runtime.client.get(runtime.path).json()["turns"]] == [new["job_id"]]
+
+
+def test_restart_before_outer_dispatch_releases_claim(runtime, monkeypatch):
+    async def pause(*_):
+        return
+
+    dispatch = main._dispatch_queued_turn
+    monkeypatch.setattr(main, "_dispatch_queued_turn", pause)
+    turn = send(runtime, "last", "queued during restart")
+    assert queue.claim_head(owner_user_id=runtime.owner, session_id=runtime.sid)["state"] == "claimed"
+    runtime.client.portal.call(main._reconcile_turn_queue_startup)
+    assert state(runtime, "last") == "queued"
+    monkeypatch.setattr(main, "_dispatch_queued_turn", dispatch)
+    wait_for(lambda: state(runtime, "last") == "terminal")
+    assert runtime.started == ["last"] and jobs.get_job(turn["job_id"])["status"] == "completed"
+
+
+def test_original_reviewed_answer_reopens_same_expired_segment(runtime, monkeypatch, tmp_path):
+    import time
+    from src.agent import recovery
+    from src.agent.execution_segments import ExecutionSegments
+    from src.agent.identity import ExecutionIdentity
+    from src.core import task_events
+
+    async def pause(*_):
+        return
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "_dispatch_queued_turn", pause)
+    admitted = send(runtime, "first", "already reviewed")
+    row = queue.claim_head(owner_user_id=runtime.owner, session_id=runtime.sid)
+    queue.mark_dispatch_intent(**main._turn_fence(row), current_step="init")
+    job = jobs.get_job(admitted["job_id"])
+    identity = ExecutionIdentity(runtime.owner, runtime.sid, job["request_id"], job["job_id"])
+    original_deadline = time.time() - 5
+    task_events.init_budget(identity.run_id, original_deadline, max_calls=6)
+    segments = ExecutionSegments(identity)
+    old_claim = segments.start()
+    segments.begin_finalize(old_claim)
+    jobs.mark_interrupted_jobs()
+    runtime.client.portal.call(main._reconcile_turn_queue_startup)
+    assert state(runtime, "first") == "reconcile_required"
+    assert segments.snapshot()["phase"] == "interrupted"
+
+    async def mock_protected_answer(root, bound, *_, **__):
+        assert bound == identity
+        return {"job_id": bound.run_id, "request_id": bound.user_turn_id, "session_id": bound.session_id,
+                "user_id": bound.owner_user_id, "client_request_id": "first", "idempotency_key": "crid:first",
+                "query": "already reviewed", "agent_resume": True, "agent_recovery_answered": True}
+
+    monkeypatch.setattr(recovery, "load_recovery_state", mock_protected_answer)
+    runtime.released.add("first")
+    response = runtime.client.post(f"/api/v2/chat/jobs/{identity.run_id}/recover-agent", json={})
+    assert response.status_code == 200, response.text
+    wait_for(lambda: state(runtime, "first") == "terminal")
+    assert jobs.get_job(identity.run_id)["status"] == "completed"
+    assert segments.snapshot()["phase"] == "terminal" and runtime.started == ["first"]
+    with task_events.transaction() as conn:
+        assert conn.execute("SELECT deadline FROM task_budgets WHERE job_id=?", (identity.run_id,)).fetchone()[0] == original_deadline
+        assert task_events.current_terminal_event(conn, identity.run_id)["event"] == "done"
+
+
+def test_interactive_reconciliation_closes_active_child_and_retains_unknown_ledger(runtime, monkeypatch, tmp_path):
+    import time
+    from src.agent.execution_segments import ExecutionSegments
+    from src.agent.identity import ExecutionIdentity
+    from src.core import task_events
+
+    async def pause(*_):
+        return
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(main, "_advance_question_turn", pause)
+    runtime.asking.add("first")
+    root = send(runtime, "first", "needs a question")
+    runtime.released.add("first")
+    wait_for(lambda: state(runtime, "first") == "awaiting_input")
+    child = answer_question(runtime, root["job_id"])["child_job_id"]
+    row = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=root["job_id"])
+    queue.resume_continuation(**main._turn_fence(row), active_child_job_id=child, deadline=time.time()+60)
+    child_job = jobs.get_job(child)
+    segments = ExecutionSegments(ExecutionIdentity(runtime.owner, runtime.sid, child_job["request_id"], child))
+    segments.start()
+    operation, _ = task_events.start_operation(child, runtime.owner, "fixture_write", {})
+    jobs.mark_interrupted_jobs()
+    runtime.client.portal.call(main._reconcile_turn_queue_startup)
+    assert state(runtime, "first") == "reconcile_required"
+    row = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=child)
+    response = runtime.client.post(runtime.path + "/first/reconcile")
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "terminal" and response.json()["active_child_job_id"] == child
+    assert jobs.get_job(root["job_id"])["status"] == "awaiting_input"
+    assert jobs.get_job(child)["current_step"] == "reconciled" and segments.snapshot()["phase"] == "quarantined"
+    current = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=child)
+    assert current["generation"] > row["generation"] and not queue.can_release_inputs(**main._turn_fence(current))
+    with task_events.transaction() as conn:
+        assert conn.execute("SELECT status FROM task_operations WHERE operation_id=?", (operation,)).fetchone()[0] == "interrupted"
+    send(runtime, "last", "later task")
+    wait_for(lambda: state(runtime, "last") == "terminal")
+    assert runtime.started == ["first", "last"]
+
+
+def test_consumer_scan_failure_degrades_readiness_then_recovers(monkeypatch):
+    from types import SimpleNamespace
+
+    failures = 0
+
+    def once(*args, **kwargs):
+        nonlocal failures
+        if failures == 0:
+            failures += 1
+            raise RuntimeError("injected queue scan failure")
+        return {"turns": [], "has_more": False}
+
+    async def scenario():
+        health = {"last_scan": None, "consecutive_failures": 0}
+        wake = asyncio.Event()
+        monkeypatch.setattr(queue, "scan_open_turns", once)
+        task = asyncio.create_task(main._consume_chat_turns(wake, health=health))
+        # Compare the diagnostic to the actual coroutine rather than an old flag.
+        state_view = SimpleNamespace(turn_queue_consumer=task, turn_queue_health=health)
+        try:
+            for _ in range(100):
+                if health["consecutive_failures"]:
+                    break
+                await asyncio.sleep(0.005)
+            assert main._turn_queue_health(state_view)["reason_code"] == "scan_retry"
+            assert not task.done()
+            for _ in range(150):
+                if health["last_scan"] is not None:
+                    break
+                await asyncio.sleep(0.005)
+            assert main._turn_queue_health(state_view)["ready"]
+            assert main._turn_queue_health(state_view, now=health["last_scan"]+20)["reason_code"] == "scan_stalled"
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert main._turn_queue_health(state_view)["reason_code"] == "consumer_stopped"
+
+    asyncio.run(scenario())
+
+
+def test_ready_requires_consumer_and_worker_is_only_diagnostic(monkeypatch):
+    from src.code_execution import presence
+    from types import SimpleNamespace
+
+    snapshot = dict(stores=True, retrieval=True, models={"ready": True}, worker={"verified": True},
+                    agent={"ready": True}, figure_skill={"prompt_loaded": True})
+    monkeypatch.setenv("CITRUS_CODE_EXECUTION", "offline-development")
+    monkeypatch.delenv("CITRUS_LOCAL_FULL_STARTUP", raising=False)
+    monkeypatch.delenv("CITRUS_REQUIRE_FIGURE_WORKER", raising=False)
+    attempts = []
+
+    def failing_worker(_):
+        attempts.append(True)
+        raise RuntimeError("optional Worker store unavailable")
+
+    monkeypatch.setattr(presence, "worker_available", failing_worker)
+    healthy_task = SimpleNamespace(done=lambda: False)
+    monkeypatch.setattr(main.app.state, "turn_queue_consumer", healthy_task, raising=False)
+    healthy = asyncio.run(main._readiness_details(snapshot=snapshot, include_code_worker=False))
+    assert healthy["ready"] and not attempts
+    diagnostic = asyncio.run(main._readiness_details(snapshot=snapshot))
+    assert diagnostic["ready"] and diagnostic["status"] == "degraded"
+    assert diagnostic["code_worker"]["enabled"] and not diagnostic["code_worker"]["available"]
+    healthy_task.done = lambda: True
+    unhealthy = asyncio.run(main._readiness_details(snapshot=snapshot, include_code_worker=False))
+    assert unhealthy["ready"] is False and unhealthy["turn_queue"]["reason_code"] == "consumer_stopped"
+
+
+def test_startup_preserves_committed_done_and_retries_terminal_pin_release(runtime, monkeypatch):
+    import time
+    from src.agent.execution_segments import ExecutionSegments
+    from src.agent.identity import ExecutionIdentity
+    from src.api.turn_envelope import RESOURCE_KIND, turn_input_resource_id
+    from src.core import task_events
+    from src.core.turn_envelope import build_turn_envelope
+
+    async def pause(*_):
+        return
+
+    release = files.release_resource_references
+    attempts = []
+
+    def injected(owner, kind, resource):
+        attempts.append((owner, kind, resource))
+        if len(attempts) < 3:
+            raise RuntimeError("simulated File DB interruption")
+        return release(owner, kind, resource)
+
+    monkeypatch.setattr(main, "_dispatch_queued_turn", pause)
+    monkeypatch.setattr(files, "release_resource_references", injected)
+    turn = send(runtime, "first", "answer already delivered")
+    claimed = queue.claim_head(owner_user_id=runtime.owner, session_id=runtime.sid)
+    queue.mark_dispatch_intent(**main._turn_fence(claimed), current_step="init")
+    job = jobs.get_job(turn["job_id"])
+    identity = ExecutionIdentity(runtime.owner, runtime.sid, job["request_id"], job["job_id"])
+    task_events.init_budget(identity.run_id, time.time()+60, max_calls=6)
+    segments = ExecutionSegments(identity)
+    claim = segments.start()
+    segments.begin_finalize(claim)
+    envelope = build_turn_envelope(job_status="completed", display_status="completed", history_saved=True)
+    task_events.append_event(identity.run_id, "done", {"job_id": identity.run_id, "session_id": runtime.sid,
+        "answer": "already delivered", "turn_status": "completed", "history_saved": True,
+        "turn_envelope": envelope.as_dict()})
+    jobs.mark_interrupted_jobs()
+    runtime.client.portal.call(main._reconcile_turn_queue_startup)
+    assert state(runtime, "first") == "terminal" and runtime.started == []
+    assert segments.snapshot()["phase"] == "terminal" and jobs.get_job(identity.run_id)["status"] == "completed"
+    pending = queue.pending_input_cleanup()
+    assert {row["client_request_id"] for row in pending} == {"first"}
+    runtime.client.portal.call(main._reconcile_turn_queue_startup)
+    assert queue.pending_input_cleanup() == []
+    assert attempts == [(runtime.owner, RESOURCE_KIND, turn_input_resource_id(runtime.sid, "first"))] * 3
+    with task_events.transaction() as conn:
+        events = conn.execute("SELECT event,data FROM task_events WHERE job_id=? AND event='done'",
+                              (identity.run_id,)).fetchall()
+        assert len(events) == 1 and "already delivered" in events[0]["data"]
+
+
+def test_reconcile_parked_checkpoint_conflict_requires_terminal_worker(runtime, monkeypatch, tmp_path):
+    import time
+    from src.agent.execution_coordinator import ExecutionCompletionCoordinator
+    from src.agent.execution_segments import ExecutionSegments
+    from src.agent.identity import ExecutionIdentity
+    from src.code_execution.service import ExecutionService
+    from src.core import task_events
+
+    async def pause(*_):
+        return
+
+    monkeypatch.setattr(main, "_dispatch_queued_turn", pause)
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "code_executions.sqlite3").touch()
+    turn = send(runtime, "first", "blocked wait")
+    claimed = queue.claim_head(owner_user_id=runtime.owner, session_id=runtime.sid)
+    queue.mark_dispatch_intent(**main._turn_fence(claimed), current_step="init")
+    job = jobs.get_job(turn["job_id"])
+    identity = ExecutionIdentity(runtime.owner, runtime.sid, job["request_id"], job["job_id"])
+    task_events.init_budget(identity.run_id, time.time()+60, max_calls=6)
+    segments = ExecutionSegments(identity)
+    claim = segments.start()
+    segments.prepare_park(claim, checkpoint_ref="a"*32, wait_ids=("b"*32,))
+    segments.release_park(claim)
+    ExecutionCompletionCoordinator._blocked(identity, "code_checkpoint_reconciliation_required")
+    assert state(runtime, "first") == "reconcile_required"
+    seen = []
+
+    def result(service):
+        seen.append(service.identity)
+        return [{"status": "running" if len(seen) == 1 else "failed"}]
+
+    monkeypatch.setattr(ExecutionService, "run_executions", result)
+    first = runtime.client.post(runtime.path + "/first/reconcile")
+    assert first.status_code == 409 and first.json()["detail"]["code"] == "execution_wait_reconciliation_pending"
+    assert state(runtime, "first") == "reconcile_required" and segments.snapshot()["phase"] == "parked"
+    second = runtime.client.post(runtime.path + "/first/reconcile")
+    assert second.status_code == 200, second.text
+    assert state(runtime, "first") == "terminal" and segments.snapshot()["phase"] == "quarantined"
+    assert seen == [identity, identity] and runtime.started == []

@@ -274,8 +274,8 @@ async def lifespan(app: FastAPI):
         from src.config import get_deepseek_model
         coordinator = ExecutionCompletionCoordinator(PROJECT_ROOT / "state",
             (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()),
-            dispatch=_resume_execution_segment,
-            busy=lambda job_id: job_id in _running_graph_tasks or job_id in _pending_graph_starts)
+            dispatch=_resume_execution_segment, settle=_settle_coordinator_turn,
+            busy=_turn_execution_busy)
     from src.core import chat_turn_queue
     await asyncio.to_thread(chat_turn_queue.ensure_schema)
     await _reconcile_turn_queue_startup()
@@ -287,7 +287,9 @@ async def lifespan(app: FastAPI):
     if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
         execution_coordinator_task = asyncio.create_task(coordinator.run())
     app.state.turn_queue_wake = asyncio.Event()
-    app.state.turn_queue_consumer = asyncio.create_task(_consume_chat_turns(app.state.turn_queue_wake))
+    app.state.turn_queue_health = {"last_scan": time.monotonic(), "consecutive_failures": 0}
+    app.state.turn_queue_consumer = asyncio.create_task(_consume_chat_turns(
+        app.state.turn_queue_wake, health=app.state.turn_queue_health))
     shared_task = (asyncio.create_task(shared_runtime.run(app.state.turn_queue_wake))
                    if shared_runtime else None)
     try:
@@ -1261,18 +1263,15 @@ class OnnxDeviceRequest(BaseModel):
 async def admin_onnx_device_status(request: Request):
     require_admin(request)
     from src.engine.hardware import get_device_status
-    return await asyncio.to_thread(get_device_status)
+    return await asyncio.to_thread(get_device_status, probe=False)
 
 
 @app.put("/api/v2/admin/onnx/device")
 async def admin_set_onnx_device(req: OnnxDeviceRequest, request: Request):
     require_admin(request)
-    from src.engine.hardware import (
-        reconfigure_runtime_models, set_device_mode,
-    )
+    from src.engine.hardware import set_device_mode
     try:
-        await asyncio.to_thread(set_device_mode, req.mode)
-        return await asyncio.to_thread(reconfigure_runtime_models)
+        return await asyncio.to_thread(set_device_mode, req.mode)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -1994,8 +1993,7 @@ async def _accept_chat_turn(req: ChatRequest, request: Request, session_id: str,
         raise HTTPException(status_code=400, detail="会话标识无效。")
     if not req.client_request_id or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", req.client_request_id):
         raise HTTPException(status_code=400, detail="请求标识无效。")
-    consumer = getattr(request.app.state, "turn_queue_consumer", None)
-    if consumer is None or consumer.done():
+    if not _turn_queue_health(request.app.state)["ready"]:
         raise HTTPException(status_code=503, detail={"code": "turn_queue_unavailable",
                                                     "message": "消息队列暂不可用。"})
     async with _turn_session_lock(session_id):
@@ -2051,7 +2049,7 @@ async def list_chat_turns(session_id: str, request: Request, limit: int = 20,
 
     def read_turns():
         rows = queue.list_turns(owner_user_id=owner, session_id=session_id,
-                                limit=limit, after_seq=after_seq)
+                                limit=limit, after_seq=after_seq, visible_only=True)
         return [present_turn(row, include_content=True) for row in rows]
 
     turns = await asyncio.to_thread(read_turns)
@@ -2062,7 +2060,7 @@ async def list_chat_turns(session_id: str, request: Request, limit: int = 20,
 
 @app.delete("/api/v2/session/{session_id}/turn-queue/{client_request_id}")
 async def cancel_chat_turn(session_id: str, client_request_id: str, request: Request):
-    from src.api.turn_envelope import present_turn, release_turn_inputs
+    from src.api.turn_envelope import present_turn
     from src.core import chat_turn_queue as queue
     from src.core.account_leases import AccountUnavailable, acquire_account_lease
     user = current_user(request)
@@ -2076,7 +2074,7 @@ async def cancel_chat_turn(session_id: str, client_request_id: str, request: Req
         try:
             turn = queue.cancel_queued(owner_user_id=owner, session_id=session_id,
                                        client_request_id=client_request_id)
-            release_turn_inputs(owner, session_id, client_request_id)
+            _release_terminal_turn_inputs(turn)
         except queue.TurnQueueError as exc:
             raise _turn_queue_http_error(exc) from exc
         except ValueError as exc:
@@ -2091,16 +2089,13 @@ async def cancel_chat_turn(session_id: str, client_request_id: str, request: Req
 
 
 @app.post("/api/v2/session/{session_id}/turn-queue/{client_request_id}/reconcile")
-async def reconcile_chat_turn(session_id: str, client_request_id: str,
-                              request: Request):
-    """Settle a turn frozen by an unknown dispatch/cleanup outcome.
-
-    The turn is never replayed. The owner acknowledges that its outcome is
-    unknown so the session's later queued turns can run again.
-    """
-    from src.api.turn_envelope import present_turn, release_turn_inputs
+async def reconcile_chat_turn(session_id: str, client_request_id: str, request: Request):
+    """Settle exact run evidence, or deliberately isolate a stopped unknown run."""
+    from src.agent.harness import execution_lock
+    from src.agent.identity import ExecutionIdentity
+    from src.api.turn_envelope import present_turn
     from src.core import chat_turn_queue as queue
-    from src.core.account_leases import AccountUnavailable, acquire_account_lease
+    from src.core.account_leases import AccountUnavailable, acquire_account_lease, run_account_thread
     user = current_user(request)
     owner = int(user["user_id"])
     async with _turn_session_lock(session_id):
@@ -2108,25 +2103,61 @@ async def reconcile_chat_turn(session_id: str, client_request_id: str,
         try:
             lease = acquire_account_lease(owner)
         except AccountUnavailable as exc:
-            raise HTTPException(status_code=409,
-                                detail={"code": "account_closed"}) from exc
+            raise HTTPException(status_code=409, detail={"code": "account_closed"}) from exc
         try:
-            turn = queue.resolve_reconcile(
-                owner_user_id=owner, session_id=session_id,
-                client_request_id=client_request_id)
-            release_turn_inputs(owner, session_id, client_request_id)
+            current = queue.get_turn(owner_user_id=owner, session_id=session_id,
+                                     client_request_id=client_request_id)
+            if current is None:
+                raise queue.TurnNotFound("turn_not_found")
+            run_id = current["active_child_job_id"] or current["root_job_id"]
+            if _turn_execution_busy(run_id):
+                raise queue.TurnStateConflict("recovery_already_active", job_id=run_id)
+            with execution_lock(PROJECT_ROOT / "state" / "agent_locks", (owner, session_id)):
+                job = _turn_job(current)
+                worker_terminal_confirmed = False
+                if current["state"] != queue.TERMINAL and job and (
+                        PROJECT_ROOT / "state" / "code_executions.sqlite3").is_file():
+                    from src.code_execution.protocol import TERMINAL
+                    from src.code_execution.service import ExecutionService
+                    identity = ExecutionIdentity(owner, session_id, job["request_id"], run_id)
+                    items = await run_account_thread(lease, ExecutionService(identity).run_executions)
+                    if any(item["status"] not in TERMINAL for item in items):
+                        raise queue.TurnReconcileRequired("execution_wait_reconciliation_pending", job_id=run_id)
+                    worker_terminal_confirmed = bool(items)
+                turn = queue.resolve_reconcile(**_turn_fence(current), worker_terminal_confirmed=worker_terminal_confirmed)
+                if turn["state"] == queue.TERMINAL:
+                    _release_terminal_turn_inputs(turn)
         except queue.TurnQueueError as exc:
+            if exc.detail in {"recovery_already_active", "execution_wait_reconciliation_pending"}:
+                raise HTTPException(status_code=409, detail={"code": exc.detail}) from exc
             raise _turn_queue_http_error(exc) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=400,
-                                detail="请求标识无效。") from exc
+            raise HTTPException(status_code=400, detail="请求标识无效。") from exc
+        except RuntimeError as exc:
+            if str(exc) != "agent_run_already_active":
+                raise
+            raise HTTPException(status_code=409, detail={"code": "recovery_already_active"}) from exc
         finally:
             lease.release()
     wake = getattr(request.app.state, "turn_queue_wake", None)
     if wake is not None:
         wake.set()
-    return JSONResponse(present_turn(turn),
-                        headers={"Cache-Control": "no-store"})
+    return JSONResponse(present_turn(turn), headers={"Cache-Control": "no-store"})
+
+
+_turn_cleanup_leases = {}
+
+
+def _turn_execution_busy(job_id):
+    if job_id in _running_graph_tasks or job_id in _pending_graph_starts:
+        return True
+    lease = _turn_cleanup_leases.get(job_id)
+    if lease is None:
+        return False
+    if not lease.group_released:
+        return True
+    _turn_cleanup_leases.pop(job_id, None)
+    return False
 
 
 def _turn_fence(turn: dict) -> dict:
@@ -2135,7 +2166,9 @@ def _turn_fence(turn: dict) -> dict:
 
 def _turn_job(turn: dict) -> dict:
     from src.core.jobs import get_job
-    return get_job(turn["active_child_job_id"] or turn["root_job_id"]) or {}
+    job = get_job(turn["active_child_job_id"] or turn["root_job_id"]) or {}
+    return job if (job.get("owner_user_id"), job.get("session_id")) == (
+        turn["owner_user_id"], turn["session_id"]) else {}
 
 
 def _turn_segment_phase(job: dict) -> str:
@@ -2151,9 +2184,79 @@ def _turn_segment_phase(job: dict) -> str:
         return ""
 
 
+async def _reconcile_startup_wait(job):
+    """Classify a crashed wake by its exact protected checkpoint, without a model."""
+    from src.agent.checkpoint_store import CheckpointProtectionError
+    from src.agent.execution_segments import ExecutionSegments
+    from src.agent.harness import execution_lock
+    from src.agent.identity import ExecutionIdentity
+    from src.agent.recovery import load_recovery_state
+    from src.config import get_deepseek_model
+    from src.core.account_leases import acquire_account_lease, run_account_async
+    from src.core.task_events import TaskConflict
+
+    identity = ExecutionIdentity(job["owner_user_id"], job["session_id"], job["request_id"], job["job_id"])
+    segments = ExecutionSegments(identity)
+    snapshot = segments.snapshot()
+    root = PROJECT_ROOT / "state"
+    lease = acquire_account_lease(identity.owner_user_id, expected_epoch=snapshot["account_epoch"])
+    try:
+        with execution_lock(root / "agent_locks", (identity.owner_user_id, identity.session_id)):
+            try:
+                wait_ids = json.loads(snapshot["wait_ids"])
+                wait = {"checkpoint_ref": snapshot["checkpoint_ref"], "wait_ids": wait_ids} if wait_ids else None
+                state = await run_account_async(lease, load_recovery_state(root, identity,
+                    (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()),
+                    execution_wait=wait, discover_execution_wait=wait is None))
+                segments.classify_restart_wait(snapshot, execution_wait=wait or state["agent_recovery_execution_wait"])
+            except (ValueError, LookupError, CheckpointProtectionError, TaskConflict):
+                segments.classify_restart_wait(snapshot)
+                return "interrupted"
+            return "parked"
+    finally:
+        lease.release()
+
+
+def _release_terminal_turn_inputs(turn):
+    from src.api.turn_envelope import RESOURCE_KIND, turn_input_resource_id
+    from src.core import chat_turn_queue as queue
+    from src.session import files as session_files
+    fence = _turn_fence(turn)
+    if not queue.can_release_inputs(**fence):
+        return
+    try:
+        session_files.release_resource_references(fence["owner_user_id"], RESOURCE_KIND,
+            turn_input_resource_id(fence["session_id"], fence["client_request_id"]))
+        queue.complete_input_cleanup(**fence)
+    except Exception as exc:
+        logger.warning("Terminal turn attachment cleanup deferred: %s", type(exc).__name__)
+
+
+def _retry_terminal_turn_inputs():
+    from src.core import chat_turn_queue as queue
+    cursor = 0
+    while page := queue.pending_input_cleanup(after=cursor):
+        for turn in page:
+            try:
+                _release_terminal_turn_inputs(turn)
+            except Exception as exc:
+                logger.warning("Terminal turn attachment cleanup deferred: %s", type(exc).__name__)
+        cursor = page[-1]["cleanup_cursor"]
+
+
 async def _reconcile_turn_queue_startup():
-    from src.api.turn_envelope import release_turn_inputs
-    from src.core import chat_turn_queue as queue, jobs
+    from src.agent.execution_segments import ExecutionSegments
+    from src.core import chat_turn_queue as queue
+    from src.core.account_leases import AccountUnavailable
+    after_job = ""
+    while candidates := await asyncio.to_thread(ExecutionSegments.candidates, after=after_job, restart_only=True):
+        for job in candidates:
+            try:
+                await _reconcile_startup_wait(job)
+            except AccountUnavailable:
+                # Closed accounts cannot reopen an execution or expose its checkpoint.
+                continue
+        after_job = candidates[-1]["job_id"]
     cursor = None
     while True:
         page = await asyncio.to_thread(queue.scan_open_turns, after=cursor)
@@ -2161,32 +2264,42 @@ async def _reconcile_turn_queue_startup():
             state = turn["state"]
             if state == queue.CLAIMED and not turn["dispatch_at"]:
                 queue.release_claim(**_turn_fence(turn))
-            elif state in {queue.RUNNING, queue.SETTLING, queue.AWAITING_INPUT}:
+            elif state in {queue.RUNNING, queue.SETTLING, queue.AWAITING_INPUT, queue.RECONCILE_REQUIRED}:
                 job = _turn_job(turn)
-                if (state == queue.SETTLING and turn["history_saved"] is not None
-                        and turn["terminal_evidence"].get("job_id") == job.get("job_id")
-                        and turn["terminal_evidence"].get("job_status") == job.get("status")):
-                    queue.finalize_terminal(**_turn_fence(turn), history_saved=turn["history_saved"],
-                                            reason=turn["clear_reason"], cleanup_confirmed=True)
-                    release_turn_inputs(turn["owner_user_id"], turn["session_id"], turn["client_request_id"])
+                phase = _turn_segment_phase(job)
+                if phase in {"parked", "cancel_parked"}:
+                    if state == queue.RECONCILE_REQUIRED:
+                        queue.restore_parked_turn(**_turn_fence(turn), job_id=job["job_id"])
                     continue
-                if _turn_segment_phase(job) in {"parked", "cancel_parked"}:
-                    continue
-                if state == queue.AWAITING_INPUT and job.get("status") == "awaiting_input":
-                    continue
-                if (state == queue.RUNNING and job.get("status") in jobs.TERMINAL_STATUS
-                        and jobs.decode_terminal_snapshot(job) and job.get("current_step") != "interrupted"):
-                    # Startup has exclusive ownership. Reuse normal settlement, including
-                    # the operation ledger check, for a durable outcome from the old process.
-                    _settle_dispatched_turn(turn, job["job_id"])
+                if job and _settle_dispatched_turn(turn, job["job_id"]):
                     continue
                 queue.mark_reconcile_required(**_turn_fence(turn), reason="turn_dispatch_interrupted")
         if not page["has_more"]:
-            return
+            break
         cursor = page["next_cursor"]
+    await asyncio.to_thread(_retry_terminal_turn_inputs)
 
 
-async def _consume_chat_turns(wake: asyncio.Event):
+def _turn_queue_health(state, *, now=None):
+    consumer = getattr(state, "turn_queue_consumer", None)
+    health = getattr(state, "turn_queue_health", {})
+    last_scan = health.get("last_scan")
+    age = None if last_scan is None else (time.monotonic() if now is None else now) - last_scan
+    failures = health.get("consecutive_failures", 0)
+    if consumer is None or consumer.done():
+        reason = "consumer_stopped"
+    elif failures:
+        reason = "scan_retry"
+    elif age is not None and age > 15:
+        reason = "scan_stalled"
+    else:
+        reason = "ready"
+    return {"ready": reason == "ready", "reason_code": reason,
+            "consecutive_failures": failures,
+            "last_scan_age_seconds": round(age, 2) if age is not None else None}
+
+
+async def _consume_chat_turns(wake: asyncio.Event, *, health=None):
     from src.core import chat_turn_queue as queue, user_questions
     from src.shared_corpus.activity import MaintenanceBusy
     from src.shared_corpus.runtime import current_runtime
@@ -2194,6 +2307,7 @@ async def _consume_chat_turns(wake: asyncio.Event):
     activity = runtime.activity if runtime else None
     cursor = None
     workers: dict[tuple[int, str], asyncio.Task] = {}
+    health = {} if health is None else health
 
     def worker_finished(key, worker):
         workers.pop(key, None)
@@ -2205,41 +2319,57 @@ async def _consume_chat_turns(wake: asyncio.Event):
 
     try:
         while True:
-            page = await asyncio.to_thread(queue.scan_open_turns, limit=32, after=cursor)
-            for turn in page["turns"]:
-                state = turn["state"]
-                if state not in {queue.QUEUED, queue.AWAITING_INPUT}:
-                    continue
-                key = (turn["owner_user_id"], turn["session_id"])
-                if key in workers or len(workers) >= chat_capacity.max_active:
-                    continue
-                action, child = "dispatch", ""
-                if state == queue.AWAITING_INPUT:
-                    parent = turn["active_child_job_id"] or turn["root_job_id"]
-                    try:
-                        action, child = await asyncio.to_thread(user_questions.queue_wait_state,
-                            parent, owner_user_id=key[0], session_id=key[1])
-                    except user_questions.QuestionConflict:
-                        action = "unknown"
-                    if action == "pending":
+            try:
+                for job_id, lease in tuple(_turn_cleanup_leases.items()):
+                    if lease.group_released and _turn_cleanup_leases.get(job_id) is lease:
+                        del _turn_cleanup_leases[job_id]
+                page = await asyncio.to_thread(queue.scan_open_turns, limit=32, after=cursor)
+                for turn in page["turns"]:
+                    state = turn["state"]
+                    if state not in {queue.QUEUED, queue.AWAITING_INPUT}:
                         continue
-                elif queue.session_blocker(owner_user_id=key[0], session_id=key[1]):
-                    continue
-                if action == "dispatch":
-                    counts = await chat_capacity.snapshot(owner_user_id=key[0])
-                    if (counts["queued"] or counts["active"] >= counts["max_active"]
-                            or counts["owner_active"] >= counts["max_active_per_owner"]):
+                    key = (turn["owner_user_id"], turn["session_id"])
+                    if key in workers or len(workers) >= chat_capacity.max_active:
                         continue
-                if activity is not None:
-                    try:
-                        activity.enter("J")
-                    except MaintenanceBusy:
-                        break
-                work = (_advance_question_turn(turn, action, child) if state == queue.AWAITING_INPUT
-                        else _dispatch_queued_turn(*key))
-                worker = workers[key] = asyncio.create_task(work)
-                worker.add_done_callback(lambda task, key=key: worker_finished(key, task))
-            cursor = page["next_cursor"] if page["has_more"] else None
+                    action, child = "dispatch", ""
+                    if state == queue.AWAITING_INPUT:
+                        parent = turn["active_child_job_id"] or turn["root_job_id"]
+                        try:
+                            action, child = await asyncio.to_thread(user_questions.queue_wait_state,
+                                parent, owner_user_id=key[0], session_id=key[1])
+                        except user_questions.QuestionConflict:
+                            action = "unknown"
+                        if action == "pending":
+                            continue
+                    elif await asyncio.to_thread(queue.session_blocker, owner_user_id=key[0], session_id=key[1]):
+                        continue
+                    if action == "dispatch":
+                        counts = await chat_capacity.snapshot(owner_user_id=key[0])
+                        if (counts["queued"] or counts["active"] >= counts["max_active"]
+                                or counts["owner_active"] >= counts["max_active_per_owner"]):
+                            continue
+                    if activity is not None:
+                        try:
+                            activity.enter("J")
+                        except MaintenanceBusy:
+                            break
+                    work = (_advance_question_turn(turn, action, child) if state == queue.AWAITING_INPUT
+                            else _dispatch_queued_turn(*key))
+                    worker = workers[key] = asyncio.create_task(work)
+                    worker.add_done_callback(lambda task, key=key: worker_finished(key, task))
+                cursor = page["next_cursor"] if page["has_more"] else None
+            except Exception as exc:
+                failures = health.get("consecutive_failures", 0) + 1
+                health["consecutive_failures"] = failures
+                cursor = None
+                if (failures & (failures - 1)) == 0:
+                    logger.warning("Turn queue scan failed (attempt %d): %s", failures, type(exc).__name__)
+                # Keep admitted workers alive while retrying the scan itself.
+                await asyncio.sleep(min(5.0, 0.25 * 2 ** min(failures - 1, 5)))
+                continue
+            if health.get("consecutive_failures"):
+                logger.info("Turn queue scanning recovered")
+            health.update(last_scan=time.monotonic(), consecutive_failures=0)
             if cursor is not None:
                 await asyncio.sleep(0)
                 continue
@@ -2256,7 +2386,6 @@ async def _consume_chat_turns(wake: asyncio.Event):
 
 
 async def _advance_question_turn(turn: dict, action: str, child: str):
-    from src.api.turn_envelope import release_turn_inputs
     from src.auth import user_by_id
     from src.core import chat_turn_queue as queue, jobs, user_questions
     from src.core.account_leases import AccountUnavailable
@@ -2302,9 +2431,9 @@ async def _advance_question_turn(turn: dict, action: str, child: str):
             saved = bool(snapshot.get("history_saved"))
             settling = queue.begin_settling(**_turn_fence(current), history_saved=saved, clear_reason=action,
                 terminal_evidence={"job_id": parent, "job_status": job["status"]})
-            queue.finalize_terminal(**_turn_fence(settling), history_saved=saved, reason=action,
-                                    cleanup_confirmed=True)
-            release_turn_inputs(owner, sid, current["client_request_id"])
+            terminal = queue.finalize_terminal(**_turn_fence(settling), history_saved=saved, reason=action,
+                                               cleanup_confirmed=True)
+            _release_terminal_turn_inputs(terminal)
         else:
             queue.mark_reconcile_required(**_turn_fence(current), reason="turn_question_result_unconfirmed")
     if worker:
@@ -2312,7 +2441,7 @@ async def _advance_question_turn(turn: dict, action: str, child: str):
 
 
 async def _dispatch_queued_turn(owner: int, sid: str):
-    from src.api.turn_envelope import load_dispatch_input, release_turn_inputs
+    from src.api.turn_envelope import load_dispatch_input
     from src.auth import reserve_chat_request, release_chat_request, user_by_id
     from src.core import chat_turn_queue as queue, jobs, task_events
     from src.core.account_leases import AccountUnavailable, acquire_account_lease, run_account_thread
@@ -2362,7 +2491,7 @@ async def _dispatch_queued_turn(owner: int, sid: str):
                 turn = queue.reject_claim(**_turn_fence(turn), reason=rejection)
                 task_events.append_event(job_id, "done", {"job_id": job_id, "session_id": sid,
                     "turn_status": "failed", "stop_reason": rejection, "history_saved": False})
-                release_turn_inputs(owner, sid, turn["client_request_id"])
+                _release_terminal_turn_inputs(turn)
                 return
             job = jobs.get_job(job_id)
             turn = queue.mark_dispatch_intent(**_turn_fence(turn), current_step="init")
@@ -2396,33 +2525,22 @@ async def _dispatch_queued_turn(owner: int, sid: str):
 
 
 def _settle_dispatched_turn(turn: dict, job_id: str):
-    from src.api.turn_envelope import release_turn_inputs
-    from src.core import chat_turn_queue as queue, jobs, task_events
+    from src.core import chat_turn_queue as queue, jobs
+    settled = queue.settle_durable(**_turn_fence(turn), job_id=job_id)
+    if settled is not None:
+        if settled["state"] == queue.TERMINAL:
+            _release_terminal_turn_inputs(settled)
+        return settled
+    # Incomplete protected or operation state is never reported as a normal
+    # terminal outcome, even if a stale job row has already closed.
     job = jobs.get_job(job_id) or {}
-    status = job.get("status")
-    with task_events.transaction() as conn:
-        unknown = conn.execute("SELECT 1 FROM task_operations WHERE job_id=? "
-            "AND status IN ('running','interrupted','unknown') LIMIT 1", (job_id,)).fetchone()
-    if unknown:
+    current = queue.get_turn(owner_user_id=turn["owner_user_id"], session_id=turn["session_id"],
+                             client_request_id=turn["client_request_id"])
+    if (current and current["generation"] == turn["generation"]
+            and current["state"] in {queue.RUNNING, queue.SETTLING}
+            and job.get("status") in jobs.TERMINAL_STATUS):
         queue.mark_reconcile_required(**_turn_fence(turn), reason="turn_operation_unsettled")
-        return
-    if status == "awaiting_input":
-        queue.mark_awaiting_input(**_turn_fence(turn), active_child_job_id=turn["active_child_job_id"])
-        return
-    if status not in jobs.TERMINAL_STATUS:
-        return
-    snapshot = jobs.decode_terminal_snapshot(job) or {}
-    history_saved = bool(snapshot.get("history_saved"))
-    reason = "" if history_saved else str(snapshot.get("stop_reason") or "history_not_saved")
-    settling = queue.begin_settling(**_turn_fence(turn), history_saved=history_saved, clear_reason=reason,
-                                    terminal_evidence={"job_id": job_id, "job_status": status})
-    # Done can already be durable. The event store de-duplicates it per segment.
-    task_events.append_event(job_id, "done", {"job_id": job_id, "session_id": turn["session_id"],
-        "turn_status": snapshot.get("display_status") or status, "history_saved": history_saved,
-        "turn_envelope": snapshot, "stop_reason": reason})
-    queue.finalize_terminal(**_turn_fence(settling), history_saved=history_saved, reason=reason,
-                            cleanup_confirmed=True)
-    release_turn_inputs(turn["owner_user_id"], turn["session_id"], turn["client_request_id"])
+    return None
 
 
 @app.post("/api/v2/chat")
@@ -2526,10 +2644,11 @@ async def _start_claimed_chat(req: ChatRequest, request_lease,
             from src.agent.execution_segments import ExecutionSegments
             from src.core import jobs, task_events
             try:
-                ExecutionSegments(execution_segment_claim.identity).release_unstarted_resume(execution_segment_claim)
-                jobs.update_job(job_id, current_step="waiting_code", error="code_resume_admission_failed")
-                task_events.append_event(job_id, "status", {"stage": "waiting_code",
-                    "summary": "执行恢复暂未受理，稍后重试。"})
+                phase = ExecutionSegments(execution_segment_claim.identity).release_unstarted_resume(execution_segment_claim)
+                if phase == "parked":
+                    jobs.update_job(job_id, current_step="waiting_code", error="code_resume_admission_failed")
+                    task_events.append_event(job_id, "status", {"stage": "waiting_code",
+                        "summary": "执行恢复暂未受理，稍后重试。"})
             except task_events.TaskConflict:
                 pass  # Cancellation/reconciliation must retain its own fence.
         raise
@@ -3363,11 +3482,12 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             nonlocal resume_released
             if execution_segment_claim is None or segment_activated or resume_released:
                 return False
-            segments.release_unstarted_resume(segment_claim)
+            phase = segments.release_unstarted_resume(segment_claim)
             resume_released = True
-            jobs_mod.update_job(job_id, current_step="waiting_code", error="code_resume_admission_failed")
-            await event_queue.put(_encode_event("status", {"stage": "waiting_code",
-                "reason_code": "code_resume_admission_failed"}))
+            if phase == "parked":
+                jobs_mod.update_job(job_id, current_step="waiting_code", error="code_resume_admission_failed")
+                await event_queue.put(_encode_event("status", {"stage": "waiting_code",
+                    "reason_code": "code_resume_admission_failed"}))
             return True
 
         async def process_with_capacity():
@@ -3622,11 +3742,14 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
         queue_turn = find_turn_by_job(owner_user_id=identity.owner_user_id, session_id=sid, job_id=job_id)
         _pending_graph_starts.add(job_id)
         graph_lease = request_lease.retain()
+        _turn_cleanup_leases[job_id] = graph_lease
         try:
             graph_task = asyncio.create_task(run_graph_segment())
         except BaseException:
+            _pending_graph_starts.discard(job_id)
             graph_lease.release()
             raise
+        graph_task.add_done_callback(lambda _: _turn_execution_busy(job_id))
         # No await separates retained-handle ownership and task registration.
         _running_graph_tasks[job_id] = graph_task
         if queue_turn is not None:
@@ -3963,6 +4086,14 @@ async def decide_task_approval(job_id: str, approval_id: str, req: ApprovalDecis
         raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
 
 
+def _settle_coordinator_turn(identity):
+    from src.core.chat_turn_queue import find_turn_by_job
+    turn = find_turn_by_job(owner_user_id=identity.owner_user_id, session_id=identity.session_id,
+                           job_id=identity.run_id)
+    if turn:
+        _settle_dispatched_turn(turn, identity.run_id)
+
+
 async def _resume_execution_segment(identity, state, admission, lease):
     """Coordinator-only dispatch using the original owner, inputs and run."""
     from src.auth import user_by_id
@@ -4032,6 +4163,7 @@ class RecoverAgentRequest(BaseModel):
 
 @app.post("/api/v2/chat/jobs/{job_id}/recover-agent")
 async def recover_chat_agent(job_id: str, req: RecoverAgentRequest, request: Request):
+    from src.agent.harness import execution_lock
     from src.agent.identity import ExecutionIdentity
     from src.agent.recovery import load_recovery_state, restore_deadline
     from src.agent.checkpoint_store import CheckpointProtectionError
@@ -4054,40 +4186,45 @@ async def recover_chat_agent(job_id: str, req: RecoverAgentRequest, request: Req
         raise HTTPException(status_code=409, detail="Account unavailable") from exc
     admission_task = asyncio.current_task()
     claimed = False
+    admission = {}
     cancel_token = CancelToken()
     try:
-        if job_id in _running_graph_tasks or job_id in _pending_graph_starts:
-            raise task_events.TaskConflict("recovery_already_active")
-        identity = ExecutionIdentity(owner, sid, str(job["request_id"]), job_id)
-        state = await run_account_async(lease, load_recovery_state(
-            PROJECT_ROOT / "state", identity,
-            (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())))
-        # All file identities come from the protected original request. Resolve
-        # ownership and current availability again while the account is leased.
-        file_ids = [str(ref["file_id"]) for ref in state.get("attachment_refs", [])]
-        ref_infos = _validate_account_file_refs(file_ids, owner)
-        saved_hashes = {ref["file_id"]: ref.get("sha256") for ref in state.get("attachment_refs", [])}
-        if any(saved_hashes.get(info["file_id"]) != info.get("sha256") for info in ref_infos):
-            raise task_events.TaskConflict("recovery_input_changed")
-        recovered_req = ChatRequest(query=state["query"], session_id=sid,
-            client_request_id=state["client_request_id"], file_refs=file_ids,
-            visualization_enabled=bool(state.get("visualization_enabled")),
-            browse_requested=state.get("browse_requested") is True,
-            context_compression=bool(state.get("context_compression", True)),
-            selected_skills=state.get("selected_skills") or [])
-        # No awaits separate the durable CAS and the in-process admission fence.
-        admission = jobs_mod.claim_agent_recovery(identity,
-            answered=state.get("agent_recovery_answered") is True)
-        claimed = True
-        _job_tokens[job_id] = cancel_token
-        _running_graph_tasks[job_id] = admission_task
+        async with _turn_session_lock(sid):
+            _require_active_turn_session(sid, user)
+            with execution_lock(PROJECT_ROOT / "state" / "agent_locks", (owner, sid)):
+                if _turn_execution_busy(job_id):
+                    raise task_events.TaskConflict("recovery_already_active")
+                identity = ExecutionIdentity(owner, sid, str(job["request_id"]), job_id)
+                state = await run_account_async(lease, load_recovery_state(
+                    PROJECT_ROOT / "state", identity,
+                    (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())))
+                # All file identities come from the protected original request. Resolve
+                # ownership and current availability again while the account is leased.
+                file_ids = [str(ref["file_id"]) for ref in state.get("attachment_refs", [])]
+                ref_infos = _validate_account_file_refs(file_ids, owner)
+                saved_hashes = {ref["file_id"]: ref.get("sha256") for ref in state.get("attachment_refs", [])}
+                if any(saved_hashes.get(info["file_id"]) != info.get("sha256") for info in ref_infos):
+                    raise task_events.TaskConflict("recovery_input_changed")
+                recovered_req = ChatRequest(query=state["query"], session_id=sid,
+                    client_request_id=state["client_request_id"], file_refs=file_ids,
+                    visualization_enabled=bool(state.get("visualization_enabled")),
+                    browse_requested=state.get("browse_requested") is True,
+                    context_compression=bool(state.get("context_compression", True)),
+                    selected_skills=state.get("selected_skills") or [])
+                # No awaits separate the durable CAS and the in-process admission fence.
+                admission = jobs_mod.claim_agent_recovery(identity, account_epoch=lease.epoch,
+                    answered=state.get("agent_recovery_answered") is True)
+                claimed = True
+                _job_tokens[job_id] = cancel_token
+                _running_graph_tasks[job_id] = admission_task
         state = restore_deadline(state, admission["budget"])
         return await _start_claimed_chat(recovered_req, lease, user, sid,
             identity.user_turn_id, job_id, cancel_token, ref_infos,
             sum(int(info.get("size_bytes") or 0) for info in ref_infos),
             quota_reserved=False, recovery_state=state,
-            recovery_cursor=admission["recovery_cursor"])
+            recovery_cursor=admission["recovery_cursor"], execution_segment_claim=admission["claim"])
     except BaseException as exc:
+        from src.core.chat_turn_queue import TurnQueueError
         if claimed:
             worker = _running_graph_tasks.get(job_id)
             if worker is not None and worker is not admission_task:
@@ -4095,14 +4232,17 @@ async def recover_chat_agent(job_id: str, req: RecoverAgentRequest, request: Req
                 if job_id not in _pending_graph_starts and not worker.done():
                     worker.cancel()
             else:
-                jobs_mod.update_job(job_id, status="failed", current_step="recovery_admission_failed",
-                                    error=type(exc).__name__)
+                if admission.get("claim") is None:
+                    jobs_mod.update_job(job_id, status="failed", current_step="recovery_admission_failed",
+                                        error=type(exc).__name__)
                 _job_tokens.pop(job_id, None)
                 _running_graph_tasks.pop(job_id, None)
-        if isinstance(exc, task_events.TaskConflict):
+        if isinstance(exc, (task_events.TaskConflict, TurnQueueError)):
             raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
         if isinstance(exc, CheckpointProtectionError):
             raise HTTPException(status_code=409, detail={"code": "recovery_checkpoint_invalid"}) from exc
+        if isinstance(exc, RuntimeError) and str(exc) == "agent_run_already_active":
+            raise HTTPException(status_code=409, detail={"code": "recovery_already_active"}) from exc
         raise
     finally:
         lease.release()
@@ -4132,10 +4272,12 @@ async def resume_chat_operation(job_id: str, req: ResumeOperationRequest, reques
 @app.get("/sessions/{session_id}/jobs")
 async def list_session_jobs(session_id: str, request: Request):
     """v8.3.7 M2: 会话最近任务列表。S1 补会话归属校验。"""
-    require_owned_session(session_id, current_user(request))
+    user = current_user(request)
+    require_owned_session(session_id, user)
     from src.core.jobs import list_for_session
     from src.core.task_events import public_job_record
-    return {"jobs": [public_job_record(job) for job in list_for_session(session_id)]}
+    jobs = list_for_session(session_id, owner_user_id=int(user["user_id"]), visible_only=True)
+    return {"jobs": [public_job_record(job) for job in jobs]}
 
 
 # ── v8.4.11 用户中断：停止当前任务（书中 §4.7.6 取消式处理）──
@@ -4334,8 +4476,8 @@ async def runtime_config():
         "permission_wait_sec": settings.PERMISSION_WAIT_SEC,
         # v8.5.0 开源版: 只暴露"是否已配置"，永不回传 key 本身
         "has_api_key": bool(settings.RESOLVED_MAIN_API_KEY),
-        "any_model_provider_configured": bool(settings._runtime_configured_model_providers),
-        "configured_model_provider_ids": sorted(settings._runtime_configured_model_providers),
+        "any_model_provider_configured": bool(settings.configured_model_providers),
+        "configured_model_provider_ids": sorted(settings.configured_model_providers),
         # Unified Agent always has Search/Fetch tools available; it decides per query.
         "web_search": {
             "enabled": True,
@@ -4418,7 +4560,7 @@ MODEL_PROVIDERS = {
 async def list_model_providers():
     return {"providers": [
         {**{k: v for k, v in provider.items() if k != "models_url"},
-         "configured": provider["id"] in settings._runtime_configured_model_providers,
+         "configured": provider["id"] in settings.configured_model_providers,
          "active": provider["id"] == settings.RESOLVED_PROVIDER_ID}
         for provider in MODEL_PROVIDERS.values()
     ]}
@@ -4431,36 +4573,34 @@ class ProviderModelsRequest(BaseModel):
 
 
 def _provider_base_url(provider_id: str, supplied: str = "") -> str:
-    provider = MODEL_PROVIDERS[provider_id]
+    from src.config import model_origin
+    provider = MODEL_PROVIDERS.get(provider_id)
+    if provider is None:
+        raise HTTPException(status_code=400, detail="不支持的模型服务商")
     base = (supplied or provider["base_url"]).strip().rstrip("/")
-    if provider.get("custom_base_url"):
-        from urllib.parse import urlsplit
-        parsed = urlsplit(base)
-        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
-            raise HTTPException(status_code=400, detail="API 地址必须是有效的 HTTPS 地址")
-    elif supplied and base != provider["base_url"].rstrip("/"):
+    if not model_origin(base).startswith("https://"):
+        raise HTTPException(status_code=400, detail="API 地址必须是有效的 HTTPS 地址")
+    if not provider.get("custom_base_url") and base != provider["base_url"].rstrip("/"):
         raise HTTPException(status_code=400, detail="该服务商的 API 地址由目录管理")
     return base
 
 
-def _configured_provider_key(provider_id: str) -> str:
-    saved = settings._runtime_provider_api_keys.get(provider_id, "")
-    if saved:
-        return saved
-    if settings.RESOLVED_PROVIDER_ID == provider_id:
-        return settings.RESOLVED_MAIN_API_KEY or ""
-    return ""
+def _provider_key(provider_id: str, base: str, supplied: str) -> str:
+    key = supplied.strip() or settings.model_credential_for(provider_id, base)
+    if not key or len(key) > 512:
+        raise HTTPException(status_code=400, detail="请为此 API 地址填写有效的 Provider API Key")
+    return key
 
 
 async def _fetch_provider_models(provider_id: str, api_key: str,
-                                 api_base_url: str = "") -> list[str]:
+                                 api_base_url: str = "", *, direct: bool = False) -> list[str]:
     provider = MODEL_PROVIDERS.get(provider_id)
     if not provider:
         raise HTTPException(status_code=400, detail="不支持的模型服务商")
     import httpx
-    base_url = _provider_base_url(provider_id, api_base_url)
+    base_url = api_base_url if direct else _provider_base_url(provider_id, api_base_url)
     models_url = provider["models_url"]
-    if provider.get("custom_base_url"):
+    if direct or provider.get("custom_base_url"):
         models_url = base_url + "/models"
     elif provider_id == "zhipu":
         models_url = base_url + "/models"
@@ -4472,13 +4612,15 @@ async def _fetch_provider_models(provider_id: str, api_key: str,
                                   parts.path.split("/compatible-mode/v1", 1)[0].rstrip("/"), "", ""))
         models_url = region_root + "/api/v1/models"
     headers = {"Authorization": f"Bearer {api_key}", "User-Agent": "CitrusQA"}
-    if provider_id == "opencode_go":
+    from src.config import MODEL_PROVIDER_ORIGINS, model_origin
+    if provider_id == "opencode_go" and model_origin(base_url) == MODEL_PROVIDER_ORIGINS[provider_id]:
         headers["x-opencode-session"] = "citrusqa-model-catalog"
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        dashscope_catalog = not direct and provider.get("catalog_type") == "dashscope"
+        async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
             response = await client.get(models_url, headers=headers,
                                         params={"page_no": 1, "page_size": 100}
-                                        if provider.get("catalog_type") == "dashscope" else None)
+                                        if dashscope_catalog else None)
         if response.status_code != 200:
             detail = response.text[:1200].lower()
             if response.status_code == 402 or any(token in detail for token in (
@@ -4496,7 +4638,7 @@ async def _fetch_provider_models(provider_id: str, api_key: str,
                 detail=f"{provider['name']} 模型列表获取失败（HTTP {response.status_code}）：{reason}。",
             )
         payload = response.json()
-        if provider.get("catalog_type") == "dashscope":
+        if dashscope_catalog:
             output = payload.get("output", {}) if isinstance(payload, dict) else {}
             rows = output.get("models", []) if isinstance(output, dict) else []
             models = sorted({str(row.get("model", "")).strip() for row in rows
@@ -4512,18 +4654,15 @@ async def _fetch_provider_models(provider_id: str, api_key: str,
         raise
     except Exception as exc:
         logger.warning("[API] provider model listing failed: provider=%s error=%s",
-                       provider_id, exc)
-        raise HTTPException(status_code=502, detail="连接模型服务商失败，请稍后重试")
+                       provider_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="连接模型服务商失败，请稍后重试") from None
 
 
 @app.post("/api/v2/config/provider-models")
 async def provider_models(req: ProviderModelsRequest):
-    key = (req.api_key or "").strip()
-    if not key:
-        key = _configured_provider_key(req.provider_id)
-    if not key or len(key) > 512:
-        raise HTTPException(status_code=400, detail="请填写有效的 Provider API Key")
-    models = await _fetch_provider_models(req.provider_id, key, req.api_base_url)
+    base = _provider_base_url(req.provider_id, req.api_base_url)
+    key = _provider_key(req.provider_id, base, req.api_key)
+    models = await _fetch_provider_models(req.provider_id, key, base)
     return {"provider_id": req.provider_id, "models": models}
 
 
@@ -4535,70 +4674,76 @@ class ProviderConfigRequest(BaseModel):
     api_base_url: str = ""
 
 
+async def _activate_model_config(*, revision: str, provider_id: str, base: str,
+                                 main: str, supplied_key: str = "", fast: str = "",
+                                 fast_base: str = "", context: int = 0,
+                                 require_listed: bool = True) -> dict:
+    from src.config import model_origin
+    from src.core.model_capabilities import model_supports_images
+
+    if provider_id not in MODEL_PROVIDERS or not model_origin(base):
+        raise HTTPException(status_code=400, detail="模型服务商或 API 地址无效")
+    if not main or len(main) > 200 or len(fast) > 200:
+        raise HTTPException(status_code=400, detail="请先获取并选择一个有效模型")
+    key = _provider_key(provider_id, base, supplied_key)
+    fast_key = settings.fast_credential_for(fast_base, base, key) if fast_base else key
+    if fast_base and (not model_origin(fast_base).startswith("https://") or not fast_key):
+        raise HTTPException(status_code=400, detail="快速模型 API 地址没有对应的凭据")
+    direct = base != MODEL_PROVIDERS[provider_id]["base_url"] and provider_id != "custom_openai"
+    # Legacy adapters may use the current deployment endpoint, but never reuse
+    # credentials across origins or follow a catalog redirect.
+    available = await _fetch_provider_models(provider_id, key, base, direct=direct)
+    if require_listed and main not in available:
+        raise HTTPException(status_code=400, detail="所选模型不在该 Key 返回的模型列表中，请重新获取列表")
+    if fast_base and (fast_base != base or fast_key != key):
+        fast_models = await _fetch_provider_models(
+            provider_id, fast_key, fast_base, direct=(direct or fast_base != base))
+    else:
+        fast_models = available
+    if require_listed and (fast or main) not in fast_models:
+        raise HTTPException(status_code=400, detail="所选快速模型不在该 API 地址返回的模型列表中")
+    try:
+        saved = await asyncio.to_thread(
+            settings.activate_model, revision=revision, provider_id=provider_id,
+            main=main, main_base_url=base, fast=fast, fast_base_url=fast_base,
+            context_window_tokens=context, new_key=supplied_key.strip())
+    except (OSError, ValueError):
+        logger.warning("Model activation could not be persisted")
+        raise HTTPException(status_code=500, detail="模型配置保存失败，原配置未改变") from None
+    if not saved:
+        raise HTTPException(status_code=409, detail="模型配置已改变，请重新读取后重试")
+    logger.info("[API] model configuration activated: provider=%s", provider_id)
+    return {"status": "ok", "warning": "", "model": {
+        "provider_id": provider_id, "main": main, "fast": fast or main,
+        "image_input": model_supports_images(provider_id, main),
+        "main_base_url": base, "fast_base_url": fast_base or base,
+        "context_window_tokens": max(4096, context) if context else settings.CONTEXT_BUDGET_MAX_TOKENS,
+        "runtime_overrides": True,
+    }}
+
+
 @app.post("/api/v2/config/provider")
 async def save_provider_config(req: ProviderConfigRequest):
-    provider = MODEL_PROVIDERS.get(req.provider_id)
-    key = (req.api_key or "").strip()
-    if not key:
-        key = _configured_provider_key(req.provider_id)
-    model = (req.main_model or "").strip()
-    if not provider:
-        raise HTTPException(status_code=400, detail="不支持的模型服务商")
-    if not key or len(key) > 512:
-        raise HTTPException(status_code=400, detail="请填写有效的 Provider API Key")
-    if not model or len(model) > 200:
-        raise HTTPException(status_code=400, detail="请先获取并选择一个模型")
-    base_url = _provider_base_url(req.provider_id, req.api_base_url)
-    available = await _fetch_provider_models(req.provider_id, key, base_url)
-    if model not in available:
-        raise HTTPException(status_code=400, detail="所选模型不在该 Key 返回的模型列表中，请重新获取列表")
-    if not settings.save_runtime_provider_api_key(req.provider_id, key):
-        raise HTTPException(status_code=500, detail="Provider Key 保存失败")
-    if not settings.save_runtime_configured_model_provider(req.provider_id):
-        raise HTTPException(status_code=500, detail="服务商配置状态保存失败")
-    if not settings.save_runtime_model_config(
-            provider_id=req.provider_id, main=model, fast="",
-            main_base_url=base_url, fast_base_url="",
-            context_window_tokens=req.context_window_tokens):
-        raise HTTPException(status_code=500, detail="模型配置保存失败")
-    logger.info("[API] provider config saved: provider=%s model=%s",
-                req.provider_id, model)
-    return {"status": "ok", "model": {
-        "provider_id": settings.RESOLVED_PROVIDER_ID,
-        "main": settings.RESOLVED_MAIN_MODEL,
-        "image_input": settings.RESOLVED_MAIN_MODEL_IMAGE_INPUT,
-        "main_base_url": settings.RESOLVED_MAIN_BASE_URL,
-        "context_window_tokens": settings.RESOLVED_CONTEXT_BUDGET_MAX_TOKENS,
-    }}
+    revision = settings.model_activation_revision
+    base = _provider_base_url(req.provider_id, req.api_base_url)
+    return await _activate_model_config(
+        revision=revision, provider_id=req.provider_id, base=base,
+        main=req.main_model.strip(), supplied_key=req.api_key, context=req.context_window_tokens)
 
 
 @app.post("/api/v2/config/apikey")
 async def set_api_key(req: ApiKeyRequest):
-    key = (req.api_key or "").strip()
-    if not key or len(key) > 512:
-        raise HTTPException(status_code=400,
-                            detail="API Key 不能为空且不能超过 512 个字符")
-    # 连通性校验：GET {base}/models
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{settings.RESOLVED_MAIN_BASE_URL.rstrip('/')}/models",
-                headers={"Authorization": f"Bearer {key}"},
-            )
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Key 校验失败（HTTP {resp.status_code}）："
-                       f"请检查密钥是否有效或已过期")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"[API] apikey connectivity check failed: {e}")
-        raise HTTPException(status_code=400, detail=f"无法连接 API 服务: {e}")
-    if not settings.save_runtime_api_key(key):
-        raise HTTPException(status_code=500, detail="Key 保存失败")
-    logger.info("[API] runtime api key configured via WebUI")
+    revision = settings.model_activation_revision
+    current = settings.model_transport(include_headers=False)
+    fast = settings.model_transport(fast=True, include_headers=False)
+    if not req.api_key.strip():
+        raise HTTPException(status_code=400, detail="API Key 不能为空")
+    await _activate_model_config(
+        revision=revision, provider_id=current.provider_id, base=current.base_url.rstrip("/"),
+        main=current.model, supplied_key=req.api_key, fast=fast.model,
+        fast_base=(fast.base_url.rstrip("/") if fast.base_url != current.base_url else ""),
+        context=settings.RESOLVED_CONTEXT_BUDGET_MAX_TOKENS,
+        require_listed=False)
     return {"status": "ok", "has_api_key": True}
 
 
@@ -4623,7 +4768,7 @@ async def set_web_search_api_key(req: WebSearchApiKeyRequest):
     fetch_key = (req.fetch_api_key or "").strip()
     if len(fetch_key) > 512:
         raise HTTPException(status_code=400, detail="DeepSeek Fetch Key 不能超过 512 个字符")
-    saved = (settings.save_runtime_provider_api_key("zhipu", key)
+    saved = (settings.save_runtime_zhipu_web_api_key(key)
              if provider_id == "zhipu_web_search"
              else settings.save_runtime_deepseek_web_api_key(key))
     if saved and provider_id == "zhipu_web_search" and fetch_key:
@@ -4647,59 +4792,26 @@ class ModelConfigRequest(BaseModel):
 
 @app.post("/api/v2/config/model")
 async def set_model_config(req: ModelConfigRequest):
-    main_base_url = (req.main_base_url or "").strip().rstrip("/")
-    if main_base_url and not (main_base_url.startswith("http://")
-                              or main_base_url.startswith("https://")):
-        raise HTTPException(status_code=400,
-                            detail="API 地址需以 http:// 或 https:// 开头")
-    provider = MODEL_PROVIDERS.get(settings.RESOLVED_PROVIDER_ID)
-    if (main_base_url and provider and not provider.get("custom_base_url")
-            and main_base_url != provider["base_url"].rstrip("/")):
-        raise HTTPException(status_code=400, detail="常见服务商 API 地址由目录固定；自定义服务请选择“其他 OpenAI 兼容服务”")
-    # 连通性校验：仅当已配 Key 且给了主地址时校验（保证地址未拼错）。
-    # 401/403 视为「地址可达但 Key 属于其他厂商」——放行并附警告（换地址后需再换 Key）。
-    auth_warning = ""
-    key = settings.RESOLVED_MAIN_API_KEY
-    if key and main_base_url:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(
-                    f"{main_base_url}/models",
-                    headers={"Authorization": f"Bearer {key}"},
-                )
-            if resp.status_code not in (200, 401, 403):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"模型列表校验失败（HTTP {resp.status_code}）：请检查 API 地址")
-            if resp.status_code in (401, 403):
-                auth_warning = (
-                    f"地址可达但当前 Key 校验未通过（HTTP {resp.status_code}）；"
-                    f"若该 Key 属于其他厂商，保存模型配置后请再在下方保存新 Key")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning(f"[API] model config connectivity check failed: {e}")
-            raise HTTPException(status_code=400,
-                                detail=f"无法连接 {main_base_url}（请检查地址是否拼写正确）: {e}")
-    if not settings.save_runtime_model_config(
-            main=req.main_model, fast=req.fast_model,
-            main_base_url=req.main_base_url, fast_base_url=req.fast_base_url,
-            context_window_tokens=req.context_window_tokens):
-        raise HTTPException(status_code=500, detail="模型配置保存失败")
-    logger.info("[API] runtime model config saved: %s", settings._runtime_model_cfg)
-    return {
-        "status": "ok",
-        "warning": auth_warning,
-        "model": {
-            "main": settings.RESOLVED_MAIN_MODEL,
-            "fast": settings.RESOLVED_FAST_MODEL,
-            "main_base_url": settings.RESOLVED_MAIN_BASE_URL,
-            "fast_base_url": settings.RESOLVED_FAST_BASE_URL,
-            "context_window_tokens": settings.RESOLVED_CONTEXT_BUDGET_MAX_TOKENS,
-            "runtime_overrides": settings.has_model_overrides,
-        },
-    }
+    revision = settings.model_activation_revision
+    current = settings.model_transport(include_headers=False)
+    fast = settings.model_transport(fast=True, include_headers=False)
+    fields = req.model_fields_set
+    provider = MODEL_PROVIDERS.get(current.provider_id)
+    if provider is None:
+        raise HTTPException(status_code=400, detail="不支持的模型服务商")
+    base = (_provider_base_url(current.provider_id, req.main_base_url) if req.main_base_url.strip()
+            else current.base_url.rstrip("/"))
+    fast_base = (req.fast_base_url.strip().rstrip("/") if "fast_base_url" in fields else
+                 (fast.base_url.rstrip("/") if fast.base_url != current.base_url else ""))
+    return await _activate_model_config(
+        revision=revision, provider_id=current.provider_id, base=base,
+        main=(req.main_model.strip() or provider["default_model"] or current.model)
+             if "main_model" in fields else current.model,
+        fast=req.fast_model.strip() if "fast_model" in fields else
+             (fast.model if fast.model != current.model else ""),
+        fast_base=fast_base,
+        context=req.context_window_tokens if "context_window_tokens" in fields else
+                settings.RESOLVED_CONTEXT_BUDGET_MAX_TOKENS)
 
 
 @app.get("/admin")
@@ -4737,7 +4849,11 @@ async def serve_frontend():
         # v9.4.4b: no-cache 强制浏览器每次回源校验——杜绝"旧 JS 缓存吃新后端"
         # （前端修复必须即时可见；静态文件带 Last-Modified/ETag，命中未变更
         # 时仅回 304，代价是一次条件请求而非全量下载）
-        "Cache-Control": "no-cache, must-revalidate"})
+        "Cache-Control": "no-cache, must-revalidate",
+        # Chat Markdown must not make third-party image requests. Preserve local
+        # avatars, previews, clipboard images, and temporary object URLs.
+        "Content-Security-Policy": "img-src 'self' blob: data:",
+    })
 
 
 # Frontend assets are split from index.html to keep the page maintainable.
@@ -4823,7 +4939,7 @@ def _runtime_snapshot():
             "agent": getattr(app.state, "agent_readiness", None) or _agent_runtime_readiness()}
 
 
-async def _readiness_details(*, snapshot=None):
+async def _readiness_details(*, snapshot=None, include_code_worker=True):
     from src.runtime_status import public_readiness
     if snapshot is None:
         snapshot = await asyncio.to_thread(_runtime_snapshot)
@@ -4831,11 +4947,25 @@ async def _readiness_details(*, snapshot=None):
         model_configured=bool(settings.RESOLVED_MAIN_API_KEY),
         full=os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1",
         worker_required=os.getenv("CITRUS_REQUIRE_FIGURE_WORKER", "0").strip().lower() in {"1", "true", "yes", "on"})
+    queue_health = _turn_queue_health(app.state)
+    status["turn_queue"] = queue_health
+    status["capabilities"]["turn_queue"] = queue_health
+    if not queue_health["ready"]:
+        status.update(ready=False, status="unavailable")
+        status["capabilities"]["chat"] = {"ready": False, "reason_code": "turn_queue_unavailable"}
+    if not include_code_worker:
+        return status
     code_enabled = os.getenv("CITRUS_CODE_EXECUTION") == "offline-development"
     code_available = False
     if code_enabled:
-        from src.code_execution.presence import worker_available
-        code_available = await asyncio.to_thread(worker_available, PROJECT_ROOT / "state" / "code_executions.sqlite3")
+        try:
+            from src.code_execution.presence import worker_available
+            code_available = await asyncio.wait_for(asyncio.to_thread(
+                worker_available, PROJECT_ROOT / "state" / "code_executions.sqlite3"), timeout=2.0)
+        except Exception as exc:
+            logger.warning("Code Worker readiness observation failed: %s", type(exc).__name__)
+        if not code_available and status["ready"]:
+            status["status"] = "degraded"
     status["code_worker"] = {"enabled": code_enabled, "available": code_available,
         "network_policy": "offline", "admission": "development-oci", "public_ready": False}
     return status
@@ -4843,7 +4973,7 @@ async def _readiness_details(*, snapshot=None):
 
 @app.get("/ready", include_in_schema=False)
 async def readiness_check():
-    ready = bool((await _readiness_details())["ready"])
+    ready = bool((await _readiness_details(include_code_worker=False))["ready"])
     return JSONResponse({"ready": ready}, status_code=200 if ready else 503,
                         headers={"Cache-Control": "no-store"})
 
@@ -4872,8 +5002,9 @@ async def vision_status():
 @app.post("/api/v1/session/{session_id}/clear")
 async def clear_session_endpoint(session_id: str, request: Request):
     async with _turn_session_lock(session_id):
-        _require_turn_session_idle(session_id, current_user(request))
-        task = asyncio.create_task(_clear_idle_session(session_id))
+        user = current_user(request)
+        _require_turn_session_idle(session_id, user)
+        task = asyncio.create_task(_clear_idle_session(session_id, int(user["user_id"])))
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -4881,15 +5012,19 @@ async def clear_session_endpoint(session_id: str, request: Request):
             raise
 
 
-async def _clear_idle_session(session_id: str):
+async def _clear_idle_session(session_id: str, owner: int):
+    from src.session.manager import SessionHistoryBusy
     try:
-        await session_manager.clear_session(session_id)
-        memory_store.clear_session(session_id)
-        logger.info(f"[API] session cleared: {session_id[:8]}...")
+        await session_manager.clear_session(session_id, owner_user_id=owner)
         return {"status": "ok", "message": f"Session {session_id[:8]} cleared"}
-    except Exception as e:
-        logger.error(f"[API] clear session failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except SessionHistoryBusy as exc:
+        raise HTTPException(status_code=409, detail={"code": "turn_session_busy",
+                            "message": "会话还有待处理的消息。"}) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在或无权访问。") from exc
+    except Exception as exc:
+        logger.error("Session history clear failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="清空会话失败。") from exc
 
 
 @app.post("/api/v1/session/new")
@@ -4904,17 +5039,40 @@ async def new_session_endpoint(request: Request):
 # ── v8.9 会话管理（列表 / 重命名 / 软删除 / 工作区文件）──
 
 @app.get("/api/v2/sessions")
-async def list_sessions(request: Request, limit: int = 100):
-    """会话列表（排除软删除，按最近更新倒序；标题为空显示"新会话"）。"""
+async def list_sessions(request: Request, limit: int = 100, before: str | None = None):
+    """Return a bounded newest-first page scoped to the authenticated owner."""
+    import base64
+    from binascii import Error as Base64Error
+    from src.core import jobs
+
     user = current_user(request)
     owner = int(user["user_id"])
-    sessions = await asyncio.to_thread(session_manager.list_sessions, limit, owner)
-    from src.core import jobs
+    if not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="会话分页大小无效。")
+    cursor = None
+    if before is not None:
+        try:
+            if not 1 <= len(before) <= 512:
+                raise ValueError("cursor length")
+            raw = base64.b64decode(before + "=" * (-len(before) % 4), altchars=b"-_", validate=True)
+            parts = json.loads(raw)
+            if (not isinstance(parts, list) or len(parts) != 2 or
+                    not all(isinstance(part, str) and len(part) <= 128 for part in parts) or not parts[1]):
+                raise ValueError("cursor shape")
+            cursor = (parts[0], parts[1])
+        except (Base64Error, ValueError, UnicodeError) as exc:
+            raise HTTPException(status_code=422, detail="会话分页位置无效。") from exc
+    sessions, has_more = await asyncio.to_thread(session_manager.list_session_page, owner, limit, cursor)
     task_sessions = await asyncio.to_thread(
-        jobs.sessions_with_jobs, [session["session_id"] for session in sessions], owner)
+        jobs.sessions_with_jobs, [session["session_id"] for session in sessions], owner, visible_only=True)
     for session in sessions:
         session["has_tasks"] = session["session_id"] in task_sessions
-    return {"sessions": sessions, "count": len(sessions)}
+    next_before = None
+    if has_more:
+        last = sessions[-1]
+        encoded = json.dumps([last["updated_at"], last["session_id"]], separators=(",", ":")).encode("utf-8")
+        next_before = base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+    return {"sessions": sessions, "count": len(sessions), "next_before": next_before}
 
 
 class RenameRequest(BaseModel):
@@ -5098,10 +5256,10 @@ async def citation_metadata_check(session_id: str, req: CitationCheckRequest, re
     user = current_user(request)
     require_owned_session(session_id, user)
     from src.api.reference_router import (
-        EXTERNAL_REFERENCE_VERIFICATION_DETAIL, external_reference_verification_active,
+        external_reference_verification_active, external_reference_verification_detail,
     )
     if external_reference_verification_active():
-        raise HTTPException(409, EXTERNAL_REFERENCE_VERIFICATION_DETAIL)
+        raise HTTPException(409, external_reference_verification_detail())
     from src.auth import check_rate_limit
     if not check_rate_limit("citation_check", str(user["user_id"]), 60, 3600):
         raise HTTPException(status_code=429, detail="文献核验请求过于频繁，请稍后再试。")
@@ -5486,6 +5644,7 @@ def build_history_turns(items: list[dict]) -> list[dict]:
                 # separately so a work note can still find the calls it
                 # introduces (insertion point above them).
                 "tool_message_id": mid or entry.get("tool_message_id") or 0,
+                **({"result_id": item["result_id"]} if item.get("result_id") else {}),
             })
         elif role == "assistant":
             # Keep answer candidates until turn boundaries are known. Only
@@ -5655,9 +5814,12 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
             tool_artifact = getattr(m, "artifact", None)
             execution_trace = (tool_artifact.get("_citrus_execution")
                                if isinstance(tool_artifact, dict) else None)
+            result_id = ""
             completed_at_ms = 0
             elapsed_ms = 0
             if isinstance(execution_trace, dict):
+                from src.core.progress_bus import public_result_receipt_id
+                result_id = public_result_receipt_id(execution_trace.get("result_id"))
                 saved_status = public_tool_status(execution_trace.get("status"), default="")
                 if saved_status and saved_status not in {"running", "resuming"}:
                     status = saved_status
@@ -5681,6 +5843,7 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
                 "turn_request_id": turn_request_id,
                 "name": tool_display_name(tool_name),
                 "tool_call_id": getattr(m, "tool_call_id", "") or "",
+                **({"result_id": result_id} if result_id else {}),
                 "content": status,
                 "status": status,
                 "reason_code": reason_code,
@@ -5749,7 +5912,7 @@ async def session_turns(session_id: str, request: Request, limit: int = 400,
         data = await session_manager.get_user_turns(session_id, limit, before)
     except Exception as exc:
         logger.warning("[API] turn index failed: %s", type(exc).__name__)
-        data = {"turns": [], "has_more": False, "next_before": 0}
+        raise HTTPException(503, "历史索引暂不可用，请重试。") from exc
     return {"session_id": session_id, **data}
 
 
@@ -5763,7 +5926,7 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
     keys = [str(turn.get("turn_request_id") or "") for turn in turns]
     saved = {key for key in (saved_request_ids or []) if key}
     saved.update(key for key in keys if key)
-    matched = jobs.jobs_for_turns(session_id, owner, keys)
+    matched = jobs.jobs_for_turns(session_id, owner, keys, visible_only=True)
     present = {job["job_id"] for job in matched.values()}
 
     def attach(turn, job):
@@ -5801,7 +5964,8 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
             if not child_id or child_id in present:
                 continue
             child = jobs.get_job(child_id)
-            if not child or int(child.get("owner_user_id") or 0) != owner or child.get("session_id") != session_id:
+            if (not child or child.get("history_hidden") or int(child.get("owner_user_id") or 0) != owner
+                    or child.get("session_id") != session_id):
                 continue
             if is_saved(child):
                 continue
@@ -5817,7 +5981,7 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
             result.append(pending)
             present.add(child_id)
     if include_pending:
-        recent = jobs.list_for_session(session_id, include_active=True, owner_user_id=owner)
+        recent = jobs.list_for_session(session_id, include_active=True, owner_user_id=owner, visible_only=True)
         for job in reversed(recent):
             if job["job_id"] in present or is_saved(job):
                 continue
@@ -5986,7 +6150,7 @@ async def diag_loop_watchdog(request: Request):
 
 @app.get("/api/v2/session/{session_id}/tool-result/{tool_call_id}")
 async def tool_result_detail_endpoint(session_id: str, tool_call_id: str,
-                                      request: Request):
+                                      request: Request, request_id: str = ""):
     """A2: 单条工具结果的**完整原文**（消息里那份是给模型的裁剪版）。
 
     返回 ``result_text``、原文长度、是否截断、全文 sha256，以及执行元信息。
@@ -5994,7 +6158,7 @@ async def tool_result_detail_endpoint(session_id: str, tool_call_id: str,
     """
     require_owned_session(session_id, current_user(request))
     from src.core import tool_results
-    row = tool_results.fetch(tool_call_id)
+    row = tool_results.fetch_for_session(session_id, tool_call_id, request_id=request_id)
     if not row:
         raise HTTPException(status_code=404, detail="该工具结果未留存或已轮转")
     owner = str(row.get("session_id") or "")
@@ -6002,6 +6166,7 @@ async def tool_result_detail_endpoint(session_id: str, tool_call_id: str,
         raise HTTPException(status_code=404, detail="该工具结果不属于此会话")
     return {
         "tool_call_id": row["tool_call_id"],
+        "provider_call_id": row.get("provider_call_id") or row["tool_call_id"],
         "tool_name": row.get("tool_name") or "",
         "status": row.get("status") or "",
         "args_json": row.get("args_json") or "",
@@ -6139,6 +6304,8 @@ async def list_account_file_library(request: Request, session_id: str = ""):
     Pass ``?session_id=`` to narrow the listing to one conversation; the default
     is the whole account library.
     """
+    from src.api.turn_envelope import MAX_FILES, MAX_LIBRARY_REF_BYTES
+
     user = current_user(request)
     scope_sid = str(session_id or "").strip()
     if scope_sid:
@@ -6154,6 +6321,7 @@ async def list_account_file_library(request: Request, session_id: str = ""):
         "generated": [f for f in items if f["origin"] == session_files.ORIGIN_GENERATED],
         "retention_idle_days": session_files.DEFAULT_IDLE_DAYS,
         "scope": "session" if scope_sid else "account",
+        "reference_limits": {"max_turn_files": MAX_FILES, "max_reference_bytes": MAX_LIBRARY_REF_BYTES},
     }
 
 
@@ -6240,6 +6408,54 @@ async def account_table_sample(file_id: str, request: Request):
     return JSONResponse(sample, headers={"Cache-Control": "private, no-store"})
 
 
+_PRIVATE_FILE_HEADERS = {
+    "Cache-Control": "private, no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+_LIBRARY_RASTER_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_ISOLATED_FILE_POLICY = "default-src 'none'; base-uri 'none'; form-action 'none'; sandbox"
+
+
+def _protected_file_preview(info: dict, *, library_tile: bool = False):
+    """Shared response policy for the account and historical session URLs."""
+    from src.session.files import _canonical_mime, kind_for
+
+    filename = info["filename"]
+    mime = _canonical_mime(filename, info.get("mime_type", ""))
+    kind = kind_for(filename, mime)
+    if library_tile and (kind not in {"image", "svg"} or info["size_bytes"] > 2 * 1024 * 1024):
+        raise HTTPException(404, "该文件没有资料库缩略图。")
+    if kind in {"html", "svg"}:
+        # Only the HTML report viewer uses a frame. SVG is displayed as an
+        # image, and a direct navigation is still sandboxed and denied scripts
+        # and network resources. Embedded raster data and presentation survive.
+        frame_source = "'self'" if kind == "html" else "'none'"
+        policy = (f"{_ISOLATED_FILE_POLICY}; style-src 'unsafe-inline'; img-src data:; "
+                  f"frame-ancestors {frame_source}")
+        return FileResponse(info["path"],
+                            media_type="text/html" if kind == "html" else "image/svg+xml",
+                            filename=filename, content_disposition_type="inline",
+                            headers={**_PRIVATE_FILE_HEADERS, "Content-Security-Policy": policy})
+    if kind == "pdf":
+        return FileResponse(info["path"], media_type="application/pdf", headers=_PRIVATE_FILE_HEADERS)
+    if kind == "image" and mime in _LIBRARY_RASTER_MIMES:
+        return FileResponse(info["path"], media_type=mime, headers=_PRIVATE_FILE_HEADERS)
+    if kind == "text":
+        return FileResponse(info["path"], media_type="text/plain", headers=_PRIVATE_FILE_HEADERS)
+    return JSONResponse({"file_id": info["file_id"], "filename": filename, "kind": kind,
+                         "mime_type": mime, "size_bytes": info["size_bytes"],
+                         "download_url": info["download_url"],
+                         "note": "该格式由浏览器端解析预览，请下载原文件查看。"},
+                        headers=_PRIVATE_FILE_HEADERS)
+
+
+def _original_file_download(info: dict):
+    return FileResponse(info["path"], media_type=info.get("mime_type") or "application/octet-stream",
+                        filename=info["filename"], content_disposition_type="attachment",
+                        headers={**_PRIVATE_FILE_HEADERS, "Content-Security-Policy": _ISOLATED_FILE_POLICY})
+
+
 @app.get("/api/v2/files/{file_id}/preview")
 async def preview_account_file(file_id: str, request: Request, library_tile: bool = False):
     user = current_user(request)
@@ -6248,31 +6464,7 @@ async def preview_account_file(file_id: str, request: Request, library_tile: boo
                                    int(user["user_id"]), touch=not library_tile)
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
-    from src.session.files import _canonical_mime, kind_for
-    # S4: 预览必须拿“浏览器能内联渲染”的类型。老记录里可能存着空值或
-    # application/octet-stream，浏览器遇到那种类型会下载而不是显示，看起来就是空白。
-    mime = _canonical_mime(info.get("filename", ""), info.get("mime_type", ""))
-    kind = info.get("kind") or kind_for(info.get("filename", ""), mime)
-    if library_tile and (kind != "image" or mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}
-                         or info["size_bytes"] > 2 * 1024 * 1024):
-        raise HTTPException(404, "该文件没有资料库缩略图。")
-    if kind == "html":
-        from urllib.parse import quote
-        return FileResponse(path=info["path"], media_type="text/html",
-            headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(info['filename'])}",
-                     "Cache-Control": "private, no-store",
-                     "X-Content-Type-Options": "nosniff",
-                     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
-                     "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox"})
-    if kind in {"pdf", "image", "text"}:
-        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
-        if mime == "image/svg+xml":
-            headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
-        return FileResponse(path=info["path"], media_type=mime, headers=headers)
-    return {"file_id": file_id, "filename": info["filename"], "kind": kind,
-            "mime_type": mime, "size_bytes": info["size_bytes"],
-            "download_url": info["download_url"],
-            "note": "该格式由浏览器端解析预览，请下载原文件查看。"}
+    return _protected_file_preview(info, library_tile=library_tile)
 
 
 @app.get("/api/v2/files/{file_id}/download")
@@ -6283,10 +6475,12 @@ async def download_account_file(file_id: str, request: Request):
                                    int(user["user_id"]), touch=True)
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
-    return FileResponse(path=info["path"],
-                        media_type=info.get("mime_type") or "application/octet-stream",
-                        filename=info["filename"],
-                        headers={"Cache-Control": "private, no-store"})
+    return _original_file_download(info)
+
+
+def _file_pinned_conflict():
+    return HTTPException(409, detail={"code": "file_pinned",
+        "message": "该文件正被任务或已保存项目引用，暂不能删除。"})
 
 
 @app.delete("/api/v2/files/{file_id}")
@@ -6299,8 +6493,11 @@ async def delete_account_library_file(file_id: str, request: Request):
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
     if info.get("origin") != session_files.ORIGIN_UPLOADED:
         raise HTTPException(status_code=403, detail="生成成果不能从资料库直接删除。")
-    ok = await asyncio.to_thread(session_files.delete_account_file, file_id,
-                                 int(user["user_id"]))
+    try:
+        ok = await asyncio.to_thread(session_files.delete_account_file, file_id,
+                                     int(user["user_id"]), report_pins=True)
+    except session_files.FilePinnedError as exc:
+        raise _file_pinned_conflict() from exc
     if not ok:
         raise HTTPException(status_code=500, detail="文件删除未完成，请稍后重试。")
     return {"status": "ok", "file_id": file_id}
@@ -6324,35 +6521,7 @@ async def preview_session_file(session_id: str, file_id: str, request: Request):
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于此会话")
 
-    from src.session.files import _canonical_mime, kind_for
-    mime = _canonical_mime(info.get("filename", ""), info.get("mime_type", ""))
-    kind = info.get("kind") or kind_for(info.get("filename", ""), mime)
-    path = info["path"]
-
-    if kind == "html":
-        from urllib.parse import quote
-        return FileResponse(
-            path=path, media_type="text/html",
-            headers={
-                "Content-Disposition":
-                    f"inline; filename*=UTF-8''{quote(info['filename'])}",
-                "Cache-Control": "private, no-store",
-                "X-Content-Type-Options": "nosniff",
-                # Sandboxed iframe previews are allowed on this same origin;
-                # scripts and outbound fetches remain blocked.
-                "Content-Security-Policy":
-                    "default-src 'none'; style-src 'unsafe-inline'; "
-                    "img-src data:; base-uri 'none'; form-action 'none'; "
-                    "frame-ancestors 'self'; sandbox",
-            })
-    if kind in {"pdf", "image", "text"}:
-        return FileResponse(path=path, media_type=mime,
-                            headers={"Cache-Control": "private, no-store",
-                                     "X-Content-Type-Options": "nosniff"})
-    return {"file_id": file_id, "filename": info["filename"], "kind": kind,
-            "mime_type": mime, "size_bytes": info["size_bytes"],
-            "download_url": info["download_url"],
-            "note": "该格式由浏览器端解析预览，请使用 download_url 获取原始字节。"}
+    return _protected_file_preview(info)
 
 
 @app.get("/api/v2/session/{session_id}/files/{file_id}/download")
@@ -6366,10 +6535,7 @@ async def download_session_file(session_id: str, file_id: str, request: Request)
                                    touch=True, owner_user_id=int(user["user_id"]))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于此会话")
-    return FileResponse(path=info["path"],
-                        media_type=info.get("mime_type") or "application/octet-stream",
-                        filename=info["filename"],
-                        headers={"Cache-Control": "private, no-store"})
+    return _original_file_download(info)
 
 
 @app.delete("/api/v2/session/{session_id}/files/{file_id}")
@@ -6388,9 +6554,11 @@ async def delete_session_file(session_id: str, file_id: str, request: Request):
         raise HTTPException(
             status_code=403,
             detail="系统生成的成果文件属于科研产物，不能在此删除；如需清理请删除整个会话。")
-    ok = await asyncio.to_thread(
-        session_files.delete_file, session_id, file_id,
-        owner_user_id=int(user["user_id"]))
+    try:
+        ok = await asyncio.to_thread(session_files.delete_file, session_id, file_id,
+                                     owner_user_id=int(user["user_id"]), report_pins=True)
+    except session_files.FilePinnedError as exc:
+        raise _file_pinned_conflict() from exc
     if not ok:
         raise HTTPException(status_code=404, detail="文件不存在或已清理")
     return {"status": "ok", "file_id": file_id}
@@ -6439,25 +6607,94 @@ async def corpus_source_endpoint(request: Request, record: str = ""):
     return JSONResponse(payload)
 
 
+def _turn_producer_job(session_id: str, owner: int, request_id: str, producer_job_id: str):
+    """Resolve only the displayed request or an authenticated answered descendant."""
+    from src.core import jobs, task_events
+
+    root = jobs.jobs_for_turns(session_id, owner, [request_id]).get(request_id)
+    if not root or root.get("history_hidden"):
+        return None
+    if not producer_job_id or producer_job_id == root["job_id"]:
+        return root
+    with task_events.transaction() as conn:
+        producer = conn.execute(
+            "SELECT * FROM task_jobs WHERE job_id=? AND session_id=? AND owner_user_id=? AND history_hidden=0",
+            (producer_job_id, session_id, owner)).fetchone()
+        if producer is None:
+            return None
+        cursor = producer_job_id
+        # Every edge must be corroborated by both the recorded parent and the
+        # exact answered question, never by a request-id naming convention.
+        for _ in range(64):
+            parent = conn.execute("""SELECT p.job_id FROM task_jobs c
+                JOIN task_jobs p ON p.job_id=c.parent_job_id AND p.session_id=c.session_id
+                                 AND p.owner_user_id=c.owner_user_id AND p.history_hidden=0
+                JOIN task_questions q ON q.id=c.question_id AND q.job_id=p.job_id
+                                      AND q.child_job_id=c.job_id AND q.session_id=c.session_id
+                                      AND q.owner_user_id=c.owner_user_id AND q.status='answered'
+                WHERE c.job_id=? AND c.session_id=? AND c.owner_user_id=? AND c.history_hidden=0""",
+                (cursor, session_id, owner)).fetchone()
+            if not parent:
+                return None
+            cursor = parent["job_id"]
+            if cursor == root["job_id"]:
+                return dict(producer)
+    return None
+
+
+def _producer_request_id(job: dict) -> str:
+    return str(job.get("client_request_id") or job.get("request_id") or "")
+
+
+@app.get("/api/v2/session/{session_id}/turn-artifacts")
+async def session_turn_artifacts(session_id: str, request: Request, request_id: str, producer_job_id: str):
+    """Read public files attributed to one exact continuation in this displayed turn."""
+    from src.core.resource_access import PRIVATE_FILE
+    from src.session import files
+
+    user = current_user(request)
+    require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
+    if not 1 <= len(request_id) <= 160 or not 1 <= len(producer_job_id) <= 128:
+        raise HTTPException(400, "无效的文件来源参数。")
+    owner = int(user["user_id"])
+
+    def resolve():
+        job = _turn_producer_job(session_id, owner, request_id, producer_job_id)
+        if not job:
+            return None
+        scope = _producer_request_id(job)
+        linked = files.list_turn_files(session_id, owner, [scope]).get(scope, [])
+        items = [item for item in linked if item.get("origin") == files.ORIGIN_GENERATED
+                 and item.get("source_session_id") == session_id and item.get("turn_request_id") == scope]
+        return {"request_id": request_id, "producer_job_id": producer_job_id,
+                "producer_request_id": scope, "files": items}
+
+    payload = await asyncio.to_thread(resolve)
+    if payload is None:
+        raise HTTPException(404, "该轮次的文件不可用。")
+    return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
+
+
 @app.get("/api/v2/session/{session_id}/citation-source")
 async def session_citation_source(session_id: str, request: Request, request_id: str = "",
                                   ref_id: str = "", mode: str = "full", offset: int | None = None,
-                                  length: int = 60_000):
+                                  length: int = 60_000, producer_job_id: str = ""):
     """Open only a source actually attributed to this owned turn's answer."""
-    from src.core import jobs, task_events, turn_sources
+    from src.core import task_events, turn_sources
     from src.core.public_delivery import project_public_event
 
     user = current_user(request)
     require_owned_session(session_id, user)
     if (mode != "full" or not 1 <= len(request_id) <= 160 or not 1 <= len(ref_id) <= 96
-            or offset is not None and not 0 <= offset <= 100_000_000 or not 1 <= length <= 60_000):
+            or len(producer_job_id) > 128 or offset is not None and not 0 <= offset <= 100_000_000
+            or not 1 <= length <= 60_000):
         raise HTTPException(400, "无效的引用读取参数。")
 
     def resolve():
-        job = jobs.jobs_for_turns(session_id, int(user["user_id"]), [request_id]).get(request_id)
+        job = _turn_producer_job(session_id, int(user["user_id"]), request_id, producer_job_id)
         if not job:
             return None
-        scope_id = str(job.get("client_request_id") or job.get("request_id") or "")
+        scope_id = _producer_request_id(job)
         with task_events.transaction() as conn:
             row = conn.execute("SELECT data FROM task_events WHERE job_id=? AND event='citations' "
                                "ORDER BY seq DESC LIMIT 1", (job["job_id"],)).fetchone()

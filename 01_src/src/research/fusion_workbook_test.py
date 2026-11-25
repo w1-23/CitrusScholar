@@ -88,6 +88,7 @@ def registry(tmp_path, monkeypatch):
     from src.core import publication_reconcile, tracing
     from src.research import tools
     from src.session import files
+    from src.session.manager import session_manager
 
     request = ["fusion-first-turn"]
     state = tmp_path / "state"
@@ -103,6 +104,7 @@ def registry(tmp_path, monkeypatch):
     monkeypatch.setattr(tracing, "get_current_tool_name", lambda: "run_fusion_skill")
     monkeypatch.setattr("src.core.account_leases.account_lease", lambda _owner: nullcontext())
     monkeypatch.setattr(publication_reconcile, "_owner_valid", lambda sid, owner: (sid, owner) == (SESSION, OWNER))
+    monkeypatch.setattr(session_manager, "get_session_owner", lambda sid: OWNER if sid == SESSION else None)
     return request, state
 
 
@@ -195,3 +197,91 @@ def test_unmatched_or_failed_report_is_never_published(fault, monkeypatch):
     with pytest.raises(ValueError):
         publish_fusion_workbook(report, source_file_id="a" * 32, source_sha256=digest,
                                 source_name="book.xlsx", source_bytes=data)
+
+
+def test_csv_derived_marks_only_verified_record_positions_and_keeps_literal_text(registry):
+    source = b'column1,column2\r\n"multi\nline",42\r\n=1+2,42\r\nline,42\r\nline,42\r\nunrelated,5\r\n'
+    digest = sha256(source).hexdigest()
+    def location(scope, **positions):
+        return {"scope": scope, "source_file_hash": digest, **positions}
+    report = {"status": "complete", "execution": {"skill": "research-integrity",
+              "inputs": [{"role": "table", "sha256": digest}], "options": {"checks": ["numeric"]}},
+              "findings": [
+                  {"finding_id": "exact", "rule_id": "duplicate_numeric_block", "severity": "review",
+                   "evidence": {"interpretation": "Review repetition"}, "locations": [
+                      location("csv_range", row_index=2, end_row_index=5, column_index=2),
+                      location("csv_range", row_index=5, end_row_index=100, column_index=1)]},
+                  {"finding_id": "column", "rule_id": "terminal_digits", "severity": "review", "locations": [
+                      location("column", column_index=1)]},
+              ]}
+    receipt = publish_fusion_workbook(report, source_file_id="0" * 32, source_sha256=digest,
+                                      source_name="data.csv", source_bytes=source)
+    assert receipt["source_format"] == "csv" and "CSV派生" in receipt["filename"] and receipt["cells"] == 4
+    with closing(sqlite3.connect(registry[1] / "research_artifacts.sqlite3")) as db:
+        ((path,),) = db.execute("SELECT path FROM artifacts")
+    workbook = openpyxl.load_workbook(path)
+    sheet, summary = workbook["CSV 原始记录"], workbook["审查结果"]
+    assert sheet["A2"].value == "multi\nline"
+    assert sheet["A3"].value == "=1+2" and sheet["A3"].data_type == "s"
+    for cell in ("B2", "B3", "B4", "B5"):
+        assert sheet[cell].fill.fgColor.rgb.endswith("FDE2E1") and "Review repetition" in sheet[cell].comment.text
+    for cell in ("A2", "A4", "A5", "B6"):
+        assert sheet[cell].fill.patternType is None and sheet[cell].comment is None
+    assert any("CSV 派生副本" == row[1] for row in list(summary.values)[2:])
+
+
+@pytest.mark.parametrize(("fmt", "query"), [
+    ("csv", "把异常清单另存为 CSV"),
+    ("json", "把审查结果另存为 JSON"),
+    ("html", "导出可下载的审查报告文件"),
+    ("docx", "把审查结果另存为 Word"),
+    ("pdf", "把审查结果另存为 PDF"),
+])
+def test_report_publication_registry_accepts_the_actual_requested_file(fmt, query, registry, monkeypatch):
+    from src.core import tracing
+    from src.core.turn_outcome import artifact_goal_evidence
+    from src.graph.task_contract import contract_for_turn
+    from src.research import fusion_delivery, tools
+
+    monkeypatch.setattr(tracing, "get_current_tool_name", tracing._current_tool_name.get)
+    report = {"status": "complete", "findings": [{"finding_id": "one", "rule_id": "required",
+              "severity": "error", "observed_value": None, "expected_value": "有数值", "evidence": {"reason": "缺失"},
+              "locations": [{"scope": "cell", "cell_range": "A2"}]}]}
+    receipt = {"result": {"file_id": "a" * 32, "sha256": "b" * 64}}
+    result = fusion_delivery.publish_report(report, execution_id="c" * 32, skill_id="research-integrity",
+                                             fmt=fmt, receipt=receipt)
+    validation = tools.validate_artifact_links([result["url"]], session_id=SESSION, owner_user_id=OWNER, request_id=registry[0][0])
+    assert validation[0]["valid"] and validation[0]["producer_tool"].startswith("fusion_"), validation
+    goals, gaps = artifact_goal_evidence(contract_for_turn(query, has_tables=True).deliverables,
+        [{"name": "resolve_external_report", "tool_call_id": "test", "status": "complete", "artifact_validations": validation}],
+        {result["url"]})
+    assert goals and not gaps
+
+
+def test_literature_saved_workbook_retains_all_rows_and_unqueried_status(registry, monkeypatch):
+    from src.core import tracing
+    from src.core.turn_outcome import artifact_goal_evidence
+    from src.graph.task_contract import contract_for_turn
+    from src.research import fusion_delivery, tools
+
+    monkeypatch.setattr(tracing, "get_current_tool_name", tracing._current_tool_name.get)
+    records = [{"record_index": index, "status": "not_found", "submitted": {"doi": f"10.1234/{index}"}}
+               for index in range(1, 101)]
+    result = fusion_delivery.publish_report({"status": "partial", "records": records}, execution_id="c" * 32,
+        skill_id="literature-verification", fmt="xlsx", receipt={"result": {"file_id": "a" * 32, "sha256": "b" * 64}},
+        host_coverage={index: "queried" if index < 90 else "not_queried" for index in range(1, 101)})
+    validation = tools.validate_artifact_links([result["url"]], session_id=SESSION, owner_user_id=OWNER, request_id=registry[0][0])
+    goals, gaps = artifact_goal_evidence(contract_for_turn("核验参考文献并导出 XLSX", has_tables=False).deliverables,
+        [{"name": "collect_external_skill", "tool_call_id": "test", "status": "partial", "artifact_validations": validation}],
+        {result["url"]})
+    assert goals and not gaps and validation[0]["producer_tool"] == "fusion_reference_workbook"
+    with closing(sqlite3.connect(registry[1] / "research_artifacts.sqlite3")) as db:
+        ((path,),) = db.execute("SELECT path FROM artifacts")
+    workbook = openpyxl.load_workbook(path, read_only=True)
+    values = iter(workbook["文献逐条核验"].values)
+    labels = next(values)
+    rows = [dict(zip(labels, row)) for row in values]
+    assert len(rows) == result["rows"] == 100
+    assert rows[0]["status"] == "not_found" and rows[0]["host_coverage"] == "queried"
+    assert rows[-1]["status"] == "not_checked" and rows[-1]["host_coverage"] == "not_queried"
+    workbook.close()

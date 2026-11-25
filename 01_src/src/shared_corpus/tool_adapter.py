@@ -352,10 +352,14 @@ def search_agent_corpus(query: str, limit: int = 6) -> str:
         refs = allocate_citation_refs(get_session_id(), get_client_request_id(), "local", len(excerpts))
         for row, ref in zip(excerpts, refs):
             row["citation_ref"] = ref
-        generation = str(getattr(runtime, "generation", "") or "")
+        generation = str(getattr(runtime, "served_generation", runtime.generation) or "")
+        fallback_reason = getattr(runtime, "fallback_reason", None)
         return _render({"query": text, "limit": size, "count": len(results),
-                        "results": results},
-                       status="complete" if results else "no_results",
+                        "results": results, "shared_generation": generation or None,
+                        "shared_requested_generation": getattr(runtime, "requested_generation", runtime.generation),
+                        "shared_degradation_reason": fallback_reason},
+                       status="partial" if fallback_reason else "complete" if results else "no_results",
+                       reason_code=fallback_reason or "",
                        coverage=(f"shared_agent_literature:{generation}" if generation else ""),
                        summary=(f"找到 {len(results)} 条共享文献片段" if results
                                 else "共享文献库没有匹配内容"))

@@ -10,23 +10,6 @@
      </div>
    ========================================================================== */
 
-/* --- 三套主题的强调色（默认 = light 的柔和柑橘橙） ------------------------ */
-:root,
-:root[data-theme="light"] {
-  --loading-accent: #C9761F;                     /* 柔和柑橘橙 */
-  --loading-veil: rgba(255, 255, 255, 0.34);     /* 极淡背板，非灰黑胶囊 */
-}
-
-:root[data-theme="cartoon"] {
-  --loading-accent: #B9722A;                     /* 温暖琥珀橙 */
-  --loading-veil: rgba(255, 246, 232, 0.42);
-}
-
-:root[data-theme="dark"] {
-  --loading-accent: #E8AE5A;                     /* 浅金橙 */
-  --loading-veil: rgba(255, 255, 255, 0.06);
-}
-
 /* --- 容器：内联 flex，水平+垂直居中，无大胶囊 --------------------------- */
 .load-sprout {
   display: flex;

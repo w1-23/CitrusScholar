@@ -152,7 +152,11 @@ class _ObservedDeepSeekChatOpenAI(_ObservedChatOpenAI, DeepSeekChatOpenAI):
 
 def _new_client(model, api_key, base_url, temperature, timeout, max_tokens,
                 extra_body: dict | None, default_headers: dict | None = None):
-    kw: dict = {}
+    from openai import DefaultAsyncHttpxClient, DefaultHttpxClient
+    kw: dict = {
+        "http_client": DefaultHttpxClient(follow_redirects=False),
+        "http_async_client": DefaultAsyncHttpxClient(follow_redirects=False),
+    }
     if extra_body:
         # v8.17.19: 关闭字段必须经 extra_body 原样透传网关——langchain-openai
         # 把 model_kwargs 里的 extra_body 提取为显式构造参数（UserWarning 实证：
@@ -186,6 +190,7 @@ def get_llm(
     timeout: float = 300,
     max_tokens: int | None = None,
     thinking_off: bool = False,
+    provider_headers: dict[str, str] | None = None,
 ):
     """进程级客户端复用；v8.17.19: thinking_off 恢复有效逻辑。
 
@@ -200,7 +205,12 @@ def get_llm(
         cfg = getattr(settings, "MODEL_REASONING_OFF_BODY", None) or {}
         if isinstance(cfg, dict) and cfg:
             extra_body = dict(cfg)
-    provider_headers = getattr(settings, "RESOLVED_PROVIDER_HEADERS", {}) or {}
+    if provider_headers is None:
+        # Legacy callers without a snapshot must not pass gateway headers to
+        # an unrelated origin, even during a concurrent provider switch.
+        from src.config import model_origin
+        current = settings.model_transport()
+        provider_headers = current.headers if model_origin(base_url) == model_origin(current.base_url) else {}
     header_key = tuple(sorted(provider_headers.items()))
     body_key = json.dumps(extra_body, sort_keys=True, separators=(",", ":")) if extra_body else None
     key = (model, api_key, base_url, temperature, timeout, max_tokens,

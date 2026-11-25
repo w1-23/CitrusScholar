@@ -93,8 +93,12 @@ async def review_page(request: Request):
 @router.get("/api/v2/integrity/reviews")
 async def review_list(request: Request):
     owner = _owner(request)
+    from src.agent.fusion_tools import external_fusion_required
+
     with _lease(owner) as lease:
-        return JSONResponse({"reviews": await run_account_thread(lease, store.list_reviews, owner)}, headers=_HEADERS)
+        reviews = await run_account_thread(lease, store.list_reviews, owner)
+    return JSONResponse({"reviews": reviews, "result_lifecycle": "legacy_review",
+        "external_reports_in_chat": external_fusion_required()}, headers=_HEADERS)
 
 
 @router.get("/api/v2/integrity/reviews/{review_id}")

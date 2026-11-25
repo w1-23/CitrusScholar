@@ -14,7 +14,7 @@ from src.agent.checkpoint_store import framework_checkpoint_scope, open_framewor
 from src.agent.harness import HarnessRuntime
 from src.agent.host_tools import HostTools
 from src.agent.identity import ExecutionIdentity
-from src.agent.runtime import AdmissionStopped, FinalCheck, RunLimits
+from src.agent.runtime import FinalCheck, RunLimits
 from src.core import cancel, jobs, progress_bus, task_events, tool_results, tracing
 from src.core.resource_refs import pin_inputs
 from src.session import files, manager
@@ -223,18 +223,14 @@ def test_framework_no_skill_file_dispatch_and_replay(tmp_path, file_run, interru
         host = HostTools(file_run, {"query": query}, allowed_names=allowed)
         async with open_framework_checkpoint(tmp_path, file_run, provider) as saver:
             resumed = runtime.run(file_run, [], saver=saver, checkpoint_config=config, resume=True)
-            if interrupted:
-                with pytest.raises(AdmissionStopped, match="recovery_requires_reconciliation"):
-                    await resumed
-            else:
-                assert (await resumed).status == "complete"
+            assert (await resumed).status == "complete"
         assert dispatches == [call["id"]]
-        assert len(model_calls) == (1 if interrupted else 2)
+        assert len(model_calls) == 2
         result = workspace_tools._storage().read(call["args"]["path"])
         assert result["text"] == call["args"]["content"]
         assert result["ref"]["version"] == 1
         assert result["ref"]["sha256"] == hashlib.sha256(result["text"].encode()).hexdigest()
-        assert restored_refs == model_refs == ([] if interrupted else [result["ref"]])
+        assert restored_refs == model_refs == [result["ref"]]
         with task_events.transaction() as conn:
             rows = conn.execute("SELECT status, host_observation, recovery_mode FROM task_operations "
                                 "WHERE job_id=? AND tool_call_id=?", (file_run.run_id, call["id"])).fetchall()

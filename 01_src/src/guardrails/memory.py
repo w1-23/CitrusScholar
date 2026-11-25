@@ -622,10 +622,14 @@ class MemoryStore:
             return []
         try:
             from src.config import settings
-            from openai import OpenAI
-            client = OpenAI(api_key=settings.RESOLVED_MAIN_API_KEY,
-                            base_url=settings.RESOLVED_MAIN_BASE_URL,
-                            default_headers=settings.RESOLVED_PROVIDER_HEADERS,
+            from openai import DefaultHttpxClient, OpenAI
+            transport = settings.model_transport(fast=True)
+            if not transport.api_key:
+                return []
+            client = OpenAI(api_key=transport.api_key,
+                            base_url=transport.base_url,
+                            default_headers=transport.headers,
+                            http_client=DefaultHttpxClient(follow_redirects=False),
                             max_retries=0)
             prompt = (
                 "从以下问答对中提取最多5条不可推导的核心事实，每条用一句话描述。\n"
@@ -648,7 +652,7 @@ class MemoryStore:
             attempt_id = task_events.reserve_attempt(get_job_id(), "memory_extraction", len(prompt) // 2 + 1000)
             try:
                 resp = client.chat.completions.create(
-                    model=settings.RESOLVED_FAST_MODEL,
+                    model=transport.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0, max_tokens=1000, timeout=min(15, remaining))
             except BaseException as exc:

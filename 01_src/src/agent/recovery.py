@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import json
 import math
 from pathlib import Path
 import time
@@ -80,7 +81,7 @@ async def is_terminal_orphan(identity, values, *, answered_question=False):
     from .harness import has_unsettled_work
 
     active = values.get("active_run_id")
-    if not isinstance(active, str) or not active or active == identity.run_id or has_unsettled_work(values, ignore_question=answered_question):
+    if not isinstance(active, str) or not active or active == identity.run_id:
         return False
     original = (values.get("host_state") or {}).get("original_request_state") or {}
     expected = (identity.owner_user_id, identity.session_id, original.get("request_id"), active)
@@ -89,15 +90,20 @@ async def is_terminal_orphan(identity, values, *, answered_question=False):
 
     def read_job():
         with task_events.transaction() as conn:
-            row = conn.execute("SELECT owner_user_id,session_id,request_id,job_id,status,terminal_snapshot "
+            row = conn.execute("SELECT owner_user_id,session_id,request_id,job_id,status,current_step,terminal_snapshot "
                                "FROM task_jobs WHERE job_id=?", (active,)).fetchone()
             if (not row or tuple(row[k] for k in ("owner_user_id", "session_id", "request_id", "job_id")) != expected
                     or row["status"] not in ({"awaiting_input"} if answered_question else
                         jobs.TERMINAL_STATUS - {"awaiting_input"}) or not row["terminal_snapshot"]):
                 return False
-            return conn.execute("SELECT 1 FROM task_operations WHERE job_id=? AND owner_user_id=? "
-                                "AND status IN ('running','interrupted','unknown') LIMIT 1",
-                                (active, identity.owner_user_id)).fetchone() is None
+            if row["current_step"] == "reconciled" and not answered_question:
+                from src.core.chat_turn_queue import _segment_phase
+                if _segment_phase(conn, active) in {"", "quarantined"} and jobs.durable_terminal(conn, row):
+                    return "quarantined"
+            return (not has_unsettled_work(values, ignore_question=answered_question)
+                    and conn.execute("SELECT 1 FROM task_operations WHERE job_id=? AND owner_user_id=? "
+                                     "AND status IN ('running','interrupted','unknown') LIMIT 1",
+                                     (active, identity.owner_user_id)).fetchone() is None)
     return await asyncio.to_thread(read_job)
 
 
@@ -133,9 +139,61 @@ async def validate_legacy_native_head(root, identity, provider_scope, *, context
                 raise AdmissionStopped("native_thread_requires_reconciliation")
 
 
+async def committed_tool_receipts(identity, messages):
+    """Recover the exact paired observations, never call a pending tool again."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    from src.core import task_events
+    from .runtime import _pending_calls
+
+    pending = _pending_calls(messages)
+    if not pending:
+        return []
+    proposal = next((value for value in reversed(messages) if isinstance(value, AIMessage)), None)
+    if proposal is None or proposal.additional_kwargs.get("run_id") != identity.run_id:
+        raise TaskConflict("recovery_requires_reconciliation")
+    calls = {call["id"]: call for call in proposal.tool_calls}
+
+    def read():
+        recovered = []
+        with task_events.transaction() as conn:
+            job = task_events._job(conn, identity.run_id)
+            if (job["owner_user_id"], job["session_id"], job["request_id"]) != (
+                    identity.owner_user_id, identity.session_id, identity.user_turn_id):
+                raise TaskConflict("recovery_identity_mismatch")
+            for cid in pending:
+                call = calls[cid]
+                rows = conn.execute("SELECT operation_id,host_observation FROM task_operations WHERE job_id=? "
+                    "AND owner_user_id=? AND tool_call_id=? AND tool_name=? AND logical_key<>'' "
+                    "AND result<>'' AND status NOT IN ('running','interrupted','unknown') AND host_observation<>'' LIMIT 2",
+                    (identity.run_id, identity.owner_user_id, cid, call["name"])).fetchall()
+                if len(rows) != 1:
+                    raise TaskConflict("recovery_requires_reconciliation")
+                try:
+                    batch = json.loads(rows[0]["host_observation"])
+                    if (batch.get("version") != 1 or batch.get("pending_question") is not False
+                            or batch.get("unknown_operations") or batch.get("execution_waits")
+                            or batch.get("context_notes") or len(batch["messages"]) != 1):
+                        raise ValueError("unsettled receipt")
+                    observed = ToolMessage(**batch["messages"][0])
+                    if (observed.name != call["name"] or observed.tool_call_id != cid
+                            or observed.additional_kwargs.get("operation_id") != rows[0]["operation_id"]
+                            or observed.additional_kwargs.get("operation_uncertain")
+                            or not observed.additional_kwargs.get("host_publication")):
+                        raise ValueError("unbound receipt")
+                    if observed.name == "draw_svg" and not observed.additional_kwargs.get("host_figure_recovery"):
+                        raise ValueError("figure observation missing")
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    raise TaskConflict("recovery_requires_reconciliation") from None
+                metadata = {**observed.additional_kwargs, **identity.message_metadata("tool")}
+                recovered.append((observed.model_copy(update={"additional_kwargs": metadata}), call))
+        return recovered
+
+    return await asyncio.to_thread(read)
+
+
 async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                               provider_scope: tuple[str, str], *,
-                              execution_wait: dict | None = None) -> dict:
+                              execution_wait: dict | None = None, discover_execution_wait=False) -> dict:
     """Read the exact committed framework state. Legacy executors are never resumed."""
     from src.core.jobs import get_job
     from .deep_agent_runtime import EXECUTOR_ID
@@ -169,10 +227,21 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
     status = values.get("stop_status")
     answered = status == "complete" and values.get("stop_reason") == "answered"
     signals = list((values.get("operation_signals") or {}).values())
-    unsettled = (_pending_calls(values["messages"]) or values.get("unknown_operations")
+    has_pending = bool(_pending_calls(values["messages"]))
+    unsettled = (values.get("unknown_operations")
                  or any(item.get("uncertain") or item.get("pending_question") for item in signals))
     if unsettled or (values.get("host_state") or {}).get("pending_question"):
         raise TaskConflict("recovery_requires_reconciliation")
+    if discover_execution_wait:
+        discovered = list(dict.fromkeys(wait for item in signals for wait in item.get("execution_waits", ())))
+        if execution_wait is not None or not discovered or values.get("execution_wake"):
+            raise TaskConflict("recovery_execution_wait_invalid")
+        execution_wait = {"checkpoint_ref": saved.config["configurable"]["checkpoint_id"],
+                          "wait_ids": discovered}
+    if has_pending:
+        if status or execution_wait is not None or pending_interrupts or values.get("execution_waits"):
+            raise TaskConflict("recovery_requires_reconciliation")
+        await committed_tool_receipts(identity, values["messages"])
     if execution_wait is not None:
         from dataclasses import asdict
         from .execution_outcome import validate_execution_suspension
@@ -193,7 +262,7 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                     or interrupts[0].value != {"kind": "execution_wait", "wait_ids": list(waits)}))
                 or (wake and (wake != expected["wait_ids"] or pending_interrupts))):
             raise TaskConflict("recovery_execution_wait_invalid")
-    elif (status and not answered) or pending_interrupts or has_unsettled_work(values):
+    elif (status and not answered) or pending_interrupts or (not has_pending and has_unsettled_work(values)):
         raise TaskConflict("recovery_checkpoint_terminal")
     host_state = values.get("host_state")
     if not isinstance(host_state, dict):
@@ -218,6 +287,9 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
         if (pool is None or pool.owner_user_id != identity.owner_user_id
                 or pool.session_id != identity.session_id or pool.turn_id != identity.run_id):
             raise TaskConflict("recovery_candidate_pool_unavailable")
+    if discover_execution_wait:
+        state["agent_recovery_execution_wait"] = execution_wait
+    state["agent_recovery_wake_committed"] = bool(execution_wait and values.get("execution_wake"))
     state["agent_resume"] = True
     state["messages"] = []  # Harness resumes with None; no new HumanMessage.
     state["answer"] = ""

@@ -16,9 +16,14 @@ class RetrievalUnavailable(RuntimeError):
 
     def __init__(self, reason_code: str, *, empty_allowed: bool):
         self.reason_code, self.empty_allowed = reason_code, empty_allowed
-        super().__init__(reason_code + (
-            ": local retrieval is unavailable in explicit empty-data mode" if empty_allowed else
-            ": configure corpus data or CITRUSQA_ALLOW_EMPTY_DATA=1"))
+        if reason_code == "base_index_reload_required":
+            guidance = ": reload all local retrieval readers for the verified active generation"
+        elif reason_code == "base_index_pointer_invalid":
+            guidance = ": validate or restore the active index pointer and registry"
+        else:
+            guidance = (": local retrieval is unavailable in explicit empty-data mode" if empty_allowed else
+                        ": configure corpus data or CITRUSQA_ALLOW_EMPTY_DATA=1")
+        super().__init__(reason_code + guidance)
 
 
 def _require_data() -> None:
@@ -41,6 +46,21 @@ def _require_data() -> None:
         raise RetrievalUnavailable(capability.reason_code, empty_allowed=allow_empty)
 
 
+def require_current_rag(rag) -> None:
+    """Reject a stale process; never combine its index with a newer registry."""
+    from src.retrieval.corpus_registry import active_index_pointer, load_corpus_registry
+
+    try:
+        pointer = active_index_pointer(rag.data_dir)
+        matches = (pointer == rag.index_pointer
+                   and load_corpus_registry(rag.data_dir, pointer=pointer) == rag.registry
+                   and active_index_pointer(rag.data_dir) == pointer)
+    except (OSError, ValueError) as exc:
+        raise RetrievalUnavailable("base_index_pointer_invalid", empty_allowed=False) from exc
+    if not matches:
+        raise RetrievalUnavailable("base_index_reload_required", empty_allowed=False)
+
+
 def get_rag():
     """Load the shared corpus/index/models once per service process."""
     global _RAG_INSTANCE
@@ -49,6 +69,11 @@ def get_rag():
             if _RAG_INSTANCE is None:
                 _require_data()
                 from src.retrieval.multi_retriever import MultiBatchRetriever
-                _RAG_INSTANCE = MultiBatchRetriever()
+                from src.retrieval.corpus_registry import CorpusMetadataError
+                try:
+                    _RAG_INSTANCE = MultiBatchRetriever()
+                except CorpusMetadataError as exc:
+                    raise RetrievalUnavailable("base_index_pointer_invalid", empty_allowed=False) from exc
                 logger.info("Local retriever singleton initialized")
+    require_current_rag(_RAG_INSTANCE)
     return _RAG_INSTANCE

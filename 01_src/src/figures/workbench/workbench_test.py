@@ -42,7 +42,11 @@ class Library:
         patch.setattr(store, "_STATE_DIR", tmp_path / "projects")
         patch.setattr(store, "_pin_files", lambda *args, **kwargs: ("", []))
         patch.setattr(files, "get_account_file", self.get)
-        patch.setattr(projects, "_publish_bytes", self.publish)
+        from src.research import artifacts
+        patch.setattr(artifacts, "stage_figure_artifact", lambda **kw: self.publish(
+            kw["owner"], kw["session_id"], kw["filename"], kw["content"], kw["mime"], request_id=kw["request_id"]))
+        patch.setattr(artifacts, "discard_staged_figures", lambda *args: None)
+        patch.setattr(files, "promote_figure_files", lambda *args: None)
         from src.core import account_leases
         patch.setattr(account_leases, "account_lease", self.lease)
         patch.setattr(router, "_read_scope", self.lease)
@@ -142,7 +146,10 @@ def test_library_ownership_read_only_and_revision_matched_bytes(library, monkeyp
     assert {row["figure_id"] for row in client.get(prefix, params={"kind": "svg", "access": "read_only"}).json()["projects"]} == {static}
     assert [row["figure_id"] for row in client.get(prefix, params={"chart": "line"}).json()["projects"]] == [figure_id]
     assert client.get(prefix, params={"chart": "scatter"}).json()["projects"] == []
+    assert client.get(f"{prefix}/{figure_id}").json()["render_version"] == 1
+    assert client.get(f"{prefix}/{figure_id}?revision=0").status_code == 409
     for inaccessible in [foreign, table["file_id"]]:
+        assert client.get(f"{prefix}/{inaccessible}").status_code == 404
         assert client.get(f"{prefix}/{inaccessible}?revision=1").status_code == 404
         assert client.get(f"{prefix}/{inaccessible}/preview/svg?revision=1").status_code == 404
     opened = client.get(f"{prefix}/{static}?revision=1").json()
@@ -265,7 +272,7 @@ def test_shared_legend_sync_is_server_declared_and_group_atomic(library):
     assert len(joined) == 2 and all(row["color"] == "#7a3c96" for row in joined)
 
 
-def test_export_remains_pinned_when_current_revision_changes(library, monkeypatch):
+def test_export_does_not_commit_after_current_revision_changes(library, monkeypatch):
     figure_id = library.spec(leaf())
     started, resume = threading.Event(), threading.Event()
     real_render = projects._render_edits
@@ -287,11 +294,12 @@ def test_export_remains_pinned_when_current_revision_changes(library, monkeypatc
             assert saved["render_version"] == 2
         finally:
             resume.set()
-        old = flight.result(timeout=45)
+        with pytest.raises(projects.ProjectError) as err:
+            flight.result(timeout=45)
+        assert err.value.code == "revision_conflict"
     new = service.download(figure_id, OWNER, 2, "pdf", generate=True)
-    assert old.body.startswith(b"%PDF-") and old.digest != new.digest
-    assert service.download(figure_id, OWNER, 1, "pdf") == old
-    assert store.get_revision_export(figure_id, OWNER, 1, "pdf")["export"]["sha256"] == old.digest
+    assert new.body.startswith(b"%PDF-")
+    assert store.get_revision_export(figure_id, OWNER, 1, "pdf") is None
 
 
 def test_frozen_script_vector_heatmap_and_confidence_band(library, monkeypatch):
@@ -346,6 +354,73 @@ ax.legend()
     assert updated["style_replay_proof"]["coordinates_sha256"] == receipt["style_replay"]["coordinates_sha256"]
 
 
+def five_series():
+    names = ["CK", "WL", "BL", "Control A", "Control B"]
+    return {**leaf(), "x": {"kind": "inline", "values": [0, 1, 2] * len(names)},
+            "y": {"kind": "inline", "values": [val for index in range(len(names)) for val in (index, index + 1, index)]},
+            "group": {"kind": "inline", "values": [name for name in names for _ in range(3)]}}
+
+
+def test_five_source_series_replay_independently_and_keep_stable_ids(library):
+    fid = library.spec(five_series(), title="Five independent groups")
+    before = service.detail(fid, OWNER, 1)
+    initial = store.get_project(fid, OWNER)
+    edits = {"CK": ("#2456af", "s"), "WL": ("#ad4140", "^"), "BL": ("#526325", "v"),
+             "Control A": ("#ad710b", "D"), "Control B": ("#752287", "P")}
+    commands = [command(group(before, name, "series"), prop, value)
+                for name, (color, marker) in edits.items() for prop, value in (("color", color), ("marker", marker))]
+    preview = service.edit(fid, OWNER, 1, commands)
+    assert store.get_project(fid, OWNER) == initial
+    saved = service.edit(fid, OWNER, 1, commands, save=True)
+    reopened = service.detail(fid, OWNER, 2)
+    for snapshot in (preview, saved, reopened):
+        series = [group(snapshot, name, "series") for name in edits]
+        assert len({item["id"] for item in series}) == len(edits)
+        for item, (name, (color, marker)) in zip(series, edits.items()):
+            assert item["id"] == group(before, name, "series")["id"]
+            assert item["values"]["color"] == color and item["values"]["marker"] == marker
+    for body in (preview["svg"], service.download(fid, OWNER, 2, "svg").body):
+        root = ET.fromstring(body)
+        for name, (color, _) in edits.items():
+            target_gid = group(reopened, name, "series")["pick_ids"][0]
+            actual = root.find(f".//s:g[@id='{target_gid}']", SVG_NS)
+            assert actual is not None and any(node.get("stroke") == color for node in actual.iter())
+
+
+def test_legacy_known_address_migrates_while_conflicting_or_absent_address_stays_read_only(library):
+    payload = {"panels": [leaf(panel="p_left"), leaf(panel="p_right")]}
+    spec = parse_spec(payload)
+    frozen, provenance = resolve_spec(spec, owner_user_id=OWNER)
+    source = prepare_source(spec, frozen, provenance)
+    rendered = render_resolved(frozen, formats=("svg",), dpi=90)
+    left, right = [row for row in rendered.manifest["objects"] if row["role"] == "series" and row["label"] == "WL"]
+    for field in ("series_id", "series_index", "panel_id"):
+        del left["locator"][field]
+    right["locator"]["series_id"] = left["gid"]
+    missing = next(row for row in rendered.manifest["objects"] if row["role"] == "series" and row["label"] == "CK")
+    for field in ("series_id", "series_index", "panel_id"):
+        del missing["locator"][field]
+    missing["gid"] = "not_a_registered_artist"
+    fid = library.project(source, rendered.manifest, rendered.blobs["svg"])
+    opened = service.detail(fid, OWNER, 1)
+    by_gid = {row["pick_ids"][0]: row for row in opened["groups"] if row["kind"] == "series"}
+    assert "color" in by_gid[left["gid"]]["properties"]
+    for rejected in (by_gid[right["gid"]], by_gid[missing["gid"]]):
+        assert not rejected["properties"] and rejected["reason"]
+        with pytest.raises(projects.ProjectError) as error:
+            service.edit(fid, OWNER, 1, [command(rejected, "color", "#123456")], save=True)
+        assert error.value.code == "group_property_unavailable"
+    saved = service.edit(fid, OWNER, 1, [command(by_gid[left["gid"]], "color", "#123456")], save=True)
+    reopened = service.detail(fid, OWNER, 2)
+    assert saved["render_version"] == 2
+    migrated = next(row for row in reopened["groups"] if row["id"] == by_gid[left["gid"]]["id"])
+    assert migrated["values"]["color"] == "#123456"
+    actual = next(row for row in reopened["hit_manifest"]["objects"] if row["gid"] == left["gid"])
+    assert actual["locator"]["series_id"] == left["gid"] and actual["locator"]["panel_id"] == "p_left"
+    sibling = next(row for row in reopened["hit_manifest"]["objects"] if row["gid"] == right["gid"])
+    assert sibling["color"] != "#123456"
+
+
 def serve_fixture(path, port):
     """Run only the test router and assets on loopback for real Chromium QA."""
     import uvicorn
@@ -353,6 +428,7 @@ def serve_fixture(path, port):
         library = Library(Path(path), patch)
         first = library.spec(leaf())
         library.spec(leaf("bar"), title="Separate bar groups")
+        library.spec(five_series(), title="Five independent groups")
         library.spec(leaf(), OTHER, "Foreign")
         static = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 30"><rect width="40" height="30"/></svg>'
         library.project({}, {}, static, title="Static only", kind="svg")

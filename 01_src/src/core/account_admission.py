@@ -6,6 +6,8 @@ reconciliation. All connections are short lived; a claim spans purge file I/O.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -108,6 +110,14 @@ class AdmissionStore:
         self.path = Path(path).resolve()
 
     @contextmanager
+    def _read_snapshot(self):
+        uri = self.path.as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn, conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN")
+            yield conn
+
+    @contextmanager
     def transaction(self):
         with closing(sqlite3.connect(str(self.path), timeout=30, isolation_level=None)) as conn:
             conn.row_factory = sqlite3.Row
@@ -207,11 +217,68 @@ class AdmissionStore:
                 raise AccountDeletionPending("another deletion claim is pending; never expires automatically")
             self._close(conn, owner)
             epoch = int(conn.execute("SELECT epoch FROM account_admission WHERE owner=?", (owner,)).fetchone()[0])
-            token = secrets.token_hex(24)
-            conn.execute("UPDATE account_admission SET claim_token=?,claim_epoch=?,claim_pid=?,"
-                         "claim_process=?,claim_started=? WHERE owner=?",
-                         (token, epoch, os.getpid(), _process_token(), time.time(), owner))
-            return DeletionClaim(self, owner, token, epoch)
+            return self._install_claim(conn, owner, epoch)
+
+    def _install_claim(self, conn, owner: int, epoch: int) -> DeletionClaim:
+        token = secrets.token_hex(24)
+        conn.execute("UPDATE account_admission SET claim_token=?,claim_epoch=?,claim_pid=?,"
+                     "claim_process=?,claim_started=? WHERE owner=?",
+                     (token, epoch, os.getpid(), _process_token(), time.time(), owner))
+        return DeletionClaim(self, owner, token, epoch)
+
+    @staticmethod
+    def _resume_snapshot(conn, owner: int) -> dict | None:
+        row = conn.execute(
+            "SELECT a.*,u.active,u.role FROM account_admission a "
+            "JOIN users u ON u.user_id=a.owner WHERE a.owner=?", (owner,)).fetchone()
+        if not row or not row["deleting"] or row["active"] or row["role"] == "admin":
+            return None
+        leases = conn.execute("SELECT * FROM account_work_leases WHERE owner=? ORDER BY lease_id",
+                              (owner,)).fetchall()
+        evidence = json.dumps([dict(row), [dict(lease) for lease in leases]], sort_keys=True)
+        return {
+            "fingerprint": hashlib.sha256(evidence.encode()).hexdigest(),
+            "has_claim": row["claim_token"] is not None,
+            "claim_pid": row["claim_pid"],
+            "claim_started": row["claim_started"],
+            "lease_count": len(leases),
+        }
+
+    def deletion_resume_status(self, owner: int) -> dict | None:
+        """Operator evidence without names, content, or live claim/lease tokens."""
+        with self._read_snapshot() as conn:
+            return self._resume_snapshot(conn, int(owner))
+
+    def pending_deletions(self) -> tuple[int, int]:
+        """Operational counts only, no identifiable account rows."""
+        with self._read_snapshot() as conn:
+            row = conn.execute("SELECT COUNT(*),COUNT(a.claim_token) FROM account_admission a "
+                               "JOIN users u ON u.user_id=a.owner WHERE a.deleting=1").fetchone()
+            return int(row[0]), int(row[1])
+
+    def resume_deletion(self, owner: int, *, fingerprint: str, confirmed_stopped: bool,
+                        audit) -> DeletionClaim:
+        """Replace exactly the observed abandoned claim without reopening admission.
+
+        The operator must independently confirm the writer is stopped. The
+        database never infers it from age/PID and this path never drops a lease.
+        """
+        if not confirmed_stopped:
+            raise ValueError("external confirmation that the writer stopped is required")
+        owner = int(owner)
+        with self.transaction() as conn:
+            snapshot = self._resume_snapshot(conn, owner)
+            if not snapshot or not secrets.compare_digest(snapshot["fingerprint"], fingerprint):
+                raise AccountDeletionPending("deletion evidence changed; inspect status again")
+            if snapshot["lease_count"]:
+                raise AccountDeletionPending("account still has admitted work; no lease was removed")
+            current = conn.execute("SELECT epoch, claim_process FROM account_admission WHERE owner=?",
+                                   (owner,)).fetchone()
+            if current["claim_process"] == _process_token():
+                raise AccountDeletionPending("cannot replace this process's live deletion claim")
+            claim = self._install_claim(conn, owner, int(current["epoch"]))
+            audit(conn, snapshot)
+            return claim
 
     def release_claim(self, claim: DeletionClaim) -> None:
         with self.transaction() as conn:

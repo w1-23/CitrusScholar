@@ -46,6 +46,23 @@ class OCIError(RuntimeError):
     """Invalid host configuration, metadata, snapshots, or untrusted output."""
 
 
+class OutputRejected(OCIError):
+    """Trusted collector rejected the requested file snapshot without returning bytes."""
+
+
+_OUTPUT_REJECTIONS = frozenset({
+    "execution_declared_output_missing", "execution_output_type_denied",
+    "execution_output_unreadable", "execution_output_byte_limit", "execution_output_changed",
+})
+
+
+def _raise_output_rejection(record):
+    # An output key is always a validated absolute logical path, never "error".
+    if (type(record) is dict and set(record) == {"error"}
+            and type(record["error"]) is str and record["error"] in _OUTPUT_REJECTIONS):
+        raise OutputRejected(record["error"])
+
+
 class UnsupportedExecution(OCIError):
     """This backend cannot enforce the requested execution policy."""
 
@@ -363,41 +380,72 @@ while True: time.sleep(3600)
 # Runs trusted code inside the existing container, never on the control host.
 # Walk directory descriptors with NOFOLLOW; a symlink swap cannot escape a root.
 _COLLECTOR = r'''
-import base64, ctypes, json, os, stat, sys
+import base64, ctypes, errno, json, os, stat, sys
 c = json.loads(sys.argv[1])
 libc = ctypes.CDLL(None, use_errno=True)
 if libc.prctl(4, 0, 0, 0, 0) != 0: raise RuntimeError('collector_protection_unavailable')
-result = {}
-remaining = c['bytes']
 def metadata(info):
     return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
             info.st_mtime_ns, info.st_ctime_ns)
-for path in c['paths']:
-    parts = path.split('/')[1:]
-    if parts[0] not in ('workspace', 'outputs'): raise ValueError('invalid_root')
-    directory = os.open('/' + parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    directories = [(directory, metadata(os.fstat(directory)))]
+
+class Rejected(Exception): pass
+
+def open_output(path, flags, *, dir_fd):
     try:
-        for component in parts[1:-1]:
-            directory = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            directories.append((directory, metadata(os.fstat(directory))))
-        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        return os.open(path, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise Rejected('execution_declared_output_missing') from None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Rejected('execution_output_type_denied') from None
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            raise Rejected('execution_output_unreadable') from None
+        raise
+
+
+def collect():
+    remaining = c['bytes']
+    result = {}
+    for path in c['paths']:
+        parts = path.split('/')[1:]
+        if parts[0] not in ('workspace', 'outputs'): raise ValueError('invalid_root')
+        directory = os.open('/' + parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directories = [(directory, metadata(os.fstat(directory)))]
         try:
-            info = os.fstat(fd)
-            before = metadata(info)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > remaining: raise ValueError('invalid_output')
-            with os.fdopen(fd, 'rb', closefd=False) as source: data = source.read(remaining + 1)
-            if len(data) > remaining: raise ValueError('output_limit')
-            if (len(data) != info.st_size or before != metadata(os.fstat(fd))
-                    or before != metadata(os.stat(parts[-1], dir_fd=directory, follow_symlinks=False))
-                    or any(saved != metadata(os.fstat(d)) for d, saved in directories)):
-                raise ValueError('output_changed_during_read')
-            remaining -= len(data)
-            result[path] = base64.b64encode(data).decode('ascii')
-        finally: os.close(fd)
-    finally:
-        for d, _ in reversed(directories): os.close(d)
-sys.stdout.write(json.dumps(result, separators=(',', ':')))
+            for component in parts[1:-1]:
+                directory = open_output(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                directories.append((directory, metadata(os.fstat(directory))))
+            fd = open_output(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            try:
+                info = os.fstat(fd)
+                before = metadata(info)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise Rejected('execution_output_type_denied')
+                if info.st_size > remaining:
+                    raise Rejected('execution_output_byte_limit')
+                with os.fdopen(fd, 'rb', closefd=False) as source: data = source.read(remaining + 1)
+                if len(data) > remaining: raise Rejected('execution_output_byte_limit')
+                try:
+                    current = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    raise Rejected('execution_output_changed') from None
+                if (len(data) != info.st_size or before != metadata(os.fstat(fd))
+                        or before != metadata(current)
+                        or any(saved != metadata(os.fstat(d)) for d, saved in directories)):
+                    raise Rejected('execution_output_changed')
+                remaining -= len(data)
+                result[path] = base64.b64encode(data).decode('ascii')
+            finally: os.close(fd)
+        finally:
+            for d, _ in reversed(directories): os.close(d)
+    return result
+
+try:
+    record = collect()
+except Rejected as exc:
+    # No filenames, partial bytes or OS exception text cross the boundary.
+    record = {'error': str(exc)}
+sys.stdout.write(json.dumps(record, separators=(',', ':')))
 sys.stdout.flush()
 '''
 
@@ -663,6 +711,7 @@ class OfflineOCIBackend:
                 raise OCIError("output_collection_unconfirmed")
             try:
                 raw = json.loads(response.stdout, object_pairs_hook=_unique_object)
+                _raise_output_rejection(raw)
                 if not isinstance(raw, dict) or set(raw) != set(request.outputs):
                     raise ValueError("output_manifest_mismatch")
                 for path, value in raw.items():

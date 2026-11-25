@@ -26,7 +26,7 @@ export class CanvasView {
     this.geometry = null;
     this.project = null;
     this.selected = null;
-    this.zoom = 1;
+    this.zoom = null;
     this.picking = true;
     this.pickCycle = null;
     this.selectGroup = selectGroup;
@@ -42,7 +42,8 @@ export class CanvasView {
     this.image.addEventListener('pointercancel', (event) => this.finishDrag(event, true));
     byId('zoomOut').addEventListener('click', () => this.resize(1 / 1.3));
     byId('zoomIn').addEventListener('click', () => this.resize(1.3));
-    byId('fit').addEventListener('click', () => this.resize(0));
+    byId('fit').addEventListener('click', () => this.setZoom(null));
+    byId('actualSize').addEventListener('click', () => this.setZoom(1));
     byId('picking').addEventListener('click', () => {
       this.picking = !this.picking;
       this.pickCycle = null;
@@ -53,10 +54,7 @@ export class CanvasView {
 
   show(asset, project, reset = false) {
     if (this.asset) URL.revokeObjectURL(this.asset.url);
-    if (reset) {
-      this.zoom = 1;
-      byId('fit').textContent = '适应';
-    }
+    if (reset) this.zoom = null;
     this.drag = null;
     byId('outline').style.transform = '';
     this.asset = asset;
@@ -71,7 +69,7 @@ export class CanvasView {
     }
     byId('canvasEmpty').hidden = true;
     byId('frame').hidden = false;
-    for (const id of ['zoomOut', 'zoomIn', 'fit']) byId(id).disabled = false;
+    for (const id of ['zoomOut', 'zoomIn', 'fit', 'actualSize']) byId(id).disabled = false;
     this.renderStatus();
     this.layout();
   }
@@ -85,8 +83,11 @@ export class CanvasView {
   }
 
   resize(factor) {
-    this.zoom = factor ? Math.min(6, Math.max(.3, this.zoom * factor)) : 1;
-    byId('fit').textContent = this.zoom === 1 ? '适应' : `${Math.round(this.zoom * 100)}%`;
+    this.setZoom(Math.min(6, Math.max(.01, (this.zoom ?? this.fitScale) * factor)));
+  }
+
+  setZoom(scale) {
+    this.zoom = scale;
     this.pickCycle = null;
     this.layout();
   }
@@ -94,12 +95,15 @@ export class CanvasView {
   layout() {
     if (!this.asset) return;
     const style = getComputedStyle(this.canvas);
-    const ratio = this.project.figure_size?.[0] / this.project.figure_size?.[1] || this.asset.width / this.asset.height;
-    const available = this.canvas.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    const width = this.canvas.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
     const height = this.canvas.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-    const width = Math.max(1, Math.min(available, height * ratio, this.asset.width) * this.zoom);
-    this.image.style.width = `${width}px`;
-    this.image.style.height = `${width / ratio}px`;
+    this.fitScale = Math.max(.01, Math.min(6, width / this.asset.width, height / this.asset.height));
+    const scale = this.zoom ?? this.fitScale;
+    this.image.style.width = `${this.asset.width * scale}px`;
+    this.image.style.height = `${this.asset.height * scale}px`;
+    byId('fit').setAttribute('aria-pressed', String(this.zoom === null));
+    byId('actualSize').setAttribute('aria-pressed', String(this.zoom === 1));
+    byId('zoomLevel').textContent = `${Math.round(scale * 100)}%`;
     this.outline();
   }
 

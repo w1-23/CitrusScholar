@@ -503,17 +503,12 @@ def _build_resolved_figure(resolved: ResolvedFigure, *, rendered=None, ax=None,
         rendered.axes.append(ax)
     else:
         fig = rendered.figure
+    from citrus_figures.presentation_ids import series_address
+
     def series_gid(index):
-        if resolved.series and resolved.series[index].key is not None and resolved.panel_id:
-            # A render-local address must not collapse duplicate display names.
-            # The explicit key is registered separately, never encoded in this gid.
-            return f"{prefix}.series_explicit_{index}"
-        if resolved.panel_id:
-            import hashlib
-            name = (resolved.series[index].name if resolved.series else "") or "ungrouped"
-            token = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
-            return f"{prefix}.series_{token}"
-        return _series_gid(axes_index, index)
+        series = resolved.series[index] if resolved.series else None
+        return series_address(axes_index, resolved.panel_id, prefix, index,
+                              key=series.key if series else None, name=series.name if series else "")
     _register(rendered, "figure_1", fig, "figure", {"scope": "figure", "role": "figure"})
     # The subplot itself is addressable: a whole axes block can be moved.
     _register(rendered, prefix, ax, "axes", {"axes_index": axes_index, "role": "axes"})

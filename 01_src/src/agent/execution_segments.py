@@ -14,7 +14,7 @@ from datetime import datetime
 import json
 import uuid
 
-from src.core import task_events
+from src.core import jobs, task_events
 from src.core.account_leases import acquire_account_lease
 from .identity import ExecutionIdentity
 from .runtime import validate_execution_waits
@@ -52,18 +52,7 @@ class ExecutionSegments:
 
     @staticmethod
     def _settled(conn, run_id):
-        if conn.execute("SELECT 1 FROM task_operations WHERE job_id=? AND (status IN ('running','interrupted','unknown') OR result='')",
-                        (run_id,)).fetchone():
-            raise task_events.TaskConflict('execution_segment_requires_reconciliation')
-        journal = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_batch_journal'").fetchone()
-        if journal:
-            for row in conn.execute('SELECT status,observation FROM agent_batch_journal WHERE run_id=?',(run_id,)):
-                try:
-                    batch = json.loads(row['observation'])
-                except (TypeError,ValueError):
-                    raise task_events.TaskConflict('execution_segment_requires_reconciliation') from None
-                if row['status'] != 'complete' or not isinstance(batch,dict) or batch.get('unknown_operations'):
-                    raise task_events.TaskConflict('execution_segment_requires_reconciliation')
+        jobs.require_settled_operations(conn, run_id, reason='execution_segment_requires_reconciliation')
 
     def _row(self, conn, *, active=True):
         conn.execute(_SCHEMA)
@@ -103,18 +92,19 @@ class ExecutionSegments:
             'job_id':self.identity.run_id,'phase':phase})
 
     @staticmethod
-    def candidates(*, after="", limit=32):
+    def candidates(*, after="", limit=32, restart_only=False):
         """Bounded host-only discovery; never expose claim tokens to clients."""
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError('execution_segment_page_invalid')
         with task_events.transaction() as conn:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_execution_segments'").fetchone() is None:
                 return []
+            phase = " AND s.phase='restart_wait'" if restart_only else ""
             return [dict(row) for row in conn.execute(
                 "SELECT j.job_id,j.owner_user_id,j.session_id,j.request_id,j.status,s.phase "
                 "FROM agent_execution_segments s JOIN task_jobs j ON j.job_id=s.job_id "
                 "WHERE j.status IN ('running','detached','cancel_requested') AND j.job_id>? "
-                "ORDER BY j.job_id LIMIT ?", (after, limit))]
+                + phase + " ORDER BY j.job_id LIMIT ?", (after, limit))]
 
     def snapshot(self):
         """Trusted lifecycle observation, including a pending cancellation."""
@@ -131,12 +121,53 @@ class ExecutionSegments:
         with self._admit(), task_events.transaction() as conn:
             row = self._row(conn)
             self._owned(row, claim)
+            if row['phase'] == 'recovering':
+                from src.core import chat_turn_queue
+                job_id = self.identity.run_id
+                conn.execute("UPDATE agent_execution_segments SET phase='interrupted',generation=generation+1,token=? WHERE job_id=?",
+                             (uuid.uuid4().hex, job_id))
+                jobs._mark_interrupted(conn, job_id, datetime.now().isoformat())
+                chat_turn_queue._freeze_unstarted_recovery(conn, job_id)
+                from src.core.turn_envelope import build_turn_envelope
+                envelope = build_turn_envelope(requested_status="failed", display_status="failed",
+                    job_status="failed", stop_reason="service_restart", history_saved=False)
+                task_events._append(conn, job_id, "done", {"job_id": job_id,
+                    "turn_envelope": envelope.as_dict(), "recovery": "interrupted_terminal"})
+                return 'interrupted'
             if row['phase'] != 'resuming':
                 raise task_events.TaskConflict('execution_segment_phase_conflict')
             self._settled(conn, self.identity.run_id)
             conn.execute("UPDATE agent_execution_segments SET phase='parked',generation=generation+1,token=? WHERE job_id=?",
                          (uuid.uuid4().hex, self.identity.run_id))
             self._step(conn, 'waiting_code', 'parked')
+            return 'parked'
+
+    def classify_restart_wait(self, snapshot, *, execution_wait=None):
+        """Fenced startup classification after reading the old protected graph."""
+        with self._admit(), task_events.transaction() as conn:
+            row = self._row(conn)
+            if (row['phase'] != 'restart_wait' or row['generation'] != snapshot['generation']
+                    or row['token'] != snapshot['token']):
+                raise task_events.TaskConflict('execution_segment_claim_lost')
+            if execution_wait:
+                checkpoint_ref, waits = execution_wait["checkpoint_ref"], tuple(execution_wait["wait_ids"])
+                self._reference(checkpoint_ref)
+                validate_execution_waits(waits)
+                if not waits:
+                    raise task_events.TaskConflict('execution_wait_references_required')
+                self._settled(conn, self.identity.run_id)
+                conn.execute("UPDATE agent_execution_segments SET checkpoint_ref=?,wait_ids=? WHERE job_id=?",
+                             (checkpoint_ref, json.dumps(waits, separators=(',', ':')), self.identity.run_id))
+                self._step(conn, 'waiting_code', 'parked')
+            else:
+                jobs._mark_interrupted(conn, self.identity.run_id, datetime.now().isoformat())
+                from src.core.turn_envelope import build_turn_envelope
+                envelope = build_turn_envelope(requested_status='failed', display_status='failed',
+                    job_status='failed', stop_reason='service_restart', history_saved=False)
+                task_events._append(conn, self.identity.run_id, 'done', {'job_id': self.identity.run_id,
+                    'turn_envelope': envelope.as_dict(), 'recovery': 'interrupted_terminal'})
+            conn.execute('UPDATE agent_execution_segments SET phase=?,generation=generation+1,token=? WHERE job_id=?',
+                         ('parked' if execution_wait else 'interrupted', uuid.uuid4().hex, self.identity.run_id))
 
     def start(self):
         """Only a new init job may gain its first segment; retries cannot dispatch."""
@@ -203,7 +234,7 @@ class ExecutionSegments:
             job = self._job(conn, active=False)
             if job['status'] != 'cancel_requested':
                 raise task_events.TaskConflict('execution_segment_not_cancelling')
-            if row['phase'] not in {'active', 'parking', 'resuming', 'finalizing', 'cancel_parked'}:
+            if row['phase'] not in {'active', 'parking', 'resuming', 'recovering', 'finalizing', 'cancel_parked'}:
                 raise task_events.TaskConflict('execution_segment_phase_conflict')
             conn.execute("UPDATE agent_execution_segments SET phase='cancel_parked' WHERE job_id=?",
                          (self.identity.run_id,))
@@ -260,7 +291,7 @@ class ExecutionSegments:
         with self._admit(), task_events.transaction() as conn:
             row = self._row(conn)
             self._owned(row,claim)
-            if row['phase'] != 'resuming':
+            if row['phase'] not in {'resuming', 'recovering'}:
                 raise task_events.TaskConflict('execution_segment_phase_conflict')
             conn.execute("UPDATE agent_execution_segments SET phase='active' WHERE job_id=?",(self.identity.run_id,))
             self._step(conn,'segment_active','active')
@@ -305,7 +336,7 @@ class ExecutionSegments:
                 return
             self._owned(row, claim)
             if status == "cancelled":
-                phases = {"finalizing", "active", "resuming", "parking"}
+                phases = {"finalizing", "active", "resuming", "recovering", "parking"}
             elif status == "failed" and row["phase"] != "finalizing":
                 # A graph exception can end the turn before finalization. Close
                 # that segment only after proving no execution outcome is still
@@ -313,7 +344,7 @@ class ExecutionSegments:
                 # A finalized turn keeps the existing behavior: its envelope is
                 # the authoritative report of any unknown operations.
                 self._settled(conn, self.identity.run_id)
-                phases = {"active", "resuming", "parking"}
+                phases = {"active", "resuming", "recovering", "parking"}
             else:
                 phases = {"finalizing"}
             if row["phase"] not in phases:

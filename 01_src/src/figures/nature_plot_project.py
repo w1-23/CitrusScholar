@@ -6,10 +6,13 @@ verified and published. It does not execute or alter any plot source or artifact
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
+import sqlite3
 from pathlib import Path
 import re
 
-from src.figures import projects, svg_projects
+from src.figures import projects, store, svg_projects
 from src.figures.plot_vectors import normalize_nature_svg
 
 PRODUCER = "run_nature_plot"
@@ -39,7 +42,7 @@ def _descriptor(file_id, filename, sha, size, origin):
             "origin": origin, "download_url": f"/api/v2/files/{file_id}/download"}
 
 
-def _originals(owner, sid, entries, primary):
+def _originals(owner, sid, entries, primary, *, execution_id=None, request_id=None):
     from src.session import files
 
     if not isinstance(entries, dict) or not 1 <= len(entries) <= 4 or primary not in entries:
@@ -63,6 +66,9 @@ def _originals(owner, sid, entries, primary):
                 or registered.get("sha256") != sha or registered.get("size_bytes") != size
                 or registered.get("mime_type") != expected_mime):
             raise ValueError("Unverified or inaccessible Nature plot original")
+        if execution_id is not None:
+            from src.research.artifacts import verify_nature_original
+            verify_nature_original(owner, sid, execution_id, request_id, filename, registered, entry)
         blob = _file_blob(registered, size, sha, capture=filename == primary)
         if filename == primary:
             primary_blob = blob
@@ -77,40 +83,101 @@ def _link_result(originals, primary, *, origin):
 
 
 def _unsupported(result):
-    return {**result, "reason_code": "plot_svg_unsupported",
+    return {**result, "publication_state": "read_only", "reason_code": "plot_svg_unsupported",
             "edit_limitation": "此 SVG 不兼容或未通过安全校验。可继续隔离预览或下载未修改的原件。"}
 
 
-def _create_derivative(*, result, owner, sid, title, backend, vector, primary, vendor_root):
+def _retryable(result):
+    return {**result, "publication_state": "retryable", "reason_code": "plot_workspace_unavailable",
+            "edit_limitation": "可编辑副本暂未登记成功，可重试收集。原件未修改，仍可预览或下载。"}
+
+
+def _editable(result, backend, figure_id, receipt):
+    revision = receipt["render_version"]
+    return {**result, "editable": True, "publication_state": "ready",
+            "vector_dialect": "svglite" if backend == "r" else "matplotlib", "figure_id": figure_id,
+            "render_version": revision, "workspace_url": f"/figure-workbench?project={figure_id}",
+            "workbench_url": f"/figure-workbench?project={figure_id}",
+            "preview_url": f"/api/v2/figure-workbench/projects/{figure_id}/preview/svg?revision={revision}",
+            "exports": receipt["exports"]}
+
+
+def _bound_derivative(result, owner, sid, backend, binding):
+    if binding is None:
+        return None
+    execution_id, fingerprint = binding
+    chosen = store.get_nature_binding(owner, sid, execution_id)
+    if chosen is None:
+        return None
+    if chosen["fingerprint"] != fingerprint:
+        raise projects.ProjectError("plot_execution_binding_mismatch", "绘图执行原件与已登记副本不一致。", 409)
+    figure_id = chosen["figure_id"]
+    if store.get_project(figure_id, owner) is None:
+        return {**result, "publication_state": "read_only", "reason_code": "plot_workspace_deleted",
+                "edit_limitation": "该执行的可编辑副本已删除，原件仍可预览或下载。"}
+    projects.complete_render_publication(figure_id, owner)
+    from src.figures.workbench.artifacts import read_entry
+    read_entry(chosen["receipt"]["exports"]["svg"], owner, "svg")
+    response = _editable(result, backend, figure_id, chosen["receipt"])
+    # The execution receipt is immutable. The workbench opens the current copy;
+    # preview the receipt bytes directly after any later edit.
+    response["preview_url"] = f"/api/v2/files/{response['exports']['svg']['file_id']}/preview"
+    return response
+
+
+def _create_derivative(*, result, owner, sid, title, backend, vector, primary, vendor_root,
+                       binding=None, request_id=None):
     dialect = "svglite" if backend == "r" else "matplotlib"
     provenance = {"version": 1, "backend": backend, "vector_dialect": dialect,
                   "origin": result["origin"], "mode": "locked_vector_paint",
                   "primary_svg": primary, "original_exports": result["original_exports"]}
     try:
-        created = svg_projects.create_svg_project(owner=owner, session_id=sid, svg=vector,
-            title=title, alt_text=title, vendor_root=vendor_root, plot_provenance=provenance)
-    except (projects.ProjectError, ValueError, OSError) as exc:
-        return {**result, "reason_code": getattr(exc, "code", "plot_workspace_unavailable"),
-                "edit_limitation": "未能登记可编辑副本。可预览或下载未修改的原件。"}
-    figure_id, revision = created["figure_id"], created["render_version"]
-    return {**result, "editable": True, "vector_dialect": dialect, "figure_id": figure_id,
-            "render_version": revision, "workspace_url": f"/figure-workbench?project={figure_id}",
-            "workbench_url": f"/figure-workbench?project={figure_id}",
-            "preview_url": f"/api/v2/figure-workbench/projects/{figure_id}/preview/svg?revision={revision}",
-            "exports": created["exports"]}
+        try:
+            created = svg_projects.create_svg_project(owner=owner, session_id=sid, svg=vector,
+                title=title, alt_text=title, vendor_root=vendor_root, plot_provenance=provenance,
+                nature_binding=binding, request_id=request_id)
+        except store.NatureBindingConflict:
+            return _bound_derivative(result, owner, sid, backend, binding)
+        if binding is not None:
+            return _bound_derivative(result, owner, sid, backend, binding)
+    except (projects.ProjectError, ValueError, OSError, sqlite3.Error) as exc:
+        if getattr(exc, "code", "") in {"plot_svg_unsupported", "svg_invalid", "svg_security"}:
+            return _unsupported(result)
+        logging.getLogger(__name__).warning("Nature editable copy registration deferred", exc_info=True)
+        return _retryable(result)
+    return _editable(result, backend, created["figure_id"], created)
 
 
-def open_nature_plot(*, owner, session_id, title, backend, original_exports, primary_svg, vendor_root=None):
-    """Return a real editable workbench project or verified preview/download links."""
+def open_nature_plot(*, owner, session_id, title, backend, original_exports, primary_svg, vendor_root=None,
+                     execution_id=None, request_id=None):
+    """Return the exact execution's editable copy or honest original-only state."""
     owner = svg_projects._valid_owner(owner)
     sid = svg_projects._require_session(owner, session_id)
     if backend not in {"python", "r"} or not isinstance(primary_svg, str) or not primary_svg.endswith(".svg"):
         raise projects.ProjectError("invalid_nature_plot", "没有明确的已批准绘图后端和 SVG 产物。", 422)
+    if execution_id is not None and (not isinstance(execution_id, str) or not _FILE_ID.fullmatch(execution_id)
+                                     or not isinstance(request_id, str) or not request_id):
+        raise projects.ProjectError("invalid_nature_plot", "没有明确的绘图执行与发起请求。", 422)
     try:
-        originals, blob = _originals(owner, sid, original_exports, primary_svg)
+        originals, blob = _originals(owner, sid, original_exports, primary_svg,
+                                     execution_id=execution_id, request_id=request_id)
     except (ValueError, KeyError, OSError) as exc:
         raise projects.ProjectError("plot_original_unverified", "无法验证绘图原件的归属和摘要。", 409) from exc
     result = {**_link_result(originals, primary_svg, origin="worker_output"), "backend": backend}
+    binding = None
+    if execution_id is not None:
+        fingerprint = hashlib.sha256(json.dumps([backend, primary_svg, request_id, originals],
+                                                  sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        binding = execution_id, fingerprint
+        try:
+            prior = _bound_derivative(result, owner, sid, backend, binding)
+        except (projects.ProjectError, ValueError, OSError, sqlite3.Error) as exc:
+            if getattr(exc, "code", "") == "plot_execution_binding_mismatch":
+                raise
+            logging.getLogger(__name__).warning("Nature editable copy recovery deferred", exc_info=True)
+            return _retryable(result)
+        if prior is not None:
+            return prior
     if blob is None:
         return _unsupported(result)
     try:
@@ -118,7 +185,8 @@ def open_nature_plot(*, owner, session_id, title, backend, original_exports, pri
     except ValueError:
         return _unsupported(result)
     return _create_derivative(result=result, owner=owner, sid=sid, title=title, backend=backend,
-                              vector=vector, primary=primary_svg, vendor_root=vendor_root)
+                              vector=vector, primary=primary_svg, vendor_root=vendor_root,
+                              binding=binding, request_id=request_id)
 
 
 def import_uploaded_nature_svg(owner, file_id, *, vendor_root=None):

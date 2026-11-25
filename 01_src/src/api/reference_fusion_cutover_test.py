@@ -156,3 +156,20 @@ def test_private_library_accepts_svg_without_expanding_chat_attachment_list(monk
     assert received[0]["owner_user_id"] == OWNER and received[0]["session_id"] == SESSION
     assert "svg" not in turn_envelope._ALLOWED_UPLOAD_SUFFIXES
     assert client.post(BASE + "/files/upload?filename=panels.exe", content=raw).status_code == 400
+
+
+def test_production_required_does_not_reopen_legacy_when_bundle_is_missing(runtime, monkeypatch):
+    client, bundle, _ = runtime
+    bundle.unlink()
+    monkeypatch.setenv("CITRUS_EXTERNAL_FUSION", "required")
+    monkeypatch.setattr(reference_audit, "create_audit", _no_legacy)
+    monkeypatch.setattr(pdf_citations, "verify_reference", _no_legacy)
+    publish_called = []
+    monkeypatch.setattr(artifacts, "publish_artifact", lambda **kwargs: publish_called.append(kwargs) or
+                        {"artifact_url": "/api/v2/session/fixture-session/artifact/test-id"})
+    response = client.post(BASE + "/reference-audits", json={"text": "Example"}, headers=HEADERS)
+    assert response.status_code == 409 and "不会切换为旧核验算法" in response.json()["detail"]
+    assert client.post(BASE + "/citation-check", json={"doi": "10.1234/example"}).status_code == 409
+    response = client.post(BASE + "/paper-review", json={"name": "paper.pdf", "data": _pdf("Sample [2]\nReferences")})
+    assert response.status_code == 200 and response.json()["verification_mode"] == "external"
+    assert response.json()["status"] == "presentation_only" and len(publish_called) == 1

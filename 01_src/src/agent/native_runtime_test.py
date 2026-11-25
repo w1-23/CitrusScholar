@@ -1,4 +1,5 @@
 import asyncio
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, add_notification_metadata
 
 from src.agent.checkpoint_store import framework_checkpoint_scope, open_framework_checkpoint
@@ -389,12 +390,13 @@ def test_framework_seed_uses_parallel_toolnode_without_charging_model_steps(tmp_
     asyncio.run(scenario())
 
 
-def test_framework_interrupt_parks_after_pair_and_reopens_without_redispatch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("resume_mode", ["normal", "expired", "ack_crash"])
+def test_framework_interrupt_parks_after_pair_and_reopens_without_redispatch(tmp_path, monkeypatch, resume_mode):
     from langchain_core.messages import ToolMessage
     from src.agent.recovery import load_recovery_state
     from src.core import jobs, task_events
     from dataclasses import asdict
-    import pytest
+    import time
 
     monkeypatch.setattr(jobs, "_DB_PATH", tmp_path / "jobs.sqlite3")
 
@@ -405,7 +407,7 @@ def test_framework_interrupt_parks_after_pair_and_reopens_without_redispatch(tmp
         original = {"user_id": 1, "session_id": "session", "request_id": "turn", "job_id": job.job_id,
                     "query": "request", "client_request_id": "client", "idempotency_key": "key"}
         wait = "a" * 32
-        calls, acknowledgments = [], []
+        calls, acknowledgments, resolutions = [], [], []
         proposal = {"id": "tool-1", "name": "fixture_code_execution", "args": {}}
 
         async def model(history, _, **kwargs):
@@ -420,11 +422,15 @@ def test_framework_interrupt_parks_after_pair_and_reopens_without_redispatch(tmp
 
         async def resolve(_, waits):
             assert waits == (wait,)
+            resolutions.append(wait)
             return ("receipt ready",)
 
         async def acknowledge(_, waits, checkpoint):
             assert waits == (wait,)
             acknowledgments.append(checkpoint)
+            if resume_mode == "ack_crash" and len(acknowledgments) == 1:
+                # The remote acknowledgment already committed when the Web died.
+                raise RuntimeError("process ended after acknowledgment")
 
         async def accept(*args):
             return FinalCheck()
@@ -445,11 +451,26 @@ def test_framework_interrupt_parks_after_pair_and_reopens_without_redispatch(tmp
         recovered = await load_recovery_state(tmp_path, i, provider,
                                             execution_wait={"checkpoint_ref": checkpoint, "wait_ids": [wait]})
         assert recovered["agent_resume"]
+        discovered = await load_recovery_state(tmp_path, i, provider, discover_execution_wait=True)
+        assert discovered["agent_recovery_execution_wait"] == {"checkpoint_ref": checkpoint, "wait_ids": [wait]}
+        if resume_mode == "expired":
+            runtime.limits = RunLimits(deadline=time.monotonic() - 1)
+        if resume_mode == "ack_crash":
+            async with open_framework_checkpoint(tmp_path, i, provider) as saver:
+                deferred = await runtime.run(i, [], saver=saver, checkpoint_config=config, resume=True)
+                assert deferred.status == "suspended" and deferred.execution_waits == (wait,)
+            recovered = await load_recovery_state(tmp_path, i, provider,
+                execution_wait={"checkpoint_ref": checkpoint, "wait_ids": [wait]})
+            assert recovered["agent_recovery_wake_committed"] is True
         async with open_framework_checkpoint(tmp_path, i, provider) as saver:
             result = await runtime.run(i, [], saver=saver, checkpoint_config=config, resume=True)
-        assert result.status == "complete" and result.model_steps == 2
-        assert calls == ["tool-1"] and len(acknowledgments) == 1
-        assert acknowledgments[0] != checkpoint
+        if resume_mode == "expired":
+            assert (result.status, result.reason, result.model_steps) == ("incomplete", "deadline", 1)
+        else:
+            assert result.status == "complete" and result.model_steps == 2
+        assert calls == ["tool-1"] and resolutions == [wait]
+        assert len(acknowledgments) == (2 if resume_mode == "ack_crash" else 1)
+        assert len(set(acknowledgments)) == 1 and acknowledgments[0] != checkpoint
 
     asyncio.run(scenario())
 
@@ -532,3 +553,164 @@ def test_only_authenticated_answered_question_child_can_start_new_turn():
         assert result.status == "complete" and calls == ["ask"]
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("tool_name,lose_receipt", [("fixture_write", False), ("draw_svg", False), ("fixture_write", True)])
+def test_framework_recovers_retained_receipt_without_running_tool_twice(tmp_path, monkeypatch, tool_name, lose_receipt):
+    import pytest
+    from dataclasses import asdict
+    from types import SimpleNamespace
+    from langchain_core.messages import ToolMessage
+    from src.agent.batch_journal import retain_observation
+    from src.agent.recovery import load_recovery_state
+    from src.core import figures, jobs, task_events
+
+    monkeypatch.setattr(jobs, "_DB_PATH", tmp_path / "jobs.sqlite3")
+
+    async def scenario():
+        provider = ("https://example.test", "fixture")
+        job = jobs.claim_job("session", "turn", owner_user_id=1, client_request_id="client", payload={})
+        identity = ExecutionIdentity(1, "session", "turn", job.job_id)
+        original = {"user_id": 1, "session_id": "session", "request_id": "turn", "job_id": job.job_id,
+                    "query": "request", "client_request_id": "client", "idempotency_key": "key"}
+        proposal = {"id": "opaque-call", "name": tool_name, "args": {}}
+        figures.begin_request()
+        writes, restored = [], []
+
+        async def model(history, _, **kwargs):
+            if not writes:
+                return AIMessage("", tool_calls=[proposal])
+            messages = [m for m in history if isinstance(m, ToolMessage)]
+            assert [m.content for m in messages] == ["durable receipt"]
+            assert all("host_figure_recovery" not in m.additional_kwargs for m in messages)
+            if tool_name == "draw_svg":
+                assert "<svg>original</svg>" in figures.expand("[[FIGURE:1]]")
+            return AIMessage("accepted")
+
+        async def execute(call, _):
+            writes.append(call["id"])
+            operation, lease = task_events.start_operation(identity.run_id, 1, call["name"], {},
+                tool_call_id=call["id"], logical_key="host:fixture")
+            observed = ToolMessage("durable receipt", name=call["name"], tool_call_id=call["id"],
+                additional_kwargs={"operation_id": operation, "host_publication": {"tool_call_id": call["id"]}},
+                artifact={"_tool_outcome": {"status": "complete", "reason_code": "fixture_completed"}})
+            task_events.finish_operation(operation, lease, observed)
+            if tool_name == "draw_svg":
+                figures.register("<svg>original</svg>")
+                observed.additional_kwargs["host_figure_recovery"] = figures.export_recovery(identity)
+            retain_observation(identity, SimpleNamespace(operation_id=operation, logical_key="host:fixture",
+                uncertain=False, attempt=1, pending_question=False, execution_waits=()), observed, call)
+            raise RuntimeError("process ended after effect committed")
+
+        async def accept(*_):
+            return FinalCheck()
+
+        schemas = [{"function": {"name": proposal["name"], "description": "Fixture", "parameters": {"type": "object"}}}]
+        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas,
+            export_host=lambda: {"identity": asdict(identity), "original_request_state": original},
+            restore_host=lambda _: None,
+            restore_tool_observation=lambda message, call: restored.append((message.tool_call_id, call["id"])))
+        config = framework_checkpoint_scope(identity, provider)
+        async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
+            with pytest.raises(RuntimeError, match="process ended after effect committed"):
+                await runtime.run(identity, [HumanMessage("request")], saver=saver, checkpoint_config=config)
+        if lose_receipt:
+            with task_events.transaction() as conn:
+                conn.execute("UPDATE task_operations SET host_observation='' WHERE job_id=?", (identity.run_id,))
+            with pytest.raises(task_events.TaskConflict, match="recovery_requires_reconciliation"):
+                await load_recovery_state(tmp_path, identity, provider)
+            assert writes == [proposal["id"]] and restored == []
+            return
+        await load_recovery_state(tmp_path, identity, provider)
+        figures.begin_request()
+        async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
+            result = await runtime.run(identity, [], saver=saver, checkpoint_config=config, resume=True)
+        assert result.status == "complete"
+        assert writes == [proposal["id"]] and restored == [(proposal["id"], proposal["id"])]
+
+    asyncio.run(scenario())
+
+
+def test_quarantined_head_cannot_replay_pending_tool_into_new_turn():
+    import pytest
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    async def scenario():
+        old = ExecutionIdentity(1, "session", "turn1", "run1")
+        new = ExecutionIdentity(1, "session", "turn2", "run2")
+        proposal = {"id": "pending", "name": "fixture_write", "args": {}}
+        writes = []
+
+        async def model(history, identity, **kwargs):
+            if identity == old:
+                return AIMessage("", tool_calls=[proposal])
+            assert not any(isinstance(m, AIMessage) and m.tool_calls for m in history)
+            assert any(isinstance(m, HumanMessage) and m.content == "new request" for m in history)
+            return AIMessage("accepted")
+
+        async def execute(call, _):
+            writes.append(call["id"])
+            raise RuntimeError("effect is not known")
+
+        async def accept(*_):
+            return FinalCheck()
+
+        async def quarantined(values):
+            assert values.get("active_run_id") == old.run_id
+            return "quarantined"
+
+        schemas = [{"function": {"name": proposal["name"], "description": "Fixture", "parameters": {"type": "object"}}}]
+        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas,
+                                 check_terminal_orphan=quarantined)
+        saver = InMemorySaver()
+        config = {"thread_id": "session"}
+        with pytest.raises(RuntimeError, match="effect is not known"):
+            await runtime.run(old, [HumanMessage("old request")], saver=saver, checkpoint_config=config)
+        result = await runtime.run(new, [HumanMessage("new request")], saver=saver, checkpoint_config=config)
+        assert result.status == "complete" and writes == ["pending"]
+
+    asyncio.run(scenario())
+
+
+def test_protected_reviewed_answer_is_delivered_without_model_when_deadline_elapsed(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    import time
+    from src.agent.recovery import load_recovery_state
+    from src.core import jobs, task_events
+
+    monkeypatch.setattr(jobs, "_DB_PATH", tmp_path / "jobs.sqlite3")
+
+    async def scenario():
+        provider = ("https://example.test", "fixture")
+        job = jobs.claim_job("session", "turn", owner_user_id=1, client_request_id="client", payload={})
+        identity = ExecutionIdentity(1, "session", "turn", job.job_id)
+        original = {"user_id": 1, "session_id": "session", "request_id": "turn", "job_id": job.job_id,
+                    "query": "original question", "client_request_id": "client", "idempotency_key": "key"}
+        model_calls = []
+
+        async def model(*_args, **_kwargs):
+            model_calls.append(True)
+            return AIMessage("already accepted")
+
+        async def accept(*_):
+            return FinalCheck()
+
+        async def execute(*_):
+            pytest.fail("A reviewed-answer recovery cannot invoke tools")
+
+        runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), (),
+            export_host=lambda: {"identity": asdict(identity), "original_request_state": original})
+        config = framework_checkpoint_scope(identity, provider)
+        async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
+            assert (await runtime.run(identity, [HumanMessage("original question")], saver=saver,
+                                      checkpoint_config=config)).status == "complete"
+        with task_events.transaction() as conn:
+            assert task_events.current_terminal_event(conn, identity.run_id) is None
+        assert (await load_recovery_state(tmp_path, identity, provider))["agent_recovery_answered"] is True
+        runtime.limits = RunLimits(deadline=time.monotonic()-1)
+        async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
+            result = await runtime.run(identity, [], saver=saver, checkpoint_config=config, resume=True)
+        assert result.status == "complete" and result.answer.content == "already accepted"
+        assert model_calls == [True]
+
+    asyncio.run(scenario())

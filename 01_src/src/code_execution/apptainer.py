@@ -20,7 +20,7 @@ import time
 import uuid
 
 from .oci import (OCIConfig, OCIError, OfflineOCIBackend, DockerCLITransport,
-                  OCICollection, _SUPERVISOR, _COLLECTOR, _unique_object,
+                  OCICollection, _SUPERVISOR, _COLLECTOR, _unique_object, _raise_output_rejection,
                   _host_directory, safe_linux_path)
 from .protocol import ExecutionRequest, identifier, bounded_integer
 
@@ -423,19 +423,29 @@ class OfflineApptainerBackend:
         maximum = handle.request.limits.log_bytes * 2 + 32768
         if outputs:
             maximum += (handle.request.limits.output_bytes * 4 + 2) // 3 + handle.request.limits.output_files * 2048
-        with socket.socket(socket.AF_UNIX) as client:
-            client.settimeout(self.config.control_timeout_sec)
-            client.connect(str(Path(handle.input_root) / "control.sock"))
-            client.sendall(json.dumps({"identity": identity, "operation": "collect" if collect else "inspect",
-                                      "outputs": outputs}, separators=(",", ":")).encode() + b"\n")
-            payload = bytearray()
-            while block := client.recv(min(65536, maximum + 1 - len(payload))):
-                payload.extend(block)
-                if len(payload) > maximum:
-                    raise OCIError("apptainer_control_record_limit")
-        parsed = json.loads(payload, object_pairs_hook=_unique_object)
-        if parsed.get("identity") != identity:
+        try:
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(self.config.control_timeout_sec)
+                client.connect(str(Path(handle.input_root) / "control.sock"))
+                client.sendall(json.dumps({"identity": identity, "operation": "collect" if collect else "inspect",
+                                          "outputs": outputs}, separators=(",", ":")).encode() + b"\n")
+                payload = bytearray()
+                while block := client.recv(min(65536, maximum + 1 - len(payload))):
+                    payload.extend(block)
+                    if len(payload) > maximum:
+                        raise OCIError("apptainer_control_record_limit")
+        except OSError as exc:
+            raise OCIError("apptainer_control_transport_unconfirmed") from exc
+        try:
+            parsed = json.loads(payload, object_pairs_hook=_unique_object)
+        except (ValueError, RecursionError) as exc:
+            raise OCIError("apptainer_control_record_invalid") from exc
+        if type(parsed) is not dict or parsed.get("identity") != identity:
             raise OCIError("apptainer_control_identity_unconfirmed")
+        # Authenticate even failure records before interpreting any error code.
+        ApptainerStatus("unknown", identity=parsed["identity"]).validate_identity(handle)
+        if "error" in parsed:
+            raise OCIError("apptainer_service_observation_unconfirmed")
         return parsed
 
     def inspect(self, handle, *, read_summary=True):
@@ -482,8 +492,18 @@ class OfflineApptainerBackend:
         if status.state != "retained":
             raise OCIError("retained_apptainer_supervisor_required")
         response = self._control(handle, status.identity, collect=True, outputs=include_outputs)
-        if response.get("summary") != status.summary:
+        if response.get("phase") != "retained" or response.get("summary") != status.summary:
             raise OCIError("apptainer_summary_changed")
+        if "collection_error" in response:
+            if not include_outputs or "outputs" in response:
+                raise OCIError("apptainer_collector_record_invalid")
+            code = response["collection_error"]
+            _raise_output_rejection({"error": code})
+            if type(code) is str and code in {
+                    "apptainer_collector_timeout", "apptainer_collector_unconfirmed",
+                    "apptainer_collection_record_limit", "apptainer_collector_record_invalid"}:
+                raise OCIError(code)
+            raise OCIError("apptainer_collector_record_invalid")
         raw = response.get("outputs")
         expected = set(handle.request.outputs) if include_outputs else set()
         if type(raw) is not dict or set(raw) != expected:

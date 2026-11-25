@@ -7,26 +7,21 @@
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
 <title>CitrusScholar</title>
+<script src="/assets/citrus-theme.js?v=1"></script>
 <script src="/assets/vendor/marked-4.3.0.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/assets/app.css?v=43">
-<link rel="stylesheet" href="/assets/skill-picker.css?v=3">
+<link rel="stylesheet" href="/assets/app.css?v=45">
+<link rel="stylesheet" href="/assets/skill-picker.css?v=4">
 <link rel="stylesheet" href="/assets/guide.css?v=4">
-<link rel="stylesheet" href="/assets/loading-sprout.css?v=4">
-<link rel="stylesheet" href="/assets/session_files.css?v=6">
+<link rel="stylesheet" href="/assets/loading-sprout.css?v=5">
+<link rel="stylesheet" href="/assets/session_files.css?v=7">
 <link rel="stylesheet" href="/assets/corpus_reader.css?v=8">
-<link rel="stylesheet" href="/assets/chat-ui.css?v=3">
+<link rel="stylesheet" href="/assets/citrus-theme.css?v=1">
+<link rel="stylesheet" href="/assets/chat-ui.css?v=4">
+<link rel="stylesheet" href="/assets/context-view.css?v=2">
 </head>
-<body>
-<svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="display:none"><symbol id="ui-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="ui-send" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4 20-7ZM22 2 11 13"/></symbol><symbol id="ui-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol><symbol id="ui-clip" viewBox="0 0 24 24"><path d="m8 13 6.5-6.5a3 3 0 0 1 4.2 4.2l-8 8a5 5 0 0 1-7-7l8-8m-5 13a1.8 1.8 0 0 0 2.5 0l6.5-6.5"/></symbol><symbol id="ui-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"/></symbol><symbol id="ui-like" viewBox="0 0 24 24"><path d="M7 10v10H4V10h3Zm0 8 3 2h7a2 2 0 0 0 2-1.6l1.3-6A2 2 0 0 0 18.4 10H15l.7-4.1A2 2 0 0 0 13.8 4L8 10"/></symbol><symbol id="ui-dislike" viewBox="0 0 24 24"><g transform="rotate(180 12 12)"><path d="M7 10v10H4V10h3Zm0 8 3 2h7a2 2 0 0 0 2-1.6l1.3-6A2 2 0 0 0 18.4 10H15l.7-4.1A2 2 0 0 0 13.8 4L8 10"/></g></symbol><symbol id="ui-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="5.5"/><path d="m15 15 4.5 4.5"/></symbol><symbol id="ui-book" viewBox="0 0 24 24"><path d="M12 6v14M3 5c4-1 6 0 9 2 3-2 5-3 9-2v13c-4-1-6 0-9 2-3-2-5-3-9-2V5Z"/></symbol><symbol id="ui-database" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 4 15 4 15 0V6M4.5 12c0 4 15 4 15 0"/></symbol><symbol id="ui-chart" viewBox="0 0 24 24"><path d="M4 4v16h16M8 16v-4m4 4V8m4 8V5"/></symbol><symbol id="ui-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></symbol><symbol id="ui-upload" viewBox="0 0 24 24"><path d="M7 18H6a4 4 0 0 1-1-7.9A6 6 0 0 1 16.5 8a5 5 0 0 1 1.5 10h-1m-5 2V11m-4 4 4-4 4 4"/></symbol><symbol id="ui-file" viewBox="0 0 24 24"><path d="M6 3h7l5 5v13H6zM13 3v6h5"/></symbol><symbol id="ui-eye" viewBox="0 0 24 24"><path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></symbol>
-  <symbol id="ui-sliders" viewBox="0 0 24 24"><path d="M4 6h3m4 0h9M4 12h8m4 0h4M4 18h2m4 0h10M9 4v4m5 2v4m-6 2v4"/></symbol>
-  <symbol id="ui-palette" viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 1 0 0 17h1.3a1.3 1.3 0 0 0 1-2.1l-.5-.7a1.5 1.5 0 0 1 1.2-2.4h2.2a3.3 3.3 0 0 0 3.3-3.3A8.5 8.5 0 0 0 12 3.5Z"/><g fill="currentColor" stroke="none"><circle cx="7.8" cy="11.5" r="1.08"/><circle cx="10.4" cy="7.9" r="1.08"/><circle cx="14.5" cy="8.1" r="1.08"/><circle cx="17.3" cy="11" r="1.08"/></g></symbol>
-  <symbol id="ui-canvas" viewBox="0 0 24 24"><path d="M8.5 6h7m2.5 2.5v7m-2.5 2.5h-7M6 15.5v-7"/><rect x="3.5" y="3.5" width="5" height="5" rx="1"/><rect x="15.5" y="3.5" width="5" height="5" rx="1"/><rect x="3.5" y="15.5" width="5" height="5" rx="1"/><rect x="15.5" y="15.5" width="5" height="5" rx="1"/></symbol>
-  <symbol id="ui-context-segments" viewBox="0 0 24 24"><rect x="4" y="3.5" width="6" height="17" rx="2"/><rect x="13.5" y="6.5" width="6.5" height="14" rx="2"/><path d="M4 11h6m3.5 4h6.5"/></symbol>
-  <symbol id="ui-context-dots" viewBox="0 0 24 24"><g fill="currentColor" stroke="none"><circle cx="5" cy="5" r="1.7"/><circle cx="12" cy="5" r="1.7"/><circle cx="19" cy="5" r="1.7"/><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/><circle cx="5" cy="19" r="1.7"/><circle cx="12" cy="19" r="1.7"/><circle cx="19" cy="19" r="1.7"/></g></symbol>
-  <symbol id="ui-table" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M3.5 10h17m-17 4.5h17M10 5v14m5-9v9"/></symbol>
-</svg>
+<body data-page="chat">
 
 <header class="app-header">
   <img class="brand-mascot" src="/assets/citrus-mark.svg" alt="">
@@ -35,9 +30,8 @@
     <button type="button" class="ctx-circle-btn" id="ctxCircleBtn" aria-controls="ctxDrawer" aria-expanded="false" onclick="toggleCtxDrawer()" aria-label="上下文用量" title="上下文用量">
       <svg viewBox="0 0 36 36" width="21" height="21" aria-hidden="true">
         <circle class="ctx-btn-bg" cx="18" cy="18" r="15" />
-        <circle class="ctx-btn-fg" id="ctxBtnFg" cx="18" cy="18" r="15" />
+        <circle class="ctx-btn-fg" id="ctxBtnFg" cx="18" cy="18" r="15" pathLength="100" stroke-dasharray="0 100" />
       </svg>
-      <span class="ctx-trigger-caption" aria-hidden="true">上下文</span>
     </button>
   </div>
 </header>
@@ -143,7 +137,7 @@
 
 <div class="main-container" id="mainContainer" style="visibility:hidden">
   <nav class="left-rail" aria-label="主导航">
-    <button class="rail-button sidebar-toggle-btn" id="sidebarToggleBtn" onclick="toggleSidebar()" title="隐藏会话侧栏" aria-label="隐藏会话侧栏" aria-expanded="true">
+    <button class="rail-button sidebar-toggle-btn" id="sidebarToggleBtn" type="button" aria-controls="appSidebar" onclick="toggleSidebar()" title="隐藏会话侧栏" aria-label="隐藏会话侧栏" aria-expanded="true">
       <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="14" rx="2.2"></rect><path d="M7 3.5v13"></path></svg>
     </button>
     <span class="rail-divider"></span>
@@ -154,7 +148,7 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v10a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"></path><path d="M3.5 9h17"></path></svg>
     </button>
     <a class="rail-button" id="figureRailBtn" href="/figures" title="工作台" aria-label="工作台">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ui-canvas"></use></svg>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-canvas"></use></svg>
     </a>
     <div class="rail-spacer"></div>
     <!-- P1-4: 常用工作台功能从账户菜单拆出来，固定在左侧栏下半部 -->
@@ -163,10 +157,10 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6.6C10.2 5.3 7.6 4.7 4.5 4.8v13.2c3.1-.1 5.7.5 7.5 1.8 1.8-1.3 4.4-1.9 7.5-1.8V4.8c-3.1-.1-5.7.5-7.5 1.8z"></path><path d="M12 6.6v13.2"></path></svg>
       </button>
       <button type="button" class="rail-button" id="memoryRailBtn" onclick="openMemorySettings()" title="个人偏好" aria-label="个人偏好">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ui-sliders"></use></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-sliders"></use></svg>
       </button>
       <button type="button" class="rail-button" id="themeRailBtn" onclick="toggleThemeMenu()" title="主题" aria-label="主题" aria-haspopup="menu" aria-expanded="false">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#ui-palette"></use></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-palette"></use></svg>
       </button>
     </div>
     <div class="display-menu theme-menu" id="themeMenu" role="menu" aria-label="背景主题" hidden>
@@ -185,21 +179,6 @@
         <button type="button" class="theme-card" data-theme-pick="navy" onclick="pickTheme('navy')" aria-pressed="false">
           <span class="theme-card-thumb"><i></i><i></i><i></i></span>
           <span class="theme-card-name">夜间蓝</span>
-          <span class="theme-card-check" aria-hidden="true">✓</span>
-        </button>
-        <button type="button" class="theme-card" data-theme-pick="light" onclick="pickTheme('light')" aria-pressed="false">
-          <span class="theme-card-thumb"><i></i><i></i><i></i></span>
-          <span class="theme-card-name">春日花笺</span>
-          <span class="theme-card-check" aria-hidden="true">✓</span>
-        </button>
-        <button type="button" class="theme-card" data-theme-pick="cartoon" onclick="pickTheme('cartoon')" aria-pressed="false">
-          <span class="theme-card-thumb"><i></i><i></i><i></i></span>
-          <span class="theme-card-name">午后书房</span>
-          <span class="theme-card-check" aria-hidden="true">✓</span>
-        </button>
-        <button type="button" class="theme-card" data-theme-pick="dark" onclick="pickTheme('dark')" aria-pressed="false">
-          <span class="theme-card-thumb"><i></i><i></i><i></i></span>
-          <span class="theme-card-name">夜林花语</span>
           <span class="theme-card-check" aria-hidden="true">✓</span>
         </button>
       </div>
@@ -239,9 +218,10 @@
       </button>
     </div>
   </nav>
-  <div class="sidebar" id="appSidebar">
+  <button class="session-drawer-backdrop" type="button" tabindex="-1" aria-hidden="true" onclick="setSidebarVisible(false)"></button>
+  <aside class="sidebar" id="appSidebar" aria-label="会话列表">
     <div class="sidebar-resizer" id="sidebarResizer" role="separator" aria-orientation="vertical"
-         tabindex="0" aria-label="调整侧栏宽度（拖拽或按左右方向键，双击复位）"></div>
+         tabindex="0" aria-controls="appSidebar" aria-valuemin="218" aria-valuemax="480" aria-valuenow="248" aria-label="调整侧栏宽度（拖拽或按左右方向键，双击复位）"></div>
     <div class="sidebar-section expanded" id="session-section">
       <button class="sidebar-header" id="session-section-toggle" type="button" aria-controls="session-list" aria-expanded="true" onclick="toggleSection('session')">
         <span>会话</span>
@@ -256,7 +236,7 @@
       <span id="citation-count">0</span>
       <div class="sidebar-content collapsed" id="sidebar-content"></div>
     </div>
-  </div>
+  </aside>
   <main class="chat-panel" aria-label="科研对话">
     <div id="shared-maintenance-notice" class="shared-maintenance-notice" role="status" aria-live="polite" hidden></div>
     <div id="chat-container">
@@ -268,6 +248,7 @@
 
     <footer>
       <div id="selected-skills" class="selected-skills" aria-live="polite" hidden></div>
+      <div id="composer-admission-recovery" class="composer-admission-recovery" aria-live="polite" hidden></div>
       <!-- 输入区：自然语言请求、附件与发送控件 -->
       <div class="composer-meta">
         <p id="composer-task-status" class="composer-task-status" role="status" aria-live="polite" hidden></p>
@@ -278,13 +259,21 @@
         <textarea id="user-input" rows="2" aria-label="消息" aria-describedby="composer-task-status" placeholder="向 CitrusScholar 提问，或上传文件进行分析…"></textarea>
         <div class="input-bottom">
           <div class="input-actions">
-            <input id="attachment-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif,.pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb" multiple hidden onchange="handleAttachmentSelection(this.files)">
+            <input id="attachment-input" type="file" accept=".pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb" multiple hidden onchange="handleAttachmentSelection(this.files, this)">
+            <input id="image-attachment-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple hidden onchange="handleAttachmentSelection(this.files, this)">
             <details class="input-tools" id="input-tools-menu">
-              <summary class="attach-btn" aria-label="添加附件或选择场景"><svg class="ui-icon" aria-hidden="true"><use href="#ui-plus"></use></svg></summary>
-              <div class="input-tools-panel">
-                <button type="button" id="attachment-btn" class="attach-btn" onclick="document.getElementById('attachment-input').click();document.getElementById('input-tools-menu').open=false" title="附加图片、PDF、Word 或 CSV/XLSX 表格"><svg class="ui-icon" aria-hidden="true"><use href="#ui-clip"></use></svg> 添加附件</button>
-                <h3>本轮预设场景（可选）</h3>
-                <p id="skill-picker-status" role="status">不选择时，助手仍会按任务调用所需方法；图片编辑在工作台完成。</p>
+              <summary class="attach-btn composer-plus" aria-label="添加附件" aria-controls="attachment-options" title="添加附件"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-plus"></use></svg></summary>
+              <div class="input-tools-panel attachment-options" id="attachment-options" aria-label="添加附件">
+                <button type="button" id="attachment-btn" data-composer-source="file"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-clip"></use></svg> 上传文件</button>
+                <button type="button" id="attachment-library-btn" data-composer-source="library" aria-controls="sessionFilesPanel"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-folder"></use></svg> 从资料库选择</button>
+                <button type="button" id="attachment-image-btn" data-composer-source="image"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-image"></use></svg> 上传图片</button>
+              </div>
+            </details>
+            <details class="input-tools" id="skill-picker-menu">
+              <summary class="attach-btn composer-scenes" aria-label="本轮场景" aria-controls="skill-picker-panel" title="选择本轮场景"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-sliders"></use></svg><span>场景</span></summary>
+              <div class="input-tools-panel" id="skill-picker-panel">
+                <h3>本轮场景（可选）</h3>
+                <p id="skill-picker-status" role="status">不选择时，助手仍会按任务自动发现所需场景。</p>
                 <div id="skill-picker-list"></div>
                 <button type="button" class="skill-refresh" id="skill-picker-refresh">刷新场景目录</button>
               </div>
@@ -293,7 +282,7 @@
               <input type="checkbox" id="browse-requested" autocomplete="off" role="switch"><span class="browse-track" aria-hidden="true"></span> 联网浏览
             </label>
             <div class="composer-controls">
-              <button type="button" class="send-btn" id="send-btn" onclick="activateComposer()" aria-disabled="true" aria-label="发送消息" title="发送 (Enter)"><svg class="ui-icon" aria-hidden="true"><use href="#ui-send"></use></svg></button>
+              <button type="button" class="send-btn" id="send-btn" onclick="activateComposer()" aria-disabled="true" aria-label="发送消息" title="发送 (Enter)"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-send"></use></svg></button>
             </div>
           </div>
         </div>
@@ -311,24 +300,24 @@
        aria-valuemin="300" aria-valuenow="468" tabindex="0"
        title="拖动调整资料库宽度，双击复位"></div>
   <header class="session-files-head">
-    <span class="library-heading-icon"><svg class="ui-icon" aria-hidden="true"><use href="#ui-folder"></use></svg></span>
+    <span class="library-heading-icon"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-folder"></use></svg></span>
     <div><h2 id="sessionFilesTitle">资料库</h2><p id="sessionFilesStats" aria-live="polite"></p></div>
     <button class="session-files-close" type="button" onclick="toggleSessionFiles(false)" title="收起资料库" aria-label="收起资料库">×</button>
   </header>
   <div class="session-files-body" id="sessionFilesBody">
     <section class="library-upload-zone" id="libraryUploadZone" aria-labelledby="libraryUploadLabel">
-      <span class="library-heading-icon"><svg class="ui-icon" aria-hidden="true"><use href="#ui-upload"></use></svg></span>
+      <span class="library-heading-icon"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-upload"></use></svg></span>
       <div class="library-upload-copy">
         <strong id="libraryUploadLabel">上传资料</strong>
         <p>拖放表格、图片、PDF 或 Word，单个文件最多 20 MB</p>
       </div>
       <input type="file" id="libraryUploadInput" hidden multiple accept="image/jpeg,image/png,image/webp,image/gif,.pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb,.svg">
-      <button type="button" id="libraryUploadButton"><svg class="ui-icon" aria-hidden="true"><use href="#ui-plus"></use></svg> 上传资料</button>
+      <button type="button" id="libraryUploadButton"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-plus"></use></svg> 上传资料</button>
       <span id="libraryUploadStatus" role="status" hidden></span>
     </section>
     <div class="library-filters">
       <label class="library-search">
-        <svg class="ui-icon" aria-hidden="true"><use href="#ui-search"></use></svg>
+        <svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-search"></use></svg>
         <input type="search" id="librarySearch" placeholder="搜索资料名称" aria-label="搜索资料名称">
       </label>
       <select id="libraryKind" aria-label="文件类型">
@@ -512,81 +501,33 @@
 </div>
 
 <div class="ctx-drawer-backdrop" id="ctxBackdrop" onclick="toggleCtxDrawer()"></div>
-<aside class="ctx-drawer" id="ctxDrawer" aria-label="上下文概览" inert>
+<aside class="ctx-drawer ctx-context-view" id="ctxDrawer" aria-label="上下文窗口" inert>
   <div class="ctx-drawer-header">
-    <div class="ctx-drawer-heading">
-      <h2 class="ctx-drawer-title">上下文概览</h2>
-      <span class="ctx-drawer-scope" id="ctxScope">当前会话 · 最近一轮</span>
+    <h2 class="ctx-drawer-title">上下文窗口</h2>
+    <div class="ctx-view-picker" role="group" aria-label="上下文显示方式">
+      <label title="圆环"><input type="radio" id="ctxViewRing" name="ctx-view" aria-label="圆环" checked>
+        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 8 8" stroke-width="3"/></svg>
+      </label>
+      <label title="网格"><input type="radio" id="ctxViewGrid" name="ctx-view" aria-label="网格">
+        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor" stroke="none"><path fill="currentColor" stroke="none" d="M4 4h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 10h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 16h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4z"/></svg>
+      </label>
     </div>
-    <button class="ctx-drawer-close" type="button" onclick="toggleCtxDrawer()" aria-label="关闭上下文概览">✕</button>
+    <button class="ctx-drawer-close" id="ctxClose" type="button" onclick="toggleCtxDrawer()" aria-label="关闭上下文窗口"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
   </div>
   <div class="ctx-drawer-body">
-    <div class="empty-sidebar" id="ctx-empty">等待首次查询…</div>
-    <div id="ctx-body" style="display:none">
-      <section class="ctx-overview-card" aria-label="用量估算">
-        <div class="ctx-overview-heading">
-          <div class="ctx-model" id="ctxModel">模型未知</div>
-          <div class="ctx-view-picker" role="group" aria-label="用量图表视图">
-            <label title="用量明细">
-              <input type="radio" id="ctxViewDetails" name="ctx-view" value="details" aria-label="用量明细">
-              <svg class="ui-icon" aria-hidden="true"><use href="#ui-context-segments"></use></svg>
-            </label>
-            <label title="用量方格">
-              <input type="radio" id="ctxViewMosaic" name="ctx-view" value="mosaic" aria-label="用量方格" checked>
-              <svg class="ui-icon" aria-hidden="true"><use href="#ui-context-dots"></use></svg>
-            </label>
-          </div>
-        </div>
-        <div class="ctx-overview-total">
-          <strong class="ctx-drawer-pct" id="ctx-pct">—</strong>
-          <span class="ctx-total-kind" id="ctxTotalKind">等待请求统计</span>
-        </div>
-        <div class="ctx-bar-label" id="ctxBarLabel">上下文估算暂不可用</div>
-        <div class="ctx-bar-label" id="ctxInputLimit">工作输入限额：未提供</div>
-        <div class="ctx-grid" id="ctxBar" aria-hidden="true" hidden></div>
-        <p class="ctx-disclosure-note ctx-grid-note" id="ctxGridNote"></p>
-      </section>
-      <div class="ctx-items" id="ctxItems" role="table" aria-label="上下文分类估算；百分比以模型窗口为分母"></div>
-      <div class="ctx-summary" id="ctxSummary"></div>
-      <details class="ctx-disclosure" id="ctxBudgetBlock" hidden>
-        <summary>工作预算与统计口径</summary>
-        <div class="ctx-budget-items" id="ctxBudgetItems"></div>
-        <p class="ctx-disclosure-note">工作输入限额控制单次发送；输出预留是生成上限。它们与任务累计用量分开计算。</p>
-      </details>
-      <details class="ctx-disclosure" id="ctxUsageBlock" hidden>
-        <summary>此调用尝试的服务商实测</summary>
-        <p class="ctx-disclosure-note">提示词缓存：<span id="ctxCacheNote">服务商未提供</span></p>
-        <div class="ctx-tokens">
-          <div class="ctx-token-card">
-            <span class="ctx-token-label">服务商输入</span>
-            <strong class="ctx-token-value" id="ctxInTokens">—</strong>
-            <span class="ctx-token-note" id="ctxInNote">本轮尚未收到用量</span>
-          </div>
-          <div class="ctx-token-card">
-            <span class="ctx-token-label">服务商输出</span>
-            <strong class="ctx-token-value" id="ctxOutTokens">—</strong>
-            <span class="ctx-token-note" id="ctxOutNote">本轮尚未收到用量</span>
-          </div>
-        </div>
-      </details>
-      <details class="ctx-disclosure" id="ctxAuditBlock" hidden>
-        <summary>本轮调用记录</summary>
-        <ol id="ctxAttempts" class="ctx-attempts"></ol>
-      </details>
-      <div class="ctx-suggestions" id="ctxSuggestions"></div>
-      <div id="ctxSentBlock">
-        <div class="ctx-detail-label" id="ctxSentLabel">实际发送给模型 · 本轮</div>
-        <div class="ctx-sent" id="ctxSent"></div>
+    <div class="context-amount">
+      <div class="context-ring" id="ctxRing" aria-hidden="true">
+        <svg viewBox="0 0 44 44"><circle class="context-ring-track" cx="22" cy="22" r="18" stroke-width="4"/>
+          <circle class="context-ring-progress" id="ctxPanelFg" cx="22" cy="22" r="18" pathLength="100" stroke-width="4" stroke-dasharray="0 100"/></svg>
+        <span id="ctxRingPct">—</span>
       </div>
-      <div id="ctxDetailBlock">
-        <div class="ctx-detail-label">上下文细分</div>
-        <div class="ctx-detail" id="ctxDetail"></div>
-      </div>
-      <div class="ctx-compressed" id="ctxCompressed" style="display:none"></div>
+      <div><strong id="ctxUsed" aria-describedby="ctxValueNote">—</strong><p id="ctxValueNote">占用量暂不可用</p></div>
+      <span class="context-level" id="ctxStatus" hidden></span>
     </div>
+    <div class="context-gauge-grid" id="ctxGrid" aria-hidden="true" hidden></div>
+    <p class="context-mosaic-note" id="ctxGridPct" hidden></p>
   </div>
 </aside>
-
 
 <template id="loadSproutTpl">
   <div class="load-sprout" id="loadSprout" hidden role="status" aria-live="polite">
@@ -607,16 +548,16 @@
     <span class="load-sprout-text">小橘正在回答您的问题<span class="load-sprout-dots" aria-hidden="true"><i>.</i><i>.</i><i>.</i></span></span>
   </div>
 </template>
-<script src="/assets/guide.js?v=4"></script>
+<script src="/assets/guide.js?v=5"></script>
 <script src="/assets/task-state.js?v=10"></script>
+<script src="/assets/context-view.js?v=1"></script>
 <script src="/assets/task-transport.js?v=6"></script>
-<script src="/assets/task-cards.js?v=8"></script>
+<script src="/assets/task-cards.js?v=9"></script>
 <script src="/assets/task-controls.js?v=5"></script>
-<script src="/assets/skill-picker.js?v=7"></script>
-<script src="/assets/app.js?v=69"></script>
-<script src="/assets/corpus_reader.js?v=11"></script>
-<script src="/assets/turn_rail.js?v=3"></script>
+<script src="/assets/skill-picker.js?v=8"></script>
+<script src="/assets/app.js?v=71"></script>
+<script src="/assets/corpus_reader.js?v=12"></script>
 <script src="/assets/xlsx.full.min.js?v=1"></script>
-<script src="/assets/session_files.js?v=13"></script>
+<script src="/assets/session_files.js?v=14"></script>
 </body>
 </html>

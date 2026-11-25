@@ -155,6 +155,8 @@ def _ensure_session_owner_column() -> None:
     conn = sqlite3.connect(str(sessions_db), timeout=30)
     try:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if not cols:
+            return
         if "owner_user_id" not in cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN owner_user_id INTEGER")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_user_id, updated_at)")
@@ -750,6 +752,8 @@ def assign_legacy_sessions_to_admin(user_id: int) -> None:
     conn = sqlite3.connect(str(sessions_db), timeout=30)
     try:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if not cols:
+            return
         if "owner_user_id" not in cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN owner_user_id INTEGER")
         conn.execute("UPDATE sessions SET owner_user_id=? WHERE owner_user_id IS NULL", (int(user_id),))
@@ -758,43 +762,109 @@ def assign_legacy_sessions_to_admin(user_id: int) -> None:
         conn.close()
 
 
-def _assert_no_active_account_jobs(conn: sqlite3.Connection, user_id: int) -> None:
-    """Refuse destructive cleanup while any recorded job is not terminal.
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
-    Missing legacy job tables mean no recorded jobs. An unreadable schema or an
-    unknown status is not evidence of quiescence and must fail closed instead.
-    This is not a drain barrier for requests that have not created a job yet.
-    """
-    if not conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_jobs'").fetchone():
+
+def _owned_job_sql(conn: sqlite3.Connection, tables: set[str]) -> tuple[str, int]:
+    """Explicit ownership wins; only an unowned legacy job inherits its exact session owner."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(task_jobs)")}
+    legacy = ("EXISTS (SELECT 1 FROM sessions s WHERE s.session_id=j.session_id AND s.owner_user_id=?)"
+              if "sessions" in tables else "")
+    if "owner_user_id" in cols:
+        return ((f"(j.owner_user_id=? OR (j.owner_user_id IS NULL AND {legacy}))", 2)
+                if legacy else ("j.owner_user_id=?", 1))
+    if legacy:
+        return legacy, 1
+    if conn.execute("SELECT 1 FROM task_jobs LIMIT 1").fetchone():
+        raise AccountDeletionPending("legacy jobs have no verified ownership")
+    return "0=1", 0
+
+
+def _revoke_undispatched_account_turns(conn: sqlite3.Connection, user_id: int) -> None:
+    """Under closed admission and drain, cancel only exact, never-dispatched roots."""
+    from src.core import chat_turn_queue as queue, jobs
+
+    tables = _tables(conn)
+    if not {"chat_turn_queue", "task_jobs"}.issubset(tables):
         return
-    from src.core.jobs import TERMINAL_STATUS
-    terminal = sorted(TERMINAL_STATUS)
-    placeholders = ",".join("?" for _ in terminal)
-    has_sessions = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone()
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(task_jobs)")}
-    if has_sessions:
-        owner_clause = "s.owner_user_id=?"
-        owners = (int(user_id),)
-        if "owner_user_id" in columns:
-            # A job can be admitted before its session row is created.
-            owner_clause = "(j.owner_user_id=? OR s.owner_user_id=?)"
-            owners = (int(user_id), int(user_id))
-        source = "task_jobs j LEFT JOIN sessions s ON s.session_id=j.session_id"
-    else:
-        # Empty/new accounts can have a jobs-only store. Unbound legacy work
-        # remains conservative: without session ownership it cannot be ignored.
-        owner_clause = "(j.owner_user_id=? OR j.owner_user_id IS NULL)" if "owner_user_id" in columns else "1=1"
-        owners = (int(user_id),) if "owner_user_id" in columns else ()
-        source = "task_jobs j"
-    active = conn.execute(
-        "SELECT 1 FROM " + source + " WHERE " + owner_clause +
-        " AND COALESCE(j.status,'') NOT IN (" + placeholders + ") LIMIT 1",
-        (*owners, *terminal),
-    ).fetchone()
-    if active:
-        raise AccountDeletionPending("account still has unfinished jobs; retry deletion after they settle")
+    operations = ("AND NOT EXISTS (SELECT 1 FROM task_operations o WHERE o.job_id=j.job_id)"
+                  if "task_operations" in tables else "")
+    roots = conn.execute(
+        "SELECT q.root_job_id FROM chat_turn_queue q JOIN task_jobs j ON "
+        "j.job_id=q.root_job_id AND j.owner_user_id=q.owner_user_id AND j.session_id=q.session_id "
+        "AND j.client_request_id=q.client_request_id "
+        "WHERE q.owner_user_id=? AND q.state='queued' AND q.dispatch_at=0 AND q.started_at=0 "
+        "AND q.active_child_job_id='' AND j.status='queued' AND j.current_step='turn_queue' "
+        "AND NOT EXISTS (SELECT 1 FROM task_jobs c WHERE c.parent_job_id=j.job_id) "
+        + operations, (user_id,)).fetchall()
+    for root, in roots:
+        if not jobs.cancel_queued_job(conn, root, reason="account_deletion"):
+            raise AccountDeletionPending("queued root changed before revocation")
+        now = time.time()
+        conn.execute("UPDATE chat_turn_queue SET state=?,generation=generation+1, "
+                     "history_saved=0,clear_reason='account_deletion',finished_at=?,updated_at=? "
+                     "WHERE owner_user_id=? AND root_job_id=?", (queue.TERMINAL, now, now, user_id, root))
+
+
+def _assert_no_active_account_jobs(conn: sqlite3.Connection, user_id: int) -> None:
+    """An unknown queue or execution state is not evidence of quiescence."""
+    from src.core import chat_turn_queue, jobs
+
+    tables = _tables(conn)
+    if "chat_turn_queue" in tables and conn.execute(
+            "SELECT 1 FROM chat_turn_queue WHERE owner_user_id=? AND COALESCE(state,'')<>? LIMIT 1",
+            (user_id, chat_turn_queue.TERMINAL)).fetchone():
+        raise AccountDeletionPending("account has unfinished chat turns")
+    if "task_jobs" in tables:
+        scope, count = _owned_job_sql(conn, tables)
+        unsettled = jobs.unsettled_history_job_sql(conn, tables)
+        if conn.execute(f"SELECT 1 FROM task_jobs j WHERE {scope} AND {unsettled} LIMIT 1",
+                        (user_id,) * count).fetchone():
+            raise AccountDeletionPending("account still has unfinished jobs")
+    if "task_operations" in tables and conn.execute(
+            "SELECT 1 FROM task_operations WHERE owner_user_id=? "
+            "AND status IN ('running','interrupted','unknown') LIMIT 1", (user_id,)).fetchone():
+        raise AccountDeletionPending("account still has unresolved operations")
+
+
+def _purge_owned_session_rows(conn: sqlite3.Connection, user_id: int, session_ids: list[str]) -> None:
+    """Remove owner-bound queues and payload receipts before dropping identity evidence."""
+    tables = _tables(conn)
+    if "task_jobs" in tables:
+        scope, count = _owned_job_sql(conn, tables)
+        job_ids = f"SELECT j.job_id FROM task_jobs j WHERE {scope}"
+        params = (user_id,) * count
+        for table in ("task_events", "task_update_requests", "task_updates", "task_approvals", "task_operations",
+                      "task_model_attempts", "task_budgets", "task_questions", "agent_execution_segments",
+                      "external_registry_receipts"):
+            if table in tables:
+                owned = "owner_user_id" in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if owned:
+                    conn.execute(f"DELETE FROM {table} WHERE owner_user_id=?", (user_id,))
+                else:
+                    conn.execute(f"DELETE FROM {table} WHERE job_id IN ({job_ids})", params)
+        if "tool_results" in tables:
+            # Detached legacy receipts are not owner-labelled. Outside a verified
+            # session delete only via an exact job ID, not a recyclable request key.
+            conn.execute("DELETE FROM tool_results WHERE EXISTS (SELECT 1 FROM task_jobs j "
+                         f"WHERE {scope} AND j.job_id=tool_results.request_id "
+                         "AND j.session_id=tool_results.session_id)", params)
+        conn.execute(f"DELETE FROM task_jobs WHERE job_id IN ({job_ids})", params)
+    for table in ("chat_turn_queue", "chat_turn_queue_seq"):
+        if table in tables:
+            conn.execute(f"DELETE FROM {table} WHERE owner_user_id=?", (user_id,))
+    for table, owner_col in (("account_preferences", "user_id"), ("ltm_facts", "owner_user_id"),
+                             ("long_term_memory", "owner_user_id"), ("account_resident_cards", "user_id"),
+                             ("account_memory_retry_queue", "user_id")):
+        if table in tables and owner_col in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
+            conn.execute(f"DELETE FROM {table} WHERE {owner_col}=?", (user_id,))
+    for sid in session_ids:
+        for table in ("messages", "session_evidence", "permission_grants", "pipeline_tasks", "tool_results", "feedback",
+                      "memory_store", "resident_cards"):
+            if table in tables:
+                conn.execute(f"DELETE FROM {table} WHERE session_id=?", (sid,))
+        conn.execute("DELETE FROM sessions WHERE session_id=? AND owner_user_id=?", (sid, user_id))
 
 
 def delete_user_account(user_id: int, *, raise_if_busy: bool = False) -> bool:
@@ -809,6 +879,38 @@ def delete_user_account(user_id: int, *, raise_if_busy: bool = False) -> bool:
         if raise_if_busy:
             raise
         return False
+
+
+def account_deletion_status(user_id: int) -> dict | None:
+    from src.core.account_admission import AdmissionStore
+    return AdmissionStore(DB_PATH).deletion_resume_status(user_id)
+
+
+def pending_deletion_counts() -> tuple[int, int]:
+    from src.core.account_admission import AdmissionStore
+    return AdmissionStore(DB_PATH).pending_deletions()
+
+
+def resume_user_account_deletion(user_id: int, *, fingerprint: str, confirmed_stopped: bool,
+                                 incident_reference: str) -> bool:
+    """Trusted maintenance CLI only. Never enable a closing account or drop a lease."""
+    from src.core.account_leases import deletion_lock
+
+    if (not re.fullmatch(r"[a-f0-9]{64}", fingerprint or "")
+            or not re.fullmatch(r"[A-Z][A-Z0-9]{1,15}-[0-9]{1,16}", incident_reference or "")):
+        raise ValueError("valid snapshot fingerprint and incident reference are required")
+
+    def audit(conn, snapshot):
+        auth_invites.record_security_event(
+            conn, event_type="account_deletion_resumed_local", target_user_id=user_id,
+            metadata={"incident_reference": incident_reference, "replaced_abandoned_claim": snapshot["has_claim"]})
+
+    def claim_resume(store):
+        return store.resume_deletion(user_id, fingerprint=fingerprint, confirmed_stopped=confirmed_stopped,
+                                     audit=audit)
+
+    with deletion_lock(user_id, claim_factory=claim_resume) as claim:
+        return _delete_user_account(user_id, raise_if_busy=True, claim=claim)
 
 
 def _delete_user_account(user_id: int, *, raise_if_busy: bool, claim) -> bool:
@@ -840,17 +942,17 @@ def _delete_user_account(user_id: int, *, raise_if_busy: bool, claim) -> bool:
         # revoke and released its lease just before idle was observed. With
         # admission closed and all holders drained, this second sweep is final.
         cancel_owner_executions(int(user_id))
-        from src.code_execution.logs import purge_owner as purge_execution_logs
-        purge_execution_logs(int(user_id), claim=claim)
         if sessions_db.exists():
             with closing(sqlite3.connect(str(sessions_db), timeout=30)) as conn, conn:
-                conn.execute("BEGIN")
-                cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-                if "owner_user_id" not in cols:
-                    raise RuntimeError("session ownership unavailable during account deletion")
+                conn.execute("BEGIN IMMEDIATE")
+                _revoke_undispatched_account_turns(conn, int(user_id))
                 _assert_no_active_account_jobs(conn, user_id)
-                session_ids = [str(row[0]) for row in conn.execute(
-                    "SELECT session_id FROM sessions WHERE owner_user_id=?", (int(user_id),))]
+                if "sessions" in _tables(conn):
+                    session_ids = [str(row[0]) for row in conn.execute(
+                        "SELECT session_id FROM sessions WHERE owner_user_id=?", (int(user_id),))]
+
+        from src.code_execution.logs import purge_owner as purge_execution_logs
+        purge_execution_logs(int(user_id), claim=claim)
 
         # Task workspaces own file pins too. Their metadata/pins must drain
         # under this fenced cleanup claim before session files remove bytes.
@@ -869,19 +971,12 @@ def _delete_user_account(user_id: int, *, raise_if_busy: bool, claim) -> bool:
         purge_integrity_reviews(int(user_id))
         from src.research.reference_audit import purge_owner as purge_reference_audits
         purge_reference_audits(int(user_id))
-        from src.core.jobs import purge_protocol_for_owner
-        purge_protocol_for_owner(int(user_id))
         # Release every retained Word version's source pins before file purge.
         from src.core.word_documents import purge_account_drafts
         purge_account_drafts(PROJECT_ROOT / "state" / "word_drafts.sqlite3", int(user_id))
 
         from src.session import files as session_files
-        session_files.init_store()
-        for sid in session_ids:
-            if not session_files.valid_session(sid):
-                raise ValueError("account contains an invalid session identifier")
-            session_files.purge_session(sid, strict=True,
-                                        owner_user_id=int(user_id))
+        session_files.purge_account_files(int(user_id), session_ids)
 
         # Generated artifacts and workspace exports are session/user scoped.
         # Resolve and constrain every recursive deletion to its managed root.
@@ -908,6 +1003,13 @@ def _delete_user_account(user_id: int, *, raise_if_busy: bool, claim) -> bool:
                             if "no such table" not in str(exc).lower():
                                 raise
 
+        evidence_base = PROJECT_ROOT / "workspace" / "evidence"
+        evidence_root = evidence_base / hashlib.sha256(str(int(user_id)).encode()).hexdigest()
+        if evidence_root.is_symlink() or evidence_base.is_symlink() or evidence_base.parent.is_symlink():
+            raise ValueError("refusing to recursively remove a linked evidence root")
+        if evidence_root.exists():
+            shutil.rmtree(evidence_root)
+
         output_base = (PROJECT_ROOT / "workspace" / "output" / "users").resolve()
         output_root = output_base / str(int(user_id))
         if output_root.exists() or output_root.is_symlink():
@@ -917,19 +1019,9 @@ def _delete_user_account(user_id: int, *, raise_if_busy: bool, claim) -> bool:
                 raise ValueError("refusing to recursively remove an output symlink")
             shutil.rmtree(output_root)
 
-        from src.guardrails.memory import memory_store
-        memory_store.clear_user_memory(user_id)
-        from src.guardrails.account_preferences import reset_preferences
-        try:
-            db_path = str(memory_store.db_path)
-        except Exception:
-            db_path = str(PROJECT_ROOT / "state" / "sessions.db")
-        reset_preferences(user_id, db_path)
-        for sid in session_ids:
-            memory_store.clear_session(sid)
-
         if sessions_db.exists():
             with closing(sqlite3.connect(str(sessions_db), timeout=30)) as conn, conn:
+                conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("BEGIN IMMEDIATE")
                 # Recheck before removing the evidence used to identify jobs.
                 # A pre-existing request may have registered during file cleanup.
@@ -941,15 +1033,7 @@ def _delete_user_account(user_id: int, *, raise_if_busy: bool, claim) -> bool:
                     if has_sessions else set())
                 if latest_ids != set(session_ids):
                     raise RuntimeError("account sessions changed during deletion; retry cleanup")
-                for sid in session_ids:
-                    for table in ("messages", "session_evidence", "permission_grants",
-                                  "pipeline_tasks", "task_jobs", "feedback"):
-                        try:
-                            conn.execute(f"DELETE FROM {table} WHERE session_id=?", (sid,))
-                        except sqlite3.OperationalError as exc:
-                            if "no such table" not in str(exc).lower():
-                                raise
-                    conn.execute("DELETE FROM sessions WHERE session_id=?", (sid,))
+                _purge_owned_session_rows(conn, int(user_id), session_ids)
                 conn.commit()
 
         with claim.store.transaction() as conn:
@@ -961,14 +1045,15 @@ def _delete_user_account(user_id: int, *, raise_if_busy: bool, claim) -> bool:
                 "DELETE FROM users WHERE user_id=? AND role!='admin'", (int(user_id),))
             if cur.rowcount != 1:
                 raise RuntimeError("account changed during deletion")
+            auth_invites.record_security_event(conn, event_type="account_deletion_completed", target_user_id=user_id)
         return True
     except AccountDeletionPending:
         logger.info("Account deletion waiting for work to finish: user_id=%s", int(user_id))
         if raise_if_busy:
             raise
         return False
-    except Exception:
-        logger.exception("Account data purge failed for user_id=%s", int(user_id))
+    except Exception as exc:
+        logger.warning("Account data purge failed: %s", type(exc).__name__)
         # Fail closed. Some session/file stores may already have been purged;
         # reactivating the account here would create an ambiguous partial state.
         return False

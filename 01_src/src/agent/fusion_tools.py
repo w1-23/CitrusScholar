@@ -1,18 +1,67 @@
 """Small AgentCore adapters for pinned external Skill execution and delivery."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 import json
+import os
+import re
+import time
 from pathlib import Path
 from typing import Annotated, Literal
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.graph.task_contract import FusionDelivery
+from src.research.fusion_delivery import summary as _summary
+
 SKILL_IDS = frozenset({"literature-verification", "data-audit", "research-integrity"})
 FUSION_WAIT_TOOLS = frozenset({"run_external_skill", "continue_external_literature"})
 REPLACED_TOOLS = frozenset({"verify_uploaded_references", "audit_uploaded_data", "audit_research_images",
                             "fetch_and_audit_open_supplements"})
+
+
+_delivery = ContextVar("fusion_delivery", default=(FusionDelivery(), "", ""))
+
+
+@contextmanager
+def fusion_delivery_scope(contract, *, query="", previous_query=""):
+    """Host scope only. A tool call cannot grant itself a delivery format."""
+    token = _delivery.set((contract, query, previous_query))
+    try:
+        yield
+    finally:
+        _delivery.reset(token)
+
+
+def external_fusion_required():
+    return os.environ.get("CITRUS_EXTERNAL_FUSION") == "required"
+
+
+_FINDINGS_REQUEST = re.compile(
+    r"(?:(?:把|将)?[^，。！？!?]{0,30}(?:审查|发现|异常|重复|核验|具体位置)[^，。！？!?]{0,20}"
+    r"(?:清单|名单|列表|列出|罗列|导出|下载|标红|标注|工作簿)|"
+    r"(?:列出|罗列|给出|导出|下载)[^，。！？!?]{0,20}(?:审查|发现|异常|重复|核验|位置)|"
+    r"\b(?:list|export|show|download)\b[^.?!]{0,45}\b(?:findings?|duplicate blocks?|audit results?|verification results?)\b)", re.I)
+_SHORT_LIST = re.compile(r"(?:好[的吧]?\s*[，,]?\s*)?(?:请你?|帮我|麻烦你?)?\s*"
+                         r"(?:给(?:我)?(?:一份|一个)?(?:完整)?(?:清单|列表)|列(?:出|一下|出来)(?:清单|结果|位置)?)"
+                         r"(?:即可|就行|谢谢)?[。！!\s]*")
+_CONTINUE = re.compile(r"(?:好[的吧]?\s*[，,]?\s*)?(?:请|你)?\s*(?:继续|再试(?:一次|一下)?)"
+                       r"(?:试(?:试|一次|一下)?|吧|即可)?[。！!\s]*")
+_DUPLICATE_REQUEST = re.compile(r"重复(?:数值|数字|数据)?(?:区段|区块|块|段|项)|\bduplicate (?:numeric |data )?blocks?\b", re.I)
+_SOURCE_LABEL = re.compile(r"(?<![\w./])([A-Za-z0-9][\w. ()-]{0,79}\.(?:csv|xlsx|bib|ris|docx|txt))(?![\w/])", re.I)
+_REPORT_ID = re.compile(r"(?<![a-fA-F0-9])[a-f0-9]{32}(?![a-fA-F0-9])")
+
+
+def fusion_report_followup(query, *, previous_query=""):
+    from src.graph.intent_text import intent_with_negation, mask_literal_payload
+    text = mask_literal_payload(query).strip()
+    if _SHORT_LIST.fullmatch(text) or intent_with_negation(text, _FINDINGS_REQUEST):
+        return True
+    return bool(previous_query and _CONTINUE.fullmatch(text)
+                and fusion_report_followup(previous_query))
 
 
 def installed_fusion(release, rows):
@@ -43,9 +92,13 @@ class LiteratureArgs(_Args):
     execution_id: FileID
 
 
-class CollectArgs(LiteratureArgs):
+class ReportPage(_Args):
+    findings_offset: int = Field(default=0, ge=0, le=1_000_000)
+
+
+class CollectArgs(LiteratureArgs, ReportPage):
     skill_id: SkillID
-    publish_excel: bool = False
+    publish_excel: bool = False  # Compatibility only. Authorization comes from the host scope.
 
 
 def _bound(skill_id):
@@ -84,47 +137,6 @@ def _consumed(value):
                      status, "external_skill_result_not_available")
 
 
-def _bounded_items(key, items, fields):
-    # No raw observations, attached paths, provider bodies, logs or options
-    # enter the model prompt. Large results preserve counts and coverage.
-    rows = []
-    for item in items[:36]:
-        if not isinstance(item, dict):
-            continue
-        row = {name: value[:500] if isinstance(value, str) else value
-               for name in fields if (value := item.get(name)) is not None}
-        if key == "records":
-            submitted = item.get("submitted") or {}
-            row["submitted"] = {name: str(submitted[name])[:350] for name in ("doi", "title", "year") if name in submitted}
-            row["attempts"] = [{"provider": a.get("provider"), "status": a.get("status"), "queried_at": a.get("queried_at")}
-                               for a in item.get("attempts", [])[:8] if isinstance(a, dict)]
-        if key == "findings":
-            coordinates = ("sheet", "sheet_name", "region", "region_id", "cell", "cell_range", "range",
-                           "scope", "group", "row", "row_index", "column", "column_index", "role")
-            row["locations"] = [{field: loc[field] for field in coordinates if field in loc}
-                                for loc in item.get("locations", [])[:8] if isinstance(loc, dict)]
-        rows.append(row)
-    return rows
-
-
-def _summary(report):
-    fields = {
-        "findings": ("kind", "rule", "check", "severity", "message", "detail", "title"),
-        "coverage": ("check", "status", "scope", "record_index", "region_id", "reason"),
-        "evidence": ("evidence_id", "doi", "title", "url"),
-        "records": ("record_index", "status", "evidence_ids", "evidence_grade", "problems"),
-    }
-    summary = {"status": report["status"], "limitations": [str(x)[:200] for x in report.get("limitations", [])[:10]]}
-    for key, selection in fields.items():
-        data = report.get(key)
-        if isinstance(data, list):
-            summary[key] = _bounded_items(key, data, selection)
-            summary[key + "_total"] = len(data)
-    execution = report.get("execution") or {}
-    summary["execution"] = {name: execution[name] for name in ("skill", "version", "python") if name in execution}
-    return summary
-
-
 def _workbook_source(identity, reference):
     from src.session import files
     from hashlib import sha256
@@ -159,8 +171,9 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
 
 @tool(args_schema=LiteratureArgs, response_format="content_and_artifact")
 def continue_external_literature(execution_id: str):
-    """After the external literature Worker extracted or parsed the bibliography, obtain authorized host registry receipts and run the same pinned verifier. Give only its earlier execution_id. Do not call again for a completed verification; the host scopes and deduplicates lookup."""
-    from src.research.fusion_observations import collect_observations
+    """Advance the host registry coverage of the original extraction execution. Collect the returned Worker execution_id. If coverage can advance, call again with the original extraction execution_id, not the latest child. Report any explicit stop reason and unavailable providers."""
+    from src.research.fusion_observations import RegistryCoverage, advance_observations, observation_payload
+    from .code_tools import _deadline
     from .fusion_worker import consume_fusion, find_fusion, schedule_fusion
 
     skill_id = "literature-verification"
@@ -171,53 +184,193 @@ def continue_external_literature(execution_id: str):
             return _consumed(value)
         report = value["report"]
         if any(row.get("role") == "observations" for row in report.get("execution", {}).get("inputs", [])):
-            return _response(_summary(report))
-        operation_id = "registry:" + execution_id
-        if existing := find_fusion(identity, operation_id=operation_id, skill_release=release, skill_id=skill_id):
-            return _queued(existing)
-        observations = collect_observations(report, identity=identity)
-        receipt = schedule_fusion(identity, operation_id=operation_id, skill_release=release,
-                                  skill_id=skill_id, inputs=value["inputs"], options=value["options"],
-                                  observations=observations)
+            return _deliver(identity, value, execution_id, skill_id)
+        if not report.get("records"):
+            # Observe a pre-cursor submission on a genuinely resumed old call;
+            # a newly empty extraction does not authorize extra lookups.
+            if existing := find_fusion(identity, operation_id="registry:" + execution_id,
+                                       skill_release=release, skill_id=skill_id):
+                return _queued(existing)
+            return _deliver(identity, value, execution_id, skill_id)
+        digest = value["receipt"]["result"]["sha256"]
+        store = RegistryCoverage(identity)
+        revision, child_id, state = store.get(execution_id, digest)
+        if child_id:
+            child = consume_fusion(identity, execution_id=child_id, skill_release=release, skill_id=skill_id)
+            if child["status"] in {"queued", "claimed", "preparing", "running", "collecting", "cancel_requested"}:
+                return _queued(child)
+            if child["status"] != "succeeded":
+                return _consumed(child)
+            if state["stop_reason"] not in {"record_window", "lookup_window", "time_budget"}:
+                return _deliver(identity, child, child_id, skill_id)
+        if not state or child_id:
+            deadline = time.monotonic() + max(0, _deadline(identity) - time.time())
+            updated = advance_observations(report, state, identity=identity, deadline=deadline)
+            if state and updated["offset"] == state["offset"] and observation_payload(updated) == observation_payload(state):
+                return _response({"execution_id": child_id, "original_execution_id": execution_id,
+                                  "considered": updated["offset"], "total": updated["total"],
+                                  "stop_reason": updated["stop_reason"], "can_continue": False},
+                                 "partial", "external_registry_no_progress")
+            store.advance(execution_id, digest, revision, updated)
+            revision, state = revision + 1, updated
+        operation_id = f"registry:{execution_id}:{revision}"
+        receipt = find_fusion(identity, operation_id=operation_id, skill_release=release, skill_id=skill_id)
+        if receipt is None:
+            receipt = schedule_fusion(identity, operation_id=operation_id, skill_release=release,
+                skill_id=skill_id, inputs=value["inputs"], options=value["options"], observations=observation_payload(state))
+        store.bind_child(execution_id, digest, revision, receipt["execution_id"], state)
         return _queued(receipt)
-    except (LookupError, PermissionError, ValueError, OSError):
+    except (KeyError, LookupError, PermissionError, ValueError, OSError):
         return _response({"error": "登记补查不可用。可读取已有结果并标注覆盖缺口。"}, "not_run", "external_registry_unavailable")
 
 
+def _literature_coverage(identity, execution_id, report, *, historical=False, source_identity=None):
+    from src.research.fusion_observations import RegistryCoverage
+    from src.core.capability_policy import allows
+    from src.core.tracing import web_search_enabled
+
+    records = report.get("records") or []
+    if not records:
+        return None, {}
+    child = RegistryCoverage(identity).child(execution_id, historical_identity=source_identity if historical else None)
+    indexed = {row["record_index"]: row["status"] for row in (child or {}).get("coverage", [])}
+    has_observations = any(row.get("role") == "observations" for row in report.get("execution", {}).get("inputs", []))
+    for record in records:
+        index = record["record_index"]
+        if index not in indexed:
+            # Old accepted reports preserve provider timestamps without a cursor.
+            used = [row for row in (record.get("attempts") or []) if row.get("queried_at")]
+            indexed[index] = (("queried" if all(row.get("status") in (200, 404) for row in used) else "provider_unavailable")
+                              if used else "not_queried")
+    considered = sum(value != "not_queried" for value in indexed.values())
+    reason = child["stop_reason"] if child else ("legacy_observation_scope" if has_observations else "observations_not_started")
+    return {"considered": considered, "total": len(records), "stop_reason": reason,
+            "original_execution_id": child["original_execution_id"] if child else execution_id,
+            "can_continue": (not historical and allows("bibliographic_lookup") and web_search_enabled()
+                             and reason in {"record_window", "lookup_window", "time_budget", "observations_not_started"}),
+            "counts": {state: sum(value == state for value in indexed.values()) for state in sorted(set(indexed.values()))}}, indexed
+
+
+def _deliver(identity, value, execution_id, skill_id, *, findings_offset=0, historical=False):
+    if value["status"] != "succeeded":
+        return _consumed(value)
+    report = value["report"]
+    contract, query, previous_query = _delivery.get()
+    curated = report
+    duplicate_request = _DUPLICATE_REQUEST.search(previous_query if historical and _CONTINUE.fullmatch(query) else query)
+    if historical and duplicate_request:
+        curated = {**report, "findings": [row for row in report.get("findings", [])
+                                         if row.get("rule_id") == "duplicate_numeric_block"]}
+    public = {"execution_id": execution_id, **_summary(curated, findings_offset=findings_offset)}
+    if skill_id == "research-integrity":
+        public["result_lifecycle"] = "external_worker_report"
+        public["lifecycle_note"] = ("这是同一账号与会话的执行报告，可查看或明确请求导出；"
+                                     "并非旧版复核记录，不支持旧 review_id、确认或管理员复核流程。")
+    if historical:
+        public["historical_report"] = True
+        public["findings_in_exact_report"] = len(report.get("findings", []))
+        public["duplicate_numeric_block_findings"] = sum(row.get("rule_id") == "duplicate_numeric_block"
+                                                         for row in report.get("findings", []))
+        public["report_note"] = ("仅列本次已接受报告的证据；列级筛查不是单元格位置，"
+                                 "无相符发现时不推断数量、不重跑或切换算法。")
+        if duplicate_request and not public["duplicate_numeric_block_findings"]:
+            public["report_note"] += " 原报告未记录任何重复数值区段，不能确认此前描述的数量或列出其位置。"
+    status = {"complete": "complete", "partial": "partial", "unsupported": "not_run", "failed": "failed"}[report["status"]]
+    registry = None
+    indexed = {}
+    if skill_id == "literature-verification":
+        registry, indexed = _literature_coverage(identity, execution_id, report, historical=historical,
+                                                 source_identity=(value.get("_source_snapshot") or {}).get("identity"))
+        if registry:
+            public["registry_coverage"] = registry
+            from src.research.fusion_delivery import annotate_record_coverage
+            for record in public.get("records", []):
+                annotate_record_coverage(record, indexed)
+            if any(value not in {"queried", "previously_observed"} for value in indexed.values()) and status == "complete":
+                status = public["status"] = "partial"
+                curated = {**curated, "status": "partial"}
+    if findings_offset or status not in {"complete", "partial"}:
+        return _response(public, status, "external_skill_report")
+    try:
+        selected_format = contract.format if contract.intent == "alternate_file" else (
+            "xlsx" if contract.intent == "annotated_xlsx" and skill_id == "literature-verification" else "")
+        if selected_format:
+            from src.research.fusion_delivery import publish_report
+            artifact = publish_report(curated, execution_id=execution_id, skill_id=skill_id,
+                                      fmt=selected_format, receipt=value["receipt"], host_coverage=indexed)
+            public["saved_report"] = {k: artifact[k] for k in ("filename", "url", "rows")}
+            return _response(public, status, "external_skill_report", receipts=[artifact])
+        if contract.intent != "annotated_xlsx" or skill_id == "literature-verification":
+            return _response(public, status, "external_skill_report")
+        from src.research.fusion_workbook import publish_fusion_workbook
+        from src.core.account_leases import account_lease
+        from .fusion_worker import historical_fusion_source
+
+        ref = value["inputs"]["workbook" if skill_id == "data-audit" else "table"]
+        with account_lease(identity.owner_user_id):
+            raw, name = (historical_fusion_source(identity, value, ref) if historical else _workbook_source(identity, ref))
+            artifact = publish_fusion_workbook(curated, source_file_id=ref["file_id"],
+                source_sha256=ref["sha256"], source_name=name, source_bytes=raw)
+        public["workbook"] = {k: artifact[k] for k in ("filename", "url", "cells", "source_format")}
+        return _response(public, status, "external_skill_report", receipts=[artifact])
+    except (KeyError, LookupError, ValueError, PermissionError, OSError):
+        public["report_file_error"] = "请求的正式文件未生成；已接受审查结论仍可用。"
+        return _response(public, "partial", "external_report_not_published")
+
+
 @tool(args_schema=CollectArgs, response_format="content_and_artifact")
-def collect_external_skill(execution_id: str, skill_id: SkillID, publish_excel: bool = False):
-    """Read a settled external Skill result by exact execution_id. For data-audit, set publish_excel=true only when the user requests a workbook or audit report; CitrusScholar copies the source XLSX and marks exact findings in red with cell comments, plus the existing summary sheet."""
+def collect_external_skill(execution_id: str, skill_id: SkillID, publish_excel: bool = False, findings_offset: int = 0):
+    """Read the current turn's settled external Skill result by exact execution_id. The host decides whether to publish a requested file. When findings_page.next_offset is present, pass that offset to read the next page of the same exact report."""
     from .fusion_worker import consume_fusion
 
     try:
         identity, _, release = _bound(skill_id)
         value = consume_fusion(identity, execution_id=execution_id, skill_release=release, skill_id=skill_id)
-        if value["status"] != "succeeded":
-            return _consumed(value)
-        report = value["report"]
-        summary = {"execution_id": execution_id, **_summary(report)}
-        status = {"complete": "complete", "partial": "partial", "unsupported": "not_run", "failed": "failed"}[report["status"]]
-        if not publish_excel or skill_id != "data-audit" or status not in {"complete", "partial"}:
-            return _response(summary, status, "external_skill_report")
-        try:
-            from src.research.fusion_workbook import publish_fusion_workbook
-            from src.core.account_leases import account_lease
-
-            ref = value["inputs"]["workbook"]
-            with account_lease(identity.owner_user_id):
-                raw, name = _workbook_source(identity, ref)
-                artifact = publish_fusion_workbook(report, source_file_id=ref["file_id"],
-                    source_sha256=ref["sha256"], source_name=name, source_bytes=raw)
-            summary["workbook"] = {"filename": artifact["filename"], "url": artifact["url"], "cells": artifact["cells"]}
-            return _response(summary, status, "external_skill_report", receipts=[artifact])
-        except (KeyError, LookupError, ValueError, PermissionError, OSError):
-            summary["workbook_error"] = "没有生成正式标注工作簿，审查结论仍可用。"
-            return _response(summary, "partial", "external_workbook_not_published")
-    except (LookupError, PermissionError, ValueError, OSError):
+        return _deliver(identity, value, execution_id, skill_id, findings_offset=findings_offset)
+    except (KeyError, LookupError, PermissionError, ValueError, OSError):
         return _response({"error": "执行结果不可用。"}, "not_run", "external_skill_report_unavailable")
 
 
-_TOOLS = (run_external_skill, continue_external_literature, collect_external_skill)
+@tool(args_schema=ReportPage, response_format="content_and_artifact")
+def resolve_external_report(findings_offset: int = 0):
+    """Read only the exact accepted external report authorized by a findings-list or report-delivery follow-up. No algorithm is rerun. Continue with findings_page.next_offset; never invent missing findings or positions."""
+    from src.core.capability_policy import allows
+    from src.graph.intent_text import mask_literal_payload
+    from .fusion_worker import consume_fusion, historical_report_candidates
+
+    contract, query, previous_query = _delivery.get()
+    query = mask_literal_payload(query).strip()
+    if not fusion_report_followup(query, previous_query=previous_query):
+        return _response({"error": "本轮没有明确要求读取先前审查发现。"}, "not_run", "external_report_not_requested")
+    source_query = previous_query if _CONTINUE.fullmatch(query) else query
+    ids = set(_REPORT_ID.findall(source_query))
+    names = set(_SOURCE_LABEL.findall(source_query)) if contract.intent != "alternate_file" else set()
+    if len(ids) > 1 or len(names) > 1:
+        return _response({"error": "请指定要读取的一份审查结果。"}, "not_run", "external_report_ambiguous")
+    try:
+        allowed = {skill for skill in SKILL_IDS if allows("skill:" + skill)}
+        if _DUPLICATE_REQUEST.search(source_query):
+            allowed &= {"research-integrity"}
+        if not allowed:
+            raise PermissionError("external_report_scope_unavailable")
+        identity, _, release = _bound(sorted(allowed)[0])
+        matches = historical_report_candidates(identity, skill_release=release, skill_ids=allowed,
+            exact_id=next(iter(ids), None), requested_source=next(iter(names), None))
+        if len(matches) > 1:
+            return _response({"error": "同一会话有多份已接受审查结果。请指明源文件或精确执行 ID。"},
+                             "not_run", "external_report_ambiguous")
+        if not matches:
+            raise LookupError("external_report_unavailable")
+        execution_id, skill_id, source_identity = matches[0]
+        value = consume_fusion(identity, execution_id=execution_id, skill_release=release,
+                              skill_id=skill_id, source_identity=source_identity)
+        return _deliver(identity, value, execution_id, skill_id, findings_offset=findings_offset, historical=True)
+    except (KeyError, LookupError, PermissionError, ValueError, OSError):
+        return _response({"error": "没有可验证的原审查私有报告。没有推断位置、数量或另行执行。"},
+                         "not_run", "external_skill_report_unavailable")
+
+
+_TOOLS = (run_external_skill, continue_external_literature, collect_external_skill, resolve_external_report)
 FUSION_TOOL_NAMES = frozenset(item.name for item in _TOOLS)
 
 

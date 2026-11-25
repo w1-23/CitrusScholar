@@ -87,7 +87,7 @@ _PRESETS = (
     _Preset("local_hybrid_search", "rag", "local_hybrid_search", None, ("local_corpus",), ()),
     _Preset("read_candidate", "rag", "candidate_pool", None, ("local_corpus", "candidate_pool"), ()),
     _Preset("search_candidates", "rag", "candidate_pool", None, ("local_corpus", "candidate_pool"), ()),
-    _Preset("draw_svg", "analysis", "draw_svg", None, (), ("figure",)),
+    _Preset("draw_svg", "analysis", "draw_svg", "session_artifact", (), ("figure",)),
     _Preset("read_account_file", "files", "read_account_file", None, ("account_files",), (), recovery_mode="local_read"),
     _Preset("read_tool_result", "files", "read_tool_result", None, ("session",), ()),
     _Preset("research_workspace", "research", "research_workspace", "session_artifact", ("session", "research_tools"), ()),

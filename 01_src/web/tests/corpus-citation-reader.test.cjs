@@ -90,3 +90,19 @@ test('fallback is explicitly labeled and rendering never loads a source image', 
   assert.doesNotMatch(body.innerHTML, /<img\b/);
   assert.match(b.get('crFootNote').textContent, /全文不可用/);
 });
+
+test('citation reader keeps exact producer and root identities throughout pagination', async () => {
+  const {b} = fixture();
+  b.ctx.CitrusCorpusReader.openCitation({kind: 'local', reader_id: key},
+    {sessionId: 'my-session', requestId: 'display-root', producerJobId: 'producer-child'});
+  function scope(req) {
+    const params = new URL(req.url, 'https://fixture.example').searchParams;
+    assert.equal(params.get('request_id'), 'display-root');
+    assert.equal(params.get('producer_job_id'), 'producer-child');
+  }
+  scope(b.requests[0]);
+  b.reply(b.requests[0], response({markdown: repeated, end: count(repeated), chars: count(repeated), next_start: count(repeated)}));
+  await flush();
+  b.get('crNextBtn').fire('click');
+  scope(b.requests[1]);
+});

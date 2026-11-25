@@ -50,7 +50,8 @@ def test_attachment_plot_needs_a_downloadable_svg():
     requirements = contract_for_turn("请你绘制这个数据", has_tables=True).deliverables
     assert requirements[0]["formats"] == ["svg"]
     assert not contract_for_turn("请描述这个数据，不要绘制图", has_tables=True).deliverables
-    assert contract_for_turn("审查 Sheet1", has_tables=True).deliverables[0]["formats"] == ["xlsx"]
+    assert not contract_for_turn("审查 Sheet1", has_tables=True).deliverables
+    assert contract_for_turn("审查 Sheet1 并另存标注 XLSX 工作簿", has_tables=True).deliverables[0]["formats"] == ["xlsx"]
     assert not contract_for_turn("审查 Sheet1，只给文字", has_tables=True).deliverables
     goals, gaps = artifact_goal_evidence(requirements, [], set())
     assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
@@ -70,7 +71,7 @@ def test_short_drawing_mentions_do_not_require_a_figure(query):
 
 
 def test_verified_workbook_can_be_delivered_with_partial_audit_coverage():
-    requirements = contract_for_turn("审查 Sheet1", has_tables=True).deliverables
+    requirements = contract_for_turn("审查 Sheet1 并另存标注 XLSX 工作簿", has_tables=True).deliverables
     link = "/api/v2/session/fixture-session/artifacts/fixture"
     record = {"name": "audit_uploaded_data", "tool_call_id": "audit", "status": "partial",
               "artifact_validations": [{"link": link, "valid": True, "request_matches": True,

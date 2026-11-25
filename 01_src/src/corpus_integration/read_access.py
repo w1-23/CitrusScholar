@@ -25,6 +25,8 @@ class IsolatedSearch:
         self.cache = cache
         self.unavailable = False
         self.fixed_generation = generation
+        self.served_generation = None
+        self.fallback_reason = None
         from citrus_corpus.generations import valid_generation
         from citrus_corpus.store import Store
         from citrus_corpus.pointers import read_pointer
@@ -32,7 +34,8 @@ class IsolatedSearch:
         store = Store(root)
         if generation is not None and not valid_generation(generation):
             raise ValueError("corpus_generation_invalid")
-        self.generation = generation if generation is not None else read_pointer(store.root)
+        self.requested_generation = generation if generation is not None else read_pointer(store.root)
+        self.generation = self.requested_generation
 
     def search(self, query, *, limit):
         from citrus_corpus.models import FusedRank
@@ -40,14 +43,18 @@ class IsolatedSearch:
         from citrus_corpus.store import Store
         from src.core.capability_policy import allows
 
+        if self.requested_generation is None:
+            raise LookupError("corpus_generation_unavailable")
         if reader_root() != self.root or not allows("local_rag"):
-            return []
+            raise LookupError("corpus_read_unavailable")
         with Reader(Store(self.root)).pin(embedder=_embedder(self.cache), reranker=FusedRank(),
-                                          generation=self.fixed_generation) as reader:
-            self.generation = reader.generation
+                                          generation=self.requested_generation,
+                                          allow_fallback=self.fixed_generation is None) as reader:
             rows = reader.search(query, limit)
-        if reader_root() != self.root or not allows("local_rag"):
-            return []
+            if reader_root() != self.root or not allows("local_rag"):
+                raise LookupError("corpus_read_unavailable")
+            self.generation = self.served_generation = reader.generation
+            self.fallback_reason = reader.fallback_reason
         fields = ("source_family", "index_generation", "document_id", "version_id", "chunk_id",
                   "title", "section_name", "read_ref")
         return [{**{field: row[field] for field in fields}, "excerpt": row["text"]} for row in rows]

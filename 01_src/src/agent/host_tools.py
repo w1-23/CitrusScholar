@@ -136,7 +136,7 @@ class HostTools:
         if row['input_hash'] != task_events.input_hash({'tool': observation.name, 'args': args, 'refs': refs}):
             return False
         result = json.loads(row['result'])
-        stored = tool_results.fetch(cid)
+        stored = tool_results.fetch(tool_results.observation_receipt_key(observation))
         return bool(stored and stored.get('session_id') == self.identity.session_id
             and stored.get('request_id') == self._result_request_id()
             and tool_results.storage_integrity(stored)['complete']
@@ -338,7 +338,7 @@ class HostTools:
         records = []
         _emit_completed_tool_step(call, message, records,
                                   logical_key=execution.logical_key or 'host:' + uuid.uuid4().hex,
-                                  attempt=execution.attempt)
+                                  attempt=execution.attempt, receipt_identity=identity)
         if not records:
             raise RuntimeError("operation_publication_unavailable")
         record = records[0]
@@ -349,8 +349,8 @@ class HostTools:
                 "reason_code": "result_storage_unavailable", "tool_call_id": message.tool_call_id,
                 "message": "操作已记录，但暂时无法核验回执原文。请先查看已有记录。"})
             raise RuntimeError("operation_result_not_persisted")
-        from src.core.tool_results import pin_references
-        if not pin_references(identity.session_id, [message.tool_call_id]):
+        from src.core.tool_results import observation_receipt_key, pin_references
+        if not pin_references(identity.session_id, [observation_receipt_key(message)]):
             raise RuntimeError("checkpoint_evidence_pin_failed")
         delivered = first_delivery(message, call=call,
                                    reader_available="read_tool_result" in self.allowed_names)
@@ -400,7 +400,20 @@ class HostTools:
             emit_encoded("context_degraded", {"stage": "tool_delivery", "status": "degraded",
                 "reason_code": "batch_observation_not_stored", "tool_call_id": call['id'],
                 "message": "部分工具观察无法编码，已登记的成果仍可查看。"})
-        retain_observation(identity, execution, delivered, call)
+        if delivered.name == "draw_svg" and execution.operation_id and not execution.uncertain:
+            from src.core.figures import export_recovery
+            retained = delivered.model_copy(update={"additional_kwargs": {
+                **delivered.additional_kwargs, "host_figure_recovery": export_recovery(identity)}})
+            try:
+                # This copy is private to the owner-scoped operation outbox.
+                retain_observation(identity, execution, retained, call)
+            except (TypeError, ValueError, RecursionError):
+                # A too-large outbox copy must not undo a published drawing.
+                # A missing early receipt prevents recovery from rerunning it.
+                import logging
+                logging.getLogger(__name__).warning("draw_observation_recovery_state_too_large")
+        else:
+            retain_observation(identity, execution, delivered, call)
         self.records.append(record)
         self._adopt_observation(delivered)
         if call["name"] == "read_tool_result":
@@ -423,9 +436,15 @@ class HostTools:
         """Check retained original bytes before adopting checkpoint evidence."""
         self.assert_context()
         from src.core import tool_results
-        stored = tool_results.fetch(message.tool_call_id)
-        record = message.additional_kwargs.get("host_publication")
+        key = tool_results.observation_receipt_key(message)
+        stored = tool_results.fetch(key)
         reference = message.additional_kwargs.get("result_reference") or {}
+        scoped = tool_results.execution_receipt_key(self.identity, message.tool_call_id)
+        if (not isinstance(reference, dict) or key not in {message.tool_call_id, scoped}
+                or (reference.get("provider_call_id") and key != scoped)
+                or (key == scoped and (stored or {}).get("provider_call_id") != message.tool_call_id)):
+            raise RuntimeError("recovery_result_identity_mismatch")
+        record = message.additional_kwargs.get("host_publication")
         if (not stored or stored.get("session_id") != self.identity.session_id
                 or stored.get("request_id") != self._result_request_id()
                 or not tool_results.storage_integrity(stored)["complete"]

@@ -25,10 +25,12 @@ request replaces the context binding; it never clears another request's data.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import threading
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 PLACEHOLDER_RE = re.compile(r"\[\[FIGURE:(\d+)\]\]")
 
@@ -37,6 +39,7 @@ PLACEHOLDER_RE = re.compile(r"\[\[FIGURE:(\d+)\]\]")
 class _Registry:
     figures: dict[int, dict[str, str]] = field(default_factory=dict)
     attempts: int = 0
+    high_water: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -77,7 +80,8 @@ def register(svg: str, alt_text: str = "", *, download_url: str = "",
     """Store a validated SVG and return ``(index, text_for_model)``."""
     registry = _registry()
     with registry.lock:
-        index = len(registry.figures) + 1
+        registry.high_water += 1
+        index = registry.high_water
         registry.figures[index] = {"svg": svg, "alt": alt_text or "图示",
                                    "download_url": download_url, "workbench_url": workbench_url}
     return index, _TOOL_TEXT.format(idx=index)
@@ -93,6 +97,68 @@ def snapshot() -> dict[int, dict[str, str]]:
     registry = _registry()
     with registry.lock:
         return {k: dict(v) for k, v in registry.figures.items()}
+
+
+_FIGURE_FIELDS = {"svg", "alt", "download_url", "workbench_url"}
+
+
+def _recovery_hash(identity, index, figure):
+    encoded = json.dumps([identity, index, figure], ensure_ascii=False,
+                         sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def export_recovery(identity) -> dict:
+    """Capture validated figure references only in this run's protected checkpoint."""
+    binding = asdict(identity)
+    registry = _registry()
+    with registry.lock:
+        return {"identity": binding, "attempts": registry.attempts, "high_water": registry.high_water, "entries": [
+            {"index": index, "figure": dict(figure), "sha256": _recovery_hash(binding, index, figure)}
+            for index, figure in registry.figures.items()]}
+
+
+def restore_recovery(identity, saved) -> None:
+    """Restore the original numbering without rerendering or republishing a figure."""
+    if saved is None:
+        return  # Old checkpoints did not persist figures.
+    binding = asdict(identity)
+    if (not isinstance(saved, dict) or saved.get("identity") != binding
+            or type(saved.get("attempts")) is not int or saved["attempts"] < 0
+            or not isinstance(saved.get("entries"), list)):
+        raise ValueError("figure_checkpoint_invalid")
+    figures = {}
+    high_water = saved.get("high_water", len(saved["entries"]))
+    index = 0
+    if type(high_water) is not int or high_water < 0:
+        raise ValueError("figure_checkpoint_invalid")
+    for entry in saved["entries"]:
+        if (not isinstance(entry, dict) or type(entry.get("index")) is not int
+                or not index < entry["index"] <= high_water):
+            raise ValueError("figure_checkpoint_invalid")
+        index = entry["index"]
+        figure = entry.get("figure")
+        if (not isinstance(figure, dict) or set(figure) != _FIGURE_FIELDS
+                or any(type(value) is not str for value in figure.values())
+                or entry.get("sha256") != _recovery_hash(binding, index, figure)):
+            raise ValueError("figure_checkpoint_invalid")
+        figures[index] = dict(figure)
+    registry = _registry()
+    with registry.lock:
+        registry.figures = figures
+        registry.attempts = saved["attempts"]
+        registry.high_water = high_water
+
+
+def reserve_legacy_indices(texts) -> None:
+    """Legacy graph receipts had placeholders but no recoverable SVG bytes."""
+    occupied = max((int(match.group(1)) for text in texts if isinstance(text, str)
+                    for match in PLACEHOLDER_RE.finditer(text)
+                    if len(match.group(1)) == 1 and 1 <= int(match.group(1)) <= 4), default=0)
+    registry = _registry()
+    with registry.lock:
+        registry.high_water = max(registry.high_water, occupied)
+        registry.attempts = max(registry.attempts, occupied)
 
 
 def expand(text: str) -> str:

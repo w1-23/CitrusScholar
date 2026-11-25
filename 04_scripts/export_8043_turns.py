@@ -59,13 +59,24 @@ EVENT_KEYS = RESULT_KEYS | {
     "tools_called", "unavailable_count", "resolution", "resolutions",
     *_delivery.TIMING_KEYS, "attempt_elapsed_ms",
 }
-LOG_KEYS = EVENT_KEYS | {
-    "ts", "observed_at", "event", "req", "request_id", "job", "job_id", "session", "session_id", "mode",
-    "ms", "db_ms", "hints_ms", "ltm_ms", "total_ms", "query_chars", "original_query_chars", "answer_chars",
-    "tools", "node", "err", "format", "classification", "url", "doi", "compacted", "raw_msgs",
-    "selected", "reranked", "rrf_candidates", "dense_candidates", "bm25_candidates", "corpus_types",
-    "translation_used", "local_query_language", "reranker_fallback",
-}
+# Legacy log archives are diagnostic sources, never conversation sources.
+# Do not recopy arbitrary prose, URLs, IDs supplied by clients, or JSON bodies.
+LOG_METRICS = {"ms", "db_ms", "hints_ms", "ltm_ms", "total_ms", "elapsed_ms", "query_chars",
+               "original_query_chars", "answer_chars", "raw_msgs", "selected", "reranked",
+               "rrf_candidates", "dense_candidates", "bm25_candidates", "translation_used",
+               "reranker_fallback", "started_at_ms", "completed_at_ms", *_delivery.TIMING_KEYS}
+LOG_STATES = {"ok", "error", "failed", "complete", "completed", "running", "recovered",
+              "queued", "cancelled", "timeout", "timed_out", "skipped", "interrupted", "unknown"}
+_VISIBLE_QUEUE = (
+    "SELECT q.* FROM chat_turn_queue q JOIN auth_source.users u ON u.user_id=q.owner_user_id "
+    "JOIN auth_source.account_admission a ON a.owner=u.user_id WHERE a.deleting=0 "
+    "AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id=q.session_id "
+    "AND (s.owner_user_id IS NULL OR s.owner_user_id<>q.owner_user_id))"
+)
+
+
+class ExportScopeChanged(RuntimeError):
+    """An account was closed while its export was being assembled."""
 
 
 def unpack(value):
@@ -173,6 +184,9 @@ def runtime_root():
 
 def history(conn, turn):
     session = turn["session_id"]
+    if not conn.execute("SELECT 1 FROM sessions WHERE session_id=? AND owner_user_id=?",
+                        (session, turn["owner_user_id"])).fetchone():
+        return []
     key = "crid:" + turn["client_request_id"][:64]
     start = conn.execute(
         "SELECT MIN(id) FROM messages WHERE session_id=? AND (client_request_id=? OR idempotency_key=?)",
@@ -189,9 +203,13 @@ def history(conn, turn):
     ).fetchall()
 
 
-def correlated_logs(root, identifiers):
-    pattern = re.compile(r"(?<![\w-])(?:" + "|".join(map(re.escape, sorted(identifiers))) + r")(?![\w-])")
-    field = re.compile(r"\b(?:req|job|request_id|job_id)=([\w-]+)")
+def correlated_logs(root, job_ids):
+    """Summarize exactly correlated job IDs, without copying historical prose."""
+    job_ids = {key for key in job_ids if isinstance(key, str) and JOB_ID.fullmatch(key)}
+    if not job_ids:
+        return
+    field = re.compile(r"\b(?:job|job_id)=([a-f0-9]{12,32})(?![\w-])")
+    level = re.compile(r"\|\s*(WARNING|ERROR|CRITICAL)\s*\|")
     file_patterns = ("business.log*", "agent.log*", "diag/diag_*.jsonl*", "web_fetch_failures.jsonl*")
     seen = set()
     for name in file_patterns:
@@ -200,30 +218,39 @@ def correlated_logs(root, identifiers):
             try:
                 with opener(path, "rt", encoding="utf-8", errors="replace") as stream:
                     for line in stream:
-                        if not pattern.search(line):
+                        if not any(job_id in line for job_id in job_ids):
                             continue
-                        text = line.rstrip("\r\n")
-                        item = unpack(text)
+                        item = unpack(line)
                         if isinstance(item, dict):
-                            if not any(str(item.get(key) or "") in identifiers
-                                       for key in ("job", "job_id", "req", "request_id")):
+                            bound_ids = {v for k in ("job", "job_id") if isinstance(v := item.get(k), str)}
+                            matches = bound_ids & job_ids
+                            if not matches or matches != bound_ids:
                                 continue
-                            item = {key: value for key, value in item.items() if key in LOG_KEYS}
-                        elif not identifiers.intersection(field.findall(text)):
-                            continue
-                        elif path.name.startswith("agent.log"):
-                            if "[diag]" in text or not re.search(r"\|\s*(?:WARNING|ERROR|CRITICAL)\s*\|", text):
-                                continue
-                            item = text[:1200]
                         else:
-                            parts = text.split(" | ")
-                            item = " | ".join([parts[0], *(part for part in parts[1:]
-                                if part.partition("=")[0] in LOG_KEYS)])
-                        if text not in seen:
-                            seen.add(text)
-                            safe = redact(item)
-                            yield f"[{path.relative_to(root)}] " + (safe if isinstance(safe, str)
-                                else json.dumps(safe, ensure_ascii=False))
+                            bound_ids = set(field.findall(line))
+                            matches = bound_ids & job_ids
+                            if not matches or matches != bound_ids:
+                                continue
+                            if path.name.startswith("agent.log"):
+                                severity = level.search(line)
+                                if "[diag]" in line or not severity:
+                                    continue
+                                item = {"level": severity[1]}
+                            else:
+                                item = {}
+                                for part in line.split(" | ")[1:]:
+                                    key, _, value = part.strip().partition("=")
+                                    if key == "status" or key in LOG_METRICS:
+                                        item[key] = unpack(value)
+                        safe = {"job_ids": sorted(matches)}
+                        safe.update({key: value for key, value in item.items()
+                                     if ((key in LOG_METRICS and type(value) in {int, float, bool})
+                                         or (key == "status" and isinstance(value, str) and value in LOG_STATES)
+                                         or (key == "level" and value in ("WARNING", "ERROR", "CRITICAL")))})
+                        row = f"[{path.relative_to(root)}] " + json.dumps(safe, ensure_ascii=False, sort_keys=True)
+                        if row not in seen:
+                            seen.add(row)
+                            yield row
             except (OSError, EOFError) as error:
                 yield f"[{path.relative_to(root)}] 读取失败：{type(error).__name__}"
 
@@ -240,9 +267,11 @@ def export_turn(conn, root, turn, out):
         "SELECT * FROM task_jobs WHERE job_id IN lineage AND owner_user_id=? AND session_id=? ORDER BY created_at",
         (job_id, owner, session, owner, session),
     ).fetchall()
-    identifiers = {identity for identity in (job_id, client_id) if identity}
-    for job in jobs:
-        identifiers.update(job[key] for key in ("job_id", "request_id", "client_request_id") if job[key])
+    identifiers = {job["job_id"] for job in jobs}
+    if conn.execute("SELECT 1 FROM sessions WHERE session_id=? AND owner_user_id=?", (session, owner)).fetchone():
+        identifiers.update(identity for identity in (job_id, client_id) if identity)
+        for job in jobs:
+            identifiers.update(job[key] for key in ("request_id", "client_request_id") if job[key])
     messages = history(conn, turn)
     proposals, history_tools = {}, []
     for message in messages:
@@ -354,10 +383,12 @@ def export_turn(conn, root, turn, out):
 
     ids = sorted(identifiers)
     slots = ",".join("?" for _ in ids)
+    has_tool_results = bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_results'").fetchone())
     records = {row["tool_call_id"]: dict(row) for row in conn.execute(
         f"SELECT * FROM tool_results WHERE session_id=? AND request_id IN ({slots}) ORDER BY created_at, rowid",
         (session, *ids),
-    )}
+    )} if ids and has_tool_results else {}
     all_calls = [key for key in dict.fromkeys([*call_ids, *history_tools, *records]) if isinstance(key, str) and key]
     print(f"\n## 工具参数与执行回执（{len(all_calls)} 条）", file=out)
     for call_id in all_calls:
@@ -394,14 +425,29 @@ def export_turn(conn, root, turn, out):
     for event in sorted(events, key=lambda row: row["timestamp"]):
         print(json.dumps(redact(event), ensure_ascii=False), file=out)
     print("\n## 关联运行日志", file=out)
-    if identifiers:
-        for entry in correlated_logs(root / "logs", identifiers):
-            print(entry, file=out)
+    for entry in correlated_logs(root / "logs", {job["job_id"] for job in jobs}):
+        print(entry, file=out)
     return len(all_calls), len(answers)
+
+
+def _publish_export(accounts_path, pending, target, owners):
+    # No DB mutations here. Serialize the final authorization check + rename
+    # with the auth writer that closes admission, even in WAL mode. Never
+    # publish a stale account snapshot after its deletion fence is installed.
+    uri = accounts_path.as_uri() + "?mode=rw"
+    with closing(sqlite3.connect(uri, uri=True, timeout=5)) as auth:
+        auth.execute("BEGIN IMMEDIATE")
+        for owner in owners:
+            if not auth.execute(
+                    "SELECT 1 FROM users u JOIN account_admission a ON a.owner=u.user_id "
+                    "WHERE u.user_id=? AND a.deleting=0", (owner,)).fetchone():
+                raise ExportScopeChanged("export scope changed; run the export again")
+        pending.replace(target)
 
 
 def save_export(conn, root, turns, directory, prefix, *, filename=None, revision=None, scope=None):
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    summaries = []
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=prefix, suffix=".tmp",
                                      dir=directory, delete=False) as out:
         pending = Path(out.name)
@@ -416,12 +462,15 @@ def save_export(conn, root, turns, directory, prefix, *, filename=None, revision
             print("常见凭据已遮盖。数值时间为 Unix 时间戳，日志时间保留源格式。", file=out)
             for turn in turns:
                 calls, answers = export_turn(conn, root, turn, out)
-                print(f"{turn['root_job_id']}: {calls} 条工具记录，{answers} 条最终回答")
+                summaries.append((turn["root_job_id"], calls, answers))
             out.flush()
             target = directory / filename if filename is not None else pending.with_suffix(".txt")
-            pending.replace(target)
+            _publish_export(root / "state" / "accounts.sqlite3", pending, target,
+                            {turn["owner_user_id"] for turn in turns})
         finally:
             pending.unlink(missing_ok=True)
+    for job_id, calls, answers in summaries:
+        print(f"{job_id}: {calls} 条工具记录，{answers} 条最终回答")
     return target
 
 
@@ -447,26 +496,28 @@ def main():
     with closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
+        accounts = root / "state" / "accounts.sqlite3"
+        conn.execute("ATTACH DATABASE ? AS auth_source", (accounts.as_uri() + "?mode=ro",))
         conn.execute("BEGIN")
         if args.job:
-            turns = [conn.execute("SELECT * FROM chat_turn_queue WHERE root_job_id=?", (job,)).fetchone()
+            turns = [conn.execute(_VISIBLE_QUEUE + " AND q.root_job_id=?", (job,)).fetchone()
                      for job in dict.fromkeys(args.job)]
             if any(turn is None for turn in turns):
                 parser.error("至少一个根任务 ID 不存在")
         elif args.date is not None:
             start = datetime.combine(args.date, time.min, SHANGHAI).timestamp()
             end = datetime.combine(args.date + timedelta(days=1), time.min, SHANGHAI).timestamp()
-            sql = "SELECT * FROM chat_turn_queue WHERE accepted_at>=? AND accepted_at<?"
+            sql = _VISIBLE_QUEUE + " AND q.accepted_at>=? AND q.accepted_at<?"
             params = (start, end)
             if args.owner is not None:
-                sql += " AND owner_user_id=?"
+                sql += " AND q.owner_user_id=?"
                 params += (args.owner,)
-            turns = conn.execute(sql + " ORDER BY accepted_at,owner_user_id,session_id,queue_seq",
+            turns = conn.execute(sql + " ORDER BY q.accepted_at,q.owner_user_id,q.session_id,q.queue_seq",
                                  params).fetchall()
         else:
-            turns = conn.execute("SELECT * FROM chat_turn_queue WHERE finished_at>0 AND root_job_id!='' "
-                                 "ORDER BY finished_at DESC LIMIT ?", (args.latest,)).fetchall()
-        if not turns:
+            turns = conn.execute(_VISIBLE_QUEUE + " AND q.finished_at>0 AND q.root_job_id!='' "
+                                 "ORDER BY q.finished_at DESC LIMIT ?", (args.latest,)).fetchall()
+        if not turns and (args.date is None or args.owner is not None):
             parser.error("没有可导出的任务")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         prefix = f"8043-{turns[0]['root_job_id']}-{stamp}-" if len(turns) == 1 else f"8043-{len(turns)}-turns-{stamp}-"
@@ -486,4 +537,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ExportScopeChanged, sqlite3.Error):
+        # Incomplete schema/unreadable identity DB is not authorization to export.
+        raise SystemExit("无法确认导出范围，请核对运行目录和账号状态后重试。") from None

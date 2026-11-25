@@ -146,8 +146,6 @@ class ContextManager:
         self._session = session_manager
         self._memory = memory_store
         self._budget = budget
-        self._fast_llm = None
-        self._fast_llm_nothink = None
         # v8.16.3: format_hint 会话级缓存（(session_id, mode) → 非 fallback 格式），
         # 追问轮直接复用，省一次 fast 调用；上限 256 防会话膨胀
         self._hint_fmt_cache: dict[tuple, str] = {}
@@ -157,28 +155,15 @@ class ContextManager:
         # v8.17.19: hints 属高频低价值 fast 调用——关思维链经 llm_pool extra_body
         # 通道（fail-soft 自动去参回退）；旧实测日志 hints_ms 38s 即 v4-flash
         # 思维链吃掉整个 load 段。失败向下游 except 兜底（fail-soft）。
-        if thinking_off:
-            if self._fast_llm_nothink is None:
-                from src.core.llm_pool import get_llm as _pool_get_llm
-                self._fast_llm_nothink = _pool_get_llm(
-                    model=settings.RESOLVED_FAST_MODEL,
-                    api_key=settings.RESOLVED_FAST_API_KEY,
-                    base_url=settings.RESOLVED_FAST_BASE_URL,
-                    temperature=0,
-                    timeout=12,
-                    thinking_off=True,
-                )
-            return self._fast_llm_nothink
-        if self._fast_llm is None:
-            from src.core.llm_pool import get_llm as _pool_get_llm
-            self._fast_llm = _pool_get_llm(
-                model=settings.RESOLVED_FAST_MODEL,
-                api_key=settings.RESOLVED_FAST_API_KEY,
-                base_url=settings.RESOLVED_FAST_BASE_URL,
-                temperature=0,
-                timeout=12,
-            )
-        return self._fast_llm
+        from src.core.llm_pool import get_llm as _pool_get_llm
+        transport = settings.model_transport(fast=True)
+        if not transport.api_key:
+            raise RuntimeError("Fast model credential is not configured for this endpoint")
+        return _pool_get_llm(
+            model=transport.model, api_key=transport.api_key, base_url=transport.base_url,
+            provider_headers=transport.headers, temperature=0, timeout=12,
+            thinking_off=thinking_off,
+        )
 
     async def load(
         self,

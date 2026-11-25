@@ -310,8 +310,8 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
             environment = {key: str(getattr(settings, key, "") or "") for key in (
                 "FIGURES_SANDBOX_BACKEND", "FIGURES_SANDBOX_IMAGE", "FIGURES_SANDBOX_IMAGE_SHA256", "FIGURES_SANDBOX_RUNTIME")}
             if contract.get("figures") or not kwargs.get("outputs_json"):
-                from src.figures.nature_receipts import COMMIT as nature_commit
-                environment["nature_skill_commit"] = nature_commit
+                from src.figures.engine_bundle import nature_method_identity
+                environment.update(nature_method_identity())
             # QA, analysis refs, titles and legacy formats affect the execution
             # too; a reused request key with any changed option must conflict.
             options = {key: value for key, value in kwargs.items() if key not in {'inputs_json', 'outputs_json'}}

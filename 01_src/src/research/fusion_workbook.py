@@ -6,6 +6,8 @@ rule, substitutes an audit method, or uses a display label to locate cells.
 from __future__ import annotations
 
 from collections import defaultdict
+import csv
+from io import BytesIO, StringIO
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -22,6 +24,7 @@ _LABELS = {
     "BROKEN_REF": "公式引用失效", "BROKEN_REFERENCE": "公式引用失效", "MISSING_SHEET": "公式引用工作表缺失",
     "EXTERNAL_LINK": "公式外部链接", "FORMULA_ERROR": "公式错误", "REF_ERROR": "公式引用错误",
     "CIRCULAR_REFERENCE": "公式循环引用", "CIRCULAR_REF": "公式循环引用",
+    "duplicate_numeric_block": "重复数值区段（复核线索）", "terminal_digits": "末位数字分布（列级复核线索）",
 }
 
 
@@ -142,7 +145,8 @@ def _finding_detail(finding):
         if finding.get(key) is not None:
             parts.append(f"{label} {_text(finding[key], 250)}")
     evidence = finding.get("evidence") or {}
-    for key, label in (("detector", "检测器"), ("formula", "公式"), ("notes", "证据")):
+    for key, label in (("detector", "检测器"), ("formula", "公式"), ("notes", "证据"),
+                       ("reason", "原因"), ("interpretation", "解释"), ("message", "说明"), ("statistics", "统计")):
         if evidence.get(key) is not None:
             parts.append(f"{label} {_text(evidence[key], 250)}")
     return "。".join(parts)
@@ -173,37 +177,118 @@ def _project_findings(report, digest, targets, bounds):
     return sorted(summaries, key=lambda item: (item["summary_location"], item["check"], item["detail"]))
 
 
+_CSV_SHEET = "CSV 原始记录"
+_MAX_CSV_CELLS = 250_000
+
+
+def _csv_workbook(report, data, digest):
+    """Mirror UTF-8 CSV record positions, never literal text into formulas."""
+    from openpyxl import Workbook
+
+    execution = report.get("execution") or {}
+    options = execution.get("options") or {}
+    inputs = execution.get("inputs") or []
+    matches = [item for item in inputs if item.get("role") == "table"]
+    if (execution.get("skill") != "research-integrity" or len(matches) != 1
+            or matches[0].get("sha256") != digest or "numeric" not in options.get("checks", [])):
+        raise ValueError("Fusion report does not identify the authorized CSV numeric review")
+    try:
+        rows = list(csv.reader(StringIO(data.decode("utf-8-sig"), newline="")))
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise ValueError("CSV record positions could not be reproduced") from exc
+    if not rows or not rows[0] or len(rows) > 5001:
+        raise ValueError("CSV record count exceeds publication budget")
+    height, width = len(rows), max(map(len, rows))
+    if width > 16384 or height * width > _MAX_CSV_CELLS:
+        raise ValueError("CSV cell count exceeds publication budget")
+    wb = Workbook()
+    sheet = wb.active
+    sheet.title = _CSV_SHEET
+    for row_number, row in enumerate(rows, 1):
+        for column_number, value in enumerate(row, 1):
+            if len(value) > 32767 or ILLEGAL_CHARACTERS_RE.search(value):
+                raise ValueError("CSV contains text that cannot be copied faithfully to Excel")
+            sheet.cell(row_number, column_number, value).data_type = "s"
+    # Openpyxl drops empty strings on reopen, but they remain distinct from a
+    # missing CSV field in the retained original. The file labels record indexing.
+    workbook = BytesIO()
+    wb.save(workbook)
+    wb.close()
+    target = {"sheet_name": _CSV_SHEET, "region_id": "csv_records", "region_bounds": _address((1, 1, width, height)),
+              "header_row": 1, "column_numbers": range(1, width + 1), "row_numbers": range(2, height + 1),
+              "findings": []}
+    summaries = [{"check": "csv_derived", "summary_label": "CSV 派生副本",
+                  "summary_location": _CSV_SHEET, "summary_link": None, "severity": "review",
+                  "detail": "CSV 逻辑记录按原顺序映射，含表头。仅 Worker 精确区段标红；线索不是定论。原 CSV 未修改。"}]
+    for finding in report["findings"]:
+        label, links, positions = set(), set(), set()
+        rule, severity = _text(finding["rule_id"], 150), finding.get("severity") or "review"
+        for location in finding["locations"]:
+            if location.get("source_file_hash") != digest:
+                label.add("非当前 CSV 来源（未标注）")
+                continue
+            scope = location.get("scope")
+            row, last, col = (location.get(key) for key in ("row_index", "end_row_index", "column_index"))
+            if (scope == "csv_range" and all(type(i) is int for i in (row, last, col))
+                    and 2 <= row <= last <= height and 1 <= col <= len(rows[0])
+                    and all(col <= len(rows[n - 1]) for n in range(row, last + 1))):
+                address = _address((col, row, col, last))
+                label.add(f"{_CSV_SHEET}!{address}")
+                links.add((_CSV_SHEET, address))
+                if severity != "coverage":
+                    positions.update((n, col) for n in range(row, last + 1))
+            elif scope == "column" and type(col) is int and 1 <= col <= len(rows[0]):
+                label.add(f"CSV 第 {col} 列（{_text(rows[0][col - 1], 100)}，非单元格发现）")
+            else:
+                label.add("未能绑定 CSV 精确记录（未标注）")
+        item = {"check": rule, "severity": severity, "detail": _finding_detail(finding)}
+        if positions:
+            target["findings"].append({**item, "finding_id": _text(finding["finding_id"], 128),
+                "evidence": {"cells": [{"row": r, "column_index": c} for r, c in sorted(positions)]}})
+        summaries.append({**item, "summary_location": _text(" ↔ ".join(sorted(label)), 1000) or "未提供精确位置",
+                          "summary_label": _LABELS.get(rule, rule), "summary_link": min(links, default=None)})
+    return workbook.getvalue(), [target], summaries
+
+
 def publish_fusion_workbook(report, *, source_file_id, source_sha256, source_name, source_bytes):
     """Render and register one annotated copy, returning the host artifact receipt."""
     from citrus_audit.workbook import export_reviewed_workbook
     from src.core.cancel import raise_if_cancelled
     from src.core.ooxml_determinism import normalize_ooxml_bytes
     from src.research import tools
+    from src.research.fusion_delivery import report_renderer
 
     raise_if_cancelled("data_audit_workbook")
+    suffix = Path(source_name).suffix.lower()
     if (not isinstance(source_file_id, str) or not source_file_id.strip() or len(source_file_id) > 256
-            or Path(source_name).suffix.lower() != ".xlsx" or not isinstance(source_bytes, bytes)
+            or suffix not in {".xlsx", ".csv"} or not isinstance(source_bytes, bytes)
             or sha256(source_bytes).hexdigest() != source_sha256):
         raise ValueError("Authorized Fusion workbook identity does not match its bytes")
     status = report.get("status")
     if status not in {"complete", "partial"}:
         raise ValueError("Fusion workbook requires a completed or partial audit")
-    targets, bounds = _review_targets(report, source_sha256)
-    summaries = _project_findings(report, source_sha256, targets, bounds)
-    content, stats = export_reviewed_workbook(source_bytes, targets=list(targets.values()),
-        source_sha256=source_sha256, status=status, presentation="annotated",
+    if suffix == ".csv":
+        data, targets, summaries = _csv_workbook(report, source_bytes, source_sha256)
+    else:
+        data = source_bytes
+        areas, bounds = _review_targets(report, source_sha256)
+        summaries = _project_findings(report, source_sha256, areas, bounds)
+        targets = list(areas.values())
+    content, stats = export_reviewed_workbook(data, targets=targets,
+        source_sha256=source_sha256, original=suffix == ".xlsx", status=status, presentation="annotated",
         exact_locations=True, summary_findings=summaries)
     content = normalize_ooxml_bytes(content)
     digest = sha256(content).hexdigest()
-    filename = tools._short_stem(source_name) + "_审查标注.xlsx"
+    filename = tools._short_stem(source_name) + ("_CSV派生_审查标注.xlsx" if suffix == ".csv" else "_审查标注.xlsx")
     publication_key = sha256(json.dumps([source_file_id, source_sha256, digest, "fusion-annotated/1"],
                                          separators=(",", ":")).encode()).hexdigest()
     raise_if_cancelled("data_audit_workbook")
-    url = tools._save_artifact(filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               source_file_id=source_file_id, source_sha256=source_sha256,
-                               logical_task_id="audit_workbook:" + publication_key)
+    with report_renderer("fusion_annotated_workbook"):
+        url = tools._save_artifact(filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   source_file_id=source_file_id, source_sha256=source_sha256,
+                                   logical_task_id="audit_workbook:" + publication_key)
     if not url:
         raise ValueError("Fusion workbook was not registered")
     return {"url": url, "filename": filename, "sha256": digest, "size_bytes": len(content),
             "source_file_id": source_file_id, "source_sha256": source_sha256,
-            "file_index": 1, "cells": stats["marked_cells"]}
+            "file_index": 1, "cells": stats["marked_cells"], "source_format": suffix[1:]}

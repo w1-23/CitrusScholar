@@ -188,10 +188,9 @@ def run(browser, origin, output):
         browser.call('Page.reload', ignoreCache=True)
         check('Refresh preserves durable clock', "document.querySelector('[data-state=waiting]') && Number((document.querySelector('.research-task-elapsed')?.innerText||'').replace(/\\D/g,'')) >= " + ''.join(filter(str.isdigit, elapsed)))
         browser.click('#ctxCircleBtn')
-        browser.click('#ctxUsageBlock summary')
-        check('Missing model capacity and cache', f"({text('#ctxBarLabel')}).includes('模型窗口未知') && ({text('#ctxCacheNote')}).includes('未提供')")
+        check('Unknown capacity shows only the known count', f"({text('#ctxUsed')}) === '9.2K' && ({text('#ctxValueNote')}).includes('容量未知') && document.querySelector('#ctxViewGrid').disabled")
         capture('context-missing')
-        browser.click('#ctxDrawer button')
+        browser.click('#ctxClose')
         phase('tool')
         check('Running tool replaces dot phase', "document.querySelector('[data-state=tool]') && document.querySelector('.is-running')")
         capture('tool')
@@ -202,19 +201,19 @@ def run(browser, origin, output):
         check('Reconnection restores the tool display', "document.querySelector('[data-state=tool]') && document.querySelector('.is-running')")
         phase('zero')
         browser.click('#ctxCircleBtn')
-        check('Explicit zeros with zero denominator suppress cache ratio',
-              f"({text('#ctxCacheNote')}).includes('读取：0') && ({text('#ctxCacheNote')}).includes('未缓存：0') && !({text('#ctxCacheNote')}).includes('%')")
+        check('Provider reporting does not overwrite context occupancy',
+              f"({text('#ctxUsed')}) === '9.2K' && !document.querySelector('#ctxCacheNote')")
         capture('context-zero')
         phase('usage')
-        check('Known capacity and provider cache ratio', f"({text('#ctxCacheNote')}).includes('25%') && ({text('#ctxBarLabel')}).includes('131,072')")
+        check('Known capacity is displayed with the estimate', f"({text('#ctxUsed')}) === '10.4K / 131K' && ({text('#ctxRingPct')}) === '8%'")
         capture('context-reported')
-        evaluate("pickTheme('dark'); setReduceMotion(true)")
-        check('Reduced motion in dark theme', "document.documentElement.dataset.theme === 'dark' && getComputedStyle(document.querySelector('.research-task-orbit')).animationName === 'none'")
+        evaluate("pickTheme('navy'); setReduceMotion(true)")
+        check('Reduced motion in dark theme', "document.documentElement.dataset.theme === 'navy' && getComputedStyle(document.querySelector('.research-task-orbit')).animationName === 'none'")
         capture('dark-reduced-motion')
-        browser.click('#ctxDrawer button')
+        browser.click('#ctxClose')
         phase('whitespace')
         check('Thirty completed tools preserve metrics and whitespace keeps waiting',
-              f"({text('.research-process-body')}).includes('共 30 次尝试') && ({text('#ctxCacheNote')}).includes('25%') && document.querySelector('[data-state=waiting]')")
+              f"({text('.research-process-body')}).includes('共 30 次尝试') && ({text('#ctxUsed')}) === '10.4K / 131K' && document.querySelector('[data-state=waiting]')")
         phase('answer')
         check('First visible answer stops dots', f"([...document.querySelectorAll('.turn-answer')].some(node => node.textContent.includes('表格核对结果'))) && !document.querySelector('[data-state=waiting]')")
         capture('answer')
@@ -228,7 +227,7 @@ def run(browser, origin, output):
         check('The only composer action is Stop while the original task is executing',
               "document.querySelectorAll('.input-box textarea, .task-controls textarea').length === 1 "
               "&& document.querySelector('#send-btn').getAttribute('aria-label') === '停止当前任务' "
-              "&& document.querySelector('#send-btn use').getAttribute('href') === '#ui-stop' "
+              "&& document.querySelector('#send-btn use').getAttribute('href') === '/assets/citrus-icons.svg#ui-stop'  "
               "&& !document.querySelector('#stop-btn, #composer-supplement, #composer-new-message') "
               "&& !document.querySelector('#input-tools-menu').hidden && !document.querySelector('#browse-requested').checked")
         fill('保留在原会话的独立草稿')
@@ -241,8 +240,11 @@ def run(browser, origin, output):
               "document.querySelector('#user-input').value === '保留在原会话的独立草稿' "
               "&& document.querySelector('#send-btn').getAttribute('aria-label') === '停止当前任务'")
         browser.click('#input-tools-menu summary')
-        check('The plus menu exposes attachment selection and the real methods catalog',
-              "document.querySelector('#attachment-btn') && document.querySelector('[data-skill-id=data-audit]')")
+        check('The plus menu exposes only separate attachment choices',
+              "document.querySelectorAll('#attachment-options [data-composer-source]').length === 3 && !document.querySelector('#input-tools-menu #skill-picker-panel')")
+        browser.click('#skill-picker-menu summary')
+        check('A separate composer control opens the real methods catalog',
+              "!document.querySelector('#input-tools-menu').open && document.querySelector('[data-skill-id=data-audit]')")
         browser.click('[data-skill-id=data-audit]')
         evaluate('''(() => {
           const input = document.querySelector('#user-input');
@@ -257,7 +259,7 @@ def run(browser, origin, output):
               "document.querySelector('#attachment-list img') && experienceRequests().posts.length === 0")
         press_enter()
         check('Enter associates the screenshot and frozen method with one independent queue entry',
-              "experienceRequests().posts.length === 1 && experienceRequests().posts[0]?.attachments[0]?.name.endsWith('.png') && experienceRequests().posts[0].selected_skills[0]?.id === 'data-audit' && !('browse_requested' in experienceRequests().posts[0]) "
+              "experienceRequests().posts.length === 1 && experienceRequests().posts[0]?.attachments[0]?.name.endsWith('.png') && experienceRequests().posts[0].selected_skills[0]?.id === 'data-audit' && experienceRequests().posts[0].selected_skills[0]?.version === 'fixture-v1' && experienceRequests().posts[0].selected_skills[0]?.sha256 === 'a'.repeat(64) && !('browse_requested' in experienceRequests().posts[0]) "
               "&& document.querySelector('.sent-attachment-gallery img') && document.querySelector('#selected-skills').hidden "
               "&& document.querySelectorAll('.message.user .turn-user-queue-state').length === 1 "
               "&& document.querySelector('#send-btn').getAttribute('aria-label') === '停止当前任务' && experienceRequests().updates.length === 0")

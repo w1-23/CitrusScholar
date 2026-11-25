@@ -91,6 +91,39 @@ def runtime_identity(c):
     return identity
 
 
+def collect_outputs(c):
+    # Run the unchanged filesystem checks in trusted code over private tmpfs.
+    # A rejected declaration is an exact collector outcome, not a socket error.
+    try:
+        result = subprocess.run([sys.executable, "-I", "-c", c["collector"],
+            json.dumps({"paths": c["outputs"], "bytes": c["output_bytes"]})],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=10, env=c["host_env"])
+    except subprocess.TimeoutExpired:
+        return {"collection_error": "apptainer_collector_timeout"}
+    except OSError:
+        return {"collection_error": "apptainer_collector_unconfirmed"}
+    if result.returncode != 0:
+        return {"collection_error": "apptainer_collector_unconfirmed"}
+    if len(result.stdout) > c["collection_bytes"]:
+        return {"collection_error": "apptainer_collection_record_limit"}
+    try:
+        record = json.loads(result.stdout, object_pairs_hook=unique_object)
+    except (ValueError, RecursionError):
+        return {"collection_error": "apptainer_collector_record_invalid"}
+    if type(record) is dict and set(record) == {"error"}:
+        return {"collection_error": record["error"]}
+    return {"outputs": record}
+
+
+def unique_object(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError("duplicate_control_key")
+        result[key] = value
+    return result
+
+
 def main():
     bootstrap = sys.argv[1] == "--bootstrap"
     settings_path = Path(sys.argv[2] if bootstrap else sys.argv[1])
@@ -132,6 +165,7 @@ def main():
         connection, _ = listener.accept()
         with connection:
             connection.settimeout(10)
+            authorized = False
             try:
                 data = bytearray()
                 while not data.endswith(b"\n"):
@@ -139,10 +173,12 @@ def main():
                     if not block or len(data) + len(block) > 4096:
                         raise ValueError("bounded_control_request_required")
                     data.extend(block)
-                request = json.loads(data)
-                if (request.get("identity") != identity or request.get("operation") not in ("inspect", "collect")
+                request = json.loads(data, object_pairs_hook=unique_object)
+                if (type(request) is not dict or request.get("identity") != identity
+                        or request.get("operation") not in ("inspect", "collect")
                         or type(request.get("outputs", False)) is not bool):
                     raise ValueError("foreign_control_request")
+                authorized = True
                 if overflow.is_set():
                     raise ValueError("supervisor_record_overflow")
                 with lock:
@@ -157,17 +193,8 @@ def main():
                 if request["operation"] == "collect":
                     if response["phase"] != "retained":
                         raise ValueError("retained_supervisor_required")
-                    response["outputs"] = {}
-                    if request.get("outputs") and c["outputs"]:
-                        # Existing NOFOLLOW + inode/link/type/size/change checks,
-                        # running as trusted service code over private tmpfs.
-                        collected = subprocess.run([sys.executable, "-I", "-c", c["collector"],
-                            json.dumps({"paths": c["outputs"], "bytes": c["output_bytes"]})],
-                            stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
-                            env=c["host_env"], check=True)
-                        if len(collected.stdout) > c["collection_bytes"]:
-                            raise ValueError("collection_record_overflow")
-                        response["outputs"] = json.loads(collected.stdout)
+                    response.update(collect_outputs(c) if request.get("outputs") and c["outputs"]
+                                    else {"outputs": {}})
                 encoded = json.dumps(response, separators=(",", ":")).encode()
                 if len(encoded) > c["collection_bytes"] + c["summary_bytes"] + 16384:
                     raise ValueError("control_record_overflow")
@@ -178,7 +205,10 @@ def main():
                 print(json.dumps({'event': 'code_observation_unconfirmed',
                     'error_type': type(exc).__name__, 'child_exit': process.poll()}), file=sys.stderr, flush=True)
                 try:
-                    connection.sendall(b'{"error":"service_observation_unconfirmed"}')
+                    response = {"error": "service_observation_unconfirmed"}
+                    if authorized:
+                        response["identity"] = identity
+                    connection.sendall(json.dumps(response, separators=(",", ":")).encode())
                 except OSError:
                     pass
 

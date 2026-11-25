@@ -3,7 +3,7 @@ name: Application regressions
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, codex/8043-ui-core-reliability]
   workflow_dispatch:
 
 permissions:
@@ -88,7 +88,39 @@ jobs:
             01_src/src/corpus_integration \
             packages/citrus_corpus/tests \
             01_src/src/research/nature_composition_test.py \
-            01_src/src/figures/nature_current_qa_test.py
+            01_src/src/figures/nature_current_qa_test.py \
+            01_src/scripts/manage_account_test.py \
+            01_src/src/account_retention_test.py \
+            01_src/src/agent/receipt_policy_test.py \
+            01_src/src/api/admin_runtime_activation_test.py \
+            01_src/src/api/library_preview_boundary_test.py \
+            01_src/src/api/session_pagination_test.py \
+            01_src/src/code_execution/apptainer_collection_test.py \
+            01_src/src/core/figure_registry_recovery_test.py \
+            01_src/src/core/scoped_tool_receipt_test.py \
+            01_src/src/figures/publication_reliability_test.py \
+            01_src/src/figures/svg_projects_test.py \
+            01_src/src/figures/workbench/workbench_test.py \
+            01_src/src/research/standalone_audit_workbook_format_test.py \
+            01_src/src/retrieval/generation_boundary_test.py \
+            01_src/src/session/workspace_retention_test.py
+  release-contract:
+    name: Immutable 8043 release contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Verify the candidate Git archive and release fixtures
+        run: |
+          python -B 04_scripts/stage_8043_release.py archive-check \
+            --repository "$GITHUB_WORKSPACE" --commit "$GITHUB_SHA"
+          python -B 04_scripts/stage_8043_release_test.py
+          python -B 04_scripts/stage_fusion_release_test.py
   skills-lock:
     name: Standalone Skill lock drift
     runs-on: ubuntu-24.04
@@ -131,42 +163,10 @@ jobs:
             --repositories "$RUNNER_TEMP/skill-sources" \
             --output "$RUNNER_TEMP/skill-release" \
             --include-runtime
-      - name: Compare staged packages with the repository
-        env:
-          RUNNER_TEMP: ${{ runner.temp }}
+      - name: Verify locked package bytes and the exact host audit overlay
         run: |
-          python - <<'PY'
-          import hashlib
-          import os
-          from pathlib import Path
-          release = Path(os.environ["RUNNER_TEMP"]) / "skill-release" / "python"
-          # These legacy fixtures belong to the Citrus test suite, not to the
-          # standalone distribution, so they are allowed as extra local files.
-          allowed_extras = {
-              "citrus_refcheck": {"reference_verdict_eval_test.py",
-                                  "reference_verdict_fixtures.py"},
-              "citrus_audit": {"plan_test.py", "region_workbook_test.py"}}
-          failed = []
-          for module in ("citrus_refcheck", "citrus_audit"):
-              staged, repo = release / module, Path("packages") / module
-              staged_files = {p.relative_to(staged) for p in staged.rglob("*") if p.is_file()}
-              repo_files = {p.relative_to(repo) for p in repo.rglob("*")
-                            if p.is_file() and "__pycache__" not in p.parts}
-              extras = repo_files - staged_files
-              extras -= {Path(name) for name in allowed_extras.get(module, ())}
-              if extras:
-                  failed.append(f"{module}: extra {sorted(map(str, extras))}")
-              for rel in sorted(staged_files):
-                  left = (staged / rel).read_bytes()
-                  right = (repo / rel).read_bytes() if (repo / rel).is_file() else None
-                  if right is None:
-                      failed.append(f"{module}/{rel}: missing from repository")
-                  elif hashlib.sha256(left).digest() != hashlib.sha256(right).digest():
-                      failed.append(f"{module}/{rel}: differs from locked repository")
-          if failed:
-              raise SystemExit("Skill lock drift:\n" + "\n".join(failed))
-          print("Skill runtime packages match the locked repositories")
-          PY
+          python -B 04_scripts/verify_standalone_skill_overlay.py \
+            --staged-python "$RUNNER_TEMP/skill-release/python" --host-packages packages
 
   node:
     name: Node browser-state fixtures

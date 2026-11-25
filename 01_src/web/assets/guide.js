@@ -209,7 +209,6 @@
     open(target.getAttribute('data-citrus-guide') || 'upload');
   });
   if (document.body && document.body.classList.contains('guide-page')) {
-    try { var theme = localStorage.getItem('citrus_theme'); if (['light', 'cartoon', 'dark'].includes(theme)) document.documentElement.dataset.theme = theme; } catch (_) {}
     open(location.hash.slice(1) || 'upload');
   }
 }());

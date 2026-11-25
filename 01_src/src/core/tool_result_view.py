@@ -19,6 +19,7 @@ _WORKSPACE_READS = frozenset({"read", "read_run", "read_skill", "read_skill_reso
 _CONTROL_PRIORITY = (
     "status", "next_action", "terminal", "review_required", "can_resume", "export_ready",
     "audit_id", "review_id", "_tool_outcome", "dataset_ref", "analysis_result_ref",
+    "findings_page", "findings_total", "registry_coverage", "execution_id", "saved_report", "report_file_error",
     "audit_status", "continuation", "counts", "coverage", "export_requests", "review", "files", "exports",
 )
 
@@ -38,19 +39,19 @@ def _verified_reference(message, text: str):
     if not isinstance(storage, dict) or storage.get("complete") is not True:
         return None
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    if (reference.get("tool_call_id") != message.tool_call_id
+    from src.core.tool_results import fetch_for_current_request, observation_receipt_key, storage_integrity
+    key = observation_receipt_key(message)
+    if (reference.get("tool_call_id") != key
             or reference.get("original_chars") != len(text) or reference.get("full_sha256") != digest):
         return None
-    from src.core.tool_results import fetch_for_current_request, storage_integrity
-
-    row = fetch_for_current_request(message.tool_call_id)
+    row = fetch_for_current_request(key)
     try:
         if (not row or row.get("tool_name") != message.name or row.get("full_sha256") != digest
                 or not storage_integrity(row)["complete"]):
             return None
     except (ValueError, TypeError):
         return None
-    return {"tool_call_id": message.tool_call_id, "full_sha256": digest,
+    return {"tool_call_id": key, "full_sha256": digest,
             "original_chars": len(text), "stored_chars": len(text)}
 
 
@@ -178,7 +179,7 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         "tool_result_ref": reference,
         "delivery": "stored_result_with_partial_preview",
         "execution_status": status,
-        "read_with": {"tool": "read_tool_result", "tool_call_id": message.tool_call_id},
+        "read_with": {"tool": "read_tool_result", "tool_call_id": reference["tool_call_id"]},
         "complete": False,
         "field_index": index,
         "control_observation": control,

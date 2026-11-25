@@ -13,7 +13,7 @@ from .acquisition import ExplicitAcquirer
 from .catalog import Catalog
 from .intake import Intake
 from .models import CpuE5, CpuRerank, FusedRank
-from .publication import Publisher
+from .publication import Publisher, resume_publication
 from .reader import Reader
 from .store import Store
 
@@ -73,6 +73,7 @@ def parser():
     publish.add_argument("--min-free-mib", type=int, default=2048)
     rollback = commands.add_parser("rollback")
     rollback.add_argument("generation")
+    commands.add_parser("resume-publication", help="release a completed rollback hold")
     search = commands.add_parser("search")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=6)
@@ -161,6 +162,8 @@ def _run(args):
     if command == "search":
         with Reader(store).pin(**_models(args)) as pinned:
             return pinned.search(args.query, args.limit)
+    if command == "resume-publication":
+        return resume_publication(store)
     os.nice(10)
     if command == "rollback":
         return Publisher(store, **_models(args)).rollback(args.generation)

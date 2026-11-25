@@ -155,6 +155,9 @@ def output_names(template, operation):
 
 def argv(spec: RunArgs, stem: str) -> tuple[str, ...]:
     """No model-provided paths, executable, flags or raw argv cross this boundary."""
+    if spec.backend == "r":
+        from .nature_skill_r import arguments
+        return arguments(spec, stem)
     options = spec.plot.model_dump(exclude={"template", "drop_incomplete"}, exclude_none=True)
     if isinstance(spec.plot, Marginal) and spec.plot.group_col is None:
         options["group_col"] = ""  # Upstream defaults to a field named group.
@@ -179,13 +182,13 @@ _MAPPINGS = {
 }
 
 
-def template_qa(raw: bytes, spec: RunArgs, stem: str) -> dict:
+def template_qa(raw: bytes, spec: RunArgs, stem: str, *, pdf_sha256=None) -> dict:
     qa = json.loads(raw)
     template = spec.plot.template
     mapping = {role: getattr(spec.plot, key) for role, key in _MAPPINGS[template].items()}
     if isinstance(spec.plot, Marginal) and spec.plot.group_col is None:
         mapping["group"] = ""
-    if (type(qa) is not dict or qa.get("template") != template or qa.get("backend") != "python"
+    if (type(qa) is not dict or qa.get("template") != template or qa.get("backend") != spec.backend
             or qa.get("demo") is not False or qa.get("input") != Path(CSV).name
             or qa.get("output_prefix") != stem or qa.get("mapping") != mapping):
         raise ValueError("nature_plot_upstream_qa_identity_mismatch")
@@ -194,4 +197,8 @@ def template_qa(raw: bytes, spec: RunArgs, stem: str) -> dict:
             or counts[0] != sum(counts[1:]) or not counts[1]
             or (any(counts[2:]) and not spec.plot.drop_incomplete)):
         raise ValueError("nature_plot_upstream_qa_counts_invalid")
-    return {key: qa[key] for key in ("rows_input", "rows_plotted", "excluded_rows", "excluded_entities")}
+    result = {key: qa[key] for key in ("rows_input", "rows_plotted", "excluded_rows", "excluded_entities")}
+    if spec.backend == "r":
+        from .nature_skill_r import figure_qa
+        result.update(figure_qa(qa, pdf_sha256))
+    return result

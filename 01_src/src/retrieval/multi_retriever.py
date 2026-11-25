@@ -21,7 +21,7 @@ from src.retrieval.bm25 import (
 )
 from src.retrieval.corpus_registry import (
     CorpusAccessScope, CorpusMetadataError, active_index_generation,
-    active_lancedb_path, load_corpus_registry,
+    active_index_pointer, active_lancedb_path, load_corpus_registry,
     normalize_chunk_metadata,
 )
 from src.core.executors import (
@@ -31,17 +31,6 @@ from src.core.executors import (
 )
 
 logger = logging.getLogger(__name__)
-
-def _normalized_local_category(value: object) -> str:
-    return load_corpus_registry().normalize_topic(value)
-
-
-def _local_category_allowed(row: dict, categories: set[str]) -> bool:
-    if not categories:
-        return True
-    actual = _normalized_local_category(row.get("l1_category"))
-    return actual in categories
-
 
 def local_corpus_family(chunk: Dict) -> str:
     """Resolve family IDs from the shared manifest and the one-time legacy adapter."""
@@ -173,11 +162,12 @@ class MultiBatchRetriever:
 
             logger.info("[MultiBatchRetriever] 首次初始化 - 加载 Qdrant 客户端与 BM25 索引")
             self.data_dir = settings.DATA_DIR
-            self.registry = load_corpus_registry(self.data_dir)
-            self.lance_root = active_lancedb_path(self.data_dir)
-            self.index_generation = active_index_generation(self.data_dir)
+            self.index_pointer = active_index_pointer(self.data_dir)
+            self.registry = load_corpus_registry(self.data_dir, pointer=self.index_pointer)
+            self.lance_root = active_lancedb_path(self.data_dir, pointer=self.index_pointer)
+            self.index_generation = active_index_generation(self.data_dir, pointer=self.index_pointer)
             self.corpus_scope = CorpusAccessScope.from_registry(
-                self.registry, index_generation=active_index_generation(self.data_dir))
+                self.registry, index_generation=self.index_generation)
             self.embedder = Embedder()
             self.reranker = Reranker()
             self.batches: Dict[str, Tuple[QdrantClient, str]] = {}
@@ -211,11 +201,8 @@ class MultiBatchRetriever:
             self.failed_batches: Dict[str, str] = {}  # v8.3.4: 向量加载失败批次（lock 冲突/异常），供降级提示
 
             try:
-                pointer_path = self.data_dir / "active_index.json"
-                pointer = None
-                if pointer_path.exists():
-                    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-                    self.index_generation = str(pointer.get("generation") or self.lance_root.name)
+                pointer = self.index_pointer
+                if pointer is not None:
                     expected_contract = {
                         "index_schema_version": 2,
                         "embedding_model": settings.EMBEDDING_MODEL,
@@ -407,7 +394,7 @@ class MultiBatchRetriever:
             if self.backend == "lancedb":
                 self._load_lance_batch(batch_name)
                 continue
-            if (self.data_dir / "active_index.json").is_file():
+            if self.index_pointer is not None:
                 self.failed_batches[batch_name] = (
                     "active versioned generations are built as LanceDB; "
                     "set RETRIEVAL_BACKEND=lancedb or auto")
@@ -1007,7 +994,7 @@ class MultiBatchRetriever:
             int(row["_global_idx"]) for row in self.global_chunks
             if local_corpus_family(row) in allowed
             and str(row.get("corpus_id") or "") in allowed_ids
-            and _local_category_allowed(row, categories)
+            and (not categories or self.registry.normalize_topic(row.get("l1_category")) in categories)
         }
         if not eligible:
             return []
@@ -1078,7 +1065,7 @@ class MultiBatchRetriever:
             int(row["_global_idx"]) for row in self.global_chunks
             if local_corpus_family(row) in allowed
             and str(row.get("corpus_id") or "") in allowed_ids
-            and _local_category_allowed(row, categories)
+            and (not categories or self.registry.normalize_topic(row.get("l1_category")) in categories)
         }
         hits = self.bm25.top_k(query, k=max(int(limit) * 12, 80),
                                allowed_doc_ids=eligible)

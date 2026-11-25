@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 from pathlib import Path
 
 from src.code_execution.presence import worker_available
@@ -15,6 +16,7 @@ from .fusion_worker_contract import (BUNDLE_ROOT, INPUT_ROOT, LAUNCHER, MAX_INPU
     OUTPUT, REQUEST, SCOPE, decode, encode, input_path, is_hash, load_bundle, make_request, sha,
     validate_reference, validate_report)
 from .fusion_worker_entry import MAX_REPORT_BYTES
+from .fusion_lineage import prior_report_jobs as _prior_report_jobs
 
 LIMITS = ExecutionLimits(timeout_sec=90, memory_mb=2048, cpu_millis=1000, pids=64,
                          scratch_bytes=32 << 20, log_bytes=128 << 10,
@@ -186,7 +188,7 @@ def schedule_fusion(identity, *, operation_id, skill_release, skill_id, inputs, 
         return _submission(service, identity, row, bundle, content)
 
 
-def _original_inputs(service, request, bindings, bundle, meta):
+def _original_inputs(service, request, bindings, bundle, meta, *, historical=False):
     ref = bindings[REQUEST]
     raw = service.workspace.read_bytes(request.workspace_id, path=REQUEST, version=ref.version,
                                        expected_sha256=ref.sha256)
@@ -210,10 +212,11 @@ def _original_inputs(service, request, bindings, bundle, meta):
         if input_path(bundle.skill, role, relative) != target:
             raise ValueError("fusion_request_binding_mismatch")
         public[role] = {"file_id": snap.file_id, "sha256": snap.sha256}
-        live = files.get_task_input_file(request.identity.owner_user_id, request.identity.run_id,
-                                         snap.file_id, snap.sha256)
-        if live is None or live.get("size_bytes") != snap.size_bytes:
-            raise PermissionError("fusion_input_scope_denied")
+        if not historical:
+            live = files.get_task_input_file(request.identity.owner_user_id, request.identity.run_id,
+                                             snap.file_id, snap.sha256)
+            if live is None or live.get("size_bytes") != snap.size_bytes:
+                raise PermissionError("fusion_input_scope_denied")
         exact[role] = {**public[role], "path": target, "size_bytes": snap.size_bytes}
     if (_content(bundle, exact, ref.sha256) != meta["content_sha256"]
             or len(scoped) != sum(path.startswith(INPUT_ROOT) for path in bindings)):
@@ -221,14 +224,115 @@ def _original_inputs(service, request, bindings, bundle, meta):
     return payload, public
 
 
-def consume_fusion(identity, *, execution_id, skill_release, skill_id, content_sha256=None):
+def historical_report_candidates(identity, *, skill_release, skill_ids, exact_id=None, requested_source=None):
+    """Identify prior successful fusion executions before exposing any output bytes."""
+    authorize_fusion_code(identity, skill_release)
+    service = _service(identity)
+    with account_lease(identity.owner_user_id):
+        known = _prior_report_jobs(identity)
+        if exact_id:
+            rows = [service.repository.get(exact_id, owner=identity.owner_user_id, session=identity.session_id)]
+        else:
+            rows = [row for prior in known for row in service.repository.run_executions(prior)]
+        chosen = []
+        for row in rows:
+            if row["status"] != "succeeded" or not row["operation"].startswith("fusion_"):
+                continue
+            request = ExecutionRequest.parse(row["request"])
+            if request.identity not in known or len(request.arguments) != 1 or request.arguments[0] not in skill_ids:
+                continue
+            source_names = []
+            for ref in request.inputs:
+                if not ref.path.startswith(INPUT_ROOT) or ref.path == OBSERVATIONS:
+                    continue
+                file = files.get_account_file(ref.file_id, identity.owner_user_id)
+                if file and file.get("sha256") == ref.sha256:
+                    source_names.append(file["filename"])
+            if requested_source and not any(name.casefold() == requested_source.casefold() for name in source_names):
+                continue
+            chosen.append((row["execution_id"], request.arguments[0], request.identity))
+        if exact_id or len(chosen) < 2:
+            return sorted(chosen, key=lambda x: x[0])
+        # Durable children form one exact original report lineage, not a new
+        # candidate per coverage window. A report from another extraction is
+        # still ambiguous and must be explicitly selected by the user.
+        from src.research.fusion_observations import RegistryCoverage
+        groups = {}
+        store = RegistryCoverage(identity)
+        for selected in chosen:
+            child_id, skill, origin = selected
+            inspected = store.child(child_id, historical_identity=origin) if skill == "literature-verification" else None
+            key = (origin, inspected["original_execution_id"] if inspected else child_id)
+            rank = (inspected.get("revision", 0) + 1, inspected["offset"]) if inspected else (0, 0)
+            if key not in groups or rank > groups[key][0]:
+                groups[key] = rank, selected
+            elif rank == groups[key][0]:
+                raise LookupError("external_report_child_ambiguous")
+        return sorted((selected for _, selected in groups.values()), key=lambda x: x[0])
+
+
+def _historical_bundle(service, row, skill_id, current):
+    """Use only read-only roots from trusted deployment configuration."""
+    request = ExecutionRequest.parse(row["request"])
+    stored = service.workspace.open(request.workspace_id)["metadata"]
+    if all(stored.get(field) == value for field, value in _meta(current).items()):
+        return current
+    roots = os.environ.get("CITRUS_FUSION_REPORT_RELEASES", "").split(os.pathsep)
+    if len(roots) > 12:
+        raise ValueError("external_report_release_limit")
+    candidates = []
+    for raw in dict.fromkeys(roots):
+        if not raw or not Path(raw).is_absolute():
+            continue
+        try:
+            candidate = load_bundle(Path(raw).resolve(strict=True), skill_id)
+        except (KeyError, LookupError, ValueError, OSError):
+            continue
+        if all(stored.get(field) == value for field, value in _meta(candidate).items()):
+            candidates.append(candidate)
+    if not candidates:
+        raise PermissionError("external_report_pinned_release_unavailable")
+    return candidates[0]
+
+
+def historical_fusion_source(identity, report_value, reference):
+    """Read exact retained input bytes. The current account must still own it."""
+    source = report_value.get("_source_snapshot")
+    if not source or source["identity"].owner_user_id != identity.owner_user_id \
+            or source["identity"].session_id != identity.session_id:
+        raise PermissionError("fusion_source_lineage_unavailable")
+    matches = [snap for snap in source["refs"] if snap.file_id == reference["file_id"]
+               and snap.sha256 == reference["sha256"]]
+    if len(matches) != 1:
+        raise ValueError("fusion_source_snapshot_ambiguous")
+    snap = matches[0]
+    with account_lease(identity.owner_user_id):
+        metadata = files.get_account_file(snap.file_id, identity.owner_user_id)
+        if not metadata or metadata.get("sha256") != snap.sha256 or metadata.get("size_bytes") != snap.size_bytes:
+            raise PermissionError("fusion_source_no_longer_authorized")
+        data = _service(identity).workspace.read_bytes(source["workspace_id"], path=snap.path,
+                  version=snap.version, expected_sha256=snap.sha256)
+        if len(data) != snap.size_bytes or sha(data) != snap.sha256:
+            raise ValueError("fusion_source_snapshot_changed")
+        return data, metadata["filename"]
+
+
+def consume_fusion(identity, *, execution_id, skill_release, skill_id, content_sha256=None, source_identity=None):
     """Read the private report only after accepted bytes and current authorization."""
     authorize_fusion_code(identity, skill_release)
     bundle = load_bundle(skill_release, skill_id)
     service = _service(identity)
     with account_lease(identity.owner_user_id):
         row = service.repository.get(execution_id, owner=identity.owner_user_id, session=identity.session_id)
-        request, meta, bindings = _load_bound(service, identity, row, bundle, content_sha256=content_sha256)
+        historical = source_identity is not None and source_identity != identity
+        if historical:
+            if source_identity not in _prior_report_jobs(identity) or row["status"] != "succeeded":
+                raise PermissionError("fusion_report_lineage_denied")
+            if ExecutionRequest.parse(row["request"]).identity != source_identity:
+                raise PermissionError("fusion_report_identity_denied")
+            bundle = _historical_bundle(service, row, skill_id, bundle)
+        request, meta, bindings = _load_bound(service, source_identity if historical else identity, row, bundle,
+                                               content_sha256=content_sha256)
         with _epoch(identity, request):
             status = service.status(execution_id)
             result = {**_public(status), "content_sha256": meta["content_sha256"],
@@ -246,7 +350,7 @@ def consume_fusion(identity, *, execution_id, skill_release, skill_id, content_s
             if (type(receipt) is not dict or receipt.get("process_stopped") is not True
                     or receipt.get("network_policy") != "offline"):
                 raise PermissionError("fusion_accepted_worker_receipt_required")
-            payload, inputs = _original_inputs(service, request, bindings, bundle, meta)
+            payload, inputs = _original_inputs(service, request, bindings, bundle, meta, historical=historical)
             with _accepted_file(service, identity, execution_id, OUTPUT, max_bytes=MAX_REPORT_BYTES) as (observed, ref, data):
                 if observed.fingerprint != request.fingerprint:
                     raise ValueError("fusion_accepted_output_identity_mismatch")
@@ -259,6 +363,9 @@ def consume_fusion(identity, *, execution_id, skill_release, skill_id, content_s
                             or any(versions.get(name) != version for name, version in runtime["dependencies"].items())):
                         raise ValueError("fusion_worker_environment_receipt_mismatch")
                 return {**result, "inputs": inputs, "options": payload["options"], "report": report,
+                        "_source_snapshot": {"identity": request.identity, "workspace_id": request.workspace_id,
+                            "refs": tuple(snap for snap in request.inputs if snap.path.startswith(INPUT_ROOT)
+                                          and snap.path != OBSERVATIONS)} if historical else None,
                         "receipt": {"execution_id": execution_id, "fence": status["fence"],
                             "request_fingerprint": request.fingerprint, "process_stopped": True,
                             "network_policy": "offline", "environment": runtime,

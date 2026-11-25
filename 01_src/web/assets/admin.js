@@ -83,6 +83,29 @@
   var oneTimeAdminSecret = '';
   var pendingResetUserId = '';
   var pendingResetName = '';
+  var resetGeneration = 0;
+  var panelGenerations = Object.create(null);
+  var accountMutations = new Map(), applicationMutations = new Map();
+  var applicationView = 0;
+  var overview = {queue: null, config: null, providers: []};
+  var deviceMutation = false, deviceEditGeneration = 0, deviceDirty = false, committedDevice = null;
+  function nextPanel(panel) {
+    panelGenerations[panel] = (panelGenerations[panel] || 0) + 1;
+    return panelGenerations[panel];
+  }
+  async function loadPanel(panel, request, render, matches) {
+    var generation = nextPanel(panel);
+    var isCurrent = function () { return generation === panelGenerations[panel] && (!matches || matches()); };
+    try {
+      var data = await request();
+      if (isCurrent()) render(data);
+    } catch (error) { if (isCurrent()) throw error; }
+  }
+  async function loadPanels(loaders) {
+    var results = await Promise.allSettled(loaders.map(function (load) { return load(); }));
+    var errors = results.filter(function (result) { return result.status === 'rejected'; });
+    if (errors.length) throw new Error(errors.map(function (entry) { return entry.reason.message; }).join(' · '));
+  }
   function el(id) { return document.getElementById(id); }
   function esc(value) {
     return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
@@ -140,37 +163,57 @@
         '<p><b>会话与耗时</b><span>' + esc(item.session_id) + ' · ' + esc(item.elapsed_ms == null ? '—' : item.elapsed_ms + ' ms') + '</span></p></div></details>';
     }).join('');
   }
-  async function loadOverview() {
-    var results = await Promise.all([
-      jsonRequest('/api/v2/admin/users'),
-      jsonRequest('/api/v2/admin/queue'),
-      jsonRequest('/api/v2/config'),
-      jsonRequest('/api/v2/config/providers'),
-      jsonRequest('/api/v2/admin/onnx/device')
-    ]);
-    var users = results[0].users || [], queue = results[1], config = results[2], providers = results[3].providers || [], device = results[4];
-    el('userCount').textContent = users.length;
-    el('requestCount').textContent = users.reduce(function (sum, user) { return sum + (Number(user.requests_today) || 0); }, 0);
-    el('activeCount').textContent = queue.active + ' / ' + queue.max_active;
-    el('queuedCount').textContent = queue.queued + ' / ' + queue.max_pending;
-    renderUsers(users);
-    var activeProvider = providers.find(function (p) { return p.id === config.model.provider_id; });
-    el('modelStatus').textContent = activeProvider
-      ? '主模型：' + activeProvider.name + ' · ' + config.model.main + ' · ' + (config.model.image_input ? '支持图像输入' : '不支持图像输入')
-      : '主模型：' + config.model.main;
-    var configured = providers.filter(function (p) { return p.configured; });
-    var webName = config.web_search && config.web_search.provider === 'zhipu_web_search' ? '智谱 Web Search' : 'DeepSeek Search/Fetch';
-    el('serviceSummary').innerHTML = '<span class="service-chip ' + (configured.length ? 'ok' : 'warn') + '">主模型服务 ' + (configured.length ? '已配置' : '未配置') + '</span>' +
-      '<span class="service-chip ' + (config.web_search && config.web_search.configured ? 'ok' : 'warn') + '">' + esc(webName) + (config.web_search && config.web_search.configured ? ' 已配置' : ' 未配置') + '</span>' +
-      '<span class="service-chip neutral">处理 ' + queue.active + ' · 排队 ' + queue.queued + '</span>';
-    renderDevice(device);
+  function renderServices() {
+    var configured = overview.providers.filter(function (provider) { return provider.configured; });
+    var web = overview.config && overview.config.web_search;
+    var webName = web && web.provider === 'zhipu_web_search' ? '智谱 Web Search' : 'DeepSeek Search/Fetch';
+    var queue = overview.queue;
+    el('serviceSummary').innerHTML =
+      (overview.config ? '<span class="service-chip ' + (configured.length ? 'ok' : 'warn') + '">主模型服务 ' + (configured.length ? '已配置' : '未配置') + '</span>' +
+        '<span class="service-chip ' + (web && web.configured ? 'ok' : 'warn') + '">' + esc(webName) + (web && web.configured ? ' 已配置' : ' 未配置') + '</span>' : '') +
+      (queue ? '<span class="service-chip neutral">处理 ' + esc(queue.active) + ' · 排队 ' + esc(queue.queued) + '</span>' : '');
   }
-  function renderDevice(device) {
+  function loadUsers() {
+    return loadPanel('users', function () { return jsonRequest('/api/v2/admin/users'); }, function (data) {
+      var users = data.users || [];
+      el('userCount').textContent = users.length;
+      el('requestCount').textContent = users.reduce(function (sum, user) { return sum + (Number(user.requests_today) || 0); }, 0);
+      renderUsers(users);
+    });
+  }
+  function loadQueue() {
+    return loadPanel('queue', function () { return jsonRequest('/api/v2/admin/queue'); }, function (queue) {
+      overview.queue = queue;
+      el('activeCount').textContent = queue.active + ' / ' + queue.max_active;
+      el('queuedCount').textContent = queue.queued + ' / ' + queue.max_pending;
+      renderServices();
+    });
+  }
+  function loadModel() {
+    return loadPanel('model', function () {
+      return Promise.all([jsonRequest('/api/v2/config'), jsonRequest('/api/v2/config/providers')]);
+    }, function (data) {
+      var config = overview.config = data[0], providers = overview.providers = data[1].providers || [];
+      var activeProvider = providers.find(function (provider) { return provider.id === config.model.provider_id; });
+      el('modelStatus').textContent = activeProvider
+        ? '主模型：' + activeProvider.name + ' · ' + config.model.main + ' · ' + (config.model.image_input ? '支持图像输入' : '不支持图像输入')
+        : '主模型：' + config.model.main;
+      renderServices();
+    });
+  }
+  function loadDevice() {
+    if (deviceMutation) return;
+    return loadPanel('device', function () { return jsonRequest('/api/v2/admin/onnx/device'); },
+      function (device) { renderDevice(device, deviceDirty); });
+  }
+  function renderDevice(device, preserveSelection) {
     if (!device) return;
-    el('onnxDeviceMode').value = device.mode || 'auto';
+    committedDevice = device;
+    if (!preserveSelection) el('onnxDeviceMode').value = device.mode || 'auto';
     var active = device.selected_providers || [];
     el('onnxDeviceStatus').textContent = '模式：' + (device.mode || 'auto') +
-      ' · 当前选择：' + active.join(' → ') + (device.gpu_available ? ' · 已检测到 GPU' : ' · 未检测到 GPU');
+       ' · 当前选择：' + (active.join(' → ') || '未验证') + (device.gpu_available ? ' · 已检测到 GPU' : ' · 未检测到 GPU') +
+      (device.selection_error ? ' · ' + device.selection_error : '');
     var activeModels = device.active_model_providers || {};
     el('onnxProviders').innerHTML = (device.available_providers || []).map(function (provider) {
       return '<span class="service-chip neutral">' + esc(provider) + '</span>';
@@ -178,51 +221,80 @@
       return '<span class="service-chip ok">' + esc(name) + '：' + esc((activeModels[name] || []).join(' → ')) + '</span>';
     }).join('');
   }
-  async function loadAudit() {
-    var query = (el('auditQuery').value || '').trim();
-    var data = await jsonRequest('/api/v2/admin/requests?limit=' + pageSize + '&offset=' + offset + '&q=' + encodeURIComponent(query));
-    renderAudit(data.items || []);
-    var total = Number(data.total) || 0;
-    el('auditPageLabel').textContent = total ? (offset + 1) + '–' + Math.min(offset + pageSize, total) + ' / ' + total : '0 条';
-    el('olderButton').disabled = offset + pageSize >= total;
-    el('newerButton').disabled = offset <= 0;
+  function loadAudit() {
+    var query = (el('auditQuery').value || '').trim(), page = offset;
+    return loadPanel('audit', function () {
+      return jsonRequest('/api/v2/admin/requests?limit=' + pageSize + '&offset=' + page + '&q=' + encodeURIComponent(query));
+    }, function (data) {
+      renderAudit(data.items || []);
+      var total = Number(data.total) || 0;
+      el('auditPageLabel').textContent = total ? (page + 1) + '–' + Math.min(page + pageSize, total) + ' / ' + total : '0 条';
+      el('olderButton').disabled = page + pageSize >= total;
+      el('newerButton').disabled = page <= 0;
+    }, function () { return page === offset && query === (el('auditQuery').value || '').trim(); });
   }
   async function refresh() {
     el('refreshButton').disabled = true;
-    try { await Promise.all([loadOverview(), loadAudit(), loadApplications(), loadInvites()]); }
+    var loaders = [loadUsers, loadQueue, loadModel, loadDevice, loadAudit, loadApplications, loadInvites];
+    if (el('corpusList')) loaders.push(loadCorpus);
+    try { await loadPanels(loaders); }
     catch (error) { notify(error.message); }
     finally { el('refreshButton').disabled = false; }
   }
   async function handleUserAction(event) {
     var button = event.target.closest('button[data-action]'); if (!button) return;
     var id = button.dataset.id, action = button.dataset.action;
+    if (action === 'reset') { openResetDialog(id, button.dataset.name); return; }
+    var marker = id + ':' + action;
+    if (accountMutations.has(marker)) return;
+    var options;
+    if (action === 'active') {
+      options = {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:button.dataset.active === 'true'})};
+    } else if (action === 'limit') {
+      var value = Number(window.prompt('每日请求上限（1–10000）', button.dataset.limit));
+      if (!Number.isInteger(value) || value < 1 || value > 10000) return;
+      options = {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({daily_limit:value})};
+    } else return;
+    var token = {};
+    accountMutations.set(marker, token);
+    button.disabled = true;
+    nextPanel('users');
     try {
-      if (action === 'reset') {
-        openResetDialog(id, button.dataset.name);
-        return;
-      } else if (action === 'active') {
-        await jsonRequest('/api/v2/admin/users/' + id + '/active', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:button.dataset.active === 'true'})});
-      } else if (action === 'limit') {
-        var value = Number(window.prompt('每日请求上限（1–10000）', button.dataset.limit));
-        if (!Number.isInteger(value) || value < 1 || value > 10000) return;
-        await jsonRequest('/api/v2/admin/users/' + id + '/daily-limit', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({daily_limit:value})});
-      }
-      await loadOverview(); notify('已更新');
-    } catch (error) { notify(error.message); }
+      await jsonRequest('/api/v2/admin/users/' + encodeURIComponent(id) + (action === 'active' ? '/active' : '/daily-limit'), options);
+      if (accountMutations.get(marker) !== token) return;
+      await loadUsers();
+      if (accountMutations.get(marker) === token) notify('账号已更新');
+    } catch (error) { if (accountMutations.get(marker) === token) notify(error.message); }
+    finally {
+      if (accountMutations.get(marker) === token) accountMutations.delete(marker);
+      button.disabled = false;
+    }
   }
   async function applyOnnxDevice() {
-    var button = el('onnxDeviceApply');
-    button.disabled = true;
+    if (deviceMutation) return;
+    var button = el('onnxDeviceApply'), select = el('onnxDeviceMode'), mode = select.value;
+    var edit = deviceEditGeneration;
+    deviceMutation = button.disabled = true;
+    var requestGeneration = nextPanel('device');
+    el('onnxDeviceStatus').textContent = '正在验证所选设备上的两个推理模型…';
     try {
-      var mode = el('onnxDeviceMode').value;
       var data = await jsonRequest('/api/v2/admin/onnx/device', {
         method: 'PUT', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({mode: mode})
       });
-      renderDevice(data);
+      if (requestGeneration !== panelGenerations.device) return;
+      deviceDirty = edit !== deviceEditGeneration && select.value !== data.mode;
+      renderDevice(data, deviceDirty);
       notify(data.note || '推理设备已切换');
-    } catch (error) { notify(error.message); }
-    finally { button.disabled = false; }
+    } catch (error) {
+      if (requestGeneration !== panelGenerations.device) return;
+      if (committedDevice && edit === deviceEditGeneration) {
+        deviceDirty = false;
+        renderDevice(committedDevice, false);
+      }
+      el('onnxDeviceStatus').textContent = '切换未确认：' + error.message;
+      notify(error.message);
+    } finally { deviceMutation = button.disabled = false; }
   }
   // ---------------------------------------------------------------- 文献候审库
   function corpusBadge(kind) {
@@ -322,8 +394,8 @@
     var query = '?status=' + encodeURIComponent(status) + '&limit=50';
     if (status === 'fulltext_missing') query += '&order=newest';
     if (before) query += '&before_id=' + encodeURIComponent(before);
-    var data = await jsonRequest('/api/v2/admin/corpus/candidates' + query);
-    if (status === corpusFilter() && before === (status === 'fulltext_missing' && corpusBefore)) renderCorpusCandidates(data);
+    return loadPanel('corpus', function () { return jsonRequest('/api/v2/admin/corpus/candidates' + query); },
+      renderCorpusCandidates, function () { return status === corpusFilter() && before === (status === 'fulltext_missing' && corpusBefore); });
   }
   function resetCorpusOriginal() {
     if (corpusOriginalRequest) corpusOriginalRequest.abort();
@@ -461,16 +533,19 @@
     el('applicationsOlder').disabled = next == null;
     el('applicationsSummary').textContent = label + ' · 状态：' + CitrusAdminContract.applicationState(appStatus).label;
   }
-  async function loadApplications() {
-    var data = await jsonRequest('/api/v2/admin/applications' + CitrusAdminContract.pageQuery(appStatus, appPageSize, appOffset));
-    renderApplications(data);
+  function loadApplications() {
+    var status = appStatus, page = appOffset;
+    return loadPanel('applications', function () {
+      return jsonRequest('/api/v2/admin/applications' + CitrusAdminContract.pageQuery(status, appPageSize, page));
+    }, renderApplications, function () { return status === appStatus && page === appOffset; });
   }
   async function handleApplicationAction(event) {
     var button = event.target.closest('button[data-app]');
     if (!button) return;
     var id = button.dataset.id;
-    var decision = button.dataset.app;
+    var decision = button.dataset.app, view = applicationView;
     var reason = '';
+    if (applicationMutations.has(id)) return;
     if (decision === 'approve') {
       if (!confirm('通过该注册申请？通过后该用户即可登录。')) return;
     } else {
@@ -479,20 +554,29 @@
       reason = answer;
       if (Array.from(reason).length > 300) { notify('拒绝理由不能超过 300 字。'); return; }
     }
+    var token = {};
+    applicationMutations.set(id, token);
     button.disabled = true;
+    nextPanel('applications');
+    function isCurrent() { return applicationView === view && applicationMutations.get(id) === token; }
     try {
       await jsonRequest(CitrusAdminContract.decisionUrl(id, decision), {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(CitrusAdminContract.decisionBody(decision, reason))
       });
-      notify(decision === 'approve' ? '已通过该申请' : '已拒绝该申请');
+      if (!isCurrent()) return;
       await loadApplications();
+      if (isCurrent()) notify(decision === 'approve' ? '已通过该申请' : '已拒绝该申请');
     } catch (error) {
+      if (!isCurrent()) return;
       if (error.status === 409) notify('该申请已被其他管理员处理，请刷新列表。');
       else if (error.status === 404) notify('申请不存在，请刷新列表。');
       else notify(error.message);
-    } finally { button.disabled = false; }
+    } finally {
+      if (applicationMutations.get(id) === token) applicationMutations.delete(id);
+      button.disabled = false;
+    }
   }
 
   // ---------------------------------------------------------------- 邀请码
@@ -523,9 +607,11 @@
     el('invitesOlder').disabled = next == null;
     el('invitesSummary').textContent = label + ' · 列表不显示明文邀请码。';
   }
-  async function loadInvites() {
-    var data = await jsonRequest('/api/v2/admin/invites' + CitrusAdminContract.invitesQuery(invitePageSize, inviteOffset));
-    renderInvites(data);
+  function loadInvites() {
+    var page = inviteOffset;
+    return loadPanel('invites', function () {
+      return jsonRequest('/api/v2/admin/invites' + CitrusAdminContract.invitesQuery(invitePageSize, page));
+    }, renderInvites, function () { return page === inviteOffset; });
   }
   function showOneTimeInvite(code) {
     oneTimeInviteCode = String(code || '');
@@ -597,6 +683,8 @@
 
   // ---------------------------------------------------------------- 管理员重置密码
   function openResetDialog(id, name) {
+    resetGeneration += 1;
+    el('adminResetSubmit').disabled = false;
     pendingResetUserId = String(id || '');
     pendingResetName = String(name || '');
     el('adminResetHint').textContent = '为“' + pendingResetName + '”生成一次性临时密码。需要先输入你当前的管理员密码确认。';
@@ -606,6 +694,7 @@
     el('adminResetPassword').focus();
   }
   function closeResetDialog() {
+    resetGeneration += 1;
     var dialog = el('adminResetDialog'); if (dialog) dialog.hidden = true;
     var password = el('adminResetPassword'); if (password) password.value = '';
     var error = el('adminResetError'); if (error) error.textContent = '';
@@ -626,16 +715,18 @@
   }
   async function submitReset(event) {
     event.preventDefault();
-    if (!pendingResetUserId) return;
+    var targetId = pendingResetUserId, generation = resetGeneration;
+    var isCurrent = function () { return generation === resetGeneration && targetId === pendingResetUserId; };
     var error = el('adminResetError');
     var button = el('adminResetSubmit');
+    if (!targetId || button.disabled) return;
     var password = el('adminResetPassword').value || '';
     error.textContent = '';
     if (!password) { error.textContent = '请输入你当前的管理员密码。'; return; }
     var targetName = pendingResetName;
     button.disabled = true;
     try {
-      var response = await fetch('/api/v2/admin/users/' + encodeURIComponent(pendingResetUserId) + '/reset-password', {
+      var response = await fetch('/api/v2/admin/users/' + encodeURIComponent(targetId) + '/reset-password', {
         method: 'POST',
         credentials: 'same-origin',
         cache: 'no-store',
@@ -643,6 +734,7 @@
         body: JSON.stringify(CitrusAdminContract.resetBody(password))
       });
       var data = await response.json().catch(function () { return {}; });
+      if (!isCurrent()) return;
       if (response.status === 401) { location.replace('/?next=%2Fadmin'); return; }
       if (response.status === 403) { error.textContent = '管理员密码不正确，或该账号不允许由他人重置。'; return; }
       if (response.status === 429) { error.textContent = '操作过于频繁，请稍后再试。'; return; }
@@ -652,14 +744,14 @@
       closeResetDialog();
       if (!temporary) {
         notify('已重置，但未收到临时密码；请让用户使用恢复码，或稍后重试。');
-        await loadOverview();
+        await loadUsers().catch(function (e) { notify('账号已重置，但列表刷新失败：' + e.message); });
         return;
       }
       showOneTimeAdminSecret(targetName, temporary);
       notify('临时密码已生成，只显示一次，请立即复制。');
-      await loadOverview();
-    } catch (e) { error.textContent = '网络异常，请稍后重试。'; }
-    finally { button.disabled = false; }
+      await loadUsers().catch(function (e) { notify('密码已重置，但账号列表刷新失败：' + e.message); });
+    } catch (e) { if (isCurrent()) error.textContent = '网络异常，请稍后重试。'; }
+    finally { if (isCurrent()) button.disabled = false; }
   }
 
   async function init() {
@@ -673,14 +765,14 @@
     });
     el('applicationsRefresh').addEventListener('click', function () { loadApplications().catch(function (e) { notify(e.message); }); });
     el('applicationStatus').addEventListener('change', function () {
-      appStatus = this.value; appOffset = 0;
+      applicationView += 1; appStatus = this.value; appOffset = 0;
       loadApplications().catch(function (e) { notify(e.message); });
     });
     el('applicationsOlder').addEventListener('click', function () {
-      appOffset += appPageSize; loadApplications().catch(function (e) { notify(e.message); });
+      applicationView += 1; appOffset += appPageSize; loadApplications().catch(function (e) { notify(e.message); });
     });
     el('applicationsNewer').addEventListener('click', function () {
-      appOffset = Math.max(0, appOffset - appPageSize); loadApplications().catch(function (e) { notify(e.message); });
+      applicationView += 1; appOffset = Math.max(0, appOffset - appPageSize); loadApplications().catch(function (e) { notify(e.message); });
     });
     el('invitesTable').addEventListener('click', function (event) {
       handleInviteAction(event).catch(function (e) { notify(e.message); });
@@ -705,9 +797,17 @@
     document.addEventListener('keydown', function (event) {
       if (event.key === 'Escape' && !el('adminResetDialog').hidden) closeResetDialog();
     });
-    window.addEventListener('pagehide', function () { discardOneTimeInvite(); discardAdminSecret(); });
+    window.addEventListener('pagehide', function () {
+      closeResetDialog(); discardOneTimeInvite(); discardAdminSecret(); accountMutations.clear(); applicationMutations.clear();
+      Object.keys(panelGenerations).forEach(nextPanel);
+    });
+    window.addEventListener('pageshow', function (event) { if (event.persisted) location.reload(); });
     el('auditSearch').addEventListener('submit', function (event) { event.preventDefault(); offset = 0; loadAudit().catch(function (e) { notify(e.message); }); });
     el('onnxDeviceApply').addEventListener('click', applyOnnxDevice);
+    el('onnxDeviceMode').addEventListener('change', function () {
+      deviceEditGeneration += 1;
+      deviceDirty = !committedDevice || this.value !== committedDevice.mode;
+    });
     el('olderButton').addEventListener('click', function () { offset += pageSize; loadAudit().catch(function (e) { notify(e.message); }); });
     el('newerButton').addEventListener('click', function () { offset = Math.max(0, offset - pageSize); loadAudit().catch(function (e) { notify(e.message); }); });
     el('logoutButton').addEventListener('click', async function () { await fetch('/api/v2/auth/logout', {method:'POST'}); location.replace('/'); });
@@ -726,7 +826,6 @@
       el('corpusStatus').addEventListener('change', function () { corpusBefore = null; loadCorpus().catch(function (e) { notify(e.message); }); });
     }
     await refresh();
-    if (el('corpusList')) await loadCorpus().catch(function (e) { notify(e.message); });
   }
   document.addEventListener('DOMContentLoaded', function () { init().catch(function (e) { notify(e.message); }); });
 }());

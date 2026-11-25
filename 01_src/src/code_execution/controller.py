@@ -19,6 +19,7 @@ from .protocol import ExecutionRequest, TERMINAL, token, json_object
 from .repository import ExecutionConflict, ExecutionLeaseLost
 from .results import OutputBlob, accept_outputs, _no_links
 from .logs import ExecutionLogs
+from .oci import OCIError, OutputRejected
 
 
 class ExecutionController:
@@ -123,7 +124,8 @@ class ExecutionController:
             row["deadline"] - self.repository._now()))
         lease, handle, workspace = None, None, None
         may_have_started, stopped, completed = False, False, False
-        resources_recorded = False
+        resources_recorded, stop_attempted = False, False
+        collection_phase = None
         result, accepted_result = None, None
         status, reason, observation = "failed", "preparation_failed", {}
         try:
@@ -176,6 +178,7 @@ class ExecutionController:
                                     or getattr(state, "timed_out", False))
                     # Capture diagnostics first: rejected/missing output files
                     # must not erase the script's real stdout/stderr.
+                    collection_phase = "diagnostics"
                     collected = self.backend.collect(handle, include_outputs=False)
                     observation = {"child_exit_code": collected.child_exit_code,
                         "stdout": self._log(collected.stdout, already_truncated=collected.logs_truncated),
@@ -187,6 +190,7 @@ class ExecutionController:
                     for stream, reference in references.items():
                         observation[stream]["log_ref"] = reference
                     observation["log_storage"] = "captured_bytes_persisted"
+                    collection_phase = "outputs"
                     outputs = {}
                     if not failed_child and request.outputs:
                         with_outputs = self.backend.collect(handle)
@@ -199,6 +203,8 @@ class ExecutionController:
                         outputs = with_outputs.outputs
                     # Collection is bounded per-file byte observation. It does
                     # not assert a simultaneous scientific multi-file snapshot.
+                    collection_phase = None
+                    stop_attempted = True
                     ended = self.backend.kill(handle)
                     stopped = ended.stopped is True
                     if not stopped:
@@ -248,13 +254,19 @@ class ExecutionController:
         except Exception as exc:
             # Do not leak host paths/connection credentials from exception text.
             observation = {**observation, "error_type": type(exc).__name__}
-            from .oci import OCIError
             if isinstance(exc, OCIError):
                 try:
                     observation["error_code"] = token(str(exc))
                 except ValueError:
                     pass
-            reason = "execution_controller_failure"
+            if collection_phase == "outputs" and isinstance(exc, OutputRejected):
+                reason = "execution_output_rejected"
+            elif collection_phase == "outputs":
+                reason = "execution_output_collection_unconfirmed"
+            elif collection_phase == "diagnostics":
+                reason = "execution_diagnostics_unconfirmed"
+            else:
+                reason = "execution_controller_failure"
         finally:
             if not completed and accepted_result is not None:
                 # The files DB may have committed before the queue/journal
@@ -263,7 +275,9 @@ class ExecutionController:
                 observation["accepted_outputs"] = accepted_result
                 observation["completion_status"] = "interrupted_after_acceptance"
             if lease is not None:
-                if may_have_started and not stopped:
+                # One exact stop attempt. An unconfirmed stop remains unknown
+                # for reconciliation, not a reason to signal or run again here.
+                if may_have_started and not stopped and not stop_attempted:
                     try:
                         stopped = self.backend.kill(handle).stopped is True
                     except Exception:

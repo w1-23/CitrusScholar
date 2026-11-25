@@ -82,7 +82,7 @@ async def list_figures(request: Request, limit: int = Query(default=24, ge=1, le
 
 
 @router.get("/projects/{figure_id}")
-async def open_figure(figure_id: str, request: Request, revision: int = Query(ge=0)):
+async def open_figure(figure_id: str, request: Request, revision: int | None = Query(default=None, ge=0)):
     owner = _owner(request)
     with _read_scope(owner) as lease:
         try:

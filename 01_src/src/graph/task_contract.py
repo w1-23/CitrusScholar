@@ -6,7 +6,8 @@ Legacy export parsing is only a migration fallback, explicitly marked degraded.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass
-from typing import Any
+import re
+from typing import Any, Literal
 
 REPAIR_TOOLS = {
     "figure": ("run_research_figure_script",),
@@ -64,10 +65,64 @@ def contract_for_explicit_outputs(query: str) -> TaskContract:
 
 
 
-def contract_for_turn(query: str, *, has_tables: bool) -> TaskContract:
-    from src.graph.agent_operations import _explicit_data_audit
+@dataclass(frozen=True)
+class FusionDelivery:
+    """Server interpretation of the current user turn, never a tool argument."""
+
+    intent: Literal["unspecified", "text_only", "annotated_xlsx", "alternate_file"] = "unspecified"
+    format: str = ""
+
+
+_AUDIT_RESULT = re.compile(
+    r"审查|核验|数据(?:检查|完整性)|科研诚信|重复(?:数据|数值|数字)?(?:区段|块|项|段|异常)|异常(?:项|清单|列表)|问题清单|标注工作簿|"
+    r"\b(?:audit|integrity|findings?|verification|duplicate blocks?|review results?)\b", re.I)
+_SAVE = r"(?:保存(?:为)?|另存(?:为)?|导出(?:为)?|下载|生成|制作|交付|写入|做成|整理成|输出(?:为)?|给我|提供|要一份|\b(?:export|download|create|produce|save|deliver|generate)\b)"
+_FILE_WORD = r"(?:文件|工作簿|表格|审查表|标注表|\b(?:xlsx|excel|workbook|spreadsheet|file)\b)"
+_XLSX = r"(?:工作簿|Excel|\bxlsx\b|\b(?:workbook|spreadsheet)\b|标注(?:版|表格?|副本))"
+_OTHER_FILE = r"(?:\b(?:csv|tsv|json|html|pdf|docx|word)\b|报告文件|文件版|可下载(?:的)?(?:报告|清单|文件))"
+_DELIVERY_QUESTION = re.compile(r"如何|怎么|怎样|能否解释|\bhow\s+(?:do|can|to)\b|\bwhat\s+(?:is|does)\b", re.I)
+_NO_FILE = re.compile(
+    r"(?:只|仅)(?:要|给|用|输出|提供)?\s*(?:文字|文本|在(?:聊天|对话|回答|这里)(?:里|中)?)|"
+    r"(?:只|仅)(?:列出|展示|罗列)(?:就行|即可|\s*在(?:聊天|对话|回答|这里)(?:里|中)?)|"
+    r"(?:不用|不要|无需|不需要|不必|禁止|别)\s*(?:额外|再|自动)?\s*(?:生成|另存|保存|交付|导出|提供|输出|制作)?\s*" + _FILE_WORD +
+    r"|不(?:再|自动)?(?:生成|另存|保存|交付|导出|提供|输出|制作)\s*" + _FILE_WORD +
+    r"|\b(?:text[- ]only|in chat only|(?:no|without) (?:an? )?(?:files?|xlsx|excel|workbook|spreadsheet))\b"
+    r"|\b(?:do not|don't)\s+(?:create|export|save|generate|deliver)\s+(?:an? )?(?:files?|xlsx|excel|workbook|spreadsheet)\b", re.I)
+
+
+def fusion_delivery_for_turn(query: str, *, has_tables: bool = False) -> FusionDelivery:
     from src.graph.intent_text import intent_clauses, intent_with_negation, mask_literal_payload
-    import re
+
+    content = mask_literal_payload(query)
+    clauses = [clause for clause in intent_clauses(content) if not _DELIVERY_QUESTION.search(clause)]
+    requested = "。".join(clauses)
+    alt = re.compile(_SAVE + r"[^，。]{0,50}?" + _OTHER_FILE, re.I)
+    xlsx = re.compile(_SAVE + r"[^，。]{0,40}?" + _XLSX + r"(?!\s*(?:审查|检查|里|中|中的|数据|格式是什么))", re.I)
+    explicit_copy = re.compile(
+        r"(?:在(?:原|复制的|给我一份)[^，。]{0,18}(?:工作簿|xlsx|excel)[^，。]{0,18}(?:标红|标注)|"
+        r"(?:标红|标注)[^，。]{0,18}(?:另存|副本|可下载)|"
+        r"(?:给我|需要|要)[^，。]{0,14}(?:标红|标注)[^，。]{0,8}(?:工作簿|xlsx|excel|副本))", re.I)
+    formats = []
+    for clause in clauses:
+        for match in alt.finditer(clause):
+            if not intent_with_negation(clause, re.compile(re.escape(match.group(0)), re.I)):
+                continue
+            fmt = re.search(r"\b(csv|tsv|json|html|pdf|docx|word)\b", match.group(0), re.I)
+            formats.append(("docx" if fmt.group(1).lower() == "word" else fmt.group(1).lower()) if fmt else "html")
+    no_file = _NO_FILE.search(requested)
+    if no_file and not (formats and re.search(_XLSX, no_file.group(0), re.I)):
+        return FusionDelivery("text_only")
+    # Multiple competing formats must not silently select one workbook.
+    if formats:
+        return FusionDelivery("alternate_file", formats[0] if len(set(formats)) == 1 else "")
+    if ((has_tables or _AUDIT_RESULT.search(content))
+            and (intent_with_negation(requested, xlsx) or intent_with_negation(requested, explicit_copy))):
+        return FusionDelivery("annotated_xlsx", "xlsx")
+    return FusionDelivery()
+
+
+def contract_for_turn(query: str, *, has_tables: bool) -> TaskContract:
+    from src.graph.intent_text import intent_clauses, intent_with_negation, mask_literal_payload
 
     explicit = contract_for_explicit_outputs(query)
     content = mask_literal_payload(query)
@@ -80,9 +135,8 @@ def contract_for_turn(query: str, *, has_tables: bool) -> TaskContract:
         r"\s*(?:(?:请你?|帮我|麻烦你?|直接|继续|先|再)\s*)*"
         r"(?:画|绘制|生成|制作)(?:一张|一个|一幅)?[^？！?!。；;]{0,60}"
         r"(?:箱线图|热图|热力图|折线图|散点图|柱状图|流程图|示意图)(?:吧|即可)?\s*")
-    audit = has_tables and _explicit_data_audit(content)
-    text_only = re.search(r"(?:只|仅)(?:要|给|用|输出|提供)?(?:文字|文本)|"
-                          r"(?:不要|无需|不用)(?:生成|交付|导出)?(?:文件|工作簿)|\btext only\b", content, re.I)
+    delivery = fusion_delivery_for_turn(query, has_tables=has_tables)
+    text_only = delivery.intent == "text_only"
     requirements = explicit.deliverables
     if not text_only and not any(FIGURE_KINDS.intersection(item["kinds"]) for item in requirements):
         if has_tables and intent_with_negation(content, drawing):
@@ -92,9 +146,27 @@ def contract_for_turn(query: str, *, has_tables: bool) -> TaskContract:
                  for clause in intent_clauses(content)):
             requirements.append({"product_id": "requested_figure", "label": "图件",
                                  "kinds": ["figure"], "formats": ["svg"]})
-    if audit and not text_only and not any("xlsx" in item["formats"] for item in requirements):
-        requirements.append({"product_id": "annotated_workbook", "label": "数据审查标注工作簿",
-                             "kinds": ["annotation_table"], "formats": ["xlsx"]})
+    audit_turn = _AUDIT_RESULT.search(content) or (has_tables and re.search(r"检查|校验", content))
+    if audit_turn:
+        audit_kinds = {"annotation_table", "table_file", "report_html", "report_docx", "report_json",
+                       "verification_sheet", "generic_output"}
+        if delivery.intent in {"unspecified", "text_only"}:
+            requirements = [item for item in requirements if not audit_kinds.intersection(item["kinds"])]
+        elif delivery.intent == "annotated_xlsx":
+            requirements = [item for item in requirements if "xlsx" not in item["formats"]]
+            literature = bool(re.search(r"文献|参考文献|\b(?:references?|bibliography|citations?)\b", content, re.I))
+            requirements.append({"product_id": "verification_workbook" if literature else "annotated_workbook",
+                                 "label": "文献核验结果工作簿" if literature else "数据审查标注工作簿",
+                                 "kinds": ["verification_sheet" if literature else "annotation_table"], "formats": ["xlsx"]})
+        elif delivery.intent == "alternate_file":
+            requirements = [item for item in requirements if not audit_kinds.intersection(item["kinds"])
+                            and delivery.format not in item["formats"]]
+            kinds = {"csv": "table_file", "tsv": "table_file", "json": "report_json", "html": "report_html",
+                     "docx": "report_docx"}
+            if delivery.format:
+                requirements.append({"product_id": "external_review_report", "label": "审查结果文件",
+                                     "kinds": [kinds.get(delivery.format, "generic_output")],
+                                     "formats": [delivery.format]})
     return TaskContract(obligations=tuple(_products(requirements)))
 
 

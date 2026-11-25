@@ -1,40 +1,56 @@
 import { byId, element } from './dom.js';
 
+const DRAG_TYPE = 'application/x-citrus-workbench-figure';
+const validId = (id) => typeof id === 'string' && /^[a-f0-9]{32}$/.test(id);
+const validVersion = (value) => Number.isSafeInteger(value) && value >= 0;
+
 function thumbnail(project, revisionUrl) {
   const format = project.exports?.svg ? 'svg' : project.exports?.png ? 'png' : '';
   if (!format) return null;
   const image = element('img', undefined, 'thumbnail');
   image.src = revisionUrl(project, `/preview/${format}`);
   image.alt = '';
+  image.draggable = false;
   image.loading = 'lazy';
   image.addEventListener('error', () => image.remove());
   return image;
 }
 
-export function initializeAssets({ request, api, revisionUrl, choose }) {
+export function initializeLibrary({ request, api, revisionUrl, loadAsset, activate, changed, busy, switchToken, setStatus, onOpened }) {
   const list = byId('assetList'), message = byId('assetStatus'), more = byId('assetMore'), retry = byId('assetRetry');
-  let sequence = 0, offset = 0, debounce;
+  const dialog = byId('library'), shelf = byId('assetLibrary'), search = byId('assetQuery'), canvas = byId('canvas');
+  const notice = byId('libraryNotice');
+  let sequence = 0, offset = 0, debounce, dragged, opening = false;
 
   async function load(append = false) {
     const current = ++sequence;
     more.hidden = retry.hidden = true;
     message.textContent = '正在读取图件…';
     if (!append) { list.replaceChildren(); offset = 0; }
-    const type = byId('assetKind').value;
-    const url = new URLSearchParams({ limit: 12, offset, query: byId('assetQuery').value,
-      access: byId('assetAccess').value });
-    if (type.startsWith('chart:')) url.set('chart', type.slice(6));
-    else if (type) url.set('kind', type);
+    const params = new URLSearchParams({ limit: 12, offset, query: search.value });
     try {
-      const { projects, has_more: hasMore } = await (await request(`${api}/projects?${url}`)).json();
+      const { projects, has_more: hasMore } = await (await request(`${api}/projects?${params}`)).json();
       if (current !== sequence) return;
       for (const project of projects) {
+        if (!validId(project.figure_id) || !validVersion(project.render_version)) continue;
         const row = element('li');
-        const button = element('button');
+        const button = element('button', undefined, 'asset-button');
+        button.type = 'button';
+        button.draggable = true;
         const preview = thumbnail(project, revisionUrl);
         if (preview) button.append(preview);
-        button.append(element('span', project.title));
-        button.addEventListener('click', () => choose(project));
+        const caption = element('span', undefined, 'asset-caption');
+        caption.append(element('strong', project.title || '未命名图件'), element('small', `版本 ${project.render_version}`));
+        button.append(caption);
+        button.setAttribute('aria-label', project.title || '未命名图件');
+        button.addEventListener('click', () => open(project));
+        button.addEventListener('dragstart', (event) => {
+          if (!event.dataTransfer || busy() || opening || dialog.open) { event.preventDefault(); return; }
+          dragged = project;
+          event.dataTransfer.effectAllowed = 'copy';
+          event.dataTransfer.setData(DRAG_TYPE, project.figure_id);
+        });
+        button.addEventListener('dragend', () => { dragged = null; canvas.classList.remove('drop-ready'); });
         row.append(button);
         list.append(row);
       }
@@ -48,139 +64,89 @@ export function initializeAssets({ request, api, revisionUrl, choose }) {
     }
   }
 
-  byId('assetQuery').addEventListener('input', () => {
+  function report(message, error = false) {
+    setStatus(message, error);
+    if (dialog.open) {
+      notice.textContent = message;
+      notice.classList.toggle('warning', error);
+    }
+  }
+
+  async function open(candidate) {
+    if (busy() || opening) return;
+    const id = candidate.figure_id, version = candidate.render_version;
+    if (!validId(id) || (version !== undefined && !validVersion(version))) {
+      report('图件链接无效。', true);
+      return;
+    }
+    if (changed() && !window.confirm('打开成功后会放弃当前未保存的草稿。继续打开？')) return;
+    opening = true;
+    const fromDialog = dialog.open, token = switchToken();
+    list.inert = true;
+    report('正在打开图件…');
+    try {
+      const url = version === undefined ? `${api}/projects/${encodeURIComponent(id)}` : revisionUrl(candidate);
+      const project = await (await request(url)).json();
+      if (project.figure_id !== id || !validVersion(project.render_version) ||
+          (version !== undefined && project.render_version !== version)) {
+        throw new Error('图件版本无法确认，请重新选择。');
+      }
+      const asset = await loadAsset(project);
+      if ((fromDialog && !dialog.open) || busy() || token !== switchToken()) {
+        URL.revokeObjectURL(asset.url);
+        if (!fromDialog || dialog.open) report('当前草稿已变化，未切换图件。');
+        return;
+      }
+      activate(project, asset);
+      if (dialog.open) dialog.close();
+      onOpened();
+    } catch (error) {
+      report(error.status === 409 ? '图件版本已更新，请重新选择图件。' : error.message, true);
+      if (error.status === 409) load();
+    } finally {
+      opening = false;
+      list.inert = false;
+    }
+  }
+
+  const canDrop = (event) => dragged && event.dataTransfer?.types.includes(DRAG_TYPE);
+  canvas.addEventListener('dragover', (event) => {
+    if (!event.dataTransfer) return;
+    event.preventDefault();
+    const supported = canDrop(event);
+    event.dataTransfer.dropEffect = supported ? 'copy' : 'none';
+    if (!supported) return;
+    canvas.classList.add('drop-ready');
+  });
+  canvas.addEventListener('dragleave', (event) => {
+    if (!event.relatedTarget || !canvas.contains(event.relatedTarget)) canvas.classList.remove('drop-ready');
+  });
+  canvas.addEventListener('drop', (event) => {
+    canvas.classList.remove('drop-ready');
+    event.preventDefault();
+    if (!canDrop(event)) return;
+    const project = dragged;
+    dragged = null;
+    if (event.dataTransfer.getData(DRAG_TYPE) === project.figure_id) open(project);
+  });
+  byId('openLibrary').addEventListener('click', () => {
+    if (busy() || dialog.open) return;
+    byId('assetDialogShelf').append(shelf);
+    notice.textContent = '选择图件即可打开。';
+    notice.classList.remove('warning');
+    dialog.showModal();
+    search.focus();
+  });
+  byId('cancelOpen').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => byId('assetShelf').append(shelf));
+  search.addEventListener('input', () => {
     clearTimeout(debounce);
     sequence += 1;
+    list.replaceChildren();
     debounce = setTimeout(load, 180);
-  });
-  for (const id of ['assetKind', 'assetAccess']) byId(id).addEventListener('change', () => {
-    clearTimeout(debounce);
-    load();
   });
   more.addEventListener('click', () => load(true));
   retry.addEventListener('click', () => load());
   load();
-  return () => load();
-}
-
-export function initializeOpenDialog({ request, api, revisionUrl, loadAsset, activate, changed, busy, onOpened, requested }) {
-  const library = { epoch: 0, offset: 0, candidate: null, pending: false };
-  const dialog = byId('library');
-  const libraryNotice = byId('libraryNotice');
-  const confirmOpen = byId('confirmOpen');
-
-  function libraryStatus(message, error = false) {
-    libraryNotice.textContent = message;
-    libraryNotice.classList.toggle('warning', error);
-  }
-
-  function chooseAsset(project) {
-    library.candidate = project;
-    confirmOpen.disabled = library.pending;
-    libraryStatus(changed() ? '打开成功后将放弃当前未保存的草稿。' : '确认打开所选图件。');
-  }
-
-  async function refreshLibrary(more = false) {
-    const epoch = library.epoch;
-    byId('moreFigures').hidden = true;
-    byId('retryLibrary').hidden = true;
-    libraryStatus('正在读取图件库…');
-    if (!more) {
-      library.offset = 0;
-      library.candidate = null;
-      confirmOpen.disabled = true;
-      byId('libraryList').replaceChildren();
-    }
-    try {
-      const response = await request(`${api}/projects?limit=24&offset=${library.offset}`);
-      const { projects, has_more: hasMore } = await response.json();
-      if (epoch !== library.epoch || !dialog.open) return;
-      for (const project of projects) {
-        const row = element('label');
-        const radio = element('input');
-        radio.type = 'radio';
-        radio.name = 'figure';
-        radio.value = project.figure_id;
-        radio.addEventListener('change', () => chooseAsset(project));
-        row.append(radio);
-        const preview = thumbnail(project, revisionUrl);
-        if (preview) row.append(preview);
-        row.append(element('span', project.title || '未命名图件'), element('small', `版本 ${project.render_version}`));
-        byId('libraryList').append(row);
-        if (!library.candidate && requested === project.figure_id) {
-          radio.checked = true;
-          chooseAsset(project);
-        }
-      }
-      library.offset += projects.length;
-      byId('moreFigures').hidden = !hasMore;
-      if (!library.candidate) libraryStatus(library.offset ? '选择一张图件。' : '图件库中没有可打开的图件。');
-    } catch (error) {
-      if (epoch !== library.epoch || !dialog.open) return;
-      libraryStatus(error.message, true);
-      byId('retryLibrary').hidden = false;
-    }
-  }
-
-  async function openCandidate() {
-    if (!library.candidate || library.pending) return;
-    const { candidate, epoch } = library;
-    library.pending = true;
-    confirmOpen.disabled = true;
-    byId('libraryItems').disabled = true;
-    libraryStatus('正在打开所选图件…');
-    try {
-      const project = await (await request(revisionUrl(candidate))).json();
-      if (project.figure_id !== candidate.figure_id || project.render_version !== candidate.render_version) {
-        throw new Error('图件版本已更新，请重试加载图件库。');
-      }
-      const asset = await loadAsset(project);
-      if (epoch !== library.epoch || !dialog.open) { URL.revokeObjectURL(asset.url); return; }
-      activate(project, asset);
-      dialog.close();
-      onOpened();
-    } catch (error) {
-      if (epoch !== library.epoch || !dialog.open) return;
-      libraryStatus(error.message, true);
-      byId('retryLibrary').hidden = error.status !== 409;
-    } finally {
-      if (epoch === library.epoch) {
-        library.pending = false;
-        confirmOpen.disabled = false;
-        byId('libraryItems').disabled = false;
-      }
-    }
-  }
-
-  function openLibrary(preset = null) {
-    if (busy() || dialog.open) return;
-    library.epoch += 1;
-    library.pending = false;
-    byId('libraryItems').disabled = false;
-    const single = byId('selectedAsset');
-    single.hidden = !preset;
-    single.replaceChildren();
-    byId('libraryItems').hidden = !!preset;
-    byId('moreFigures').hidden = true;
-    byId('retryLibrary').hidden = true;
-    dialog.showModal();
-    if (!preset) { refreshLibrary(); return; }
-    const preview = thumbnail(preset, revisionUrl);
-    if (preview) single.append(preview);
-    single.append(element('strong', preset.title), element('span', `版本 ${preset.render_version}`, 'muted'));
-    chooseAsset(preset);
-    confirmOpen.focus();
-  }
-
-  byId('openLibrary').addEventListener('click', () => openLibrary());
-  byId('moreFigures').addEventListener('click', () => refreshLibrary(true));
-  byId('retryLibrary').addEventListener('click', () => {
-    byId('libraryItems').hidden = false;
-    byId('selectedAsset').hidden = true;
-    refreshLibrary();
-  });
-  confirmOpen.addEventListener('click', openCandidate);
-  byId('cancelOpen').addEventListener('click', () => dialog.close());
-  dialog.addEventListener('close', () => { library.epoch += 1; });
-  return openLibrary;
+  return { open, refresh: () => { clearTimeout(debounce); load(); } };
 }

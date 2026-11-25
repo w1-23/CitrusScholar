@@ -76,7 +76,7 @@ async def general_agent_node(state: dict) -> dict:
 
 
 async def _run(state, identity, ledger):
-    from src.config import settings, get_deepseek_model
+    from src.config import settings
     from src.core.capability_policy import digest, policy_for_state
     from src.core import figures, task_events, tracing
     from src.core.cancel import is_cancelled
@@ -85,7 +85,7 @@ async def _run(state, identity, ledger):
     from src.core.request_context import _epoch
     from src.graph import agent_operations as ops
     from src.graph.model_driver import _model_timeout, request_deadline_from_settings
-    from src.graph.request_plan import executor_authorizations, merge_task_instructions
+    from src.graph.request_plan import executor_authorizations, explicit_note_target, merge_task_instructions
 
     from src.config import PROJECT_ROOT
     from src.core.provider_protocol import uses_deepseek_protocol
@@ -95,7 +95,8 @@ async def _run(state, identity, ledger):
     if state.get("agent_resume") is True:
         emit_public_progress("", category="agent_prepare", note_id=f"{identity.run_id}:resume-prepare",
                              job_id=identity.run_id)
-    provider_scope = (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())
+    transport = settings.model_transport()
+    provider_scope = (transport.base_url, transport.model)
     state_root = PROJECT_ROOT / "state"
     resume = state.get("agent_resume") is True
     policy = policy_for_state(state)
@@ -139,10 +140,22 @@ async def _run(state, identity, ledger):
     register_workspace_tools(catalog)
     from .code_tools import register_code_tools, CODE_TOOL_NAMES
     register_code_tools(catalog)
-    from .fusion_tools import FUSION_TOOL_NAMES, REPLACED_TOOLS, SKILL_IDS, installed_fusion, register_fusion_tools
+    from .fusion_tools import (FUSION_TOOL_NAMES, REPLACED_TOOLS, SKILL_IDS, external_fusion_required,
+                               fusion_delivery_scope, fusion_report_followup, installed_fusion, register_fusion_tools)
+    from src.graph.task_contract import fusion_delivery_for_turn
     from .nature_skill_tools import NATURE_TOOL_NAMES, installed_nature, register_nature_tools
     external_release = installed_fusion(release, installed_rows)
     external_nature = installed_nature(release, installed_rows)
+    legacy_receipt_pins = frozenset(os.getenv("CITRUS_PRE_FUSION_INVENTORY_SHA256", "").split())
+    legacy_resume = (resume and release is not None and not (release / "fusion").exists()
+                     and state["skill_release_inventory_sha256"] in legacy_receipt_pins)
+    external_required = external_fusion_required() and not legacy_resume
+    previous_report_query = ""
+    report_history_verified = False
+
+    def report_followup():
+        return (not (state.get("attachment_refs") or tables) and report_history_verified
+                and fusion_report_followup(str(state.get("query") or ""), previous_query=previous_report_query))
     if external_release:
         register_fusion_tools(catalog)
     if external_nature:
@@ -185,7 +198,7 @@ async def _run(state, identity, ledger):
             host.allowed_names.difference_update(retrieval_tool_names())
         host.allowed_names.update(WORKSPACE_TOOL_NAMES)
         host.allowed_names.update(PLAN_TOOL_NAMES)
-        if external_release:
+        if external_release or external_required:
             # Old analyzers are reachable only by exact historical releases.
             host.allowed_names.difference_update(REPLACED_TOOLS)
         if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
@@ -193,14 +206,22 @@ async def _run(state, identity, ledger):
             from src.config import PROJECT_ROOT as runtime_root
             host.allowed_names.update(CODE_TOOL_NAMES)
             worker_ready = worker_available(runtime_root / "state" / "code_executions.sqlite3")
+            if external_release and any(policy.allows("skill:" + name) for name in SKILL_IDS):
+                if worker_ready:
+                    host.allowed_names.update(FUSION_TOOL_NAMES - {"resolve_external_report"})
+                if report_followup():
+                    host.allowed_names.add("resolve_external_report")
             if not worker_ready:
                 host.allowed_names.difference_update({"code_execute", "code_environment_install"})
             else:
-                if external_release and any(policy.allows("skill:" + name) for name in SKILL_IDS):
-                    host.allowed_names.update(FUSION_TOOL_NAMES)
                 if external_nature and policy.allows("skill:nature-figure"):
                     host.allowed_names.update(NATURE_TOOL_NAMES)
-        tracing.set_request_authorizations(executor_authorizations(str(state.get("query") or "")))
+        if report_followup():
+            # A report continuation cannot rerun the audit, invoke code, or
+            # advertise another source of findings if exact evidence is absent.
+            host.allowed_names.intersection_update({"resolve_external_report", "read_tool_result", "request_user_input"})
+        current_query = str(state.get("query") or "")
+        tracing.set_request_authorizations(executor_authorizations(current_query), note_target=explicit_note_target(current_query))
         return set(host.allowed_names)
     refresh_allowed()
     from .skill_adapter import validate_scenario_selection
@@ -235,12 +256,16 @@ async def _run(state, identity, ledger):
     prompt = await asyncio.to_thread(system_prompt, host.allowed_names, native_skills=True)
     prompt += ("\nFile 是基础能力。按任务需要自主列举、搜索、读取已授权输入，在当前会话工作区创建或编辑中间文件。"
                "不依赖所选 Skill、任务类型或逐次确认。读取已有文件版本后再编辑；不要修改输入原件。")
+    if external_required and not (host.allowed_names & FUSION_TOOL_NAMES):
+        prompt += ("\n外部审查运行能力暂不可用，或已安装的审查 Skill 未获本轮授权。不得替换为旧分析器，"
+                   "不得引用未经验证的检查结果。仍可提供独立的原文读取及普通问答。")
     if host.allowed_names & FUSION_TOOL_NAMES:
         prompt += ("\n外部核验、数据审查与科研诚信按已安装 Skill 和绑定的文件身份运行。"
                    "文献先调用 run_external_skill 解析，再用 continue_external_literature 对同一执行补查，"
                    "最后收集；没有联网权限时收集原结果并说明缺口。"
-                   "数据审查先明确真实工作表与区域。用户要求出具报告或标注文件时用 collect_external_skill 的 publish_excel，"
-                   "以实际附带的工作簿回执为准；仅请求文字结论时不自动发布工作簿。")
+                   "数据审查先明确真实工作表与区域。collect_external_skill 按本轮用户明确需要的格式交付，"
+                   "以实际附带的文件回执为准。仅文字结论及未要求文件时不发布工作簿。"
+                   "追问审查清单，应读取可验证的既有报告，而不重新执行检查或编造位置和数量。")
     if host.allowed_names & NATURE_TOOL_NAMES:
         prompt += ("\n使用已安装上游 Nature Skill。固定模板可用 run_nature_plot 然后 collect_nature_plot。"
                    "以实收产物和工作台编辑能力为准。用户明确要求 R 而当前 Worker 不支持时，说明限制，不替换成 Python。")
@@ -270,8 +295,10 @@ async def _run(state, identity, ledger):
     messages = ops._sanitize_history_tool_protocol(messages)
     messages = messages[1:]
     trace_start -= 1
-    model = get_llm(model=get_deepseek_model(), api_key=settings.RESOLVED_MAIN_API_KEY,
-        base_url=settings.RESOLVED_MAIN_BASE_URL, temperature=settings.TEMPERATURE_MAIN,
+    if not transport.api_key:
+        raise RuntimeError("Main model credential is not configured for this endpoint")
+    model = get_llm(model=transport.model, api_key=transport.api_key,
+        base_url=transport.base_url, provider_headers=transport.headers, temperature=settings.TEMPERATURE_MAIN,
         max_tokens=settings.MAX_TOKENS, timeout=_model_timeout())
     # Provisional answers are not streamed as accepted answers. The final
     # accepted bytes are published once, then passed to session_save unchanged.
@@ -334,8 +361,10 @@ async def _run(state, identity, ledger):
         return {"identity": asdict(identity),
                 "original_request_state": original_request_state, "trace_start": trace_start,
                 "working_assets": assets,
+                "figures": figures.export_recovery(identity),
                 "script_budget_scope": state["script_budget_scope"],
-                "query": state["query"],
+                "query": state["query"], "previous_report_query": previous_report_query,
+                "report_history_verified": report_history_verified,
                 "update_version": update_version, "final_review": deepcopy(final_review),
                 "artifact_requirements": deepcopy(requirements),
                 "records": host.records,
@@ -345,13 +374,16 @@ async def _run(state, identity, ledger):
                 "model_output_tokens": getattr(driver, "output_tokens", None)}
 
     def restore_host(saved):
-        nonlocal update_version, original_request_state, trace_start, requirements
+        nonlocal update_version, original_request_state, trace_start, requirements, previous_report_query, report_history_verified
         original = saved["original_request_state"]
         binding = {"user_id": identity.owner_user_id, "session_id": identity.session_id,
                    "request_id": identity.user_turn_id, "job_id": identity.run_id}
         if (saved.get("identity", asdict(identity)) != asdict(identity)
                 or any(original.get(key) != value for key, value in binding.items())):
             raise task_events.TaskConflict("identity_conflict")
+        figures.restore_recovery(identity, saved.get("figures"))
+        previous_report_query = str(saved.get("previous_report_query") or "")
+        report_history_verified = saved.get("report_history_verified") is True
         assets = saved.get("working_assets")
         if assets is not None and (not isinstance(assets, dict)
                 or not set(assets).issubset(asset_fields)
@@ -487,15 +519,24 @@ async def _run(state, identity, ledger):
                 finally:
                     reset_task_scope(token)
             scope = script_scope()
-        with scope:
+        query = str(state.get("query") or "")
+        with scope, fusion_delivery_scope(fusion_delivery_for_turn(query, has_tables=bool(tables)),
+                                          query=query, previous_query=previous_report_query):
             execution = await host.invoke(tool, call, identity)
         message = await host.publish(call, execution, identity)
+        if not error:
+            record = message.additional_kwargs.get("host_publication") or {}
+            retrieval_ledger.settle(call["name"], normalized_args, call["id"],
+                                    status=record.get("status", ""), reason=record.get("reason", ""),
+                                    uncertain=execution.uncertain)
         return message, {"uncertain": execution.uncertain, "operation_id": execution.operation_id,
                          "pending_question": execution.pending_question,
                          "execution_waits": list(execution.execution_waits)}
 
     async def seed_retrieval(history):
+        nonlocal previous_report_query, report_history_verified
         import hashlib
+        import re
         from src.graph.retrieval_router import attachment_processing_only, plan_retrieval, topic_for_retrieval
         query = str(state.get("query") or "")
         # Only authenticated human text may ground a follow-up topic.
@@ -504,6 +545,16 @@ async def _run(state, identity, ledger):
                    and m.additional_kwargs.get("context_origin") == "user"
                    and m.additional_kwargs.get("context_trusted") is True
                    and m.additional_kwargs.get("run_id") != identity.run_id]
+        previous_report_query = earlier[-1] if earlier else ""
+        audit_topic = re.compile(r"审查|核验|科研诚信|造假|造价|重复(?:区段|区块|数据)|\b(?:integrity|audit|verification)\b", re.I)
+        report_history_verified = (bool(audit_topic.search(query)) or any(audit_topic.search(text) for text in earlier[-3:])
+            or any(isinstance(m, ToolMessage) and m.name in {"collect_external_skill", "resolve_external_report"}
+                   for m in history[-60:]))
+        if report_followup() and "resolve_external_report" in refresh_allowed():
+            return [{"name": "resolve_external_report", "args": {"findings_offset": 0},
+                     "id": "citrus_report_" + hashlib.sha256(identity.run_id.encode()).hexdigest()[:24],
+                     "type": "tool_call"}], ("本轮先读取已接受的审查报告。按真实检查范围答复；"
+                                             "如证据不可用或报告有多个，请明确说明，不得推断位置或重做。")
         topic = topic_for_retrieval(query, earlier)
         matching = tuple(registry.matching_families(topic)) if topic and registry else ()
         plan = plan_retrieval(query, allowed_names=refresh_allowed(), recent_user_queries=earlier,
@@ -731,7 +782,11 @@ async def _run(state, identity, ledger):
         if (message.additional_kwargs.get("execution_dispatched")
                 and not message.additional_kwargs.get("operation_uncertain")):
             if call and call["name"] == message.name:
+                host.validate_observation(message)
+                record = message.additional_kwargs.get("host_publication") or {}
                 retrieval_ledger.restore(message.name, call["args"], message.tool_call_id)
+                retrieval_ledger.settle(message.name, call["args"], message.tool_call_id,
+                                        status=record.get("status", ""), reason=record.get("reason", ""))
 
     def working_view(messages, context):
         if context is None or not policy.allows("summarization"):
@@ -805,10 +860,12 @@ async def _run(state, identity, ledger):
                     committed = await saver.aget_tuple({"configurable": checkpoint_config})
                     values = committed.checkpoint["channel_values"] if committed else {}
                     signals = list((values.get("operation_signals") or {}).values())
-                    waits = list(dict.fromkeys(wait for item in signals for wait in item.get("execution_waits", ())))
+                    wake = values.get("execution_wake") or []
+                    pending_waits = list(dict.fromkeys(wait for item in signals for wait in item.get("execution_waits", ())))
+                    waits = wake or pending_waits
                     if ((values.get("host_state") or {}).get("identity") != asdict(identity)
                             or values.get("active_run_id") != identity.run_id
-                            or waits != list(result.execution_waits) or values.get("execution_wake")
+                            or waits != list(result.execution_waits) or (wake and pending_waits)
                             or any(item.get("uncertain") for item in signals)
                             or host.pending_question or result.unknown_operations
                             or result.pending_tool_calls or _pending_calls(result.messages)):
@@ -1139,16 +1196,17 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
 def _maintenance_offer(root, identity, provider_scope, context_scope):
     """Bind identities only. No request savers, resources or chat budget survive."""
     async def maintenance(session_lock, is_busy):
-        from src.config import get_deepseek_model, settings
+        from src.config import settings
         from src.core.llm_pool import get_llm
         from .deep_agent_runtime import metered_maintenance_model
         from .harness import open_terminal_graph
         from .post_turn_compaction import compact_post_turn
 
         base, model_name = provider_scope
-        if (base, model_name) != (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()):
+        current = settings.model_transport()
+        if not current.api_key or (base, model_name) != (current.base_url, current.model):
             return "ineligible"
-        transport = get_llm(model_name, settings.RESOLVED_MAIN_API_KEY, base, temperature=0,
+        transport = get_llm(model_name, current.api_key, base, provider_headers=current.headers, temperature=0,
                             timeout=25, max_tokens=min(2048, settings.AGENT_FINAL_OUTPUT_TOKENS))
         trigger = min(settings.CONTEXT_WORKING_SOFT_TOKENS,
                       settings.CONTEXT_CHECKPOINT_MAX_TOKENS - 2048)

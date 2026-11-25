@@ -14,7 +14,7 @@ Reuse boundaries
 * QA: F4's ``src.figures.nature_runtime.verify_svg_bytes`` and
   ``current_security_findings``;
 * publication: the existing account file library through
-  ``projects.publish_rendered`` and ``src.research.artifacts.publish_artifact``.
+  ``projects.stage_rendered`` with post-commit batch promotion.
 """
 from __future__ import annotations
 
@@ -381,7 +381,8 @@ def _publish_receipt(owner: int, session_id: str, filename: str,
 
 def create_svg_project(*, owner: Any, session_id: Any, svg: Any,
                        alt_text: Any = "图形", title: Any = "",
-                       vendor_root: Any = None, plot_provenance: dict | None = None) -> dict[str, Any]:
+                       vendor_root: Any = None, plot_provenance: dict | None = None,
+                       nature_binding=None, request_id=None) -> dict[str, Any]:
     """Sanitize, audit and publish one authorized SVG as a figure project."""
     owner = _valid_owner(owner)
     sid = _require_session(owner, session_id)
@@ -434,34 +435,16 @@ def create_svg_project(*, owner: Any, session_id: Any, svg: Any,
         manifest["figure_kind"] = "nature_plot_vector"
         manifest["claims"] = ["Only supported paint attributes of native SVG objects may be edited. "
                               "Geometry, labels, data and the original exports are unchanged."]
-    project = projects.create_project(
-        owner_user_id=owner, title=name, source_kind="svg", source=source,
-        session_id=sid, data_refs=[{**original, "kind": "nature_plot_original"}
-            for original in (plot_provenance or {}).get("original_exports", {}).values()])
-    figure_id = str(project.get("figure_id") or "")
-    if not figure_id:
-        raise ProjectError("project_failed", "图件项目创建失败。", 500)
-    published: dict[str, Any] = {}
-    try:
-        published = projects.publish_rendered(owner, sid, name, {"svg": blob})
-        entry = published.get("svg") if isinstance(published, dict) else None
-        if not isinstance(entry, dict) or entry.get("sha256") != digest:
-            raise ProjectError("publish_failed",
-                               "已发布 SVG 摘要与安全检查字节不一致。", 503)
-        committed = projects.update_project(
-            figure_id, owner, expected_revision=0, manifest_json=manifest,
-            exports_json=published, overrides_json=[], render_version=1,
-            status="ready", last_error="")
-        if not committed:
-            raise ProjectError("revision_conflict", "保存期间图件已更新，请重新生成。", 409)
-    except BaseException:
-        # No project row without its real export; an unavailable publisher must
-        # never leave a half-created, linkless project behind.
-        try:
-            projects.delete_project(figure_id, owner)
-        except Exception:
-            _LOG.warning("svg project rollback failed", exc_info=True)
-        raise
+    refs = [{**original, "kind": "nature_plot_original"}
+            for original in (plot_provenance or {}).get("original_exports", {}).values()]
+    with projects.stage_rendered(owner, sid, name, {"svg": blob}, request_id=request_id) as (published, publication):
+        if published["svg"].get("sha256") != digest:
+            raise ProjectError("publish_failed", "已暂存 SVG 摘要与安全检查字节不一致。", 503)
+        project = projects.create_project(owner_user_id=owner, title=name, source_kind="svg", source=source,
+            session_id=sid, data_refs=refs, initial_manifest=manifest, initial_exports=published,
+            publication=publication, nature_binding=nature_binding)
+        figure_id = project["figure_id"]
+        projects.complete_render_publication(figure_id, owner)
     revision = 1
     return {
         "figure_id": figure_id,
@@ -547,26 +530,17 @@ def apply_svg_project_edits(*, figure_id: Any, owner: Any, edits: Any,
     for key in ("initial_nature_skill_receipt",):
         if key in previous_manifest:
             manifest[key] = previous_manifest[key]
-    published: dict[str, Any] = {}
-    try:
-        published = projects.publish_rendered(
-            owner, sid, str(project.get("title") or "figure"), {"svg": new_blob})
-        entry = published.get("svg") if isinstance(published, dict) else None
-        if not isinstance(entry, dict) or entry.get("sha256") != digest:
-            raise ProjectError("publish_failed",
-                               "已发布 SVG 摘要与编辑后字节不一致。", 503)
-        committed = projects.update_project(
-            str(figure_id), owner, expected_revision=revision,
-            source_json=new_source, manifest_json=manifest,
-            overrides_json=accepted, exports_json=published,
-            render_version=revision + 1, status="ready", last_error="")
+    with projects.stage_rendered(owner, sid, str(project.get("title") or "figure"),
+                                 {"svg": new_blob}) as (published, publication):
+        if published["svg"].get("sha256") != digest:
+            raise ProjectError("publish_failed", "已暂存 SVG 摘要与编辑后字节不一致。", 503)
+        committed = projects.update_project_committed(
+            str(figure_id), owner, expected_revision=revision, publication=publication,
+            source_json=new_source, manifest_json=manifest, overrides_json=accepted,
+            exports_json=published, render_version=revision + 1, status="ready", last_error="")
         if not committed:
-            raise ProjectError("revision_conflict",
-                               "保存期间图件已更新或删除，当前版本未被覆盖。", 409)
-    except BaseException:
-        # The project row still points at its previous verified export. A new
-        # immutable file is never linked from a failed save.
-        raise
+            raise ProjectError("revision_conflict", "保存期间图件已更新或删除，当前版本未被覆盖。", 409)
+        projects.complete_render_publication(str(figure_id), owner)
     new_revision = revision + 1
     return {
         "figure_id": str(figure_id),

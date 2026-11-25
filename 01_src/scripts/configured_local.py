@@ -47,7 +47,8 @@ def configure(args):
     if ((runtime == source and not existing)
             or runtime.is_relative_to(ROOT / '01_src')):
         raise ValueError('Use runtime state separate from source assets and credential source')
-    if existing and (not runtime.is_dir() or not (runtime / 'state/model_config.json').is_file()):
+    if existing and (not runtime.is_dir() or not any(
+            (runtime / 'state' / name).is_file() for name in ('model_activation.json', 'model_config.json'))):
         raise ValueError('Existing runtime must already contain its model configuration')
     if not (args.corpus_root / 'active_index.json').is_file():
         raise ValueError('Existing corpus active_index.json is required; no index is rebuilt')
@@ -59,8 +60,12 @@ def configure(args):
     state = runtime / 'state'
     state.mkdir(exist_ok=True)
     config_path = state / 'model_config.json'
-    if not config_path.exists():
-        previous = json.loads((source / 'state/model_config.json').read_text(encoding='utf-8'))
+    if not config_path.exists() and not (state / 'model_activation.json').exists():
+        source_activation = source / 'state/model_activation.json'
+        if source_activation.is_file():
+            previous = json.loads(source_activation.read_text(encoding='utf-8'))['model']
+        else:
+            previous = json.loads((source / 'state/model_config.json').read_text(encoding='utf-8'))
         selected = {key: str(value).strip() for key, value in previous.items()
                     if key in MODEL_FIELDS and str(value).strip()}
         if not selected.get('provider_id') or not selected.get('main_model'):
@@ -73,7 +78,6 @@ def configure(args):
         'HF_HOME': str(args.model_cache_root / 'hf'),
         'FASTEMBED_CACHE_PATH': str(args.model_cache_root / 'fastembed'),
         'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
-        'CITRUS_ONNX_DEVICE': 'gpu',
         'FIGURES_SANDBOX_BACKEND': backend,
         'FIGURES_SANDBOX_WSL_DISTRO': args.distribution,
         'FIGURES_SANDBOX_IMAGE': args.image,
@@ -86,10 +90,9 @@ def configure(args):
     })
     if backend == 'apptainer':
         os.environ['CITRUS_APPTAINER_HOST_PYTHON'] = args.host_python
-        # hardware.py defaults to GPU and reads an explicit administrator choice
-        # from this runtime. A forced env value would erase that choice on restart.
-        os.environ.pop('CITRUS_ONNX_DEVICE', None)
-    # Start in GPU mode, while preserving subsequent administrator CPU/auto choices.
+    # hardware.py defaults to GPU. The saved administrator choice must survive
+    # starting again through either of these configured launchers.
+    os.environ.pop('CITRUS_ONNX_DEVICE', None)
     os.environ.pop('CITRUS_REQUIRE_GPU', None)
     if args.require_full:
         os.environ['CITRUS_LOCAL_FULL_STARTUP'] = '1'
@@ -108,17 +111,13 @@ def configure(args):
     else:
         os.environ.pop('CITRUS_CODE_EXECUTION', None)
     from src.config import settings
-    # Existing keys saved by this runtime take precedence. The authorized old
-    # instance supplies the selected key in memory only; no session DB is read.
+    # The selected credential source is read-only in the Web container. The
+    # writable activation takes priority; an inherited key must match both the
+    # selected provider and endpoint origin and is never copied to this runtime.
+    settings.bind_readonly_model_source(source)
+    if not settings.model_transport(include_headers=False).api_key:
+        raise ValueError('Selected provider has no origin-bound credential in the runtime or authorized source')
     provider = settings.RESOLVED_PROVIDER_ID
-    if not settings._runtime_provider_api_keys.get(provider):
-        key_path = source / 'state/provider_api_keys.json'
-        keys = json.loads(key_path.read_text(encoding='utf-8'))
-        key = keys.get(provider)
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError('Selected provider has no configured key in the authorized source')
-        settings._runtime_provider_api_keys[provider] = key.strip()
-        settings._runtime_configured_model_providers.add(provider)
     # Reuse the authorized deployment's network configuration in memory only.
     # Runtime-local settings win; no credentials or account DBs are copied.
     if not getattr(args, "without_source_web_search", False):
@@ -131,10 +130,14 @@ def configure(args):
         if not settings.RESOLVED_DEEPSEEK_WEB_API_KEY and search_key.is_file():
             settings._runtime_deepseek_web_api_key = search_key.read_text(encoding='utf-8').strip()
         if settings.RESOLVED_WEB_SEARCH_PROVIDER == 'zhipu_web_search' and not settings.RESOLVED_ZHIPU_API_KEY:
-            source_keys = json.loads((source / 'state/provider_api_keys.json').read_text(encoding='utf-8'))
-            zhipu_key = source_keys.get('zhipu')
+            dedicated = source / 'state/zhipu_web_api_key.json'
+            legacy = source / 'state/provider_api_keys.json'
+            if dedicated.is_file():
+                zhipu_key = json.loads(dedicated.read_text(encoding='utf-8')).get('key')
+            else:
+                zhipu_key = json.loads(legacy.read_text(encoding='utf-8')).get('zhipu') if legacy.is_file() else None
             if isinstance(zhipu_key, str) and zhipu_key.strip():
-                settings._runtime_provider_api_keys['zhipu'] = zhipu_key.strip()
+                settings._runtime_zhipu_web_api_key = zhipu_key.strip()
     if backend == 'apptainer':
         from src.figures.readiness import validate_apptainer_staging
         validate_apptainer_staging()

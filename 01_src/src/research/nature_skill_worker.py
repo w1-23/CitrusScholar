@@ -11,6 +11,7 @@ from src.code_execution.protocol import ExecutionLimits, ExecutionRequest, TERMI
 from src.core.account_leases import account_lease, acquire_account_lease, bound_account_lease
 from src.session import files
 
+from . import nature_skill_r
 from .nature_skill_contract import (CSV, EXPORTS, MAX_CSV_BYTES, PRODUCER, QA_MAX_BYTES,
                                    SCOPE, SCRIPT, SKILL_ID, RunArgs, argv,
                                    output_names, template_qa)
@@ -30,9 +31,17 @@ def _execution_lease(identity, request):
 
 
 def _meta(pin, spec):
-    return {"code_scope": SCOPE, "release_sha256": pin.release_sha256,
-            "upstream_commit": pin.commit, "script_sha256": pin.sha256,
-            "spec": spec.model_dump()}
+    metadata = {"code_scope": SCOPE, "release_sha256": pin.release_sha256,
+                "upstream_commit": pin.commit, "script_sha256": pin.sha256,
+                "spec": spec.model_dump()}
+    if spec.backend == "r":
+        metadata["r_image_sha256"] = nature_skill_r.R_IMAGE_SHA256
+    return metadata
+
+
+def _execution_template(release, pin, spec):
+    return (nature_skill_r.SCRIPT, nature_skill_r.sealed_adapter(Path(release), pin)) \
+        if spec.backend == "r" else (SCRIPT, pin)
 
 
 def _source(identity, ref):
@@ -46,11 +55,11 @@ def _source(identity, ref):
     return {"file_id": ref.file_id, "sha256": ref.sha256, "size_bytes": row["size_bytes"]}
 
 
-def _bind(service, identity, current, pin, source):
+def _bind(service, identity, current, pin, source, *, script=SCRIPT):
     task, wid, revision = current["task_id"], current["workspace_id"], current["revision"]
     snapshot = service.workspace.snapshot(wid, task_id=task, expected_revision=revision)
     entries = {item["path"]: item for item in snapshot["files"]}
-    expected = {CSV: source, SCRIPT: {"sha256": pin.sha256, "size_bytes": len(pin.content)}}
+    expected = {CSV: source, script: {"sha256": pin.sha256, "size_bytes": len(pin.content)}}
     if not entries.keys() <= expected.keys():
         raise PermissionError("nature_plot_private_workspace_changed")
     for path, ref in expected.items():
@@ -58,9 +67,9 @@ def _bind(service, identity, current, pin, source):
             if entries[path]["version"] != 1 or any(entries[path][key] != value for key, value in ref.items()):
                 raise PermissionError("nature_plot_private_workspace_changed")
             continue
-        if path == SCRIPT:
+        if path == script:
             row = files.register_file(session_id=identity.session_id, owner_user_id=identity.owner_user_id,
-                filename=Path(SCRIPT).name, content=pin.content, mime="text/plain",
+                filename=Path(script).name, content=pin.content, mime="text/plain",
                 origin=files.ORIGIN_UPLOADED, visibility="internal",
                 producer_tool=PRODUCER, client_request_id=_key(SCOPE, identity.owner_user_id,
                                                                identity.session_id, pin.sha256))
@@ -75,7 +84,7 @@ def _bind(service, identity, current, pin, source):
     return revision
 
 
-def _bound_request(service, identity, row, pin):
+def _bound_request(service, identity, row, pin, *, release=None):
     request = ExecutionRequest.parse(row["request"])
     if request.identity != identity or not request.task_id.startswith("nature_"):
         raise PermissionError("nature_plot_execution_scope_denied")
@@ -84,11 +93,12 @@ def _bound_request(service, identity, row, pin):
     if metadata.get("code_scope") != SCOPE:
         raise PermissionError("nature_plot_execution_scope_denied")
     spec = RunArgs.model_validate(metadata.get("spec"))
+    script, pin = _execution_template(release, pin, spec)
     stem, paths = output_names(spec.plot.template, request.task_id)
-    if (metadata != _meta(pin, spec) or spec.backend != "python"
+    if (metadata != _meta(pin, spec)
             or current["task_id"] != request.task_id
             or request.operation_id != request.task_id or request.idempotency_key != request.task_id
-            or request.script.path != SCRIPT or request.script.sha256 != pin.sha256
+            or request.script.path != script or request.script.sha256 != pin.sha256
             or request.script.size_bytes != len(pin.content) or request.script.version != 1
             or len(request.inputs) != 1 or request.inputs[0].path != CSV
             or request.inputs[0].version != 1 or request.inputs[0].file_id != spec.input.file_id
@@ -107,8 +117,11 @@ class NatureSubmissionUncertain(RuntimeError):
 
 def schedule_plot(identity, *, release, pin, spec):
     call_id = authorize_fusion_code(identity, release)
-    if spec.backend != "python":
-        raise ValueError("nature_plot_backend_unavailable")
+    if spec.backend == "r":
+        nature_skill_r.require_template(spec)
+        if not nature_skill_r.available():
+            raise LookupError("nature_plot_r_runtime_unavailable")
+    script, execution_pin = _execution_template(release, pin, spec)
     task = "nature_" + _key(SCOPE, *identity.turn_key, identity.run_id, call_id)
     stem, paths = output_names(spec.plot.template, task)
     service = _service(identity)
@@ -116,22 +129,22 @@ def schedule_plot(identity, *, release, pin, spec):
         source = _source(identity, spec.input)
         deadline = _deadline(identity)
         current = service.workspace.create(task_id=task, request_id=task, make_current=False,
-                                           metadata=_meta(pin, spec))
+                                           metadata=_meta(execution_pin, spec))
         wid = current["workspace_id"]
         row = service.repository.find_submission(owner=identity.owner_user_id, session=identity.session_id,
             workspace_id=wid, operation_id=task, idempotency_key=task)
         if row is None:
             if not worker_available(service.repository.path):
                 raise LookupError("nature_plot_code_worker_unavailable")
-            revision = _bind(service, identity, current, pin, source)
+            revision = _bind(service, identity, current, execution_pin, source, script=script)
             try:
                 row = service.submit(task_id=task, workspace_id=wid, expected_revision=revision,
-                    operation_id=task, idempotency_key=task, script_path=SCRIPT, arguments=argv(spec, stem),
+                    operation_id=task, idempotency_key=task, script_path=script, arguments=argv(spec, stem),
                     inputs=(CSV,), outputs=paths, limits=LIMITS, absolute_deadline=deadline)
             except (LookupError, PermissionError, ValueError, OSError) as exc:
                 raise NatureSubmissionUncertain() from exc
         try:
-            request, saved, _ = _bound_request(service, identity, row, pin)
+            request, saved, _ = _bound_request(service, identity, row, pin, release=release)
             if saved != spec:
                 raise PermissionError("nature_plot_submission_mismatch")
             with _execution_lease(identity, request):
@@ -143,7 +156,7 @@ def schedule_plot(identity, *, release, pin, spec):
 def _accepted_exports(service, identity, execution_id, request, spec, stem):
     from src.core.deliverable_check import validate_deliverable
 
-    data, qa = {}, None
+    data, raw_qa = {}, None
     for path in request.outputs:
         name = Path(path).name
         is_qa = name.endswith(".qa.json")
@@ -152,7 +165,7 @@ def _accepted_exports(service, identity, execution_id, request, spec, stem):
             if actual.fingerprint != request.fingerprint:
                 raise PermissionError("nature_plot_accepted_request_changed")
             if is_qa:
-                qa = template_qa(raw, spec, stem)
+                raw_qa = raw
                 continue
             fmt = Path(path).suffix[1:]
             mime = EXPORTS[fmt]
@@ -160,7 +173,8 @@ def _accepted_exports(service, identity, execution_id, request, spec, stem):
                 raise ValueError("nature_plot_export_format_mismatch")
             validate_deliverable(filename=name, content=raw, mime=mime)
             data[name] = (raw, mime, ref["sha256"])
-    return data, qa
+    pdf_sha256 = data[stem + ".pdf"][2]
+    return data, template_qa(raw_qa, spec, stem, pdf_sha256=pdf_sha256)
 
 
 def _request_id(identity):
@@ -210,11 +224,11 @@ def collect_plot(identity, *, release, pin, execution_id, receipts):
     owner, session = identity.owner_user_id, identity.session_id
     with account_lease(owner):
         row = service.repository.get(execution_id, owner=owner, session=session)
-        request, spec, stem = _bound_request(service, identity, row, pin)
+        request, spec, stem = _bound_request(service, identity, row, pin, release=release)
         with _execution_lease(identity, request):
             status = service.status(execution_id)
             result = {"execution_id": execution_id, "worker_status": status["status"],
-                      "backend": "python", "template": spec.plot.template}
+                      "backend": spec.backend, "template": spec.plot.template}
             if status["status"] != "succeeded":
                 if status["status"] in TERMINAL:
                     return result, "failed", "nature_plot_worker_failed"
@@ -225,21 +239,29 @@ def collect_plot(identity, *, release, pin, execution_id, receipts):
                     or not isinstance(receipt.get("files"), list)
                     or [item.get("path") for item in receipt["files"]] != list(request.outputs)):
                 raise PermissionError("nature_plot_accepted_worker_receipt_required")
+            if spec.backend == "r":
+                nature_skill_r.verify_worker_environment(receipt)
             data, qa = _accepted_exports(service, identity, execution_id, request, spec, stem)
             request_id = _request_id(identity)
             originals = _publish(identity, request_id, execution_id, request.inputs[0], data, receipts)
             result.update(original_exports=originals, template_data_qa=qa,
                           provenance={"skill": SKILL_ID, "upstream_commit": pin.commit,
-                                      "script_sha256": pin.sha256, "release_sha256": pin.release_sha256,
+                                      "script_sha256": request.script.sha256, "release_sha256": pin.release_sha256,
                                       "request_fingerprint": request.fingerprint,
                                       "input_sha256": request.inputs[0].sha256})
+            if spec.backend == "r":
+                result["provenance"]["sandbox_image_sha256"] = nature_skill_r.R_IMAGE_SHA256
+                result["provenance"]["template_origin"] = "citrus_fixed_r_adapter"
             from src.figures.projects import ProjectError
             try:
                 result["workbench"] = open_nature_plot(owner=owner, session_id=session,
-                    title=spec.title or spec.plot.template, backend="python", original_exports=originals,
-                    primary_svg=stem + ".svg", vendor_root=pin.vendor_root)
+                    title=spec.title or spec.plot.template, backend=spec.backend, original_exports=originals,
+                    primary_svg=stem + ".svg", vendor_root=pin.vendor_root,
+                    execution_id=execution_id, request_id=request_id)
             except ProjectError:
                 result["workbench"] = {"editable": False, "reason_code": "nature_plot_workbench_unavailable"}
+                return result, "partial", "nature_plot_workbench_unavailable"
+            if result["workbench"].get("publication_state") == "retryable":
                 return result, "partial", "nature_plot_workbench_unavailable"
             if result["workbench"].get("editable") is True:
                 derived = result["workbench"]["exports"]["svg"]

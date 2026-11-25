@@ -32,6 +32,7 @@ different claim, and there is no code path that can do that.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 import json
 import re
 import time
@@ -44,7 +45,8 @@ from src.figures.overrides import (
 )
 from src.figures.store import (
     create_project, delete_project, get_project, list_projects,
-    get_revision_export, list_revision_exports, record_revision_export, update_project, update_project_committed,
+    finish_publications, get_revision_export, list_revision_exports, pending_publication,
+    record_revision_export, update_project, update_project_committed,
 )
 
 # The formats a figure project carries.
@@ -510,42 +512,47 @@ def _normalise_manifest(manifest: Any) -> dict[str, Any]:
 
 # ── Publishing ────────────────────────────────────────────────────────────
 
-def _publish_bytes(owner: int, session_id: str, filename: str,
-                   payload: bytes, mime: str, *, request_id: str = "") -> dict[str, Any]:
-    """Publish one rendered file into the account's file library.
-
-    The file library is the service's own storage for a user's material, so
-    the rendered figure lands there with the same ownership rules as an
-    uploaded table. A *generated* file lives in the session's artifact
-    directory rather than in the upload directory: the library distinguishes
-    the two, and only an artifact may be written to the artifact area.
-    """
-    from src.research.artifacts import publish_artifact
+@contextmanager
+def stage_rendered(owner, session_id, stem, blobs, *, request_id=None):
+    """Keep renders private until the figure transaction records this batch."""
+    from src.core.account_leases import account_lease
+    from src.core.cancel import raise_if_cancelled
+    from src.core.tracing import get_client_request_id
+    from src.research.artifacts import discard_staged_figures, stage_figure_artifact
 
     if not session_id:
         raise ProjectError("no_session", "没有有效会话，无法把图件登记到资料库。")
+    request_id = str(get_client_request_id() or "") if request_id is None else request_id
+    batch = uuid.uuid4().hex
+    exports = {}
+    with account_lease(owner):
+        try:
+            for fmt in FIGURE_FORMATS:
+                if fmt in blobs:
+                    try:
+                        exports[fmt] = stage_figure_artifact(owner=owner, session_id=session_id,
+                            filename=f"{_safe_stem(stem)}.{fmt}", content=blobs[fmt],
+                            mime=MIME_BY_FORMAT[fmt], request_id=request_id)
+                    except Exception as exc:
+                        raise ProjectError("publish_failed", "图件文件无法暂存，可重试。", 503) from exc
+            raise_if_cancelled("artifact:before_commit")
+            yield exports, (batch, session_id, request_id, list(exports.values()))
+        finally:
+            if exports:
+                # Never discard a committed batch after transient promotion failure.
+                try:
+                    if not pending_publication(batch, owner):
+                        discard_staged_figures(owner, session_id, list(exports.values()))
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).warning("figure stage cleanup deferred", exc_info=True)
+
+
+def complete_render_publication(figure_id, owner, *, required_batch=None):
     try:
-        from src.core.tracing import get_client_request_id
-        return publish_artifact(
-            owner=owner, session_id=session_id, filename=filename,
-            content=payload, mime=mime, producer_tool="figure_workspace",
-            request_id=request_id or str(get_client_request_id() or ""))
+        finish_publications(figure_id, owner, required_batch=required_batch)
     except Exception as exc:
-        raise ProjectError("publish_failed", f"图件登记失败：{exc}") from exc
-
-
-def publish_rendered(owner: int, session_id: str, stem: str,
-                     blobs: dict[str, bytes]) -> dict[str, dict[str, Any]]:
-    """Publish every rendered format and return the file entries."""
-    published: dict[str, dict[str, Any]] = {}
-    for fmt in FIGURE_FORMATS:
-        payload = blobs.get(fmt)
-        if payload is None:
-            continue
-        safe_stem = _safe_stem(stem)
-        published[fmt] = _publish_bytes(
-            owner, session_id, f"{safe_stem}.{fmt}", payload, MIME_BY_FORMAT[fmt])
-    return published
+        raise ProjectError("publication_retryable", "图件已保存，文件登记暂未完成，可重试打开。", 503) from exc
 
 
 def _safe_stem(stem: str) -> str:
@@ -561,7 +568,16 @@ def list_for_owner(owner: int, *, limit: int = 100,
                    offset: int = 0) -> list[dict[str, Any]]:
     """The account's projects, as the workspace needs them."""
     projects = list_projects(owner, limit=limit, offset=offset)
-    return [_public(project) for project in projects]
+    result = []
+    for project in projects:
+        try:
+            complete_render_publication(project["figure_id"], owner)
+        except ProjectError as exc:
+            # Do not return staged download URLs while publication is retryable.
+            project = {**project, "exports_json": {}, "status": "publication_retryable",
+                       "last_error": exc.message}
+        result.append(_public(project))
+    return result
 
 
 def get_for_owner(figure_id: str, owner: int) -> dict[str, Any]:
@@ -573,6 +589,7 @@ def get_for_owner(figure_id: str, owner: int) -> dict[str, Any]:
     project = get_project(str(figure_id), int(owner))
     if not project:
         raise ProjectError("not_found", "图件不存在或无权访问。", status=404)
+    complete_render_publication(str(figure_id), int(owner))
     return project
 
 
@@ -660,7 +677,7 @@ def detail_for_owner(figure_id: str, owner: int, *, upgrade_manifest: bool = Fal
     manifest = _normalise_manifest(project.get("manifest_json"))
     public = _public(project)
     public["exports"] = {
-        **list_revision_exports(figure_id, owner, public["render_version"]), **public["exports"],
+        **public["exports"], **list_revision_exports(figure_id, owner, public["render_version"]),
     }
     from src.figures.manifest import MANIFEST_VERSION
     svg_detail = {}
@@ -877,50 +894,55 @@ def _load_revision(figure_id: str, owner: int, expected_revision: int | None) ->
 
 
 def generate_export(figure_id: str, owner: int, fmt: str, *, expected_revision: int) -> dict:
-    """Render and register a missing PNG or PDF from a bound saved revision."""
+    """Return a valid export or regenerate only the exact current frozen revision."""
     from src.figures.nature_receipts import current_qa_summary
-    from src.session.files import get_account_file
+    from src.figures.workbench.artifacts import read_entry, valid_export_bytes
 
     if fmt not in {"png", "pdf"}:
         raise ProjectError("format_unsupported", "仅支持生成 PNG 或 PDF。")
     project = get_for_owner(figure_id, owner)
     restored = get_revision_export(figure_id, owner, expected_revision, fmt)
-    if restored is not None:
-        entry = restored["export"]
-        registered = get_account_file(entry["file_id"], owner)
-        if (not registered or registered["sha256"] != entry["sha256"]
-                or not Path(registered["path"]).is_file()):
-            raise ProjectError("artifact_unavailable", "该版本的已登记文件不可读取。", status=404)
-        return restored
-    if project["render_version"] != expected_revision:
+    current = project["render_version"] == expected_revision
+    if restored:
+        try:
+            read_entry(restored["export"], owner, fmt)
+        except ProjectError:
+            pass
+        else:
+            return restored
+    if not current:
         raise ProjectError("revision_conflict", "图件版本已更新，请重新打开。", status=409)
     existing = (project.get("exports_json") or {}).get(fmt)
-    if isinstance(existing, dict) and existing.get("file_id"):
-        return {"figure_id": figure_id, "render_version": expected_revision, "format": fmt,
-                "export": existing}
+    try:
+        read_entry(existing, owner, fmt)
+    except ProjectError:
+        pass
+    else:
+        return {"figure_id": figure_id, "render_version": expected_revision, "format": fmt, "export": existing}
     if project.get("source_kind") == "svg" or not _can_edit(project):
         raise ProjectError("render_unavailable", "当前图件没有可重放的冻结工程。", status=409)
     session_id = project.get("session_id")
     if not session_id:
         raise ProjectError("no_session", "当前图件没有已授权的登记会话。", status=409)
-
-    _, _, manifest, blobs = _render_edits(project, owner, [], formats=(fmt,), require_current=False)
-    get_for_owner(figure_id, owner)
-    restored = get_revision_export(figure_id, owner, expected_revision, fmt)
-    if restored is not None:
-        return restored
-    filename = f"{_safe_stem(project.get('title'))}.{fmt}"
-    artifact = _publish_bytes(owner, session_id, filename, blobs[fmt], MIME_BY_FORMAT[fmt],
-                              request_id=f"figure-export:{figure_id}:{expected_revision}:{fmt}")
+    _, _, manifest, blobs = _render_edits(project, owner, [], formats=(fmt,))
+    _assert_current(project, owner)
+    if fmt not in blobs or not valid_export_bytes(blobs[fmt], fmt):
+        raise ProjectError("artifact_unavailable", "新生成的图件格式或大小无法验证。", status=409)
     summary = current_qa_summary(manifest)
-    checks = [check for check in summary.get("checks", [])
-              if (check.get("artifact") or {}).get("format") == fmt]
-    payload = {"figure_id": figure_id, "render_version": expected_revision, "format": fmt,
-               "export": artifact, "checks": checks, "qa_receipt_id": summary.get("receipt_id")}
-    committed = record_revision_export(figure_id, owner, expected_revision, fmt, payload)
-    if committed is None:
-        raise ProjectError("not_found", "图件不存在或无权访问。", status=404)
-    return committed
+    checks = [check for check in summary.get("checks", []) if (check.get("artifact") or {}).get("format") == fmt]
+    with stage_rendered(owner, session_id, project.get("title"), {fmt: blobs[fmt]},
+                        request_id=f"figure-export:{figure_id}:{expected_revision}:{fmt}") as (exports, publication):
+        payload = {"figure_id": figure_id, "render_version": expected_revision, "format": fmt,
+                   "export": exports[fmt], "checks": checks, "qa_receipt_id": summary.get("receipt_id")}
+        committed = record_revision_export(figure_id, owner, expected_revision, fmt, payload,
+                                           previous=restored, publication=publication)
+        if committed is None:
+            raise ProjectError("revision_conflict", "图件版本已更新，请重新打开。", status=409)
+        complete_render_publication(figure_id, owner, required_batch=publication[0])
+        if (committed.get("render_version") != expected_revision or committed.get("format") != fmt):
+            raise ProjectError("artifact_unavailable", "该版本的文件无法验证，可刷新后重试。", status=409)
+        read_entry(committed["export"], owner, fmt)
+        return committed
 
 
 def _resolve_edit_targets(project: dict[str, Any], raw_overrides: Any,
@@ -1016,20 +1038,14 @@ def save_overrides(figure_id: str, owner: int, raw_overrides: Any,
         confirm_targets(new_manifest, merged, changed)
 
     stem = project.get("title") or "figure"
-    published = publish_rendered(owner, session_id or project.get("session_id", ""),
-                                 stem, blobs)
-
-    committed_project = update_project_committed(
-        figure_id, owner, expected_revision=revision,
-        overrides_json=merged,
-        manifest_json=new_manifest,
-        exports_json=published,
-        render_version=revision + 1,
-        status="ready", last_error="")
-    if committed_project is None:
-        # Published files are valid immutable artifacts with normal lifecycle
-        # records, but must never replace a newer project's current render set.
-        raise ProjectError("revision_conflict", "保存期间图件已更新或删除，当前版本未被覆盖。", status=409)
+    with stage_rendered(owner, session_id or project.get("session_id", ""), stem, blobs) as (published, publication):
+        committed_project = update_project_committed(
+            figure_id, owner, expected_revision=revision, publication=publication,
+            overrides_json=merged, manifest_json=new_manifest, exports_json=published,
+            render_version=revision + 1, status="ready", last_error="")
+        if committed_project is None:
+            raise ProjectError("revision_conflict", "保存期间图件已更新或删除，当前版本未被覆盖。", status=409)
+        complete_render_publication(figure_id, owner)
     committed_revision = int(committed_project.get("render_version") or 0)
     document = committed_project.get("document_json") or None
     # Return only the document written by this commit. Never fall back to a
@@ -1051,7 +1067,8 @@ def save_overrides(figure_id: str, owner: int, raw_overrides: Any,
 def delete_for_owner(figure_id: str, owner: int) -> bool:
     """Delete a project owned by this account."""
     from src.figures.preview_pipeline import invalidate
-    get_for_owner(figure_id, owner)
+    if get_project(str(figure_id), int(owner)) is None:
+        raise ProjectError("not_found", "图件不存在或无权访问。", status=404)
     invalidate(owner, figure_id)
     return delete_project(str(figure_id), int(owner))
 
@@ -1124,20 +1141,12 @@ def import_from_library(owner: int, session_id: str, file_id: str,
     _verify_sources({"source_json": source,
                      "data_refs_json": [{**ref, "sha256": input_digest} for ref in info.get("refs", [])]}, owner)
     stem = title or filename.rsplit(".", 1)[0]
-    project = create_project(
-        owner_user_id=owner, title=stem, source_kind="spec",
-        source=source,
-        session_id=session_id, data_refs=info.get("refs", []))
     manifest["data_provenance"] = info
-    try:
-        published = publish_rendered(owner, session_id, stem, blobs)
-        committed = update_project(project["figure_id"], owner, expected_revision=0,
-                                   manifest_json=manifest, exports_json=published, render_version=1)
-        if not committed:
-            raise ProjectError("revision_conflict", "导入期间图件已更新或删除。", status=409)
-    except Exception:
-        delete_project(project["figure_id"], owner)
-        raise
+    with stage_rendered(owner, session_id, stem, blobs) as (published, publication):
+        project = create_project(owner_user_id=owner, title=stem, source_kind="spec", source=source,
+            session_id=session_id, data_refs=info.get("refs", []), initial_manifest=manifest,
+            initial_exports=published, publication=publication)
+        complete_render_publication(project["figure_id"], owner)
 
     return {
         "figure_id": project["figure_id"],
@@ -1282,6 +1291,6 @@ def schema_for_file(owner: int, file_id: str) -> dict[str, Any]:
 __all__ = [
     "DEFAULT_FORMATS", "FIGURE_FORMATS", "MIME_BY_FORMAT", "ProjectError",
     "data_files", "delete_for_owner", "detail_for_owner", "get_for_owner",
-    "import_from_library", "list_for_owner", "publish_rendered",
+    "import_from_library", "list_for_owner", "stage_rendered",
     "preview_overrides", "save_overrides", "schema_for_file",
 ]

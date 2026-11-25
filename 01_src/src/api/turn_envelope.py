@@ -20,8 +20,8 @@ in a worker thread:
 * admits one queue row through ``chat_turn_queue.enqueue_turn`` with a bounded
   payload that never contains raw bytes, Base64, tokens or host paths;
 * treats an idempotent replay (same owner-level client id + same canonical
-  fingerprint) as the original accepted fact and reconstitutes it from the
-  already registered uploads instead of registering new copies;
+  fingerprint) as the original accepted fact, without resolving or repinning
+  current library entries;
 * distinguishes a same-bytes upload whose name/type changed, and changed
   library references or order, as a payload conflict;
 * exposes an authorised public view and a dispatch-time rehydration that
@@ -275,14 +275,9 @@ def _decode_upload(item: dict) -> tuple[str, str, bytes, str]:
 
 
 def _resolve_library_refs(file_ids: list[str], owner_user_id: int) -> list[dict]:
-    """Resolve opaque account-file ids by ownership; preserve first-seen order."""
+    """Resolve first-seen opaque account-file ids by ownership for new turns."""
     resolved: list[dict] = []
-    seen: set[str] = set()
-    for raw_id in file_ids:
-        file_id = str(raw_id or "")
-        if file_id in seen:
-            continue
-        seen.add(file_id)
+    for file_id in file_ids:
         info = session_files.get_account_file(file_id, owner_user_id)
         if not info:
             raise _http(404, "引用的资料不存在、已过期或不属于当前账号。")
@@ -308,7 +303,7 @@ def _input_metadata(info: dict, *, source: str) -> dict:
 
 def _request_fingerprint(*, session_id: str, query: str, options: dict,
                          selected_skills: list[dict], uploads: list[tuple],
-                         file_refs: list[dict]) -> str:
+                         file_refs: list[str]) -> str:
     """Pre-registration identity of the *client's* request.
 
     Uploads are identified by requested name/type plus immutable byte SHA-256,
@@ -327,7 +322,7 @@ def _request_fingerprint(*, session_id: str, query: str, options: dict,
             {"name": name, "type": mime, "sha256": sha}
             for name, mime, _content, sha in uploads
         ],
-        "file_refs": [str(ref.get("file_id") or "") for ref in file_refs],
+        "file_refs": file_refs,
     }
     try:
         return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
@@ -353,8 +348,10 @@ def _stored_fingerprint_matches(payload: dict, *, session_id: str,
                 "type": item.get("type"),
                 "sha256": item.get("sha256"),
             })
-        else:
+        elif item.get("source") == "library":
             file_refs.append(str(item.get("file_id") or ""))
+        elif item.get("source") != "previous_turn":
+            return False
     material = {
         "schema": payload.get("schema", PAYLOAD_SCHEMA),
         "session_id": session_id,
@@ -402,50 +399,14 @@ def _existing_turn(*, owner_user_id: int, session_id: str,
         client_request_id=client_request_id)
 
 
-def _replay_existing(turn: dict, *, owner_user_id: int, session_id: str,
-                     client_request_id: str, fingerprint: str) -> dict:
-    """Return the original accepted fact for a valid same-fingerprint replay."""
+def _replay_existing(turn: dict, *, session_id: str, fingerprint: str) -> dict:
+    """Return the stored admission fact. Current bytes are checked at dispatch."""
     payload = turn.get("bounded_payload")
     if not isinstance(payload, dict) or not _stored_fingerprint_matches(
             payload, session_id=session_id, computed=fingerprint):
         raise chat_turn_queue.TurnPayloadConflict(
             "turn_payload_conflict", job_id=turn.get("job_id"))
-    inputs = payload.get("inputs") or []
-    if turn.get("state") in chat_turn_queue.NONTERMINAL_STATES:
-        # A still-pending turn must still have readable, unchanged bytes and a
-        # live pin. Reconstitute from the *original* registered uploads; never
-        # register a second copy for a lost 202 response.
-        _verify_and_repin(owner_user_id, session_id, client_request_id, turn)
-    _ensure_turn_links(owner_user_id, session_id, client_request_id, inputs)
-    turn["created"] = False
-    return turn
-
-
-def _verify_and_repin(owner_user_id: int, session_id: str,
-                      client_request_id: str, turn: dict) -> None:
-    payload = turn.get("bounded_payload")
-    if not isinstance(payload, dict):
-        raise chat_turn_queue.TurnReconcileRequired(
-            "turn_payload_missing", job_id=turn.get("job_id"))
-    file_ids = []
-    for item in payload.get("inputs") or []:
-        if not isinstance(item, dict):
-            raise chat_turn_queue.TurnReconcileRequired(
-                "turn_payload_invalid", job_id=turn.get("job_id"))
-        file_id = str(item.get("file_id") or "")
-        expected = str(item.get("sha256") or "")
-        info = session_files.get_account_file(file_id, owner_user_id)
-        if not info:
-            raise chat_turn_queue.TurnReconcileRequired(
-                "turn_input_unavailable", job_id=turn.get("job_id"))
-        if str(info.get("sha256")) != expected:
-            raise chat_turn_queue.TurnReconcileRequired(
-                "turn_input_checksum_changed", job_id=turn.get("job_id"))
-        file_ids.append(file_id)
-    if file_ids:
-        session_files.replace_resource_references(
-            owner_user_id, RESOURCE_KIND,
-            turn_input_resource_id(session_id, client_request_id), file_ids)
+    return {**turn, "created": False}
 
 
 def _ensure_turn_links(owner_user_id: int, session_id: str,
@@ -551,27 +512,25 @@ def admit_turn(*, request: dict, owner_user_id: int, session_id: str,
     upload_bytes = sum(len(content) for _name, _mime, content, _sha in uploads)
     if upload_bytes > MAX_UPLOAD_BYTES:
         raise _http(413, "本轮附件总大小不能超过 20 MB")
-    ref_infos = _resolve_library_refs(req["file_refs"], owner_user_id)
-    ref_bytes = sum(int(info.get("size_bytes") or 0) for info in ref_infos)
-    if ref_bytes > MAX_LIBRARY_REF_BYTES:
-        raise _http(413, "引用资料总大小不能超过 20 MB。")
-    if len(uploads) + len(ref_infos) > MAX_FILES:
-        raise _http(413, "每轮最多上传或引用 8 个文件。")
-
+    # Preserve schema-1 identity: the previous implementation hashed only the
+    # resolved opaque ids, in their first-seen order, never the library metadata.
+    file_refs = list(dict.fromkeys(req["file_refs"]))
     fingerprint = _request_fingerprint(
         session_id=session_id, query=req["query"], options=req["options"],
-        selected_skills=req["selected_skills"], uploads=uploads,
-        file_refs=ref_infos)
+        selected_skills=req["selected_skills"], uploads=uploads, file_refs=file_refs)
 
-    # Idempotency is checked before limits and before any registration. A lost
-    # 202 retry therefore consumes no quota and writes no second copy.
+    # A receipt proves historical acceptance, not current file authorization.
+    # Look up the scoped receipt before reading any current library entry.
     existing = _existing_turn(
         owner_user_id=owner_user_id, session_id=session_id,
         client_request_id=client_request_id)
     if existing is not None:
-        return _replay_existing(
-            existing, owner_user_id=owner_user_id, session_id=session_id,
-            client_request_id=client_request_id, fingerprint=fingerprint)
+        return _replay_existing(existing, session_id=session_id, fingerprint=fingerprint)
+
+    ref_infos = _resolve_library_refs(file_refs, owner_user_id)
+    ref_bytes = sum(int(info.get("size_bytes") or 0) for info in ref_infos)
+    if ref_bytes > MAX_LIBRARY_REF_BYTES:
+        raise _http(413, "引用资料总大小不能超过 20 MB。")
 
     if enforce_rate:
         _enforce_rate_limit(owner_user_id)
@@ -582,9 +541,7 @@ def admit_turn(*, request: dict, owner_user_id: int, session_id: str,
         owner_user_id=owner_user_id, session_id=session_id,
         client_request_id=client_request_id)
     if existing is not None:
-        return _replay_existing(
-            existing, owner_user_id=owner_user_id, session_id=session_id,
-            client_request_id=client_request_id, fingerprint=fingerprint)
+        return _replay_existing(existing, session_id=session_id, fingerprint=fingerprint)
 
     staged_file_ids: list[str] = []
     try:

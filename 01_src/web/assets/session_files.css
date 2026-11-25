@@ -517,9 +517,7 @@ body .session-files-panel .session-file-act {
   .session-file-preview-actions .overlay-close { width: 30px; height: 30px; font-size: 17px; }
 }
 
-/* ===== 数据审查：问题清单跳转定位 + 表头失配告警（2026-10-31） ===== */
-.sf-issue-row { cursor: pointer; }
-.sf-issue-row:hover td { background: rgba(249, 115, 22, 0.10); }
+/* Workbook preview location markers */
 .sf-audit-jump {
   border: 0;
   padding: 0;
@@ -549,8 +547,7 @@ body .session-files-panel .session-file-act {
   font-size: 12.5px;
   line-height: 1.6;
 }
-html[data-theme="night"] .sf-preview-warn,
-html[data-theme="dark"] .sf-preview-warn {
+html[data-theme="navy"] .sf-preview-warn {
   background: rgba(249, 115, 22, 0.16);
   color: #ffd7b0;
 }

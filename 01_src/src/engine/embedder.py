@@ -7,7 +7,7 @@ import traceback
 from typing import List
 from src.config import MODEL_CACHE_ROOT, settings
 from src.engine.hardware import (
-    GPUUnavailableError, cpu_thread_budget, require_gpu, verify_model_session,
+    GPUUnavailableError, active_runtime_model, cpu_thread_budget, get_device_mode, require_gpu, verify_model_session,
 )
 
 def TextEmbedding(**kwargs):
@@ -54,6 +54,7 @@ def _with_e5_prefix(text: str, prefix: str) -> str:
 
 class Embedder:
     _instance = None
+    _initial_runtime = None
     _singleton_lock = threading.Lock()
 
     def __new__(cls):
@@ -63,33 +64,51 @@ class Embedder:
                     cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
-        if getattr(self, "_loaded", False):
-            return
-        with self._singleton_lock:
-            if getattr(self, "_loaded", False):
-                return
-            self.model_name = settings.EMBEDDING_MODEL
-            self._dim = None
-            self._force_cpu = bool(settings.EMBEDDER_FORCE_CPU and not require_gpu())
-            self._inference_verified = False
-            self._runtime_error = None
-            self._providers = None
-            self._needs_lock = False
-            self._shared_model = None
-            self._shared_lock = threading.Lock()
-            self._query_cache: dict = {}          # v8.4.4
-            self._cache_lock = threading.Lock()   # v8.4.4
-            self._load_config()
-            self._loaded = True
+    @classmethod
+    def _new_runtime(cls, *, mode=None, providers=None, staging=False):
+        self = object.__new__(cls)
+        self._concrete_runtime = True
+        self._staging = staging
+        mode = mode if mode is not None else get_device_mode()
+        self._strict_gpu = require_gpu(mode)
+        self.model_name = settings.EMBEDDING_MODEL
+        self._dim = None
+        self._force_cpu = bool(settings.EMBEDDER_FORCE_CPU and not self._strict_gpu and mode == "auto")
+        self._inference_verified = False
+        self._runtime_error = None
+        self._providers = None
+        self._needs_lock = False
+        self._shared_model = None
+        self._shared_lock = threading.Lock()
+        self._query_cache: dict = {}          # v8.4.4
+        self._cache_lock = threading.Lock()   # v8.4.4
+        self._load_config(providers)
+        return self
 
-    def _load_config(self):
-        if self._force_cpu and not require_gpu():
+    def _runtime(self):
+        if getattr(self, "_concrete_runtime", False):
+            return self
+        cls = type(self)
+        if (active := active_runtime_model("embedder")) is not None:
+            return active
+        with cls._singleton_lock:
+            if (active := active_runtime_model("embedder")) is not None:
+                return active
+            candidate = cls._initial_runtime
+            if candidate is None:
+                candidate = cls._new_runtime()
+                if (active := active_runtime_model("embedder")) is not None:
+                    return active
+                cls._initial_runtime = candidate
+            return candidate
+
+    def _load_config(self, providers=None):
+        if self._force_cpu and not self._strict_gpu:
             self._providers = ["CPUExecutionProvider"]
             logger.info(f"[Embedder] 配置 | Provider: CPU(forced) | 进程内共享模型 | 模型: {self.model_name}")
             return
         from src.engine.hardware import get_ort_providers
-        raw = get_ort_providers()
+        raw = list(providers) if providers is not None else get_ort_providers()
         self._providers = raw
         if "DmlExecutionProvider" in raw:
             self._needs_lock = True
@@ -97,30 +116,29 @@ class Embedder:
         logger.info(f"[Embedder] 配置 | Provider: {label} | 进程内共享模型 | 模型: {self.model_name}")
 
     def _create_session(self):
-        with self._singleton_lock:
-            # Preserve the host's offline default at explicit model construction,
-            # never as an import-time environment mutation.
-            os.environ.setdefault("HF_HUB_OFFLINE", "1")
-            cpu_threads = cpu_thread_budget()
-            # FastEmbed otherwise defaults to a temporary system directory
-            # (for example /tmp/fastembed_cache). Keep the model cache beside
-            # the other persistent model assets so startup and offline index
-            # rebuilds use the same data-disk cache.
-            fastembed_cache = MODEL_CACHE_ROOT / "fastembed"
-            fastembed_cache.mkdir(parents=True, exist_ok=True)
-            model = TextEmbedding(model_name=self.model_name,
-                                  cache_dir=str(fastembed_cache),
-                                  providers=self._providers,
-                                  threads=cpu_threads,
-                                  **({"local_files_only": True} if require_gpu() else {}))
-            verify_model_session(model, "embedder")
-            if self._dim is None or require_gpu():
-                test_emb = list(model.embed(["validate"]))
-                verify_model_session(model, "embedder")
-                self._inference_verified = True
-                self._runtime_error = None
-                self._dim = len(test_emb[0])
-                logger.info(f"[Embedder] 新会话 | Dim: {self._dim} | Provider: {self._providers}")
+        # Preserve the host's offline default at explicit model construction,
+        # never as an import-time environment mutation.
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        cpu_threads = cpu_thread_budget()
+        # FastEmbed otherwise defaults to a temporary system directory
+        # (for example /tmp/fastembed_cache). Keep the model cache beside
+        # the other persistent model assets so startup and offline index
+        # rebuilds use the same data-disk cache.
+        fastembed_cache = MODEL_CACHE_ROOT / "fastembed"
+        fastembed_cache.mkdir(parents=True, exist_ok=True)
+        model = TextEmbedding(model_name=self.model_name,
+                              cache_dir=str(fastembed_cache),
+                              providers=self._providers,
+                              threads=cpu_threads,
+                              **({"local_files_only": True} if self._strict_gpu or self._staging else {}))
+        verify_model_session(model, "embedder", strict=self._strict_gpu)
+        if self._dim is None or self._strict_gpu:
+            test_emb = list(model.embed(["validate"]))
+            verify_model_session(model, "embedder", strict=self._strict_gpu)
+            self._inference_verified = True
+            self._runtime_error = None
+            self._dim = len(test_emb[0])
+            logger.info(f"[Embedder] 新会话 | Dim: {self._dim} | Provider: {self._providers}")
         return model
 
     def _get_model(self):
@@ -133,29 +151,11 @@ class Embedder:
                 self._shared_model = self._create_session()
         return self._shared_model
 
-    def reconfigure(self) -> None:
-        """Drop the current ONNX session and apply the persisted device mode."""
-        from src.engine.hardware import get_device_mode, get_ort_providers
-        mode = get_device_mode()
-        with self._singleton_lock:
-            self._force_cpu = bool(not require_gpu() and (
-                mode == "cpu" or (mode == "auto" and settings.EMBEDDER_FORCE_CPU)))
-            self._inference_verified = False
-            self._runtime_error = None
-            self._providers = (
-                ["CPUExecutionProvider"] if self._force_cpu else get_ort_providers())
-            self._needs_lock = "DmlExecutionProvider" in self._providers
-            self._shared_model = None
-            with self._cache_lock:
-                self._query_cache.clear()
-        logger.info("[Embedder] device reconfiguration queued | providers=%s",
-                    self._providers)
-
     def _safe_embed(self, texts: List[str]) -> List[List[float]]:
         for attempt in range(2):
             try:
                 model = self._get_model()
-                verify_model_session(model, "embedder")
+                verify_model_session(model, "embedder", strict=self._strict_gpu)
                 if self._needs_lock:
                     from src.engine.gpu_lock import GPULockGuard
                     with GPULockGuard():
@@ -163,14 +163,16 @@ class Embedder:
                             result = [emb.tolist() for emb in model.embed(texts)]
                 else:
                     result = [emb.tolist() for emb in model.embed(texts)]
-                verify_model_session(model, "embedder")
+                verify_model_session(model, "embedder", strict=self._strict_gpu)
                 self._inference_verified = True
                 self._runtime_error = None
                 return result
             except Exception as e:
                 self._inference_verified = False
                 self._runtime_error = f"{type(e).__name__}: {e}"
-                if require_gpu():
+                if self._staging:
+                    raise
+                if self._strict_gpu:
                     raise GPUUnavailableError(
                         f"embedder unavailable with CITRUS_REQUIRE_GPU=1: {e}. "
                         "Check GPU libraries, cached model and actual session providers; CPU retry is disabled.") from e
@@ -185,6 +187,9 @@ class Embedder:
                 raise
 
     def embed_query(self, text: str) -> List[float]:
+        runtime = self._runtime()
+        if runtime is not self:
+            return runtime.embed_query(text)
         prefixed = _with_e5_prefix(text, "query:")
         # v8.4.4: query embedding LRU 缓存（进程内，512 条）——检索场景同一
         # 关键词跨请求/跨轮复用，避免重复推理（TUNE_PARAMS §9 补全）
@@ -210,10 +215,16 @@ class Embedder:
         account memory and web-evidence clustering; corpus indexers must call this
         explicit method so document/query vectors share the model's intended format.
         """
+        runtime = self._runtime()
+        if runtime is not self:
+            return runtime.embed_passages(texts)
         prefixed = [_with_e5_prefix(text, "passage:") for text in texts]
         return self.embed_docs(prefixed)
 
     def embed_docs(self, texts: List[str]) -> List[List[float]]:
+        runtime = self._runtime()
+        if runtime is not self:
+            return runtime.embed_docs(texts)
         if not texts:
             return []
         cleaned = [_clean_text(_validate_utf8(t)) for t in texts]
@@ -224,6 +235,9 @@ class Embedder:
 
     @property
     def dim(self) -> int:
+        runtime = self._runtime()
+        if runtime is not self:
+            return runtime.dim
         if self._dim is None:
             model = self._get_model()
             if self._dim is None:

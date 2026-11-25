@@ -296,6 +296,10 @@ def _fake_session_registry(tmp_path, monkeypatch):
                 "download_url": entry["download_url"], "artifact_id": entry["file_id"]}
 
     monkeypatch.setattr(artifacts_module, "publish_artifact", publish)
+    monkeypatch.setattr(artifacts_module, "stage_figure_artifact",
+                        lambda **kwargs: publish(producer_tool="figure_workspace", **kwargs))
+    monkeypatch.setattr(artifacts_module, "discard_staged_figures", lambda *args: None)
+    monkeypatch.setattr(files_module, "promote_figure_files", lambda *args: None)
     return entries, add
 
 
@@ -713,22 +717,23 @@ ax.set_title('Mixed artists')
             return render_edits(bound, owner, overrides, **options)
 
         monkeypatch.setattr(projects, "_render_edits", edit_during_export)
-        pdf = projects.generate_export(figure_id, 7, "pdf", expected_revision=1)
+        with pytest.raises(projects.ProjectError) as stale:
+            projects.generate_export(figure_id, 7, "pdf", expected_revision=1)
+        assert stale.value.code == "revision_conflict"
+        assert store.get_revision_export(figure_id, 7, 1, "pdf") is None
         assert set(projects.detail_for_owner(figure_id, 7)["exports"]) == {"svg"}
         assert store.get_project(figure_id, 7)["render_version"] == 2
         assert store.get_project(figure_id, 7)["overrides_json"] == [override]
-        for output, signature in ((png, b"\x89PNG\r\n\x1a\n"), (pdf, b"%PDF-")):
-            artifact = output["export"]
-            payload = entries[artifact["file_id"]]["path"].read_bytes()
-            assert payload.startswith(signature) and _sha(payload) == artifact["sha256"]
-            assert output["render_version"] == 1
-            assert output["checks"]
-            assert all(check["artifact"]["sha256"] == artifact["sha256"] for check in output["checks"])
-            assert projects.generate_export(figure_id, 7, output["format"], expected_revision=1) == output
-            with pytest.raises(projects.ProjectError) as denied:
-                projects.generate_export(figure_id, 8, output["format"], expected_revision=1)
-            assert denied.value.code == "not_found"
-        assert len(entries) == 3
+        artifact = png["export"]
+        payload = entries[artifact["file_id"]]["path"].read_bytes()
+        assert payload.startswith(b"\x89PNG\r\n\x1a\n") and _sha(payload) == artifact["sha256"]
+        assert png["render_version"] == 1 and png["checks"]
+        assert all(check["artifact"]["sha256"] == artifact["sha256"] for check in png["checks"])
+        assert projects.generate_export(figure_id, 7, "png", expected_revision=1) == png
+        with pytest.raises(projects.ProjectError) as denied:
+            projects.generate_export(figure_id, 8, "png", expected_revision=1)
+        assert denied.value.code == "not_found"
+        assert len(entries) == 2
         assert store.delete_project(figure_id, 7)
         assert store.list_revision_exports(figure_id, 7, 1) == {}
     finally:

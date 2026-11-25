@@ -8,6 +8,9 @@ import time
 from collections import OrderedDict
 
 
+DEGRADED_TTL_SECONDS = 60
+
+
 class QueryResultCache:
     def __init__(self, max_entries: int = 300, ttl_seconds: int = 86400,
                  max_bytes: int = 64 * 1024 * 1024, max_entry_bytes: int = 1024 * 1024):
@@ -25,15 +28,15 @@ class QueryResultCache:
             item = self._items.get(key)
             if item is None:
                 return None
-            created, size, value = item
-            if now - created >= self.ttl_seconds:
+            expires, size, value = item
+            if now >= expires:
                 self._items.pop(key, None)
                 self._bytes = max(0, self._bytes - size)
                 return None
             self._items.move_to_end(key)
             return copy.deepcopy(value)
 
-    def set(self, key: str, value) -> None:
+    def set(self, key: str, value, *, degraded: bool = False) -> None:
         try:
             size = len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
         except Exception:
@@ -44,7 +47,8 @@ class QueryResultCache:
             old = self._items.pop(key, None)
             if old:
                 self._bytes = max(0, self._bytes - old[1])
-            self._items[key] = (time.monotonic(), size, copy.deepcopy(value))
+            ttl = min(self.ttl_seconds, DEGRADED_TTL_SECONDS) if degraded else self.ttl_seconds
+            self._items[key] = (time.monotonic() + ttl, size, copy.deepcopy(value))
             self._bytes += size
             while len(self._items) > self.max_entries or self._bytes > self.max_bytes:
                 _, (_, removed_size, _) = self._items.popitem(last=False)
@@ -53,7 +57,7 @@ class QueryResultCache:
 
 def build_cache_key(query: str, families: list[str], categories: list[str], limit: int,
                     rag_identity: int, settings, corpus_generation: str = "",
-                    allowed_corpus_ids: list[str] | None = None) -> str:
+                    allowed_corpus_ids: list[str] | None = None, *, retrieval_profile: tuple = ()) -> str:
     from src.core.capability_policy import current_policy
     payload = {
         "capability_history": current_policy().history_key,
@@ -63,6 +67,7 @@ def build_cache_key(query: str, families: list[str], categories: list[str], limi
                                 else sorted(set(str(x) for x in allowed_corpus_ids))),
         "limit": int(limit), "rag": int(rag_identity),
         "corpus_generation": str(corpus_generation or ""),
+        "retrieval_profile": retrieval_profile,
         "rrf_k": int(getattr(settings, "RRF_K", 60) or 60),
         "bm25_weight": float(getattr(settings, "RRF_WEIGHT_BM25", 1.0) or 1.0),
         "dense_weight": float(getattr(settings, "RRF_WEIGHT_ORIG_DENSE", 1.0) or 1.0),

@@ -123,6 +123,10 @@ def isolated(tmp_path, monkeypatch):
         files_module, "get_account_file",
         lambda file_id, owner, **kwargs: entries.get(str(file_id)))
     monkeypatch.setattr(artifacts_module, "publish_artifact", publish)
+    monkeypatch.setattr(artifacts_module, "stage_figure_artifact",
+                        lambda **kwargs: publish(producer_tool="figure_workspace", **kwargs))
+    monkeypatch.setattr(artifacts_module, "discard_staged_figures", lambda *args: None)
+    monkeypatch.setattr(files_module, "promote_figure_files", lambda *args: None)
     state.add = add
     try:
         yield state

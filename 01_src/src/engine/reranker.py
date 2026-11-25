@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore", message=".*mean pooling instead of CLS.*")
 from typing import List, Dict
 from src.config import settings, MODEL_CACHE_ROOT
 from src.engine.hardware import (
-    GPUUnavailableError, get_ort_providers, model_session, profile_compute_providers,
+    GPUUnavailableError, active_runtime_model, get_device_mode, get_ort_providers, model_session, profile_compute_providers,
     require_gpu, session_options, verify_model_session,
 )
 
@@ -37,6 +37,7 @@ def _reranker_score(logit: float) -> float:
 
 class Reranker:
     _instance = None
+    _initial_runtime = None
     _singleton_lock = threading.Lock()
     _thread_local = threading.local()
 
@@ -47,36 +48,54 @@ class Reranker:
                     cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
-        if getattr(self, "_loaded", False):
-            return
-        with self._singleton_lock:
-            if getattr(self, "_loaded", False):
-                return
-            # Model weights live in a persistent cache independent of the
-            # request/session data root. Isolated tests may redirect PROJECT_ROOT;
-            # that must not make a present reranker look missing and trigger a download.
-            self._cache_dir = MODEL_CACHE_ROOT / "onnx_reranker"
-            self._force_cpu = False
-            self._inference_verified = False
-            self._runtime_error = None
-            self._compute_providers = []
-            self._profile_evidence = {}
-            self._profile_pending = False
-            self._providers = None
-            self._needs_lock = False
-            self._shared_model = None
-            self._shared_tokenizer = None
-            self._shared_lock = threading.Lock()
-            self._load_config()
-            self._loaded = True
+    @classmethod
+    def _new_runtime(cls, *, mode=None, providers=None, staging=False):
+        self = object.__new__(cls)
+        self._concrete_runtime = True
+        self._staging = staging
+        mode = mode if mode is not None else get_device_mode()
+        self._strict_gpu = require_gpu(mode)
+        # Model weights live in a persistent cache independent of the
+        # request/session data root. Isolated tests may redirect PROJECT_ROOT;
+        # that must not make a present reranker look missing and trigger a download.
+        self._cache_dir = MODEL_CACHE_ROOT / "onnx_reranker"
+        self._force_cpu = False
+        self._inference_verified = False
+        self._runtime_error = None
+        self._compute_providers = []
+        self._profile_evidence = {}
+        self._profile_pending = False
+        self._providers = None
+        self._needs_lock = False
+        self._shared_model = None
+        self._shared_tokenizer = None
+        self._shared_lock = threading.Lock()
+        self._load_config(providers)
+        return self
+
+    def _runtime(self):
+        if getattr(self, "_concrete_runtime", False):
+            return self
+        cls = type(self)
+        if (active := active_runtime_model("reranker")) is not None:
+            return active
+        with cls._singleton_lock:
+            if (active := active_runtime_model("reranker")) is not None:
+                return active
+            candidate = cls._initial_runtime
+            if candidate is None:
+                candidate = cls._new_runtime()
+                if (active := active_runtime_model("reranker")) is not None:
+                    return active
+                cls._initial_runtime = candidate
+            return candidate
 
     @staticmethod
     def _is_mistral_model() -> bool:
         return "mistral" in settings.RERANKER_MODEL.lower()
 
-    def _load_config(self):
-        raw_providers = get_ort_providers()
+    def _load_config(self, providers=None):
+        raw_providers = list(providers) if providers is not None else get_ort_providers()
         self._providers = raw_providers
         self._force_cpu = raw_providers == ["CPUExecutionProvider"]
         if any("DmlExecutionProvider" in p or "CUDAExecutionProvider" in p for p in raw_providers):
@@ -84,7 +103,7 @@ class Reranker:
         logger.info(f"[Reranker] 配置 | Provider: {raw_providers} | 进程内共享模型")
 
     def _create_session(self):
-        if not self._cache_dir.exists() and require_gpu():
+        if not self._cache_dir.exists() and (self._strict_gpu or self._staging):
             raise GPUUnavailableError(
                 f"reranker cache missing at {self._cache_dir}; stage the exported ONNX model "
                 "before starting the GPU service (strict readiness never downloads weights)")
@@ -101,15 +120,15 @@ class Reranker:
         # Strict model compute is instead gated by the actual first-forward
         # profile below; Python session fallback and CPU retries remain disabled.
         options = session_options(provider=provider)
-        if require_gpu():
+        if self._strict_gpu:
             options.enable_profiling = True
             options.profile_file_prefix = str(Path(tempfile.gettempdir()) / f"citrus-rerank-{uuid.uuid4().hex}")
         tokenizer = AutoTokenizer.from_pretrained(
-            self._cache_dir, fix_mistral_regex=self._is_mistral_model(), local_files_only=require_gpu())
+            self._cache_dir, fix_mistral_regex=self._is_mistral_model(), local_files_only=self._strict_gpu or self._staging)
         model = ORTModelForSequenceClassification.from_pretrained(
-            self._cache_dir, provider=provider, session_options=options, local_files_only=require_gpu())
-        verify_model_session(model, "reranker")
-        self._profile_pending = require_gpu()
+            self._cache_dir, provider=provider, session_options=options, local_files_only=self._strict_gpu or self._staging)
+        verify_model_session(model, "reranker", strict=self._strict_gpu)
+        self._profile_pending = self._strict_gpu
         return model, tokenizer
 
     def _get_model(self):
@@ -121,26 +140,6 @@ class Reranker:
                 self._shared_model, self._shared_tokenizer = self._create_session()
             return self._shared_model, self._shared_tokenizer
 
-    def reconfigure(self) -> None:
-        """Drop the current ONNX session and apply the persisted device mode."""
-        from src.engine.hardware import get_device_mode, get_ort_providers
-        mode = get_device_mode()
-        with self._singleton_lock:
-            self._force_cpu = mode == "cpu" and not require_gpu()
-            self._inference_verified = False
-            self._runtime_error = None
-            self._compute_providers = []
-            self._profile_evidence = {}
-            self._profile_pending = False
-            self._providers = get_ort_providers()
-            self._needs_lock = any(
-                provider in {"DmlExecutionProvider", "CUDAExecutionProvider"}
-                for provider in self._providers)
-            self._shared_model = None
-            self._shared_tokenizer = None
-        logger.info("[Reranker] device reconfiguration queued | providers=%s",
-                    self._providers)
-
     def _run_guarded(self, model, inputs):
         """Run one forward pass with a watchdog.
 
@@ -151,7 +150,7 @@ class Reranker:
         """
         import threading
 
-        verify_model_session(model, "reranker")
+        verify_model_session(model, "reranker", strict=self._strict_gpu)
         outcome: dict[str, object] = {}
 
         def _call() -> None:
@@ -166,13 +165,15 @@ class Reranker:
         if worker.is_alive():
             from src.engine.hardware import mark_provider_unusable
             provider = (self._providers or ["CPUExecutionProvider"])[0]
-            mark_provider_unusable(
-                provider, f"rerank forward made no progress within {_FORWARD_TIMEOUT_SEC:.0f}s")
+            if not self._staging:
+                mark_provider_unusable(
+                    provider, f"rerank forward made no progress within {_FORWARD_TIMEOUT_SEC:.0f}s",
+                    runtime=self)
             raise TimeoutError(
                 f"reranker forward pass exceeded {_FORWARD_TIMEOUT_SEC:.0f}s on {provider}")
         if "error" in outcome:
             raise outcome["error"]  # type: ignore[misc]
-        status = verify_model_session(model, "reranker")
+        status = verify_model_session(model, "reranker", strict=self._strict_gpu)
         if self._profile_pending:
             self._profile_evidence = {}
             self._compute_providers = profile_compute_providers(
@@ -180,7 +181,7 @@ class Reranker:
             self._profile_pending = False
             logger.info("[Reranker] actual model profile | compute=%s | CPU control=%s",
                         self._compute_providers, self._profile_evidence.get("cpu_control_ops", {}))
-        if require_gpu() and set(self._compute_providers) != {status["providers"][0]}:
+        if self._strict_gpu and set(self._compute_providers) != {status["providers"][0]}:
             raise GPUUnavailableError(
                 f"reranker executed compute providers={self._compute_providers}; "
                 "GPU compute was not observed exclusively (bounded CPU control operations are reported separately)")
@@ -228,7 +229,9 @@ class Reranker:
             except Exception as e:
                 self._inference_verified = False
                 self._runtime_error = f"{type(e).__name__}: {e}"
-                if require_gpu():
+                if self._staging:
+                    raise
+                if self._strict_gpu:
                     raise GPUUnavailableError(
                         f"reranker unavailable with CITRUS_REQUIRE_GPU=1: {e}. "
                         "Check GPU libraries, cached model and actual session providers; CPU retry is disabled.") from e
@@ -246,4 +249,4 @@ class Reranker:
     def rerank(self, query: str, chunks: List[Dict], top_k: int = 10) -> List[Dict]:
         if not chunks:
             return []
-        return self._safe_rerank(query, chunks, top_k)
+        return self._runtime()._safe_rerank(query, chunks, top_k)

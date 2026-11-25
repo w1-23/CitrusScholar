@@ -70,7 +70,7 @@ def _document_matches(document, objects):
     return True
 
 
-def _read_only(project, manifest, owner, *, check_document=True):
+def _read_only(project, manifest, owner, frozen, *, check_document=True):
     source = project.get("source_json")
     if project.get("source_kind") == "svg":
         return "此图件是静态 SVG，未登记系列和子图编辑信息。"
@@ -81,12 +81,8 @@ def _read_only(project, manifest, owner, *, check_document=True):
             return projects.edit_context(project).get("edit_limitation") or "此图件没有可用的样式重放环境。"
         except (TypeError, KeyError, AttributeError):
             return "图件的已保存来源无法验证。"
-    if not projects._is_script(project):
-        try:
-            if load_snapshot(source) is None:
-                return "历史图件没有可验证的冻结数据快照。"
-        except SnapshotError:
-            return "图件的冻结数据快照无法验证。"
+    if not projects._is_script(project) and frozen is None:
+        return "历史图件没有可验证的冻结数据快照。"
     document = project.get("document_json")
     if (not isinstance(document, dict) or document.get("schema") != SCHEMA
             or document.get("revision") != project["render_version"]
@@ -112,7 +108,20 @@ def _inventory(project, owner, *, check_preview=True):
         manifest = {"objects": []}
     # Reject a partially normalized inventory. A legacy invalid bounding box
     # can still be read through the sidebar with its geometry warning.
-    reason = _read_only(project, manifest, owner, check_document=check_preview)
+    frozen = None
+    snapshot_error = False
+    if project.get("source_kind") == "spec" and isinstance(project.get("source_json"), dict):
+        try:
+            source = project["source_json"]
+            snapshot = load_snapshot(source)
+            if snapshot is not None:
+                frozen, _ = snapshot
+                if manifest.get("resolved_data_sha256") != source["resolved_snapshot"]["resolved_sha256"]:
+                    snapshot_error = True
+        except SnapshotError:
+            snapshot_error = True
+    reason = ("图件的冻结数据快照与渲染对象无法验证。" if snapshot_error else
+              _read_only(project, manifest, owner, frozen, check_document=check_preview))
     if not reason and (not isinstance(raw, dict) or not isinstance(raw.get("objects"), list)
                        or len(raw["objects"]) != len(manifest["objects"])):
         reason = "图件的已保存对象清单无法验证。"
@@ -122,7 +131,7 @@ def _inventory(project, owner, *, check_preview=True):
         except projects.ProjectError as exc:
             reason = exc.message
     try:
-        return manifest, Inventory(project, manifest, disabled=reason)
+        return manifest, Inventory(project, manifest, disabled=reason, frozen=frozen)
     except (projects.ProjectError, TypeError, AttributeError):
         return {"objects": []}, Inventory({**project, "overrides_json": []}, {"objects": []},
                                             disabled="图件的已保存对象清单无法验证。")

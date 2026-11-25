@@ -34,6 +34,10 @@ from typing import Any
 _STATE_DIR: Path | None = None
 
 
+class NatureBindingConflict(ValueError):
+    """Another collection already chose the project for this execution."""
+
+
 class ProjectQuotaExceeded(ValueError):
     """Existing projects remain available when creation capacity is exhausted."""
 
@@ -81,34 +85,22 @@ def _connect() -> sqlite3.Connection:
         last_error     TEXT NOT NULL DEFAULT '',
         created_at     REAL NOT NULL,
         updated_at     REAL NOT NULL)""")
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(figure_projects)")}
-    for name, declaration in (
-        ("data_refs_json", "TEXT NOT NULL DEFAULT '[]'"),
-        ("document_json", "TEXT NOT NULL DEFAULT '{}'"),
-        ("render_version", "INTEGER NOT NULL DEFAULT 0"),
-        ("pins_version", "INTEGER NOT NULL DEFAULT 0"),
-    ):
-        if name not in columns:
-            try:
-                conn.execute(f"ALTER TABLE figure_projects ADD COLUMN {name} {declaration}")
-            except sqlite3.OperationalError:
-                if name not in {row[1] for row in conn.execute("PRAGMA table_info(figure_projects)")}:
-                    raise
+    _ensure_columns(conn, "figure_projects", {
+        "data_refs_json": "TEXT NOT NULL DEFAULT '[]'",
+        "document_json": "TEXT NOT NULL DEFAULT '{}'",
+        "render_version": "INTEGER NOT NULL DEFAULT 0",
+        "pins_version": "INTEGER NOT NULL DEFAULT 0",
+    })
     conn.execute("CREATE INDEX IF NOT EXISTS idx_figure_projects_owner "
                  "ON figure_projects(owner_user_id, updated_at DESC)")
     conn.execute("CREATE TABLE IF NOT EXISTS figure_project_pins "
                  "(resource_id TEXT PRIMARY KEY, figure_id TEXT NOT NULL, owner_user_id INTEGER NOT NULL)")
-    pin_columns = {row[1] for row in conn.execute("PRAGMA table_info(figure_project_pins)")}
-    for name, declaration in (("script_session", "TEXT NOT NULL DEFAULT ''"),
-                              ("script_ref_json", "TEXT NOT NULL DEFAULT 'null'"),
-                              ("obsolete", "INTEGER NOT NULL DEFAULT 0")):
-        if name not in pin_columns:
-            try:
-                conn.execute(f"ALTER TABLE figure_project_pins ADD COLUMN {name} {declaration}")
-            except sqlite3.OperationalError:
-                # Another connection may have completed this additive migration.
-                if name not in {row[1] for row in conn.execute("PRAGMA table_info(figure_project_pins)")}:
-                    raise
+    _ensure_columns(conn, "figure_project_pins", {
+        "script_session": "TEXT NOT NULL DEFAULT ''",
+        "script_ref_json": "TEXT NOT NULL DEFAULT 'null'",
+        "obsolete": "INTEGER NOT NULL DEFAULT 0",
+        "revision": "INTEGER NOT NULL DEFAULT 0",
+    })
     conn.execute("""CREATE TABLE IF NOT EXISTS figure_revision_exports (
         figure_id TEXT NOT NULL,
         owner_user_id INTEGER NOT NULL,
@@ -117,7 +109,80 @@ def _connect() -> sqlite3.Connection:
         payload TEXT NOT NULL,
         PRIMARY KEY (figure_id, owner_user_id, render_version, format)
     )""")
+    _ensure_columns(conn, "figure_revision_exports", {"pin_id": "TEXT NOT NULL DEFAULT ''",
+                                                       "batch_id": "TEXT NOT NULL DEFAULT ''"})
+    conn.execute("""CREATE TABLE IF NOT EXISTS figure_publications (
+        batch_id TEXT PRIMARY KEY, figure_id TEXT NOT NULL, owner_user_id INTEGER NOT NULL,
+        session_id TEXT NOT NULL, request_id TEXT NOT NULL, entries TEXT NOT NULL,
+        optional INTEGER NOT NULL DEFAULT 0)""")
+    _ensure_columns(conn, "figure_publications", {"optional": "INTEGER NOT NULL DEFAULT 0"})
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_figure_publications_project "
+                 "ON figure_publications(figure_id,owner_user_id)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS figure_nature_bindings (
+        owner_user_id INTEGER NOT NULL, session_id TEXT NOT NULL, execution_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL, figure_id TEXT NOT NULL, receipt TEXT NOT NULL,
+        PRIMARY KEY (owner_user_id,session_id,execution_id))""")
     return conn
+
+
+def _ensure_columns(conn, table, declarations):
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, declaration in declarations.items():
+        if name not in columns:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            except sqlite3.OperationalError:
+                if name not in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
+                    raise
+
+
+def _record_publication(conn, figure_id, owner, publication, *, optional=False):
+    if publication is not None:
+        batch_id, session_id, request_id, entries = publication
+        conn.execute("INSERT INTO figure_publications VALUES (?,?,?,?,?,?,?)",
+                     (batch_id, figure_id, owner, session_id, request_id,
+                      json.dumps(entries, ensure_ascii=False, allow_nan=False), int(optional)))
+
+
+def pending_publication(batch_id, owner):
+    with _connect() as conn:
+        return conn.execute("SELECT 1 FROM figure_publications WHERE batch_id=? AND owner_user_id=?",
+                            (batch_id, owner)).fetchone() is not None
+
+
+def finish_publications(figure_id: str, owner: int, *, required_batch=None) -> None:
+    """Reconcile durable decisions after CAS, even after a process interruption."""
+    from src.core.account_leases import account_lease
+    from src.session.files import promote_figure_files
+
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM figure_publications WHERE figure_id=? AND owner_user_id=? "
+                            "ORDER BY rowid", (figure_id, owner)).fetchall()
+    if rows:
+        with account_lease(owner):
+            for queued in rows:
+                try:
+                    with _connect() as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        row = conn.execute("SELECT * FROM figure_publications WHERE batch_id=? AND owner_user_id=?",
+                                           (queued["batch_id"], owner)).fetchone()
+                        if row is None:
+                            continue
+                        promote_figure_files(owner, row["session_id"], row["request_id"], json.loads(row["entries"]))
+                        conn.execute("DELETE FROM figure_publications WHERE batch_id=? AND owner_user_id=?",
+                                     (row["batch_id"], owner))
+                except (OSError, ValueError, sqlite3.Error):
+                    # A corrupt optional export must not block opening its SVG or
+                    # regeneration. Explicit export requests still see the failure.
+                    if not queued["optional"] or queued["batch_id"] == required_batch:
+                        raise
+
+
+def get_nature_binding(owner, session_id, execution_id):
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM figure_nature_bindings WHERE owner_user_id=? "
+                           "AND session_id=? AND execution_id=?", (owner, session_id, execution_id)).fetchone()
+    return {**dict(row), "receipt": json.loads(row["receipt"])} if row else None
 
 
 def _source_script(source):
@@ -156,12 +221,12 @@ def _pin_files(owner: int, figure_id: str, file_ids: list[str],
         raise
 
 
-def _record_pin(conn, resource_id, figure_id, owner, source, session_id):
+def _record_pin(conn, resource_id, figure_id, owner, source, session_id, revision=0):
     if resource_id:
         conn.execute("INSERT INTO figure_project_pins "
-            "(resource_id,figure_id,owner_user_id,script_session,script_ref_json) VALUES (?,?,?,?,?)",
+            "(resource_id,figure_id,owner_user_id,script_session,script_ref_json,revision) VALUES (?,?,?,?,?,?)",
             (resource_id, figure_id, owner, session_id,
-             json.dumps(_source_script(source), ensure_ascii=False)))
+             json.dumps(_source_script(source), ensure_ascii=False), revision))
 
 
 def _release_pin(owner: int, resource_id: str, *, source=None, session_id="") -> None:
@@ -194,32 +259,51 @@ def _row_to_project(row: sqlite3.Row | None) -> dict[str, Any] | None:
 def create_project(*, owner_user_id: int, title: str = "",
                    source_kind: str = "spec", source: Any = None,
                    session_id: str = "",
-                   data_refs: list[Any] | None = None) -> dict[str, Any]:
+                   data_refs: list[Any] | None = None, initial_manifest=None,
+                   initial_exports=None, publication=None, nature_binding=None) -> dict[str, Any]:
     """Create a project while the account admits writes."""
     from src.core.account_leases import account_lease
     with account_lease(int(owner_user_id)):
         return _create_project(owner_user_id=owner_user_id, title=title,
                                source_kind=source_kind, source=source,
-                               session_id=session_id, data_refs=data_refs)
+                               session_id=session_id, data_refs=data_refs, initial_manifest=initial_manifest,
+                               initial_exports=initial_exports, publication=publication,
+                               nature_binding=nature_binding)
 
 
 def _create_project(*, owner_user_id: int, title: str, source_kind: str,
-                    source: Any, session_id: str, data_refs: list[Any] | None) -> dict[str, Any]:
+                    source: Any, session_id: str, data_refs: list[Any] | None,
+                    initial_manifest, initial_exports, publication, nature_binding) -> dict[str, Any]:
     figure_id = uuid.uuid4().hex
     now = time.time()
     from src.figures.document import build_figure_document
+    revision = int(initial_exports is not None)
+    exports = initial_exports or {}
+    manifest = initial_manifest or {}
     document = build_figure_document({"figure_id": figure_id, "source_kind": source_kind,
-                                      "source_json": source or {}})
+        "source_json": source or {}, "manifest_json": manifest, "exports_json": exports,
+        "render_version": revision})
     data_refs = list(data_refs or [])
-    resource_id, pinned = _pin_files(int(owner_user_id), figure_id,
-        [str(ref["file_id"]) for ref in data_refs if isinstance(ref, dict) and ref.get("file_id")], data_refs,
-        source=source, session_id=session_id)
+    file_ids = [str(ref["file_id"]) for ref in data_refs if isinstance(ref, dict) and ref.get("file_id")]
+    export_ids = [item["file_id"] for item in exports.values()]
+    resource_id, pinned = _pin_files(int(owner_user_id), figure_id, file_ids + export_ids, data_refs,
+                                    source=source, session_id=session_id)
+    binding_pin = ""
     hashes = {ref["file_id"]: ref["sha256"] for ref in pinned}
     data_refs = [{**ref, "sha256": hashes[ref["file_id"]]} if isinstance(ref, dict)
                  and ref.get("file_id") in hashes else ref for ref in data_refs]
     try:
+        if nature_binding is not None:
+            binding_pin, _ = _pin_files(int(owner_user_id), figure_id, export_ids)
         with _connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if nature_binding is not None:
+                execution_id, fingerprint = nature_binding
+                result = conn.execute("INSERT OR IGNORE INTO figure_nature_bindings VALUES (?,?,?,?,?,?)",
+                    (owner_user_id, session_id, execution_id, fingerprint, figure_id,
+                     json.dumps({"exports": exports, "render_version": revision})))
+                if result.rowcount != 1:
+                    raise NatureBindingConflict()
             import os
             maximum = int(os.environ.get("CITRUS_FIGURE_PROJECTS_PER_ACCOUNT", "500"))
             if maximum <= 0:
@@ -231,18 +315,22 @@ def _create_project(*, owner_user_id: int, title: str, source_kind: str,
             conn.execute(
                 "INSERT INTO figure_projects (figure_id, owner_user_id, session_id, title,"
                 " source_kind, source_json, manifest_json, overrides_json, exports_json,"
-                " data_refs_json, status, created_at, updated_at, document_json, pins_version)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,2)",
+                " data_refs_json, status, created_at, updated_at, document_json, render_version, pins_version)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2)",
                 (figure_id, int(owner_user_id), str(session_id or ""), str(title or ""),
                  str(source_kind or "spec"), json.dumps(source or {}, ensure_ascii=False),
-                 "{}", "[]", "{}", json.dumps(data_refs, ensure_ascii=False),
-                 "ready", now, now, json.dumps(document, ensure_ascii=False)))
+                 json.dumps(manifest, ensure_ascii=False), "[]", json.dumps(exports, ensure_ascii=False),
+                  json.dumps(data_refs, ensure_ascii=False), "ready", now, now,
+                  json.dumps(document, ensure_ascii=False), revision))
             _record_pin(conn, resource_id, figure_id, int(owner_user_id), source, session_id)
+            _record_pin(conn, binding_pin, figure_id, int(owner_user_id), None, "", revision=-1)
+            _record_publication(conn, figure_id, owner_user_id, publication)
             row = conn.execute(
                 "SELECT * FROM figure_projects WHERE figure_id=? AND owner_user_id=?",
                 (figure_id, int(owner_user_id))).fetchone()
     except BaseException:
         _release_pin(int(owner_user_id), resource_id, source=source, session_id=session_id)
+        _release_pin(int(owner_user_id), binding_pin)
         raise
     return _row_to_project(row) or {}
 
@@ -256,6 +344,20 @@ def get_project(figure_id: str, owner_user_id: int) -> dict[str, Any] | None:
     return _row_to_project(row)
 
 
+def _export_payload(row, figure_id, version, fmt):
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+        if (isinstance(payload, dict) and isinstance(payload.get("export"), dict)
+                and payload.get("figure_id") == figure_id and type(payload.get("render_version")) is int
+                and payload["render_version"] == version and payload.get("format") == fmt):
+            return payload
+    except (TypeError, ValueError):
+        pass
+    return {}
+
+
 def get_revision_export(figure_id: str, owner: int, version: int, fmt: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
@@ -264,7 +366,7 @@ def get_revision_export(figure_id: str, owner: int, version: int, fmt: str) -> d
             "WHERE e.figure_id=? AND e.owner_user_id=? AND e.render_version=? AND e.format=?",
             (figure_id, owner, version, fmt),
         ).fetchone()
-    return json.loads(row["payload"]) if row else None
+    return _export_payload(row, figure_id, version, fmt)
 
 
 def list_revision_exports(figure_id: str, owner: int, version: int) -> dict[str, dict]:
@@ -274,21 +376,81 @@ def list_revision_exports(figure_id: str, owner: int, version: int) -> dict[str,
             "WHERE figure_id=? AND owner_user_id=? AND render_version=?",
             (figure_id, owner, version),
         ).fetchall()
-    return {row["format"]: json.loads(row["payload"])["export"] for row in rows}
+    return {row["format"]: item["export"] for row in rows if (item := _export_payload(row, figure_id, version, row["format"]))}
 
 
 def record_revision_export(figure_id: str, owner: int, version: int, fmt: str,
-                           payload: dict) -> dict | None:
+                           payload: dict, *, previous=None, publication=None) -> dict | None:
+    """Install or repair a current-revision export, conditional on both reads."""
+    key = (figure_id, owner, version, fmt)
+    select = ("SELECT payload,pin_id,batch_id FROM figure_revision_exports WHERE figure_id=? AND "
+              "owner_user_id=? AND render_version=? AND format=?")
+    from src.core.account_leases import account_lease
+    with account_lease(owner):
+        resource_id, pinned = _pin_files(owner, figure_id, [payload["export"]["file_id"]])
+        committed, obsolete = False, []
+        try:
+            if pinned and pinned[0]["sha256"] != payload["export"]["sha256"]:
+                raise ValueError("revision export checksum mismatch")
+            with _connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                project = conn.execute("SELECT render_version FROM figure_projects WHERE figure_id=? "
+                                       "AND owner_user_id=?", (figure_id, owner)).fetchone()
+                if project is None or project["render_version"] != version:
+                    return None
+                row = conn.execute(select, key).fetchone()
+                existing = _export_payload(row, figure_id, version, fmt)
+                if existing != previous or (row and row["pin_id"] and existing == payload):
+                    return existing
+                if row and row["pin_id"]:
+                    obsolete = _mark_obsolete_pins(conn, figure_id, owner, "resource_id=?", (row["pin_id"],))
+                if row and row["batch_id"]:
+                    conn.execute("DELETE FROM figure_publications WHERE batch_id=? AND owner_user_id=?",
+                                 (row["batch_id"], owner))
+                conn.execute("INSERT INTO figure_revision_exports VALUES (?,?,?,?,?,?,?) "
+                             "ON CONFLICT(figure_id,owner_user_id,render_version,format) DO UPDATE "
+                             "SET payload=excluded.payload,pin_id=excluded.pin_id,batch_id=excluded.batch_id",
+                             (*key, json.dumps(payload, ensure_ascii=False, allow_nan=False), resource_id,
+                              publication[0] if publication else ""))
+                _record_pin(conn, resource_id, figure_id, owner, None, "", revision=version)
+                _record_publication(conn, figure_id, owner, publication, optional=True)
+            committed = True
+        finally:
+            if not committed:
+                _release_pin(owner, resource_id)
+        if obsolete:
+            try:
+                _release_recorded_pins(owner, obsolete)
+            except Exception:
+                logging.getLogger(__name__).warning("figure export pin cleanup deferred", exc_info=True)
+        return payload
+
+
+def _pin_current_legacy_exports(artifact_id=None) -> None:
+    """Adopt legacy on-demand exports while they are still current and intact."""
+    from src.core.account_admission import AccountUnavailable
+    from src.figures.workbench.artifacts import read_entry
+    from src.figures.projects import ProjectError
+
+    query = ("SELECT e.* FROM figure_revision_exports e JOIN figure_projects p "
+             "ON p.figure_id=e.figure_id AND p.owner_user_id=e.owner_user_id "
+             "AND p.render_version=e.render_version WHERE e.pin_id='' AND e.format IN ('png','pdf')")
+    params = ()
+    if artifact_id is not None:
+        query += " AND json_extract(CASE WHEN json_valid(e.payload) THEN e.payload ELSE '{}' END, '$.export.artifact_id')=?"
+        params = (artifact_id,)
     with _connect() as conn:
-        conn.execute(
-            "INSERT INTO figure_revision_exports "
-            "(figure_id, owner_user_id, render_version, format, payload) "
-            "SELECT figure_id, owner_user_id, ?, ?, ? FROM figure_projects "
-            "WHERE figure_id=? AND owner_user_id=? "
-            "ON CONFLICT (figure_id, owner_user_id, render_version, format) DO NOTHING",
-            (version, fmt, json.dumps(payload, ensure_ascii=False, allow_nan=False), figure_id, owner),
-        )
-    return get_revision_export(figure_id, owner, version, fmt)
+        rows = conn.execute(query, params).fetchall()
+    for row in rows:
+        payload = _export_payload(row, row["figure_id"], row["render_version"], row["format"])
+        if payload:
+            try:
+                read_entry(payload["export"], row["owner_user_id"], row["format"])
+                record_revision_export(row["figure_id"], row["owner_user_id"], row["render_version"],
+                                       row["format"], payload, previous=payload)
+            except (AccountUnavailable, ProjectError, ValueError, KeyError, OSError):
+                # Missing data isn't a pin candidate and is handled by replay.
+                continue
 
 
 def list_projects(owner_user_id: int, *, limit: int = 100,
@@ -311,7 +473,7 @@ def update_project(figure_id: str, owner_user_id: int, *,
 
 
 def update_project_committed(figure_id: str, owner_user_id: int, *,
-                             expected_revision: int | None = None,
+                             expected_revision: int | None = None, publication=None,
                              **fields: Any) -> dict[str, Any] | None:
     """Update a project and return the row that was committed.
 
@@ -324,11 +486,11 @@ def update_project_committed(figure_id: str, owner_user_id: int, *,
     from src.core.account_leases import account_lease
     with account_lease(int(owner_user_id)):
         return _update_project(figure_id, owner_user_id,
-                               expected_revision=expected_revision, **fields)
+                               expected_revision=expected_revision, publication=publication, **fields)
 
 
 def _update_project(figure_id: str, owner_user_id: int, *,
-                    expected_revision: int | None = None,
+                    expected_revision: int | None = None, publication=None,
                     **fields: Any) -> dict[str, Any] | None:
     """Update the mutable fields of a project.
 
@@ -422,9 +584,16 @@ def _update_project(figure_id: str, owner_user_id: int, *,
                     "SELECT * FROM figure_projects WHERE figure_id=? AND owner_user_id=?",
                     (str(figure_id), int(owner_user_id))).fetchone()
                 persisted = _row_to_project(row)
-            if committed and dependencies_changed:
-                obsolete = _retire_pins(conn, str(figure_id), int(owner_user_id))
-                _record_pin(conn, resource_id, str(figure_id), int(owner_user_id), source, session_id)
+                _record_publication(conn, figure_id, owner_user_id, publication)
+                if new_revision > old_revision:
+                    obsolete.extend(_mark_obsolete_pins(conn, figure_id, owner_user_id,
+                                                        "revision BETWEEN 1 AND ?", (old_revision,)))
+                    conn.execute("DELETE FROM figure_publications WHERE batch_id IN ("
+                        "SELECT batch_id FROM figure_revision_exports WHERE figure_id=? AND owner_user_id=? "
+                        "AND render_version<=? AND batch_id<>'')", (figure_id, owner_user_id, old_revision))
+                if dependencies_changed:
+                    obsolete.extend(_retire_pins(conn, str(figure_id), int(owner_user_id)))
+                    _record_pin(conn, resource_id, str(figure_id), int(owner_user_id), source, session_id)
     except BaseException:
         committed = False
         raise
@@ -450,12 +619,15 @@ def _delete_revisions(conn, figure_id: str, owner: int) -> None:
 
 def _retire_pins(conn, figure_id: str, owner: int) -> list:
     """Capture obsolete identities inside the successful current-state transaction."""
-    pins = conn.execute(
-        "SELECT * FROM figure_project_pins WHERE figure_id=? AND owner_user_id=?",
-        (figure_id, owner)).fetchall()
-    conn.execute("UPDATE figure_project_pins SET obsolete=1 WHERE figure_id=? AND owner_user_id=?",
-                 (figure_id, owner))
     _delete_revisions(conn, figure_id, owner)
+    return _mark_obsolete_pins(conn, figure_id, owner, "revision=0")
+
+
+def _mark_obsolete_pins(conn, figure_id, owner, predicate, params=()):
+    where = " WHERE figure_id=? AND owner_user_id=? AND obsolete=0 AND " + predicate
+    args = (figure_id, owner, *params)
+    pins = conn.execute("SELECT * FROM figure_project_pins" + where, args).fetchall()
+    conn.execute("UPDATE figure_project_pins SET obsolete=1" + where, args)
     return pins
 
 
@@ -471,6 +643,8 @@ def delete_project(figure_id: str, owner_user_id: int) -> bool:
             (str(figure_id), int(owner_user_id)))
         removed = cursor.rowcount > 0
         _delete_revisions(conn, str(figure_id), int(owner_user_id))
+        conn.execute("DELETE FROM figure_publications WHERE figure_id=? AND owner_user_id=?",
+                     (figure_id, owner_user_id))
         conn.execute("DELETE FROM figure_revision_exports WHERE figure_id=? AND owner_user_id=?",
                      (str(figure_id), int(owner_user_id)))
     _release_recorded_pins(int(owner_user_id), pins)
@@ -502,6 +676,8 @@ def purge_account(owner_user_id: int) -> int:
             "DELETE FROM figure_projects WHERE owner_user_id=?",
             (int(owner_user_id),))
         removed = int(cursor.rowcount or 0)
+        conn.execute("DELETE FROM figure_publications WHERE owner_user_id=?", (owner_user_id,))
+        conn.execute("DELETE FROM figure_nature_bindings WHERE owner_user_id=?", (owner_user_id,))
         conn.execute("DELETE FROM figure_revision_exports WHERE owner_user_id=?",
                      (int(owner_user_id),))
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='figure_revisions'").fetchone():
@@ -510,7 +686,7 @@ def purge_account(owner_user_id: int) -> int:
     return removed
 
 
-def migrate_resource_references() -> dict[str, int]:
+def migrate_resource_references(*, legacy_export_artifact_id=None) -> dict[str, int]:
     """Protect current dependencies and retire legacy history before cleanup.
 
     Version 2 retains one current dependency set instead of every saved render.
@@ -580,6 +756,7 @@ def migrate_resource_references() -> dict[str, int]:
         # Recheck under the write lock before retiring the old snapshot table.
         if not conn.execute("SELECT 1 FROM figure_projects WHERE pins_version < 2 LIMIT 1").fetchone():
             conn.execute("DROP TABLE IF EXISTS figure_revisions")
+    _pin_current_legacy_exports(legacy_export_artifact_id)
     return {"migrated": migrated, "released_abandoned": len(abandoned)}
 
 

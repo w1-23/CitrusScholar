@@ -10,14 +10,16 @@ import xml.etree.ElementTree as ET
 from playwright.sync_api import expect, sync_playwright
 
 
-def choose(page, label, *, confirm=True):
+def choose(page, label):
     page.get_by_role("button", name="打开图件", exact=True).click()
-    asset = page.get_by_role("radio", name=label)
-    asset.focus()
-    page.keyboard.press("Space")
-    expect(asset).to_be_checked()
-    if confirm:
-        page.get_by_role("button", name="打开所选图件").click()
+    page.get_by_role("dialog").get_by_role("button", name=label, exact=True).click()
+
+
+def expand(page, name):
+    branch = group(page, name)
+    expect(branch).to_be_visible()
+    if branch.get_attribute("aria-expanded") == "false":
+        branch.locator(":scope > .tree-row > .tree-arrow").click()
 
 
 def group(page, name):
@@ -28,9 +30,9 @@ def selected(page, name):
     expect(group(page, name)).to_have_attribute("aria-selected", "true")
 
 
-def apply(page):
+def apply(page, button="应用到此组"):
     with page.expect_response(lambda response: response.request.method == "POST" and response.url.endswith("/preview"), timeout=30000) as response:
-        page.get_by_role("button", name="应用到此组").click()
+        page.get_by_role("button", name=button).click()
     expect(page.locator("#status")).to_have_text("草稿预览已更新。", timeout=30000)
     return response.value.json()
 
@@ -72,33 +74,43 @@ def run(browser, origin, output):
     assert page.get_by_text("从资料库导入").count() == 0
     assets = page.locator("#assetList")
     expect(assets.get_by_role("button", name="Synthetic overlap")).to_be_visible()
-    page.get_by_label("类型", exact=True).select_option("svg")
-    expect(assets.get_by_role("button", name="Static only")).to_be_visible()
-    expect(assets.get_by_role("button", name="Synthetic overlap")).to_have_count(0)
-    page.get_by_label("类型", exact=True).select_option("chart:line")
-    expect(assets.get_by_role("button", name="Synthetic overlap")).to_be_visible()
-    expect(assets.get_by_role("button", name="Separate bar groups")).to_have_count(0)
-    page.get_by_label("类型", exact=True).select_option("")
-    page.get_by_label("编辑权限", exact=True).select_option("editable")
+    assert page.get_by_label("类型", exact=True).count() == 0
+    assert page.get_by_label("编辑权限", exact=True).count() == 0
     page.get_by_label("按名称筛选", exact=True).fill("overlap")
     expect(assets.get_by_role("button", name="Synthetic overlap")).to_be_visible()
     expect(assets.get_by_role("button", name="Static only")).to_have_count(0)
-    assets.get_by_role("button", name="Synthetic overlap").click()
+    assert all("kind=" not in url and "access=" not in url for _, url in requests)
+    page.get_by_label("按名称筛选", exact=True).clear()
+    expect(assets.get_by_role("button", name="Static only")).to_be_visible()
+    page.get_by_role("button", name="打开图件", exact=True).click()
     expect(page.get_by_role("dialog")).to_be_visible()
-    page.get_by_role("button", name="取消").click()
-    choose(page, "Synthetic overlap", confirm=False)
-    expect(page.get_by_role("radio", name="Foreign")).to_have_count(0)
-    expect(page.get_by_role("radio", name="data.csv")).to_have_count(0)
-    page.get_by_role("button", name="取消").click()
+    assert page.get_by_role("dialog").get_by_role("button", name="Foreign").count() == 0
+    assert page.get_by_role("dialog").get_by_role("button", name="data.csv").count() == 0
+    page.get_by_role("button", name="关闭图件库").click()
     expect(page.get_by_role("heading", name="未打开图件")).to_be_visible()
     assert not any(method == "POST" for method, _ in requests)
-    choose(page, "Synthetic overlap")
+    assets.get_by_role("button", name="Synthetic overlap").click()
     expect(page.get_by_role("heading", name="Synthetic overlap")).to_be_visible(timeout=15000)
+    expect(page.get_by_role("dialog")).not_to_be_visible()
     expect(page.get_by_role("tree", name="对象组")).to_be_visible()
     expect(page.locator("#preview")).to_be_visible()
     detail = next(url for method, url in reversed(requests) if method == "GET" and "/projects/" in url and "/preview/" not in url)
     page.evaluate("url => {window.fixtureDetail = url}", detail)
 
+    first_url = page.url
+    panel = group(page, "子图 1")
+    expect(panel).to_have_attribute("aria-expanded", "false")
+    expect(group(page, "WL")).not_to_be_visible()
+    expand(page, "子图 1")
+    expect(group(page, "数据系列")).to_have_attribute("aria-expanded", "false")
+    group(page, "数据系列").locator(":scope > .tree-row > .tree-name").click()
+    expect(page.get_by_text("批量属性 · 3 个对象")).to_be_visible()
+    page.get_by_label("标记形状", exact=True).select_option("D")
+    batch = apply(page, "应用到类别")
+    assert {item["label"] for item in batch["groups"] if item["kind"] == "series" and item["values"].get("marker") == "D"} == {"CK", "BL", "WL"}
+    page.get_by_role("button", name="撤销", exact=True).click()
+    expect(page.locator("#status")).to_have_text("已恢复保存的图件。", timeout=20000)
+    expand(page, "数据系列")
     page.get_by_role("button", name="画布选取").click()
     page.locator('[role=treeitem][tabindex="0"]').focus()
     for _ in range(60):
@@ -126,10 +138,11 @@ def run(browser, origin, output):
     expect(page.locator("#status")).to_have_text("草稿预览已更新。", timeout=20000)
     expect(page.get_by_label("填充方式", exact=True)).to_have_value("none")
 
+    page.once("dialog", lambda dialog: dialog.accept())
     choose(page, "Unreadable asset")
     expect(page.get_by_role("dialog")).to_be_visible()
     expect(page.locator("#libraryNotice")).to_contain_text("无法")
-    page.get_by_role("button", name="取消").click()
+    page.get_by_role("button", name="关闭图件库").click()
     expect(page.get_by_role("heading", name="Synthetic overlap")).to_be_visible()
     selected(page, "WL")
     expect(page.locator("#revision")).to_have_text("版本 1 · 草稿")
@@ -188,22 +201,63 @@ def run(browser, origin, output):
         assert received.value.headers["x-figure-revision"] == "2"
     page.locator("#exports summary").click()
 
+    # A pinned URL opens directly, and a same-library drag uses the identical loader.
+    page.goto(first_url.split("&revision=")[0] + "&revision=2")
+    expect(page.get_by_role("heading", name="Synthetic overlap")).to_be_visible(timeout=15000)
+    expect(page.get_by_role("dialog")).not_to_be_visible()
+    page.locator("#canvas").evaluate("""canvas => {
+      const transfer = new DataTransfer();
+      transfer.setData('text/html', '<svg onload=alert(1)>');
+      const drop = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer });
+      if (canvas.dispatchEvent(drop)) throw new Error('Untrusted drop default was not cancelled');
+    }""")
+    expect(page.get_by_role("heading", name="Synthetic overlap")).to_be_visible()
+    assets.get_by_role("button", name="Five independent groups").drag_to(page.locator("#canvas"))
+    expect(page.get_by_role("heading", name="Five independent groups")).to_be_visible(timeout=15000)
+    expect(group(page, "子图 1")).to_have_attribute("aria-expanded", "false")
+    expand(page, "子图 1")
+    expand(page, "数据系列")
+    for name in ["CK", "WL", "BL", "Control A", "Control B"]:
+        group(page, name).locator(":scope > .tree-row > .tree-name").click()
+        expect(page.get_by_role("heading", name=name, exact=True)).to_be_visible()
+        expect(page.get_by_label("系列颜色", exact=True)).to_be_visible()
+
+    theme = page.get_by_role("combobox", name="界面主题")
+    expect(theme).to_be_visible()
+    theme.select_option("navy")
+    expect(page.locator("html")).to_have_attribute("data-theme", "navy")
+    page.reload()
+    expect(page.get_by_role("heading", name="Five independent groups")).to_be_visible(timeout=15000)
+    expect(theme).to_have_value("navy")
+    page.screenshot(path=str(output / "workbench-navy.png"))
+    theme.select_option("sage")
+
     page.set_viewport_size({"width": 390, "height": 760})
     choose(page, "Separate bar groups")
     expect(page.get_by_role("heading", name="Separate bar groups")).to_be_visible(timeout=15000)
+    fit = page.get_by_role("button", name="适合窗口")
+    actual = page.get_by_role("button", name="实际大小 100%")
+    assert page.locator("#preview").evaluate("img => img.getBoundingClientRect().width < img.naturalWidth")
+    actual.click()
+    expect(actual).to_have_attribute("aria-pressed", "true")
+    assert page.locator("#preview").evaluate("img => img.getBoundingClientRect().width === img.naturalWidth")
+    fit.click()
+    expect(fit).to_have_attribute("aria-pressed", "true")
+    page.get_by_role("button", name="对象组", exact=True).click()
+    expand(page, "子图 1")
+    expand(page, "数据系列")
     group(page, "CK").focus()
     page.keyboard.press("Enter")
-    page.get_by_role("button", name="样式", exact=True).click()
     expect(page.get_by_label("填充颜色", exact=True)).to_be_visible()
     page.get_by_label("填充颜色", exact=True).fill("#7a3c96")
     apply(page)
     page.get_by_role("button", name="对象组", exact=True).click()
     group(page, "BL").focus()
     page.keyboard.press("Enter")
-    page.get_by_role("button", name="样式", exact=True).click()
     assert page.get_by_label("填充颜色", exact=True).input_value() != "#7a3c96"
     page.screenshot(path=str(output / "workbench-narrow.png"))
 
+    page.once("dialog", lambda dialog: dialog.accept())
     choose(page, "Static only")
     expect(page.get_by_role("heading", name="Static only")).to_be_visible(timeout=15000)
     page.locator("#exports summary").click()
@@ -218,10 +272,11 @@ def run(browser, origin, output):
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
     args.add_argument("--origin", required=True)
+    args.add_argument("--chromium")
     args.add_argument("--output", required=True, type=Path)
     options = args.parse_args()
     assert urlparse(options.origin).hostname == "127.0.0.1"
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = playwright.chromium.launch(headless=True, executable_path=options.chromium, args=["--no-sandbox"])
         run(browser, options.origin, options.output)
         browser.close()

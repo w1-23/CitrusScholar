@@ -242,8 +242,10 @@ async def _check_tool_sandbox(tool_name: str, args: dict) -> Optional[str]:
         # rejected with a correlated receipt when the request did not contain
         # that request. This cannot be bypassed by disabling the sandbox.
         if spec.authorization == "explicit_user_request":
-            from src.core.tracing import request_authorizes
-            if not request_authorizes(tool_name):
+            from src.core.tracing import get_authorized_note_target, request_authorizes
+            target = get_authorized_note_target()
+            matching_target = tool_name != "save_research_note" or bool(target and (args or {}).get("project_name") == target)
+            if not request_authorizes(tool_name) or not matching_target:
                 return (f"[ERR_HITL_REJECT] 工具 {tool_name} 需要用户在本轮明确请求；"
                         f"当前请求未包含该授权，已拒绝执行。请先询问用户是否需要保存。")
         if not getattr(settings, "SANDBOX_ENABLED", True):
@@ -493,7 +495,8 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
         if name == "run_research_figure_script":
             from src.research.script_reconciliation import capture_script_failure
             reconciliation_scope = capture_script_failure(owner, job["session_id"])
-        elif name in {"deliver_research_artifact", "audit_uploaded_data", "collect_external_skill", "collect_nature_plot"}:
+        elif name in {"deliver_research_artifact", "audit_uploaded_data", "collect_external_skill", "collect_nature_plot",
+                      "resolve_external_report"}:
             from src.research.delivery_reconciliation import capture_delivery
             reconciliation_scope = capture_delivery(name, tool_call["id"])
         elif name in ZERO_WRITE_TOOL_NAMES:

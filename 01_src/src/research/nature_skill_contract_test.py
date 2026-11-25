@@ -13,6 +13,7 @@ from src.agent.identity import ExecutionIdentity
 from src.code_execution.protocol import ExecutionRequest, FileSnapshot
 from src.research import nature_skill_contract as contract
 from src.research import nature_skill_worker as worker
+from src.research import nature_skill_r as r_runtime
 
 
 class NatureSkillTest(TestCase):
@@ -43,13 +44,40 @@ class NatureSkillTest(TestCase):
             with self.subTest(patch=patch), self.assertRaises(ValidationError):
                 contract.RunArgs.model_validate({**self.raw, "plot": patch})
 
-    def test_r_explains_limitation_without_queue_or_fallback(self):
+    def test_r_absent_image_does_not_create_workspace_or_fallback(self):
         with patch.object(tools, "_bound", return_value=(self.identity, self.release, self.pin)), \
-                patch.object(worker, "schedule_plot") as schedule:
+                patch.object(worker, "authorize_fusion_code"), patch.object(worker, "_service") as service, \
+                patch.dict("os.environ", {"FIGURES_SANDBOX_BACKEND": "apptainer",
+                                          "FIGURES_SANDBOX_IMAGE_SHA256": "a" * 64}):
             _, artifact = tools.run_nature_plot.func(**{**self.raw, "backend": "r"})
-        schedule.assert_not_called()
+        service.assert_not_called()
         self.assertEqual(artifact["status"], "unsupported")
+        self.assertEqual(artifact["_tool_outcome"]["reason_code"], "nature_plot_r_runtime_unavailable")
         self.assertNotIn("_code_execution_id", artifact)
+
+    def test_r_request_remains_one_data_argument_with_no_interpolation(self):
+        spec = contract.RunArgs.model_validate({**self.raw, "backend": "r", "title": "x; system('no')"})
+        stem, _ = contract.output_names("marginal", "nature_" + "4" * 64)
+        arg, = contract.argv(spec, stem)
+        self.assertEqual(json.loads(arg), {"stem": stem, "title": spec.title, "plot": spec.plot.model_dump()})
+        with patch.dict("os.environ", {"FIGURES_SANDBOX_BACKEND": "apptainer",
+                                      "FIGURES_SANDBOX_IMAGE_SHA256": r_runtime.R_IMAGE_SHA256}):
+            self.assertTrue(r_runtime.available())
+        valid_receipt = {"verified_environment": {"image_id": "sha256:" + r_runtime.R_IMAGE_SHA256,
+                                                    "environment_id": "base", "revision": 1}}
+        r_runtime.verify_worker_environment(valid_receipt)
+        for invalid in ({}, {"verified_environment": {**valid_receipt["verified_environment"], "image_id": "other"}}):
+            with self.assertRaises(PermissionError):
+                r_runtime.verify_worker_environment(invalid)
+
+    def test_r_template_not_claimed_when_only_python_supports_it(self):
+        raw = {**self.raw, "backend": "r", "plot": {"template": "paired", "id_col": "id",
+                 "condition_col": "group", "value_col": "value"}}
+        with patch.object(tools, "_bound", return_value=(self.identity, self.release, self.pin)), \
+                patch.object(worker, "authorize_fusion_code"), patch.object(worker, "_service") as service:
+            _, artifact = tools.run_nature_plot.func(**raw)
+        service.assert_not_called()
+        self.assertEqual(artifact["_tool_outcome"]["reason_code"], "nature_plot_r_template_unavailable")
 
     def test_native_tool_only_submits_and_uncertainty_is_not_replayable(self):
         with patch.object(tools, "_bound", return_value=(self.identity, self.release, self.pin)), \

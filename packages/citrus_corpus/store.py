@@ -44,6 +44,14 @@ INSERT OR IGNORE INTO corpus_state (id) VALUES (1);
 """
 
 
+def publication_hold(conn):
+    """Return the current durable operator hold event, if publication is held."""
+    event = conn.execute("""SELECT seq,generation,state FROM publication_events
+                            WHERE state IN ('publication_held','publication_resumed')
+                            ORDER BY seq DESC LIMIT 1""").fetchone()
+    return event if event and event["state"] == "publication_held" else None
+
+
 class Store:
     def __init__(self, root: str | Path, *, read_timeout=0.2):
         raw = Path(root).expanduser()

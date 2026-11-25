@@ -69,6 +69,7 @@ class Element {
     return node;
   }
   append(node) { return this.appendChild(node); }
+  before(node) { if (this.parentNode) this.parentNode.insertBefore(node, this); }
   insertBefore(node, before) {
     if (!before) return this.appendChild(node);
     node.remove();
@@ -202,7 +203,8 @@ function makeBrowser() {
     querySelector(selector) { return document.body.querySelector(selector); },
     querySelectorAll(selector) { return document.body.querySelectorAll(selector); },
     contains(node) { return node === document.body || document.body.contains(node); },
-    addEventListener() {}
+    listeners: {},
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   };
   document.body = new Element('body', document);
   document.documentElement = new Element('html', document);
@@ -583,4 +585,117 @@ test('audit workbook preview jumps to an internal source cell without following 
   assert.ok(target.classList.contains('sf-cell-focus'));
   assert.ok(target.classList.contains('sf-cell-noted'));
   assert.equal(target.getAttribute('title'), '重复待核');
+});
+
+
+test('account library accepts an actual SVG selection and uses image-only previews', async () => {
+  const b = makeBrowser();
+  const file = fileRecord({filename: 'private diagram.SVG', mime_type: 'image/svg+xml', kind: 'svg'});
+  b.context.currentSessionId = () => 'session-fixture';
+  b.fetchHandler = (url, opt) => {
+    if (opt.method === 'POST') {
+      assert.equal(url, '/api/v2/session/session-fixture/files/upload?filename=private%20diagram.SVG');
+      assert.equal(opt.body, selected);
+      return jsonResponse({file_id: file.file_id}, 201);
+    }
+    assert.equal(url, '/api/v2/files');
+    return jsonResponse({uploaded: [file], generated: [], retention_idle_days: 30});
+  };
+  const selected = {name: file.filename, size: 38, type: ''};
+  b.document.listeners.DOMContentLoaded[0]();
+  const input = b.get('libraryUploadInput');
+  b.get('libraryUploadButton').click();
+  input.files = [selected];
+  input.listeners.change[0]();
+  await flush();
+  assert.match(b.get('libraryUploadStatus').textContent, /已上传 1 份/);
+  const thumb = b.get('sessionFilesUploaded').querySelector('img');
+  assert.equal(thumb.getAttribute('src'), file.preview_url + '?library_tile=1');
+  b.context.openAccountFilePreview(file.file_id);
+  const stage = b.get('sessionFilePreviewStage');
+  assert.equal(stage.querySelector('img').getAttribute('src'), file.preview_url);
+  assert.equal(stage.querySelector('iframe'), null);
+  assert.equal(stage.querySelector('svg'), null);
+  assert.equal(stage.querySelector('object'), null);
+  assert.equal(b.get('sessionFilePreviewDownload').href, file.download_url);
+});
+
+test('real range links target one merged anchor even when the audit sheet name collides', async () => {
+  const b = makeBrowser();
+  const xlsx = require('../assets/xlsx.full.min.js');
+  b.context.XLSX = {...xlsx, read: (buf, opts) => xlsx.read(Buffer.from(new Uint8Array(buf)), {...opts, type: 'buffer'})};
+  const book = xlsx.utils.book_new();
+  const originalName = "Plant's Data";
+  const sheet = xlsx.utils.aoa_to_sheet([['A', 'B', 'C', 'D'], ['merged', '', 'x', 'y'], ['', '', 'z', 'w']]);
+  sheet['!merges'] = [xlsx.utils.decode_range('A2:B3')];
+  xlsx.utils.book_append_sheet(book, sheet, originalName);
+  xlsx.utils.book_append_sheet(book, xlsx.utils.aoa_to_sheet([['User original named like summary']]), '审查结果');
+  const summary = xlsx.utils.aoa_to_sheet([['位置','类型','结论'], ['actual range','duplicate','review'],
+    ['valid-looking but absent link A2','not a target','plain'], ['external','web','plain'], ['beyond sheet','none','plain']]);
+  summary.A2.l = {Target: "#'Plant''s Data'!$B$3:$D$3"};
+  summary.A4.l = {Target: 'https://example.invalid/another-workbook'};
+  summary.A5.l = {Target: "#'Plant''s Data'!A2:Z3"};
+  xlsx.utils.book_append_sheet(book, summary, '审查结果_2');
+  const issues = xlsx.utils.aoa_to_sheet([['序号', '工作表', '区域', '单元格', '行', '列'],
+    [1, originalName, 'selected', 'B3', 3, 'B'], [2, originalName, 'selected', '第 3 行（整行）', 3, '']]);
+  xlsx.utils.book_append_sheet(book, issues, '问题清单_2');
+  const file = fileRecord({filename: 'samples_审查标注.xlsx'});
+  const node = await openTablePreview(b, file, xlsx.write(book, {type: 'array', bookType: 'xlsx'}));
+  node.querySelector('[data-sheet="审查结果_2"]').click();
+  const buttons = node.querySelectorAll('.sf-audit-jump');
+  assert.equal(buttons.length, 1);
+  buttons[0].click();
+  const target = node.querySelector('[data-ref="A2"]');
+  assert.equal(target.getAttribute('rowspan'), '2');
+  assert.equal(target.getAttribute('colspan'), '2');
+  assert.ok(target.classList.contains('sf-cell-focus'));
+  assert.equal(node.querySelectorAll('.sf-cell-focus').length, 1);
+  assert.match(node.querySelector('[role="status"]').textContent, /B3:D3.*仅定位到范围起点.*合并单元格 A2/);
+  node.querySelector('[data-sheet="问题清单_2"]').click();
+  assert.equal(node.querySelectorAll('.sf-audit-jump').length, 1);
+  node.querySelector('.sf-audit-jump').click();
+  assert.match(node.querySelector('[role="status"]').textContent, /B3.*合并单元格 A2/);
+});
+
+test('library selection obeys separate reference bytes and joint count from server policy', async () => {
+  const b = makeBrowser();
+  const mebibyte = 1024 * 1024;
+  const a = fileRecord({file_id: 'a'.repeat(32), size_bytes: 8 * mebibyte});
+  const c = fileRecord({file_id: 'c'.repeat(32), size_bytes: 12 * mebibyte});
+  const d = fileRecord({file_id: 'd'.repeat(32), size_bytes: 1});
+  b.fetchHandler = () => jsonResponse({uploaded: [a,c,d], reference_limits: {max_turn_files: 3, max_reference_bytes: 20 * mebibyte}});
+  await b.context.loadSessionFiles();
+  b.context._selectedAttachments = [{size: 19 * mebibyte}];
+  b.context.queueAccountFileReference(a.file_id);
+  b.context.queueAccountFileReference(c.file_id);
+  assert.equal(b.context._selectedAccountFileRefs.length, 2, 'reference budget is separate from new uploads');
+  b.context.queueAccountFileReference(d.file_id);
+  assert.match(b.context.banners.at(-1), /最多上传或引用 3/);
+  b.context._selectedAttachments = [];
+  b.context.queueAccountFileReference(d.file_id);
+  assert.equal(b.context._selectedAccountFileRefs.length, 2);
+  assert.match(b.context.banners.at(-1), /引用资料总大小不能超过 20 MB/);
+});
+
+test('pinned deletes preserve the catalog and older GET cannot resurrect a deleted file', async () => {
+  const b = makeBrowser();
+  const file = fileRecord();
+  const filePayload = {uploaded: [file]};
+  b.fetchHandler = () => jsonResponse(filePayload);
+  await b.context.loadSessionFiles();
+  b.context.queueAccountFileReference(file.file_id);
+  b.fetchHandler = () => jsonResponse({detail: {code: 'file_pinned', message: '该文件正被任务引用。'}}, 409);
+  assert.equal(await b.context.deleteSessionFile(file.file_id), false);
+  assert.equal(b.get('sessionFilesUploaded').querySelectorAll('.session-file-item').length, 1);
+  assert.match(b.context.banners.at(-1), /正被任务引用/);
+  let release;
+  b.fetchHandler = () => new Promise(resolve => { release = resolve; });
+  const old = b.context.loadSessionFiles();
+  await flush();
+  b.fetchHandler = (_, options) => jsonResponse(options.method === 'DELETE' ? {status: 'ok'} : {uploaded: []});
+  assert.equal(await b.context.deleteSessionFile(file.file_id), true);
+  release(jsonResponse(filePayload));
+  await old;
+  assert.equal(b.get('sessionFilesUploaded').querySelectorAll('.session-file-item').length, 0);
+  assert.equal(b.context._selectedAccountFileRefs.length, 0);
 });

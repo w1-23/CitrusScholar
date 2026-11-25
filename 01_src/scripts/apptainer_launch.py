@@ -224,6 +224,13 @@ def command(config, role):
                    '--env', 'CITRUS_BROWSE_CONFIG_SHA256=' + bundle.config_sha256,
                    '--env', 'CITRUS_BROWSE_APPTAINER=1']
     skill_release = verified_skill_release(config, binds)
+    external_required = config.get('external_fusion_required', False)
+    if type(external_required) is not bool:
+        raise ValueError('Invalid external Skill policy')
+    if external_required:
+        if skill_release is None or not (skill_release / 'fusion/bundle.json').is_file():
+            raise ValueError('Required external Skill bundle unavailable')
+        result += ['--env', 'CITRUS_EXTERNAL_FUSION=required']
     # The release source tree is the single authority for both the application
     # and the method packages. Without ``packages/`` on PYTHONPATH the image's
     # site-packages copy shadows a freshly published skill package, so a fixed
@@ -239,6 +246,7 @@ def command(config, role):
         raise ValueError('Invalid historical Skill release registry')
     if role == 'web':
         used = {Path(path) for path, _mode in binds}
+        pre_fusion, fusion_history = [], []
         for item in historical:
             if not isinstance(item, dict) or item.keys() != {'path', 'mount_path', 'sha256'}:
                 raise ValueError('Invalid historical Skill release entry')
@@ -250,6 +258,13 @@ def command(config, role):
                 raise ValueError('Historical Skill mount overlaps an existing deployment bind')
             used.add(destination)
             result += ['--bind', f'{prior}:{destination}:ro']
+            if (prior / 'fusion/bundle.json').is_file():
+                fusion_history.append(str(destination))
+            elif not (prior / 'fusion').exists():
+                pre_fusion.append(item['sha256'])
+        if external_required:
+            result += ['--env', 'CITRUS_FUSION_REPORT_RELEASES=' + os.pathsep.join(fusion_history),
+                       '--env', 'CITRUS_PRE_FUSION_INVENTORY_SHA256=' + ' '.join(pre_fusion)]
     result += ['--env', 'PYTHONPATH=' + ':'.join(python_path)]
     for path, mode in dict(binds).items():
         result += ['--bind', f'{path}:{path}:{mode}']

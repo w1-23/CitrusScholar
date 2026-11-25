@@ -22,31 +22,42 @@ from src.graph.tool_policy import ToolPolicy, resolve_tool_policy
 
 SCHEMA_VERSION = 1
 
-# A note write is the only declared side effect that needs an explicit request.
-# This parser is pure and lives here so the request plan, the visibility layer,
-# and the executor all read the same fact.
-_NOTE_EXPORT = re.compile(
-    r"(?:导出|下载|export|download).{0,12}(?:课题|项目|研究)(?:记录|笔记)|"
-    r"(?:课题|项目|研究)(?:记录|笔记).{0,12}(?:导出|下载|export|download)",
-    re.I)
-_NOTE_SAVE = re.compile(
-    r"(?:保存|记录|记住|记下来|加入课题记录|save).{0,18}(?:课题|项目|研究|note|notes)|"
-    r"(?:课题|项目|研究|note|notes).{0,18}(?:保存|记录|记住|save)", re.I)
+# Persisting across sessions requires an explicit command and exact target.
+# Plain operation mentions, quoted examples and ambiguous targets are not grants.
+_NOTE_TARGET = r"(?:课题|项目|研究项目|project)\s*[「『“\"](?P<target>[^」』”\"\r\n]{1,120})[」』”\"]"
+_NOTE_COMMAND = re.compile(
+    r"^\s*(?:请(?:你|帮我)?\s*|请将\s*|帮我\s*|please\s+)?"
+    r"(?:把|将)?(?:(?![。！!?]).){0,140}?(?:保存|记录|记入|save|record)\s*(?:到|在|进|into|to)\s*"
+    + _NOTE_TARGET + r"\s*(?:的(?:记录|笔记)|笔记|记录|notes?)?\s*[。！!：:]?\s*$", re.I)
+_NOTE_NON_COMMAND = re.compile(r"不要|不需要|无需|无须|不用|不必|不想|先不|暂不|禁止|别|请勿|忽略|举例|引用|翻译|改写|如何|怎么|"
+                               r"是否|会不会|\b(?:do not|don't|without|quote|example|how|whether|not)\b", re.I)
+
+
+def explicit_note_target(query: str) -> str:
+    from src.graph.intent_text import intent_clauses, mask_literal_payload
+
+    text = mask_literal_payload(query).strip()
+    if not text or _NOTE_NON_COMMAND.search(text) or "?" in text or "？" in text:
+        return ""
+    found = []
+    for clause in intent_clauses(text):
+        match = _NOTE_COMMAND.fullmatch(clause)
+        if match:
+            target = match.group("target").strip()
+            prefix = clause[:match.start("target")-1]
+            if target and not any(char in prefix for char in '「」『』“”\"`'):
+                found.append(target)
+    return found[0] if len(found) == 1 else ""
 
 
 def explicit_note_save_request(query: str) -> bool:
-    """True only when the user asked to write a project note this turn."""
-    text = str(query or "")
-    if _NOTE_EXPORT.search(text):
-        return False
-    return bool(_NOTE_SAVE.search(text))
+    """True only for the user's explicit current-turn, target-bound request."""
+    return bool(explicit_note_target(query))
 
 
 def executor_authorizations(query: str) -> tuple[str, ...]:
     """Tools whose side effect the user explicitly requested in this turn."""
-    if explicit_note_save_request(query):
-        return ("save_research_note",)
-    return ()
+    return ("save_research_note",) if explicit_note_save_request(query) else ()
 
 
 @dataclass(frozen=True)

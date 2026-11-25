@@ -506,6 +506,11 @@ PUBLIC_WORK_NOTES = {
 }
 
 
+def public_result_receipt_id(value) -> str:
+    """Only expose server-issued receipt handles, not arbitrary strings."""
+    return _token(value, r"tr_[a-f0-9]{64}")
+
+
 def public_progress_payload(event: str, data: dict) -> dict:
     """Project progress events only. Chat, citations and explicit reads are separate."""
     cursor = _fields(data, numbers=("seq",))
@@ -519,6 +524,8 @@ def public_progress_payload(event: str, data: dict) -> dict:
         if event in {"tool_call_start", "tool_result"}:
             public["action_hint"] = public["display_name"]
         if event == "tool_result":
+            if receipt_id := public_result_receipt_id(data.get("result_id")):
+                public["result_id"] = receipt_id
             public.update(public_tool_outcome(data))
         if event == "operation":
             public["status"] = public_tool_status(data.get("status"))
@@ -674,7 +681,7 @@ def emit_tool_executing(message: str, tool_name: str = "", tool_call_id: str = "
 def emit_tool_result(tool_name: str, output: str, tool_call_id: str = "",
                      is_error: bool = False, summary: str = "",
                      outcome: dict | None = None, action_hint: str = "",
-                     logical_key: str = "", attempt: int = 1) -> dict:
+                     logical_key: str = "", attempt: int = 1, emit: bool = True) -> dict:
     """Emit a correlated, safe terminal state; full tool output stays in the Agent."""
     elapsed_ms = mark_tool_end(tool_call_id) if tool_call_id else 0
     outcome = outcome if isinstance(outcome, dict) else {}
@@ -700,7 +707,8 @@ def emit_tool_result(tool_name: str, output: str, tool_call_id: str = "",
         "elapsed_ms": elapsed_ms,
         "completed_at_ms": int(time.time() * 1000),
     }
-    emit_encoded("tool_result", result)
+    if emit:
+        emit_encoded("tool_result", result)
     journal = _current_tool_journal.get()
     if isinstance(journal, list):
         journal.append({"name": str(tool_name or ""), "status": status,

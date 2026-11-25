@@ -51,16 +51,12 @@ def _response(data, status, reason, *, receipts=(), wait_id=None):
 
 @tool(args_schema=RunArgs, response_format="content_and_artifact")
 def run_nature_plot(backend, input, plot, title=None):
-    """Run one pinned Nature Figure Python template (volcano, ROC, dotplot, marginal scatter, or paired) on the whole authorized UTF-8 CSV. Use the exact file_id and SHA-256 and explicitly map known columns by their research meaning, not position. It does not run hypothesis tests, accept code or paths, render demos, auto-convert workbooks, or execute R. Set drop_incomplete only after an explicit scientific decision to exclude observations. The Worker runs offline and this first call only submits. After its trusted wait settles, call collect_nature_plot with the returned execution_id. Do not retry a still-working execution."""
+    """Run a pinned Nature Figure template on the authorized whole UTF-8 CSV. Python supports volcano, ROC, dotplot, marginal, and paired. R supports marginal scatter with optionally grouped x/y histograms when the pinned offline R Worker image is active. Use the exact file_id, SHA-256 and explicitly mapped columns. Never substitute a backend. No user scripts, paths, demos or inferred statistics. Set drop_incomplete only after an explicit scientific decision. This first call only submits. After the trusted wait settles, call collect_nature_plot with the execution_id. Do not retry a still-working execution."""
     from src.research.nature_skill_worker import NatureSubmissionUncertain, schedule_plot
 
     try:
         identity, release, pin = _bound()
         spec = RunArgs(backend=backend, input=input, plot=plot, title=title)
-        if backend == "r":
-            return _response({"backend": "r", "status": "unsupported", "detail":
-                "当前隔离 Worker 没有固定的 R 运行时和绘图依赖。未运行 R，也没有改用 Python 代画。"},
-                "not_run", "nature_plot_r_runtime_unavailable")
         row = schedule_plot(identity, release=release, pin=pin, spec=spec)
         execution_id = row["execution_id"]
         return _response({"execution_id": execution_id, "worker_status": row["status"],
@@ -72,6 +68,12 @@ def run_nature_plot(backend, input, plot, title=None):
                          "unknown", "nature_plot_submission_requires_reconciliation")
     except (LookupError, PermissionError, ValueError, OSError) as exc:
         reason = str(exc)
+        if reason in {"nature_plot_r_runtime_unavailable", "nature_plot_r_template_unavailable"}:
+            detail = ("当前未启用本版本验证的隔离 R Worker 镜像。"
+                      if reason == "nature_plot_r_runtime_unavailable"
+                      else "固定 R 图型当前仅支持散点图与两轴边缘分布（marginal）。")
+            return _response({"backend": "r", "status": "unsupported",
+                              "detail": detail + "未运行，也未切换绘图后端。"}, "not_run", reason)
         if reason == "nature_plot_code_worker_unavailable":
             return _response({"status": "unsupported", "detail": "当前无可用的隔离 Code Worker。"},
                              "not_run", reason)
@@ -84,7 +86,7 @@ def run_nature_plot(backend, input, plot, title=None):
 
 @tool(args_schema=CollectArgs, response_format="content_and_artifact")
 def collect_nature_plot(execution_id):
-    """Collect exactly this turn's settled Nature template execution. Do not pass file paths, URLs, data or a title. Returns verified unchanged SVG/PDF/600 dpi TIFF, upstream row-count QA, and the editable Figure Workbench route if supported, otherwise download-only. Row-count QA does not certify visual or scientific correctness. Do not call again after verified collection or claim a workbench link when the result says download-only."""
+    """Collect exactly this turn's settled Nature template execution. Do not pass file paths, URLs, data or a title. Returns verified unchanged SVG/PDF/600 dpi TIFF, row-count QA, R rendered geometry evidence when selected, and the editable Figure Workbench route if supported, otherwise download-only. Row-count QA does not certify visual or scientific correctness. Do not call again after verified collection or claim a workbench link when the result says download-only."""
     from src.research.nature_skill_worker import collect_plot
 
     receipts = []

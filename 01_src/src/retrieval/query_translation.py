@@ -59,26 +59,21 @@ def parse_translation(raw: str) -> str | None:
     return None
 
 
-def _gateway_headers(base_url: str) -> dict[str, str]:
-    """Use the same gateway routing identity as the configured main transport."""
-    from urllib.parse import urlsplit
-    host = (urlsplit(base_url or "").hostname or "").lower()
-    if host != "opencode.ai" and not host.endswith(".opencode.ai"):
-        return {}
-    return dict(settings.RESOLVED_PROVIDER_HEADERS)
-
-
 def _generate_english_translation(text: str) -> str | None:
     if not text or not str(text).strip():
         return None
     try:
-        from openai import OpenAI
+        from openai import DefaultHttpxClient, OpenAI
+        transport = settings.model_transport(fast=True)
+        if not transport.api_key:
+            return None
         client = OpenAI(
-            api_key=settings.RESOLVED_FAST_API_KEY,
-            base_url=settings.RESOLVED_FAST_BASE_URL,
+            api_key=transport.api_key,
+            base_url=transport.base_url,
             timeout=15,
             max_retries=0,  # Every physical retry is charged explicitly below.
-            default_headers=_gateway_headers(settings.RESOLVED_FAST_BASE_URL),
+            default_headers=transport.headers,
+            http_client=DefaultHttpxClient(follow_redirects=False),
         )
         # 翻译是确定性辅助任务，不需要推理；也不再向 provider 发送
         # reasoning/thinking 关闭参数——部分网关会以 BadRequestError 拒绝，
@@ -110,7 +105,7 @@ def _generate_english_translation(text: str) -> str | None:
 
         for attempt in (1, 2):
             kwargs = {
-                "model": settings.RESOLVED_FAST_MODEL,
+                "model": transport.model,
                 "messages": [
                     {"role": "system", "content": _TRANSLATE_PROMPT},
                     {"role": "user", "content": f"User question:\n{text}\n\nEnglish translation:"},

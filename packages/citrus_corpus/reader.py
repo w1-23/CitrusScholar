@@ -7,7 +7,19 @@ from .catalog import Catalog
 from .chunks import chunk_document
 from .contract import ISOLATED
 from .generations import GenerationError, load_generation, valid_generation
+from .search import GenerationContractError, GenerationIntegrityError, GenerationNotFound
 from .pointers import read_pointer
+from .store import publication_hold
+
+
+def _fallback_reason(error):
+    if isinstance(error, GenerationIntegrityError):
+        return "active_generation_integrity_invalid"
+    if isinstance(error, GenerationContractError):
+        return "active_generation_contract_invalid"
+    if isinstance(error, (GenerationNotFound, LookupError)):
+        return "active_generation_unavailable"
+    return "active_generation_open_failed"
 
 
 class Reader:
@@ -26,28 +38,36 @@ class Reader:
                 for item in json.loads(row["selection"])}
 
     @contextmanager
-    def pin(self, *, embedder, reranker, generation=None):
-        fixed = generation is not None
-        if fixed and not valid_generation(generation):
+    def pin(self, *, embedder, reranker, generation=None, allow_fallback=False):
+        """An explicit generation is strict unless the caller pinned the active pointer itself."""
+        fixed = generation is not None and not allow_fallback
+        if generation is not None and not valid_generation(generation):
             raise ValueError("corpus_generation_invalid")
-        if not fixed:
+        if generation is None:
             generation = read_pointer(self.store.root)
         if not generation:
             raise LookupError("corpus_generation_unavailable")
+        fallback_reason = None
         try:
             handle, membership = self._open(generation, embedder, reranker)
-        except (GenerationError, LookupError):
+        except (GenerationError, LookupError) as exc:
             if fixed:
                 raise
             with self.store.read() as conn:
+                # Do not silently serve a newer, explicitly rolled-back generation
+                # if the held target becomes unreadable after an operator rollback.
+                conn.execute("BEGIN")
+                if publication_hold(conn) is not None:
+                    raise
                 prior = conn.execute("""SELECT generation FROM publications WHERE published IS NOT NULL
                                      AND generation<>? ORDER BY published DESC, seq DESC LIMIT 1""",
                                      (generation,)).fetchone()
             if prior is None:
                 raise
             handle, membership = self._open(prior["generation"], embedder, reranker)
+            fallback_reason = _fallback_reason(exc)
         with handle:
-            yield PinnedReader(self.catalog, handle, membership)
+            yield PinnedReader(self.catalog, handle, membership, generation, fallback_reason)
 
     def _open(self, generation, embedder, reranker):
         membership = self._membership(generation)
@@ -83,11 +103,13 @@ class Reader:
 
 
 class PinnedReader:
-    def __init__(self, catalog, handle, membership):
+    def __init__(self, catalog, handle, membership, requested_generation, fallback_reason):
         self.catalog = catalog
         self.handle = handle
         self.membership = membership
         self.generation = handle.generation
+        self.requested_generation = requested_generation
+        self.fallback_reason = fallback_reason
 
     def search(self, query, limit=6):
         def eligible(row):

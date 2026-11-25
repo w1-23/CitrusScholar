@@ -109,9 +109,10 @@ function accountFetch(url, options) {
   });
 }
 var skillPicker = window.CitrusSkillPicker ? window.CitrusSkillPicker.create({
-  menu: document.getElementById('input-tools-menu'), list: document.getElementById('skill-picker-list'),
+  attachmentMenu: document.getElementById('input-tools-menu'),
+  menu: document.getElementById('skill-picker-menu'), list: document.getElementById('skill-picker-list'),
   status: document.getElementById('skill-picker-status'), summary: document.getElementById('selected-skills'),
-  retry: document.getElementById('skill-picker-refresh'), input: document.getElementById('user-input'), fetch: accountFetch,
+  retry: document.getElementById('skill-picker-refresh'), fetch: accountFetch,
   scope: function () { return currentAccount && sessionId && !accountDocumentRetired ? authEpoch + ':' + sessionId : ''; }
 }) : null;
 function advanceAuthEpoch() {
@@ -146,8 +147,8 @@ function resetAccountState() {
   clearSentAttachmentPreviewUrls();
   _historyMsgs = []; _historyTurns = null; _historyHasMore = false;
   roundHistory = []; _restoredGroups = null; _restoredRefPool = null;
-  _sessions = []; _sessionsVisible = 20; _citationsRetry = 0;
-  _ctxData = null; _ctxSelection = null; _sentSnapshots = [];
+  resetSessionList(); _citationsRetry = 0;
+  _ctxData = null; _ctxSelection = null;
   if (window.resetSessionFiles) window.resetSessionFiles();
   currentRoundId = 0; currentQuery = ''; totalTokens = 0;
   _agentTokenBuffer = ''; _agentTokenName = '';
@@ -163,9 +164,7 @@ function resetAccountState() {
   if (userInput) { userInput.value = ''; userInput.placeholder = '有什么想做的？'; }
   refreshTaskComposer();
   ['attachment-list', 'session-list', 'sidebar-content', 'workspace-list',
-    'ctxDetail', 'ctxSent', 'ctxItems', 'ctxSummary', 'ctxSuggestions',
-    'ctxInTokens', 'ctxInNote', 'ctxOutTokens', 'ctxOutNote', 'ctxBarLabel', 'ctx-pct', 'ctxCompressed',
-    'ctxScope', 'ctxModel', 'ctxBar', 'ctxGridNote', 'ctxCacheNote', 'ctxAttempts', 'ctxInputLimit', 'ctxBudgetItems',
+
     'accountMemoryContent', 'accountMemoryStatus', 'accountPreferenceStatus',
     'settingsAvatarError', 'settingsAvatarLabel', 'authAvatarError', 'authAvatarLabel',
     'authNotice', 'authError', 'recoverError', 'recoverNotice', 'passwordChangeStatus', 'recoveryStatus', 'recoveryCodesList',
@@ -174,7 +173,7 @@ function resetAccountState() {
     'configuredProvidersList'].forEach(function(id) {
     var node = document.getElementById(id); if (node) node.replaceChildren();
   });
-  ['attachment-input', 'authUsername', 'authPassword', 'authInviteCode', 'authAvatarFile', 'settingsAvatarFile',
+  ['attachment-input', 'image-attachment-input', 'authUsername', 'authPassword', 'authInviteCode', 'authAvatarFile', 'settingsAvatarFile',
     'recoverUsername', 'recoverCode', 'recoverNewPassword', 'recoverConfirmPassword',
     'passwordCurrent', 'passwordNew', 'passwordConfirm', 'recoveryCurrent',
     'apiKeyInput', 'webSearchApiKeyInput', 'webFetchApiKeyInput', 'mainModelSelect', 'mainApiBaseUrlInput'].forEach(function(id) {
@@ -197,6 +196,7 @@ function resetAccountState() {
   });
   var ctxTrigger = document.getElementById('ctxCircleBtn');
   if (ctxTrigger) ctxTrigger.setAttribute('aria-expanded', 'false');
+  if (_contextView) _contextView.update(null);
   if (citationCount) citationCount.textContent = '0';
   var count = document.getElementById('session-count'); if (count) count.textContent = '0';
   renderAttachmentSelection(); renderReviewConsent(); setSendDisabled(false);
@@ -1155,6 +1155,7 @@ async function bootstrapAccount() {
 }
 window.addEventListener('DOMContentLoaded', bootstrapAccount);
 var sessionId = null;
+var sessionNavigation = 0;
 var chatContainer = document.getElementById('chat-container');
 var userInput = document.getElementById('user-input');
 var sendBtn = document.getElementById('send-btn');
@@ -1178,6 +1179,7 @@ if (typeof marked === 'undefined') window.marked = { parse: function(t) { return
 var composerDraftPrefix = 'citrus.composer.';
 var composerDrafts = new Map();
 var composerSelections = new Map();
+var composerAdmissions = new Map();
 var queueSyncUnavailable = false;
 var browseCheckbox = document.getElementById('browse-requested');
 if (browseCheckbox) browseCheckbox.addEventListener('change', refreshTaskComposer);
@@ -1240,6 +1242,10 @@ function saveComposerInput() {
 function clearComposerDrafts() {
   composerDrafts.clear();
   composerSelections.clear();
+  composerAdmissions.clear();
+  turnAdmissionChains.clear();
+  var recovery = document.getElementById('composer-admission-recovery');
+  if (recovery) { recovery.replaceChildren(); recovery.hidden = true; }
   queueSyncUnavailable = false;
   if (browseCheckbox) browseCheckbox.checked = false;
   try {
@@ -1275,6 +1281,74 @@ function restoreComposerSession(preserve) {
     }
   }
   renderAttachmentSelection();
+  renderAdmissionRecovery(key);
+  if (key) Object.values(readComposerAdmissions(key)).forEach(function (entry) {
+    if (entry.state === 'uncertain') lookupDetachedAdmission(key, entry);
+  });
+}
+
+// Retain the original request identity. File bytes stay in the File selection,
+// never in sessionStorage; an unknown outcome is reconciled with a GET only.
+function readComposerAdmissions(key) {
+  if (!composerAdmissions.has(key)) {
+    var pending = Object.create(null);
+    try {
+      var stored = JSON.parse(sessionStorage.getItem(key + '.admissions') || '[]');
+      if (Array.isArray(stored)) stored.forEach(function (entry) {
+        if (!entry || !/^crid-[a-z0-9-]+$/.test(entry.id) || typeof entry.text !== 'string') return;
+        if (entry.state === 'staged') entry.state = 'rejected';
+        if (entry.state === 'posting') entry.state = 'uncertain';
+        if (entry.state === 'uncertain' || entry.state === 'rejected') pending[entry.id] = entry;
+      });
+    } catch (_) {}
+    composerAdmissions.set(key, pending);
+  }
+  return composerAdmissions.get(key);
+}
+function setComposerAdmission(key, id, entry, refresh) {
+  var pending = readComposerAdmissions(key);
+  if (entry) pending[id] = entry;
+  else delete pending[id];
+  try {
+    var records = Object.values(pending).map(function (item) { return {id:item.id, text:item.text, state:item.state}; });
+    if (records.length) sessionStorage.setItem(key + '.admissions', JSON.stringify(records));
+    else sessionStorage.removeItem(key + '.admissions');
+  } catch (_) {}
+  if (refresh !== false) renderAdmissionRecovery(key);
+}
+function renderAdmissionRecovery(key) {
+  var host = document.getElementById('composer-admission-recovery');
+  if (!host || !key || key !== composerDraftKey()) return;
+  host.replaceChildren();
+  Object.values(readComposerAdmissions(key)).forEach(function (entry) {
+    if (entry.state !== 'rejected' && entry.state !== 'uncertain') return;
+    var action = document.createElement('button'); action.type = 'button'; action.className = 'history-retry';
+    action.textContent = entry.state === 'rejected' ? '恢复未发送的草稿' : '重新确认原消息状态';
+    if (entry.text) action.title = entry.text.slice(0, 160);
+    action.onclick = function () {
+      if (key !== composerDraftKey()) return;
+      if (entry.state === 'uncertain') { lookupDetachedAdmission(key, entry); return; }
+      userInput.value = [userInput.value, entry.text].filter(Boolean).join('\n\n');
+      saveComposerInput(); setComposerAdmission(key, entry.id, null);
+      refreshTaskComposer(); userInput.focus();
+    };
+    host.appendChild(action);
+  });
+  host.hidden = !host.firstChild;
+}
+function lookupDetachedAdmission(key, entry) {
+  if (key !== composerDraftKey()) return;
+  if (entry.lookupPending) return;
+  entry.lookupPending = true;
+  var epoch = authEpoch, sid = sessionId;
+  readTurnQueue(sid, function (error, result) {
+    delete entry.lookupPending;
+    if (epoch !== authEpoch || accountDocumentRetired || readComposerAdmissions(key)[entry.id] !== entry) return;
+    if (!error && result && result.ok && result.body && result.body.client_request_id === entry.id) {
+      setComposerAdmission(key, entry.id, null);
+      if (key === composerDraftKey()) restoreSessionHistory();
+    }
+  }, entry.id);
 }
 
 function readSupplementDraft(state) {
@@ -1320,9 +1394,11 @@ async function lookupLegacyComposerUpdate(target) {
   refreshTaskComposer();
 }
 
-function handleAttachmentSelection(fileList) {
+// Dialogs, paste and drag/drop share this size and format gate.
+function handleAttachmentSelection(fileList, picker) {
   if (!currentAccount || accountDocumentRetired) return;
   var dropped = Array.from(fileList || []);
+  if (picker) picker.value = '';
   var allowed = dropped.filter(function(file) {
     var name = String(file.name || '').toLowerCase();
     return /^image\/(jpeg|png|webp|gif)$/.test(file.type || '') || /\.(jpe?g|png|webp|gif|pdf|docx|csv|tsv|xlsx|xls|xlsm|xlsb)$/.test(name);
@@ -1337,12 +1413,10 @@ function handleAttachmentSelection(fileList) {
     added.reduce(function(n, f) { return n + f.size; }, 0);
   if (_selectedAttachments.length + window._selectedAccountFileRefs.length + added.length > 8 || total > 20 * 1024 * 1024) {
     alert('每轮最多 8 个附件，合计不超过 20 MB。');
-    var input = document.getElementById('attachment-input'); if (input) input.value = '';
     return;
   }
   _selectedAttachments = _selectedAttachments.concat(added);
   renderAttachmentSelection();
-  var picker = document.getElementById('attachment-input'); if (picker) picker.value = '';
   if (userInput) { try { userInput.focus({preventScroll: true}); } catch (_) { userInput.focus(); } }
 }
 
@@ -1374,6 +1448,24 @@ function handleAttachmentPaste(event) {
   if (!clipboard.getData('text/plain')) event.preventDefault();
 }
 if (userInput) userInput.addEventListener('paste', handleAttachmentPaste);
+
+(function wireAttachmentOptions() {
+  var panel = document.getElementById('attachment-options');
+  if (!panel) return;
+  panel.addEventListener('click', function (event) {
+    var button = event.target.closest('[data-composer-source]');
+    if (!button) return;
+    var source = button.getAttribute('data-composer-source');
+    var disclosure = document.getElementById('input-tools-menu');
+    disclosure.open = false;
+    disclosure.querySelector('summary').focus();
+    if (source === 'library') {
+      if (typeof window.toggleSessionFiles === 'function') window.toggleSessionFiles(true);
+      return;
+    }
+    document.getElementById(source === 'image' ? 'image-attachment-input' : 'attachment-input').click();
+  });
+})();
 
 // One composer key handler. Enter sends and suppresses its native newline;
 // Shift+Enter keeps the native newline, IME (composition / keyCode 229) and
@@ -2025,7 +2117,7 @@ function isCitationLink(href, label, bubbles) {
   });
 }
 
-function renderCitationBubbles(container, bubbles, requestId, sid) {
+function renderCitationBubbles(container, bubbles, requestId, sid, producerJobId) {
   container.replaceChildren();
   container.classList.add('turn-citation-bubbles');
   var seen = new Set();
@@ -2046,7 +2138,7 @@ function renderCitationBubbles(container, bubbles, requestId, sid) {
       button.className = 'turn-citation-bubble'; button.textContent = '本地：' + title;
       button.addEventListener('click', function () {
         if (window.CitrusCorpusReader && typeof window.CitrusCorpusReader.openCitation === 'function') {
-          window.CitrusCorpusReader.openCitation(source, {sessionId: sid, requestId: requestId});
+          window.CitrusCorpusReader.openCitation(source, {sessionId: sid, requestId: requestId, producerJobId: producerJobId || ""});
         }
       });
       container.appendChild(button);
@@ -2067,19 +2159,58 @@ function stripCitationMarkdown(text, bubbles) {
   }).join('');
 }
 
+// Markdown is untrusted prose. Only these authenticated preview routes may
+// auto-fetch. Everything else is either a user-activated web link or alt text.
+function isTrustedProductImage(url) {
+  if (url.origin !== location.origin || url.hash) return false;
+  if (/^\/api\/v2\/(?:session\/[A-Za-z0-9_-]{8,128}\/)?files\/[a-f0-9]{32}\/preview$/.test(url.pathname)) {
+    return !url.search || url.search === '?library_tile=1';
+  }
+  if (/^\/api\/v2\/figures\/projects\/[a-f0-9]{32}\/preview\.(?:svg|png)$/.test(url.pathname)) {
+    return !url.search || /^\?v=\d+$/.test(url.search);
+  }
+  return /^\/api\/v2\/figure-workbench\/projects\/[a-f0-9]{32}\/preview\/(?:svg|png)$/.test(url.pathname) &&
+    /^\?revision=\d+$/.test(url.search);
+}
+
+function renderMarkdownImage(token, title, text) {
+  var raw = typeof token === 'object' && token ? token.href : token;
+  var label = escapeHtml((typeof token === 'object' && token ? token.text : text) || '图片');
+  if (typeof raw !== 'string' || !/^(?:https?:\/\/|\/)/i.test(raw) || /[\s\\<>"'\x00-\x1f]/.test(raw)) return label;
+  try {
+    var url = new URL(raw, location.origin);
+    if (!/^https?:$/.test(url.protocol) || url.username || url.password) return label;
+    if (isTrustedProductImage(url)) {
+      return '<img src="' + escapeHtml(url.pathname + url.search) + '" alt="' + label +
+        '" loading="lazy" decoding="async">';
+    }
+    if (url.origin !== location.origin) {
+      return '<a href="' + escapeHtml(url.href) + '" target="_blank" rel="noopener noreferrer" ' +
+        'referrerpolicy="no-referrer">查看外部图片：' + label + '</a>';
+    }
+  } catch (_) { /* malformed URL */ }
+  return label;
+}
+
 function renderMarkdownSafe(text, bubbles) {
   // Accept bare SVG responses as well as fenced ```svg blocks.
   var svgBlocks = [];
   var src = stripCitationMarkdown(text, bubbles);
+  var svgPrefix = "CITRUS_SAFE_SVG_";
+  while (src.includes(svgPrefix)) svgPrefix += "_";
   function svgToken(svg) {
-    var token = 'CITRUS_SAFE_SVG_' + svgBlocks.length + '_TOKEN';
+    var token = svgPrefix + svgBlocks.length + '_TOKEN';
     svgBlocks.push({ token: token, html: renderSvgBlock(svg) });
     return token;
   }
-  src = src.replace(/```svg[ \t]*\n([\s\S]*?)```/gi, function(_, svg) { return svgToken(svg); });
-  src = src.replace(/<svg\b[\s\S]*?<\/svg\s*>/gi, function(svg) { return svgToken(svg); });
+  // Let the Markdown parser handle SVG code fences. Standalone raw SVG passes
+  // through the same sanitizer, but text/attribute positions never receive markup.
+  src = src.split(/(^[ \t]{0,3}(?:```+|~~~+)[^\n]*\n[\s\S]*?^[ \t]{0,3}(?:```+|~~~+)[ \t]*$)/gm)
+    .map(function(part, i) {
+      return i % 2 ? part : part.replace(/^[ \t]{0,3}(<svg\b[\s\S]*?<\/svg\s*>)[ \t]*$/gmi,
+        function(_, svg) { return '\n' + svgToken(svg) + '\n'; });
+    }).join('');
   var renderer = new marked.Renderer();
-  var origCode = renderer.code;
   renderer.code = function(code, lang) {
     // v8.4.8: 兼容 marked>=5 的 token 对象签名（code 可能为 {text:...}），
     // 否则代码块会渲染成 "[object Object]"
@@ -2092,8 +2223,9 @@ function renderMarkdownSafe(text, bubbles) {
     if (code && typeof code === 'object') { code = code.text || ''; }
     return '<code>' + escapeHtmlCode(code) + '</code>';
   };
-  // SVG is accepted only through the fenced-block sanitizer; escape arbitrary raw HTML.
+  // Raw HTML never bypasses the SVG sanitizer or level-specific renderers.
   renderer.html = function(html) { return escapeHtml(html); };
+  renderer.image = renderMarkdownImage;
   var originalLink = renderer.link;
   renderer.link = function(token, title, text) {
     var href = typeof token === 'object' && token ? token.href : token;
@@ -2108,7 +2240,6 @@ function renderMarkdownSafe(text, bubbles) {
   var rendered = marked.parse(src, { renderer: renderer, breaks: true });
   svgBlocks.forEach(function(block) {
     rendered = rendered.split('<p>' + block.token + '</p>').join(block.html);
-    rendered = rendered.split(block.token).join(block.html);
   });
   return rendered;
 }
@@ -2116,12 +2247,6 @@ function renderMarkdownSafe(text, bubbles) {
 /* ─── v8.4.3: 运行时配置（上下文预算/权限模式单一来源，删本地硬编码）─── */
 var _runtimeConfig = null;
 var _pendingPermission = null;
-function _ctxMaxTokens() {
-  if (_runtimeConfig && _runtimeConfig.context && _runtimeConfig.context.max_tokens) {
-    return _runtimeConfig.context.max_tokens;
-  }
-  return 1000000;
-}
 var _permWaitSec = 90;   /* v8.4.12: 审批卡片超时提示（config 下发，缺省 90s） */
 /* v8.5.0 开源版：未配置 API Key 时显示引导遮罩 */
 function maybeShowApiSetup(cfg) {
@@ -2470,61 +2595,26 @@ function decidePermission(toolName, decision, scope) {
 function grantPermission(toolName, scope) { return decidePermission(toolName, 'granted', scope); }
 function rejectPermission(toolName) { return decidePermission(toolName, 'rejected', 'once'); }
 
-/* ─── Theme（C: 三套主题循环：浅色清新 → 深色 → 卡通）─── */
-var THEME_CYCLE = ['sage', 'paper', 'navy', 'light', 'cartoon', 'dark'];
-var THEME_LABEL = { sage: '浅绿白', paper: '暖纸白', navy: '夜间蓝', light: '春日花笺', cartoon: '午后书房', dark: '夜林花语' };
-(function() {
-  var t = localStorage.getItem('citrus_theme') || 'light';
-  if (THEME_CYCLE.indexOf(t) < 0) t = 'light';
-  document.documentElement.setAttribute('data-theme', t);
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', syncThemePicker);
-} else {
-  setTimeout(syncThemePicker, 0);
-}
-})();
-
+/* Theme changes restyle the mounted page without replacing conversation state. */
 function mascotSay(name) {
   try { if (window.CitrusMascot) window.CitrusMascot.setState(name); } catch (_) {}
 }
 
 function syncThemePicker() {
-  var cur = document.documentElement.getAttribute('data-theme') || 'light';
-  var cards = document.querySelectorAll('[data-theme-pick]');
-  for (var i = 0; i < cards.length; i++) {
-    var on = cards[i].getAttribute('data-theme-pick') === cur;
-    cards[i].classList.toggle('is-active', on);
-    cards[i].setAttribute('aria-pressed', on ? 'true' : 'false');
-  }
-  var btn = document.getElementById('themeBtn');
-  if (btn) btn.innerHTML = '<span aria-hidden="true">◐</span> 主题：' + (THEME_LABEL[cur] || THEME_LABEL.light);
+  var current = window.CitrusTheme.current();
+  document.querySelectorAll('[data-theme-pick]').forEach(function (card) {
+    var on = card.getAttribute('data-theme-pick') === current;
+    card.classList.toggle('is-active', on);
+    card.setAttribute('aria-pressed', String(on));
+  });
 }
-
-/* 主题切换只改 data-theme 与背景变量：不重建 DOM，不打断进行中的请求，
-   也不重置吉祥物状态（C 批与 D 批解耦）。 */
-function pickTheme(name) {
-  if (THEME_CYCLE.indexOf(name) < 0) return;
-  document.documentElement.setAttribute('data-theme', name);
-  try { localStorage.setItem('citrus_theme', name); } catch (e) {}
+if (window.CitrusTheme) {
   syncThemePicker();
-  setAccountMenuOpen(false);
+  window.addEventListener('citrus:themechange', syncThemePicker);
 }
-
-function toggleTheme() {
-  var html = document.documentElement;
-  var cur = html.getAttribute('data-theme') || 'light';
-  var idx = THEME_CYCLE.indexOf(cur);
-  var next = THEME_CYCLE[(idx + 1) % THEME_CYCLE.length];
-  html.setAttribute('data-theme', next);
-  localStorage.setItem('citrus_theme', next);
-  var btn = document.getElementById('themeBtn');
-  if (btn) btn.innerHTML = '<span aria-hidden="true">◐</span> 主题：' + THEME_LABEL[next];
+function pickTheme(name) {
+  if (window.CitrusTheme && window.CitrusTheme.names.indexOf(name) !== -1) window.CitrusTheme.set(name);
 }
-document.addEventListener('DOMContentLoaded', function() {
-  var btn = document.getElementById('themeBtn');
-  var cur = document.documentElement.getAttribute('data-theme') || 'light';
-  if (btn) btn.innerHTML = '<span aria-hidden="true">◐</span> 主题：' + (THEME_LABEL[cur] || '浅色清新');
-});
 
 /* ─── AbortController for SSE (cancel inflight on new send) ─── */
 var currentAbortController = null;
@@ -2535,7 +2625,8 @@ var historyTaskDisposers = [];
 var historyRestoreVersion = 0;
 var historyRequest = null, historyPageRequest = null;
 var turnQueueBindings = [];
-var turnAdmissionChain = Promise.resolve();
+var turnAdmissionChains = new Map();
+var TURN_POST_DEADLINE_MS = 15000;
 var turnQueueReads = [];
 
 function abortHistoryRequests() {
@@ -2544,10 +2635,31 @@ function abortHistoryRequests() {
   historyRequest = null; historyPageRequest = null;
 }
 
-function enqueueTurnAdmission(work) {
-  var run = turnAdmissionChain.then(function () { return work(); });
-  turnAdmissionChain = run.catch(function () {});
+function enqueueTurnAdmission(scope, work) {
+  var previous = turnAdmissionChains.get(scope) || Promise.resolve();
+  var run = previous.then(work);
+  var lane = run.catch(function () {});
+  turnAdmissionChains.set(scope, lane);
+  lane.then(function () { if (turnAdmissionChains.get(scope) === lane) turnAdmissionChains.delete(scope); });
   return run;
+}
+
+async function submitTurnBeforeDeadline(url, payload, controller) {
+  var timer;
+  try {
+    return await Promise.race([
+      (async function () {
+        var response = await accountFetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+          signal:controller.signal, body:JSON.stringify(payload)});
+        var body = null;
+        try { body = await response.json(); } catch (_) {}
+        return {response:response, body:body};
+      })(),
+      new Promise(function (_, reject) { timer = setTimeout(function () {
+        controller.abort(); reject(new Error('turn_post_timeout'));
+      }, TURN_POST_DEADLINE_MS); })
+    ]);
+  } finally { clearTimeout(timer); }
 }
 
 function turnQueueURL(sid) {
@@ -2698,7 +2810,7 @@ function refreshTaskComposer() {
     button.classList.toggle('is-stop-mode', executing);
     button.classList.toggle('is-stopping', !!(executing && stopping));
     var icon = button.querySelector('use');
-    if (icon) icon.setAttribute('href', executing ? '#ui-stop' : '#ui-send');
+    if (icon) icon.setAttribute('href', executing ? '/assets/citrus-icons.svg#ui-stop' : '/assets/citrus-icons.svg#ui-send');
   }
   var hint = document.getElementById('composer-task-status');
   if (hint) {
@@ -2758,33 +2870,66 @@ function stopCurrentTask() {
 var _sidebarMap = { session: 'session-list' };
 var _sidebarSections = ['session'];
 
+function isSessionDrawer() { return window.innerWidth <= 1024; }
 function setSidebarVisible(visible) {
   var shell = document.getElementById('mainContainer');
   var button = document.getElementById('sidebarToggleBtn');
-  if (!shell || !button) return;
+  var sidebar = document.getElementById('appSidebar');
+  if (!shell || !button || !sidebar) return;
   shell.classList.toggle('sidebar-hidden', !visible);
-  button.setAttribute('aria-expanded', visible ? 'true' : 'false');
+  sidebar.inert = !visible;
+  button.setAttribute('aria-expanded', String(visible));
   button.setAttribute('aria-label', visible ? '隐藏会话侧栏' : '显示会话侧栏');
   button.title = visible ? '隐藏会话侧栏' : '显示会话侧栏';
-  localStorage.setItem('citrus_sidebar_visible', visible ? '1' : '0');
+  if (!isSessionDrawer()) {
+    try { localStorage.setItem('citrus_sidebar_visible', visible ? '1' : '0'); } catch (_) {}
+  }
 }
 
 function toggleSidebar() {
   var shell = document.getElementById('mainContainer');
-  setSidebarVisible(!!shell && shell.classList.contains('sidebar-hidden'));
+  if (!shell) return;
+  var opening = shell.classList.contains('sidebar-hidden');
+  setSidebarVisible(opening);
+  if (opening && isSessionDrawer()) document.getElementById('session-section-toggle').focus();
 }
 
-(function restoreSidebarVisibility() {
-  var saved = localStorage.getItem('citrus_sidebar_visible');
-  setSidebarVisible(saved === null ? window.innerWidth > 1024 : saved === '1');
+(function setupSessionDrawer() {
+  var narrow = isSessionDrawer();
+  function restore() {
+    var saved;
+    try { saved = localStorage.getItem('citrus_sidebar_visible'); } catch (_) {}
+    setSidebarVisible(!narrow && saved !== '0');
+  }
+  restore();
+  window.addEventListener('resize', function () {
+    if (isSessionDrawer() === narrow) return;
+    narrow = isSessionDrawer();
+    restore();
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape' || event.defaultPrevented || !isSessionDrawer()) return;
+    var rail = document.getElementById('sidebarToggleBtn');
+    var sidebar = document.getElementById('appSidebar');
+    if (rail.getAttribute('aria-expanded') === 'true' && (event.target === rail || sidebar.contains(event.target))) {
+      event.preventDefault(); setSidebarVisible(false); rail.focus();
+    }
+  });
+  document.getElementById('session-list').addEventListener('click', function (event) {
+    if (isSessionDrawer() && event.target.closest('.session-title')) {
+      setSidebarVisible(false);
+      document.getElementById('sidebarToggleBtn').focus();
+    }
+  });
 })();
 
-// P2-1: 侧栏宽度可拖拽（240–480px），双击复位 300px，方向键 ±16px
 var SIDEBAR_MIN = 218, SIDEBAR_MAX = 480, SIDEBAR_DEFAULT = 248;
 function applySidebarWidth(width, persist) {
   var shell = document.getElementById('mainContainer');
   var value = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, Math.round(width)));
   if (shell) shell.style.setProperty('--sidebar-w', value + 'px');
+  var handle = document.getElementById('sidebarResizer');
+  if (handle) handle.setAttribute('aria-valuenow', String(value));
   if (persist) { try { localStorage.setItem('citrus_sidebar_width', String(value)); } catch (err) {} }
   return value;
 }
@@ -2824,10 +2969,10 @@ function applySidebarWidth(width, persist) {
   handle.addEventListener('pointercancel', finish);
   handle.addEventListener('dblclick', function() { applySidebarWidth(SIDEBAR_DEFAULT, true); });
   handle.addEventListener('keydown', function(event) {
-    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return;
     event.preventDefault();
     var current = sidebar.getBoundingClientRect().width || SIDEBAR_DEFAULT;
-    applySidebarWidth(current + (event.key === 'ArrowRight' ? 16 : -16), true);
+    applySidebarWidth(event.key === 'Home' ? SIDEBAR_DEFAULT : current + (event.key === 'ArrowRight' ? 16 : -16), true);
   });
 })();
 
@@ -2860,29 +3005,42 @@ applySidebar('session');
 
 /* ─── v8.9 会话管理（列表/切换/新建/重命名/软删除）+ 工作区文件 ─── */
 var _sessions = [];
-var _sessionsVisible = 20;   // v8.9: 默认只显示最近 20 个，加载更多展开
+var _sessionsBefore = null, _sessionsRead = null, _sessionsError = '', _sessionPageSize = 20;
 
-function loadSessions() {
-  var epoch = authEpoch;
-  return accountFetch('/api/v2/sessions').then(function (r) { if (epoch !== authEpoch) return; return r.json(); }).then(function (d) { if (epoch !== authEpoch) return;
-    _sessions = (d && d.sessions) || [];
-    renderSessions();
-    return true;
-  }).catch(function () { if (epoch !== authEpoch) return; return false; });
+function resetSessionList() {
+  if (_sessionsRead) _sessionsRead.abort();
+  _sessions = []; _sessionsBefore = null; _sessionsRead = null; _sessionsError = '';
 }
 
-/* v8.10e: 会话列表加载失败自动重试（网络抖动/服务重启竞态），最多 3 次后停止 */
-function loadSessionsWithRetry(retries) {
-  var epoch = authEpoch;
-  var n = retries === undefined ? 3 : retries;
-  return loadSessions().then(function (ok) { if (epoch !== authEpoch) return;
-    if (!ok && n > 0) {
-      return new Promise(function (res) {
-        setTimeout(function () { res(epoch === authEpoch ? loadSessionsWithRetry(n - 1) : false); }, 600);
-      });
-    }
-    return ok;
-  });
+async function loadSessions(append) {
+  var epoch = authEpoch, before = append ? _sessionsBefore : null;
+  if (append && (!before || _sessionsRead)) return false;
+  if (_sessionsRead) _sessionsRead.abort();
+  var read = new AbortController();
+  _sessionsRead = read; _sessionsError = '';
+  renderSessions();
+  function owns() { return _sessionsRead === read && epoch === authEpoch && !accountDocumentRetired; }
+  try {
+    var response = await accountFetch('/api/v2/sessions?limit=' + _sessionPageSize +
+      (before ? '&before=' + encodeURIComponent(before) : ''), {signal: read.signal});
+    if (!owns()) return false;
+    if (!response.ok) throw new Error('sessions_unavailable');
+    var data = await response.json();
+    if (!owns()) return false;
+    if (!data || !Array.isArray(data.sessions)) throw new Error('invalid_sessions');
+    var byId = new Map((append ? _sessions : []).map(function (item) { return [item.session_id, item]; }));
+    data.sessions.forEach(function (item) {
+      if (item && typeof item.session_id === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(item.session_id)) byId.set(item.session_id, item);
+    });
+    _sessions = Array.from(byId.values());
+    _sessionsBefore = typeof data.next_before === 'string' && data.next_before !== before ? data.next_before : null;
+    return true;
+  } catch (_) {
+    if (owns()) _sessionsError = append ? 'append' : 'initial';
+    return false;
+  } finally {
+    if (owns()) { _sessionsRead = null; renderSessions(); }
+  }
 }
 
 function fmtSessionTime(iso) {
@@ -2910,18 +3068,13 @@ function renderSessions() {
     if (s.msg_count > 0 || s.has_tasks || s.session_id === sessionId) visible.push(s);
   }
   if (count) count.textContent = visible.length;
-  if (visible.length === 0) {
-    box.innerHTML = '<div class="empty-sidebar">暂无会话，点击左侧 ＋ 新建</div>';
-    return;
-  }
-  var shown = visible.slice(0, _sessionsVisible);
   var buckets = [
     {key:'today',label:'今天',items:[]},
     {key:'yesterday',label:'昨天',items:[]},
     {key:'week',label:'最近 7 天',items:[]},
     {key:'older',label:'更早',items:[]}
   ];
-  shown.forEach(function(s) {
+  visible.forEach(function(s) {
     var key = sessionTimeBucket(s.updated_at);
     var bucket = buckets.find(function(b) { return b.key === key; }) || buckets[3];
     bucket.items.push(s);
@@ -2942,6 +3095,9 @@ function renderSessions() {
     if (Array.isArray(parsedOpenGroups)) savedOpenGroups = parsedOpenGroups;
   } catch (_) {}
   var html = '';
+  if (!visible.length && !_sessionsRead && !_sessionsError) {
+    html = '<div class="empty-sidebar">' + (_sessionsBefore ? '此页暂无会话，可继续加载。' : '暂无会话，点击左侧 ＋ 新建') + '</div>';
+  }
   buckets.forEach(function(bucket) {
     if (!bucket.items.length) return;
     var containsActive = bucket.items.some(function(s) { return s.session_id === sessionId; });
@@ -2950,10 +3106,9 @@ function renderSessions() {
       '<summary>' + bucket.label + '<span class="session-group-count">' + bucket.items.length + '</span></summary>' +
       '<div class="session-group-content">' + bucket.items.map(sessionItemHtml).join('') + '</div></details>';
   });
-  if (visible.length > _sessionsVisible) {
-    html += '<button class="session-more" onclick="loadMoreSessions()">加载更多（还剩 ' +
-      (visible.length - _sessionsVisible) + '）</button>';
-  }
+  if (_sessionsRead) html += '<div class="empty-sidebar" role="status">正在读取会话…</div>';
+  else if (_sessionsError) html += '<button class="session-more" type="button" onclick="retrySessionsList()">会话读取失败，点击重试</button>';
+  else if (_sessionsBefore) html += '<button class="session-more" type="button" onclick="loadMoreSessions()">加载更多会话</button>';
   box.innerHTML = html;
   box.querySelectorAll('.session-group').forEach(function(group) {
     group.addEventListener('toggle', function() {
@@ -2978,10 +3133,8 @@ function sessionTimeBucket(iso) {
   return 'older';
 }
 
-function loadMoreSessions() {
-  _sessionsVisible += 20;
-  renderSessions();
-}
+function loadMoreSessions() { return loadSessions(true); }
+function retrySessionsList() { return loadSessions(_sessionsError === 'append'); }
 
 function closeSessionMenu() {
   var m = document.querySelector('.session-menu');
@@ -3014,8 +3167,9 @@ function sessionMenuAction(action, sid) {
   else if (action === 'delete') deleteSession(sid);
 }
 
-function switchSession(sid) {
+function switchSession(sid, skipHistory) {
   if (!sid || sid === sessionId) return;
+  sessionNavigation++;
   disposeTaskView();
   setSendDisabled(false);
   rememberComposerSession();
@@ -3030,11 +3184,12 @@ function switchSession(sid) {
   _historyHasMore = false;
   roundHistory = [];
   _restoredGroups = null;   // v9.2: 切换会话清空恢复视图，等下一次 restore
-  _ctxData = null;
+  renderContextPanel(null);
   sidebarContent.innerHTML = '<div class="empty-sidebar">提交问题后文献将在此展示</div>';
   citationCount.textContent = '0';
   renderSessions();
-  restoreSessionHistory();
+  if (skipHistory) renderSessionWelcome();
+  else restoreSessionHistory();
   if (window.turnRail && window.turnRail.reload) window.turnRail.reload();
   userInput.focus();
 }
@@ -3052,14 +3207,37 @@ function renameSession(sid) {
     .catch(function(error) { if (epoch === authEpoch) alert('重命名失败: ' + error.message); });
 }
 
-function deleteSession(sid) {
-  var epoch = authEpoch;
-  var isCur = sid === sessionId;
-  if (!confirm('删除会话？\n' + (isCur ? '（当前会话）' : '') + '\n仅从列表隐藏，历史数据保留（可追溯）。')) return;
-  accountFetch('/api/v2/session/' + encodeURIComponent(sid), { method: 'DELETE' })
-    .then(function (r) { if (epoch !== authEpoch) return; return r.json(); }).then(function () { if (epoch !== authEpoch) return;
-      if (isCur) { newSession(); } else { loadSessions(); }
-    }).catch(function(error) { if (epoch === authEpoch) alert('删除失败: ' + error.message); });
+function captureSessionView() {
+  var epoch = authEpoch, sid = sessionId, navigation = sessionNavigation;
+  return {id: sid, owns: function () {
+    return epoch === authEpoch && sid === sessionId && navigation === sessionNavigation && !accountDocumentRetired;
+  }};
+}
+
+function notifySessionMutationFailure(response, action) {
+  if (response && response.status === 409) {
+    alert('会话还有待处理的消息。请等待任务完成后再' + action + '，当前会话未更改。');
+  } else {
+    alert(action + '失败，当前会话未更改。请稍后重试。');
+  }
+}
+
+async function deleteSession(sid) {
+  if (!sid) return false;
+  var view = captureSessionView();
+  var isCurrent = sid === view.id;
+  if (!confirm('删除会话？\n' + (isCurrent ? '（当前会话）' : '') + '\n仅从列表隐藏，历史数据保留（可追溯）。')) return false;
+  try {
+    var response = await accountFetch('/api/v2/session/' + encodeURIComponent(sid), {method: 'DELETE'});
+    if (!view.owns()) return false;
+    if (!response.ok) { notifySessionMutationFailure(response, '删除'); return false; }
+    if (isCurrent) await newSession();
+    else await loadSessions();
+    return true;
+  } catch (_) {
+    if (view.owns()) notifySessionMutationFailure(null, '删除');
+    return false;
+  }
 }
 
 function loadWorkspaceFiles() {
@@ -3161,552 +3339,17 @@ function selectTurnContext(active) {
   _ctxSelection = {source: source, scope: scope, epoch: authEpoch, sid: sessionId};
   renderContextPanel(Object.assign({}, source, {view_scope: scope}));
 }
-var CTX_BTN_R = 15;
-var CTX_BTN_CIRCUM = 2 * Math.PI * CTX_BTN_R;
-
-function toggleCtxDrawer() {
-  var drawer = document.getElementById('ctxDrawer');
-  var backdrop = document.getElementById('ctxBackdrop');
-  var willOpen = !drawer.classList.contains('open');
-  drawer.classList.toggle('open');
-  backdrop.classList.toggle('open');
-  // Keep the popover focused on available estimates and measured usage.
-  // Raw request/history inspection belongs in the admin tools.
-  drawer.inert = !willOpen;
-  var trigger = document.getElementById('ctxCircleBtn');
-  trigger.setAttribute('aria-expanded', String(willOpen));
-  if (willOpen) {
-    renderContextPanel(_ctxData || {});
-    drawer.querySelector('button').focus();
-  } else trigger.focus();
+var _contextView;
+function contextView() {
+  if (!_contextView) _contextView = CitrusContextView.create(document);
+  return _contextView;
 }
-document.addEventListener('keydown', function (event) {
-  var drawer = document.getElementById('ctxDrawer');
-  if (event.key === 'Escape' && drawer && drawer.classList.contains('open') && !event.defaultPrevented) {
-    event.preventDefault(); toggleCtxDrawer();
-  }
-});
-
-function _ctxLevelClass(pct) {
-  if (pct < 0.70) return 'low';
-  if (pct < 0.85) return 'mid';
-  if (pct < 0.93) return 'high';
-  return 'crit';
-}
-
-function _updateCtxBtnRing(pct) {
-  // v8.10: pct<=0（未使用上下文）渲染系统灰空环，与其他图标一致；有进度才按分级色渲染
-  var fg = document.getElementById('ctxBtnFg');
-  var dash = CTX_BTN_CIRCUM * (1 - Math.min(pct, 1));
-  fg.style.strokeDasharray = CTX_BTN_CIRCUM + ' ' + CTX_BTN_CIRCUM;
-  fg.style.strokeDashoffset = dash;
-  fg.setAttribute('class', 'ctx-btn-fg ' + (pct <= 0 ? 'none' : _ctxLevelClass(pct)));
-}
-
-function _ctxCacheNote(provider) {
-  var read = _ctxTokenNumber(provider.cache_read), write = _ctxTokenNumber(provider.cache_write), miss = _ctxTokenNumber(provider.cache_uncached);
-  if (read == null && write == null && miss == null) return '服务商未提供';
-  var parts = [['读取', read], ['写入', write], ['未缓存', miss]].map(function (pair) {
-    return pair[0] + '：' + (pair[1] == null ? '未提供' : pair[1].toLocaleString());
-  });
-  return (read == null || write == null || miss == null ? '部分数据。' : '') + parts.join('；') + '。' +
-    (read != null && miss != null && read + miss > 0 ? ' 读取占比 ' + _ctxPercent(read, read + miss) + '（读取 ÷ [读取 + 未缓存]）' : ' 无法计算读取占比。');
-}
-function _ctxCells(rows, total, count) {
-  if (!(total > 0)) return [];
-  var offset = 0;
-  return rows.filter(function (row) { return row.value > 0; }).map(function (row) {
-    var start = Math.round(offset / total * count);
-    offset += row.value;
-    return {row: row, count: Math.round(offset / total * count) - start};
-  });
-}
-var CTX_CHANGES = {initial: '首次装配', initial_attempt: '首次调用', retry: '重试同一调用',
-  protocol_fallback: '调整请求协议', tools_changed: '工具定义变化', request_layout_changed: '请求布局变化',
-  working_set_compacted: '上下文整理', history_compacted: '历史压缩', instructions_changed: '指令变化',
-  tool_results_added: '工具结果增加', final_synthesis: '最终综述', prepared_payload_changed: '请求内容变化', epoch_changed: '上下文阶段变化'};
-function _ctxTokenNumber(value) {
-  return (typeof value === 'number' || typeof value === 'string' && value.trim() !== '') &&
-    Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null;
-}
-function _ctxPercent(value, max) {
-  if (!(max > 0) || value == null) return '—';
-  var pct = value / max * 100;
-  return pct > 0 && pct < 0.1 ? '<0.1%' : Number(pct.toFixed(1)) + '%';
-}
-// Fixed identities match request_context.estimate_request(), never model prose.
-var CTX_COMPONENTS = [
-  ['messages', '消息内容（含工具结果）', '用户、助手和工具结果的消息内容；包括已装配的摘要与引用。'],
-  ['system', '系统提示', '当前请求中的系统与开发者指令；技能内容若已装配，也计入所在消息。'],
-  ['tool_arguments', '调用参数', '当前消息中序列化的工具调用参数。'],
-  ['tool_schemas', '工具定义', '实际绑定到本次模型请求的工具定义。'],
-  ['images', '图片预留', '图片的保守估算，不代表服务商实际视觉 token 用量。'],
-  ['protocol', '协议开销', '消息边界、名称、调用身份及响应格式等协议估算。']
-];
-function _ctxBreakdown(data, est, fullRequest) {
-  var components = data.components || {}, sum = 0, known = 0;
-  var rows = fullRequest ? CTX_COMPONENTS.map(function(def, index) {
-    var value = _ctxTokenNumber(components[def[0]]);
-    if (value != null) { sum += value; known++; }
-    return {key: def[0], label: def[1], note: def[2], value: value, slot: index + 1};
-  }) : [];
-  if (!known || sum > est) return {
-    rows: [{key: 'unclassified', label: fullRequest ? '输入估算（未细分）' : '已保存会话／输入文本', value: est, slot: 0}],
-    inconsistent: known > 0 && sum > est
-  };
-  if (sum < est) rows.push({key: 'unclassified', label: '未细分估算', value: est - sum, slot: 0});
-  return {rows: rows, inconsistent: false};
-}
+function toggleCtxDrawer() { contextView().toggle(); }
 function renderContextPanel(data) {
-  _ctxData = data || {};
-  var fullRequest = _ctxData.estimate_scope === 'full_request_estimate';
-  var estimate = _ctxTokenNumber(_ctxData.estimated_tokens);
-  var hasEstimate = estimate != null;
-  var est = hasEstimate ? estimate : 0;
-  var max = _ctxTokenNumber(_ctxData.model_window); // A working budget is not a model window.
-  var pct = fullRequest && max > 0 ? est / max : 0;
-  _updateCtxBtnRing(pct);
-  var drawer = document.getElementById('ctxDrawer');
-  if (drawer && !drawer.classList.contains('open')) return;
-
-  var emptyEl = document.getElementById('ctx-empty');
-  var bodyEl = document.getElementById('ctx-body');
-  if (emptyEl) emptyEl.style.display = 'none';
-  if (bodyEl) bodyEl.style.display = '';
-
-  // Provider-reported usage stays separate from the assembled input estimate.
-  var provider = _ctxData.provider_usage || {};
-  var providerIn = _ctxTokenNumber(provider.input_tokens);
-  var inEl = document.getElementById('ctxInTokens');
-  var inNote = document.getElementById('ctxInNote');
-  var hasProviderIn = providerIn != null;
-  if (inEl) inEl.textContent = hasProviderIn ? providerIn.toLocaleString() : '—';
-  if (inNote) inNote.textContent = '服务商实测 · 此调用尝试';
-  var cache = document.getElementById('ctxCacheNote');
-  if (cache) cache.textContent = _ctxCacheNote(provider);
-  var outTokens = _ctxTokenNumber(provider.output_tokens);
-  var outEl = document.getElementById('ctxOutTokens');
-  var outNote = document.getElementById('ctxOutNote');
-  if (outEl) outEl.textContent = outTokens != null ? outTokens.toLocaleString() : '—';
-  if (outNote) outNote.textContent = '服务商实测 · 此调用尝试';
-  [inEl, outEl].forEach(function(el, index) {
-    var card = el && el.closest('.ctx-token-card');
-    if (card) card.hidden = index === 0 ? !hasProviderIn : outTokens == null;
-  });
-  var usageBlock = document.getElementById('ctxUsageBlock');
-  if (usageBlock) usageBlock.hidden = !_ctxData.attempt_id;
-
-  var bar = document.getElementById('ctxBar');
-  var barLabel = document.getElementById('ctxBarLabel');
-  var breakdown = _ctxBreakdown(_ctxData, est, fullRequest);
-  var capacityKnown = fullRequest && max > 0;
-  if (bar) {
-    var remaining = capacityKnown ? Math.max(0, max - est) : 0;
-    var rows = breakdown.rows.concat(remaining ? [{key: 'free', label: '窗口余量（估算）', value: remaining, slot: -1}] : []);
-    var cells = hasEstimate ? _ctxCells(rows, est + remaining, 192) : [];
-    var signature = JSON.stringify(cells);
-    if (bar.dataset.signature !== signature) {
-      bar.dataset.signature = signature;
-      var fragment = document.createDocumentFragment();
-      cells.forEach(function (group) {
-        for (var i = 0; i < group.count; i++) {
-          var cell = document.createElement('span');
-          cell.className = 'ctx-cell ctx-slot-' + group.row.slot;
-          cell.title = group.row.label + '：约 ' + group.row.value.toLocaleString() + ' tokens';
-          fragment.appendChild(cell);
-        }
-      });
-      bar.replaceChildren(fragment);
-    }
-    bar.hidden = !cells.length;
-  }
-  var estimateName = _ctxData.estimate_scope === 'historical_estimate' ? '历史估算' : fullRequest ? '当前完整输入估算'
-    : _ctxData.estimate_scope === 'history_text_only' ? '会话文本估算'
-    : (_ctxData.estimate_scope === 'bounded_call_text' || _ctxData.estimate_scope === 'assembled_message_text') ? '本次输入估算' : '上下文估算';
-  if (barLabel) barLabel.textContent = hasEstimate
-    ? estimateName + ' ' + est.toLocaleString() + (max > 0 ? ' / ' + max.toLocaleString() + ' tokens' : ' tokens · 模型窗口未知')
-    : '上下文估算暂不可用';
-  var scopeEl = document.getElementById('ctxScope');
-  var attempts = _ctxData.observed_attempts || [];
-  var index = attempts.findIndex(function (row) { return row.logical_call_id === _ctxData.logical_call_id && row.attempt_id === _ctxData.attempt_id; });
-  if (scopeEl) {
-    scopeEl.textContent = _ctxData.logical_call_id
-      ? (_ctxData.view_scope === 'previous' ? '最近一次调用' : '本轮调用') + (index >= 0 ? ' · 记录 ' + (index + 1) + ' / ' + attempts.length : _ctxData.attempt_id ? '' : ' · 尚未发送')
-      : hasEstimate ? '历史估算 · 未记录完整调用快照' : '尚未记录模型调用快照';
-    scopeEl.title = _ctxData.logical_call_id ? '调用 ' + _ctxData.logical_call_id + (_ctxData.attempt_id ? ' / ' + _ctxData.attempt_id : '') : '';
-  }
-  var model = document.getElementById('ctxModel');
-  if (model) model.textContent = _ctxData.model || '模型未知';
-  var limit = document.getElementById('ctxInputLimit');
-  if (limit) limit.textContent = '工作输入限额：' + (_ctxTokenNumber(_ctxData.input_limit) == null ? '未提供' : Number(_ctxData.input_limit).toLocaleString() + ' tokens');
-  var gridNote = document.getElementById('ctxGridNote');
-  if (gridNote) gridNote.textContent = !hasEstimate ? '' : capacityKnown ? (est > max ? '输入已超过窗口；方格仅表示输入构成。' : '每格约占模型窗口的 1/192；精确数字见下方。') : '方格只表示已估算输入的构成，不代表模型窗口占比。';
-  var pctEl = document.getElementById('ctx-pct');
-  if (pctEl) pctEl.textContent = hasEstimate && capacityKnown ? '约 ' + _ctxPercent(est, max) : '—';
-  var kindEl = document.getElementById('ctxTotalKind');
-  if (kindEl) kindEl.textContent = !hasEstimate ? '等待请求统计' : !(max > 0) ? '模型窗口未知' : fullRequest ? '输入占模型窗口' : '历史估算，完整占用未知';
-
-  var itemsEl = document.getElementById('ctxItems');
-  if (itemsEl) {
-    itemsEl.replaceChildren();
-    itemsEl.hidden = !hasEstimate;
-    itemsEl.setAttribute('aria-label', '上下文分类估算；百分比以' + (capacityKnown ? '模型窗口' : '估算输入') + '为分母');
-    var rows = breakdown.rows.concat([{key: 'free', label: fullRequest ? '窗口余量（估算）' : '剩余空间（未知）',
-      value: fullRequest && max > 0 ? Math.max(0, max - est) : null, slot: -1,
-      note: '模型窗口减去估算输入；输出预留和工作输入限额另列，不代表可继续发送的额度。'}]);
-    rows.forEach(function(row) {
-      var el = document.createElement('div');
-      el.className = 'ctx-item' + (row.key === 'free' ? ' ctx-item-free' : '');
-      el.dataset.key = row.key; el.setAttribute('role', 'row');
-      if (row.note) el.title = row.note;
-      var name = document.createElement('span'); name.className = 'ctx-item-name'; name.setAttribute('role', 'cell');
-      var swatch = document.createElement('i'); swatch.className = 'ctx-swatch ctx-slot-' + row.slot;
-      swatch.setAttribute('aria-hidden', 'true'); name.appendChild(swatch);
-      var label = document.createElement('span'); label.textContent = row.label; name.appendChild(label);
-      var value = document.createElement('span'); value.className = 'ctx-item-value'; value.setAttribute('role', 'cell');
-      value.textContent = row.value != null ? row.value.toLocaleString() : row.key === 'free' ? '未知' : '未提供';
-      var percent = document.createElement('span'); percent.className = 'ctx-item-percent'; percent.setAttribute('role', 'cell');
-      percent.textContent = _ctxPercent(row.value, capacityKnown ? max : row.key === 'free' ? null : est);
-      el.appendChild(name); el.appendChild(value); el.appendChild(percent); itemsEl.appendChild(el);
-    });
-  }
-  var sumEl = document.getElementById('ctxSummary');
-  if (sumEl) {
-    sumEl.textContent = !hasEstimate ? '收到统计后自动更新。'
-      : (fullRequest ? '完整请求估算，含工具定义、调用参数、协议与图片预留；不等同于服务商实测用量。'
-        : '仅估算保存的会话或本次输入文本；系统提示、工具定义和图片等未完整计量，剩余空间未知。') +
-        (breakdown.inconsistent ? ' 分类合计与总量不一致，暂按总量显示。' : '') +
-        (max > 0 && est > max ? ' 输入估算已超过模型窗口。' : '');
-    var historyLabels = {success: '已装配', loaded: '已装配', empty: '无历史记录', degraded: '降级装配', failed: '加载失败', unknown: '装配状态未知'};
-    var historyReasons = {legacy_checkpoint_untrusted: '已读取可用的原始对话',
-      raw_history_incomplete: '部分原始记录不可用', source_integrity_failed: '部分历史未通过完整性校验',
-      owner_scope_mismatch: '部分历史未通过账号与会话校验', history_load_failed: '部分历史暂不可读'};
-    var historyStatus = historyLabels[_ctxData.history_load_status] || historyLabels.unknown;
-    var historyReason = historyReasons[_ctxData.history_load_reason];
-    sumEl.textContent += ' 历史：' + historyStatus + (historyReason ? '，' + historyReason : '') + '。';
-    if (CTX_CHANGES[_ctxData.change_reason]) sumEl.textContent += ' 变化：' + CTX_CHANGES[_ctxData.change_reason] + '。';
-    var toolMessages = _ctxTokenNumber(_ctxData.tool_message_count);
-    if (toolMessages != null) sumEl.textContent += ' 工具结果消息 ' + toolMessages + ' 条，已计入消息内容；未单独提供 token 数。';
-    if (_ctxData.status === 'failed') sumEl.textContent += ' 本次调用失败。';
-  }
-  var audit = document.getElementById('ctxAttempts'), auditBlock = document.getElementById('ctxAuditBlock');
-  if (audit && auditBlock) {
-    auditBlock.hidden = !attempts.length;
-    audit.replaceChildren();
-    attempts.forEach(function (row, i) {
-      var item = document.createElement('li');
-      var estimate = _ctxTokenNumber(row.estimated_tokens), previous = _ctxTokenNumber(i ? attempts[i - 1].estimated_tokens : null);
-      var delta = previous != null && estimate != null ? estimate - previous : null;
-      var labels = {admitted: '已受理', estimated: '已估算', running: '执行中', complete: '已完成', failed: '失败', cancelled: '已停止'};
-      item.textContent = (CTX_CHANGES[row.change_reason] || '模型请求') + ' · ' + (labels[row.status] || '状态待确认') +
-        (estimate == null ? ' · 估算未提供' : ' · 发送前估算 ' + estimate.toLocaleString() + ' tokens') +
-        (delta != null ? '（' + (delta > 0 ? '+' : '') + delta.toLocaleString() + '）' : '');
-      item.title = '调用 ' + row.logical_call_id + ' / 尝试 ' + row.attempt_id;
-      if (i === index) item.setAttribute('aria-current', 'step');
-      audit.appendChild(item);
-    });
-  }
-  var budgetItems = document.getElementById('ctxBudgetItems');
-  var budgetBlock = document.getElementById('ctxBudgetBlock');
-  if (budgetItems) {
-    budgetItems.replaceChildren();
-    [['input_limit', '工作输入限额'], ['working_soft_tokens', '自动整理参考阈值'],
-      ['working_target_tokens', '整理目标'], ['output_tokens', '输出预留（上限）']].forEach(function(def) {
-      var value = fullRequest ? _ctxTokenNumber(_ctxData[def[0]]) : null;
-      if (value == null) return;
-      var item = document.createElement('div'); item.className = 'ctx-budget-row';
-      var label = document.createElement('span'); label.textContent = def[1];
-      var count = document.createElement('span'); count.textContent = value.toLocaleString() + ' tokens';
-      item.appendChild(label); item.appendChild(count); budgetItems.appendChild(item);
-    });
-    if (budgetBlock) budgetBlock.hidden = !hasEstimate || !budgetItems.childElementCount;
-  }
-  var sugEl = document.getElementById('ctxSuggestions');
-  if (sugEl) { sugEl.replaceChildren(); sugEl.hidden = true; }
-  ['ctxSentBlock', 'ctxDetailBlock'].forEach(function(id) {
-    var block = document.getElementById(id); if (block) block.hidden = true;
-  });
-  var compEl = document.getElementById('ctxCompressed');
-  if (compEl) {
-    if (_ctxData.compressed) { compEl.style.display = ''; compEl.textContent = '上下文已压缩为检查点摘要'; }
-    else compEl.style.display = 'none';
-  }
+  _ctxData = data || null;
+  if (typeof CitrusContextView !== 'undefined') contextView().update(_ctxData);
 }
 
-/* 上下文细分：system 提示词 / 历史消息(user·ai·tool) / 记忆块，逐段展开看原文 */
-var CTX_ROLE_LABEL = {system: '系统', user: '用户', ai: '助手', tool: '工具', memory: '记忆', other: '其他'};
-
-function loadCtxDetail() {
-  var epoch = authEpoch;
-  var box = document.getElementById('ctxDetail');
-  if (!box || !sessionId) return;
-  box.innerHTML = '<div class="ctx-sug-item" style="padding:6px 0">加载上下文细分…</div>';
-  accountFetch('/api/v2/session/' + encodeURIComponent(sessionId) + '/context-detail')
-    .then(function (r) { if (epoch !== authEpoch) return; return r.json(); })
-    .then(function (d) { if (epoch !== authEpoch) return;
-      var segs = (d && d.segments) || [];
-      if (d && d.error) {
-        box.innerHTML = '<div class="ctx-sug-item">⚠ 细分加载失败，请稍后重试（异常已记录）</div>';
-        return;
-      }
-      if (segs.length === 0) {
-        box.innerHTML = '<div class="ctx-sug-item" style="padding:6px 0">当前会话暂无上下文</div>';
-        return;
-      }
-      // 连续同角色段落合并成一行（工具结果往往有十几段，逐段平铺读不动）
-      var groups = [];
-      for (var i = 0; i < segs.length; i++) {
-        var s = segs[i];
-        var role = s.role || 'other';
-        var last = groups[groups.length - 1];
-        if (last && last.role === role) {
-          last.count += 1;
-          last.chars += Number(s.chars || 0);
-          last.content += "\n\n" + String(s.content || "");
-        } else {
-          groups.push({role: role, count: 1, chars: Number(s.chars || 0), content: String(s.content || ""), source: String(s.source || "")});
-        }
-      }
-      var lastAi = -1;
-      for (var k = 0; k < groups.length; k++) { if (groups[k].role === 'ai') lastAi = k; }
-      var html = '';
-      for (var g = 0; g < groups.length; g++) {
-        var grp = groups[g];
-        var label = CTX_ROLE_LABEL[grp.role] || grp.role;
-        var meta = (grp.count > 1 ? grp.count + ' 段 · ' : '') + grp.chars.toLocaleString() + ' 字符';
-        if (grp.role === 'ai' && g === lastAi) meta += ' · 本轮产出';
-        var srcText = grp.source || label;
-        if (grp.count > 1) srcText = srcText + ' … 共 ' + grp.count + ' 段';
-        html += '<div class="ctx-seg">' +
-          '<div class="ctx-seg-head" onclick="toggleCtxSeg(' + g + ')">' +
-          '<span class="ctx-seg-role ' + grp.role + '">' + label + '</span>' +
-          '<span class="ctx-seg-src">' + escapeHtml(srcText) + '</span>' +
-          '<span class="ctx-seg-chars">' + meta + '</span>' +
-          '<span class="ctx-seg-arrow" id="ctx-seg-' + g + '-arrow">▶</span>' +
-          '</div>' +
-          '<div class="ctx-seg-body" id="ctx-seg-' + g + '" style="display:none"><pre>' + escapeHtml(grp.content) + '</pre></div>' +
-          '</div>';
-      }
-      box.innerHTML = html;
-    })
-    .catch(function () { if (epoch !== authEpoch) return; box.innerHTML = '<div class="ctx-sug-item">⚠ 细分加载失败，请稍后重试（异常已记录）</div>'; });
-}
-
-function toggleCtxSeg(i) {
-  var body = document.getElementById('ctx-seg-' + i);
-  var arrow = document.getElementById('ctx-seg-' + i + '-arrow');
-  if (!body) return;
-  var open = body.style.display !== 'none';
-  body.style.display = open ? 'none' : '';
-  if (arrow) arrow.textContent = open ? '▶' : '▼';
-}
-
-/* D-A1 实际发送快照：运行时在模型调用漏斗处记录的请求体摘要。
-   与"上下文细分"的区别：细分是按角色重建的近似，这里是**真的发出去的那一份**。 */
-var SENT_ROLE_LABEL = {system: '系统', user: '用户', assistant: '助手', tool: '工具'};
-
-function _isAdminAccount() {
-  return !!(currentAccount && currentAccount.role === 'admin');
-}
-function loadSentContext() {
-  var epoch = authEpoch, sentSessionId = sessionId;
-  var sentRequestId = (_ctxData || {}).request_id || '';
-  var box = document.getElementById('ctxSent');
-  // 技术统计只对管理员可见：先判角色再判会话，否则会话创建失败时会露出空标题（D4）
-  var block = document.getElementById('ctxSentBlock');
-  if (!_isAdminAccount()) {
-    if (block) block.hidden = true;
-    if (box) box.innerHTML = '';
-    return;
-  }
-  if (block) block.hidden = false;
-  if (!box || !sessionId) return;
-  box.innerHTML = '<div class="ctx-sug-item" style="padding:6px 0">读取本轮请求快照…</div>';
-  var url = '/api/v2/session/' + encodeURIComponent(sentSessionId) + '/turn-context?limit=6';
-  if (sentRequestId) url += '&request_id=' + encodeURIComponent(sentRequestId);
-  function ownsSnapshot() {
-    return epoch === authEpoch && sentSessionId === sessionId && sentRequestId === ((_ctxData || {}).request_id || '');
-  }
-  accountFetch(url)
-    .then(function (r) { if (!ownsSnapshot()) return; return r.json(); })
-    .then(function(data) { if (ownsSnapshot()) renderSentContext(data); })
-    .catch(function () { if (!ownsSnapshot()) return;
-      box.innerHTML = '<div class="ctx-sent-empty">⚠ 请求快照读取失败（不影响本轮回答）</div>';
-    });
-}
-
-var _sentSnapshots = [];
-function _sentTok(chars) {
-  // 逐条 token 未由接口返回，按字符数估算（中文约 1 字 ≈ 0.6 token、英文约 4 字符 ≈ 1 token，取折中 3）
-  var n = Math.round((Number(chars) || 0) / 3);
-  return n.toLocaleString();
-}
-function _sentPreview(text) {
-  var s = String(text || '').replace(/\s+/g, ' ').trim();
-  return s.length > 55 ? s.slice(0, 55) + '…' : s;
-}
-function renderSentContext(d) {
-  var box = document.getElementById('ctxSent');
-  if (!box) return;
-  var rows = (d && d.rows) || [];
-  _sentSnapshots = rows;
-  if (!rows.length) {
-    box.innerHTML = '<div class="ctx-sent-empty">本轮没有记录到请求快照。' +
-      '记录从本次更新后开始，历史轮次不会补录。</div>';
-    return;
-  }
-  var html = '';
-  for (var i = 0; i < rows.length; i++) {
-    var row = rows[i];
-    var payload = row.payload || {};
-    var msgs = payload.messages || [];
-    var when = row.created_at ? new Date(row.created_at * 1000) : null;
-    var timeText = when ? (('0' + when.getHours()).slice(-2) + ':' +
-      ('0' + when.getMinutes()).slice(-2) + ':' + ('0' + when.getSeconds()).slice(-2)) : '';
-    var label = _sentLabelOf(i);
-    var head = '<div class="ctx-sent-head" onclick="toggleSentCall(' + i + ')">' +
-      '<span class="ctx-sent-idx">#' + (rows.length - i) + '</span>' +
-      '<span class="ctx-sent-meta">' + (payload.scope === 'physical_attempt' ? '物理尝试 · ' : '逻辑观测 · ') + msgCountText(msgs.length, row.msg_count) + ' · ' +
-      Number(row.chars || 0).toLocaleString() + ' 字符 · ' +
-      (row.input_tokens ? '输入 ' + Number(row.input_tokens).toLocaleString() + ' tokens'
-        : '输入 tokens 未返回') + '</span>' +
-      (label ? '<span class="ctx-sent-label">' + escapeHtml(label) + '</span>' : '') +
-      '<span class="ctx-sent-time">' + timeText + '</span>' +
-      '<span class="ctx-seg-arrow" id="ctx-sent-' + i + '-arrow">▶</span></div>' +
-      '<div class="ctx-sent-acts">' +
-        '<button type="button" class="ctx-mini-btn" onclick="event.stopPropagation();copySentSnapshot(' + i + ')">复制 JSON</button>' +
-        '<button type="button" class="ctx-mini-btn" onclick="event.stopPropagation();labelSentSnapshot(' + i + ')">标注</button>' +
-      '</div>';
-    var body = '<div class="ctx-sent-body" id="ctx-sent-' + i + '" style="display:none">';
-    if (row.error) body += '<div class="ctx-sent-err">该次调用失败：' + escapeHtml(row.error) + '</div>';
-    body += '<div class="ctx-sent-thead"><span class="ctx-sent-c-no">序号</span>' +
-      '<span class="ctx-sent-c-role">角色</span>' +
-      '<span class="ctx-sent-c-prev">大小与哈希（旧记录保留预览）</span>' +
-      '<span class="ctx-sent-c-tok" title="逐条 token 未返回，按字符数估算">token</span>' +
-      '<span class="ctx-sent-c-act">操作</span></div>';
-    for (var m = 0; m < msgs.length; m++) {
-      var msg = msgs[m];
-      var kind = msg.kind || '';
-      var role = SENT_ROLE_LABEL[kind] || kind || '?';
-      var chip = kind === 'assistant' ? 'ai' : (kind === 'user' ? 'user' : (kind === 'tool' ? 'tool' : 'sys'));
-      var calls = (msg.tool_calls && msg.tool_calls.length)
-        ? '<span class="ctx-sent-calls">调用 ' + escapeHtml(msg.tool_calls.join(', ')) + '</span>' : '';
-      var act = '';
-      if (kind === 'system') {
-        act = '<span class="ctx-sent-ro" title="系统提示词未在对话历史中渲染">只读</span>';
-      } else if (kind === 'tool') {
-        act = '<button type="button" class="ctx-mini-btn" onclick="event.stopPropagation();focusSentRow(' + i + ',' + m + ',\'tool\')">查看</button>';
-      } else {
-        act = '<button type="button" class="ctx-mini-btn" onclick="event.stopPropagation();focusSentRow(' + i + ',' + m + ',\'' + (kind === 'user' ? 'user' : 'answer') + '\')">定位</button>';
-      }
-      body += '<div class="ctx-sent-row is-' + chip + '">' +
-        '<span class="ctx-sent-c-no">' + (m + 1) + '</span>' +
-        '<span class="ctx-sent-c-role"><span class="ctx-seg-role ' + chip + '">' + role + '</span>' + calls + '</span>' +
-        '<span class="ctx-sent-c-prev">' + escapeHtml(msg.hash
-          ? (msg.bytes != null ? msg.bytes + ' bytes · ' : '') + 'sha256 ' + msg.hash.slice(0, 16)
-          : _sentPreview(msg.preview || '')) + '</span>' +
-        '<span class="ctx-sent-c-tok">≈' + _sentTok(msg.chars) + '</span>' +
-        '<span class="ctx-sent-c-act">' + act + '</span></div>';
-    }
-    if (!msgs.length) body += '<div class="ctx-sent-err">这条记录没有消息明细</div>';
-    body += '</div>';
-    html += '<div class="ctx-sent-call">' + head + body + '</div>';
-  }
-  box.innerHTML = html;
-}
-function msgCountText(n, fallback) {
-  var v = (typeof n === 'number' && n > 0) ? n : (fallback || 0);
-  return v + ' 条';
-}
-function _sentLabelKey(i) {
-  var row = _sentSnapshots[i] || {};
-  return 'citrus_ctx_label:' + (sessionId || '') + ':' + (row.request_id || row.created_at || i);
-}
-function _sentLabelOf(i) {
-  try { return localStorage.getItem(_sentLabelKey(i)) || ''; } catch (e) { return ''; }
-}
-function labelSentSnapshot(i) {
-  var cur = _sentLabelOf(i);
-  var next = window.prompt('给这次请求加一个标注（留空则清除）', cur || '');
-  if (next === null) return;
-  try {
-    if (next.trim()) localStorage.setItem(_sentLabelKey(i), next.trim().slice(0, 40));
-    else localStorage.removeItem(_sentLabelKey(i));
-  } catch (e) {}
-  var box = document.getElementById('ctxSent');
-  var rows = _sentSnapshots;
-  if (box && rows.length) renderSentContext({ rows: rows });
-}
-function copySentSnapshot(i) {
-  var row = _sentSnapshots[i];
-  if (!row) return;
-  var text = JSON.stringify(row, null, 2);
-  var done = function () {
-    var box = document.getElementById('ctxSent');
-    if (!box) return;
-    var tip = document.createElement('div');
-    tip.className = 'ctx-sent-toast';
-    tip.textContent = '已复制这次请求的 JSON（仅结构摘要，不含完整正文）';
-    box.appendChild(tip);
-    setTimeout(function () { if (tip.parentNode) tip.parentNode.removeChild(tip); }, 2200);
-  };
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(done).catch(function () {});
-  } else {
-    var ta = document.createElement('textarea');
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); done(); } catch (e) {}
-    document.body.removeChild(ta);
-  }
-}
-function _flashEl(el) {
-  if (!el) return;
-  el.classList.add('ctx-focus-flash');
-  setTimeout(function () { el.classList.remove('ctx-focus-flash'); }, 2000);
-}
-function focusSentRow(i, m, kind) {
-  var row = _sentSnapshots[i];
-  var msg = row && (row.payload || {}).messages ? row.payload.messages[m] : null;
-  if (kind === 'tool') {
-    // 工具结果：展开本轮执行时间线，定位到同名工步
-    var name = (msg && msg.tool_calls && msg.tool_calls.length) ? msg.tool_calls[0] : '';
-    var traces = document.querySelectorAll('.terminal-log .term-line');
-    var target = null;
-    for (var k = traces.length - 1; k >= 0; k--) {
-      var t = traces[k];
-      if (!name || (t.textContent || '').indexOf(name) >= 0) { target = t; break; }
-    }
-    if (target) {
-      var det = target.closest('details');
-      if (det) det.open = true;
-      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      _flashEl(target);
-      return;
-    }
-    var box = document.getElementById('ctxSent');
-    if (box) _flashEl(box);
-    return;
-  }
-  // 用户输入 / 助手回答：滚到本轮对应气泡并高亮
-  var sel = kind === 'user' ? '.message.user' : '.message.bot';
-  var nodes = document.querySelectorAll(sel);
-  var el = nodes.length ? nodes[nodes.length - 1] : null;
-  if (el) {
-    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    _flashEl(el);
-  }
-}
-
-function toggleSentCall(i) {
-  var body = document.getElementById('ctx-sent-' + i);
-  var arrow = document.getElementById('ctx-sent-' + i + '-arrow');
-  if (!body) return;
-  var open = body.style.display !== 'none';
-  body.style.display = open ? 'none' : '';
-  if (arrow) arrow.textContent = open ? '▶' : '▼';
-}
-
-// Public task descriptions only. Never render loaded-history counters or private reasoning.
 function publicTaskStage(value) {
   var text = String(value == null ? '' : value).trim();
   if (/已加载.*(?:历史|\d+\s*条)|loaded\s+(?:history|\d+)|history\s+loaded|(?:准备|注入|读取|加载|恢复|压缩).{0,12}(?:会话|上下文|历史记录)|正在理解.{0,8}(?:请求|要求|需求)|(?:load|inject|prepare|compress|restore).{0,25}(?:session|context|history)/i.test(text)) return '';
@@ -3785,7 +3428,7 @@ function createResearchProcessPanel(goal) {
       if (!response.ok) { var error = new Error('工具记录读取失败'); error.status = response.status; throw error; }
       var result = await response.json();
       if (!ownsDetails()) return null;
-      if (!result || result.tool_call_id !== callId) throw new Error('工具记录身份不匹配');
+      if (!result || (result.tool_call_id !== callId && result.provider_call_id !== callId)) throw new Error('工具记录身份不匹配');
       return result;
     },
     elapsed: function (ms) { return (Math.max(0, Number(ms) || 0) / 1000).toFixed(1) + ' 秒'; }});
@@ -3881,7 +3524,7 @@ function addMessage(role, html, before, fresh) {
 }
 
 function uiIcon(name) {
-  return '<svg class="ui-icon" aria-hidden="true"><use href="#ui-' + name + '"></use></svg>';
+  return '<svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-' + name + '"></use></svg>';
 }
 
 function appendMessageActions(content, role, text) {
@@ -3962,6 +3605,36 @@ function filesAttributedToTurn(files, sid, rid, artifactIds) {
   });
 }
 
+function turnFileScopes(content) {
+  return new Set([content.dataset.requestId || ''].concat(content._turnFileProducerIds || []));
+}
+
+function recordTurnFileProducer(content, producerRequestId) {
+  if (!producerRequestId) return;
+  var ids = content._turnFileProducerIds || (content._turnFileProducerIds = []);
+  if (!ids.includes(producerRequestId)) ids.push(producerRequestId);
+}
+
+function continuationProducer(entry, observedJobId) {
+  return entry && entry.active_child_job_id === observedJobId ? observedJobId : '';
+}
+
+async function fetchTurnGeneratedFiles(sid, requestId, producerJobId, artifactIds) {
+  if (!producerJobId) {
+    if (!window.loadSessionFiles) return null;
+    var library = await window.loadSessionFiles();
+    return library ? {requestId: requestId, files: filesAttributedToTurn(library.generated, sid, requestId, artifactIds)} : null;
+  }
+  var query = new URLSearchParams({request_id: requestId, producer_job_id: producerJobId});
+  var response = await accountFetch('/api/v2/session/' + encodeURIComponent(sid) + '/turn-artifacts?' + query);
+  if (!response.ok) return null;
+  var payload = await response.json();
+  if (payload.request_id !== requestId || payload.producer_job_id !== producerJobId ||
+      typeof payload.producer_request_id !== 'string' || !payload.producer_request_id || !Array.isArray(payload.files)) return null;
+  return {requestId: payload.producer_request_id,
+    files: filesAttributedToTurn(payload.files, sid, payload.producer_request_id, artifactIds)};
+}
+
 function syncHistoryTurnFiles() {
   if (!window.loadSessionFiles || !sessionId) return;
   var epoch = authEpoch, sid = sessionId;
@@ -3969,7 +3642,9 @@ function syncHistoryTurnFiles() {
     if (epoch !== authEpoch || sid !== sessionId || !payload) return;
     chatContainer.querySelectorAll('.content').forEach(function(content) {
       if (!content.closest('.bot') || content.dataset.sessionId !== sid || !content.dataset.requestId) return;
-      appendTurnGeneratedFiles(content, filesAttributedToTurn(payload.generated, sid, content.dataset.requestId));
+      turnFileScopes(content).forEach(function (producer) {
+        appendTurnGeneratedFiles(content, filesAttributedToTurn(payload.generated, sid, producer));
+      });
     });
   }).catch(function() {});
 }
@@ -3978,12 +3653,12 @@ function appendTurnGeneratedFiles(content, files, headingText) {
   if (!content || !files || !files.length) return;
   var host = content.closest('.message') || content;
   var ownerSession = content.dataset.sessionId || sessionId;
-  var ownerTurn = content.dataset.requestId || '';
+  var producerRequests = turnFileScopes(content);
   // A canonical turn's file references are authoritative. Conflicting metadata
   // is never allowed to move a file into another session or turn.
   files = files.filter(function(file) {
     return isPublicTurnFile(file) && file.file_id && (!file.source_session_id || String(file.source_session_id) === ownerSession)
-      && (!file.turn_request_id || String(file.turn_request_id) === ownerTurn);
+      && (!file.turn_request_id || producerRequests.has(String(file.turn_request_id)));
   });
   if (!files.length) return;
   // The section is a sibling immediately after the answer bubble, owned by
@@ -4120,50 +3795,51 @@ document.addEventListener('click', function (e) {
   });
 });
 
-/* v8.10: silent=true 跳过确认（newSession 内部调用——新建会话不应弹"清空"提示） */
+function renderSessionWelcome() {
+  chatContainer.innerHTML = '<div class="message bot"><div class="avatar"><img class="agent-avatar-image" src="/assets/citrusscholar-mascot.png" alt="CitrusScholar 助手" width="36" height="36"></div><div class="content">您好！有什么想了解的？</div></div>';
+}
+
 async function clearSession(silent) {
-  var epoch = authEpoch;
-  if (!silent && !confirm('确定清空当前会话？')) return;
+  var view = captureSessionView();
+  if (!view.id || (!silent && !confirm('确定清空当前会话？'))) return false;
   try {
-    await accountFetch('/api/v1/session/' + sessionId + '/clear', { method: 'POST' });
-    if (epoch !== authEpoch) return;
-    chatContainer.innerHTML = '<div class="message bot"><div class="avatar"><img class="agent-avatar-image" src="/assets/citrusscholar-mascot.png" alt="CitrusScholar 助手" width="36" height="36"></div><div class="content">您好！有什么想了解的？</div></div>';
+    var response = await accountFetch('/api/v1/session/' + encodeURIComponent(view.id) + '/clear', {method: 'POST'});
+    if (!view.owns()) return false;
+    if (!response.ok) { notifySessionMutationFailure(response, '清空'); return false; }
+    sessionNavigation++;
+    disposeTaskView();
+    clearSentAttachmentPreviewUrls();
+    renderSessionWelcome();
     sidebarContent.innerHTML = '<div class="empty-sidebar">提交问题后文献将在此展示</div>';
     citationCount.textContent = '0';
-    _historyMsgs = [];
-    _historyTurns = null;
-    _historyHasMore = false;
-    roundHistory = [];
-    _restoredGroups = null;   // v9.2: 清空会话同步清空恢复视图
-    // P3-2: 重置上下文面板（清空后不再残留旧会话数字）
-    _ctxData = null;
-    renderContextPanel({ estimated_tokens: 0, max_tokens: _ctxMaxTokens(), history_msgs: 0,
-                         soft_threshold: 0.75, hard_threshold: 0.93 });
-    // P0: 清空会话后导航立即重建（服务端历史已空）
+    _historyMsgs = []; _historyTurns = null; _historyHasMore = false;
+    roundHistory = []; _restoredGroups = null; _restoredRefPool = null;
+    renderContextPanel(null);
     if (window.turnRail && window.turnRail.reload) window.turnRail.reload();
-    // 清空后刷新会话列表。
-    loadSessions();
-  } catch (e) { if (epoch !== authEpoch) return; alert('清空失败: ' + e.message); }
+    void loadSessions();
+    return true;
+  } catch (_) {
+    if (view.owns()) notifySessionMutationFailure(null, '清空');
+    return false;
+  }
 }
 
 async function newSession() {
-  var epoch = authEpoch;
+  var view = captureSessionView();
   try {
-    var resp = await accountFetch('/api/v1/session/new', { method: 'POST' });
-    var data = await resp.json(); if (epoch !== authEpoch) return;
-    disposeTaskView();
-    rememberComposerSession();
-    sessionId = data.session_id;
-    restoreComposerSession();
-    localStorage.setItem(sessionStorageKey(), sessionId);
-    window.dispatchEvent(new CustomEvent('citrus:session-changed', {detail:{session_id:sessionId}}));
-    // v8.10: 静默清空旧会话界面（不弹"确定清空"确认——新建会话语义，勿误导用户）
-    await clearSession(true); if (epoch !== authEpoch) return;
-    // v8.10e: 创建后强制刷新会话列表（await + 重试），并延迟二次刷新防后端时序
+    var response = await accountFetch('/api/v1/session/new', {method: 'POST'});
+    if (!view.owns()) return false;
+    var data = response.ok ? await response.json() : null;
+    if (!view.owns()) return false;
+    if (!data || typeof data.session_id !== 'string' || !data.session_id) throw new Error('session_create_failed');
+    switchSession(data.session_id, true);
     applySidebar('session');
-    await loadSessionsWithRetry(); if (epoch !== authEpoch) return;
-    setTimeout(function () { if (epoch === authEpoch) loadSessions(); }, 300);
-  } catch (e) { if (epoch !== authEpoch) return; alert('创建新会话失败: ' + e.message); }
+    void loadSessions();
+    return true;
+  } catch (_) {
+    if (view.owns()) notifySessionMutationFailure(null, '创建新会话');
+    return false;
+  }
 }
 
 function toggleRound(id) {
@@ -4368,6 +4044,8 @@ async function sendMsg(paperVerification) {
     writeComposerDraft(draftKey, '');
   }
   var sentDraftRevision = composerDraft(draftKey).revision;
+  var admission = {id:clientRequestId, text:paperVerification ? '' : rawDraft, state:'staged'};
+  setComposerAdmission(draftKey, clientRequestId, admission, false);
 
   var botContent = addMessage('bot', '', null, true);
   // P0-A: 实时气泡带与历史恢复相同的轮次锚点（同一套归属规则，文件/跳转可定位）
@@ -4629,15 +4307,15 @@ async function sendMsg(paperVerification) {
   }
 
   function loadTurnGeneratedFiles(data) {
-    if (!window.loadSessionFiles) return;
+    var producerJobId = continuationProducer(queueEntry, taskStore.state.job_id);
     var artifactIds = Array.isArray(data && data.artifact_ids) ? data.artifact_ids.map(String) : null;
-    window.loadSessionFiles().then(function(payload) {
+    fetchTurnGeneratedFiles(requestSessionId, clientRequestId, producerJobId, artifactIds).then(function (result) {
       // A later turn may be active. Only account/session/view changes retire
       // this completed turn's DOM. Account-library growth is not attribution.
-      if (epoch !== authEpoch || requestSessionId !== sessionId || !payload || !chatContainer.contains(botContent)) return;
-      appendTurnGeneratedFiles(botContent,
-        filesAttributedToTurn(payload.generated, requestSessionId, clientRequestId, artifactIds));
-    }).catch(function() {});
+      if (!result || epoch !== authEpoch || requestSessionId !== sessionId || !chatContainer.contains(botContent)) return;
+      recordTurnFileProducer(botContent, result.requestId);
+      appendTurnGeneratedFiles(botContent, result.files);
+    }).catch(function () {});
   }
 
   function renderAnswer() {
@@ -4724,7 +4402,8 @@ async function sendMsg(paperVerification) {
     if (type === 'citations') {
       if (data.display === 'bubble_only') {
         citedBubbles = Array.isArray(data.bubbles) ? data.bubbles : [];
-        renderCitationBubbles(citationsDiv, citedBubbles, clientRequestId, requestSessionId);
+        renderCitationBubbles(citationsDiv, citedBubbles, clientRequestId, requestSessionId,
+          continuationProducer(queueEntry, taskStore.state.job_id));
         if (fullText) renderAnswer();
       }
       return;
@@ -5065,6 +4744,7 @@ async function sendMsg(paperVerification) {
     if (!observer || queueFollowedJobId === observer) return;
     if (queueFollowedJobId) {
       fullText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
+      citedBubbles = []; renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
       hasTerminalEvent = false; snapshotOnly = false;
     }
     queueFollowedJobId = observer;
@@ -5131,17 +4811,30 @@ async function sendMsg(paperVerification) {
   }
 
   function restoreNewDraft() {
-    if (paperVerification) return;
-    if (userInput.value) saveComposerInput();
-    if (requestRoundId !== currentRoundId || composerDraft(draftKey).revision !== sentDraftRevision) return;
+    if (paperVerification) return true;
+    var current = composerDraftKey() === draftKey;
+    if (current && userInput.value) saveComposerInput();
+    if (composerDraft(draftKey).revision !== sentDraftRevision) return false;
     writeComposerDraft(draftKey, rawDraft);
-    userInput.value = rawDraft;
+    if (current) { userInput.value = rawDraft; refreshTaskComposer(); }
+    return true;
+  }
+
+  function recordKnownNonAdmission() {
+    admission.state = 'rejected';
+    setComposerAdmission(draftKey, clientRequestId, restoreNewDraft() ? null : admission);
+  }
+
+  function recordUnknownAdmission() {
+    admission.state = 'uncertain';
+    setComposerAdmission(draftKey, clientRequestId, admission, !ownsTurn());
+    if (ownsTurn()) reconcileQueueAdmission();
+    else if (composerDraftKey() === draftKey) lookupDetachedAdmission(draftKey, admission);
   }
 
   function restoreDraft(message) {
     clearTimeout(spinnerTimeout); clearStatus();
     isCancelled = true; hasTerminalEvent = true;
-    restoreNewDraft();
     answerDiv.style.display = ''; answerDiv.textContent = '';
     showBanner(message);
     setSendDisabled(false);
@@ -5150,21 +4843,26 @@ async function sendMsg(paperVerification) {
 
   // A timeout or server-side error cannot prove the POST did not commit,
   // even when the response has a JSON error body. Reconcile the original ID.
-  function admissionRejectionConfirmed(status) {
-    return status >= 400 && status < 500 && status !== 408 && status !== 499;
+  function admissionRejectionConfirmed(status, code) {
+    // This code is emitted before the durable queue write. Generic 503 is uncertain.
+    return (status === 503 && code === 'turn_queue_unavailable') ||
+      (status >= 400 && status < 500 && status !== 408 && status !== 499);
   }
 
   function handleAdmissionError(status, body) {
     var detail = body && body.detail && typeof body.detail === 'object' ? body.detail : {};
     var code = detail.code || (body && body.code);
-    if (!admissionRejectionConfirmed(status)) { reconcileQueueAdmission(); return; }
+    if (!admissionRejectionConfirmed(status, code)) { recordUnknownAdmission(); return; }
     requestSubmitted = false;
+    recordKnownNonAdmission();
+    if (!ownsTurn()) return;
     var message = status === 401 ? '请先登录后继续。'
       : status === 413 ? '附件过大或数量超限，请调整后重试。'
       : status === 429 || code === 'turn_queue_full' ? '待处理消息已达上限，请稍后再试。'
       : code === 'turn_payload_conflict' ? '相同请求标识已用于不同内容；请重新发送为新请求。'
-      : code === 'skill_selection_changed' ? '所选技能已变更或不可用，请打开“＋”刷新技能目录后重新选择。'
+      : code === 'skill_selection_changed' ? '所选技能已变更或不可用，请打开“场景”刷新目录后重新选择。'
       : code === 'account_closed' ? '账户已停用，不能接受新请求。'
+      : code === 'turn_queue_unavailable' ? '消息队列暂不可用，内容已保留，请稍后重试。'
       : detail.message ? String(detail.message)
       : '这次没有完成，请稍后重试。';
     restoreDraft(message);
@@ -5191,12 +4889,14 @@ async function sendMsg(paperVerification) {
       if (!ownsTurn()) return;
       if (!error && result && result.ok && result.body && result.body.client_request_id === clientRequestId) {
         queueUncertainAttempts = 0;
+        setComposerAdmission(draftKey, clientRequestId, null);
         adoptTurnEntry(result.body, !requestSubmitted);
         return;
       }
-      if (!requestSubmitted) { restoreDraft('发送未完成，内容已保留，请重试。'); return; }
+      if (!requestSubmitted) { recordKnownNonAdmission(); restoreDraft('发送未完成，内容已保留，请重试。'); return; }
       if (++queueUncertainAttempts < 8) { setTimeout(reconcileQueueAdmission, 1500); return; }
       statusLabel.textContent = '消息状态暂未同步';
+      renderAdmissionRecovery(draftKey);
       showQueueRetry();
     }, clientRequestId);
   }
@@ -5240,18 +4940,16 @@ async function sendMsg(paperVerification) {
     var streamAbortController = new AbortController();
     requestAbortController = streamAbortController;
 
-    function ownsAdmission() {
-      return epoch === authEpoch && !accountDocumentRetired && !streamAbortController.signal.aborted;
-    }
-    // Finishing admission is independent of the current view and of graph execution.
-    enqueueTurnAdmission(async function () {
-      if (!ownsAdmission()) return;
+    function ownsAdmission() { return epoch === authEpoch && !accountDocumentRetired; }
+    // An unrelated session never waits for this POST, while messages in one
+    // owner/session preserve their original submission order.
+    enqueueTurnAdmission(epoch + ':' + draftKey, async function () {
+      if (!ownsAdmission() || streamAbortController.signal.aborted) return;
       try {
         var attachments = await Promise.all(filesForRequest.map(async function (file) {
           return {name: file.name, type: file.type, data: await fileAsDataUrl(file)};
         }));
-        if (!ownsAdmission()) return;
-        requestSubmitted = true;
+        if (!ownsAdmission() || streamAbortController.signal.aborted) return;
         var payload = {
           session_id: requestSessionId, query: query, client_request_id: clientRequestId,
           visualization_enabled: visualizeForRequest,
@@ -5259,26 +4957,37 @@ async function sendMsg(paperVerification) {
           file_refs: fileRefsForRequest.map(function (file) { return file.file_id; })
         };
         if (browseForRequest) payload.browse_requested = true;
-        var response = await accountFetch(turnQueueURL(requestSessionId), {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          signal: streamAbortController.signal, body: JSON.stringify(payload)
-        });
-        if (!ownsTurn() || streamAbortController.signal.aborted) return;
-        var body = null;
-        try { body = await response.json(); } catch (_) {}
-        if (!ownsTurn() || streamAbortController.signal.aborted) return;
-        if (!response.ok) { handleAdmissionError(response.status, body); return; }
-        if (!adoptTurnEntry(body)) reconcileQueueAdmission();
-      } catch (err) {
-        if (!ownsTurn() || requestAbortController !== streamAbortController || streamAbortController.signal.aborted) return;
+        requestSubmitted = true;
+        admission.state = 'posting'; setComposerAdmission(draftKey, clientRequestId, admission, false);
+        var outcome = await submitTurnBeforeDeadline(turnQueueURL(requestSessionId), payload, streamAbortController);
+        if (!ownsAdmission()) return;
+        if (!outcome.response.ok) { handleAdmissionError(outcome.response.status, outcome.body); return; }
+        if (!outcome.body || outcome.body.client_request_id !== clientRequestId) { recordUnknownAdmission(); return; }
+        setComposerAdmission(draftKey, clientRequestId, null);
+        if (ownsTurn()) adoptTurnEntry(outcome.body);
+        else {
+          var saved = composerSelections.get(draftKey);
+          if (saved && !paperVerification) {
+            saved.files = saved.files.filter(function (file) { return filesForRequest.indexOf(file) < 0; });
+            saved.refs = saved.refs.filter(function (file) { return fileRefsForRequest.indexOf(file) < 0; });
+            if (saved.skills && saved.skills.scope === capturedSkills.scope && saved.skills.revision === capturedSkills.revision) saved.skills = null;
+          }
+          if (composerDraftKey() === draftKey) {
+            _selectedAttachments = _selectedAttachments.filter(function (file) { return filesForRequest.indexOf(file) < 0; });
+            window._selectedAccountFileRefs = window._selectedAccountFileRefs.filter(function (file) { return fileRefsForRequest.indexOf(file) < 0; });
+            renderAttachmentSelection();
+            restoreSessionHistory();
+          }
+        }
+      } catch (_) {
+        if (!ownsAdmission()) return;
         if (!requestSubmitted) {
-          clearTimeout(spinnerTimeout); clearStatus();
-          restoreNewDraft();
-          showBanner('发送未完成，内容已保留，请重试。');
-          stopCurrentTurn('switch');
-          removeOptimisticTurn();
-          setSendDisabled(false);
-        } else reconcileQueueAdmission();
+          recordKnownNonAdmission();
+          if (ownsTurn()) {
+            restoreDraft('发送未完成，内容已保留，请重试。');
+            stopCurrentTurn('switch'); removeOptimisticTurn(); setSendDisabled(false);
+          }
+        } else recordUnknownAdmission();
       } finally {
         if (requestAbortController === streamAbortController) requestAbortController = null;
       }
@@ -5658,6 +5367,10 @@ function jumpToMessage(messageId, opts) {
   var mid = String(messageId || '');
   if (!mid) return false;
   var node = chatContainer.querySelector('[data-message-id="' + mid + '"]');
+  return highlightTurnNode(node, opts);
+}
+
+function highlightTurnNode(node, opts) {
   if (!node) return false;
   // Center the whole bubble, not just its text box; the id can live on .content.
   var host = node.closest('.message') || node;
@@ -5683,6 +5396,12 @@ window.jumpToFileTurn = async function (targetSessionId, requestId) {
   if (!_historyMsgs.length) await restoreSessionHistory();
   if (epoch !== authEpoch || targetSessionId !== sessionId) return false;
   var version = historyRestoreVersion;
+  function mountedProducer() {
+    return Array.prototype.find.call(chatContainer.querySelectorAll('.content'), function (content) {
+      return content.dataset.sessionId === targetSessionId && turnFileScopes(content).has(String(requestId));
+    });
+  }
+  if (highlightTurnNode(mountedProducer(), {})) return true;
   var target = null;
   for (var i = 0; i < _historyMsgs.length; i++) {
     if (String(_historyMsgs[i].request_id || '') === String(requestId)) { target = _historyMsgs[i]; break; }
@@ -5691,6 +5410,7 @@ window.jumpToFileTurn = async function (targetSessionId, requestId) {
     // The turn may sit in an older page: walk back a bounded number of pages.
     for (var guard = 0; guard < 8 && _historyHasMore && !target; guard++) {
       if (!await loadEarlierHistory() || epoch !== authEpoch || targetSessionId !== sessionId || version !== historyRestoreVersion) return false;
+      if (highlightTurnNode(mountedProducer(), {})) return true;
       for (var j = 0; j < _historyMsgs.length; j++) {
         if (String(_historyMsgs[j].request_id || '') === String(requestId)) { target = _historyMsgs[j]; break; }
       }
@@ -5835,7 +5555,7 @@ function groupHistoryTurns(msgs) {
         entry = {kind: 'tool', tool_call_id: tcid, name: String(m.name || 'tool'), summary: ''};
         current.trace.push(entry);
       }
-      ['logical_key', 'operation_id', 'attempt', 'aliases', 'facts', 'outcome', 'result_refs'].forEach(function (field) { if (m[field] != null) entry[field] = m[field]; });
+      ['logical_key', 'operation_id', 'attempt', 'aliases', 'facts', 'outcome', 'result_refs', 'result_id'].forEach(function (field) { if (m[field] != null) entry[field] = m[field]; });
       entry.status = m.status || m.content || '';
       entry.reason_code = m.reason_code || '';
       entry.action_hint = m.action_hint || '';
@@ -6115,9 +5835,10 @@ function mergeQueuedHistory(history, entries) {
     }
     if (!root.user) root.user = {content: entry.query || '', request_id: entry.client_request_id, attachments: entry.attachments || []};
     if (segment && segment !== root) {
-      root.answer = segment.answer || root.answer;
-      var files = new Map(root.files.concat(segment.files).map(function (file) { return [file.file_id, file]; }));
-      root.files = Array.from(files.values());
+      if (segment.answer) {
+        root.answer = segment.answer;
+        root.answerProducerJobId = segment.jobId;
+      }
       root.trace = segment.trace;
       root.messageIds = root.messageIds.concat(segment.messageIds);
     }
@@ -6131,10 +5852,15 @@ function mergeQueuedHistory(history, entries) {
     }
     root.queueEntry = entry;
     var relative = segment;
+    var producerRequests = [], files = new Map(root.files.map(function (file) { return [file.file_id, file]; }));
     while (relative && relative !== root && !hidden.has(relative)) {
       hidden.add(relative);
+      if (relative.turnRequestId) producerRequests.push(relative.turnRequestId);
+      relative.files.forEach(function (file) { if (!files.has(file.file_id)) files.set(file.file_id, file); });
       relative = byJob.get(relative.parentJobId);
     }
+    root.fileProducerRequestIds = producerRequests;
+    root.files = Array.from(files.values());
   });
   return history.filter(function (turn) { return !hidden.has(turn); }).concat(missing);
 }
@@ -6239,7 +5965,8 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       if (!citationContainer) {
         citationContainer = document.createElement('div'); content.appendChild(citationContainer);
       }
-      renderCitationBubbles(citationContainer, savedCitations, turn.turnRequestId, sid);
+      renderCitationBubbles(citationContainer, savedCitations, turn.turnRequestId, sid,
+        continuationProducer(entry, store.state.job_id));
       if (!hasSavedAnswer && streamedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer, savedCitations);
     }
     if (!finalAnswerReceived && isPublicAnswerEvent(data)) {
@@ -6264,9 +5991,15 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       }
       process.terminal(CitrusTaskState.displayStatus(data));
       answer.dataset.displayStatus = CitrusTaskState.displayStatus(data);
-      if (Array.isArray(data.artifact_ids) && window.loadSessionFiles) window.loadSessionFiles().then(function (payload) {
-        if (owns() && payload) appendTurnGeneratedFiles(content, filesAttributedToTurn(payload.generated, sid, turn.turnRequestId, data.artifact_ids.map(String)));
-      }).catch(function () {});
+      var producerJobId = continuationProducer(entry, store.state.job_id);
+      if (producerJobId || Array.isArray(data.artifact_ids)) {
+        var fileIds = Array.isArray(data.artifact_ids) ? data.artifact_ids.map(String) : null;
+        fetchTurnGeneratedFiles(sid, turn.turnRequestId, producerJobId, fileIds).then(function (result) {
+          if (!owns() || !result) return;
+          recordTurnFileProducer(content, result.requestId);
+          appendTurnGeneratedFiles(content, result.files);
+        }).catch(function () {});
+      }
     }
     if (type === 'request_user_input' || type === 'question' || type === 'done') questionLabel();
     syncWaiting();
@@ -6354,6 +6087,57 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
   } else if (turn.jobId) transport.follow(turn.jobId);
 }
 
+function bindSettledHistoryDetails(turn, content, answer, process) {
+  // Persistent preview is sufficient for the initial history viewport.
+  // Fetch full public events only if this specific turn is expanded.
+  var sid = sessionId, epoch = authEpoch, controller = null, done = false;
+  var recoveryAnswer = !String(turn.answer && turn.answer.content || "").trim();
+  var button = document.createElement('button');
+  button.type = 'button'; button.className = 'research-tool-toggle';
+  button.textContent = '查看完整过程';
+  process.element.appendChild(button);
+  function owns() { return epoch === authEpoch && sid === sessionId && chatContainer.contains(content); }
+  historyTaskDisposers.push(function () { if (controller) controller.abort(); });
+  button.onclick = async function () {
+    if (controller || done || !owns()) return;
+    controller = new AbortController(); button.disabled = true;
+    var jobId = (turn.queueEntry || {}).active_child_job_id || turn.jobId;
+    try {
+      var cursor = 0, previous, page;
+      do {
+        previous = cursor;
+        var response = await accountFetch('/jobs/' + encodeURIComponent(jobId) + '/events?after=' + cursor + '&limit=200',
+                                          {signal: controller.signal});
+        if (!response.ok) throw new Error('history_events_unavailable');
+        page = await response.json();
+        if (!owns()) return;
+        if (page.protocol !== 'citrus-task/1' || page.job_id !== jobId || !Array.isArray(page.events)) throw new Error('history_event_identity_mismatch');
+        page.events.forEach(function (event) {
+          if (!Number.isSafeInteger(event.seq) || event.seq <= cursor) return;
+          cursor = event.seq;
+          var type = event.event, data = Object.assign({}, event.data || {}, {seq: event.seq});
+          process.receive(type, data);
+          if (recoveryAnswer && (type === 'done' || type === 'error') && typeof data.answer === 'string' &&
+              data.answer.trim() && isPublicAnswerEvent(data)) {
+            answer.innerHTML = renderMarkdownSafe(data.answer, data.citation_bubbles);
+            appendMessageActions(content, 'assistant', data.answer);
+          }
+        });
+        if (page.next_cursor !== cursor || page.has_more && cursor <= previous) throw new Error('history_event_cursor_invalid');
+      } while (page.has_more && owns());
+      if (!owns()) return;
+      process.terminal(turn.displayStatus);
+      done = true;
+      button.textContent = cursor ? '完整过程已加载' : '没有更多过程记录';
+    } catch (_) {
+      if (owns()) button.textContent = '过程记录暂不可用，点击重试';
+    } finally {
+      controller = null;
+      if (owns()) button.disabled = done;
+    }
+  };
+}
+
 function renderHistoryMessages(msgs, serverTurns, placement) {
   if (!placement) {
     disposeTaskView();
@@ -6391,6 +6175,7 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     if (turn.jobId) contentEl.dataset.jobId = turn.jobId;
     if (answer.message_id) contentEl.dataset.messageId = String(answer.message_id);
     if (turn.turnRequestId) contentEl.dataset.requestId = String(turn.turnRequestId);
+    (turn.fileProducerRequestIds || []).forEach(function (rid) { recordTurnFileProducer(contentEl, rid); });
     contentEl.dataset.sessionId = sessionId;
     var answerBody = document.createElement('div'); answerBody.className = 'turn-answer';
     answerBody.dataset.displayStatus = turn.displayStatus;
@@ -6398,7 +6183,7 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     if (answer.citation_bubbles && answer.citation_bubbles.length) {
       var citationRow = document.createElement('div');
       contentEl.appendChild(citationRow);
-      renderCitationBubbles(citationRow, answer.citation_bubbles, turn.turnRequestId, sessionId);
+      renderCitationBubbles(citationRow, answer.citation_bubbles, turn.turnRequestId, sessionId, turn.answerProducerJobId);
     }
     if (turn.artifactDelivery) renderArtifactDelivery(contentEl, turn.artifactDelivery);
     var process = createResearchProcessPanel(turn.intentSummary || (turn.user && turn.user.content));
@@ -6410,12 +6195,15 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
       var relation = document.createElement('div'); relation.className = 'turn-continuation'; relation.textContent = '根据上一轮选择继续';
       contentEl.insertBefore(relation, process.element);
     }
-    if (!turn.jobId) {
-      projectHistoryTrace(process, turn.trace);
-      // Unmarked legacy stage labels cannot establish a public model note.
-    }
+    var savedSettlement = !!(turn.jobId && turn.displayStatus &&
+      (!turn.queueEntry || turn.queueEntry.state === 'terminal') &&
+      !(turn.question && turn.question.status === 'pending'));
+    if (!turn.jobId || savedSettlement) projectHistoryTrace(process, turn.trace);
     var ownsContext = (!placement || placement.append) && ti === (composerIndex >= 0 ? composerIndex : turns.length - 1);
-    if (turn.jobId || turn.question || turn.queueEntry) bindHistoryTask(turn, contentEl, answerBody, process, ownsContext, ti === composerIndex, userContent);
+    if (savedSettlement) {
+      bindSettledHistoryDetails(turn, contentEl, answerBody, process);
+      if (ownsContext && turn.contextSnapshot) renderContextPanel(turn.contextSnapshot);
+    } else if (turn.jobId || turn.question || turn.queueEntry) bindHistoryTask(turn, contentEl, answerBody, process, ownsContext, ti === composerIndex, userContent);
     else if (ownsContext) {
       var context = CitrusTaskState.createContext({session_id: sessionId, request_id: turn.turnRequestId});
       if (turn.contextSnapshot) context.receive('context_snapshot', turn.contextSnapshot);
@@ -6457,6 +6245,7 @@ async function createDefaultSession(epoch, preserveComposer) {
       if (!resp.ok) return;
       var data = await resp.json();
       if (epoch !== authEpoch || sessionId || !data || typeof data.session_id !== 'string' || !data.session_id) return;
+      sessionNavigation++;
       sessionId = data.session_id;
       restoreComposerSession(preserveComposer);
       localStorage.setItem(sessionStorageKey(), sessionId);
@@ -6473,17 +6262,17 @@ async function recoverMissingSession(epoch, sid) {
   // local Files, preview URLs and account file references belong to the user.
   disposeTaskView();
   setSendDisabled(false);
+  sessionNavigation++;
   sessionId = null;
   localStorage.removeItem(sessionStorageKey());
   clearSentAttachmentPreviewUrls();
   chatContainer.replaceChildren();
   _historyMsgs = []; _historyTurns = null; _historyHasMore = false;
   roundHistory = []; _restoredGroups = null; _restoredRefPool = null;
-  _ctxData = null; _sentSnapshots = [];
+  _ctxData = null;
   sidebarContent.innerHTML = '<div class="empty-sidebar">提交问题后文献将在此展示</div>';
   citationCount.textContent = '0';
-  renderContextPanel({estimated_tokens: 0, max_tokens: _ctxMaxTokens(), history_msgs: 0,
-                      soft_threshold: 0.75, hard_threshold: 0.93});
+  renderContextPanel(null);
   // One creation attempt; do not recursively reload a replacement's history.
   await createDefaultSession(epoch, true);
   if (epoch !== authEpoch) return;

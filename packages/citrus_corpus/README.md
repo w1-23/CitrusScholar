@@ -35,3 +35,23 @@ in one SQLite transaction. The publisher independently builds and activates
 an index. An operator's exact-version revocation is never overridden by an
 automatic observation. For rollback, legacy workers can still prepare a
 queued observation, but it needs operator rights review on the legacy code.
+
+### Hold publication after rollback
+
+`python -m citrus_corpus --root ROOT rollback GENERATION --embedding-cache CACHE`
+verifies the published target, persists an operator hold, then replaces the
+pointer. `publish` (including `--watch`) returns `publication_held` without
+activating ready work or rebuilding. The hold survives restarts. The rights
+ledger is not rolled back, so revoked content is still unavailable from the
+active index, fallback, and exact citation reads. While held, an unreadable
+rollback target fails closed instead of serving a different generation.
+
+After validating the rollback, run
+`python -m citrus_corpus --root ROOT resume-publication` to release the hold.
+This command does not publish or load models. If the rollback did not durably replace
+the pointer and record completion, resume refuses and the hold stays in force. Retry the
+verified rollback, investigate any persistence errors, and verify the active
+generation before resuming. Resume authorizes normal selection and idle/budget
+checks again, so a subsequent watch iteration may activate ready work. Use the
+build of the publisher that supports this protocol for all writers, including an
+already-running watch loop, before relying on the hold.

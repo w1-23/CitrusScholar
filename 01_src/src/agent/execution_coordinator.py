@@ -15,6 +15,7 @@ import time
 from src.core import jobs, task_events
 from src.core.account_leases import acquire_account_lease, run_account_async, run_account_thread
 from src.code_execution.protocol import TERMINAL
+from .checkpoint_store import CheckpointProtectionError
 from .execution_segments import ExecutionSegments
 from .execution_waits import ExecutionWaitBoundary
 from .identity import ExecutionIdentity
@@ -24,11 +25,12 @@ logger = logging.getLogger(__name__)
 
 
 class ExecutionCompletionCoordinator:
-    def __init__(self, root: Path, provider_scope, *, dispatch, busy, service_factory=None):
+    def __init__(self, root: Path, provider_scope, *, dispatch, busy, settle=None, service_factory=None):
         self.root = Path(root)
         self.provider_scope = provider_scope
         self.dispatch = dispatch
         self.busy = busy
+        self.settle = settle
         if service_factory is None:
             from src.code_execution.service import ExecutionService
             service_factory = ExecutionService
@@ -90,25 +92,33 @@ class ExecutionCompletionCoordinator:
                 if (snapshot['phase'] in {'parked', 'cancel_parked'}
                         and all(item['status'] in TERMINAL for item in statuses)):
                     from .harness import execution_lock
-                    with execution_lock(self.root / 'agent_locks', identity):
-                        await run_account_thread(lease, segments.finish_cancelled)
+                    with execution_lock(self.root / 'agent_locks', (identity.owner_user_id, identity.session_id)):
+                        try:
+                            await run_account_thread(lease, segments.finish_cancelled)
+                        except task_events.TaskConflict as exc:
+                            if str(exc) == 'execution_segment_requires_reconciliation':
+                                self._blocked(identity, 'code_cancellation_reconciliation_required')
+                            raise
+                    if self.settle:
+                        await run_account_thread(lease, self.settle, identity)
                 return
             if snapshot['phase'] != 'parked' or job.get('status') not in {'running', 'detached'}:
                 return
             wait_ids = tuple(json.loads(snapshot['wait_ids']))
             boundary = ExecutionWaitBoundary(service)
-            observations = await run_account_async(lease, boundary.resolve(identity, wait_ids))
-            if observations is None:
-                return
             try:
                 state = await run_account_async(lease, load_recovery_state(
                     self.root, identity, self.provider_scope,
                     execution_wait={'checkpoint_ref': snapshot['checkpoint_ref'], 'wait_ids': list(wait_ids)}))
-            except (ValueError, LookupError) as exc:
+            except (ValueError, LookupError, CheckpointProtectionError):
                 # A missing/incompatible commit or process-local candidate pool
                 # is diagnostic, never permission to synthesize/replay a turn.
                 self._blocked(identity, 'code_checkpoint_reconciliation_required')
-                raise exc
+                raise
+            if not state.get('agent_recovery_wake_committed'):
+                observations = await run_account_async(lease, boundary.resolve(identity, wait_ids))
+                if observations is None:
+                    return
             admission = segments.claim_resume()
             try:
                 state = restore_deadline(state, admission['budget'])
@@ -142,11 +152,13 @@ class ExecutionCompletionCoordinator:
 
     @staticmethod
     def _blocked(identity, code):
+        from src.core import chat_turn_queue
         with task_events.transaction() as conn:
             job = task_events._job(conn, identity.run_id)
-            if job['status'] not in {'running', 'detached'} or job['error'] == code:
+            if job['status'] not in {'running', 'detached', 'cancel_requested'} or job['error'] == code:
                 return
             conn.execute('UPDATE task_jobs SET current_step=?,error=? WHERE job_id=?',
                          ('code_reconciliation_required', code, identity.run_id))
+            chat_turn_queue._freeze_unstarted_recovery(conn, identity.run_id, reason=code)
             task_events._append(conn, identity.run_id, 'execution_segment', {
                 'job_id': identity.run_id, 'phase': 'reconciliation_required', 'reason_code': code})

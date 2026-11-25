@@ -22,6 +22,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command, interrupt
 from langgraph.errors import NodeCancelledError
 from pydantic import Field
@@ -238,12 +239,11 @@ class HarnessRuntime:
                 if unknown:
                     return {"stop_status": "incomplete", "stop_reason": "operation_outcome_unknown",
                             "unknown_operations": unknown, "host_state": host_snapshot(), "jump_to": "end"}
-                if state.get("execution_wake"):
-                    await acknowledge_wake(state)
                 followup_used = state.get("delivery_followup_used", False)
                 notes = [note for item in signals for note in item.get("notes", ())]
                 if state.get("model_steps", 0) >= adapter.limits.max_model_steps:
-                    return {"stop_status": "incomplete", "stop_reason": "model_step_limit", "jump_to": "end"}
+                    return {"stop_status": "incomplete", "stop_reason": "model_step_limit", "jump_to": "end",
+                            "execution_wake": [], "execution_waits": [], "operation_signals": None, "batch_status": ""}
                 if time.monotonic() >= adapter.limits.deadline:
                     raise AdmissionStopped("deadline")
                 if adapter.prepare:
@@ -432,6 +432,9 @@ class HarnessRuntime:
                     message = persistent_message(message.model_copy(update={"name": name,
                         "additional_kwargs": {**message.additional_kwargs,
                                               **identity.message_metadata("tool")}}))
+                    if name == "draw_svg" and adapter.export_host:
+                        from src.core.figures import export_recovery
+                        signal["figure_recovery"] = export_recovery(identity)
                     if not signal:
                         return message
                     return Command(update={"messages": [message], "operation_signals": {cid: signal}})
@@ -487,21 +490,43 @@ class HarnessRuntime:
             if committed.values.get("execution_wake") != list(waits):
                 raise ValueError("execution_wake_commit_required")
             reference = committed.config["configurable"]["checkpoint_id"]
-            await adapter.acknowledge_execution_waits(identity, waits, reference)
+            try:
+                await adapter.acknowledge_execution_waits(identity, waits, reference)
+            except Exception as exc:
+                # Keep the committed receipt and preserve the exact checkpoint
+                # reference if an acknowledgement cannot presently be written.
+                import logging
+                logging.getLogger(__name__).warning("execution_wake_ack_deferred: %s", type(exc).__name__)
+                return None
+            changes = {"execution_wake": [], "execution_waits": [],
+                       "operation_signals": None, "batch_status": "", "host_state": host_snapshot()}
+            if time.monotonic() >= self.limits.deadline:
+                changes.update(stop_status="incomplete", stop_reason="deadline")
+            # Establish a settled head while no model node can run. If Web
+            # dies after ack but before this commit, it rereads the same ID.
+            await graph.aupdate_state(config, changes, as_node="Suspension.before_model")
+            return {**state, **changes}
+
+        def deferred_wake(state):
+            return self._result({**state, "stop_status": "suspended", "stop_reason": "execution_pending",
+                                 "execution_waits": state["execution_wake"]})
 
         prior = snapshot.values
         continuing_thread = bool(prior and not resume and prior.get("active_run_id") != identity.run_id)
+        quarantined = False
         if continuing_thread:
             closed = not snapshot.next and prior.get("stop_status") in {"complete", "incomplete", "cancelled"}
             before_model = set(snapshot.next) <= {"model", "Policy.before_model", "Suspension.before_model"}
-            orphan_closed = (before_model and adapter.check_terminal_orphan
-                             and await adapter.check_terminal_orphan(prior))
+            orphan = await adapter.check_terminal_orphan(prior) if adapter.check_terminal_orphan else False
+            quarantined = orphan == "quarantined"
+            orphan_closed = bool(before_model and orphan)
             answered_question = (adapter.authorized_question_parent == prior.get("active_run_id")
                                  and len(snapshot.interrupts) == 1 and snapshot.interrupts[0].value == {
                                      "kind": "user_input", "wait_ids": []})
-            if (prior.get("executor_id") != EXECUTOR_ID or not (closed or orphan_closed or answered_question)
+            if (prior.get("executor_id") != EXECUTOR_ID or (not quarantined and (
+                    not (closed or orphan_closed or answered_question)
                     or has_unsettled_work(prior, ignore_question=answered_question)
-                    or (snapshot.interrupts and not answered_question)):
+                    or (snapshot.interrupts and not answered_question)))):
                 raise AdmissionStopped("native_thread_requires_reconciliation")
         initial = None
         if prior and not continuing_thread:
@@ -514,6 +539,18 @@ class HarnessRuntime:
                 raise ValueError("execution_checkpoint_identity_mismatch")
             if adapter.restore_host:
                 adapter.restore_host(prior["host_state"])
+                # ToolNode can commit before the next complete Host snapshot.
+                # Draw calls can produce joint snapshots, so read the latest
+                # count/attempt watermark without depending on tool ordering.
+                from src.core.figures import reserve_legacy_indices, restore_recovery
+                figures = [item["figure_recovery"] for item in (prior.get("operation_signals") or {}).values()
+                           if "figure_recovery" in item]
+                if figures:
+                    restore_recovery(identity, max(figures, key=lambda item: (item["attempts"], len(item["entries"]))))
+                elif "figures" not in prior["host_state"]:
+                    reserve_legacy_indices(m.content for m in prior["messages"] if isinstance(m, ToolMessage)
+                        and m.name == "draw_svg" and m.additional_kwargs.get("run_id") == identity.run_id
+                        and m.additional_kwargs.get("host_publication"))
                 # The suspension occurs after ToolNode committed canonical
                 # observations. Rehydrate outstanding publication without I/O replay.
                 if adapter.restore_tool_observation:
@@ -525,6 +562,32 @@ class HarnessRuntime:
                                 and message.additional_kwargs.get("run_id") == identity.run_id
                                 and message.additional_kwargs.get("host_publication")):
                             adapter.restore_tool_observation(message, proposed.get(message.tool_call_id))
+            if _pending_calls(prior["messages"]):
+                from .recovery import committed_tool_receipts
+                if (not adapter.restore_tool_observation or set(snapshot.next) != {"tools"}
+                        or snapshot.interrupts):
+                    raise AdmissionStopped("recovery_requires_reconciliation")
+                recovered = await committed_tool_receipts(identity, prior["messages"])
+                pairs, recovered_figures = [], []
+                for message, call in recovered:
+                    private = dict(message.additional_kwargs)
+                    if figure := private.pop("host_figure_recovery", None):
+                        recovered_figures.append(figure)
+                    message = message.model_copy(update={"additional_kwargs": private})
+                    adapter.restore_tool_observation(message, call)
+                    pairs.append(message)
+                if recovered_figures:
+                    from src.core.figures import restore_recovery
+                    restore_recovery(identity, max(recovered_figures,
+                        key=lambda item: (item["attempts"], len(item["entries"]))))
+                if self.validate_resume:
+                    self.validate_resume()
+                # Publish the matching, authorized observations as the already
+                # completed tools node. No callable tool enters this path.
+                await graph.aupdate_state(config, {"messages": pairs,
+                    "host_state": host_snapshot()}, as_node="tools")
+                snapshot = await graph.aget_state(config)
+                prior = snapshot.values
             await observed(prior)
             if self.validate_resume:
                 self.validate_resume()
@@ -541,6 +604,15 @@ class HarnessRuntime:
                 if notes is None:
                     return self._result(waiting)
                 initial = Command(resume={snapshot.interrupts[0].id: {"completion_notes": list(notes)}})
+            elif prior.get("execution_wake"):
+                settled = await acknowledge_wake(prior)
+                if settled is None:
+                    return deferred_wake(prior)
+                if settled.get("stop_status"):
+                    await observed(settled, "stopped")
+                    await event("run_finished", settled)
+                    return self._result(settled)
+                await observed(settled)
             elif prior.get("stop_status"):
                 # An already accepted answer can be delivered without another
                 # model call. Supplementary requirements need a fresh model step.
@@ -554,7 +626,11 @@ class HarnessRuntime:
             if resume:
                 raise ValueError("execution_checkpoint_missing")
             additions = list(messages)
-            if continuing_thread:
+            if quarantined:
+                # Keep the old protected checkpoint for diagnosis, but replace
+                # the live message head with trusted history and the new turn.
+                additions.insert(0, RemoveMessage(id=REMOVE_ALL_MESSAGES))
+            elif continuing_thread:
                 previous_request = (prior.get("host_state") or {}).get("original_request_state") or {}
                 previous_id = previous_request.get("request_id")
                 anchor = next((index for index in range(len(messages) - 2, -1, -1)
@@ -571,7 +647,27 @@ class HarnessRuntime:
                 "skills_metadata": None, "delivery_followup_used": False, "operation_signals": None,
                 "unknown_operations": [], "execution_waits": [], "execution_wake": [], "batch_status": "",
                 "stop_status": "", "stop_reason": "", "rejected_responses": [], "seed_proposal": []}
+            if quarantined:
+                initial.update(working_context={}, batch_notes=[])
         await event("run_started", latest)
+        if isinstance(initial, Command):
+            # Only the Suspension middleware can run through this breakpoint.
+            # Commit the paired observation before acknowledging its durable
+            # notification, independently of any remaining model budget.
+            await graph.ainvoke(initial, config, durability="sync",
+                                interrupt_after=["Suspension.before_model"])
+            committed = (await graph.aget_state(config)).values
+            if not committed.get("execution_wake"):
+                raise ValueError("execution_wake_commit_required")
+            settled = await acknowledge_wake(committed)
+            if settled is None:
+                return deferred_wake(committed)
+            if settled.get("stop_status"):
+                await observed(settled, "stopped")
+                await event("run_finished", settled)
+                return self._result(settled)
+            await observed(settled)
+            initial = None
         timer = asyncio.timeout(max(0, self.limits.deadline-time.monotonic())
                                 if self.limits.deadline != float("inf") else None)
         try:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import getpass
 from getpass import GetPassWarning
+import sqlite3
 import sys
 import warnings
 from pathlib import Path
@@ -26,9 +27,9 @@ from pathlib import Path
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT))
 
-from src.auth import (AccountInviteError, create_local_account, init_store,  # noqa: E402
-                      issue_invite, list_users, reset_password,
-                      set_user_status, validate_credentials)
+from src.auth import (AccountDeletionPending, AccountInviteError, account_deletion_status,  # noqa: E402
+                      create_local_account, init_store, issue_invite, list_users, pending_deletion_counts, reset_password,
+                      resume_user_account_deletion, set_user_status, validate_credentials)
 
 MIN_LEN, MAX_LEN = 10, 256
 DEFAULT_DAILY_LIMIT = 300
@@ -167,6 +168,41 @@ def cmd_issue_invite(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_deletion_status(args: argparse.Namespace) -> int:
+    try:
+        if args.check_pending:
+            pending, claimed = pending_deletion_counts()
+            print(f"待删除账号数 {pending}，其中有清理进程认领 {claimed}。")
+            return int(pending > 0)
+        state = account_deletion_status(args.user_id)
+    except sqlite3.Error:
+        print("无法读取账号删除状态，请核对目标运行目录及账号库。")
+        return 2
+    if state is None:
+        print("没有处于待清理状态的非管理员账号。")
+        return 2
+    print(f"删除仍未完成。待处理工作引用组数 {state['lease_count']}。")
+    if state["has_claim"]:
+        print(f"原清理进程 PID {state['claim_pid']}（仅供核对，不证明进程已经停止）。")
+    print(f"核对指纹 {state['fingerprint']}")
+    return 0
+
+
+def cmd_resume_deletion(args: argparse.Namespace) -> int:
+    try:
+        completed = resume_user_account_deletion(
+            args.user_id, fingerprint=args.snapshot, confirmed_stopped=args.confirmed_writer_stopped,
+            incident_reference=args.incident)
+    except (AccountDeletionPending, ValueError):
+        print("未续清。请核对当前状态、全部相关写入进程和事件记录。")
+        return 2
+    if not completed:
+        print("清理未完成。账号仍停用，请查阅运维诊断。")
+        return 2
+    print("账号数据清理已完成，运维审计事件已保留。")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CitrusQA 本地账号管理")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -184,6 +220,18 @@ def _build_parser() -> argparse.ArgumentParser:
     for name, flag in (("enable", True), ("disable", False)):
         p = sub.add_parser(name, help=f"{'启用' if flag else '停用'}账号")
         p.add_argument("username")
+
+    p = sub.add_parser("deletion-status", help="查看待清理状态，不显示用户名或 claim 凭据")
+    scope = p.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--user-id", type=int)
+    scope.add_argument("--check-pending", action="store_true", help="只输出计数，有待清理项返回 1")
+
+    p = sub.add_parser("resume-deletion", help="仅在独立核实旧写入进程整体停止后续清")
+    p.add_argument("--user-id", required=True, type=int)
+    p.add_argument("--snapshot", required=True, help="deletion-status 返回的当前核对指纹")
+    p.add_argument("--incident", required=True, help="无个人信息的事件工单编号，例如 OPS-123")
+    p.add_argument("--confirmed-writer-stopped", action="store_true", required=True,
+                   help="确认独立核实旧写入进程及其子进程均已停止；仅凭 PID 或时长不够")
 
     p = sub.add_parser("issue-invite", help="签发一次性邀请码（需已授权管理员）")
     p.add_argument("--admin", required=True, metavar="USERNAME",
@@ -205,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
         except (GetPassWarning, EOFError):
             print("请在可隐藏密码输入的交互终端运行此命令。")
             return 2
+    if args.cmd == "deletion-status":
+        return cmd_deletion_status(args)
     init_store()
     if args.cmd == "list":
         return cmd_list(args)
@@ -214,6 +264,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_set_active(args, False)
     if args.cmd == "issue-invite":
         return cmd_issue_invite(args)
+    if args.cmd == "resume-deletion":
+        return cmd_resume_deletion(args)
     return 2
 
 

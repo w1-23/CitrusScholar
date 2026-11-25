@@ -10,6 +10,7 @@ import math
 from citrus_figures.manifest import EDITABLE_BY_ROLE
 from citrus_figures.workbench_styles import properties as workbench_properties
 from src.figures.projects import ProjectError
+from src.figures.workbench.identities import DeclarativeIdentity, verified_panels
 
 _TEXT = {"color", "fontsize", "fontfamily", "fontweight", "fontstyle", "horizontalalignment", "visible"}
 _SERIES = {"color", "linewidth", "linestyle", "marker", "markersize", "markerfacecolor", "markeredgecolor",
@@ -81,14 +82,14 @@ class Group:
 class Inventory:
     """One revision's groups and the closed translation into renderer overrides."""
 
-    def __init__(self, project, manifest, *, disabled=""):
+    def __init__(self, project, manifest, *, disabled="", frozen=None):
         self.figure_id = project["figure_id"]
         self.source_kind = project.get("source_kind")
         self.groups = {}
         self.disabled = disabled
         self.rows = {}
         self.saved = {}
-        self.source = project.get("source_json") or {}
+        self.declarative = DeclarativeIdentity(frozen) if self.source_kind == "spec" else None
         self._build(manifest, project.get("overrides_json") or [])
 
     def _add(self, key, kind, label, parent=None, rows=()):
@@ -102,30 +103,6 @@ class Inventory:
                            for row in rows if (row["gid"], "offset_px") in self.saved}
         self.groups[gid] = group
         return group
-
-    def _panel_ids(self, axes):
-        source = self.source.get("spec", {})
-        declared = source.get("panels") or [source] if isinstance(source, dict) else []
-        if not isinstance(declared, list):
-            declared = []
-        resolved = {}
-        for index, row in axes.items():
-            locator_id = row["locator"].get("panel_id")
-            semantic_id = row.get("semantic_key") if row.get("identity_scope") == "semantic" else None
-            if self.source_kind == "spec" and index < len(declared) and isinstance(declared[index], dict):
-                source_id = declared[index].get("panel_id")
-                if source_id and (not locator_id or source_id == locator_id):
-                    resolved[index] = source_id
-                elif len(axes) == len(declared) == 1 and not locator_id:
-                    resolved[index] = "single-spec-panel"
-            elif isinstance(semantic_id, str) and semantic_id:
-                resolved[index] = semantic_id
-            elif isinstance(locator_id, str) and locator_id:
-                resolved[index] = locator_id
-            elif len(axes) == 1:
-                resolved[index] = "single-rendered-panel"
-        counts = {key: list(resolved.values()).count(key) for key in resolved.values()}
-        return {index: key for index, key in resolved.items() if counts[key] == 1}
 
     def _build(self, manifest, saved):
         rows = manifest.get("objects", [])
@@ -164,7 +141,7 @@ class Inventory:
                             "transparent": row.get("transparent", False)}]
         root = self._add(("figure",), "figure", "整张图", rows=figure_rows)
         root.hits.clear()
-        panel_ids = self._panel_ids(axes)
+        panel_ids = verified_panels(axes, self.declarative)
         panel_keys = {index: ("verified", panel_ids[index]) if index in panel_ids else ("unverified", index)
                       for index in axes}
         panels = {}
@@ -191,12 +168,9 @@ class Inventory:
             if panel is None and locator.get("scope") != "figure":
                 continue
             if role == "series":
-                source_key = (row.get("semantic_key") if row.get("identity_scope") == "semantic" else None)
-                if not source_key and self.source_kind == "spec":
-                    stored_panel = locator.get("panel_id")
-                    if not stored_panel or stored_panel == panel_ids.get(index):
-                        source_key = locator.get("series_id")
-                key = (panel_keys.get(index), "series", source_key or row["gid"])
+                source_key = self.declarative.series_key(index, row) if self.declarative is not None else (
+                    row.get("semantic_key") if row.get("identity_scope") == "semantic" else None)
+                key = (panel_keys.get(index), "series", source_key if source_key else ("read-only", row["gid"]))
                 label = row.get("label") or _ARTISTS.get(row.get("artist"), "未命名系列")
             elif role in _ALLOWED:
                 key = (panel_keys.get(index), role, row["gid"])
@@ -303,7 +277,9 @@ class Inventory:
         if not expected.keys() <= values.keys():
             raise invalid("group_edit_unconfirmed", "渲染器未确认全部组样式，修改未保存。", 409)
         for gid, prop in expected:
-            if gid not in actual or _identity(expected[gid, prop]) != _identity(actual[gid]):
+            before, after = expected[gid, prop], actual.get(gid)
+            if after is None or (_identity(before) != _identity(after) and not (
+                    self.declarative and self.declarative.confirmation(before, after))):
                 raise invalid("group_members_changed", "重绘时所选组成员发生变化。", 409)
             if prop not in (set(actual[gid].get("editable", [])) | workbench_properties(actual[gid])):
                 raise invalid("group_property_unavailable", "重绘未确认所选组的样式。", 409)

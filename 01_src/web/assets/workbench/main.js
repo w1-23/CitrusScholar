@@ -1,10 +1,11 @@
 import { byId, element } from './dom.js';
-import { renderInspector, renderTree } from './controls.js?v=2';
-import { CanvasView, imageAsset } from './canvas.js?v=2';
-import { initializeAssets, initializeOpenDialog } from './library.js?v=2';
+import { renderInspector, renderTree } from './controls.js?v=3';
+import { CanvasView, imageAsset } from './canvas.js?v=3';
+import { initializeLibrary } from './library.js?v=3';
+import { categoryValues, displayGroups } from './categories.js?v=1';
 
 const api = '/api/v2/figure-workbench';
-const state = { project: null, selected: null, expanded: new Set(), snapshots: [[]], cursor: 0,
+const state = { project: null, groups: [], selected: null, expanded: new Set(), snapshots: [[]], cursor: 0,
   epoch: 0, draft: 0, timer: null, flight: null, saving: false, previewOk: true };
 const starting = new URLSearchParams(location.search);
 const path = (id) => `${api}/projects/${encodeURIComponent(id)}`;
@@ -18,7 +19,7 @@ const status = (message, error = false) => {
 };
 const canvas = new CanvasView((id) => selectGroup(id, false, true), (id, x, y) => {
   if (state.saving) return;
-  const group = state.project?.groups.find((entry) => entry.id === id);
+  const group = state.groups.find((entry) => entry.id === id);
   if (!group?.properties.includes('offset_px')) return;
   const previous = effective(group).offset_px || [0, 0];
   const bound = (n) => Math.max(-200, Math.min(200, Math.round(n * 10) / 10));
@@ -42,6 +43,7 @@ function post(data) {
 function editUrl(project, operation) { return `${path(project.figure_id)}/${operation}`; }
 
 function effective(group) {
+  if (group.kind === 'category') return categoryValues(group, effective);
   const values = { ...group.values };
   for (const entry of commands()) if (entry.group_id === group.id) values[entry.property] = entry.value;
   return values;
@@ -59,23 +61,27 @@ function openDrawer(side, open) {
 }
 
 function selectGroup(id, focus, reveal) {
-  const group = state.project?.groups.find((entry) => entry.id === id);
+  const group = state.groups.find((entry) => entry.id === id);
   if (!group) return;
+  const changedGroup = state.selected !== id;
   state.selected = id;
   let ancestor = group.parent;
   while (ancestor) {
     state.expanded.add(ancestor);
-    ancestor = state.project.groups.find((entry) => entry.id === ancestor)?.parent;
+    ancestor = state.groups.find((entry) => entry.id === ancestor)?.parent;
   }
-  if (reveal && !focus) openDrawer('right', true);
-  renderGroups(focus);
+  const showMobileProperties = reveal && matchMedia('(max-width: 920px)').matches;
+  if (showMobileProperties) openDrawer('right', true);
+  renderGroups(focus && !showMobileProperties);
   renderProperties();
+  if (changedGroup || showMobileProperties) byId('inspector').scrollTop = 0;
+  if (showMobileProperties) byId('inspectorTitle').focus({ preventScroll: true });
   canvas.focus(id);
 }
 
 function renderGroups(focus = false) {
   const tree = byId('groupTree');
-  const groups = state.project?.groups || [];
+  const groups = state.groups;
   tree.hidden = !groups.length;
   byId('groupsEmpty').hidden = !!groups.length;
   const current = renderTree(tree, groups, state.selected, state.expanded, selectGroup, effective);
@@ -83,7 +89,7 @@ function renderGroups(focus = false) {
 }
 
 function renderProperties() {
-  const group = state.project?.groups.find((entry) => entry.id === state.selected);
+  const group = state.groups.find((entry) => entry.id === state.selected);
   renderInspector(byId('propertyPanel'), state.project, group, group ? effective(group) : {}, applyChanges);
   const form = byId('propertyPanel').querySelector('form');
   if (form && state.saving) for (const field of form.elements) field.disabled = true;
@@ -164,8 +170,16 @@ async function loadAsset(project) {
   let error;
   for (const format of ['svg', 'png']) {
     if (project.format_capabilities[format]?.state !== 'ready') continue;
-    try { return await imageAsset(await request(revisionUrl(project, `/preview/${format}`)), format); }
-    catch (failure) { error = failure; }
+    try {
+      const response = await request(revisionUrl(project, `/preview/${format}`));
+      const mime = format === 'svg' ? 'image/svg+xml' : 'image/png';
+      if (response.headers.get('X-Figure-Revision') !== String(project.render_version) ||
+          !/^[a-f0-9]{64}$/.test(response.headers.get('X-Figure-SHA256') || '') ||
+          response.headers.get('Content-Type')?.split(';')[0].trim() !== mime) {
+        throw new Error('无法确认预览所对应的图件版本。');
+      }
+      return await imageAsset(response, format);
+    } catch (failure) { error = failure; }
   }
   throw error || new Error(project.format_capabilities.svg?.reason || project.read_only_reason || '图件没有可读取的 SVG 或 PNG 预览。');
 }
@@ -180,12 +194,14 @@ function activate(project, asset, { preserveFocus = false } = {}) {
   state.draft += 1;
   state.epoch += 1;
   state.project = project;
+  state.groups = displayGroups(project.groups);
+  syncLocation(project);
   state.previewOk = true;
   state.snapshots = [[]];
   state.cursor = 0;
-  if (!preserveFocus) state.expanded = new Set(project.groups.map((group) => group.id));
-  if (!preserveFocus || !project.groups.some((group) => group.id === state.selected)) {
-    state.selected = project.groups[0]?.id || null;
+  if (!preserveFocus) state.expanded = new Set();
+  if (!preserveFocus || !state.groups.some((group) => group.id === state.selected)) {
+    state.selected = state.groups[0]?.id || null;
   }
   canvas.show(asset, project, !preserveFocus);
   canvas.focus(state.selected);
@@ -205,6 +221,7 @@ function applyChanges(entries) {
     if (JSON.stringify(entry.value) === JSON.stringify(initial)) before.delete(key);
     else before.set(key, entry);
   }
+  if (before.size > 200) { status('最多可以提交 200 项修改。', true); return; }
   state.snapshots = [...state.snapshots.slice(0, state.cursor + 1), [...before.values()]];
   state.cursor += 1;
   updateDraft();
@@ -278,19 +295,22 @@ async function save() {
       // The commit succeeded. Treat the confirmed revision as current even
       // when its preview was concurrently superseded or could not be loaded.
       state.project = saved;
-          state.snapshots = [[]];
+      state.groups = displayGroups(saved.groups);
+      syncLocation(saved);
+      state.snapshots = [[]];
       state.cursor = 0;
       state.previewOk = false;
       byId('frame').hidden = true;
       byId('canvasEmpty').hidden = false;
-      byId('canvasEmpty').textContent = '请重新打开查看保存的图件。';
+      byId('canvasEmpty').querySelector('span').textContent = '请重新打开查看保存的图件。';
       renderGroups();
       renderExports();
       status(`已保存版本 ${saved.render_version}。${error.message}`, true);
+      library.refresh();
       return;
     }
     status(`已保存版本 ${saved.render_version}。`);
-    refreshAssets();
+    library.refresh();
   } catch (error) {
     status(`保存未确认，草稿仍在本页。${error.message}`, true);
   } finally {
@@ -329,13 +349,40 @@ window.addEventListener('beforeunload', (event) => {
 });
 renderToolbar();
 renderExports();
-const requested = starting.get('figure_id') || starting.get('project');
-const openLibrary = initializeOpenDialog({ request, api, revisionUrl, loadAsset, activate, changed, requested,
+function syncLocation(project) {
+  const url = new URL(location.href);
+  url.searchParams.delete('figure_id');
+  url.searchParams.set('project', project.figure_id);
+  url.searchParams.set('revision', project.render_version);
+  history.replaceState(history.state, '', url);
+}
+
+const library = initializeLibrary({ request, api, revisionUrl, loadAsset, activate, changed,
   busy: () => state.saving,
+  switchToken: () => `${state.epoch}:${state.draft}`,
+  setStatus: status,
   onOpened: () => {
-    if (matchMedia('(max-width: 920px)').matches) openDrawer('left', true);
-    byId('groupTree').querySelector('[tabindex="0"]')?.focus();
+    if (matchMedia('(max-width: 920px)').matches) openDrawer('left', false);
+    byId('canvas').focus({ preventScroll: true });
   },
 });
-const refreshAssets = initializeAssets({ request, api, revisionUrl, choose: openLibrary });
-if (requested) openLibrary();
+const requested = starting.get('figure_id') ?? starting.get('project');
+if (requested !== null) {
+  const revision = starting.get('revision');
+  library.open({ figure_id: requested, render_version: revision === null ? undefined : /^\d+$/.test(revision) ? Number(revision) : NaN });
+}
+
+const theme = window.CitrusTheme;
+if (theme) {
+  const choice = byId('themeChoice');
+  for (const name of theme.names) {
+    const option = element('option', theme.labels[name]);
+    option.value = name;
+    choice.append(option);
+  }
+  const syncTheme = () => { choice.value = theme.current(); };
+  choice.addEventListener('change', () => theme.set(choice.value));
+  window.addEventListener('citrus:themechange', syncTheme);
+  syncTheme();
+  choice.hidden = false;
+}

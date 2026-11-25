@@ -229,6 +229,31 @@ def _data_audit_payload(review: dict) -> dict:
             'interpretation': '错误表示违反显式数据规则。探索性发现属于人工复核线索。原始文件未修改。'}
 
 
+def _require_normal_audit_xlsx(content: bytes) -> None:
+    """Check the actual OOXML package before using the normal XLSX contract."""
+    from io import BytesIO
+    from xml.etree import ElementTree
+    from zipfile import ZipFile
+
+    types_ns = "{http://schemas.openxmlformats.org/package/2006/content-types}"
+    normal = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+    with ZipFile(BytesIO(content)) as archive:
+        manifest = archive.getinfo("[Content_Types].xml")
+        if manifest.file_size > 2 * 1024 * 1024:
+            raise ValueError("XLSX 包的内容类型清单过大")
+        root = ElementTree.fromstring(archive.read(manifest))
+        workbook_types = [entry.get("ContentType") for entry in root.findall(types_ns + "Override")
+                          if entry.get("PartName") == "/xl/workbook.xml"]
+        macro_parts = ("vbaproject", "macroenabled", "macrosheet")
+        names = archive.namelist()
+        if (root.tag != types_ns + "Types" or workbook_types != [normal]
+                or "xl/workbook.xml" not in names or len(set(names)) != len(names)
+                or any(marker in entry.get("ContentType", "").lower()
+                       for entry in root for marker in macro_parts)
+                or any(marker in name.lower() for name in names for marker in macro_parts)):
+            raise ValueError("审查工作簿不是普通 XLSX，未发布文件")
+
+
 def publish_audit_workbooks(report, *, load_source, title='', review_id=''):
     """Publish one annotated copy per reviewed source using the recorded findings."""
     from collections import defaultdict
@@ -251,10 +276,13 @@ def publish_audit_workbooks(report, *, load_source, title='', review_id=''):
             raise_if_cancelled("data_audit_workbook")
             try:
                 name, digest = saved["source_name"], saved["source_sha256"]
+                if Path(name).suffix.lower() == ".xlsm":
+                    raise ValueError("暂不发布 XLSM 审查工作簿，可使用文字审查或 HTML/JSON")
                 snapshot = AuditSnapshot(load_source(saved), name, dumps(saved["report"]), digest)
                 if snapshot.report_sha256 != saved["report_sha256"]:
                     raise ValueError("审查快照摘要不符")
                 content, stats = export_workbook(snapshot, presentation="annotated")
+                _require_normal_audit_xlsx(content)
                 content = normalize_ooxml_bytes(content)
                 filename = tools._short_stem(name) + "_审查标注.xlsx"
                 publication_key = sha256(dumps([saved["source_file_id"], digest, snapshot.report_sha256,
@@ -263,6 +291,8 @@ def publish_audit_workbooks(report, *, load_source, title='', review_id=''):
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     source_file_id=saved["source_file_id"], source_sha256=digest,
                     logical_task_id="audit_workbook:" + publication_key)
+                if not url:
+                    raise ValueError("审查交付未获得发布回执")
                 receipts[(saved["file_index"], digest)] = {"url": url, "filename": filename,
                     "sha256": sha256(content).hexdigest(), "size_bytes": len(content),
                     "source_file_id": saved["source_file_id"], "source_sha256": digest,

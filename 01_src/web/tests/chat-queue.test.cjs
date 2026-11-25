@@ -558,3 +558,64 @@ test('history groups the latest continuation under its original user turn', () =
   assert.equal(merged[0].answer.content, 'Final answer');
   assert.equal(merged[0].jobId, 'grandchild');
 });
+
+const childEvidence = {kind: 'local', reader_id: 'cite:' + 'a'.repeat(64), title: '仅追问产生的证据'};
+const childFile = {file_id: 'a'.repeat(32), artifact_id: 'child-artifact', kind: 'svg', filename: 'Child output.svg',
+  origin: 'generated', source_session_id: 'session', turn_request_id: 'continue:child-1'};
+
+test('live continuation uses root display and exact child read scopes', async () => {
+  const b = browser();
+  const reads = [];
+  b.context.CitrusCorpusReader = {openCitation: (source, scope) => reads.push({source, ...scope})};
+  b.userInput.value = '追问前的原始问题';
+  await b.context.sendMsg();
+  await flush();
+  const root = JSON.parse(b.last(isAdmission).opts.body).client_request_id;
+  b.respond(isAdmission, turnEntry({client_request_id: root, active_child_job_id: 'child-1',
+    state: 'running', dispatch_at: 'started'}), 202);
+  await flush();
+  b.respond('/jobs/child-1/events', {job_id: 'child-1', protocol: 'citrus-task/1', next_cursor: 3, has_more: false, events: [
+    {seq: 1, event: 'job', data: {job_id: 'child-1', status: 'running'}},
+    {seq: 2, event: 'citations', data: {display: 'bubble_only', bubbles: [childEvidence]}},
+    {seq: 3, event: 'done', data: {answer: '追问回答', artifact_ids: [childFile.artifact_id],
+      turn_envelope: {display_status: 'completed'}}},
+  ]});
+  await flush();
+  const request = b.last('/turn-artifacts?');
+  assert.ok(request);
+  const params = new URL(request.url, 'https://chat.example.test').searchParams;
+  assert.equal(params.get('request_id'), root);
+  assert.equal(params.get('producer_job_id'), 'child-1');
+  b.respond('/turn-artifacts?', {request_id: root, producer_job_id: 'child-1', producer_request_id: childFile.turn_request_id,
+    files: [childFile, {...childFile, file_id: 'b'.repeat(32), turn_request_id: 'unrelated'}]});
+  await flush();
+  const bot = b.chatContainer.querySelector('.bot');
+  assert.equal(bot.querySelector('.content').dataset.requestId, root);
+  assert.equal(bot.querySelectorAll('.turn-file-card').length, 1);
+  assert.equal(bot.querySelector('.turn-file-card').dataset.fileId, childFile.file_id);
+  bot.querySelector('.turn-citation-bubble').listeners.click[0]();
+  assert.deepEqual(reads, [{source: childEvidence, sessionId: 'session', requestId: root, producerJobId: 'child-1'}]);
+});
+
+test('history reload preserves child citation and files under one original question', async () => {
+  const b = browser();
+  const reads = [];
+  b.context.CitrusCorpusReader = {openCitation: (source, scope) => reads.push({source, ...scope})};
+  const restore = b.context.restoreSessionHistory();
+  await flush();
+  b.respond('/messages?', {turns: [
+    {turn_request_id: 'saved-root', job_id: 'root-1', user: {content: '原始问题'}, files: []},
+    {turn_request_id: childFile.turn_request_id, job_id: 'child-1', parent_job_id: 'root-1',
+      answer: {content: '追问回答', citation_bubbles: [childEvidence]}, files: [childFile], display_status: 'completed'},
+  ], messages: [], has_more: false});
+  await flush();
+  b.respond('/turn-queue?limit=100', {turns: [turnEntry({client_request_id: 'saved-root', job_id: 'root-1',
+    active_child_job_id: 'child-1', state: 'terminal', dispatch_at: 'started'})]});
+  await restore;
+  assert.equal(b.chatContainer.querySelectorAll('.bot').length, 1);
+  const bot = b.chatContainer.querySelector('.bot');
+  assert.equal(bot.querySelector('.content').dataset.requestId, 'saved-root');
+  assert.equal(bot.querySelector('.turn-file-card').dataset.fileId, childFile.file_id);
+  bot.querySelector('.turn-citation-bubble').listeners.click[0]();
+  assert.deepEqual(reads, [{source: childEvidence, sessionId: 'session', requestId: 'saved-root', producerJobId: 'child-1'}]);
+});

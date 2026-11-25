@@ -594,18 +594,19 @@ def _discard_artifact(path: Path, session_id: str, artifact_id: str) -> None:
 
 
 def _artifact_row_by_name(db, session_id: str, filename: str, producer_tool: str = ""):
-    """Latest artifact of this name; a producer filter avoids picking another tool's file."""
+    """Latest publicly available artifact of the requested name and producer."""
+    from src.research.artifacts import figure_artifact_visible
+
     try:
         with sqlite3.connect(str(db)) as conn:
             conn.row_factory = sqlite3.Row
+            query = "SELECT * FROM artifacts WHERE session_id=? AND filename=?"
+            args = (session_id, filename)
             if producer_tool:
-                return conn.execute(
-                    "SELECT * FROM artifacts WHERE session_id=? AND filename=? AND producer_tool=? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (session_id, filename, producer_tool)).fetchone()
-            return conn.execute(
-                "SELECT * FROM artifacts WHERE session_id=? AND filename=? "
-                "ORDER BY created_at DESC LIMIT 1", (session_id, filename)).fetchone()
+                query += " AND producer_tool=?"
+                args += (producer_tool,)
+            return next((row for row in conn.execute(query + " ORDER BY created_at DESC", args)
+                         if figure_artifact_visible(row)), None)
     except sqlite3.Error:
         return None
 
@@ -781,13 +782,21 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
     audit_workbook = re.fullmatch(r"audit_workbook:[a-f0-9]{64}", logical_task_id or "") is not None
     if audit_workbook:
         key = hashlib.sha256(f"{owner_user_id}:{session_id}:{logical_task_id}:{output_sha256}".encode()).hexdigest()
+    nature_execution = tool_name == "run_nature_plot" and re.fullmatch(r"[a-f0-9]{32}", logical_task_id or "")
+    if nature_execution:
+        legacy_key = key
+        key = hashlib.sha256(f"{owner_user_id}:{logical_task_id}:{key}".encode()).hexdigest()
+        lookup_params = (session_id, key, legacy_key, owner_user_id, logical_task_id)
+        lookup = ("SELECT * FROM artifacts WHERE session_id=? AND dedupe_key IN (?,?) "
+                  "AND owner_user_id=? AND logical_task_id=? ORDER BY created_at DESC LIMIT 1")
+    else:
+        lookup_params = (session_id, key)
+        lookup = "SELECT * FROM artifacts WHERE session_id=? AND dedupe_key=? ORDER BY created_at DESC LIMIT 1"
     existing: sqlite3.Row | None = None
     try:
         with closing(sqlite3.connect(str(db))) as conn, conn:
             conn.row_factory = sqlite3.Row
-            existing = conn.execute(
-                "SELECT * FROM artifacts WHERE session_id=? AND dedupe_key=? "
-                "ORDER BY created_at DESC LIMIT 1", (session_id, key)).fetchone()
+            existing = conn.execute(lookup, lookup_params).fetchone()
     except sqlite3.Error:
         logger.warning("Artifact exact-dedupe lookup failed", exc_info=True)
 
@@ -842,9 +851,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
             # Two identical requests can both pass the pre-write lookup. The
             # write transaction performs a second lookup so only one row and
             # one version are published; the loser's temporary file is removed.
-            published_existing = conn.execute(
-                "SELECT * FROM artifacts WHERE session_id=? AND dedupe_key=? "
-                "ORDER BY created_at DESC LIMIT 1", (session_id, key)).fetchone()
+            published_existing = conn.execute(lookup, lookup_params).fetchone()
             if published_existing is not None:
                 try:
                     published_path = Path(str(published_existing["path"] or "")).resolve()
@@ -973,7 +980,9 @@ def resolve_artifact(session_id: str, artifact_id: str) -> dict[str, Any] | None
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM artifacts WHERE artifact_id=? AND session_id=?",
                            (artifact_id, session_id)).fetchone()
-    if not row:
+    from src.research.artifacts import figure_artifact_visible
+
+    if not row or not figure_artifact_visible(row):
         return None
     last_active = _session_last_activity(session_id) or float(row["created_at"])
     if now - last_active > _ARTIFACT_TTL_SEC:
@@ -1023,6 +1032,8 @@ def validate_artifact_links(
     root = (PROJECT_ROOT / "state" / "artifacts" / expected_session).resolve()
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
+    from src.research.artifacts import figure_artifact_visible
+
     pattern = re.compile(
         r"^/api/v2/session/([A-Za-z0-9_-]{8,128})/artifacts/([a-f0-9]{32})$")
     db = _db_path()
@@ -1064,7 +1075,7 @@ def validate_artifact_links(
                 row = conn.execute(
                     "SELECT * FROM artifacts WHERE artifact_id=? AND session_id=?",
                     (artifact_id, expected_session)).fetchone()
-                if row is None:
+                if row is None or not figure_artifact_visible(row):
                     base["reason_code"] = "not_registered"
                     results.append(base)
                     continue
@@ -1160,7 +1171,7 @@ def _expire_unreferenced_artifact(session_id: str, artifact_id: str,
     from src.session.files import unreferenced_artifact, remove_generated_entry
     from src.figures.store import migrate_resource_references
 
-    migrate_resource_references()
+    migrate_resource_references(legacy_export_artifact_id=artifact_id)
     removed = 0
     with unreferenced_artifact(artifact_id) as allowed:
         if not allowed:

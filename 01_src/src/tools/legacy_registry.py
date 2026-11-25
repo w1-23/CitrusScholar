@@ -83,7 +83,7 @@ _TOOL_DECLARATIONS = (
      ("local_corpus", "candidate_pool"), (), ""),
     (search_candidates, "rag", "candidate_pool", None,
      ("local_corpus", "candidate_pool"), (), ""),
-    (draw_svg, "analysis", "draw_svg", None, (), ("figure",), ""),
+    (draw_svg, "analysis", "draw_svg", "session_artifact", (), ("figure",), ""),
     (read_account_file, "files", "read_account_file", None, ("account_files",), (), ""),
     (read_tool_result, "files", "read_tool_result", None, ("session",), (), ""),
     (research_workspace, "research", "research_workspace", "session_artifact",

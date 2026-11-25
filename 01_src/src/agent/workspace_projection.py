@@ -89,6 +89,8 @@ def _installed_resources(release, scope):
         mount, _, remainder = name.partition("/")
         skill_id, _, resource = remainder.partition("/")
         key = "/" + name
+        if mount == "skills" and skill_id == "nature-shared" and resource != "SKILL.md":
+            skill_id = "nature-figure"
         if mount != "skills" or skill_id not in installed or not resource or not within(key, scope):
             continue
         try:

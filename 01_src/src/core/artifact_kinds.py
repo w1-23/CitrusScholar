@@ -14,5 +14,14 @@ RENDERER_OUTPUT_KINDS = {
     "render_research_report": frozenset({"report_html"}),
     "figure_workspace": frozenset({"figure", "figure_package"}),
     "run_nature_plot": frozenset({"figure", "figure_package"}),
-    "collect_external_skill": frozenset({"annotation_table"}),
+    "collect_external_skill": frozenset({"annotation_table"}),  # Historical immutable renderer ID.
+    "fusion_annotated_workbook": frozenset({"annotation_table", "table_file"}),
+    "fusion_report_table": frozenset({"table_file"}),
+    "fusion_report_html": frozenset({"report_html"}),
+    "fusion_report_json": frozenset({"report_json"}),
+    "fusion_report_docx": frozenset({"report_docx"}),
+    "fusion_report_pdf": frozenset({"report_html"}),
+    "fusion_reference_table": frozenset({"verification_sheet", "bibliography", "table_file"}),
+    "fusion_reference_json": frozenset({"bibliography", "report_json"}),
+    "fusion_reference_workbook": frozenset({"verification_sheet", "bibliography", "table_file"}),
 }

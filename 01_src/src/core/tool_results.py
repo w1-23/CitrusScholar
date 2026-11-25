@@ -78,6 +78,10 @@ def ensure_schema() -> None:
             conn.execute("ALTER TABLE tool_results ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
         if "evidence_ref" not in columns:
             conn.execute("ALTER TABLE tool_results ADD COLUMN evidence_ref TEXT NOT NULL DEFAULT ''")
+        if "provider_call_id" not in columns:
+            conn.execute("ALTER TABLE tool_results ADD COLUMN provider_call_id TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tr_provider_scope "
+                     "ON tool_results(session_id, request_id, provider_call_id)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tr_session "
             "ON tool_results(session_id, created_at)")
@@ -151,7 +155,30 @@ def clamp_for_model(text: str, tool_name: str = "",
     return raw[:head_len] + note + ident_block + tail, True
 
 
+_SCOPED_RECEIPT = re.compile(r"tr_[a-f0-9]{64}\Z", re.ASCII)
+
+
+def execution_receipt_key(identity, provider_call_id: str) -> str:
+    """Durable result key; provider call IDs remain unchanged in messages."""
+    body = ["citrus-tool-receipt-v1", identity.owner_user_id, identity.session_id,
+            identity.user_turn_id, identity.run_id, provider_call_id]
+    return "tr_" + hashlib.sha256(json.dumps(body, ensure_ascii=False,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def observation_receipt_key(message) -> str:
+    reference = message.additional_kwargs.get("result_reference") or {}
+    if not isinstance(reference, dict):
+        return message.tool_call_id
+    receipt_id = reference.get("tool_call_id")
+    if (isinstance(receipt_id, str) and _SCOPED_RECEIPT.fullmatch(receipt_id)
+            and reference.get("provider_call_id") == message.tool_call_id):
+        return receipt_id
+    return message.tool_call_id
+
+
 def record(*, tool_call_id: str, session_id: str = "", request_id: str = "",
+           provider_call_id: str = "",
            tool_name: str = "", status: str = "", args: Any = None,
            result_text: str = "", error_text: str = "",
            elapsed_ms: int = 0, summary: str = "", evidence_ref: dict | None = None) -> bool:
@@ -169,7 +196,7 @@ def record(*, tool_call_id: str, session_id: str = "", request_id: str = "",
         digest = hashlib.sha256(stored.encode("utf-8")).hexdigest()
         args_json = json.dumps(args, ensure_ascii=False, default=str, sort_keys=True)
         identity = {
-            "session_id": session_id, "request_id": request_id,
+            "session_id": session_id, "request_id": request_id, "provider_call_id": provider_call_id,
             "tool_name": tool_name, "status": status, "args_json": args_json,
             "result_text": stored, "result_chars": len(stored),
             "truncated": 0, "full_sha256": digest, "error_text": str(error_text or ""),
@@ -190,11 +217,11 @@ def record(*, tool_call_id: str, session_id: str = "", request_id: str = "",
                 "INSERT INTO tool_results "
                 "(tool_call_id, session_id, request_id, tool_name, status, "
                 " args_json, result_text, result_chars, truncated, full_sha256, "
-                " error_text, elapsed_ms, summary, created_at, evidence_ref) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " error_text, elapsed_ms, summary, created_at, evidence_ref, provider_call_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (cid, session_id, request_id, tool_name, status, args_json,
                  stored, len(stored), 0, digest, identity["error_text"],
-                 int(elapsed_ms or 0), str(summary or "")[:2_000], stamp, identity["evidence_ref"]))
+                 int(elapsed_ms or 0), str(summary or "")[:2_000], stamp, identity["evidence_ref"], provider_call_id))
             if session_id:
                 conn.execute(
                     "UPDATE tool_results SET retained=0, result_text=NULL, args_json=NULL, "
@@ -229,7 +256,8 @@ def record_with_reference(**kwargs: Any) -> dict | None:
     if not storage["complete"] or row["result_text"] != expected:
         return None
     return {"tool_call_id": row["tool_call_id"], "tool_name": row["tool_name"],
-            "request_id": row["request_id"], "full_sha256": storage["full_sha256"],
+            "request_id": row["request_id"], "provider_call_id": row.get("provider_call_id", ""),
+            "full_sha256": storage["full_sha256"],
             "original_chars": storage["original_chars"], "stored_chars": storage["stored_chars"],
             "storage": storage}
 
@@ -333,14 +361,27 @@ def fetch_for_current_request(tool_call_id: str, *, strict: bool = False) -> dic
     cid = str(tool_call_id or "").strip()
     if not cid:
         return None
+    return fetch_for_session(sid, cid, strict=strict)
+
+
+def fetch_for_session(session_id: str, key: str, *, request_id: str = "",
+                      strict: bool = False) -> dict | None:
+    """Resolve an exact receipt or an unambiguous legacy provider ID."""
+    if not session_id or not key:
+        return None
     try:
         ensure_schema()
         with _connect() as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT * FROM tool_results WHERE retained=1 AND tool_call_id=? AND session_id=?",
-                (cid, sid)).fetchone()
-        return dict(row) if row else None
+            scope = "session_id=? AND (tool_call_id=? OR provider_call_id=?)"
+            params = [session_id, key, key]
+            if request_id:
+                scope += " AND request_id=?"
+                params.append(request_id)
+            # Include tombstones in this ambiguity test. After rotation, do
+            # not resolve a bare provider ID to another round's result.
+            rows = conn.execute("SELECT * FROM tool_results WHERE " + scope + " LIMIT 2", params).fetchall()
+        return dict(rows[0]) if len(rows) == 1 and rows[0]["retained"] else None
     except sqlite3.Error as exc:
         if strict:
             raise

@@ -272,6 +272,7 @@ _SCHEMA = (
         clear_reason TEXT NOT NULL DEFAULT '',
         history_saved INTEGER,
         terminal_evidence TEXT NOT NULL DEFAULT '',
+        inputs_released INTEGER NOT NULL DEFAULT 0,
         updated_at REAL NOT NULL,
         PRIMARY KEY (owner_user_id, client_request_id),
         UNIQUE (owner_user_id, session_id, queue_seq)
@@ -298,6 +299,10 @@ def init_schema(conn) -> None:
     """
     for statement in _SCHEMA:
         conn.execute(statement)
+    if "inputs_released" not in {row[1] for row in conn.execute("PRAGMA table_info(chat_turn_queue)")}:
+        conn.execute("ALTER TABLE chat_turn_queue ADD COLUMN inputs_released INTEGER NOT NULL DEFAULT 0")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_turn_input_cleanup "
+                 "ON chat_turn_queue(state, inputs_released)")
 
 
 @contextmanager
@@ -314,6 +319,32 @@ def ensure_schema() -> None:
     """Open one short transaction so admission can rely on the queue tables."""
     with _transaction():
         pass
+
+
+def pending_input_cleanup(*, after=0, limit=64):
+    """Terminal rows serve as a durable retry intent for the separate File DB."""
+    with _transaction() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT rowid AS cleanup_cursor,owner_user_id,session_id,client_request_id,generation "
+            "FROM chat_turn_queue WHERE state=? AND inputs_released=0 AND rowid>? ORDER BY rowid LIMIT ?",
+            (TERMINAL, after, limit))]
+
+
+def can_release_inputs(*, owner_user_id, session_id, client_request_id, generation):
+    with _transaction() as conn:
+        row = _scoped(conn, owner_user_id, session_id, client_request_id)
+        if row is None or row['state'] != TERMINAL or row['generation'] != generation or row['inputs_released']:
+            return False
+        job = _execution_job(conn, row)
+        job_id = job["job_id"]
+        return job["current_step"] != "reconciled" or _ledger_settled(conn, job_id)
+
+
+def complete_input_cleanup(*, owner_user_id, session_id, client_request_id, generation):
+    with _transaction() as conn:
+        conn.execute("UPDATE chat_turn_queue SET inputs_released=1 WHERE owner_user_id=? AND session_id=? "
+                     "AND client_request_id=? AND state=? AND generation=?",
+                     (owner_user_id, session_id, client_request_id, TERMINAL, generation))
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +667,7 @@ def find_turn_by_job(*, owner_user_id: int, session_id: str,
 
 def list_turns(*, owner_user_id: int, session_id: str, limit: int = 50,
                include_terminal: bool = True, include_active: bool = True,
-               after_seq: int | None = None) -> list[dict]:
+               after_seq: int | None = None, visible_only: bool = False) -> list[dict]:
     """Authoritative session view; active turns can never be hidden by a limit.
 
     Every non-terminal turn is always returned when ``include_active`` is true,
@@ -668,18 +699,20 @@ def list_turns(*, owner_user_id: int, session_id: str, limit: int = 50,
                     (owner_user_id, session_id, *_NONTERMINAL_SQL_STATES))
             )
         if include_terminal and limit:
+            visible = (" AND EXISTS (SELECT 1 FROM task_jobs j WHERE j.job_id=root_job_id "
+                       "AND j.owner_user_id=chat_turn_queue.owner_user_id "
+                       "AND j.session_id=chat_turn_queue.session_id AND j.history_hidden=0)"
+                       if visible_only else "")
             if after_seq is None:
                 rows = list(conn.execute(
                     "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
-                    "AND session_id=? AND state=? ORDER BY queue_seq DESC "
-                    "LIMIT ?",
+                    "AND session_id=? AND state=?" + visible + " ORDER BY queue_seq DESC LIMIT ?",
                     (owner_user_id, session_id, TERMINAL, limit)))
                 rows.reverse()
             else:
                 rows = list(conn.execute(
                     "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
-                    "AND session_id=? AND state=? AND queue_seq>? "
-                    "ORDER BY queue_seq ASC LIMIT ?",
+                    "AND session_id=? AND state=? AND queue_seq>?" + visible + " ORDER BY queue_seq ASC LIMIT ?",
                     (owner_user_id, session_id, TERMINAL, after_seq, limit)))
             turns.extend(_with_position(conn, _decode(row)) for row in rows)
         turns.sort(key=lambda turn: turn["queue_seq"])
@@ -1174,18 +1207,148 @@ def mark_reconcile_required(*, owner_user_id: int, session_id: str,
 
 
 
-def resolve_reconcile(*, owner_user_id: int, session_id: str,
-                      client_request_id: str,
-                      generation: int | None = None,
-                      reason: str = "turn_reconciled_by_user") -> dict:
-    """Settle a frozen turn once its owner acknowledges an unknown outcome.
+def _execution_job(conn, row):
+    root = _require_root_job(conn, row)
+    child = row["active_child_job_id"]
+    if not child:
+        return root
+    job = conn.execute("SELECT c.* FROM task_jobs c JOIN task_questions q ON q.id=c.question_id "
+        "AND q.child_job_id=c.job_id AND q.job_id=c.parent_job_id AND q.owner_user_id=c.owner_user_id "
+        "AND q.session_id=c.session_id WHERE c.job_id=? AND c.owner_user_id=? AND c.session_id=? "
+        "AND q.status='answered'", (child, row["owner_user_id"], row["session_id"])).fetchone()
+    ancestry = conn.execute("WITH RECURSIVE links(job_id) AS (SELECT ? UNION "
+        "SELECT c.parent_job_id FROM links l JOIN task_jobs c ON c.job_id=l.job_id "
+        "JOIN task_questions q ON q.id=c.question_id AND q.job_id=c.parent_job_id AND q.child_job_id=c.job_id "
+        "AND q.owner_user_id=c.owner_user_id AND q.session_id=c.session_id "
+        "WHERE q.status='answered' AND c.owner_user_id=? AND c.session_id=?) "
+        "SELECT 1 FROM links WHERE job_id=?", (child, row["owner_user_id"], row["session_id"], root["job_id"])).fetchone()
+    if job is None or ancestry is None:
+        raise TurnStateConflict("continuation_child_conflict", job_id=child)
+    return job
 
-    The turn is never replayed: it becomes terminal with ``history_saved=0``
-    and an explicit reason, so the session can admit its queued successors
-    again. Only a turn this queue froze (``reconcile_required``) can be
-    settled here; queued, claimed, running and terminal turns keep their own
-    transition paths.
-    """
+
+def _reopen_for_recovery(conn, job, *, account_epoch):
+    """Same transaction as explicit job/segment admission, including child runs."""
+    from src.core.task_events import TaskConflict
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='chat_turn_queue'").fetchone():
+        return False
+    row = conn.execute("SELECT * FROM chat_turn_queue WHERE owner_user_id=? AND session_id=? "
+        "AND (root_job_id=? OR active_child_job_id=?)",
+        (job["owner_user_id"], job["session_id"], job["job_id"], job["job_id"])).fetchone()
+    if row is None:
+        if _head(conn, job["owner_user_id"], job["session_id"]):
+            raise TaskConflict("recovery_session_active")
+        return False
+    head = _head(conn, row["owner_user_id"], row["session_id"])
+    if (row["state"] != RECONCILE_REQUIRED or row["account_epoch"] != account_epoch
+            or not row["dispatch_at"] or head is None or head["root_job_id"] != row["root_job_id"]
+            or _execution_job(conn, row)["job_id"] != job["job_id"]):
+        raise TaskConflict("recovery_queue_unavailable")
+    conn.execute("UPDATE chat_turn_queue SET state=?,generation=generation+1,clear_reason='',updated_at=? WHERE root_job_id=?",
+                 (RUNNING, time.time(), row["root_job_id"]))
+    return True
+
+
+def restore_parked_turn(*, owner_user_id, session_id, client_request_id, generation, job_id):
+    """Reopen a queue fence for a validated restart wait, never an ordinary run."""
+    with _transaction() as conn:
+        row = _scoped(conn, owner_user_id, session_id, client_request_id)
+        if (not row or row["state"] != RECONCILE_REQUIRED or row["generation"] != generation
+                or row["clear_reason"] not in {"turn_dispatch_interrupted", "turn_cleanup_unconfirmed"}
+                or _execution_job(conn, row)["job_id"] != job_id):
+            return
+        segment = conn.execute("SELECT phase,account_epoch FROM agent_execution_segments WHERE job_id=?",
+                               (job_id,)).fetchone()
+        head = _head(conn, owner_user_id, session_id)
+        if (segment and segment["phase"] in {"parked", "cancel_parked"}
+                and segment["account_epoch"] == row["account_epoch"] and head
+                and head["root_job_id"] == row["root_job_id"]):
+            conn.execute("UPDATE chat_turn_queue SET state=?,generation=generation+1,clear_reason='',updated_at=? "
+                         "WHERE root_job_id=?", (RUNNING, time.time(), row["root_job_id"]))
+
+
+def _freeze_unstarted_recovery(conn, job_id, *, reason="turn_dispatch_interrupted"):
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='chat_turn_queue'").fetchone():
+        conn.execute("UPDATE chat_turn_queue SET state=?,generation=generation+1,clear_reason=?,updated_at=? "
+                     "WHERE state=? AND (active_child_job_id=? OR (active_child_job_id='' AND root_job_id=?))",
+                     (RECONCILE_REQUIRED, reason, time.time(), RUNNING, job_id, job_id))
+
+
+def _ledger_settled(conn, job_id):
+    from src.core.task_events import TaskConflict
+    try:
+        jobs.require_settled_operations(conn, job_id)
+    except TaskConflict:
+        return False
+    return True
+
+
+def _segment_phase(conn, job_id):
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='agent_execution_segments'").fetchone():
+        row = conn.execute("SELECT phase FROM agent_execution_segments WHERE job_id=?", (job_id,)).fetchone()
+        if row:
+            return row["phase"]
+    return ""
+
+
+def _settle_durable(conn, row, job):
+    terminal = jobs.durable_terminal(conn, job)
+    phase = _segment_phase(conn, job["job_id"])
+    if not terminal or job["status"] not in jobs.TERMINAL_STATUS or phase not in {"", "terminal"}:
+        return False
+    if not _ledger_settled(conn, job["job_id"]):
+        return False
+    snapshot_only = row["state"] != SETTLING
+    if not snapshot_only:
+        evidence = _decode_json(row["terminal_evidence"], {})
+        if (evidence.get("job_id") != job["job_id"] or evidence.get("job_status") != job["status"]
+                or row["history_saved"] != int(terminal["history_saved"])):
+            return False
+    if job["status"] == "awaiting_input" and snapshot_only:
+        if not conn.execute("SELECT 1 FROM task_questions WHERE job_id=? AND owner_user_id=? AND session_id=?",
+                            (job["job_id"], row["owner_user_id"], row["session_id"])).fetchone():
+            return False
+        if row["state"] != AWAITING_INPUT:
+            conn.execute("UPDATE chat_turn_queue SET state=?, generation=generation+1, updated_at=? WHERE root_job_id=?",
+                         (AWAITING_INPUT, time.time(), row["root_job_id"]))
+        return True
+    reason = row["clear_reason"] if not snapshot_only else (
+        "" if terminal["history_saved"] else str(terminal.get("stop_reason") or "history_not_saved"))
+    _finalize_reconciled(conn, row, job, history_saved=terminal["history_saved"], reason=reason)
+    return True
+
+
+def _finalize_reconciled(conn, row, job, *, history_saved, reason):
+    now = time.time()
+    conn.execute("UPDATE chat_turn_queue SET state=?,generation=generation+1,history_saved=?,clear_reason=?,"
+                 "finished_at=?,updated_at=?,terminal_evidence=? WHERE root_job_id=? AND generation=?",
+                 (TERMINAL, int(history_saved), reason, now, now, _encode_evidence(
+                     {"job_id": job["job_id"], "job_status": job["status"]}), row["root_job_id"], row["generation"]))
+
+
+def settle_durable(*, owner_user_id, session_id, client_request_id, generation, job_id):
+    """Use the authenticated active job and publish queue settlement atomically."""
+    with _transaction() as conn:
+        row = _scoped(conn, owner_user_id, session_id, client_request_id)
+        if not row or row["state"] not in {RUNNING, AWAITING_INPUT, SETTLING, RECONCILE_REQUIRED}:
+            return None
+        if row["generation"] != generation:
+            return None
+        job = _execution_job(conn, row)
+        if job["job_id"] != job_id or not _settle_durable(conn, row, job):
+            return None
+        view = _reread(conn, owner_user_id, session_id, client_request_id)
+    if view["state"] == TERMINAL:
+        _write_terminal_log(view)
+    return view
+
+
+def resolve_reconcile(*, owner_user_id: int, session_id: str,
+                      client_request_id: str, generation: int | None = None,
+                      reason: str = "turn_reconciled_by_user", worker_terminal_confirmed=False) -> dict:
+    """Close a frozen execution and its queue fence without replaying any effects."""
+    from src.core import task_events
+    from src.core.turn_envelope import build_turn_envelope
     _validate_identity(owner_user_id, session_id)
     _validate_client_request_id(client_request_id)
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 64:
@@ -1194,37 +1357,47 @@ def resolve_reconcile(*, owner_user_id: int, session_id: str,
         row = _scoped(conn, owner_user_id, session_id, client_request_id)
         if row is None:
             raise TurnNotFound("turn_not_found")
-        if row["state"] == TERMINAL:
-            view = _with_position(conn, _decode(row))
-        else:
+        if row["state"] != TERMINAL:
             if row["state"] != RECONCILE_REQUIRED:
                 raise TurnStateConflict(row["state"], job_id=row["root_job_id"])
-            expected = row["generation"] if generation is None else generation
-            _check_generation(row, expected)
-            now = time.time()
-            cursor = conn.execute(
-                "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
-                "history_saved=0, clear_reason=?, finished_at=?, updated_at=? "
-                "WHERE owner_user_id=? AND session_id=? AND client_request_id=? "
-                "AND state=? AND generation=?",
-                (TERMINAL, reason.strip(), now, now, owner_user_id, session_id,
-                 client_request_id, RECONCILE_REQUIRED, expected),
-            )
-            if cursor.rowcount != 1:
-                raise TurnQueueNotReady("reconcile_lost",
-                                        job_id=row["root_job_id"])
-            job = _require_root_job(conn, row)
-            if job["status"] not in jobs.TERMINAL_STATUS:
+            _check_generation(row, row["generation"] if generation is None else generation)
+            job = _execution_job(conn, row)
+            job_id = job["job_id"]
+            phase = _segment_phase(conn, job_id)
+            parked_blocked = (phase in {"parked", "cancel_parked"} and worker_terminal_confirmed is True
+                              and job["error"] in {"code_checkpoint_reconciliation_required",
+                                                   "code_cancellation_reconciliation_required"})
+            if not parked_blocked and phase in {"parked", "cancel_parked", "restart_wait",
+                                                "parking", "resuming", "recovering"}:
+                raise TurnStateConflict("execution_wait_reconciliation_pending", job_id=job_id)
+            if conn.execute("SELECT 1 FROM task_operations WHERE job_id=? AND status='running' LIMIT 1",
+                            (job_id,)).fetchone():
+                raise TurnStateConflict("recovery_already_active", job_id=job_id)
+            if not _settle_durable(conn, row, job):
+                terminal = jobs.durable_terminal(conn, job)
+                if phase:
+                    conn.execute("UPDATE agent_execution_segments SET phase='quarantined',generation=generation+1,token=? WHERE job_id=?",
+                                 (uuid.uuid4().hex, job_id))
+                if terminal is None:
+                    # Preserve old event history while superseding the synthetic
+                    # restart 'done' with a new, explicit terminal disposition.
+                    if task_events.current_terminal_event(conn, job_id) is not None:
+                        task_events._append(conn, job_id, "agent_recovery", {"status": "abandoned", "job_id": job_id})
+                    envelope = build_turn_envelope(requested_status="failed", display_status="failed",
+                        job_status="failed", stop_reason="outcome_unknown_reconciled", history_saved=False,
+                        notices=["执行结果未确认，旧执行已隔离，不会重放。请先核对已生成的文件或其他变更。"])
+                    task_events._append(conn, job_id, "done", {"job_id": job_id, "session_id": session_id,
+                        "turn_status": "failed", "history_saved": False, "turn_envelope": envelope.as_dict()})
                 now_iso = datetime.now().isoformat()
-                conn.execute(
-                    "UPDATE task_jobs SET status='failed', "
-                    "current_step='reconciled', error=?, updated_at=?, "
-                    "finished_at=? WHERE job_id=?",
-                    ("outcome_unknown_reconciled", now_iso, now_iso,
-                     row["root_job_id"]),
-                )
-            view = _reread(conn, owner_user_id, session_id, client_request_id)
-    _write_terminal_log(view)
+                conn.execute("UPDATE task_jobs SET status=?,current_step='reconciled',error=?,updated_at=?,finished_at=? WHERE job_id=?",
+                    ((terminal or {}).get("job_status", "failed"), "outcome_unknown_reconciled", now_iso, now_iso, job_id))
+                conn.execute("UPDATE task_questions SET status='cancelled' WHERE job_id=? AND owner_user_id=? "
+                    "AND session_id=? AND status='pending'", (job_id, owner_user_id, session_id))
+                _finalize_reconciled(conn, row, task_events._job(conn, job_id),
+                                    history_saved=bool(terminal and terminal["history_saved"]), reason=reason.strip())
+        view = _reread(conn, owner_user_id, session_id, client_request_id)
+    if view["state"] == TERMINAL:
+        _write_terminal_log(view)
     return view
 
 

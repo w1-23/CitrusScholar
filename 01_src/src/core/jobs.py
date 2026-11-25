@@ -54,7 +54,29 @@ _MIGRATIONS = (
     ("parent_job_id", "TEXT NOT NULL DEFAULT ''"),
     ("question_id", "TEXT NOT NULL DEFAULT ''"),
     ("native_context_scope", "TEXT NOT NULL DEFAULT ''"),
+    ("history_hidden", "INTEGER NOT NULL DEFAULT 0"),
 )
+
+
+def unsettled_history_job_sql(conn, tables: set[str]) -> str:
+    """Predicate on alias j: an awaiting segment needs proof its question closed."""
+    safe = "j.status IN ('completed','failed','cancelled')"
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(task_jobs)")}
+    evidence = []
+    if "owner_user_id" in cols and "chat_turn_queue" in tables:
+        evidence.append("EXISTS (SELECT 1 FROM chat_turn_queue tq WHERE tq.state='terminal' "
+                        "AND tq.owner_user_id=j.owner_user_id AND tq.session_id=j.session_id "
+                        "AND j.job_id IN (tq.root_job_id,tq.active_child_job_id))")
+    if {"owner_user_id", "question_id", "parent_job_id"}.issubset(cols) and "task_questions" in tables:
+        evidence.append("EXISTS (SELECT 1 FROM task_questions q LEFT JOIN task_jobs c ON c.job_id=q.child_job_id "
+                        "AND c.question_id=q.id AND c.parent_job_id=q.job_id "
+                        "AND c.owner_user_id=q.owner_user_id AND c.session_id=q.session_id "
+                        "WHERE q.job_id=j.job_id AND q.owner_user_id=j.owner_user_id AND q.session_id=j.session_id "
+                        "AND ((q.status IN ('cancelled','expired') AND q.child_job_id='') "
+                        "OR (q.status='answered' AND c.job_id IS NOT NULL)))")
+    if evidence:
+        safe += " OR (j.status='awaiting_input' AND (" + " OR ".join(evidence) + "))"
+    return "(NOT COALESCE((" + safe + "), 0) OR j.current_step='code_reconciliation_required')"
 
 
 def _migrate(conn) -> None:
@@ -387,42 +409,98 @@ def mark_completed_if_open(job_id: str, note: str = "", **fields) -> bool:
         return False
 
 
-def mark_interrupted_jobs() -> int:
-    """Close request jobs left running by a process restart or crash."""
-    now = datetime.now().isoformat()
+def durable_terminal(conn, job):
+    """Return a matching done/snapshot pair, never an interrupted or reviewed-only answer."""
+    from src.core import task_events
+    event = task_events.current_terminal_event(conn, job["job_id"])
+    if event is None:
+        return None
     try:
-        with _write_lock:
-            with _connect() as conn:
-                has_segments = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_execution_segments'").fetchone()
-                segment_guard = (" AND job_id NOT IN (SELECT job_id FROM agent_execution_segments)"
-                                 if has_segments else "")
-                if has_segments:
-                    # A fully parked segment deliberately has no live Host.
-                    # Other crashed phases require reconciliation, not TTL takeover.
-                    conn.execute("UPDATE task_jobs SET current_step='code_reconciliation_required', "
-                                 "error='segment_interrupted',updated_at=? WHERE status IN ('running','detached') "
-                                 "AND job_id IN (SELECT job_id FROM agent_execution_segments WHERE phase<>'parked')",
-                                 (now,))
-                cursor = conn.execute(
-                    "UPDATE task_jobs SET status='failed', current_step='interrupted', "
-                    "progress_summary='服务进程在任务完成前停止；可显式申请恢复。', "
-                    "error='service_restart', updated_at=?, finished_at=? "
-                    "WHERE status IN ('running','detached','cancel_requested')" + segment_guard,
-                    (now, now),
-                )
-                from src.core.task_events import recover_interrupted
-                recover_interrupted(conn)
-                conn.commit()
-                count = int(cursor.rowcount or 0)
-        if count:
-            logger.warning("[Jobs] marked %d stale open jobs as interrupted", count)
-        return count
-    except Exception as exc:
-        logger.warning("[Jobs] failed to reconcile interrupted jobs: %s", exc)
-        return 0
+        fact = json.loads(event["data"])
+        envelope = fact.get("turn_envelope")
+        if (fact.get("recovery") == "interrupted_terminal" or fact.get("job_id") != job["job_id"]
+                or fact.get("session_id", job["session_id"]) != job["session_id"]
+                or not isinstance(envelope, dict) or envelope != json.loads(job["terminal_snapshot"])
+                or envelope.get("job_status") not in TERMINAL_STATUS
+                or (job["status"] in TERMINAL_STATUS and envelope["job_status"] != job["status"])
+                or type(envelope.get("history_saved")) is not bool):
+            return None
+        return envelope
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
-def claim_agent_recovery(identity, *, answered: bool = False) -> dict:
+_RESTART_SUMMARY = "服务进程在任务完成前停止；可显式申请恢复。"
+
+
+def _mark_interrupted(conn, job_id, now):
+    conn.execute("UPDATE task_jobs SET status='failed',current_step='interrupted',error='service_restart',"
+                 "progress_summary=?,updated_at=?,finished_at=? WHERE job_id=?",
+                 (_RESTART_SUMMARY, now, now, job_id))
+
+
+def mark_interrupted_jobs() -> int:
+    """Classify abandoned startup work in the job/segment/event transaction."""
+    from src.core import task_events
+    now = datetime.now().isoformat()
+    count = 0
+    with _write_lock, task_events.transaction() as conn:
+        has_segments = conn.execute("SELECT 1 FROM sqlite_master WHERE name='agent_execution_segments'").fetchone()
+        phase = "s.phase" if has_segments else "NULL AS phase"
+        join = (" LEFT JOIN agent_execution_segments s USING(job_id)" if has_segments else "")
+        for job in conn.execute(f"SELECT j.*,{phase} FROM task_jobs j{join} "
+                                "WHERE j.status IN ('running','detached','cancel_requested')").fetchall():
+            run_id = job["job_id"]
+            terminal = durable_terminal(conn, job)
+            if terminal:
+                status = terminal["job_status"]
+                conn.execute("UPDATE task_jobs SET status=?,current_step=?,updated_at=?,finished_at=? WHERE job_id=?",
+                             (status, status, now, now, run_id))
+                if job["phase"]:
+                    conn.execute("UPDATE agent_execution_segments SET phase='terminal',generation=generation+1,token=? WHERE job_id=?",
+                                 (uuid.uuid4().hex, run_id))
+                continue
+            if job["phase"] in {"parked", "cancel_parked"}:
+                continue
+            if job["phase"] and job["status"] == "cancel_requested":
+                # Worker execution, if any, is checked by the coordinator before completion.
+                conn.execute("UPDATE agent_execution_segments SET phase='cancel_parked',generation=generation+1,token=? WHERE job_id=?",
+                             (uuid.uuid4().hex, run_id))
+                continue
+            if job["phase"] in {"parking", "resuming", "active", "restart_wait"}:
+                # A protected wait can commit before the outer API records its
+                # reference. Startup inspects the exact protected graph either way.
+                conn.execute("UPDATE agent_execution_segments SET phase='restart_wait',generation=generation+1,token=? WHERE job_id=?",
+                             (uuid.uuid4().hex, run_id))
+                continue
+            if job["phase"]:
+                conn.execute("UPDATE agent_execution_segments SET phase='interrupted',generation=generation+1,token=? WHERE job_id=?",
+                             (uuid.uuid4().hex, run_id))
+            _mark_interrupted(conn, run_id, now)
+            count += 1
+        task_events.recover_interrupted(conn)
+    if count:
+        logger.warning("[Jobs] marked %d stale open jobs as interrupted", count)
+    return count
+
+
+def require_settled_operations(conn, job_id, *, reason="recovery_requires_reconciliation"):
+    """Require durable ledger facts without treating any as authorization to replay."""
+    from src.core.task_events import TaskConflict
+    if conn.execute("SELECT 1 FROM task_operations WHERE job_id=? "
+                    "AND (status IN ('running','interrupted','unknown') OR result='') LIMIT 1", (job_id,)).fetchone():
+        raise TaskConflict(reason)
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='agent_batch_journal'").fetchone():
+        for row in conn.execute("SELECT status,observation FROM agent_batch_journal WHERE run_id=?", (job_id,)):
+            try:
+                batch = json.loads(row["observation"])
+            except (TypeError, ValueError):
+                raise TaskConflict(reason) from None
+            if row["status"] != "complete" or not isinstance(batch, dict) or batch.get("unknown_operations"):
+                raise TaskConflict(reason)
+
+
+def claim_agent_recovery(identity, *, answered: bool = False, account_epoch=None) -> dict:
     """CAS one authenticated startup-interrupted run back into its normal lifecycle.
 
     Called only after protected checkpoint validation and account/session checks.
@@ -441,28 +519,27 @@ def claim_agent_recovery(identity, *, answered: bool = False) -> dict:
         if (job["status"] != "failed" or job["current_step"] != "interrupted"
                 or job["error"] != "service_restart" or job["cancel_requested_at"]):
             raise task_events.TaskConflict("recovery_not_available")
-        if conn.execute("SELECT 1 FROM task_jobs WHERE owner_user_id=? AND session_id=? AND job_id<>? AND status IN ('running','detached','cancel_requested','queued')",
+        from src.core import chat_turn_queue
+        queue_turn = chat_turn_queue._reopen_for_recovery(conn, job, account_epoch=account_epoch)
+        other_statuses = "('running','detached','cancel_requested')" if queue_turn else "('running','detached','cancel_requested','queued')"
+        if conn.execute("SELECT 1 FROM task_jobs WHERE owner_user_id=? AND session_id=? AND job_id<>? AND status IN " + other_statuses,
                         (identity.owner_user_id, identity.session_id, identity.run_id)).fetchone():
             raise task_events.TaskConflict("recovery_session_active")
+        segment = None
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='agent_execution_segments'").fetchone():
+            segment = conn.execute("SELECT * FROM agent_execution_segments WHERE job_id=?", (identity.run_id,)).fetchone()
+        claim = None
+        if segment:
+            if segment["phase"] != "interrupted" or segment["account_epoch"] != account_epoch:
+                raise task_events.TaskConflict("recovery_segment_unavailable")
+            from src.agent.execution_segments import ExecutionSegmentClaim
+            claim = ExecutionSegmentClaim(identity, segment["generation"] + 1, uuid.uuid4().hex)
+            conn.execute("UPDATE agent_execution_segments SET phase='recovering',generation=?,token=?,checkpoint_ref='',wait_ids='[]' WHERE job_id=?",
+                         (claim.generation, claim.token, identity.run_id))
         terminal = task_events.current_terminal_event(conn, identity.run_id)
         if terminal is None or json.loads(terminal[2]).get("recovery") != "interrupted_terminal":
             raise task_events.TaskConflict("recovery_terminal_conflict")
-        if conn.execute("SELECT 1 FROM task_operations WHERE job_id=? AND (status IN ('running','interrupted','unknown') OR result='')",
-                        (identity.run_id,)).fetchone():
-            raise task_events.TaskConflict("recovery_requires_reconciliation")
-        has_journal = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_batch_journal'").fetchone()
-        if has_journal:
-            if conn.execute("SELECT 1 FROM agent_batch_journal WHERE run_id=? AND status<>'complete'", (identity.run_id,)).fetchone():
-                raise task_events.TaskConflict("recovery_requires_reconciliation")
-            # The graph might still be before the tools node even though its
-            # outbox committed. An unknown published result is not resumable.
-            for (observation,) in conn.execute("SELECT observation FROM agent_batch_journal WHERE run_id=?", (identity.run_id,)):
-                try:
-                    batch = json.loads(observation)
-                except (TypeError, ValueError):
-                    raise task_events.TaskConflict("recovery_requires_reconciliation") from None
-                if not isinstance(batch, dict) or batch.get("unknown_operations"):
-                    raise task_events.TaskConflict("recovery_requires_reconciliation")
+        require_settled_operations(conn, identity.run_id)
         budget = conn.execute("SELECT * FROM task_budgets WHERE job_id=?", (identity.run_id,)).fetchone()
         if budget is None:
             raise task_events.TaskConflict("recovery_budget_missing")
@@ -483,7 +560,7 @@ def claim_agent_recovery(identity, *, answered: bool = False) -> dict:
             "job_id": identity.run_id, "request_id": identity.user_turn_id,
             "status": "admitted", "previous_terminal_seq": terminal[0],
             "reactivated_updates": reactivated_updates})
-        return {"budget": dict(budget), "recovery_cursor": event["seq"]}
+        return {"budget": dict(budget), "recovery_cursor": event["seq"], "claim": claim}
 
 
 def get_job(job_id: str) -> Optional[dict]:
@@ -552,7 +629,7 @@ def decode_terminal_snapshot(job: Optional[dict]) -> dict:
 
 def list_for_session(session_id: str, limit: int = 10, *,
                      include_active: bool = False,
-                     owner_user_id: int | None = None) -> list:
+                     owner_user_id: int | None = None, visible_only: bool = False) -> list:
     """Recent jobs, optionally retaining every live or waiting task as well."""
     if owner_user_id is not None and (type(owner_user_id) is not int or owner_user_id <= 0):
         return []
@@ -561,6 +638,8 @@ def list_for_session(session_id: str, limit: int = 10, *,
     if owner_user_id is not None:
         scope += " AND owner_user_id=?"
         params.append(owner_user_id)
+    if visible_only:
+        scope += " AND history_hidden=0"
     query = f"SELECT * FROM task_jobs WHERE {scope}"
     if include_active:
         active = sorted(OPEN_STATUS | {"queued", "awaiting_input"})
@@ -581,7 +660,8 @@ def list_for_session(session_id: str, limit: int = 10, *,
         return []
 
 
-def sessions_with_jobs(session_ids: list[str], owner_user_id: int) -> set[str]:
+def sessions_with_jobs(session_ids: list[str], owner_user_id: int, *,
+                       visible_only: bool = False) -> set[str]:
     """Batch task presence for an owner's listed sessions, including empty ones."""
     if type(owner_user_id) is not int or owner_user_id <= 0:
         return set()
@@ -595,7 +675,8 @@ def sessions_with_jobs(session_ids: list[str], owner_user_id: int) -> set[str]:
             placeholders = ",".join("?" for _ in batch)
             result.update(row[0] for row in conn.execute(
                 f"SELECT DISTINCT session_id FROM task_jobs WHERE owner_user_id=? "
-                f"AND session_id IN ({placeholders})", [owner_user_id, *batch]))
+                f"AND session_id IN ({placeholders})" + (" AND history_hidden=0" if visible_only else ""),
+                [owner_user_id, *batch]))
     return result
 
 
@@ -633,7 +714,8 @@ def find_chat_job_id(session_id: str, owner_user_id: int, client_request_id: str
     return str(row[0]) if row is not None else None
 
 
-def jobs_for_turns(session_id: str, owner_user_id: int, request_ids: list[str]) -> dict[str, dict]:
+def jobs_for_turns(session_id: str, owner_user_id: int, request_ids: list[str], *,
+                   visible_only: bool = False) -> dict[str, dict]:
     """Resolve exact owner/session turn identities, never recent jobs or prose.
 
     client_request_id has a durable unique index. Legacy request_id is accepted
@@ -651,7 +733,8 @@ def jobs_for_turns(session_id: str, owner_user_id: int, request_ids: list[str]) 
         conn.row_factory = sqlite3.Row
         rows = [dict(r) for r in conn.execute(
             f"SELECT * FROM task_jobs WHERE session_id=? AND owner_user_id=? AND "
-            f"(client_request_id IN ({placeholders}) OR request_id IN ({placeholders}))",
+            f"(client_request_id IN ({placeholders}) OR request_id IN ({placeholders}))"
+            + (" AND history_hidden=0" if visible_only else ""),
             [session_id, owner_user_id, *keys, *keys])]
     result = {}
     for key in keys:

@@ -39,14 +39,32 @@ EXTERNAL_REFERENCE_VERIFICATION_DETAIL = "新文献核验请通过会话中的�
 
 
 def external_reference_verification_active() -> bool:
-    from src.agent.fusion_tools import installed_fusion
+    from src.agent.fusion_tools import external_fusion_required, installed_fusion
     from src.agent.installed_skills import list_installed, release_path
 
+    # A missing/unreadable release may not reopen the old algorithms in a
+    # deployment that explicitly requires the external verification engine.
+    if external_fusion_required():
+        return True
     try:
         release = release_path()
         return installed_fusion(release, list_installed(release)) if release is not None else False
     except (OSError, ValueError, KeyError) as exc:
         raise HTTPException(503, "无法确认当前文献核验发行版本。") from exc
+
+
+def external_reference_verification_detail() -> str:
+    from src.agent.fusion_tools import external_fusion_required, installed_fusion
+    from src.agent.installed_skills import list_installed, release_path
+
+    if external_fusion_required():
+        try:
+            release = release_path()
+            if release is None or not installed_fusion(release, list_installed(release)):
+                return "当前外部文献核验发行不可用。不会切换为旧核验算法。"
+        except (OSError, ValueError, KeyError):
+            return "当前外部文献核验发行不可用。不会切换为旧核验算法。"
+    return EXTERNAL_REFERENCE_VERIFICATION_DETAIL
 
 
 def _user(request: Request) -> dict:
@@ -187,7 +205,7 @@ async def create_audit(session_id: str, body: AuditCreate, request: Request):
     _same_origin(request)
     if external_reference_verification_active():
         _owned_session(session_id, user)
-        raise HTTPException(409, EXTERNAL_REFERENCE_VERIFICATION_DETAIL)
+        raise HTTPException(409, external_reference_verification_detail())
     content = _create_input(body)
     _rate(user["user_id"], "create", 30)
     return _response(await _call(user, session_id, "create_audit", name=body.name,
@@ -221,7 +239,7 @@ async def run_audit(session_id: str, audit_id: str, body: AuditRun, request: Req
                          time_budget=body.time_budget, resume=body.resume,
                          require_started=external_reference_verification_active())
     if result.get("run_reason") == "legacy_audit_not_started":
-        raise HTTPException(409, EXTERNAL_REFERENCE_VERIFICATION_DETAIL)
+        raise HTTPException(409, external_reference_verification_detail())
     conflict = result.get("run_reason") in {"already_running", "lease_lost"}
     return _response(result, status_code=409 if conflict else 200)
 

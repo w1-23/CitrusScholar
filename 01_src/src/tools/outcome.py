@@ -60,6 +60,16 @@ _REASON_CLASS = {
     # A failed query-side translation is a temporary condition of this turn:
     # the corpus is fine, the English query was not produced.
     "translation_failed": "transient",
+    "base_index_reload_required": "transient",
+    "base_index_pointer_invalid": "source_unavailable",
+    "retrieval_channel_error": "coverage_incomplete",
+    "retrieval_model_changed": "coverage_incomplete",
+    "reranker_fallback": "coverage_incomplete",
+    "requested_corpus_unavailable": "coverage_incomplete",
+    "active_generation_integrity_invalid": "coverage_incomplete",
+    "active_generation_contract_invalid": "coverage_incomplete",
+    "active_generation_unavailable": "coverage_incomplete",
+    "active_generation_open_failed": "coverage_incomplete",
     "auth": "internal_error",
     "tool_error": "internal_error",
     "unrecognized_tool_outcome": "internal_error",
@@ -161,12 +171,15 @@ def safe_tool_step(tool_name: str, content: str, artifact: dict | None = None,
         summary = "已停止，这一步的结果未采用"
     if tool_name in {"local_bm25_search", "local_dense_search", "local_hybrid_search"}:
         rows = data.get("main_results")
-        count = len(rows) if isinstance(rows, list) else None
+        selected = data.get("selected_result_count")
+        count = selected if type(selected) is int else len(rows) if isinstance(rows, list) else None
         if count is None:
             match = re.search(r"读取\s*(\d+)\s*条去重候选", str(content or ""))
             if match:
                 count = int(match.group(1))
-        if count is not None:
+        if status == "not_run" and reason in {"base_index_reload_required", "base_index_pointer_invalid"}:
+            summary = "本地索引代次待验证或重载，本次未检索"
+        elif count is not None:
             summary = f"找到 {count} 条候选资料" if count else "没有找到候选资料"
         elif status == "failed":
             summary = "本地资料检索未完成"
@@ -406,16 +419,18 @@ def _normalize_tool_outcome(tool_name: str, content: str, artifact: dict | None 
         if local_status == "skipped_no_matching_family":
             return ToolOutcome("not_run", "no_matching_corpus")
         if local_status == "hit":
-            count = len(data.get("main_results") or [])
-            partial = bool(data.get("errors") or data.get("reranker_fallback"))
+            selected = data.get("selected_result_count")
+            count = selected if type(selected) is int else len(data.get("main_results") or [])
+            reason = data.get("base_degradation_reason") or data.get("shared_degradation_reason")
+            partial = bool(reason or data.get("errors") or data.get("reranker_fallback"))
             return ToolOutcome("partial" if partial else ("complete" if count else "no_results"),
-                               "" if count else "no_candidates",
+                               reason or ("" if count else "no_candidates"),
                                f"{count} 条本地候选")
         if local_status == "zero_hit":
-            errors = data.get("errors") or {}
-            return ToolOutcome("partial" if errors else "no_results",
-                               "retrieval_channel_error" if errors else "no_candidates",
-                               "零候选；有通道失败" if errors else "零候选")
+            reason = (data.get("base_degradation_reason") or data.get("shared_degradation_reason")
+                      or ("retrieval_channel_error" if data.get("errors") else ""))
+            return ToolOutcome("partial" if reason else "no_results", reason or "no_candidates",
+                               "零候选，部分检索能力降级" if reason else "零候选")
         if local_status in {"error", "failed"}:
             return ToolOutcome("failed", "local_search_error")
 

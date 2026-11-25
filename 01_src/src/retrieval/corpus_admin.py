@@ -733,6 +733,46 @@ def registry_main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _verified_pointer(path: Path, *, requested_generation: str | None = None) -> dict[str, Any]:
+    """Verify the complete versioned contract before changing an active reader's pointer."""
+    pointer = json.loads(path.read_text(encoding="utf-8"))
+    generation = pointer.get("generation")
+    if not isinstance(generation, str) or not re.fullmatch(r"g[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}", generation):
+        raise CorpusMetadataError("index pointer generation is invalid")
+    if requested_generation is not None and generation != requested_generation:
+        raise CorpusMetadataError("staged manifest generation does not match request")
+    contract = {"index_schema_version": INDEX_SCHEMA_VERSION, "embedding_model": settings.EMBEDDING_MODEL,
+                "document_prefix": DOCUMENT_PREFIX, "query_prefix": QUERY_PREFIX}
+    mismatches = [key for key, value in contract.items() if pointer.get(key) != value]
+    if mismatches:
+        raise CorpusMetadataError("staged index contract mismatch: " + ", ".join(mismatches))
+
+    from src.retrieval.corpus_registry import active_lancedb_path, registry_path, _validate_registry
+    # An operator's runtime registry override must not affect staged pointer verification.
+    registry_file = registry_path(DATA_DIR, pointer=pointer, use_override=False)
+    if not pointer.get("registry_path"):
+        raise CorpusMetadataError("staged pointer registry_path is required")
+    registry = _validate_registry(json.loads(registry_file.read_text(encoding="utf-8")))
+    if pointer.get("registry_version") != registry.registry_version:
+        raise CorpusMetadataError("staged pointer registry version does not match registry")
+    corpus_rows = {cid: int(spec.get("chunk_count") or 0) for cid, spec in registry.corpora.items()}
+    if not corpus_rows or int(pointer.get("chunk_count", -1)) != sum(corpus_rows.values()):
+        raise CorpusMetadataError("staged pointer chunk_count does not match registry")
+    if int(pointer.get("table_count", -1)) != len(corpus_rows):
+        raise CorpusMetadataError("staged pointer table_count does not match registry")
+    dimension = pointer.get("dimension")
+    if type(dimension) is not int or dimension <= 0:
+        raise CorpusMetadataError("staged pointer embedding dimension is invalid")
+    import lancedb
+    db = lancedb.connect(str(active_lancedb_path(DATA_DIR, pointer=pointer)))
+    _verify_generation(db, corpus_rows, _registry_payload(registry))
+    for spec in registry.corpora.values():
+        vector_type = db.open_table(str(spec["table_name"])).schema.field("vector").type
+        if getattr(vector_type, "list_size", None) != dimension:
+            raise CorpusMetadataError("staged vector dimension does not match pointer")
+    return pointer
+
+
 @_serialize_mutations
 def rollback_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="校验并切回上一版活动索引")
@@ -741,31 +781,12 @@ def rollback_main(argv: list[str] | None = None) -> int:
     if not previous_path.is_file():
         parser.error("no previous active index pointer is available")
     try:
-        pointer = json.loads(previous_path.read_text(encoding="utf-8"))
-        registry_rel = str(pointer.get("registry_path") or "").replace("\\", "/")
-        lance_rel = str(pointer.get("lancedb_path") or "").replace("\\", "/")
-        if (not registry_rel or registry_rel.startswith("/") or ".." in Path(registry_rel).parts
-                or not lance_rel or lance_rel.startswith("/") or ".." in Path(lance_rel).parts):
-            raise CorpusMetadataError("previous pointer contains unsafe relative paths")
-        registry_path = (DATA_DIR / registry_rel).resolve()
-        lance_path = (DATA_DIR / lance_rel).resolve()
-        if DATA_DIR not in registry_path.parents or not registry_path.is_file():
-            raise CorpusMetadataError("previous registry is missing or outside data directory")
-        if DATA_DIR not in lance_path.parents or not lance_path.is_dir():
-            raise CorpusMetadataError("previous LanceDB is missing or outside data directory")
-        from src.retrieval.corpus_registry import _validate_registry
-        registry = _validate_registry(json.loads(registry_path.read_text(encoding="utf-8")))
-        corpus_rows = {cid: int(spec.get("chunk_count") or 0)
-                       for cid, spec in registry.corpora.items()}
-        import lancedb
-        db = lancedb.connect(str(lance_path))
-        _verify_generation(db, corpus_rows, _registry_payload(registry))
+        pointer = _verified_pointer(previous_path)
         _activate_pointer(pointer)
-        print(f"ROLLED BACK to verified index generation {pointer.get('generation')}")
+        print(f"ROLLED BACK to verified index generation {pointer['generation']}")
         return 0
     except Exception as exc:
-        print(f"ROLLBACK REFUSED; active index was not changed: {type(exc).__name__}: {exc}",
-              file=sys.stderr)
+        print(f"ROLLBACK REFUSED: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
 
@@ -782,44 +803,10 @@ def activate_main(argv: list[str] | None = None) -> int:
         parser.error("staged generation directory is missing or unsafe")
     manifest_path = generation_root / "index_manifest.json"
     try:
-        pointer = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if str(pointer.get("generation")) != generation:
-            raise CorpusMetadataError("staged manifest generation does not match request")
-        contract = {
-            "index_schema_version": INDEX_SCHEMA_VERSION,
-            "embedding_model": settings.EMBEDDING_MODEL,
-            "document_prefix": DOCUMENT_PREFIX,
-            "query_prefix": QUERY_PREFIX,
-        }
-        mismatches = [f"{key}={pointer.get(key)!r} (expected {value!r})"
-                      for key, value in contract.items() if pointer.get(key) != value]
-        if mismatches:
-            raise CorpusMetadataError("staged index contract mismatch: " + "; ".join(mismatches))
-        registry_rel = str(pointer.get("registry_path") or "").replace("\\", "/")
-        lance_rel = str(pointer.get("lancedb_path") or "").replace("\\", "/")
-        if (not registry_rel or registry_rel.startswith("/") or ".." in Path(registry_rel).parts
-                or not lance_rel or lance_rel.startswith("/") or ".." in Path(lance_rel).parts):
-            raise CorpusMetadataError("staged pointer contains unsafe relative paths")
-        registry_path = (DATA_DIR / registry_rel).resolve()
-        lance_path = (DATA_DIR / lance_rel).resolve()
-        if DATA_DIR not in registry_path.parents or not registry_path.is_file():
-            raise CorpusMetadataError("staged registry is missing or outside data directory")
-        if DATA_DIR not in lance_path.parents or not lance_path.is_dir():
-            raise CorpusMetadataError("staged LanceDB is missing or outside data directory")
-        from src.retrieval.corpus_registry import _validate_registry
-        registry = _validate_registry(json.loads(registry_path.read_text(encoding="utf-8")))
-        corpus_rows = {cid: int(spec.get("chunk_count") or 0)
-                       for cid, spec in registry.corpora.items()}
-        if int(pointer.get("chunk_count", -1)) != sum(corpus_rows.values()):
-            raise CorpusMetadataError("staged pointer chunk_count does not match registry")
-        if int(pointer.get("table_count", -1)) != len(corpus_rows):
-            raise CorpusMetadataError("staged pointer table_count does not match registry")
-        import lancedb
-        db = lancedb.connect(str(lance_path))
-        _verify_generation(db, corpus_rows, _registry_payload(registry))
+        pointer = _verified_pointer(manifest_path, requested_generation=generation)
         _activate_pointer(pointer)
         print(f"ACTIVATED verified generation {generation}: "
-              f"chunks={sum(corpus_rows.values())}; tables={len(corpus_rows)}")
+              f"chunks={pointer['chunk_count']}; tables={pointer['table_count']}")
         return 0
     except Exception as exc:
         print(f"ACTIVATION REFUSED; active index was not changed: {type(exc).__name__}: {exc}",

@@ -16,30 +16,6 @@
   --error: #C76B4B;
   --error-glow: rgba(199,107,75,0.13);
 }
-[data-theme="dark"] {
-  --bg-deep: #050505;
-  --bg-surface: #0A0A0A;
-  --bg-elevated: #121212;
-  --bg-hover: rgba(255,255,255,0.03);
-  --border-hairline: rgba(255,255,255,0.06);
-  --border-hover: rgba(255,255,255,0.12);
-  --text-primary: #E2E8F0;
-  --text-secondary: #94A3B8;
-  --text-muted: #64748B;
-  --overlay: rgba(0,0,0,0.7);
-}
-[data-theme="light"] {
-  --bg-deep: #F7FAF6;
-  --bg-surface: #FFFFFF;
-  --bg-elevated: #F0F5EF;
-  --bg-hover: rgba(64,112,76,0.055);
-  --border-hairline: rgba(58,99,67,0.13);
-  --border-hover: rgba(58,99,67,0.25);
-  --text-primary: #26352C;
-  --text-secondary: #64746A;
-  --text-muted: #89978D;
-  --overlay: rgba(0,0,0,0.4);
-}
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -427,9 +403,9 @@ a.rail-button { text-decoration: none; color: var(--text-muted); }
   padding: 7px 13px;
   white-space: pre-wrap;
 }
-[data-theme="dark"] .message.user .content { background: color-mix(in srgb, var(--accent) 23%, var(--bg-surface)); }
-[data-theme="dark"] .content .msg-text, [data-theme="dark"] .content p,
-[data-theme="dark"] .content li, [data-theme="dark"] .content td { color: #F2F4F2; }
+[data-theme="navy"] .message.user .content { background: color-mix(in srgb, var(--accent) 23%, var(--bg-surface)); }
+[data-theme="navy"] .content .msg-text, [data-theme="navy"] .content p,
+[data-theme="navy"] .content li, [data-theme="navy"] .content td { color: #F2F4F2; }
 .sent-attachment-count { margin-top: 5px; color: var(--text-secondary); font-size: 11px; }
 .sent-attachment-gallery { display: flex; flex-wrap: wrap; gap: 7px; max-width: 340px; margin-top: 9px; }
 .sent-attachment-card { position: relative; width: 112px; height: 92px; flex: 0 0 112px; overflow: hidden; border: 1px solid rgba(0,0,0,.12); border-radius: 9px; background: rgba(255,255,255,.55); }
@@ -1199,17 +1175,7 @@ footer {
 .ctx-circle-btn:hover { transform: scale(1.1); }
 .ctx-circle-btn svg { transform: rotate(-90deg); }
 .ctx-btn-bg { fill: none; stroke: var(--border-hairline); stroke-width: 2.5; }
-/* v8.10: 默认空环 + 系统灰（未使用上下文时与其他图标一致）；进度由 JS 渲染 */
-.ctx-btn-fg { fill: none; stroke: var(--text-muted); stroke-width: 2.5; stroke-linecap: round; stroke-dasharray: 94.25 94.25; stroke-dashoffset: 94.25; transition: stroke-dashoffset 0.5s var(--ease-out-quint), stroke 0.5s var(--ease-out-quint); }
-.ctx-btn-fg.none { stroke: var(--text-muted); }
-.ctx-btn-fg.low { stroke: var(--success); }
-.ctx-btn-fg.mid { stroke: var(--accent); }
-.ctx-btn-fg.high { stroke: var(--warning); }
-.ctx-btn-fg.crit { stroke: var(--error); }
-.ctx-circle-btn .ctx-pct-label {
-  position: absolute; font-family: var(--font-mono); font-size: 7px;
-  font-weight: 700; color: var(--text-muted); pointer-events: none;
-}
+.ctx-btn-fg { fill:none; stroke-width:2.5; stroke-linecap:butt; transition:stroke .18s var(--ease-out-quint); }
 
 /* ── Workflow Node States (main chat area) ── */
 .workflow-container {
@@ -1561,11 +1527,7 @@ footer {
 @media (max-width: 640px) { .account-label { display:none; } }
 
 /* CitrusScholar fresh accent details; dimensions and placement of the chat layout stay unchanged. */
-[data-theme="light"] .sidebar,
-[data-theme="light"] header { background: color-mix(in srgb, var(--bg-surface) 94%, #e8f2e8); }
-[data-theme="light"] .message.bot .avatar { background: #eaf4e9; }
-[data-theme="light"] .left-rail { background: color-mix(in srgb, var(--bg-surface) 94%, #e8f2e8); }
-[data-theme="light"] .user .content { border-color: rgba(217,130,27,.17); }
+[data-theme="sage"] .message.bot .avatar { background: #eaf4e9; }
 button, a, input, select, textarea { accent-color: var(--success); }
 button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--success) 70%, white); outline-offset: 2px;
@@ -1953,33 +1915,6 @@ body:has(#ctxDrawer.open) .turn-rail-tip { right: 436px; max-width: 300px; z-ind
 @media (max-width: 900px) {
   .ctx-sent-thead, .ctx-sent-row { grid-template-columns: 20px 52px minmax(0, 1fr) 34px 44px; }
 }
-/* ═══ C: 三套主题（浅色清新 / 深色 / 卡通）═══
-   设计稿要求：主题切换只换背景图与色彩变量，吉祥物组件与布局不变。
-   body 用「遮罩色 + 背景图」两层叠加，保证正文对比度，不改任何面板结构。 */
-[data-theme="cartoon"] {
-  --bg-deep: #FDF8F1;
-  --bg-surface: #FFFDFA;
-  --bg-elevated: #FBF1E4;
-  --bg-hover: rgba(217,130,27,0.07);
-  --border-hairline: rgba(180,120,60,0.16);
-  --border-hover: rgba(180,120,60,0.26);
-  --text-primary: #3B2E22;
-  --text-secondary: #7A6350;
-  --text-muted: #A08A76;
-  --overlay: rgba(59,46,34,0.35);
-}
-:root { --theme-veil: rgba(247,250,246,0.74); --theme-bg: none; }
-[data-theme="light"]   { --theme-veil: rgba(247,250,246,0.72); --theme-bg: url("themes/fresh.png"); }
-[data-theme="dark"]    { --theme-veil: rgba(5,5,5,0.72);        --theme-bg: url("themes/dark.png"); }
-[data-theme="cartoon"] { --theme-veil: rgba(255,252,246,0.62);  --theme-bg: url("themes/cartoon.png"); }
-body {
-  background-color: var(--bg-deep);
-  background-image: linear-gradient(var(--theme-veil), var(--theme-veil)), var(--theme-bg);
-  background-size: cover, cover;
-  background-position: center center, center center;
-  background-repeat: no-repeat, no-repeat;
-  background-attachment: fixed, fixed;
-}
 /* ═══ 鱼眼导航（fisheye）═══
    刻度少 → space-between 均匀铺满；刻度多 → 压缩 + 滚动；
    悬停某个刻度时它和上下各两级邻居局部放大，其余轻微让位。
@@ -2355,9 +2290,6 @@ body .session-file-item { position: relative; }
    图标（绿色小芽图片）不受影响。
    ========================================================================== */
 html:root,
-html:root[data-theme="light"] { --loading-accent: #A5560F; }   /* 春日浅色 */
-html:root[data-theme="cartoon"] { --loading-accent: #9E5A16; } /* 另一套浅色 */
-html:root[data-theme="dark"] { --loading-accent: #E8AE5A; }    /* 深色保持明亮橙金 */
 /* 生成文件卡片：徽标文字不折行，给右侧新增的操作按钮留出空间 */
 body .turn-file-type { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 body .turn-file-card { row-gap: 6px; }
@@ -2370,7 +2302,7 @@ body .turn-file-card { row-gap: 6px; }
 .pet-activity-btn:hover{border-color:var(--accent,#C9761F);color:var(--accent,#C9761F)}
 .pet-activity-btn.is-on{background:var(--accent,#C9761F);border-color:var(--accent,#C9761F);color:#fff}
 .pet-activity-btn:focus-visible{outline:2px solid var(--accent,#C9761F);outline-offset:2px}
-[data-theme="dark"] .pet-activity-btn.is-on,[data-theme="night"] .pet-activity-btn.is-on{color:#1b1b1b}
+[data-theme="navy"] .pet-activity-btn.is-on{color:#1b1b1b}
 
 /* ─── R15: library responsive grid ───────────────────────────────────────
    资料库卡片按「面板自身宽度」自动多列，与浏览器窗口宽度无关：

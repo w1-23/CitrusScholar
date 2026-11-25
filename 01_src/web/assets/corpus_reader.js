@@ -155,8 +155,8 @@
       var parser = window.marked;
       var renderer = new parser.Renderer();
       renderer.html = esc;
-      // Reading a local document must not fetch remote images or auto-load other assets.
-      renderer.image = function (_, title, label) { return esc(label || title || '图片'); };
+      renderer.image = typeof window.renderMarkdownImage === 'function'
+        ? window.renderMarkdownImage : function (_, title, label) { return esc(label || title || '图片'); };
       renderer.link = function (href, _, label) {
         var url = /^https?:\/\//i.test(String(href || '')) ? safeWebUrl(href) : '';
         return url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + label + '</a>' : label;
@@ -333,7 +333,8 @@
     var id = String(source.reader_id || source.record_key || '');
     if (!/^(cite|shared):[a-f0-9]{64}$/.test(id) || !scope.sessionId || !scope.requestId) return;
     state.shared = null;
-    state.citation = { id: id, sessionId: scope.sessionId, requestId: scope.requestId, pin: null };
+    state.citation = {id: id, sessionId: scope.sessionId, requestId: scope.requestId,
+      producerJobId: scope.producerJobId || "", pin: null};
     openReader(id, '');
     loadCitationPage(null);
   }
@@ -342,6 +343,7 @@
     var citation = state.citation;
     var params = new URLSearchParams({request_id: citation.requestId, ref_id: citation.id,
                                       mode: 'full', length: CITATION_PAGE_CHARS});
+    if (citation.producerJobId) params.set('producer_job_id', citation.producerJobId);
     if (offset != null) params.set('offset', offset);
     loadSource('/api/v2/session/' + encodeURIComponent(citation.sessionId) + '/citation-source?' + params, 'citation');
   }

@@ -1,0 +1,32 @@
+/* The same measured estimate is represented by either the ring or the grid. */
+.app-header .ctx-circle-btn { width:34px; min-height:34px; padding:0; border-radius:50%; }
+.ctx-circle-btn, .ctx-context-view { --context-fill:var(--ui-control,var(--accent)); }
+:is(.ctx-circle-btn,.ctx-context-view)[data-level="warning"] { --context-fill:var(--warning,#ae611c); }
+:is(.ctx-circle-btn,.ctx-context-view)[data-level="critical"] { --context-fill:var(--error,#b84236); }
+.ctx-circle-btn .ctx-btn-fg { stroke:var(--context-fill); }
+.ctx-context-view .ctx-drawer-header { justify-content:space-between; gap:10px; }
+.ctx-context-view .ctx-drawer-title { margin:0; white-space:nowrap; }
+.ctx-context-view .ctx-drawer-body { display:grid; gap:12px; }
+.ctx-context-view .ctx-drawer-close { display:grid; place-items:center; flex:none; }
+.ctx-context-view .ctx-drawer-close .ui-icon { width:17px; height:17px; }
+.ctx-context-view .ctx-view-picker { margin-inline-start:auto; }
+.ctx-context-view .ctx-view-picker label:has(input:disabled) { opacity:.48; cursor:default; }
+.ctx-context-view .ctx-view-picker label:has(input:disabled) input { cursor:default; }
+.context-amount { display:flex; align-items:center; flex-wrap:wrap; gap:12px; }
+.context-amount strong { font-size:clamp(20px,4vw,28px); letter-spacing:-.035em; font-variant-numeric:tabular-nums; }
+.context-amount p { margin:4px 0 0; color:var(--text-secondary); font-size:12px; }
+.context-level { margin-inline-start:auto; font-size:11px; padding:3px 8px; border-radius:999px;
+  color:var(--text-primary); background:color-mix(in srgb,var(--context-fill) 18%,var(--bg-surface)); }
+.context-ring { width:70px; height:70px; display:grid; place-items:center; position:relative; flex:none; }
+.context-ring svg { width:100%; height:100%; transform:rotate(-90deg); fill:none; }
+.context-ring-track { stroke:var(--border-hairline); }
+.context-ring-progress { stroke:var(--context-fill); stroke-linecap:butt; }
+.context-ring span { position:absolute; inset:auto; font-size:12px; font-variant-numeric:tabular-nums; }
+.context-gauge-grid { display:grid; grid-template-columns:repeat(20,minmax(0,1fr)); gap:3px; }
+.context-gauge-grid i { display:block; aspect-ratio:1; border-radius:2px; background:var(--bg-elevated); }
+.context-gauge-grid i.is-used { background:var(--context-fill); }
+.context-mosaic-note { margin:0; color:var(--text-secondary); font-size:12px; }
+@media (forced-colors:active) {
+  .context-gauge-grid i { border:1px solid CanvasText; }
+  .context-gauge-grid i.is-used { background:Highlight; forced-color-adjust:none; }
+}

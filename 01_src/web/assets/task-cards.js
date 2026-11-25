@@ -146,7 +146,7 @@
       container.appendChild(node('pre', 'term-full', text));
     }
     function details(row, item) {
-      var data = item.data, callId = String(data.tool_call_id || '');
+      var data = item.data, callId = String(data.result_id || data.tool_call_id || '');
       if (!callId || !options.loadToolResult) return;
       var state = row._toolDetails;
       if (state && state.callId !== callId) { state.element.remove(); state.button.remove(); state = null; }

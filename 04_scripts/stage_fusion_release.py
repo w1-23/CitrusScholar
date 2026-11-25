@@ -204,6 +204,9 @@ def _stage_nature(handoff: Path, release: Path, lock: dict, *, active: bool) -> 
             if dest == "skills/nature-shared/SKILL.md":
                 raise ValueError("fusion_shared_skill_cannot_be_discovered")
             _locked_copy(handoff, source, digest, release, dest)
+            if dest.startswith("skills/nature-shared/"):
+                relative = dest.removeprefix("skills/nature-shared/")
+                _locked_copy(handoff, source, digest, release, f"skills/{NATURE}/references/shared/{relative}")
         _write(release, f"skills/{NATURE}/provenance.json", _json({
             "repository": origin["repository"], "commit": origin["commit"], "license": origin["license"],
             "omissions": lock["nature_omissions"],

@@ -21,14 +21,6 @@
   var WORKBOOK_PREVIEW_BYTES = 16 * 1024 * 1024;
   var WORKBOOK_PREVIEW_COLUMNS = 24;
   var model = window.FigureEditModel;
-  function applyTheme(name) {
-    document.documentElement.setAttribute('data-theme',
-      ['light', 'cartoon', 'dark'].indexOf(name) >= 0 ? name : 'light');
-  }
-  try { applyTheme(localStorage.getItem('citrus_theme')); } catch (error) { applyTheme('light'); }
-  window.addEventListener('storage', function (event) {
-    if (event.key === 'citrus_theme' || event.key === null) applyTheme(event.newValue);
-  });
 
   var state = {
     projects: [],

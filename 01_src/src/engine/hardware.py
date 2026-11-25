@@ -15,12 +15,16 @@ def _ort():
     import onnxruntime
     return onnxruntime
 
-from src.config import PROJECT_ROOT, _yaml_val
+from src.config import PROJECT_ROOT, _atomic_private_json, _yaml_val
 
 logger = logging.getLogger(__name__)
 
 VALID_DEVICE_MODES = frozenset({"auto", "gpu", "cpu"})
 _DEVICE_LOCK = threading.RLock()
+_SWITCH_LOCK = threading.Lock()
+_ACTIVE_MODELS: tuple[str, Any, Any, int] | None = None
+_SWITCH_TIMEOUT_SEC = 240.0
+_switch_work: threading.Thread | None = None
 _DEVICE_PATH = PROJECT_ROOT / "state" / "onnx_device.json"
 _GPU_PROVIDERS = frozenset({
     "CUDAExecutionProvider",
@@ -43,10 +47,10 @@ class GPUUnavailableError(RuntimeError):
     """The operator requires GPU inference but it cannot be verified."""
 
 
-def require_gpu() -> bool:
+def require_gpu(mode: str | None = None) -> bool:
     # A selected GPU mode also forbids model-level CPU retry/fallback. The
     # administrator can explicitly select cpu/auto when a fallback is desired.
-    return os.getenv("CITRUS_REQUIRE_GPU", "").strip() == "1" or _read_mode() == "gpu"
+    return os.getenv("CITRUS_REQUIRE_GPU", "").strip() == "1" or (mode if mode is not None else _read_mode()) == "gpu"
 
 
 def cpu_thread_budget() -> int:
@@ -91,9 +95,11 @@ def model_session_status(model: Any) -> dict[str, Any]:
         return {"providers": [], "gpu": False, "error": str(exc)}
 
 
-def verify_model_session(model: Any, component: str) -> dict[str, Any]:
+def verify_model_session(model: Any, component: str, *, strict: bool | None = None) -> dict[str, Any]:
     status = model_session_status(model)
-    if require_gpu():
+    if strict is None:
+        strict = require_gpu()
+    if strict:
         if not status["gpu"]:
             raise GPUUnavailableError(
                 f"{component}: CITRUS_REQUIRE_GPU=1 but actual ONNX session providers "
@@ -187,6 +193,8 @@ def _provider_priority() -> list[str]:
 def _read_mode() -> str:
     global _runtime_mode
     with _DEVICE_LOCK:
+        if _ACTIVE_MODELS is not None:
+            return _ACTIVE_MODELS[0]
         if _runtime_mode in VALID_DEVICE_MODES:
             return str(_runtime_mode)
         env_mode = str(os.getenv("CITRUS_ONNX_DEVICE") or "").strip().casefold()
@@ -208,32 +216,24 @@ def _read_mode() -> str:
 
 
 def _write_mode(mode: str) -> None:
-    _DEVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = _DEVICE_PATH.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps({"mode": mode}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8")
-    os.replace(temporary, _DEVICE_PATH)
+    _atomic_private_json(_DEVICE_PATH, {"mode": mode})
 
 
 def get_device_mode() -> str:
     return _read_mode()
 
 
-def set_device_mode(mode: str) -> dict[str, Any]:
-    global _runtime_mode
-    selected = str(mode or "").strip().casefold()
-    if selected not in VALID_DEVICE_MODES:
-        raise ValueError("mode must be auto, gpu, or cpu")
-    available = list(_ort().get_available_providers())
-    if selected == "gpu" and not any(provider in _GPU_PROVIDERS for provider in available):
-        raise RuntimeError("GPU ExecutionProvider is not available in this runtime")
-    with _DEVICE_LOCK:
-        _write_mode(selected)
-        _runtime_mode = selected
-    logger.info("[Hardware] ONNX device mode changed | mode=%s | available=%s",
-                selected, available)
-    return get_device_status()
+def active_runtime_model(component: str) -> Any | None:
+    # Read one immutable generation. A call taking its model before publication
+    # holds that concrete instance until that call finishes.
+    generation = _ACTIVE_MODELS
+    return None if generation is None else generation[1 if component == "embedder" else 2]
+
+
+def runtime_model_generation() -> int:
+    """Distinguish cache data generated before/after a successful runtime activation."""
+    generation = _ACTIVE_MODELS
+    return generation[3] if generation is not None else 0
 
 
 def _probe_model_path() -> "os.PathLike[str] | None":
@@ -261,26 +261,33 @@ def _probe_model_path() -> "os.PathLike[str] | None":
         producer_name="citrus-qa-ep-probe")
     model.ir_version = 9
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(model.SerializeToString())
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(model.SerializeToString())
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
     return path
 
 
-def probe_provider(provider: str) -> tuple[bool, str]:
+def probe_provider(provider: str, cache: dict | None = None) -> tuple[bool, str]:
     """Return (usable, reason). Runs the probe in a watchdog thread so a hung EP
     is reported as a failure instead of blocking startup forever."""
-    if provider in _probe_cache:
-        return _probe_cache[provider]
+    cache = _probe_cache if cache is None else cache
+    if provider in cache:
+        return cache[provider]
     if provider == "CPUExecutionProvider":
-        _probe_cache[provider] = (True, "cpu")
-        return _probe_cache[provider]
+        cache[provider] = (True, "cpu")
+        return cache[provider]
     try:
         path = _probe_model_path()
     except Exception as exc:
-        _probe_cache[provider] = (False, f"cannot prepare EP probe: {exc}")
-        return _probe_cache[provider]
+        cache[provider] = (False, f"cannot prepare EP probe: {exc}")
+        return cache[provider]
     if path is None:
-        _probe_cache[provider] = (False, "probe unavailable: install onnx and provide a writable state directory")
-        return _probe_cache[provider]
+        cache[provider] = (False, "probe unavailable: install onnx and provide a writable state directory")
+        return cache[provider]
 
     result: dict[str, object] = {}
 
@@ -321,7 +328,7 @@ def probe_provider(provider: str) -> tuple[bool, str]:
     else:
         usable = bool(result.get("ok"))
         reason = str(result.get("reason") or "probe failed")
-    _probe_cache[provider] = (usable, reason)
+    cache[provider] = (usable, reason)
     if not usable:
         logger.error(
             "[Hardware] Execution provider %s is advertised but unusable (%s); "
@@ -329,40 +336,37 @@ def probe_provider(provider: str) -> tuple[bool, str]:
             provider, reason)
     else:
         logger.info("[Hardware] Execution provider %s passed the probe (%s)", provider, reason)
-    return _probe_cache[provider]
+    return cache[provider]
 
 
-def _usable_provider_order(providers: list[str]) -> list[str]:
+def _usable_provider_order(providers: list[str], cache: dict | None = None) -> list[str]:
     """Keep the configured order but drop GPU providers that fail the probe."""
     kept: list[str] = []
     for provider in providers:
         if provider in _GPU_PROVIDERS:
-            ok, _reason = probe_provider(provider)
+            ok, _reason = probe_provider(provider, cache)
             if not ok:
                 continue
         kept.append(provider)
     return kept or ["CPUExecutionProvider"]
 
 
-def mark_provider_unusable(provider: str, reason: str) -> None:
+def mark_provider_unusable(provider: str, reason: str, *, runtime: Any = None) -> None:
     """Record at runtime that a provider is broken, so later sessions skip it."""
     if not provider or provider == "CPUExecutionProvider":
         return
-    _probe_cache[provider] = (False, reason)
+    with _DEVICE_LOCK:
+        active = active_runtime_model("reranker")
+        if runtime is not None and active is not None and active is not runtime:
+            return
+        _probe_cache[provider] = (False, reason)
     logger.error("[Hardware] Marking %s unusable for this process: %s", provider, reason)
-    try:
-        from src.engine.embedder import Embedder
-        if Embedder._instance is not None:
-            Embedder._instance.reconfigure()
-    except Exception:
-        pass
 
-
-def get_ort_providers() -> list[str]:
+def get_ort_providers(*, mode: str | None = None, cache: dict | None = None) -> list[str]:
     available = list(_ort().get_available_providers())
-    mode = _read_mode()
+    mode = mode if mode is not None else _read_mode()
     logger.info("[Hardware] ONNX available providers=%s mode=%s", available, mode)
-    strict = require_gpu()
+    strict = require_gpu(mode)
     if mode == "cpu":
         if strict:
             raise GPUUnavailableError("CITRUS_REQUIRE_GPU=1 conflicts with ONNX device mode cpu; select gpu or auto")
@@ -372,19 +376,19 @@ def get_ort_providers() -> list[str]:
             provider for provider in _provider_priority()
             if provider in available and provider in _GPU_PROVIDERS
         ]
-        preferred = _usable_provider_order(preferred)
+        preferred = _usable_provider_order(preferred, cache)
         if preferred and preferred[0] in _GPU_PROVIDERS:
             return preferred
         logger.error("[Hardware] GPU mode requested but no usable GPU provider is available")
         raise GPUUnavailableError(
             "GPU mode or CITRUS_REQUIRE_GPU=1: no verified GPU execution provider. "
-            f"Available={available}; probe failures={_probe_cache}. "
+            f"Available={available}; probe failures={_probe_cache if cache is None else cache}. "
             "Check container --nv, CUDA/cuDNN libraries, onnxruntime-gpu and provider_priority.")
     matched = [
         provider for provider in _provider_priority()
         if provider in available
     ]
-    return _usable_provider_order(matched)
+    return _usable_provider_order(matched, cache)
 
 
 def get_device_status(*, probe: bool = True) -> dict[str, Any]:
@@ -397,30 +401,35 @@ def get_device_status(*, probe: bool = True) -> dict[str, Any]:
         available = []
         runtime_available = False
         selection_error = f"onnx_runtime_unavailable:{type(exc).__name__}"
-    mode = _read_mode()
+    with _DEVICE_LOCK:
+        mode = _read_mode()
+        generation = _ACTIVE_MODELS
+        probes = _probe_cache.copy()
+    strict = require_gpu(mode)
     selected = []
     if runtime_available:
         if probe:
             try:
-                selected = get_ort_providers()
+                selected = get_ort_providers(mode=mode, cache=probes)
             except GPUUnavailableError as exc:
                 selection_error = str(exc)
-        elif mode == "cpu" and not require_gpu():
+        elif mode == "cpu" and not strict:
             selected = ["CPUExecutionProvider"] if "CPUExecutionProvider" in available else []
         else:
             # Missing evidence stays unverified. Never call _usable_provider_order
             # here: it launches probe threads and writes a probe model/profile.
             selected = [p for p in _provider_priority() if p in available
-                        and (p not in _GPU_PROVIDERS or _probe_cache.get(p, (False, ""))[0])
-                        and (p in _GPU_PROVIDERS or (mode == "auto" and not require_gpu()))]
-            if (mode == "gpu" or require_gpu()) and not any(p in _GPU_PROVIDERS for p in selected):
+                        and (p not in _GPU_PROVIDERS or probes.get(p, (False, ""))[0])
+                        and (p in _GPU_PROVIDERS or (mode == "auto" and not strict))]
+            if strict and not any(p in _GPU_PROVIDERS for p in selected):
                 selection_error = "gpu_execution_unverified"
-    if mode == "cpu" and require_gpu():
+    if mode == "cpu" and strict:
         selection_error = "CITRUS_REQUIRE_GPU=1 conflicts with ONNX device mode cpu"
     models: dict[str, dict[str, Any]] = {}
     for name, class_name in (("embedder", "Embedder"), ("reranker", "Reranker")):
         module = sys.modules.get(f"src.engine.{name}")
-        instance = getattr(getattr(module, class_name, None), "_instance", None)
+        instance = (generation[1 if name == "embedder" else 2] if generation is not None else
+                    getattr(getattr(module, class_name, None), "_initial_runtime", None))
         model = getattr(instance, "_shared_model", None)
         evidence = model_session_status(model)
         evidence["loaded"] = model is not None
@@ -430,16 +439,16 @@ def get_device_status(*, probe: bool = True) -> dict[str, Any]:
         evidence["cpu_control_ops"] = dict(getattr(instance, "_profile_evidence", {}).get("cpu_control_ops", {}))
         models[name] = evidence
     return {
-        "mode": _read_mode(),
+        "mode": mode,
         "available_providers": available,
         "selected_providers": selected,
         "gpu_available": any(provider in _GPU_PROVIDERS for provider in available),
         "provider_probe": {name: {"usable": ok, "reason": reason}
-                           for name, (ok, reason) in _probe_cache.items()},
+                           for name, (ok, reason) in probes.items()},
         "active_model_providers": {name: evidence["providers"] for name, evidence in models.items()
                                    if evidence["loaded"]},
         "models": models,
-        "require_gpu": require_gpu(),
+        "require_gpu": strict,
         "selection_error": selection_error,
         "cpu_threads": cpu_thread_budget(),
     }
@@ -461,7 +470,7 @@ def runtime_readiness() -> dict[str, Any]:
             errors.append(f"{name}: {model['runtime_error']}")
         elif model["loaded"] and not model["inference_verified"]:
             errors.append(f"{name}: loaded session has not completed a verified inference")
-    if require_gpu() or status["mode"] == "gpu":
+    if status["require_gpu"]:
         for name, model in status["models"].items():
             if not model["loaded"]:
                 errors.append(f"{name}: load the cached model and run a local inference to verify GPU readiness")
@@ -475,26 +484,92 @@ def runtime_readiness() -> dict[str, Any]:
     return status
 
 
-def reconfigure_runtime_models() -> dict[str, Any]:
-    """Clear loaded ONNX sessions so the next request recreates them."""
-    reloaded: list[str] = []
+class DeviceActivationError(RuntimeError):
+    """Safe, actionable description of a failed staging step."""
+
+
+def _stage_runtime_models(mode: str) -> tuple[Any, Any, dict]:
+    import math
+    from src.engine.embedder import Embedder
+    from src.engine.reranker import Reranker
+
+    # Testing a failing candidate must not demote the active generation's EP.
+    probes: dict = {}
     try:
-        from src.engine.embedder import Embedder
-        embedder = Embedder._instance
-        if embedder is not None:
-            embedder.reconfigure()
-            reloaded.append("embedder")
-    except Exception as exc:
-        logger.warning("Embedder device reconfigure failed: %s", exc)
+        providers = get_ort_providers(mode=mode, cache=probes)
+    except GPUUnavailableError as exc:
+        raise DeviceActivationError("未检测到通过执行探针的 GPU，或部署要求强制使用 GPU。") from exc
     try:
-        from src.engine.reranker import Reranker
-        reranker = Reranker._instance
-        if reranker is not None:
-            reranker.reconfigure()
-            reloaded.append("reranker")
+        embedder = Embedder._new_runtime(mode=mode, providers=providers, staging=True)
+        vector = embedder.embed_query("device activation probe")
+        if not vector or not all(math.isfinite(value) for value in vector) or not any(vector):
+            raise ValueError("invalid probe vector")
     except Exception as exc:
-        logger.warning("Reranker device reconfigure failed: %s", exc)
-    status = get_device_status()
-    status["reconfigured"] = reloaded
-    status["note"] = "现有请求不被中断；下一次嵌入或重排请求会重建会话。"
-    return status
+        raise DeviceActivationError("嵌入模型无法在所选设备完成推理，请检查模型缓存和运行时。") from exc
+    try:
+        reranker = Reranker._new_runtime(mode=mode, providers=providers, staging=True)
+        ranked = reranker.rerank("device activation probe", [{"text": "local model verification"}], top_k=1)
+        if not ranked or not math.isfinite(ranked[0]["rerank_score"]):
+            raise ValueError("invalid probe score")
+    except Exception as exc:
+        raise DeviceActivationError("重排序模型无法在所选设备完成推理，请检查模型缓存和运行时。") from exc
+    for name, instance in (("embedder", embedder), ("reranker", reranker)):
+        evidence = model_session_status(instance._shared_model)
+        if (not evidence["providers"] or evidence["providers"][0] != instance._providers[0]
+                or not instance._inference_verified or instance._runtime_error):
+            label = "嵌入" if name == "embedder" else "重排序"
+            raise DeviceActivationError(f"{label}模型未在所选设备上完成验证。")
+    return embedder, reranker, probes
+
+
+def set_device_mode(mode: str) -> dict[str, Any]:
+    """Verify two detached sessions before atomically publishing preference and runtime."""
+    global _ACTIVE_MODELS, _probe_cache, _switch_work
+    selected = str(mode or "").strip().casefold()
+    if selected not in VALID_DEVICE_MODES:
+        raise ValueError("mode must be auto, gpu, or cpu")
+    override = os.getenv("CITRUS_ONNX_DEVICE", "").strip().casefold()
+    if override in VALID_DEVICE_MODES and override != selected:
+        raise RuntimeError("部署环境固定了推理设备，未更改当前配置。")
+    if not _SWITCH_LOCK.acquire(blocking=False):
+        raise RuntimeError("正在验证另一项推理设备切换，请稍后重试。")
+    try:
+        if _switch_work is not None and _switch_work.is_alive():
+            raise RuntimeError("上一次设备验证还未释放资源，请稍后重试。")
+        outcome: dict[str, Any] = {}
+
+        def prepare() -> None:
+            try:
+                outcome["staged"] = _stage_runtime_models(selected)
+            except Exception as exc:
+                outcome["error"] = exc
+
+        _switch_work = threading.Thread(target=prepare, name="onnx-activation", daemon=True)
+        _switch_work.start()
+        _switch_work.join(_SWITCH_TIMEOUT_SEC)
+        if _switch_work.is_alive():
+            raise RuntimeError("推理设备验证超时，当前设备与偏好未改变。")
+        if "staged" not in outcome:
+            exc = outcome.get("error")
+            logger.warning("ONNX activation probe failed: mode=%s error=%s", selected, type(exc).__name__)
+            reason = str(exc) if isinstance(exc, DeviceActivationError) else "无法验证所选设备的推理模型。"
+            raise RuntimeError(reason + "当前设备与偏好未改变。") from None
+        embedder, reranker, probes = outcome["staged"]
+        try:
+            with _DEVICE_LOCK:
+                _write_mode(selected)
+                embedder._staging = reranker._staging = False
+                _probe_cache = probes
+                next_generation = runtime_model_generation() + 1
+                _ACTIVE_MODELS = (selected, embedder, reranker, next_generation)
+                # Old handles do not own the retired sessions. An operation
+                # already using a retired runtime still holds its own reference.
+                type(embedder)._initial_runtime = type(reranker)._initial_runtime = None
+        except OSError:
+            raise RuntimeError("推理设备偏好保存失败，当前设备未改变。") from None
+        status = get_device_status(probe=False)
+        status["reconfigured"] = ["embedder", "reranker"]
+        status["note"] = "嵌入和重排序模型已在所选设备通过验证并切换。"
+        return status
+    finally:
+        _SWITCH_LOCK.release()

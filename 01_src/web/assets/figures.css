@@ -1,5 +1,4 @@
-/* Workspace chrome consumes the real app theme. Background layers, theme
-   resources and the orange brand accent remain owned by app.css. */
+/* The legacy figures workspace consumes the shared CitrusScholar theme tokens. */
 :root {
   --surface: var(--bg-surface);
   --ink: var(--text-primary);
@@ -7,9 +6,7 @@
   --line: var(--border-hairline);
   --danger: var(--error);
   --ok: var(--success);
-  color-scheme: light;
 }
-:root[data-theme="dark"] { color-scheme: dark; }
 * { box-sizing: border-box; }
 body.figure-app {
   margin: 0; height: 100vh; height: 100dvh; min-width: 0; overflow: hidden;
@@ -31,8 +28,8 @@ body.figure-app {
 .button:disabled, .icon-button:disabled { opacity: .38; cursor: default; }
 .button:focus-visible, .icon-button:focus-visible, .export-menu summary:focus-visible,
 .object-list:focus-visible, .project-open:focus-visible, .viewport:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.button.primary { color: #fff; background: var(--accent); font-weight: 600; }
-.button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: transparent; }
+.button.primary { color: var(--ui-on-control); background: var(--ui-control); font-weight: 600; }
+.button.primary:hover:not(:disabled) { background: var(--ui-control); filter: brightness(.92); border-color: transparent; }
 .button.secondary { background: var(--surface); border-color: var(--line); }
 .button.danger { color: var(--danger); }
 .icon-button.is-active { color: var(--accent); background: var(--accent-muted); }
@@ -47,7 +44,7 @@ body.figure-app {
 .workspace-identity, .toolbar-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .workspace-identity { gap: 12px; }
 .brand { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); text-decoration: none; flex-shrink: 0; }
-.brand-mark { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 7px; color: #fff; background: var(--accent); font-weight: 700; font-size: 16px; }
+.brand-mark { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 7px; color: var(--ui-on-control); background: var(--ui-control); font-weight: 700; font-size: 16px; }
 .brand strong { font-size: 15px; letter-spacing: -.3px; }
 .identity-divider { width: 1px; height: 17px; background: var(--line); }
 .workspace-name { font-size: 12px; color: var(--muted); white-space: nowrap; }
@@ -93,7 +90,7 @@ body.figure-app {
 .list-empty { padding: 14px 7px; font-size: 12px; color: var(--muted); line-height: 1.7; }
 .project-section:has(.import-panel:not([hidden])) { max-height: 65%; }
 .import-toggle[aria-expanded="true"] { border-style: solid; border-color: var(--accent); color: var(--ink); background: var(--accent-muted); }
-.import-panel { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: grid; gap: 16px; padding: 16px 0 12px; }
+.import-panel { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 16px 0 12px; }
 .import-panel[hidden] { display: none; }
 .import-source { display: grid; gap: 7px; }
 .import-field { display: grid; gap: 6px; min-width: 0; color: var(--ink); font-size: 12px; line-height: 1.5; }
@@ -109,7 +106,7 @@ body.figure-app {
 .import-status, .import-help { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
 .import-status:empty { display: none; }
 .import-help { padding-left: 9px; border-left: 2px solid var(--line); }
-.import-preview { display: grid; gap: 6px; min-width: 0; }
+.import-preview { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; min-width: 0; }
 .import-preview[hidden] { display: none; }
 .import-preview-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .import-preview-heading strong { font-size: 11px; font-weight: 600; }

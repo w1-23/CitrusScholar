@@ -101,14 +101,6 @@ _DSML_PROTOCOL_RE = re.compile(
 )
 _DSML_CALLS_OPEN_RE = re.compile(r"<\s*" + _DSML_PREFIX + r"calls\s*>", re.I)
 _DSML_CALLS_CLOSE_RE = re.compile(r"</\s*" + _DSML_PREFIX + r"calls\s*>", re.I)
-_DSML_INVOKE_OPEN_RE = re.compile(
-    r"<\s*" + _DSML_PREFIX + r"invoke\b(?P<attrs>[^>]*)>", re.I)
-_DSML_INVOKE_CLOSE_RE = re.compile(r"</\s*" + _DSML_PREFIX + r"invoke\s*>", re.I)
-_DSML_PARAMETER_RE = re.compile(
-    r"<\s*" + _DSML_PREFIX + r"parameter\b(?P<attrs>[^>]*)>"
-    r"(?P<value>.*?)"
-    r"</\s*" + _DSML_PREFIX + r"parameter\s*>", re.I | re.S)
-_DSML_ATTR_RE = re.compile(r"([\w:-]+)\s*=\s*([\"'])(.*?)\2", re.S)
 _RETRIEVAL_CUES = re.compile(
     r"最新|进展|论文|文献|研究|证据|来源|核实|检索|查找|查询|搜索|查一下|查一查|搜一下|找一下|查查|资料|数据库|知识库|"
     r"详细|机制|过程|为什么|如何|比较|对比|设计|数据|年份|doi|pmid|"
@@ -395,60 +387,6 @@ def _bind_request_candidate_pool(state) -> object | None:
     return pool
 
 
-def _scoped_toolset(scope: str, *, query: str = "", has_table: bool = False,
-                    has_paper_attachment: bool = False,
-                    has_account_files: bool = False,
-                    visualization_enabled: bool = True,
-                    has_candidate_pool: bool = False,
-                    plan=None):
-    """Return the tools that can actually run in this request's environment.
-
-    Visibility is a function of the environment, not of the question's wording.
-    A tool disappears only when a declared precondition is unmet (no attachment
-    to inspect, no account file to read, no session to write into, research
-    tools disabled) or when the *user said so in so many words* (local-only,
-    web-only, or "do not search this turn"). Everything else is advertised and
-    the model decides whether calling it is worth a step.
-
-    Visibility and execution authorization are separate. ``save_research_note``
-    is visible when the environment can run it; the executor rejects the write
-    unless the request plan recorded the user's explicit request. A rejected
-    call still produces a correlated terminal receipt, so the model cannot
-    silently perform an account mutation or pretend it succeeded.
-    """
-    tools, _schemas = _toolset()
-    available = {tool.name: tool for tool in tools}
-    q = str(query or "")
-    paper_only = _read_uploaded_paper_without_search(q, scope, has_paper_attachment)
-    from src.core.tracing import get_session_id, web_search_enabled
-    # Configuration readiness is a fact, not a network probe. Direct scholarly
-    # APIs remain usable when the separate paid web-search provider lacks a key.
-    from src.graph.request_plan import RequestFacts, build_request_plan
-    from src.graph.tool_availability import provider_denials
-    research_enabled = os.getenv("CITRUS_RESEARCH_TOOLS_ENABLED", "true").strip().lower() not in {
-        "0", "false", "no", "off"}
-    if plan is None:
-        plan = build_request_plan(
-            q,
-            RequestFacts(
-                session_id=get_session_id(),
-                attachments=1 if has_table else 0,
-                account_files=1 if has_account_files else 0,
-                has_paper_attachment=has_paper_attachment,
-                network=bool(web_search_enabled()),
-                local_corpus=True,
-                research_tools=research_enabled,
-                visualization=visualization_enabled,
-                has_session=bool(get_session_id()),
-                has_candidate_pool=has_candidate_pool,
-            ),
-            selected_scope=scope,
-            paper_only=paper_only,
-            provider_denials=provider_denials(settings),
-        )
-    return [available[name] for name in plan.visible_tools if name in available], []
-
-
 def _answer_profile(query: str) -> tuple[int, str]:
     """Choose a bounded completion budget and concise task-specific guidance.
 
@@ -715,68 +653,6 @@ def _safe_persisted_trace(messages: list) -> list:
         else:
             safe.append(message)
     return safe
-
-
-def _parse_dsml_tool_calls(content: str, tools_by_name: dict) -> tuple[bool, list[dict]]:
-    """Recover provider-emitted DSML text into calls from this request's allowlist.
-
-    Some OpenAI-compatible endpoints return ``<｜｜DSML｜｜ invoke ...>`` as
-    assistant text instead of populating ``AIMessage.tool_calls``. The loop must
-    never treat that control text as a user-facing answer. Only fully parsed,
-    schema-compatible calls to currently exposed tools are recoverable.
-    """
-    text = str(content or "")
-    if not _DSML_PROTOCOL_RE.search(text):
-        return False, []
-
-    calls: list[dict] = []
-    cursor = 0
-    while True:
-        opening = _DSML_INVOKE_OPEN_RE.search(text, cursor)
-        if opening is None:
-            break
-        closing = _DSML_INVOKE_CLOSE_RE.search(text, opening.end())
-        if closing is None:
-            return True, []
-
-        attrs = {k.lower(): html.unescape(v) for k, _, v in _DSML_ATTR_RE.findall(
-            opening.group("attrs") or "")}
-        name = attrs.get("name", "").strip()
-        tool = tools_by_name.get(name)
-        if tool is None:
-            return True, []
-
-        args: dict = {}
-        block = text[opening.end():closing.start()]
-        for parameter in _DSML_PARAMETER_RE.finditer(block):
-            param_attrs = {k.lower(): html.unescape(v)
-                           for k, _, v in _DSML_ATTR_RE.findall(
-                               parameter.group("attrs") or "")}
-            param_name = param_attrs.get("name", "").strip()
-            if not param_name or param_name in args:
-                return True, []
-            value = html.unescape(parameter.group("value").strip())
-            if param_attrs.get("string", "true").lower() != "true":
-                try:
-                    value = json.loads(value)
-                except (TypeError, ValueError):
-                    pass
-            args[param_name] = value
-
-        # Reject malformed or schema-incompatible calls before dispatch, using
-        # the same checker the executor uses. The executor still performs its
-        # own validation and sandboxing.
-        from src.tools.argument_check import argument_problem, schema_fields
-
-        if not args or argument_problem(name, args, schema_fields(tool)):
-            return True, []
-
-        calls.append({"name": name, "args": args,
-                      "id": "dsml_" + uuid.uuid4().hex,
-                      "type": "tool_call"})
-        cursor = closing.end()
-
-    return True, calls
 
 
 def _sanitize_history_tool_protocol(messages: list) -> list:
@@ -1134,7 +1010,7 @@ def _record_execution_terminal(call: dict, step: dict, content: str,
 
 def _emit_completed_tool_step(call: dict, message: ToolMessage,
                               tool_status_sink: list[dict] | None = None, *,
-                              logical_key: str = "", attempt: int = 1) -> dict[str, Any]:
+                              logical_key: str = "", attempt: int = 1, receipt_identity=None) -> dict[str, Any]:
     """Publish one completed tool as soon as it finishes, with no raw payload."""
     name = str(call.get("name") or "")
     content = str(getattr(message, "content", "") or "")
@@ -1225,12 +1101,12 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
                 summary = "本地资料检索已完成，没有找到候选资料"
             elif step["status"] == "complete":
                 summary = f"本地资料检索已完成，找到 {len(rows)} 条候选资料"
-        from src.core.progress_bus import emit_tool_result, tool_action_hint
+        from src.core.progress_bus import emit_encoded, emit_tool_result, tool_action_hint
         action_hint = tool_action_hint(name, call.get("args") or {})
         trace_record = emit_tool_result(
             name, content, str(call.get("id") or ""),
             summary=summary, outcome=step, action_hint=action_hint,
-            logical_key=logical_key, attempt=attempt)
+            logical_key=logical_key, attempt=attempt, emit=False)
         # Persist the actual execution output before creating any first-delivery
         # reference view. A failed write must never advertise a readback handle.
         try:
@@ -1238,8 +1114,13 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
             from src.core import turn_source_ledger as _source_ledger
             from src.core.progress_bus import get_turn_scope as _get_scope
             _sid, _rid = _get_scope()
+            provider_id = str(call.get("id") or "")
+            if receipt_identity is not None and _sid != receipt_identity.session_id:
+                raise ValueError("tool_receipt_session_mismatch")
+            storage_key = (_tool_results.execution_receipt_key(receipt_identity, provider_id)
+                           if receipt_identity is not None else provider_id)
             reference = _tool_results.record_with_reference(
-                tool_call_id=str(call.get("id") or ""),
+                tool_call_id=storage_key, provider_call_id=provider_id if receipt_identity else "",
                 session_id=_sid, request_id=_rid, tool_name=name,
                 status=str(trace_record.get("status") or ""),
                 args=call.get("args") or {}, result_text=content,
@@ -1252,11 +1133,13 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
                 reference["storage"] if reference else {"state": "unavailable"})
             if reference:
                 message.additional_kwargs["result_reference"] = reference
+                trace_record["result_id"] = reference["tool_call_id"]
             if step.get("status") in {"complete", "partial"}:
                 _source_ledger.record_tool_sources(_sid, _rid, artifact=artifact,
                     reference=reference, tool_name=name, result_text=content)
         except Exception as exc:
             logger.warning("Tool result or source persistence failed for %s: %s", name, type(exc).__name__)
+        emit_encoded("tool_result", {key: value for key, value in trace_record.items() if key != "summary"})
         # ToolMessage.artifact is deliberately excluded from model-visible
         # content, but is checkpointed with the message. Persist only the
         # sanitized execution record so refresh/history can reproduce real
@@ -1271,7 +1154,8 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
         }
         persisted_artifact["_citrus_execution"].update(
             tool_call_id=str(call.get("id") or ""), logical_key=logical_key, attempt=attempt,
-            reused_from_tool_call_id=str(call.get("_reused_from_tool_call_id") or ""))
+            reused_from_tool_call_id=str(call.get("_reused_from_tool_call_id") or ""),
+            result_id=trace_record.get("result_id", ""))
         # The artifact is checkpointed verbatim with the message. Tool functions
         # do return numpy/pandas scalars, paths and timestamps, and a single
         # non-native value used to make the whole checkpoint unreadable. Convert

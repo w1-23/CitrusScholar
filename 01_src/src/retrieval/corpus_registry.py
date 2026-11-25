@@ -330,15 +330,32 @@ def _load_registry_cached(path_text: str, mtime_ns: int, size: int) -> CorpusReg
     return _validate_registry(_load_payload(Path(path_text)))
 
 
-def registry_path(data_dir: Path | None = None) -> Path:
-    override = os.getenv("CITRUSQA_CORPUS_REGISTRY")
+_CURRENT_POINTER = object()
+
+
+def active_index_pointer(data_dir: Path | None = None) -> dict[str, Any] | None:
+    """Read the atomically replaced pointer exactly once."""
+    pointer = Path(data_dir or settings.DATA_DIR) / "active_index.json"
+    try:
+        payload = json.loads(pointer.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise CorpusMetadataError("invalid active_index.json") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise CorpusMetadataError("invalid active_index.json")
+    return payload
+
+
+def registry_path(data_dir: Path | None = None, *, pointer=_CURRENT_POINTER, use_override: bool = True) -> Path:
+    override = os.getenv("CITRUSQA_CORPUS_REGISTRY") if use_override else None
     if override:
         return Path(override).expanduser().resolve()
     root = Path(data_dir or settings.DATA_DIR)
-    pointer = root / "active_index.json"
-    if pointer.exists():
-        payload = json.loads(pointer.read_text(encoding="utf-8"))
-        rel = str(payload.get("registry_path") or "").strip().replace("\\", "/")
+    if pointer is _CURRENT_POINTER:
+        pointer = active_index_pointer(root)
+    if pointer is not None:
+        rel = str(pointer.get("registry_path") or "").strip().replace("\\", "/")
         if rel:
             if rel.startswith("/") or ".." in Path(rel).parts:
                 raise CorpusMetadataError("active index registry_path escapes data root")
@@ -349,40 +366,35 @@ def registry_path(data_dir: Path | None = None) -> Path:
     return root / "corpus_registry.json"
 
 
-def active_lancedb_path(data_dir: Path | None = None) -> Path:
-    """Resolve the active LanceDB generation; legacy data/lancedb is read-only fallback."""
+def active_lancedb_path(data_dir: Path | None = None, *, pointer=_CURRENT_POINTER) -> Path:
+    """Resolve the selected LanceDB generation; legacy data/lancedb is a fallback."""
     root = Path(data_dir or settings.DATA_DIR).resolve()
-    pointer = root / "active_index.json"
-    if pointer.exists():
-        try:
-            payload = json.loads(pointer.read_text(encoding="utf-8"))
-            rel = str(payload.get("lancedb_path") or "").strip()
-            if not rel:
-                raise CorpusMetadataError("active_index.json has no lancedb_path")
-            candidate = (root / rel).resolve()
-            if root not in candidate.parents or not candidate.is_dir():
-                raise CorpusMetadataError("active LanceDB path is outside data root or missing")
-            return candidate
-        except CorpusMetadataError:
-            raise
-        except Exception as exc:
-            raise CorpusMetadataError(f"invalid active_index.json: {exc}") from exc
+    if pointer is _CURRENT_POINTER:
+        pointer = active_index_pointer(root)
+    if pointer is not None:
+        rel = str(pointer.get("lancedb_path") or "").strip()
+        if not rel:
+            raise CorpusMetadataError("active_index.json has no lancedb_path")
+        candidate = (root / rel).resolve()
+        if root not in candidate.parents or not candidate.is_dir():
+            raise CorpusMetadataError("active LanceDB path is outside data root or missing")
+        return candidate
     return root / "lancedb"
 
 
-def active_index_generation(data_dir: Path | None = None) -> str:
-    """Return a stable cache namespace for the active index/manifest pair."""
+def active_index_generation(data_dir: Path | None = None, *, pointer=_CURRENT_POINTER) -> str:
+    """Return a stable cache namespace for the selected index/manifest pair."""
     root = Path(data_dir or settings.DATA_DIR).resolve()
-    pointer = root / "active_index.json"
-    if pointer.exists():
-        payload = json.loads(pointer.read_text(encoding="utf-8"))
-        return str(payload.get("generation") or payload.get("lancedb_path") or "")
+    if pointer is _CURRENT_POINTER:
+        pointer = active_index_pointer(root)
+    if pointer is not None:
+        return str(pointer.get("generation") or pointer.get("lancedb_path") or "")
     return "legacy:" + str((root / "lancedb").resolve())
 
 
-def load_corpus_registry(data_dir: Path | None = None) -> CorpusRegistry:
-    """Load the runtime registry, falling back to the shipped legacy catalog."""
-    path = registry_path(data_dir)
+def load_corpus_registry(data_dir: Path | None = None, *, pointer=_CURRENT_POINTER) -> CorpusRegistry:
+    """Load the selected registry, falling back to the shipped legacy catalog."""
+    path = registry_path(data_dir, pointer=pointer)
     if not path.exists():
         path = _DEFAULT_PATH
     st = path.stat()

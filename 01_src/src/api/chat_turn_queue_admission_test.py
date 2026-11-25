@@ -188,6 +188,79 @@ def test_library_reference_is_pinned_without_duplication():
     assert view["attachments"][0]["file_id"] == reference
 
 
+def test_identical_upload_bytes_keep_each_selected_name_and_reference():
+    turn = _admit(_request(attachments=[_attachment("alpha.txt"), _attachment("beta.txt")]))
+    payload = turn["bounded_payload"]["inputs"]
+    ids = [item["file_id"] for item in payload]
+    assert len(set(ids)) == 2
+    assert len({item["sha256"] for item in payload}) == 1
+    assert [item["name"] for item in payload] == ["alpha.txt", "beta.txt"]
+    assert {row["file_id"] for row in _resource_rows()} == set(ids)
+    request, metadata = turn_envelope.load_dispatch_input(turn)
+    assert request["file_refs"] == ids
+    assert [item["filename"] for item in metadata] == ["alpha.txt", "beta.txt"]
+
+
+def test_upload_registration_only_reuses_exact_identity_in_source_session():
+    first = _library_file(session=SESSION)
+    assert _library_file(session=SESSION) == first
+    assert _library_file() != first
+    # Names that sanitize to the same disk basename are distinct inputs too.
+    one = _library_file(name="one?.txt")
+    two = _library_file(name="one:.txt")
+    assert one != two
+    assert session_files.get_account_file(one, OWNER)["filename"] == "one?.txt"
+    other = session_files.get_account_file(two, OWNER)
+    assert other["filename"] == "one:.txt"
+    assert "upload_identity" not in other
+
+
+def test_replay_returns_stored_receipt_after_original_was_deleted(monkeypatch):
+    reference = _library_file()
+    other = _library_file(name="other.pdf")
+    request = _request(file_refs=[reference, other, reference])
+    first = _admit(request)
+    turn_queue.cancel_queued(owner_user_id=OWNER, session_id=SESSION, client_request_id=CLIENT)
+    turn_envelope.release_turn_inputs(OWNER, SESSION, CLIENT)
+    assert session_files.delete_account_file(reference, OWNER)
+    before = _queue_rows()
+
+    def unexpected_library_lookup(*args, **kwargs):
+        pytest.fail("replay consulted the current library")
+
+    with monkeypatch.context() as replay:
+        replay.setattr(session_files, "get_account_file", unexpected_library_lookup)
+        second = _admit(request)
+        assert second["created"] is False and second["state"] == "terminal"
+        assert second["job_id"] == first["job_id"]
+        assert second["bounded_payload"] == first["bounded_payload"]
+        for changed in ([other, reference], ["f" * 32]):
+            with pytest.raises(turn_queue.TurnPayloadConflict):
+                _admit(_request(file_refs=changed))
+    assert _queue_rows() == before
+    assert _resource_rows() == []
+    with pytest.raises(HTTPException) as missing:
+        _admit(_request(cid="new-authorization", file_refs=[reference]))
+    assert missing.value.status_code == 404
+
+
+def test_pending_replay_does_not_repin_but_dispatch_verifies_bytes(monkeypatch):
+    reference = _library_file()
+    request = _request(file_refs=[reference])
+    first = _admit(request)
+    info = session_files.get_account_file(reference, OWNER)
+    Path(info["path"]).unlink()
+    before = _resource_rows()
+    with monkeypatch.context() as replay:
+        replay.setattr(session_files, "replace_resource_references", lambda *a: pytest.fail("replay wrote pins"))
+        replay.setattr(session_files, "get_account_file", lambda *a: pytest.fail("replay read library"))
+        replay.setattr(session_files, "link_turn_files", lambda *a: pytest.fail("replay wrote turn links"))
+        assert _admit(request)["job_id"] == first["job_id"]
+    assert _resource_rows() == before
+    with pytest.raises(turn_queue.TurnReconcileRequired):
+        turn_envelope.load_dispatch_input(first)
+
+
 def test_rejected_admission_cleans_staged_upload_and_pin():
     limits = turn_queue.QueueLimits(max_pending_per_session=0)
 

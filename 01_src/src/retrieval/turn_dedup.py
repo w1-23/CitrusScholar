@@ -115,13 +115,23 @@ class RetrievalLedger:
     """One instance per user turn/run, never process-wide or thread-wide."""
 
     _first_calls: dict[str, str] = field(default_factory=dict)
+    _retried: set[str] = field(default_factory=set)
+    _retryable: set[str] = field(default_factory=set)
+    _settled_ids: set[str] = field(default_factory=set)
 
     def claim(self, name: str, args: Mapping, call_id: str) -> str | None:
         """Call on the async tool node before any await of the actual handler."""
         if not call_id or not (key := retrieval_key(name, args)):
             return None
         original = self._first_calls.setdefault(key, call_id)
-        return original if original != call_id else None
+        if original == call_id:
+            return None
+        if key in self._retryable and key not in self._retried:
+            self._retryable.remove(key)
+            self._retried.add(key)
+            self._first_calls[key] = call_id
+            return None
+        return original
 
     def restore_key(self, key: str, call_id: str) -> None:
         """Adopt a private fingerprint from a verified existing observation."""
@@ -132,3 +142,17 @@ class RetrievalLedger:
     def restore(self, name: str, args: Mapping, call_id: str) -> None:
         """Restore only authenticated current-turn attempted/observed calls."""
         self.claim(name, args, call_id)
+
+    def settle(self, name: str, args: Mapping, call_id: str, *, status: str,
+               reason: str, uncertain: bool = False) -> None:
+        # Only a durable, specifically classified transient failure permits
+        # another *read*. No successful, ambiguous, cancelled or partial call
+        # is discarded, and an in-flight identical call still blocks duplicates.
+        key = retrieval_key(name, args)
+        if not key or call_id in self._settled_ids or self._first_calls.get(key) != call_id:
+            return
+        self._settled_ids.add(call_id)
+        if not uncertain and status in {"failed", "unavailable"} and reason in {
+            "timeout", "translation_failed", "dependency", "candidate_search_failed", "network", "source_unavailable",
+        } and key not in self._retried and name not in {"read_tool_result", "read_context_evidence"}:
+            self._retryable.add(key)

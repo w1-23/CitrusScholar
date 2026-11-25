@@ -149,8 +149,16 @@ def get_current_tool_name() -> str:
     return _current_tool_name.get()
 
 
-def set_request_authorizations(tool_names) -> None:
+_note_target = contextvars.ContextVar("request_note_target", default="")
+
+
+def get_authorized_note_target() -> str:
+    return _note_target.get()
+
+
+def set_request_authorizations(tool_names, *, note_target: str = "") -> None:
     """Bind the tools the user explicitly authorized for this request."""
+    _note_target.set(note_target if "save_research_note" in (tool_names or ()) else "")
     _request_authorizations.set(frozenset(
         str(name) for name in (tool_names or ()) if str(name).strip()))
 
@@ -160,6 +168,7 @@ def request_authorizes(tool_name: str) -> bool:
 
 
 def clear_request_authorizations() -> None:
+    _note_target.set("")
     _request_authorizations.set(frozenset())
 
 

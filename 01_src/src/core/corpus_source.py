@@ -27,6 +27,7 @@ import re
 import threading
 import unicodedata
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -48,6 +49,7 @@ __all__ = [
     "locate_record",
     "describe",
     "build_payload",
+    "reconstruct_cited_document",
 ]
 
 # 检索顺序即优先级：同一 paper_id 只会在其中一个语料里出现，顺序决定“先命中谁”。
@@ -527,6 +529,109 @@ def build_payload(corpus_id: str, record_key: str) -> dict[str, Any] | None:
         "markdown": markdown,
         "source_file": _safe_source_file(first.get("source_file")),
     }
+
+
+_VERSIONED_GENERATION = re.compile(r"g[0-9]{8}T[0-9]{6}Z_[a-f0-9]{8}")
+_MAX_RECONSTRUCTED_CHARS = 4_000_000
+
+
+def _cited_chunk_path(corpus_id: str, generation: str, user: dict) -> Path | None:
+    from src.core.resource_access import PUBLIC_CORPUS, authorize_resource
+    from src.retrieval.corpus_registry import active_index_generation, load_corpus_registry
+
+    root = Path(DATA_DIR).resolve()
+    if not _VERSIONED_GENERATION.fullmatch(generation) or active_index_generation(root) != generation:
+        return None
+    registry = load_corpus_registry(root)
+    scope = registry.corpora.get(corpus_id)
+    if not scope or not authorize_resource(
+            PUBLIC_CORPUS, user, access_level=registry.access_level_for_corpus(corpus_id)).allowed:
+        return None
+    chunks = str(scope.get("chunks_path") or "")
+    parts = Path(chunks).parts
+    if (len(parts) != 5 or parts[0] != "corpus_generations" or not _VERSIONED_GENERATION.fullmatch(parts[1])
+            or parts[2:] != ("corpora", corpus_id, "chunks.jsonl")):
+        return None
+    path = root / chunks
+    return path if path.resolve() == path and path.is_file() else None
+
+
+def _verified_chunk_chain(rows: list[dict], corpus_id: str, record_key: str) -> bool:
+    from src.retrieval.corpus_registry import deterministic_id
+
+    if not rows or not rows[0].get("source_file"):
+        return False
+    for position, row in enumerate(rows):
+        if (row.get("corpus_id") != corpus_id or row.get("paper_id") != record_key
+                or row.get("document_id") != record_key or type(row.get("chunk_index")) is not int
+                or row["chunk_index"] != position or row.get("source_file") != rows[0]["source_file"]
+                or row.get("chunk_id") != deterministic_id(corpus_id, record_key, position)
+                or not isinstance(row.get("text"), str) or not row["text"].strip()):
+            return False
+        for field, neighbor in (("prev_chunk_id", position - 1), ("next_chunk_id", position + 1)):
+            expected = ("",) if not 0 <= neighbor < len(rows) else (
+                deterministic_id(corpus_id, record_key, neighbor), f"{record_key}::{neighbor:04d}")
+            # Historic neighbor pointers preserve the pre-normalization paper::ordinal alias.
+            if row.get(field) not in expected:
+                return False
+    return True
+
+
+def _verified_reconstruction(rows: list[dict], hit_index: int) -> tuple[str, int, int]:
+    title = _title_label(rows)
+    title_key = _heading_fingerprint(title)
+    parts, cursor = [f"# {title}\n\n"], len(title) + 4
+    last_section = None
+    hit_start = hit_end = 0
+    for position, row in enumerate(rows):
+        section = _section_label(row.get("section_name") or row.get("section"))
+        if section != last_section and _heading_fingerprint(section) != title_key:
+            heading = f"## {section}\n\n"
+            parts.append(heading)
+            cursor += len(heading)
+        last_section = section
+        text = _clean_text(row["text"])
+        if position == hit_index:
+            hit_start, hit_end = cursor, cursor + len(text)
+        parts.append(text)
+        cursor += len(text)
+        if position + 1 < len(rows):
+            parts.append("\n\n")
+            cursor += 2
+        if cursor > _MAX_RECONSTRUCTED_CHARS:
+            raise ValueError("citation_document_too_large")
+    return "".join(parts), hit_start, hit_end
+
+
+def reconstruct_cited_document(locator: dict, generation: str, user: dict) -> dict | None:
+    """Verify the indexed document chain and anchored input hash, never an original .md path."""
+    corpus_id = str(locator.get("corpus_id") or "")
+    record_key = str(locator.get("paper_id") or "")
+    hit_index = locator.get("chunk_index")
+    if (locator.get("index_generation") != generation or not is_valid_record_key(record_key)
+            or type(hit_index) is not int or hit_index < 0):
+        return None
+    try:
+        path = _cited_chunk_path(corpus_id, generation, user)
+        index = _load_index(path) if path is not None else None
+        offsets = index.offsets.get(record_key) if index is not None else None
+        if not offsets:
+            return None
+        rows = _read_rows(index, offsets)
+        rows.sort(key=_chunk_order)
+        if len(rows) != len(offsets) or hit_index >= len(rows) or not _verified_chunk_chain(rows, corpus_id, record_key):
+            return None
+        hit = rows[hit_index]
+        if (hit["chunk_id"] != locator.get("chunk_id")
+                or sha256(hit["text"].encode("utf-8")).hexdigest() != locator.get("input_sha256")):
+            return None
+        text, start, end = _verified_reconstruction(rows, hit_index)
+        if _cited_chunk_path(corpus_id, generation, user) != path or _load_index(path) is not index:
+            return None
+        return {"markdown": text, "hit_start": start, "hit_end": end,
+                "md_sha256": sha256(text.encode("utf-8")).hexdigest(), "index_generation": generation}
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def describe(record_key: str) -> dict[str, Any] | None:

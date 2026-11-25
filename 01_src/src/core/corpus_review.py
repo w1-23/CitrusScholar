@@ -29,9 +29,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from .corpus_review_originals import (
+    ARCHIVE_DIRNAME, QUEUE_DIRNAME, is_text_original, original_media_type, read_original,
+)
 
-QUEUE_DIRNAME = "_review_queue"
+logger = logging.getLogger(__name__)
 MIN_CONTENT_CHARS = 1500
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MISSING_FULLTEXT = "fulltext_missing"
@@ -63,7 +65,7 @@ def _queue_root() -> Path:
 
 
 def _archive_root() -> Path:
-    root = _queue_root() / "archive"
+    root = _queue_root() / ARCHIVE_DIRNAME
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -76,6 +78,17 @@ def _now() -> str:
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(_db_path()), timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _open_read_catalog() -> sqlite3.Connection | None:
+    path = _db_path()
+    if not path.is_file():
+        return None
+    # Review reads never initialize/migrate the historical catalog or create
+    # the queue. Writers retain their existing schema setup in legacy mode.
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -730,7 +743,7 @@ def archive_upload(name: str, raw: bytes, text: str = "", *, user_id: int = 0,
 
 # --------------------------------------------------------------------------- 查询与决策
 
-def _row_to_public(row: sqlite3.Row, *, with_preview: bool = False) -> dict[str, Any]:
+def _row_to_public(row: sqlite3.Row) -> dict[str, Any]:
     item = {
         "id": int(row["id"]),
         "status": row["status"],
@@ -748,38 +761,52 @@ def _row_to_public(row: sqlite3.Row, *, with_preview: bool = False) -> dict[str,
         "decided_at": row["decided_at"],
         "note": row["note"],
     }
-    for column in ("raw_format", "conversion", "raw_bytes", "fetched_at", "archive_state", "origin", "pmid"):
-        try:
-            item[column] = row[column]
-        except (IndexError, KeyError):
-            item[column] = ""
-    try:
-        item["stored_path"] = row["stored_path"]
-    except (IndexError, KeyError):
-        item["stored_path"] = ""
-    if with_preview:
-        item["preview"] = _preview(item.get("stored_path") or "")
+    for column in ("raw_format", "conversion", "raw_bytes", "fetched_at", "archive_state", "origin", "pmid",
+                   "stored_path"):
+        item[column] = _row_value(row, column)
     return item
 
 
-def _preview(path_text: str, limit: int = 1200) -> str:
+def _row_value(row: sqlite3.Row, column: str, default=""):
+    return row[column] if column in row.keys() else default
+
+
+def _candidate_original(row: sqlite3.Row, *, include_data: bool = False) -> tuple[str, bytes]:
+    if _row_value(row, "archive_state") == MISSING_FULLTEXT:
+        raise FileNotFoundError("review original unavailable")
+    return read_original(
+        _data_dir(), str(_row_value(row, "stored_path") or ""), str(_row_value(row, "raw_sha256") or ""),
+        _row_value(row, "raw_bytes", 0), max_bytes=MAX_ARCHIVE_BYTES, include_data=include_data,
+    )
+
+
+def _readable_candidate(row: sqlite3.Row, *, with_preview: bool = False, read_only: bool) -> dict[str, Any]:
+    item = _row_to_public(row)
+    if read_only:
+        item.pop("stored_path", None)
+    if with_preview:
+        item["preview"] = ""
+    if item["archive_state"] == MISSING_FULLTEXT:
+        item["raw_status"] = MISSING_FULLTEXT
+        return item
     try:
-        path = Path(path_text)
-        if not path.is_file():
-            return ""
-        if path.suffix.lower() in {".pdf", ".docx", ".xlsx", ".doc"}:
-            return ""
-        text = path.read_text(encoding="utf-8", errors="replace")
-        return text[:limit]
-    except Exception:
-        return ""
+        filename, data = _candidate_original(row, include_data=with_preview)
+    except FileNotFoundError:
+        item["raw_status"] = "unavailable"
+    else:
+        item["raw_status"] = "available"
+        if with_preview and is_text_original(filename):
+            item["preview"] = data[:4800].decode("utf-8", errors="replace")[:1200]
+    return item
 
 
 def list_candidates(*, status: str = "pending", limit: int = 50,
-                    before_id: int | None = None, order: str = "frequency") -> dict[str, Any]:
-    ensure_schema()
+                    before_id: int | None = None, order: str = "frequency",
+                    read_only: bool = False) -> dict[str, Any]:
     limit = max(1, min(int(limit or 50), 200))
-    conn = _connect()
+    conn = _open_read_catalog()
+    if conn is None:
+        return {"candidates": [], "has_more": False, "next_before_id": None, "counts": {}}
     try:
         params: list[Any] = []
         where = []
@@ -801,24 +828,27 @@ def list_candidates(*, status: str = "pending", limit: int = 50,
         rows = rows[:limit]
         counts = {row["status"]: int(row["n"]) for row in conn.execute(
             "SELECT status, COUNT(*) AS n FROM corpus_candidates GROUP BY status")}
-        return {
-            "candidates": [_row_to_public(row) for row in rows],
-            "has_more": has_more,
-            "next_before_id": int(rows[-1]["id"]) if has_more and rows else None,
-            "counts": counts,
-        }
     finally:
         conn.close()
+    return {
+        "candidates": [_readable_candidate(row, read_only=read_only) for row in rows],
+        "has_more": has_more,
+        "next_before_id": int(rows[-1]["id"]) if has_more and rows else None,
+        "counts": counts,
+    }
 
 
-def get_candidate(candidate_id: int) -> dict[str, Any] | None:
-    ensure_schema()
-    conn = _connect()
-    try:
-        row = conn.execute("SELECT * FROM corpus_candidates WHERE id = ?", (int(candidate_id),)).fetchone()
-        return _row_to_public(row, with_preview=True) if row else None
-    finally:
-        conn.close()
+def _candidate_row(candidate_id: int) -> sqlite3.Row | None:
+    conn = _open_read_catalog()
+    if conn is None:
+        return None
+    with closing(conn):
+        return conn.execute("SELECT * FROM corpus_candidates WHERE id = ?", (int(candidate_id),)).fetchone()
+
+
+def get_candidate(candidate_id: int, *, read_only: bool = False) -> dict[str, Any] | None:
+    row = _candidate_row(candidate_id)
+    return _readable_candidate(row, with_preview=True, read_only=read_only) if row else None
 
 
 def decide(candidate_id: int, action: str, *, admin_user_id: int, note: str = "") -> dict[str, Any]:
@@ -851,35 +881,16 @@ def decide(candidate_id: int, action: str, *, admin_user_id: int, note: str = ""
                            (int(candidate_id),)).fetchone()
         if row is None:
             raise KeyError(candidate_id)
-        return {"candidate": _row_to_public(row, with_preview=False),
+        return {"candidate": _row_to_public(row),
                 "changed": bool(cursor.rowcount), "idempotent": not cursor.rowcount}
     finally:
         conn.close()
 
 
 def raw_file(candidate_id: int) -> dict[str, Any]:
-    """给管理端下载/预览用：返回真实落盘文件与媒体类型。"""
-    ensure_schema()
-    conn = _connect()
-    try:
-        row = conn.execute("SELECT * FROM corpus_candidates WHERE id = ?",
-                           (int(candidate_id),)).fetchone()
-    finally:
-        conn.close()
+    """Return exact verified bytes to the administrator, with no recorded paths."""
+    row = _candidate_row(candidate_id)
     if row is None:
         raise KeyError(candidate_id)
-    path = Path(row["stored_path"] or "")
-    if not path.is_file():
-        raise FileNotFoundError(str(path))
-    suffix = path.suffix.lower()
-    mime = {".md": "text/markdown; charset=utf-8", ".pdf": "application/pdf",
-            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            ".csv": "text/csv; charset=utf-8", ".txt": "text/plain; charset=utf-8",
-            ".md2": "text/markdown; charset=utf-8"}.get(suffix, "application/octet-stream")
-    try:
-        raw_format = row["raw_format"]
-    except (IndexError, KeyError):
-        raw_format = ""
-    return {"path": path, "mime": mime, "filename": path.name,
-            "raw_format": raw_format, "title": row["title"], "id": int(row["id"])}
+    filename, data = _candidate_original(row, include_data=True)
+    return {"data": data, "mime": original_media_type(filename), "filename": filename}

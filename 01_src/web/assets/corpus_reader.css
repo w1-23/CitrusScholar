@@ -318,3 +318,35 @@ body.corpus-reader-open { overflow: hidden; }
 .cr-ts-web {
   border-style: dashed;
 }
+
+.cr-heading {
+  flex: 0 0 auto;
+  padding: 14px 22px 12px;
+  border-bottom: 1px solid rgba(127, 113, 94, 0.25);
+  font-size: 15px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.cr-hit-block {
+  margin: 0.85em 0;
+  padding: 3px 12px;
+  border-inline-start: 3px solid var(--accent, #c9761f);
+  border-radius: 4px;
+  background: rgba(255, 196, 92, 0.25);
+  overflow-wrap: anywhere;
+}
+.cr-citation-focus { scroll-margin-block: 1rem; }
+[data-theme="dark"] .cr-hit-block,
+[data-theme="night"] .cr-hit-block { background: rgba(232, 174, 90, 0.2); }
+
+/* The answer's attributed sources are separate from the body prose. */
+.turn-citation-bubbles:not([hidden]) { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.turn-citation-bubble {
+  display: inline-flex; align-items: center; max-width: 100%; min-height: 28px;
+  border: 1px solid var(--border-hairline); border-radius: 999px;
+  background: var(--surface-card, var(--panel-bg)); padding: 4px 10px;
+  color: var(--text-primary); cursor: pointer; font: inherit; font-size: 12px;
+  line-height: 1.35; text-align: start; text-decoration: none; overflow-wrap: anywhere;
+}
+.turn-citation-bubble:hover { border-color: var(--accent); color: var(--accent); }
+.turn-citation-bubble:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

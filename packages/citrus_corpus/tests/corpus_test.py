@@ -155,6 +155,12 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
     with reader.pin(**models) as pinned:
         row0 = pinned.search("leaf nutrient")[0]
         assert reader.reference(row0["read_ref"])["markdown"] == row0["text"]
+        full = reader.reference(row0["read_ref"], full=True)
+        assert full["markdown"].startswith("# Methods\n\n")
+        assert full["markdown"][full["start"]:full["end"]] == row0["text"]
+        assert sha256(full["markdown"].encode()).hexdigest() == full["md_sha256"]
+        with pytest.raises(LookupError):
+            reader.reference({**row0["read_ref"], "md_sha256": "0" * 64}, full=True)
         with pytest.raises(LookupError):
             reader.reference({**row0["read_ref"], "start": row0["read_ref"]["start"] + 1})
         model.fail = True
@@ -195,6 +201,8 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
             assert experiment.search("leaf") == []
         with pytest.raises(LookupError):
             reader.reference(row0["read_ref"])
+        with pytest.raises(LookupError):
+            reader.reference(row0["read_ref"], full=True)
     assert publisher.rollback(generation0)["generation"] == generation0
     with reader.pin(**models) as restored:
         assert restored.search("leaf") == []

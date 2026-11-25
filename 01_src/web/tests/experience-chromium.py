@@ -155,6 +155,11 @@ def run(browser, origin, output):
           input.dispatchEvent(new Event('input', {{bubbles: true}}));
         }})()""")
 
+    def press_enter():
+        evaluate("document.querySelector('#user-input').focus()")
+        for event in ('keyDown', 'keyUp'):
+            browser.call('Input.dispatchKeyEvent', type=event, key='Enter', code='Enter', windowsVirtualKeyCode=13)
+
     def switch_session(title):
         selector = f'.session-title[title="{title}"]'
         check(f'Session listed: {title}', f'document.querySelector({json.dumps(selector)})')
@@ -168,12 +173,16 @@ def run(browser, origin, output):
 
     try:
         browser.call('Page.navigate', url=origin + '/')
-        check('Queue rank and no running indicator',
-              f"({text('.turn-queue-state')}).includes('第 3 位') && !document.querySelector('[data-state=waiting]')",
+        check('Only the user bubble displays a muted pending badge before dispatch',
+              "document.querySelector('.message.user .turn-user-queue-state')?.textContent === '待发送' "
+              "&& document.querySelectorAll('.turn-user-queue-state').length === 1 "
+              "&& getComputedStyle(document.querySelector('.message.bot.turn-awaiting-dispatch')).display === 'none' "
+              "&& !document.querySelector('.turn-queue-cancel, [data-state=waiting]') "
+              "&& !document.querySelector('#chat-container').innerText.includes('第 3 位')",
               timeout=30)
         capture('queued')
         phase('start')
-        check('One indicator shown at execution start', "document.querySelectorAll('[data-state=waiting]').length === 1 && document.querySelectorAll('.research-task-orbit i').length === 3")
+        check('One indicator shown at execution start', "document.querySelectorAll('[data-state=waiting]').length === 1 && document.querySelectorAll('.research-task-orbit i').length === 3 && !document.querySelector('.turn-user-queue-state, .turn-awaiting-dispatch')")
         elapsed = check('Execution clock populated', f"({text('.research-task-elapsed')}).match(/\\d+/) && ({text('.research-task-elapsed')})")
         capture('waiting')
         browser.call('Page.reload', ignoreCache=True)
@@ -211,79 +220,26 @@ def run(browser, origin, output):
         capture('answer')
         check('Only explicitly public progress is rendered',
               "document.querySelector('.research-process').textContent.includes('公开进度：正在核查列名') && !document.querySelector('#chat-container').textContent.includes('INTERNAL_FIXTURE_MARKER')")
-        check('The single composer defaults to the running task and shows its version',
+        check('Only cited sources appear in the answer bubble and duplicate Markdown links are removed',
+              "Array.from(document.querySelectorAll('.message.bot .turn-citation-bubbles .turn-citation-bubble'), el => el.textContent).join('|') === '联网：公开表格说明|本地：本地表格字典' "
+              "&& document.querySelector('.turn-citation-bubbles a')?.href === 'https://example.org/cited-table' "
+              "&& Array.from(document.querySelectorAll('.turn-answer a'), el => el.href).join('|') === 'https://example.org/ordinary' "
+              "&& !document.querySelector('.cr-turn-sources') && experienceRequests().sourceReads.length === 0")
+        check('The only composer action is Stop while the original task is executing',
               "document.querySelectorAll('.input-box textarea, .task-controls textarea').length === 1 "
-              "&& !document.querySelector('#composer-supplement').hidden "
-              "&& document.querySelector('#composer-task-target').title === 'browser-fixture-job' "
-              "&& document.querySelector('#composer-task-target').textContent.includes('任务版本 1') "
-              "&& document.querySelector('#composer-new-message').textContent === '作为新任务' "
-              "&& document.querySelector('#input-tools-menu').hidden && document.querySelector('#composer-browse').hidden")
-        browser.click('#composer-new-message')
-        check('The new-task override exposes attachments, Skills, and Browse with Browse off',
-              "document.querySelector('#composer-new-message').textContent === '补充当前任务' "
-              "&& !document.querySelector('#input-tools-menu').hidden && !document.querySelector('#composer-browse').hidden "
-              "&& !document.querySelector('#browse-requested').checked && document.activeElement.id === 'user-input'")
-        fill('待发送的新消息草稿')
-        browser.click('#composer-new-message')
-        check('Returning to the active task keeps the separate new-task draft out of the composer',
-              "document.querySelector('#user-input').value === '' "
-              "&& document.querySelector('#composer-task-target').title === 'browser-fixture-job' "
-              "&& document.querySelector('#input-tools-menu').hidden && document.activeElement.id === 'user-input'")
-        fill('被拒绝的补充')
-        evaluate("experienceUpdateMode('conflict')")
-        browser.click('#send-btn')
-        check('Conflict preserves the update draft without queueing a new turn',
-              "experienceRequests().updates.length === 1 && experienceRequests().updates[0].expected_version === 1 "
-              "&& experienceRequests().updates[0].instruction === '被拒绝的补充' && experienceRequests().posts.length === 0 "
-              "&& document.querySelector('#user-input').value === '被拒绝的补充' "
-              "&& document.querySelector('#composer-task-status').textContent.includes('草稿已保留') "
-              "&& !document.querySelector('#send-btn').disabled")
-        fill('回执会丢失的补充')
-        evaluate("experienceUpdateMode('lost', true)")
-        browser.click('#send-btn')
-        check('Lost update receipt uses its own ID and preserves the draft',
-              "experienceRequests().updates.length === 2 && experienceRequests().lookups[0] === experienceRequests().updates[1].update_request_id && document.querySelector('#user-input').value === '回执会丢失的补充' && !document.querySelector('#send-btn').disabled")
-        browser.call('Page.reload', ignoreCache=True)
-        check('Reload keeps the separate new-task draft and offers the active task',
-              "document.querySelector('#user-input')?.value === '待发送的新消息草稿' "
-              "&& !document.querySelector('#composer-supplement').hidden "
-              "&& document.querySelector('#composer-new-message').textContent === '补充当前任务'")
-        evaluate("experienceUpdateMode('lost', false)")
-        browser.click('#composer-new-message')
-        check('Lookup after reload confirms receipt of the original update without reposting',
-              "experienceRequests().updates.length === 2 && experienceRequests().posts.length === 0 "
-              "&& experienceRequests().lookups.at(-1) === experienceRequests().updates[1].update_request_id "
-              "&& document.querySelector('#user-input').value === '' && !document.querySelector('#send-btn').disabled "
-              "&& document.querySelector('#composer-task-target').textContent.includes('任务版本 2') "
-              "&& document.querySelector('#composer-task-status').textContent.includes('已接收第 2 版补充，等待应用')")
-        evaluate('experienceApplyUpdates()')
-        check('The application watermark changes the receipt message to applied',
-              "document.querySelector('#composer-task-status').textContent.includes('已应用第 2 版要求')")
-        fill('终态保留的补充草稿')
+              "&& document.querySelector('#send-btn').getAttribute('aria-label') === '停止当前任务' "
+              "&& document.querySelector('#send-btn use').getAttribute('href') === '#ui-stop' "
+              "&& !document.querySelector('#stop-btn, #composer-supplement, #composer-new-message') "
+              "&& !document.querySelector('#input-tools-menu').hidden && !document.querySelector('#browse-requested').checked")
+        fill('保留在原会话的独立草稿')
         switch_session('另一个会话')
         check('Different session receives an independent new-message draft',
-              "document.querySelector('#user-input').value === '' && document.querySelector('#composer-supplement').hidden")
+              "document.querySelector('#user-input').value === '' && document.querySelector('#send-btn').getAttribute('aria-label') === '发送消息'")
         fill('另一个会话的草稿')
         switch_session('表格核对')
-        check('Returning restores the original new-task draft',
-              "document.querySelector('#user-input').value === '待发送的新消息草稿' "
-              "&& document.querySelector('#composer-new-message').textContent === '补充当前任务'")
-        browser.click('#composer-new-message')
-        check('The same job restores its own update draft', "document.querySelector('#user-input').value === '终态保留的补充草稿'")
-        phase('done')
-        check('Terminal state displays completion', "document.querySelector('.turn-answer[data-display-status=completed]') && !document.querySelector('.is-running') && true")
-        capture('completed')
-        check('Terminal race keeps the supplement pinned and blocks sending it to another task',
-              "document.querySelector('#composer-task-target').title === 'browser-fixture-job' "
-              "&& document.querySelector('#user-input').value === '终态保留的补充草稿' "
-              "&& document.querySelector('#send-btn').disabled && experienceRequests().posts.length === 0 "
-              "&& document.querySelector('.task-update-recovery:not([hidden]) p')?.textContent === '终态保留的补充草稿'")
-        browser.click('#composer-new-message')
-        check('Explicitly switching after terminal restores the separate new-task draft',
-              "document.querySelector('#composer-supplement').hidden "
-              "&& document.querySelector('#user-input').value === '待发送的新消息草稿' "
-              "&& !document.querySelector('#send-btn').disabled "
-              "&& document.querySelector('.task-update-recovery:not([hidden]) p')?.textContent === '终态保留的补充草稿'")
+        check('Returning restores the original draft and the executing job control',
+              "document.querySelector('#user-input').value === '保留在原会话的独立草稿' "
+              "&& document.querySelector('#send-btn').getAttribute('aria-label') === '停止当前任务'")
         browser.click('#input-tools-menu summary')
         check('The plus menu exposes attachment selection and the real methods catalog',
               "document.querySelector('#attachment-btn') && document.querySelector('[data-skill-id=data-audit]')")
@@ -299,11 +255,26 @@ def run(browser, origin, output):
         })()''')
         check('Synthetic image paste shows a thumbnail and composing Enter does not send',
               "document.querySelector('#attachment-list img') && experienceRequests().posts.length === 0")
-        browser.click('#send-btn')
-        check('Send associates the screenshot and a frozen method with only its queue entry',
-              "experienceRequests().posts[0]?.attachments[0]?.name.endsWith('.png') && experienceRequests().posts[0].selected_skills[0]?.id === 'data-audit' && !('browse_requested' in experienceRequests().posts[0]) && document.querySelector('.sent-attachment-gallery img') && document.querySelector('#selected-skills').hidden")
-        browser.click('#browse-requested')
+        press_enter()
+        check('Enter associates the screenshot and frozen method with one independent queue entry',
+              "experienceRequests().posts.length === 1 && experienceRequests().posts[0]?.attachments[0]?.name.endsWith('.png') && experienceRequests().posts[0].selected_skills[0]?.id === 'data-audit' && !('browse_requested' in experienceRequests().posts[0]) "
+              "&& document.querySelector('.sent-attachment-gallery img') && document.querySelector('#selected-skills').hidden "
+              "&& document.querySelectorAll('.message.user .turn-user-queue-state').length === 1 "
+              "&& document.querySelector('#send-btn').getAttribute('aria-label') === '停止当前任务' && experienceRequests().updates.length === 0")
+        browser.click('#composer-browse')
         fill('第二条独立消息')
+        browser.click('#send-btn')
+        check('Clicking Stop cancels just the executing job and does not submit the draft or cancel its follower',
+              "experienceRequests().cancels.length === 1 && experienceRequests().cancels[0] === experienceActiveJob "
+              "&& experienceRequests().queueDeletes.length === 0 && experienceRequests().posts.length === 1 "
+              "&& document.querySelector('#user-input').value === '第二条独立消息' && document.querySelector('#browse-requested').checked "
+              "&& document.querySelector('#send-btn').getAttribute('aria-label') === '正在停止当前任务'")
+        phase('done')
+        check('Terminal answer returns the shared control to Send with the draft preserved',
+              "document.querySelector('.turn-answer[data-display-status=completed]') && !document.querySelector('.is-running') "
+              "&& document.querySelector('#send-btn').getAttribute('aria-label') === '发送消息' "
+              "&& document.querySelector('#user-input').value === '第二条独立消息'")
+        capture('completed')
         browser.click('#send-btn')
         check('Separate FIFO admissions keep their request identity',
               "experienceRequests().posts.length === 2 && experienceRequests().posts[0].client_request_id !== experienceRequests().posts[1].client_request_id && experienceRequests().posts[1].query === '第二条独立消息'")
@@ -314,17 +285,21 @@ def run(browser, origin, output):
         check('Subsequent new request omits the Browse flag',
               "experienceRequests().posts.length === 3 && !('browse_requested' in experienceRequests().posts[2])")
         evaluate('experienceQueueAvailability(false)')
-        check('Unavailable queue retains known rows and reports the sync gap',
-              "document.querySelector('#composer-task-status').textContent.includes('队列状态待同步') && document.querySelectorAll('.turn-queue-cancel').length === 3")
+        check('Unavailable queue retains known user bubbles and reports the sync gap',
+              "document.querySelector('#composer-task-status').textContent.includes('消息状态待同步') "
+              "&& document.querySelectorAll('.message.user .turn-user-queue-state').length === 3")
         evaluate('experienceQueueAvailability(true)')
-        browser.click('.turn-queue-cancel')
-        check('A single queue cancellation preserves other queued requests',
-              "document.querySelector('#chat-container').textContent.includes('已取消，这条消息不会执行') && document.querySelectorAll('.turn-queue-cancel').length === 2")
+        check('Queue polling recovers without additional submissions or cancellation actions',
+              "document.querySelector('#composer-task-status').hidden && experienceRequests().posts.length === 3 "
+              "&& experienceRequests().queueDeletes.length === 0 && !document.querySelector('.turn-queue-cancel')")
         evaluate('experienceScale(100, 10000)')
         started = time.monotonic()
         browser.call('Page.reload', ignoreCache=True)
-        check('Reload restores a cancellation before dispatch',
-              "document.querySelector('.turn-answer[data-display-status=cancelled]')?.textContent.includes('不会执行') && document.querySelectorAll('.turn-queue-cancel').length === 2")
+        check('Reload restores all pending user bubbles and no duplicate requests',
+              "document.querySelectorAll('.message.user .turn-user-queue-state').length === 3 "
+              "&& [...document.querySelectorAll('.message.bot.turn-awaiting-dispatch')].length === 3 "
+              "&& experienceRequests().posts.length === 3 && experienceRequests().updates.length === 0 "
+              "&& experienceRequests().queueDeletes.length === 0 && !document.querySelector('.turn-queue-cancel')")
         count = check('Long fixture renders its supplied history',
                       "document.querySelectorAll('.message').length >= 200 && document.querySelectorAll('.message').length",
                       timeout=30)
@@ -400,7 +375,13 @@ def run(browser, origin, output):
                         'observed': {'revision': 2, 'methods': ['HEAD', 'GET'], 'bytes': len(SAVED_SVG)}})
     except Exception:
         capture('failure')
-        diagnostic = evaluate("({ url: location.href, queue: document.querySelector('.turn-queue-state')?.textContent, body: document.body.innerText.slice(-5000), states:[...document.querySelectorAll('[data-state]')].map(x=>x.dataset.state) })")
+        diagnostic = evaluate('''({url: location.href,
+          queue: [...document.querySelectorAll('.turn-user-queue-state')].map(el => el.textContent),
+          composer: {label: document.querySelector('#send-btn')?.getAttribute('aria-label'),
+            draft: document.querySelector('#user-input')?.value,
+            textareas: document.querySelectorAll('.input-box textarea, .task-controls textarea').length,
+            legacyControls: !!document.querySelector('#stop-btn, #composer-supplement, #composer-new-message')},
+          body: document.body.innerText.slice(-5000), states: [...document.querySelectorAll('[data-state]')].map(el => el.dataset.state)})''')
         (output / 'failure.json').write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding='utf-8')
         raise
     finally:

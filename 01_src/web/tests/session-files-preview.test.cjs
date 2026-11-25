@@ -214,6 +214,7 @@ function makeBrowser() {
     setTimeout: () => 0, clearTimeout() {}, requestAnimationFrame: () => 0,
     addEventListener() {}, confirm: () => true, alert() {},
     URL: {createObjectURL: () => 'blob:test', revokeObjectURL() {}},
+    uiIcon() { return '<svg aria-hidden="true"></svg>'; },
     showBanner(message) { context.banners.push(message); },
     banners: []
   };
@@ -321,18 +322,19 @@ test('library item exposes explicit Preview, a Reference pill and a secondary me
   assert.deepEqual(returned, payload, 'loadSessionFiles return shape is unchanged');
   assert.equal(JSON.stringify(returned), before, 'rendering must not mutate the server payload');
 
-  const uploadedList = b.get('sessionFilesUploaded');
-  assert.equal(uploadedList.querySelector('[data-file-act="preview"]').textContent, '预览');
-  assert.equal(uploadedList.querySelector('.session-file-ref-pill').textContent, '＋ 引用');
-  assert.ok(uploadedList.querySelector('[aria-haspopup="menu"]'));
-  assert.equal(uploadedList.querySelector('[data-file-act="info"]').getAttribute('role'), 'menuitem');
-  assert.ok(uploadedList.querySelector('[data-file-act="delete"]'));
-  assert.match(uploadedList.textContent, /最近访问/);
-
-  const generatedList = b.get('sessionFilesGenerated');
-  assert.equal(generatedList.querySelector('[data-file-act="delete"]'), null);
-  assert.doesNotMatch(generatedList.textContent, /删除/);
-  assert.ok(generatedList.querySelector('[data-file-act="jump"]'));
+  const cards = b.get('sessionFilesUploaded').querySelectorAll('.session-file-item');
+  assert.equal(cards.length, 2, 'one searchable catalog contains both kinds of files');
+  const uploadedCard = cards.find(card => card.dataset.fileId === uploaded.file_id);
+  const generatedCard = cards.find(card => card.dataset.fileId === generated.file_id);
+  assert.equal(uploadedCard.querySelector('[data-file-act="preview"]').textContent.trim(), '预览');
+  assert.equal(uploadedCard.querySelector('.session-file-ref-pill').textContent.trim(), '引用');
+  assert.ok(uploadedCard.querySelector('[aria-haspopup="menu"]'));
+  assert.equal(uploadedCard.querySelector('[data-file-act="info"]').getAttribute('role'), 'menuitem');
+  assert.ok(uploadedCard.querySelector('[data-file-act="delete"]'));
+  assert.match(uploadedCard.querySelector('.session-file-sub').title, /最近使用/);
+  assert.equal(generatedCard.querySelector('[data-file-act="delete"]'), null);
+  assert.doesNotMatch(generatedCard.textContent, /删除/);
+  assert.ok(generatedCard.querySelector('[data-file-act="jump"]'));
 
   const retention = b.get('sessionFilesRetention').textContent;
   assert.match(retention, /连续 14 天/);
@@ -344,6 +346,46 @@ test('library item exposes explicit Preview, a Reference pill and a secondary me
   const info = b.get('sessionFilePreviewStage').innerHTML;
   assert.match(info, /最近访问/);
   assert.match(info, /连续 14 天未使用时自动清理/);
+});
+
+test('table thumbnails are visible-only, account-scoped, bounded and rendered as text', async () => {
+  const b = makeBrowser();
+  let observer;
+  class Intersections {
+    constructor(callback, options) { this.callback = callback; this.options = options; this.tiles = []; observer = this; }
+    observe(tile) { this.tiles.push(tile); }
+    unobserve(tile) { this.tiles = this.tiles.filter(item => item !== tile); }
+    disconnect() { this.tiles = []; }
+    change(tile, visible) { this.callback([{target: tile, isIntersecting: visible}], this); }
+  }
+  b.context.IntersectionObserver = Intersections;
+  const file = fileRecord({});
+  const route = `/api/v2/files/${file.file_id}/table-sample`;
+  const raw = '<img src=x onerror=alert(1)>';
+  const rows = [[raw, 'value', '', 'hidden? no', 'not sampled'], ['2'], ['3'], ['4']];
+  b.context.accountFetch = (url, options) => {
+    if (url === '/api/v2/files') return Promise.resolve(jsonResponse({uploaded: [file]}));
+    assert.equal(url, route);
+    assert.equal(options.credentials, 'same-origin');
+    assert.ok(options.signal);
+    return b.context.fetch(url, options);
+  };
+  b.fetchHandler = () => jsonResponse({rows});
+  await b.context.loadSessionFiles();
+  const tile = observer.tiles[0];
+  assert.equal(observer.options.root, b.get('sessionFilesBody'));
+  assert.equal(tile.querySelector('table'), null);
+  observer.change(tile, false);
+  assert.equal(b.requests.length, 0);
+  observer.change(tile, true);
+  await flush();
+  assert.deepEqual(b.requests.map(request => request.url), [route]);
+  assert.equal(tile.querySelector('table').querySelectorAll('tr').length, 3);
+  assert.equal(tile.querySelector('tr').querySelectorAll('td').length, 4);
+  assert.equal(tile.querySelector('td').textContent, raw);
+  assert.equal(tile.querySelector('img'), null);
+  b.context.resetSessionFiles();
+  assert.equal(b.get('sessionFilesUploaded').children.length, 0);
 });
 
 test('the reference pill queues the existing attachment reference without upload', async () => {

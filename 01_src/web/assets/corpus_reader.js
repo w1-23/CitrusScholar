@@ -1,15 +1,12 @@
-/* ─── R15: 本地语料原文阅读器 ─────────────────────────────────────────────
- * 回答里出现的本地来源标识（paper_… / doc_…）点击后，直接打开整篇原文阅读。
- * 原文来自本地语料（chunks.jsonl 按 chunk_index 还原），由只读接口
- * GET /api/v2/corpus/source?record=<键> 提供；前端只传键，从不传路径。
- * DOI 有就跳转、没有也照常打开——DOI 不是打开原文的前置条件。
- * ---------------------------------------------------------------------- */
+/* Owned citation bubbles open verified full Markdown or a clearly labeled fragment.
+ * Older exact-reference and candidate readers retain their own read paths. */
 (function () {
   'use strict';
 
   var MASK_ID = 'corpusReaderMask';
   var state = { key: '', data: null, view: 'rendered', request: 0 };
   var PAGE_CHARS = 12000;
+  var CITATION_PAGE_CHARS = 60000;
 
   function esc(s) {
     return String(s == null ? '' : s)
@@ -42,7 +39,8 @@
     mask.className = 'corpus-reader-mask';
     mask.setAttribute('hidden', '');
     mask.innerHTML =
-      '<div class="corpus-reader" role="dialog" aria-modal="true" aria-label="本地原文阅读">' +
+      '<div class="corpus-reader" role="dialog" aria-modal="true" aria-label="文献阅读">' +
+        '<header class="cr-heading" id="crHeading" hidden></header>' +
         '<div class="cr-body" id="crBody" tabindex="0"></div>' +
         '<footer class="cr-foot" id="crFoot">' +
           '<div class="cr-actions">' +
@@ -67,10 +65,13 @@
     });
     mask.querySelector('#crCopyBtn').addEventListener('click', copySource);
     mask.querySelector('#crPreviousBtn').addEventListener('click', function () {
-      if (state.shared && state.data) loadSharedPage(state.shared, Math.max(0, state.data.start - PAGE_CHARS));
+      if (state.citation && state.data && state.data.previous_start != null) loadCitationPage(state.data.previous_start);
+      else if (state.shared && state.data) loadSharedPage(state.shared, Math.max(0, state.data.start - PAGE_CHARS));
     });
     mask.querySelector('#crNextBtn').addEventListener('click', function () {
-      if (state.shared && state.data && state.data.next_start != null) loadSharedPage(state.shared, state.data.next_start);
+      if (!state.data || state.data.next_start == null) return;
+      if (state.citation) loadCitationPage(state.data.next_start);
+      else if (state.shared) loadSharedPage(state.shared, state.data.next_start);
     });
     document.addEventListener('keydown', function (ev) {
       if (ev.key === 'Escape' && !mask.hasAttribute('hidden')) closeReader();
@@ -87,6 +88,7 @@
   function closeReader() {
     state.request += 1;
     state.shared = null;
+    state.citation = null;
     state.data = null;
     var mask = document.getElementById(MASK_ID);
     if (mask) mask.setAttribute('hidden', '');
@@ -102,7 +104,7 @@
     var d = state.data;
     if (!d) return;
     var body = document.getElementById('crBody');
-    var foot = document.getElementById('crFoot');
+    if (state.citation) { paintCitation(d, body); return; }
     var viewBtn = document.getElementById('crViewBtn');
 
     if (state.view === 'raw') {
@@ -126,10 +128,78 @@
     if (footNote) {
       footNote.textContent = d.kind === 'stored_markdown'
         ? (d.exact_span ? '已保存 Markdown 引用片段 · ' : '已保存 Markdown 全文 · ') + (d.title || '共享文献') + ' · 字符 ' + (d.start + 1) + '–' + d.end + ' / ' + d.total_chars
-        : '基于分块重建 · 本地语料 ' + (d.corpus || '');
+        : (d.kind === 'stored_evidence' ? '已保存的引用片段 · ' : '基于分块重建 · ') + (d.corpus || '');
       document.getElementById('crPreviousBtn').hidden = !(state.shared && !d.exact_span && d.start > 0);
       document.getElementById('crNextBtn').hidden = !(state.shared && d.next_start != null);
     }
+  }
+
+  function citationRange(data) {
+    var text = data.markdown;
+    var start = data.hit_start - data.start, end = data.hit_end - data.start;
+    if (data.hit_start >= data.end || data.hit_end <= data.start) return null;
+    // Server offsets are Python Unicode code points, not JavaScript UTF-16 offsets.
+    var points = 0, units = 0, from = -1;
+    for (var character of text) {
+      if (points === start) from = units;
+      if (points === end) break;
+      points++;
+      units += character.length;
+    }
+    return from >= 0 && points === end ? [from, units] : null;
+  }
+
+  function renderCitationFragment(text) {
+    if (!text) return '';
+    try {
+      var parser = window.marked;
+      var renderer = new parser.Renderer();
+      renderer.html = esc;
+      // Reading a local document must not fetch remote images or auto-load other assets.
+      renderer.image = function (_, title, label) { return esc(label || title || '图片'); };
+      renderer.link = function (href, _, label) {
+        var url = /^https?:\/\//i.test(String(href || '')) ? safeWebUrl(href) : '';
+        return url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + label + '</a>' : label;
+      };
+      return parser.parse(text, { renderer: renderer, mangle: false, headerIds: false });
+    } catch (_) {
+      return '<pre class="cr-raw">' + esc(text) + '</pre>';
+    }
+  }
+
+  function paintCitation(data, body) {
+    var text = data.markdown;
+    var range = citationRange(data);
+    var raw = state.view === 'raw';
+    var heading = document.getElementById('crHeading');
+    heading.textContent = data.title || '文献阅读';
+    heading.hidden = false;
+    document.getElementById('crViewBtn').textContent = raw ? '渲染视图' : '原始 Markdown';
+    if (raw) {
+      body.innerHTML = '<pre class="cr-raw">' + (range
+        ? esc(text.slice(0, range[0])) + '<mark class="cr-hit cr-citation-focus">' +
+          esc(text.slice(range[0], range[1])) + '</mark>' + esc(text.slice(range[1]))
+        : esc(text)) + '</pre>';
+    } else {
+      body.innerHTML = range
+        ? renderCitationFragment(text.slice(0, range[0])) +
+          '<div class="cr-hit-block cr-citation-focus" aria-label="命中分块">' +
+          renderCitationFragment(text.slice(range[0], range[1])) + '</div>' +
+          renderCitationFragment(text.slice(range[1]))
+        : renderCitationFragment(text);
+    }
+    var label = data.kind === 'stored_markdown' ? '已保存的 Markdown 全文'
+      : data.kind === 'reconstructed_markdown' ? '由完整索引分块链重建，非原始文件'
+      : data.coverage === 'chunk' ? '仅保存的命中分块，全文不可用' : '仅保存的引用片段，全文不可用';
+    document.getElementById('crFootNote').textContent = label + ' · 字符 ' +
+      humanNum(data.start + 1) + '–' + humanNum(data.end) + ' / ' + humanNum(data.total_chars);
+    document.getElementById('crPreviousBtn').hidden = data.previous_start == null;
+    document.getElementById('crNextBtn').hidden = data.next_start == null;
+    document.getElementById('crCopyBtn').textContent = data.chars < data.total_chars ? '复制本页' :
+      (data.kind === 'stored_evidence' ? '复制片段' : '复制 Markdown');
+    body.scrollTop = 0;
+    var hit = body.querySelector('.cr-citation-focus');
+    if (hit) hit.scrollIntoView({block: 'center', inline: 'nearest'});
   }
 
   // 命中片段高亮：把工具结果里的证据片段在正文中定位出来。
@@ -224,6 +294,8 @@
     state.view = 'rendered';
     state.focus = focus;
     document.getElementById('crFootNote').textContent = '';
+    document.getElementById('crHeading').hidden = true;
+    document.getElementById('crCopyBtn').textContent = '复制原文';
     document.getElementById('crViewBtn').textContent = '原始 Markdown';
     document.getElementById('crPreviousBtn').hidden = true;
     document.getElementById('crNextBtn').hidden = true;
@@ -233,6 +305,7 @@
     var key = String(recordKey || '').trim();
     if (!key) return;
     state.shared = null;
+    state.citation = null;
     openReader(key, (opts && opts.focus) ? String(opts.focus) : '');
     loadSource('/api/v2/corpus/source?record=' + encodeURIComponent(key), 'local');
   }
@@ -249,9 +322,47 @@
   }
 
   function openSharedSource(ref) {
+    state.citation = null;
     state.shared = ref;
     openReader(ref.document_id, '');
     loadSharedPage(ref, ref.start);
+  }
+
+  function openCitation(source, scope) {
+    if (!source || !scope) return;
+    var id = String(source.reader_id || source.record_key || '');
+    if (!/^(cite|shared):[a-f0-9]{64}$/.test(id) || !scope.sessionId || !scope.requestId) return;
+    state.shared = null;
+    state.citation = { id: id, sessionId: scope.sessionId, requestId: scope.requestId, pin: null };
+    openReader(id, '');
+    loadCitationPage(null);
+  }
+
+  function loadCitationPage(offset) {
+    var citation = state.citation;
+    var params = new URLSearchParams({request_id: citation.requestId, ref_id: citation.id,
+                                      mode: 'full', length: CITATION_PAGE_CHARS});
+    if (offset != null) params.set('offset', offset);
+    loadSource('/api/v2/session/' + encodeURIComponent(citation.sessionId) + '/citation-source?' + params, 'citation');
+  }
+
+  function validCitationPage(page) {
+    if (!page || !['stored_markdown', 'reconstructed_markdown', 'stored_evidence'].includes(page.kind)
+        || page.offset_unit !== 'unicode_code_point' || typeof page.markdown !== 'string'
+        || !/^[a-f0-9]{64}$/.test(page.md_sha256 || '')) return false;
+    if (![page.start, page.end, page.total_chars, page.hit_start, page.hit_end].every(Number.isSafeInteger)
+        || page.start < 0 || page.end <= page.start || page.end > page.total_chars
+        || page.hit_start < 0 || page.hit_end <= page.hit_start || page.hit_end > page.total_chars
+        || Array.from(page.markdown).length !== page.end - page.start) return false;
+    if ((page.previous_start != null && (!Number.isSafeInteger(page.previous_start) ||
+         page.previous_start < 0 || page.previous_start >= page.start)) ||
+        (page.next_start != null && (page.next_start !== page.end || page.next_start >= page.total_chars))) return false;
+    if ((page.hit_start < page.end && page.hit_end > page.start) && !citationRange(page)) return false;
+    var pin = JSON.stringify([page.kind, page.coverage, page.index_generation, page.version_id, page.md_sha256,
+                              page.total_chars, page.hit_start, page.hit_end]);
+    if (state.citation.pin && state.citation.pin !== pin) return false;
+    state.citation.pin = pin;
+    return true;
   }
 
   function loadSource(url, kind) {
@@ -270,6 +381,10 @@
         if (request !== state.request) return;
         if (!res.ok || !res.payload || (kind === 'shared' ? res.payload.kind !== 'stored_markdown' : res.payload.ok !== true)) {
           setStatus(reasonText(res.payload, res.status), 'warn');
+          return;
+        }
+        if (kind === 'citation' && !validCitationPage(res.payload)) {
+          setStatus('该文献版本已变化或不可核验，请重新打开引用。', 'warn');
           return;
         }
         state.data = res.payload;
@@ -524,30 +639,6 @@
     }
   }
 
-  function watchChatSources() {
-    var host = document.getElementById('chat-container') || document.getElementById('chatMessages');
-    if (!host) { setTimeout(watchChatSources, 900); return; }
-    var timer = null;
-    var run = function () { try { attachHistorySources(host); } catch (e) {} };
-    if (typeof MutationObserver === 'function') {
-      new MutationObserver(function () {
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(run, 1500);
-      }).observe(host, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['data-request-id', 'class']
-      });
-    }
-    setTimeout(run, 1200);
-    window.addEventListener('focus', function () { setTimeout(run, 0); });
-    document.addEventListener('visibilitychange', function () {
-      if (!document.hidden) setTimeout(run, 0);
-    });
-  }
-
-
   // chips 自己的点击代理：不依赖 app.js 里针对 a.corpus-key 的代理
   document.addEventListener('click', function (ev) {
     var el = ev.target;
@@ -568,11 +659,11 @@
   window.CitrusCorpusReader = {
     open: openCorpusSource,
     openShared: openSharedSource,
+    openCitation: openCitation,
     close: closeReader,
     isOpen: isOpen,
     getState: function () { return { key: state.key, view: state.view, chars: (state.data && state.data.chars) || 0 }; },
     attachTurnSources: attachTurnSources,
     attachHistorySources: attachHistorySources
   };
-  watchChatSources();
 })();

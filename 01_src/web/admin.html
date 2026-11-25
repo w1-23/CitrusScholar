@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex,nofollow">
   <title>CitrusScholar 管理后台</title>
-  <link rel="stylesheet" href="/assets/admin.css?v=3">
-  <script src="/assets/admin.js?v=3" defer></script>
+  <link rel="stylesheet" href="/assets/admin.css?v=4">
+  <script src="/assets/admin.js?v=4" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -91,12 +91,12 @@
       <div class="audit-pager"><button class="button secondary" id="olderButton">更早记录</button><span id="auditPageLabel"></span><button class="button secondary" id="newerButton">更新记录</button></div>
     </section>
     <section class="panel">
-      <div class="panel-heading corpus-heading"><div><h2>文献候审库</h2><p>查看抓取原文与共享上传资料。抓取不到全文的条目可在这里补录。</p></div>
+      <div class="panel-heading corpus-heading"><div><h2>文献候审库</h2><p id="corpusModeHelp">查看历史候审记录、归档原件与书目信息。</p></div>
         <div class="corpus-actions">
           <label class="corpus-filter">状态
             <select id="corpusStatus">
               <option value="pending">待审</option>
-              <option value="fulltext_missing">待补全文</option>
+              <option id="corpusMissingOption" value="fulltext_missing">未取得全文</option>
               <option value="approved">已保留</option>
               <option value="rejected">已拒绝</option>
               <option value="all">全部</option>
@@ -128,6 +128,17 @@
       </div>
     </form>
   </div>
+  <dialog class="admin-modal-card corpus-original-dialog" id="corpusOriginalDialog" aria-labelledby="corpusOriginalTitle">
+    <h2 id="corpusOriginalTitle">查看归档原件</h2>
+    <p class="muted" id="corpusOriginalPaper"></p>
+    <p class="muted" id="corpusOriginalStatus" role="status"></p>
+    <pre id="corpusOriginalText" aria-label="原件正文" tabindex="0" hidden></pre>
+    <div class="actions admin-modal-actions">
+      <a class="button secondary" id="corpusOriginalPdf" target="_blank" rel="noopener noreferrer" hidden>在新标签页打开 PDF</a>
+      <a class="button secondary" id="corpusOriginalDownload" hidden>下载原件</a>
+      <button class="button primary" id="corpusOriginalClose" type="button" autofocus>关闭</button>
+    </div>
+  </dialog>
   <dialog class="admin-modal-card" id="corpusFulltextDialog" aria-labelledby="corpusFulltextTitle">
     <form id="corpusFulltextForm">
       <h2 id="corpusFulltextTitle">补录完整正文</h2>

@@ -1365,10 +1365,13 @@ async def admin_corpus_candidates(request: Request, status: str = "pending",
     require_admin(request)
     from src.core import corpus_review
     from src.shared_corpus.runtime import current_runtime
-    runtime = current_runtime()
+    can_review = legacy_enabled()
+    runtime = current_runtime() if can_review else None
 
     def list_with_preparation():
-        result = corpus_review.list_candidates(status=status, limit=limit, before_id=before_id, order=order)
+        result = corpus_review.list_candidates(status=status, limit=limit, before_id=before_id, order=order,
+                                               read_only=True)
+        result["legacy_mutation_enabled"] = can_review
         if runtime is not None:
             states = runtime.preparation_states(result["candidates"])
             for item in result["candidates"]:
@@ -1383,10 +1386,10 @@ async def admin_corpus_candidates(request: Request, status: str = "pending",
 async def admin_corpus_candidate(candidate_id: int, request: Request):
     require_admin(request)
     from src.core import corpus_review
-    item = await asyncio.to_thread(corpus_review.get_candidate, candidate_id)
+    item = await asyncio.to_thread(corpus_review.get_candidate, candidate_id, read_only=True)
     if item is None:
         raise HTTPException(status_code=404, detail="候选不存在。")
-    return item
+    return {**item, "legacy_mutation_enabled": legacy_enabled()}
 
 
 def _require_legacy_corpus_mutation():
@@ -1471,7 +1474,7 @@ async def admin_corpus_reopen(candidate_id: int, request: Request, req: CorpusRe
 
 
 @app.get("/api/v2/admin/corpus/candidates/{candidate_id}/raw")
-async def admin_corpus_raw(candidate_id: int, request: Request):
+async def admin_corpus_raw(candidate_id: int, request: Request, download: bool = False):
     """下载或预览候审的**原始资料**（.md 原文或上传的原始 PDF 字节）。"""
     require_admin(request)
     from src.core import corpus_review
@@ -1481,10 +1484,13 @@ async def admin_corpus_raw(candidate_id: int, request: Request):
         raise HTTPException(status_code=404, detail="候选不存在。")
     except FileNotFoundError:
         raise HTTPException(status_code=410, detail="原始文件已不在磁盘上。")
-    from fastapi.responses import FileResponse
-    return FileResponse(
-        str(info["path"]), media_type=info["mime"], filename=info["filename"],
-        headers={"Cache-Control": "no-store"})
+    from fastapi.responses import Response
+    mime = info["mime"]
+    is_text = mime in {"text/plain", "text/markdown", "text/csv"}
+    disposition = "attachment" if download or not (is_text or mime == "application/pdf") else "inline"
+    return Response(info["data"], media_type="text/plain" if is_text and not download else mime,
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+                 "Content-Disposition": f'{disposition}; filename="{info["filename"]}"'})
 
 
 def _attachment_excerpt(text: str, max_chars: int = 80_000) -> str:
@@ -6212,6 +6218,20 @@ async def export_account_file(file_id: str, body: AccountFileExportRequest, requ
                             detail={"code": exc.code, "message": str(exc)}) from exc
 
 
+@app.get("/api/v2/files/{file_id}/table-sample")
+async def account_table_sample(file_id: str, request: Request):
+    from src.session import files as session_files
+    from src.session.library_samples import table_sample
+
+    user = current_user(request)
+    info = await asyncio.to_thread(session_files.get_account_file, file_id,
+                                   int(user["user_id"]), touch=False)
+    sample = await asyncio.to_thread(table_sample, info) if info else None
+    if sample is None:
+        raise HTTPException(404, "该文件没有资料库表格缩略图。")
+    return JSONResponse(sample, headers={"Cache-Control": "private, no-store"})
+
+
 @app.get("/api/v2/files/{file_id}/preview")
 async def preview_account_file(file_id: str, request: Request, library_tile: bool = False):
     user = current_user(request)
@@ -6409,6 +6429,45 @@ async def corpus_source_endpoint(request: Request, record: str = ""):
     if payload is None:
         return JSONResponse(not_found, status_code=404)
     return JSONResponse(payload)
+
+
+@app.get("/api/v2/session/{session_id}/citation-source")
+async def session_citation_source(session_id: str, request: Request, request_id: str = "",
+                                  ref_id: str = "", mode: str = "full", offset: int | None = None,
+                                  length: int = 60_000):
+    """Open only a source actually attributed to this owned turn's answer."""
+    from src.core import jobs, task_events, turn_sources
+    from src.core.public_delivery import project_public_event
+
+    user = current_user(request)
+    require_owned_session(session_id, user)
+    if (mode != "full" or not 1 <= len(request_id) <= 160 or not 1 <= len(ref_id) <= 96
+            or offset is not None and not 0 <= offset <= 100_000_000 or not 1 <= length <= 60_000):
+        raise HTTPException(400, "无效的引用读取参数。")
+
+    def resolve():
+        job = jobs.jobs_for_turns(session_id, int(user["user_id"]), [request_id]).get(request_id)
+        if not job:
+            return None
+        scope_id = str(job.get("client_request_id") or job.get("request_id") or "")
+        with task_events.transaction() as conn:
+            row = conn.execute("SELECT data FROM task_events WHERE job_id=? AND event='citations' "
+                               "ORDER BY seq DESC LIMIT 1", (job["job_id"],)).fetchone()
+        data = project_public_event("citations", json.loads(row[0])) if row else {}
+        if data.get("display") != "bubble_only":
+            return None
+        for item in data.get("bubbles", ()):
+            if turn_sources.citation_bubble_id(item) == ref_id:
+                return turn_sources.read_cited_source(item, user, session_id=session_id,
+                    request_id=scope_id, offset=offset, length=length)
+        return None
+
+    result = await asyncio.to_thread(resolve)
+    headers = {"Cache-Control": "private, no-store"}
+    if result is None:
+        return JSONResponse({"ok": False, "reason": "citation_unavailable",
+                             "message": "该引用的文献或原文不可用。"}, status_code=404, headers=headers)
+    return JSONResponse(result, headers=headers)
 
 
 @app.get("/api/v2/session/{session_id}/turn-sources")

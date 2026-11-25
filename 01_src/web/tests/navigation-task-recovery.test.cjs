@@ -7,30 +7,22 @@ const active = (id = 'job', status = 'detached') => ({turn_request_id: id + '-re
 const events = (b, job) => b.requests.findLast(r => r.url.includes('/jobs/' + job + '/events?'));
 const chats = b => b.requests.filter(r => r.url === '/api/v2/chat');
 
-test.skip('unsaved job restores a task card and same-job append/stop without a chat submission (legacy /updates contract)', async () => {
+test('an unsaved detached task restores one task card and stops only its exact executing job', async () => {
   const b = browser(); render(b, [active()]);
   assert.equal(b.get('chat-container').querySelectorAll('.bot').length, 1);
   assert.equal(b.get('chat-container').querySelectorAll('.user').length, 0);
-  assert.match(b.get('chat-container').textContent, /任务在后台执行/);
+  assert.equal(b.get('chat-container').querySelector('.research-task-line').dataset.state, 'waiting');
+  assert.equal(b.context.activeTurnComposer.store.state.status, 'detached');
   assert.equal(b.context.currentJobId, 'job');
-  assert.equal(b.get('stop-btn').style.display, 'flex');
-  const binding = b.context.activeTurnComposer;
-  assert.equal(binding.controls.canUpdate(), true);
-  b.get('user-input').value = '追加要求';
-  const send = b.context.sendMsg(); await flush();
-  const update = b.requests.find(r => r.url.includes('/jobs/job/updates'));
-  assert.ok(update); reply(update, {accepted: true, version: 1}); await flush();
-  // submitUpdate also refreshes status; resolve it without replacing this task.
-  for (const request of b.requests.filter(r => r.url === '/jobs/job')) reply(request, {job_id: 'job', status: 'detached'});
+  assert.equal(b.get('send-btn').getAttribute('aria-label'), '停止当前任务');
+  b.get('user-input').value = '未发送的独立草稿';
+  b.context.activateComposer();
   await flush();
-  for (const request of b.requests.filter(r => r.url.includes('/jobs/job/events?'))) reply(request, framesPage('job', []));
-  await send;
+  assert.deepEqual(b.requests.filter(r => r.opts?.method === 'POST').map(r => r.url), ['/api/v2/chat/jobs/job/cancel']);
   assert.equal(chats(b).length, 0);
-  b.context.stopCurrentTask();
-  assert.ok(b.requests.some(r => r.url === '/api/v2/chat/jobs/job/cancel'));
-  assert.equal(b.requests.filter(r => r.url === '/api/v2/chat/cancel').length, 0);
-  assert.match(b.get('user-input').placeholder, /正在停止/);
-  assert.equal(binding.store.state.display_status, '');
+  assert.equal(b.requests.filter(r => r.url.includes('/updates')).length, 0);
+  assert.equal(b.get('user-input').value, '未发送的独立草稿');
+  assert.equal(b.get('send-btn').getAttribute('aria-label'), '正在停止当前任务');
 });
 
 test('a newer terminal turn cannot steal controls from an earlier active task', () => {
@@ -41,13 +33,24 @@ test('a newer terminal turn cannot steal controls from an earlier active task', 
   assert.ok(b.requests.some(r => r.url === '/api/v2/chat/jobs/running/cancel'));
 });
 
-test.skip('queued job blocks a second chat while retaining exact cancellation (legacy composer lock)', async () => {
-  const b = browser(); render(b, [active('queued', 'queued')]);
-  assert.equal(b.get('stop-btn').style.display, 'flex');
-  b.get('user-input').value = '不得另起一轮'; await b.context.sendMsg();
-  assert.equal(chats(b).length, 0);
+test('a restored queued job leaves Send available and is never the target of Stop', async () => {
+  const b = browser();
+  const turn = {session_id: 'session', client_request_id: 'queued-id', job_id: 'queued-job',
+    query: '原有排队消息', queue_seq: 1, queue_position: 2, state: 'queued'};
+  b.context.renderHistoryMessages([], b.context.mergeQueuedHistory([], [turn]));
+  const chat = b.get('chat-container');
+  assert.equal(chat.querySelector('.user').querySelector('.turn-user-queue-state').textContent, '待发送');
+  assert.ok(chat.querySelector('.bot').classList.contains('turn-awaiting-dispatch'));
+  assert.equal(chat.querySelector('.turn-queue-cancel'), null);
+  assert.equal(b.get('send-btn').getAttribute('aria-label'), '发送消息');
+  assert.equal(events(b, 'queued-job'), undefined);
   b.context.stopCurrentTask();
-  assert.ok(b.requests.some(r => r.url === '/api/v2/chat/jobs/queued/cancel'));
+  b.get('user-input').value = '再提交一条';
+  await b.context.activateComposer(); await flush();
+  const posts = b.requests.filter(r => r.opts?.method === 'POST');
+  assert.deepEqual(posts.map(r => r.url), ['/api/v2/session/session/turn-queue']);
+  assert.equal(JSON.parse(posts[0].opts.body).query, '再提交一条');
+  assert.equal(chats(b).length, 0);
 });
 
 test('rerender retires old observers and late replay cannot update replacement DOM', async () => {
@@ -62,12 +65,14 @@ test('rerender retires old observers and late replay cannot update replacement D
   assert.equal(b.requests.filter(r => r.url === '/jobs/old').length, 0);
 });
 
-test.skip('canonical terminal releases restored stop controls and never sends a session cancel (legacy answer event)', async () => {
+test('canonical terminal releases the restored shared Stop control without a cancellation request', async () => {
   const b = browser(); render(b, [active()]);
-  reply(events(b, 'job'), framesPage('job', [[1, 'done', {answer: '真实终答', turn_envelope: {display_status: 'completed'}}]])); await flush();
-  assert.match(b.get('chat-container').textContent, /真实终答/);
-  assert.equal(b.get('stop-btn').style.display, 'none');
-  assert.equal(b.context.currentJobId, '');
+  assert.equal(b.get('send-btn').getAttribute('aria-label'), '停止当前任务');
+  reply(events(b, 'job'), framesPage('job', [[1, 'done', {answer: '真实终答', turn_envelope: {display_status: 'completed'}}]]));
+  await flush();
+  const answer = b.get('chat-container').querySelector('.turn-answer');
+  assert.match(answer.innerHTML, /真实终答/);
+  assert.equal(b.get('send-btn').getAttribute('aria-label'), '发送消息');
   b.context.stopCurrentTask();
   assert.equal(b.requests.filter(r => r.opts?.method === 'POST').length, 0);
 });

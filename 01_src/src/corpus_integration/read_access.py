@@ -113,6 +113,40 @@ def read_reference_page(ref, *, offset=0, length=6000):
             "markdown": page["markdown"][offset:offset + length]}
 
 
+def read_reference_document(ref):
+    """Return stored Markdown only for an authorized, pinned citation reference."""
+    from src.core.capability_policy import allows
+
+    if not allows("local_rag") or ref["end"] - ref["start"] > 12000:
+        raise LookupError("shared_document_unavailable")
+    if "chunk_id" in ref:
+        from citrus_corpus.reader import Reader
+        from citrus_corpus.store import Store
+
+        root = reader_root()
+        if not root:
+            raise LookupError("shared_document_unavailable")
+        result = Reader(Store(root)).reference(ref, full=True)
+        if reader_root() != root:
+            raise LookupError("shared_document_unavailable")
+    else:
+        runtime = legacy_reader()
+        if runtime is None:
+            raise LookupError("shared_document_unavailable")
+        result = runtime.preview(ref["document_id"], generation=ref["index_generation"],
+                                 version=ref["version_id"], start=ref["start"],
+                                 length=ref["end"] - ref["start"], digest=ref["md_sha256"], full=True)
+        if (result["end"] != ref["end"] or result["md_sha256"] != ref["md_sha256"]
+                or result["version_id"] != ref["version_id"]
+                or result["index_generation"] != ref["index_generation"]):
+            raise LookupError("shared_document_unavailable")
+    if not allows("local_rag"):
+        raise LookupError("shared_document_unavailable")
+    return {"title": result["title"], "markdown": result["markdown"],
+            "hit_start": ref["start"], "hit_end": ref["end"], "md_sha256": ref["md_sha256"],
+            "index_generation": ref["index_generation"], "version_id": ref["version_id"]}
+
+
 def reference_visible(ref):
     if "chunk_id" not in ref:
         runtime = legacy_reader()

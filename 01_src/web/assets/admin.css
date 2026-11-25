@@ -65,3 +65,7 @@ body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 Inter,"Mi
 .invite-create-row input:focus-visible, .invite-create-row select:focus-visible, .corpus-filter select:focus-visible { outline:2px solid color-mix(in srgb,var(--accent) 60%,white); outline-offset:2px; }
 @media(max-width:720px) { .invite-code-row code { width:100%; } .admin-modal-actions { flex-direction:column-reverse; } .admin-modal-actions .button { width:100%; } }
 @media(prefers-reduced-motion:reduce) { .toast, .button, .small-button { transition:none; } }
+
+.corpus-original-dialog { width:min(840px, calc(100% - 32px)); box-sizing:border-box; }
+.corpus-original-dialog pre { max-height:52vh; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.55; }
+.corpus-original-dialog [hidden] { display:none; }

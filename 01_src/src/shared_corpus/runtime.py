@@ -187,7 +187,8 @@ class SharedCorpusRuntime:
             return {"indexing_status": state, "index_generation": pending["generation"]}
         return {**inactive, "indexing_status": "awaiting_build"}
 
-    def preview(self, document, *, generation=None, version=None, start=0, length=12000, digest=None):
+    def preview(self, document, *, generation=None, version=None, start=0, length=12000,
+                digest=None, full=False):
         with self.activity.reader():
             if self.unavailable or not self.generation:
                 raise LookupError("shared_document_unavailable")
@@ -206,11 +207,13 @@ class SharedCorpusRuntime:
             if start < 0 or start >= len(text) or length < 1:
                 raise ValueError("shared_preview_offset_out_of_range")
             stop = min(start + length, len(text))
+            if full and (stop - start != length or not self.catalog.is_visible(document, version)):
+                raise LookupError("shared_document_unavailable")
             return {"document_id": document, "version_id": version, "index_generation": generation,
                     "title": metadata.get("title", ""), "doi": metadata.get("doi", ""),
                     "section_path": metadata.get("section_path", []), "kind": "stored_markdown",
                     "md_sha256": actual_digest, "start": start, "end": stop, "total_chars": len(text),
-                    "next_start": stop if stop < len(text) else None, "markdown": text[start:stop]}
+                    "next_start": stop if stop < len(text) else None, "markdown": text if full else text[start:stop]}
 
     def _checked_candidate(self, generation):
         from .search import HEALTH_QUERY

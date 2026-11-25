@@ -252,7 +252,7 @@ def _source_ref(value):
 
 def _citation(value):
     row = _object(value)
-    item = project_fields(row, ids="kind ref_id record_key role type source_type source_family doi",
+    item = project_fields(row, ids="kind ref_id reader_id record_key role type source_type source_family doi",
                           numbers="index year score rank ref_number", bools="cited",
                           texts="title authors journal url source snippet excerpt abstract description")
     _set_object(item, row, "read_ref", _source_ref)

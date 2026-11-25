@@ -64,6 +64,9 @@ jobs:
             01_src/src/api/task_observation_regression_test.py \
             01_src/src/api/citation_identity_regression_test.py \
             01_src/src/api/citation_roles_refresh_test.py \
+            01_src/src/api/reference_views_test.py \
+            01_src/src/core/corpus_review_originals_test.py \
+            01_src/src/core/citation_reader_test.py \
             01_src/src/core/citation_stable_refs_test.py \
             01_src/src/research/render_script_contract_test.py \
             01_src/src/research/reference_kernel_test.py \

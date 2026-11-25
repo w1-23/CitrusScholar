@@ -114,13 +114,18 @@ test('attachment-only send shows a visible hint and preserves the attachment', a
   b.ctx._selectedAccountFileRefs = [];
   input(b).value = '';
   const notice = hint(b);
-  assert.equal(notice.textContent, '已选择附件；请填写正文后再发送。');
+  assert.match(notice.textContent, /已选择附件[，；]请填写正文后再发送/);
   assert.equal(notice.hidden, false);
-  await b.ctx.sendMsg();
+  const attachment = b.ctx._selectedAttachments[0];
+  let focused = false;
+  input(b).focus = () => { focused = true; };
+  await b.ctx.activateComposer();
   await flush();
   assert.equal(posts(b).length, 0);
-  assert.equal(b.ctx._selectedAttachments.length, 1, 'attachment selection survives');
-  assert.match(hint(b).textContent, /已选择附件；请填写正文后再发送，附件会保留。/);
+  assert.deepEqual(b.ctx._selectedAttachments, [attachment], 'attachment selection survives');
+  assert.equal(focused, true);
+  assert.equal(hint(b).hidden, false);
+  assert.match(notice.textContent, /请填写正文后再发送，附件会保留/);
 });
 
 test('a confirmed rejection removes only this optimistic turn and restores an untouched draft', async () => {
@@ -177,12 +182,17 @@ for (const [status, error] of [[502, null], [500, {detail: {code: 'internal_erro
     const lookup = '/api/v2/session/session/task-by-request/' + body.client_request_id;
     const read = b.requests.filter(r => r.url === lookup).pop();
     assert.ok(read, 'reconciles by the original client_request_id');
-    const botContent = messages(b)[1].querySelector('.content');
+    const [optimisticUser, optimisticBot] = messages(b);
+    const botContent = optimisticBot.querySelector('.content');
     assert.equal(botContent.dataset.requestId, body.client_request_id);
     b.reply(read, entry({client_request_id: body.client_request_id, job_id: 'root-7'}));
     await flush();
     assert.equal(posts(b).length, 1, 'reconciliation never re-posts the turn');
-    assert.match(b.get('chat-container').querySelector('.turn-queue-state').textContent, /排队中/);
+    assert.deepEqual(messages(b), [optimisticUser, optimisticBot]);
+    assert.equal(optimisticUser.querySelector('.turn-user-queue-state').textContent, '待发送');
+    assert.ok(optimisticBot.classList.contains('turn-awaiting-dispatch'));
+    assert.equal(b.get('chat-container').querySelectorAll('.turn-user-queue-state').length, 1);
+    assert.equal(b.get('chat-container').querySelector('.turn-queue-cancel'), null);
   });
 
 }

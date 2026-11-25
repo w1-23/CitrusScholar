@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
+from hashlib import sha256
 from typing import Any
 
 from src.core import tool_results, turn_source_ledger
@@ -168,6 +170,139 @@ def read_local_citation(key: str, user: dict) -> dict | None:
             "source_ref": ref["ref"], "read_ref": ref, "title_label": row["title"],
             "corpus": result["source"]["locator"]["corpus_id"], "markdown": result["text"],
             "chars": len(result["text"])}
+
+
+CITATION_PAGE_CHARS = 60_000
+_CITE_KEY = re.compile(r"cite:[a-f0-9]{64}")
+
+
+def citation_bubble_id(item: dict) -> str:
+    """Read selector from the bound identity, never a model-facing citation ordinal."""
+    if item.get("kind") == "local":
+        key = item.get("record_key")
+        return key if isinstance(key, str) and _CITE_KEY.fullmatch(key) else ""
+    if item.get("kind") == "shared":
+        from src.shared_corpus.references import read_reference
+        ref = read_reference(item)
+        if ref:
+            return turn_source_ledger.reference_key("shared", ref)
+    return ""
+
+
+def _cited_ledger_entry(item: dict, session_id: str, request_id: str) -> tuple[dict, dict] | None:
+    key = citation_bubble_id(item)
+    kind = item.get("kind")
+    if not key or not session_id or not request_id:
+        return None
+    for row in turn_source_ledger.fetch_rows(session_id, request_id):
+        if row["kind"] != kind or row["source_key"] != key:
+            continue
+        ref = _read_ref(row)
+        if kind == "local":
+            ref = turn_source_ledger.local_read_reference(ref)
+            ref_kind = "cite"
+        else:
+            from src.shared_corpus.references import read_reference
+            ref = read_reference({"read_ref": ref})
+            ref_kind = "shared"
+        if ref and turn_source_ledger.reference_key(ref_kind, ref) == key:
+            return row, ref
+    return None
+
+
+def _cited_page(document: dict, *, offset: int | None, length: int) -> dict | None:
+    text = document["markdown"]
+    hit_start, hit_end = document["hit_start"], document["hit_end"]
+    if not 0 <= hit_start < hit_end <= len(text):
+        return None
+    target = hit_start if offset is None else offset
+    if target >= len(text):
+        return None
+
+    hit_page_start = hit_start // length * length
+    if hit_page_start + length < hit_end:
+        hit_page_start = hit_start
+    hit_page_end = max(hit_page_start + length, hit_end)
+
+    def page_start(position):
+        if position < hit_page_start:
+            return position // length * length
+        if position < hit_page_end:
+            return hit_page_start
+        return hit_page_end + (position - hit_page_end) // length * length
+
+    start = page_start(target)
+    end = start + length
+    if start < hit_page_start:
+        end = min(end, hit_page_start)
+    elif start == hit_page_start:
+        end = hit_page_end
+    end = min(end, len(text))
+    return {**document, "ok": True, "offset_unit": "unicode_code_point",
+            "start": start, "end": end, "total_chars": len(text), "chars": end - start,
+            "previous_start": page_start(start - 1) if start else None,
+            "next_start": end if end < len(text) else None, "markdown": text[start:end]}
+
+
+def _local_cited_document(ref: dict, row: dict, session_id: str, user: dict) -> dict | None:
+    from src.core import corpus_source
+    from src.core.capability_policy import allows
+    from src.retrieval.evidence_adapter import read_evidence
+
+    exact = _local_evidence(ref, session_id, user, preview=True)
+    if not exact:
+        return None
+    locator = exact["source"]["locator"]
+    details = {"title": row["title"], "corpus": locator["corpus_id"]}
+    if allows("local_rag"):
+        chunk = read_evidence(ref["ref"], turn_id=ref["turn_id"], generation=ref["generation"],
+                              offset=0, max_chars=30_000, user=user, session_id=session_id)
+        if chunk["status"] != "ok":
+            return None
+        if (chunk["next_offset"] is None and chunk["source"]["locator"] == locator
+                and sha256(chunk["text"].encode("utf-8")).hexdigest() == locator.get("input_sha256")
+                and chunk["text"][ref["start"]:ref["end"]] == exact["text"]):
+            reconstructed = corpus_source.reconstruct_cited_document(locator, ref["generation"], user)
+            if reconstructed is not None and allows("local_rag"):
+                # Check the evidence again after expanding to the entire document.
+                if not _local_evidence(ref, session_id, user, preview=True):
+                    return None
+                return {**details, **reconstructed, "kind": "reconstructed_markdown"}
+            if allows("local_rag"):
+                return {**details, "kind": "stored_evidence", "coverage": "chunk", "markdown": chunk["text"],
+                        "hit_start": 0, "hit_end": len(chunk["text"]), "md_sha256": locator["input_sha256"]}
+    text = exact["text"]
+    return {**details, "kind": "stored_evidence", "coverage": "excerpt", "markdown": text,
+            "hit_start": 0, "hit_end": len(text), "md_sha256": sha256(text.encode("utf-8")).hexdigest()}
+
+
+def read_cited_source(item: dict, user: dict, *, session_id: str, request_id: str,
+                      offset: int | None = None, length: int = CITATION_PAGE_CHARS) -> dict | None:
+    """Expand a durable answer bubble already selected by the owned-turn API."""
+    from src.corpus_integration.read_access import read_reference_document
+    from src.retrieval.evidence_adapter import _require_session
+    from src.shared_corpus.activity import MaintenanceBusy
+
+    if (type(length) is not int or not 1 <= length <= CITATION_PAGE_CHARS
+            or (offset is not None and (type(offset) is not int or offset < 0))
+            or type(user.get("user_id")) is not int or user["user_id"] <= 0):
+        return None
+    try:
+        _require_session(user["user_id"], session_id)
+        verified = _cited_ledger_entry(item, session_id, request_id)
+        if not verified:
+            return None
+        row, ref = verified
+        if row["kind"] == "local":
+            document = _local_cited_document(ref, row, session_id, user)
+        elif user.get("active") and user.get("approval_status") == "approved":
+            document = {**read_reference_document(ref), "kind": "stored_markdown"}
+        else:
+            return None
+        _require_session(user["user_id"], session_id)
+        return _cited_page(document, offset=offset, length=length) if document else None
+    except (LookupError, MaintenanceBusy, OSError, sqlite3.Error, ValueError):
+        return None
 
 
 def _retained_shared_rows(records):
@@ -423,6 +558,7 @@ _LITERAL_MARKDOWN = re.compile(
     r"|!?\[[^\]\n]+\]\([^\n]*?\)|!?\[(?![LWHClwhc]\d{1,3}\])[^\]\n]+\][ \t]*\[[^\]\n]*\]"
     r'|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』|"[^"\n]*"', re.M)
 _INLINE_REFERENCE = re.compile(r"\[([LWHC]\d{1,3})\]", re.I)
+_CITATION_LINK = re.compile(r"\[([^]\n]+)\]\(\s*<?(https?://[^>\s)]+)>?(?:\s+[^)\n]+)?\)", re.I)
 
 
 def _visible_shared_reference(ref, user):
@@ -469,9 +605,9 @@ def answer_citations(answer, *, session_id, request_id, user):
 
     parts, start = [], 0
     for literal in _LITERAL_MARKDOWN.finditer(answer):
-        parts.extend((_INLINE_REFERENCE.sub(redact, answer[start:literal.start()]), literal[0]))
+        parts.extend(((False, _INLINE_REFERENCE.sub(redact, answer[start:literal.start()])), (True, literal[0])))
         start = literal.end()
-    parts.append(_INLINE_REFERENCE.sub(redact, answer[start:]))
+    parts.append((False, _INLINE_REFERENCE.sub(redact, answer[start:])))
     cited, dropped = [], []
     stored = None
     seen = set()
@@ -506,9 +642,19 @@ def answer_citations(answer, *, session_id, request_id, user):
         key = (row["kind"], row["source_key"])
         if key not in seen:
             item["ref_id"] = marker
+            if reader_id := citation_bubble_id(item):
+                item["reader_id"] = reader_id
             cited.append(item)
             seen.add(key)
-    return "".join(parts), {"display": "bubble_only", "bubbles": cited, "dropped": dropped}
+    cited_urls = {item["url"] for item in cited if item["kind"] == "web"}
+    body = []
+    for literal, text in parts:
+        link = _CITATION_LINK.fullmatch(text) if literal and cited_urls else None
+        if link and turn_source_ledger.safe_http_url(link[2]) in cited_urls:
+            # A link to the already-verified citation belongs on its citation bubble.
+            text = "" if _INLINE_REFERENCE.fullmatch(f"[{link[1]}]") else link[1]
+        body.append(text)
+    return "".join(body), {"display": "bubble_only", "bubbles": cited, "dropped": dropped}
 
 
 def visible_citation_bubbles(bubbles, user, *, session_id, request_id):
@@ -519,8 +665,8 @@ def visible_citation_bubbles(bubbles, user, *, session_id, request_id):
         kind = item.get("kind")
         if kind == "local" and read_local_citation(item.get("record_key", ""), user):
             visible.append(item)
-        elif kind == "shared" and _visible_shared_reference(item.get("read_ref"), user):
-            visible.append(item)
+        elif kind == "shared" and (ref := _visible_shared_reference(item.get("read_ref"), user)):
+            visible.append({**item, "reader_id": citation_bubble_id({**item, "read_ref": ref})})
         elif kind == "web" and request_id:
             if entries is None:
                 entries = _citation_entries(session_id, request_id)

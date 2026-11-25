@@ -236,6 +236,11 @@
   var corpusBefore = null;
   var corpusNext = null;
   var corpusSupplementId = null;
+  var corpusLegacyMutation = false;
+  var corpusOriginalRequest = null;
+  function corpusCandidateUrl(id) {
+    return '/api/v2/admin/corpus/candidates/' + encodeURIComponent(id);
+  }
   var preparationLabels = {
     queued: '等待索引准备', queue_full: '准备队列已满，未排队', source_too_large: '已归档，超过 8 MiB 索引准备上限',
     not_queued: '已归档，未排队', prepared: '已准备', needs_review: '等待授权审核',
@@ -249,6 +254,11 @@
     el('corpusSummary').textContent = '待审 ' + (counts.pending || 0) + ' 篇 · 已保留 ' +
       (counts.approved || 0) + ' 篇 · 已拒绝 ' + (counts.rejected || 0) +
       ' 篇';
+    corpusLegacyMutation = data.legacy_mutation_enabled === true;
+    el('corpusModeHelp').textContent = corpusLegacyMutation
+      ? '查看抓取原文与共享上传资料。未取得全文的条目可在这里补录。'
+      : '历史候审记录仅供查看。未取得全文的条目只显示书目信息。';
+    el('corpusMissingOption').textContent = corpusLegacyMutation ? '待补全文' : '未取得全文';
     var capacity = data.shared_capacity;
     if (capacity) {
       var notices = {
@@ -268,32 +278,36 @@
     var items = data.candidates || [];
     if (!items.length) { host.innerHTML = '<p class="muted">当前没有符合条件的资料</p>'; return; }
     host.innerHTML = items.map(function (item) {
-      var raw = '<a class="small-button" href="/api/v2/admin/corpus/candidates/' + item.id +
-        '/raw" target="_blank" rel="noopener">查看原文</a>';
+      var id = esc(item.id);
       var missing = item.archive_state === 'fulltext_missing';
-      if (missing) raw = '';
-      var actions = '';
-      if (missing && item.status === 'pending') {
-        actions = '<button class="small-button" data-corpus="fulltext" data-id="' + item.id + '">补录全文</button>' +
-          '<button class="small-button danger" data-corpus="reject" data-id="' + item.id + '">拒绝</button>';
-      } else if (item.status === 'pending') {
-        actions = raw +
-          '<button class="small-button" data-corpus="approve" data-id="' + item.id + '">保留</button>' +
-          '<button class="small-button danger" data-corpus="reject" data-id="' + item.id + '">拒绝</button>';
-      } else if (item.status === 'approved') {
-        actions = raw + '<button class="small-button danger" data-corpus="reject" data-id="' + item.id + '">撤下</button>';
-      } else {
-        actions = raw + '<button class="small-button" data-corpus="reopen" data-id="' + item.id + '">重审</button>';
+      var rawAvailable = item.raw_status === 'available';
+      var actions = rawAvailable
+        ? '<button class="small-button" data-corpus="open" data-id="' + id + '">查看原件</button>' : '';
+      if (corpusLegacyMutation) {
+        if (missing && item.status === 'pending') {
+          actions += '<button class="small-button" data-corpus="fulltext" data-id="' + id + '">补录全文</button>';
+        } else if (item.status === 'pending') {
+          actions += '<button class="small-button" data-corpus="approve" data-id="' + id + '">保留</button>';
+        }
+        if (item.status === 'pending' || item.status === 'approved') {
+          actions += '<button class="small-button danger" data-corpus="reject" data-id="' + id + '">' +
+            (item.status === 'approved' ? '撤下' : '拒绝') + '</button>';
+        } else {
+          actions += '<button class="small-button" data-corpus="reopen" data-id="' + id + '">重审</button>';
+        }
       }
       var doi = item.doi ? '<span class="corpus-doi">' + esc(item.doi) + '</span>' : '<span class="muted">无 DOI</span>';
-      var format = (item.raw_format || '未知格式') + (item.conversion && item.conversion.indexOf('none') === 0
-        ? '' : ' · ' + item.conversion);
+      var presence = missing ? '未取得全文 · 仅有元数据' : rawAvailable ? '已归档 · 原件可用' : '原件不可用';
+      var format = presence;
+      if (!missing) {
+        if (item.raw_format) format += ' · ' + item.raw_format;
+        if (item.conversion && item.conversion.indexOf('none') !== 0) format += ' · ' + item.conversion;
+        if (item.origin === 'admin_fulltext') format += ' · 已补录全文';
+      }
       var bytes = Number(item.raw_bytes || 0);
       var pmid = item.pmid ? ' · PMID ' + esc(item.pmid) : '';
       var source = missing && /^https?:\/\//i.test(item.url || '')
         ? ' · <a href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer">文献来源</a>' : '';
-      if (missing) format = '待补全文';
-      if (item.origin === 'admin_fulltext') format = '已补录全文 · ' + format;
       if (preparationLabels[item.preparation_status]) format += ' · ' + preparationLabels[item.preparation_status];
       return '<article class="corpus-item"><div class="corpus-main"><strong>' + esc(item.title || '(无标题)') + '</strong>' +
         '<small>' + doi + pmid + source + ' · ' + corpusBadge(item.source_kind) + ' · ' + esc(format) +
@@ -311,11 +325,70 @@
     var data = await jsonRequest('/api/v2/admin/corpus/candidates' + query);
     if (status === corpusFilter() && before === (status === 'fulltext_missing' && corpusBefore)) renderCorpusCandidates(data);
   }
+  function resetCorpusOriginal() {
+    if (corpusOriginalRequest) corpusOriginalRequest.abort();
+    corpusOriginalRequest = null;
+    el('corpusOriginalText').hidden = true;
+    el('corpusOriginalText').textContent = '';
+    ['corpusOriginalDownload', 'corpusOriginalPdf'].forEach(function (id) {
+      el(id).hidden = true;
+      el(id).removeAttribute('href');
+    });
+  }
+  async function openCorpusOriginal(button) {
+    resetCorpusOriginal();
+    var request = new AbortController();
+    corpusOriginalRequest = request;
+    var url = corpusCandidateUrl(button.dataset.id) + '/raw';
+    var dialog = el('corpusOriginalDialog');
+    var status = el('corpusOriginalStatus');
+    el('corpusOriginalPaper').textContent = button.closest('article').querySelector('strong').textContent;
+    status.textContent = '正在读取归档原件…';
+    if (!dialog.open) dialog.showModal();
+    try {
+      var response = await fetch(url, {credentials:'same-origin', cache:'no-store', signal:request.signal});
+      if (request.signal.aborted) return;
+      if (response.status === 401) { location.replace('/?next=%2Fadmin'); return; }
+      if (!response.ok) {
+        status.textContent = response.status === 404 || response.status === 410
+          ? '原件已不可用。可关闭此窗口并刷新候审列表。'
+          : '无法读取归档原件，请稍后重试。';
+        return;
+      }
+      var mime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      var isText = ['text/plain', 'text/markdown', 'text/csv'].indexOf(mime) !== -1;
+      if (response.redirected || mime === 'application/json' || mime === 'text/html' || !mime) {
+        status.textContent = '未收到原件，请刷新候审列表后重试。';
+        return;
+      }
+      if (isText) {
+        var text = await response.text();
+        if (request.signal.aborted) return;
+        el('corpusOriginalText').textContent = text;
+        el('corpusOriginalText').hidden = false;
+        status.textContent = '正在显示归档文件的原始文字。';
+      } else {
+        if (response.body) response.body.cancel().catch(function () {});
+        status.textContent = mime === 'application/pdf'
+          ? '可在新标签页查看 PDF，或下载原件。' : '该格式不支持页内预览，可下载原件后打开。';
+        if (mime === 'application/pdf') {
+          el('corpusOriginalPdf').href = url;
+          el('corpusOriginalPdf').hidden = false;
+        }
+      }
+      el('corpusOriginalDownload').href = url + '?download=true';
+      el('corpusOriginalDownload').hidden = false;
+    } catch (_error) {
+      if (!request.signal.aborted) status.textContent = '无法读取归档原件，请稍后重试。';
+    }
+  }
   async function handleCorpusAction(event) {
     var button = event.target.closest('button[data-corpus]');
     if (!button) return;
     try {
       var action = button.dataset.corpus;
+      if (action === 'open') { await openCorpusOriginal(button); return; }
+      if (!corpusLegacyMutation) return;
       if (action === 'fulltext') {
         corpusSupplementId = button.dataset.id;
         el('corpusFulltextForm').reset();
@@ -325,7 +398,7 @@
         return;
       }
       if (action === 'reject' && !confirm('不再保留这篇资料？之后仍可重审。')) return;
-      await jsonRequest('/api/v2/admin/corpus/candidates/' + button.dataset.id + '/' + action,
+      await jsonRequest(corpusCandidateUrl(button.dataset.id) + '/' + action,
         {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({note:''})});
       notify('已更新保留状态');
       await loadCorpus();
@@ -336,12 +409,12 @@
     var button = el('corpusFulltextSubmit');
     var file = el('corpusFulltextFile').files[0];
     var errorBox = el('corpusFulltextError');
-    if (!file || button.disabled) return;
+    if (!corpusLegacyMutation || !file || button.disabled) return;
     errorBox.textContent = '';
     button.disabled = true;
     el('corpusFulltextCancel').disabled = true;
     try {
-      var result = await jsonRequest('/api/v2/admin/corpus/candidates/' + corpusSupplementId + '/fulltext',
+      var result = await jsonRequest(corpusCandidateUrl(corpusSupplementId) + '/fulltext',
         {method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:file});
       el('corpusFulltextDialog').close();
       var preparation = preparationLabels[result.candidate.preparation_status];
@@ -642,6 +715,8 @@
       el('corpusList').addEventListener('click', function (event) { handleCorpusAction(event).catch(function (e) { notify(e.message); }); });
       el('corpusNewest').addEventListener('click', function () { corpusBefore = null; loadCorpus().catch(function (e) { notify(e.message); }); });
       el('corpusOlder').addEventListener('click', function () { corpusBefore = corpusNext; loadCorpus().catch(function (e) { notify(e.message); }); });
+      el('corpusOriginalClose').addEventListener('click', function () { el('corpusOriginalDialog').close(); });
+      el('corpusOriginalDialog').addEventListener('close', function () { if (!this.open) resetCorpusOriginal(); });
       el('corpusFulltextForm').addEventListener('submit', submitCorpusFulltext);
       el('corpusFulltextCancel').addEventListener('click', function () { el('corpusFulltextDialog').close(); });
       el('corpusFulltextDialog').addEventListener('cancel', function (event) {

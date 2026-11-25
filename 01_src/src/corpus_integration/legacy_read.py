@@ -32,7 +32,8 @@ class LegacyReader:
         except (sqlite3.Error, ValueError):
             return []
 
-    def preview(self, document, *, generation=None, version=None, start=0, length=12000, digest=None):
+    def preview(self, document, *, generation=None, version=None, start=0, length=12000,
+                digest=None, full=False):
         generation = generation or read_pointer(self.root)
         members = self._members(generation, document, version)
         if len(members) != 1:
@@ -45,11 +46,13 @@ class LegacyReader:
                 not self._members(generation, document, version)):
             raise LookupError("shared_document_unavailable")
         end = min(start + length, len(text))
+        if full and end - start != length:
+            raise LookupError("shared_document_unavailable")
         return {"document_id": document, "version_id": version, "index_generation": generation,
                 "title": metadata.get("title", ""), "doi": metadata.get("doi", ""),
                 "section_path": metadata.get("section_path", []), "kind": "stored_markdown",
                 "md_sha256": actual, "start": start, "end": end, "total_chars": len(text),
-                "next_start": end if end < len(text) else None, "markdown": text[start:end]}
+                "next_start": end if end < len(text) else None, "markdown": text if full else text[start:end]}
 
 
 def archived_reader():

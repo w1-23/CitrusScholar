@@ -17,11 +17,16 @@
 
   function resetSessionFiles() {
     catalogScope += 1;
+    clearTableTiles();
+    closeMoreMenus(null);
     fileCache = Object.create(null);
     libraryRows = [];
     if (el("librarySearch")) el("librarySearch").value = "";
     if (el("libraryKind")) el("libraryKind").value = "";
     if (el("sessionFilesStats")) el("sessionFilesStats").textContent = "";
+    ['sessionFilesUploaded', 'sessionFilesGenerated'].forEach(function (id) {
+      if (el(id)) el(id).replaceChildren();
+    });
     retentionIdleDays = 0;
     listLoaded = false;
     closeSessionFilePreview();
@@ -77,35 +82,38 @@
     var jump = (f.turn_request_id && f.source_session_id);
     var menuId = 'session-file-menu-' + String(f.file_id || '');
     var lastAccess = fmtTime(f.last_accessed_at);
-    var ext = String(f.filename || '').split('.').pop().toUpperCase().slice(0, 5);
+    var stamp = Number(f.last_accessed_at || f.created_at || 0);
+    var date = stamp && isFinite(stamp) ? new Date(stamp * 1000) : null;
+    var dateLabel = date && isFinite(date.getTime()) ? date.toLocaleDateString() : '';
+    var ext = (String(f.filename || '').match(/\.([^.]+)$/) || ['', ''])[1].toUpperCase().slice(0, 5);
     var thumbnail = kind === 'image' && Number(f.size_bytes) <= 2*1024*1024 && safePreviewUrl(f.preview_url);
-    var thumbnailHtml = thumbnail
-      ? '<img src="' + esc(thumbnail + (thumbnail.includes('?') ? '&' : '?') + 'library_tile=1') + '" alt="" loading="lazy">'
-      : window.uiIcon(kind === 'svg' ? 'chart' : 'file') + '<small>' + esc(ext) + '</small>';
+    var tableTile = kind === 'table' && /^[a-f0-9]{32}$/i.test(String(f.file_id || ''));
+    var thumbnailHtml = '<span class="session-file-thumb-fallback">' +
+      window.uiIcon(kind === 'table' ? 'table' : kind === 'svg' ? 'canvas' : 'file') +
+      (ext ? '<small>' + esc(ext) + '</small>' : '') + '</span>' + (thumbnail
+      ? '<img src="' + esc(thumbnail + (thumbnail.includes('?') ? '&' : '?') + 'library_tile=1') +
+        '" alt="" loading="lazy" decoding="async">' : '');
     // Card content is not itself a button: preview is an explicit, labelled
     // action, and every secondary operation lives in the ⋯ menu. This keeps a
     // single tab stop per action and gives touch/pointer users a 44px target.
     return '' +
       '<div class="session-file-item" data-file-id="' + esc(f.file_id) + '"' +
       '     data-kind="' + esc(kind) + '" data-filename="' + esc(f.filename) + '">' +
-      '  <span class="session-file-thumb k-' + esc(kind) + '" aria-hidden="true">' + thumbnailHtml + '</span>' +
+      '  <div class="session-file-thumb k-' + esc(kind) + '" aria-hidden="true"' +
+           (tableTile ? ' data-table-tile="' + esc(f.file_id) + '"' : '') + '>' + thumbnailHtml + '</div>' +
       '  <div class="session-file-open">' +
-      '    <span class="session-file-badge k-' + esc(kind) + '">' + esc(label) + '</span>' +
-      // 完整文件名始终放在 title 里：卡片里最多两行，超出的部分截断但可悬停看全名
       '    <span class="session-file-name" title="' + esc(f.filename) + '">' + esc(f.filename) + '</span>' +
-      '    <span class="session-file-sub">' + esc(fmtSize(f.size_bytes)) +
-             ' · 创建 ' + esc(fmtTime(f.created_at) || '—') + '</span>' +
-      (lastAccess
-        ? '    <span class="session-file-last">最近使用 ' + esc(lastAccess) + '</span>'
-        : '') +
+      '    <div class="session-file-sub" title="' + esc((lastAccess ? '最近使用 ' + lastAccess : fmtTime(f.created_at))) + '">' +
+      '      <span class="session-file-badge k-' + esc(kind) + '">' + esc(label) + '</span> ' + esc(fmtSize(f.size_bytes)) +
+             (dateLabel ? '<span class="session-file-date"> · ' + esc(dateLabel) + '</span>' : '') + '</div>' +
       '  </div>' +
       '  <div class="session-file-actions">' +
       '    <button type="button" class="session-file-preview-btn" data-file-act="preview" data-file-id="' +
            esc(f.file_id) + '" title="预览 ' + esc(f.filename) + '" aria-label="预览 ' +
-           esc(f.filename) + '" aria-haspopup="dialog">' + window.uiIcon('eye') + ' 预览</button>' +
+           esc(f.filename) + '" aria-haspopup="dialog">' + window.uiIcon('eye') + ' <span>预览</span></button>' +
       '    <button type="button" class="session-file-ref-pill" data-file-act="reference" data-file-id="' +
            esc(f.file_id) + '" title="在当前对话中引用" aria-label="引用 ' +
-           esc(f.filename) + '">＋ 引用</button>' +
+           esc(f.filename) + '">' + window.uiIcon('plus') + ' <span>引用</span></button>' +
       '    <button type="button" class="session-file-act session-file-more-btn" data-file-act="more" data-file-id="' +
            esc(f.file_id) + '" title="更多操作" aria-label="更多操作（' + esc(f.filename) +
            '）" aria-haspopup="menu" aria-controls="' + esc(menuId) + '" aria-expanded="false">⋯</button>' +
@@ -145,7 +153,10 @@
       var batch = document.createElement('div');
       batch.innerHTML = files.slice(shown, next).map(itemHtml).join('');
       var first = batch.querySelector('[data-file-act="preview"]');
+      var tiles = batch.querySelectorAll('[data-table-tile]');
+      batch.querySelectorAll('img').forEach(bindImageTile);
       while (batch.firstChild) listEl.insertBefore(batch.firstChild, more.parentNode ? more : null);
+      if (!el('sessionFilesPanel').hidden) watchTableTiles(tiles);
       shown = next;
       more.hidden = shown === files.length;
       if (!more.hidden) more.textContent = '再显示 ' + Math.min(batchSize, files.length - shown) + ' 个文件';
@@ -160,6 +171,96 @@
     });
   }
 
+  function bindImageTile(img) {
+    function showImage() { if (img.naturalWidth) img.classList.add('is-ready'); }
+    img.addEventListener('load', showImage);
+    if (img.complete) showImage();
+  }
+
+  // Passive samples use a separate, no-retention-touch account route. Never
+  // substitute the explicit preview/download route while browsing the list.
+  var tableTileObserver = null;
+  var tableTilePending = new Set();
+  var tableTileActive = new Map();
+
+  function clearTableTiles() {
+    if (tableTileObserver) tableTileObserver.disconnect();
+    tableTileObserver = null;
+    tableTilePending.clear();
+    tableTileActive.forEach(function (request) { request.abort(); });
+    tableTileActive.clear();
+  }
+
+  function watchTableTiles(tiles) {
+    if (!tiles.length || !window.IntersectionObserver || !window.AbortController || !window.accountFetch) return;
+    if (!tableTileObserver) {
+      tableTileObserver = new window.IntersectionObserver(function (entries, observer) {
+        if (observer !== tableTileObserver) return;
+        entries.forEach(function (entry) {
+          var tile = entry.target;
+          if (entry.isIntersecting && !tableTileActive.has(tile)) tableTilePending.add(tile);
+          else tableTilePending.delete(tile);
+        });
+        fillTableTiles();
+      }, {root: el('sessionFilesBody')});
+    }
+    tiles.forEach(function (tile) { tableTileObserver.observe(tile); });
+  }
+
+  function fillTableTiles() {
+    while (tableTileObserver && tableTileActive.size < 2 && tableTilePending.size) {
+      var tile = tableTilePending.values().next().value;
+      tableTilePending.delete(tile);
+      tableTileObserver.unobserve(tile);
+      if (!el('sessionFilesPanel').hidden && document.contains(tile)) fetchTableTile(tile);
+    }
+  }
+
+  function fetchTableTile(tile) {
+    var request = new window.AbortController();
+    var fileId = String(tile.dataset.tableTile || '');
+    if (!/^[a-f0-9]{32}$/i.test(fileId)) return;
+    var timer = window.setTimeout(function () { request.abort(); }, 8000);
+    tableTileActive.set(tile, request);
+    window.accountFetch('/api/v2/files/' + encodeURIComponent(fileId) + '/table-sample', {
+      credentials: 'same-origin', headers: {'Accept': 'application/json'}, signal: request.signal
+    }).then(function (res) { return res.ok ? res.json() : null; }).then(function (payload) {
+      if (!request.signal.aborted && document.contains(tile) && tableTileActive.get(tile) === request) {
+        renderTableTile(tile, payload && payload.rows);
+      }
+    }).catch(function () { /* The format icon remains when no sample is available. */ })
+      .finally(function () {
+        window.clearTimeout(timer);
+        if (tableTileActive.get(tile) === request) {
+          tableTileActive.delete(tile);
+          fillTableTiles();
+        }
+      });
+  }
+
+  function renderTableTile(tile, rows) {
+    if (!Array.isArray(rows) || !rows.length) return;
+    var tbody = document.createElement('tbody');
+    var hasValues = false;
+    rows.slice(0, 3).forEach(function (row) {
+      if (!Array.isArray(row) || !row.length) return;
+      var tr = document.createElement('tr');
+      row.slice(0, 4).forEach(function (value) {
+        var td = document.createElement('td');
+        td.textContent = typeof value === 'string' ? value.slice(0, 80) : '';
+        if (td.textContent.trim()) hasValues = true;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    if (!hasValues) return;
+    var sample = document.createElement('table');
+    sample.className = 'session-file-table-sample';
+    sample.appendChild(tbody);
+    tile.appendChild(sample);
+    tile.classList.add('has-table-sample');
+  }
+
   function retentionSentence(days) {
     var n = Math.floor(Number(days) || 0);
     if (n > 0) {
@@ -170,6 +271,8 @@
   }
 
   function renderFilteredLibrary() {
+    clearTableTiles();
+    closeMoreMenus(null);
     var empty = el('sessionFilesEmpty');
     var query = String(el('librarySearch').value || '').trim().toLowerCase();
     var kind = el('libraryKind').value;
@@ -303,6 +406,7 @@
     var p = el('sessionFilesPanel');
     if (!p) return;
     var want = (typeof show === 'boolean') ? show : p.hidden;
+    var restoreFocus = !want && p.contains(document.activeElement);
     p.hidden = !want;
     document.body.classList.toggle('session-files-open', want);
     var toggle = el('sessionFilesRailBtn');
@@ -310,7 +414,15 @@
       toggle.setAttribute('aria-expanded', want ? 'true' : 'false');
       toggle.classList.toggle('active', want);
     }
-    if (want) { syncLibraryBounds(); scheduleLibraryColumns(); loadSessionFiles(); }
+    if (want) {
+      syncLibraryBounds(); scheduleLibraryColumns(); loadSessionFiles();
+      var close = p.querySelector('.session-files-close');
+      if (close && window.innerWidth <= 900) close.focus();
+    } else {
+      clearTableTiles();
+      closeMoreMenus(null);
+      if (toggle && restoreFocus) toggle.focus();
+    }
   }
 
   // P1-3: 打开前记住焦点，关闭后还回去（键盘用户不会掉到页面顶部）
@@ -2110,7 +2222,14 @@
         }
         if (event.key === 'Tab') { closeMoreMenus(null); return; }
       }
-      if (event.key === 'Escape') closeMoreMenus(null);
+      if (event.key === 'Escape') {
+        closeMoreMenus(null);
+        var panel = el('sessionFilesPanel');
+        if (!event.defaultPrevented && panel && !panel.hidden && panel.contains(target)) {
+          event.preventDefault();
+          toggleSessionFiles(false);
+        }
+      }
     });
     // 菜单是 position:fixed，面板滚动/窗口尺寸变化后位置会失效，直接关掉。
     var bodyEl = el('sessionFilesBody');

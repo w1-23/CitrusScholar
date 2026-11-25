@@ -58,7 +58,7 @@ class Reader:
             raise GenerationError("corpus_generation_membership_invalid")
         return handle, membership
 
-    def reference(self, reference):
+    def reference(self, reference, *, full=False):
         if reference.get("source_family") != ISOLATED.family_id:
             raise ValueError("corpus_reference_invalid")
         generation = reference["index_generation"]
@@ -78,7 +78,8 @@ class Reader:
             raise LookupError("corpus_reference_unavailable")
         if not self.catalog.visible(*pair):
             raise LookupError("corpus_reference_unavailable")
-        return {**reference, "title": metadata.get("title", ""), "markdown": text[start:end]}
+        return {**reference, "title": metadata.get("title", ""),
+                "markdown": text if full else text[start:end]}
 
 
 class PinnedReader:

@@ -1178,8 +1178,6 @@ if (typeof marked === 'undefined') window.marked = { parse: function(t) { return
 var composerDraftPrefix = 'citrus.composer.';
 var composerDrafts = new Map();
 var composerSelections = new Map();
-var composerSupplement = null;
-var composerTaskViewDisposing = false;
 var queueSyncUnavailable = false;
 var browseCheckbox = document.getElementById('browse-requested');
 if (browseCheckbox) browseCheckbox.addEventListener('change', refreshTaskComposer);
@@ -1236,11 +1234,10 @@ function saveReceivedUpdates(key, received) {
 }
 
 function saveComposerInput() {
-  writeComposerDraft(composerSupplement ? composerSupplement.key : composerDraftKey(), userInput.value);
+  writeComposerDraft(composerDraftKey(), userInput.value);
 }
 
 function clearComposerDrafts() {
-  composerSupplement = null;
   composerDrafts.clear();
   composerSelections.clear();
   queueSyncUnavailable = false;
@@ -1300,82 +1297,17 @@ function readSupplementDraft(state) {
   return {text: [draft.text].concat(unapplied).filter(Boolean).join('\n\n'), pending: draft.pending};
 }
 
-function leaveComposerSupplement() {
-  var previous = composerSupplement;
-  if (!previous) return null;
-  saveComposerInput();
-  composerSupplement = null;
-  userInput.value = composerDraft(composerDraftKey()).text;
-  return previous;
-}
-
-function activeSupplementBinding() {
-  var binding = activeTurnComposer;
-  return !composerTaskViewDisposing && binding && binding.owns() && !binding.stopping &&
-    (!binding.queueEntry || ['settling', 'terminal'].indexOf(binding.queueEntry.state) < 0) &&
-    binding.controls && binding.controls.acceptsUpdates &&
-    binding.controls.acceptsUpdates() ? binding : null;
-}
-
-function selectComposerSupplement(binding) {
-  var jobId = binding.store.state.job_id, key = composerDraftKey(jobId);
-  if (!key) return;
-  saveComposerInput();
-  composerSupplement = {controller: binding.controls, jobId: jobId, key: key, epoch: authEpoch,
-    label: String(binding.query || '').replace(/\s+/g, ' ').trim().slice(0, 48) || jobId};
-  var draft = composerDraft(key);
-  userInput.value = draft.text;
-  if (draft.pending) {
-    var target = composerSupplement;
-    Promise.resolve().then(function () {
-      if (composerSupplement === target) return settleComposerUpdate(target, 'lookup');
-    });
-  }
-}
-
-
-function useNewTaskComposer(moveDraft) {
-  var previous = leaveComposerSupplement();
-  if (previous && moveDraft && !userInput.value) {
-    var draft = composerDraft(previous.key);
-    if (!draft.pending && !previous.controller.isBusy()) {
-      userInput.value = draft.text;
-      writeComposerDraft(previous.key, '');
-      saveComposerInput();
-    }
-  }
-  if (previous && previous.controller.owns()) previous.controller.render(previous.controller.store.state);
-}
-
 function reconcileSupplement(controller) {
   var jobId = controller.store.state.job_id, key = composerDraftKey(jobId);
-  if (key && composerDraft(key).pending) void settleComposerUpdate({controller: controller, jobId: jobId, key: key, epoch: authEpoch}, 'lookup');
+  if (key && composerDraft(key).pending) void lookupLegacyComposerUpdate({controller: controller, jobId: jobId, key: key, epoch: authEpoch});
 }
 
-function submitComposerSupplement() {
-  var target = composerSupplement, controller = target.controller;
-  if (!controller.owns() || controller.isBusy() || controller.store.state.job_id !== target.jobId) return;
-  saveComposerInput();
-  var draft = composerDraft(target.key), binding = activeSupplementBinding();
-  var canSend = binding && binding.controls === controller && binding.store.state.job_id === target.jobId;
-  if (draft.pending) return settleComposerUpdate(target, canSend ? 'retry' : 'lookup');
-  if (!canSend || !draft.text.trim()) return;
-  var requestId = 'update-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
-  savePendingUpdate(target.key, {text: draft.text, payload: {update_request_id: requestId,
-    expected_version: controller.store.state.task_version, instruction: draft.text.trim()}});
-  return settleComposerUpdate(target, 'submit');
-}
-
-async function settleComposerUpdate(target, action) {
+async function lookupLegacyComposerUpdate(target) {
   var controller = target.controller;
   var draft = composerDraft(target.key), pending = draft.pending;
   if (!pending || controller.isBusy() || controller.store.state.job_id !== target.jobId) return;
-  var outcome = await controller.submitUpdate(pending.payload, action, function () {
-    var binding = activeSupplementBinding();
-    return composerSupplement === target && binding && binding.controls === controller && binding.store.state.job_id === target.jobId;
-  });
+  var outcome = await controller.submitUpdate(pending.payload, 'lookup', function () { return false; });
   if (outcome === 'pending' || target.epoch !== authEpoch || draft.pending !== pending) return;
-  if (composerSupplement && composerSupplement.key === target.key) saveComposerInput();
   if (outcome.version && outcome.status !== 'applied' && (outcome.status !== 'not_applied' || draft.text !== pending.text)) {
     draft.received[outcome.version] = pending.text;
     saveReceivedUpdates(target.key, draft.received);
@@ -1383,27 +1315,13 @@ async function settleComposerUpdate(target, action) {
   savePendingUpdate(target.key, null);
   if (outcome.version && outcome.status !== 'not_applied' && !pending.edited && draft.text === pending.text) {
     writeComposerDraft(target.key, '');
-    if (composerSupplement && composerSupplement.key === target.key) userInput.value = '';
   }
   if (controller.owns()) controller.render(controller.store.state);
   refreshTaskComposer();
 }
 
-var newMessageModeButton = document.getElementById('composer-new-message');
-if (newMessageModeButton) newMessageModeButton.addEventListener('click', function () {
-  if (composerSupplement) useNewTaskComposer(true);
-  else {
-    var binding = activeSupplementBinding();
-    if (binding) {
-      selectComposerSupplement(binding);
-    }
-  }
-  refreshTaskComposer();
-  userInput.focus();
-});
-
 function handleAttachmentSelection(fileList) {
-  if (!currentAccount || accountDocumentRetired || composerSupplement) return;
+  if (!currentAccount || accountDocumentRetired) return;
   var dropped = Array.from(fileList || []);
   var allowed = dropped.filter(function(file) {
     var name = String(file.name || '').toLowerCase();
@@ -1429,7 +1347,7 @@ function handleAttachmentSelection(fileList) {
 }
 
 function handleAttachmentPaste(event) {
-  if (!currentAccount || accountDocumentRetired || composerSupplement || event.defaultPrevented) return;
+  if (!currentAccount || accountDocumentRetired || event.defaultPrevented) return;
   var clipboard = event.clipboardData;
   if (!clipboard) return;
   // files and items usually describe the same payload. Read only one of them.
@@ -1491,12 +1409,12 @@ function hasDraggedFiles(event) {
     if (!hasDraggedFiles(event)) return;
     event.preventDefault();
     dragDepth += 1;
-    if (!composerSupplement) panel.classList.add('file-drag-over');
+    panel.classList.add('file-drag-over');
   });
   panel.addEventListener('dragover', function(event) {
     if (!hasDraggedFiles(event)) return;
     event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = composerSupplement ? 'none' : 'copy';
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
   });
   panel.addEventListener('dragleave', function(event) {
     if (!hasDraggedFiles(event)) return;
@@ -2060,50 +1978,66 @@ function renderSvgBlock(source) {
   }
 }
 
-function renderCitationBubbles(container, bubbles) {
-  container.replaceChildren();
-  container.classList.add('turn-citation-bubbles');
-  (Array.isArray(bubbles) ? bubbles : []).forEach(function (source) {
-    var link = document.createElement('a');
-    link.className = 'turn-citation-bubble';
-    var title = String(source.title || '来源');
-    if (source.kind === 'web' && /^https?:\/\//i.test(source.url || '')) {
-      link.href = source.url;
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      link.textContent = '联网：' + title;
-    } else if (source.kind === 'local' && /^cite:[a-f0-9]{64}$/.test(source.record_key || '')) {
-      link.href = '/api/v2/corpus/source?record=' + encodeURIComponent(source.record_key);
-      link.textContent = '本地：' + title;
-      link.addEventListener('click', function (event) {
-        if (typeof window.openCorpusSource !== 'function') return;
-        event.preventDefault();
-        window.openCorpusSource(source.record_key);
-      });
-    } else if (source.kind === 'shared' && source.read_ref) {
-      var ref = source.read_ref;
-      var params = new URLSearchParams({version_id: ref.version_id, index_generation: ref.index_generation,
-                                        md_sha256: ref.md_sha256, start: ref.start, length: ref.end - ref.start});
-      if (ref.chunk_id) params.set('chunk_id', ref.chunk_id);
-      link.href = '/api/v2/shared-corpus/documents/' + encodeURIComponent(ref.document_id) + '?' + params;
-      link.textContent = '本地：' + title;
-      link.addEventListener('click', function (event) {
-        if (!window.CitrusCorpusReader || typeof window.CitrusCorpusReader.openShared !== 'function') return;
-        event.preventDefault();
-        window.CitrusCorpusReader.openShared(ref);
-      });
-    } else return;
-    container.appendChild(link);
-  });
-  container.style.display = container.childElementCount ? 'flex' : 'none';
-  container.style.flexWrap = 'wrap';
-  container.style.gap = '0.35rem';
+function citedHrefKey(url) {
+  try { var parsed = new URL(url, location.origin); parsed.hash = ''; return parsed.href; }
+  catch (_) { return ''; }
 }
 
-function renderMarkdownSafe(text) {
+function isCitationLink(href, label, bubbles) {
+  if (/^\/api\/v2\/(?:corpus\/source\b|shared-corpus\/documents\b)/.test(href)) return true;
+  if (/^(?:本地|联网)[：:]\s*\S/.test(label || '')) return true;
+  var key = citedHrefKey(href);
+  return !!key && (bubbles || []).some(function (s) {
+    return s && s.kind === 'web' && s.url && citedHrefKey(s.url) === key;
+  });
+}
+
+function renderCitationBubbles(container, bubbles, requestId, sid) {
+  container.replaceChildren();
+  container.classList.add('turn-citation-bubbles');
+  var seen = new Set();
+  (Array.isArray(bubbles) ? bubbles : []).forEach(function (source) {
+    var title = String(source.title || '来源');
+    if (source.kind === 'web' && safeProductUrl(source.url, false) && /^https?:/i.test(source.url)) {
+      var webKey = citedHrefKey(source.url);
+      if (!webKey || seen.has(webKey)) return;
+      seen.add(webKey);
+      var link = document.createElement('a'); link.className = 'turn-citation-bubble';
+      link.href = source.url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+      link.textContent = '联网：' + title; container.appendChild(link);
+    } else if (source.kind === 'local' || source.kind === 'shared') {
+      var id = String(source.reader_id || source.record_key || source.ref_id || '');
+      if (!id || seen.has(id) || !requestId || !sid) return;
+      seen.add(id);
+      var button = document.createElement('button'); button.type = 'button';
+      button.className = 'turn-citation-bubble'; button.textContent = '本地：' + title;
+      button.addEventListener('click', function () {
+        if (window.CitrusCorpusReader && typeof window.CitrusCorpusReader.openCitation === 'function') {
+          window.CitrusCorpusReader.openCitation(source, {sessionId: sid, requestId: requestId});
+        }
+      });
+      container.appendChild(button);
+    }
+  });
+  container.hidden = !container.childElementCount;
+}
+
+function stripCitationMarkdown(text, bubbles) {
+  // Protect literal Markdown examples and inline code from link projection.
+  var parts = String(text || '').split(/(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)/g);
+  return parts.map(function (part, index) {
+    if (index % 2) return part;
+    return part.replace(/\[([^\[\]\n]+)\]\(([^\s()]+)\)/g, function (raw, label, href) {
+      if (!isCitationLink(href, label, bubbles)) return raw;
+      return /^(?:本地|联网)[：:]/.test(label) ? '' : label;
+    });
+  }).join('');
+}
+
+function renderMarkdownSafe(text, bubbles) {
   // Accept bare SVG responses as well as fenced ```svg blocks.
   var svgBlocks = [];
-  var src = String(text == null ? '' : text);
+  var src = stripCitationMarkdown(text, bubbles);
   function svgToken(svg) {
     var token = 'CITRUS_SAFE_SVG_' + svgBlocks.length + '_TOKEN';
     svgBlocks.push({ token: token, html: renderSvgBlock(svg) });
@@ -2127,6 +2061,15 @@ function renderMarkdownSafe(text) {
   };
   // SVG is accepted only through the fenced-block sanitizer; escape arbitrary raw HTML.
   renderer.html = function(html) { return escapeHtml(html); };
+  var originalLink = renderer.link;
+  renderer.link = function(token, title, text) {
+    var href = typeof token === 'object' && token ? token.href : token;
+    var label = typeof token === 'object' && token ? token.text : text;
+    if (!safeProductUrl(href, false) || isCitationLink(href, label, bubbles)) {
+      return escapeHtml(label || '');
+    }
+    return originalLink.apply(this, arguments);
+  };
   // v10.0: 回答不使用删除线——防模型输出 ~~...~~ 被 marked 渲染成"横线划掉"观感
   src = src.replace(/~~/g, '');
   var rendered = marked.parse(src, { renderer: renderer, breaks: true });
@@ -2134,71 +2077,8 @@ function renderMarkdownSafe(text) {
     rendered = rendered.split('<p>' + block.token + '</p>').join(block.html);
     rendered = rendered.split(block.token).join(block.html);
   });
-  // R15: 本地来源标识（paper_… / doc_…）在渲染后变成可点入口，点开本地原文。
-  // 历史回答与本轮流式回答都走本函数，因此刷新前后行为一致。
-  rendered = linkifyCorpusKeys(rendered);
   return rendered;
 }
-
-/* ─── R15: 本地来源标识 → 可点击（原文读取在 corpus_reader.js）────────────
- * 语料键形如 `paper_45bbcac3_000004_B_2017_Nature_Genetics_`（文献）或
- * `doc_Agrobacterium_Transformation_Method`（方法/专著/品种记录）。
- * 这里只把「已渲染 HTML 的文本节点」换成链接，不改任何回答文本内容。 */
-/* 严格形状：文献键 = paper_<8位十六进制>_<6位序号>_<大写字母>_<年份>_<期刊slug…>，
- * 尾部可能以 `_` 结尾（期刊被截断时），必须整段吃进来否则 describe() 找不到原文；
- * 期刊 slug 会出现连续下划线（如 GigaByte__Hong_K）。方法/专著/品种键以 doc_ 开头。 */
-var _CORPUS_KEY_RE = /\bpaper_[0-9a-f]{8}_\d{6}_[A-Z]_\d{4}_[A-Za-z0-9_]{2,}|\bdoc_[A-Za-z0-9][A-Za-z0-9_.:-]{2,180}/g;
-
-function _corpusKeyOnly(text) {
-  var t = String(text == null ? '' : text).trim();
-  if (t.length < 12 || t.length > 200) return '';
-  var re = new RegExp(_CORPUS_KEY_RE.source, 'g');
-  if (!re.test(t)) return '';
-  return t.replace(new RegExp(_CORPUS_KEY_RE.source, 'g'), '') === '' ? t : '';
-}
-
-function _corpusAnchor(key, innerHtml, extraClass) {
-  return '<a class="corpus-key' + (extraClass ? ' ' + extraClass : '') +
-    '" href="#" role="button" data-corpus-key="' + escapeHtml(key) +
-    '" title="打开本地原文">' + innerHtml + '</a>';
-}
-
-function linkifyCorpusKeys(html) {
-  var src = String(html == null ? '' : html);
-  var stash = [];
-  // 1) 模型常把键写成行内代码：`paper_...` → 整段就是键时，换成代码观感的链接。
-  //    先换成占位符，避免第 2 步把刚生成的 <a> 里的文本再包一层 <a>（嵌套锚点会点不动）。
-  src = src.replace(/<code>([^<]{8,200})<\/code>/g, function (m, inner) {
-    var key = _corpusKeyOnly(inner);
-    if (!key) return m;
-    stash.push(_corpusAnchor(key, escapeHtmlCode(inner), 'corpus-key-code'));
-    return '\u0000CR' + (stash.length - 1) + '\u0000';
-  });
-  // 2) 普通文本节点里的裸键（跳过标签内部，避免破坏属性）
-  src = src.replace(/(^|>)([^<]+)(?=<|$)/g, function (m, lead, text) {
-    var out = String(text).replace(new RegExp(_CORPUS_KEY_RE.source, 'g'), function (key) {
-      return _corpusAnchor(key, key, '');
-    });
-    return lead + out;
-  });
-  // 3) 还原行内代码链接
-  src = src.replace(/\u0000CR(\d+)\u0000/g, function (m, i) { return stash[+i]; });
-  return src;
-}
-
-/* 单一代理监听：历史气泡重建、流式替换都不会重复绑定 */
-document.addEventListener('click', function (ev) {
-  var t = ev.target;
-  var a = (t && t.closest) ? t.closest('a.corpus-key') : null;
-  if (!a) return;
-  ev.preventDefault();
-  var key = a.getAttribute('data-corpus-key') || a.textContent || '';
-  if (typeof window.openCorpusSource === 'function') {
-    window.openCorpusSource(key);
-  } else {
-    console.warn('[corpus] 原文阅读器未加载');
-  }
-});
 
 /* ─── v8.4.3: 运行时配置（上下文预算/权限模式单一来源，删本地硬编码）─── */
 var _runtimeConfig = null;
@@ -2683,8 +2563,6 @@ function findTurnQueueEntry(turns, requestId) {
 
 // Retire observers and view controls only. Navigation never sends cancellation.
 function disposeTaskView() {
-  composerTaskViewDisposing = true;
-  leaveComposerSupplement();
   historyRestoreVersion += 1;
   abortHistoryRequests();
   abortTurnQueueReads();
@@ -2703,7 +2581,6 @@ function disposeTaskView() {
   var permission = document.getElementById('permission-card');
   if (permission) permission.remove();
   _pendingPermission = null;
-  composerTaskViewDisposing = false;
   refreshTaskComposer();
 }
 
@@ -2715,33 +2592,24 @@ function turnQueueIsExecuting(state) {
 
 function queueStateLabel(entry) {
   if (!entry) return '';
-  var names = {queued: '排队中', claimed: '准备执行', running: '执行中',
+  var names = {queued: '待发送', claimed: '准备执行', running: '执行中',
     awaiting_input: '等待你的选择', settling: '正在保存结果', terminal: '已结束',
     reconcile_required: '状态待核对'};
-  var label = names[entry.state] || '等待确认';
-  var blocker = entry.blocked_by;
-  if (entry.state === 'queued' && blocker && blocker.job_id) {
-    var task = Number(blocker.queue_seq) > 0
-      ? '会话第 ' + Number(blocker.queue_seq) + ' 条任务（' + blocker.job_id + '）'
-      : '任务 ' + blocker.job_id;
-    var reason = names[blocker.kind] || (blocker.kind === 'pending_question' ? '等待你的选择' : '尚未结束');
-    return '被' + task + '阻塞 · ' + reason;
-  }
-  if (entry.state === 'queued' && sharedMaintenanceActive) label = '已排队 · 等待语料库更新';
-  if (entry.state === 'queued' && Number(entry.queue_position) > 0)
-    label += ' · 第 ' + Number(entry.queue_position) + ' 位';
-  return label;
+  return names[entry.state] || '等待确认';
 }
 
-function queuedTurnCount() {
-  var count = 0;
-  for (var i = 0; i < turnQueueBindings.length; i++) {
-    var binding = turnQueueBindings[i];
-    if (!binding || !binding.owns || !binding.owns()) continue;
-    if (CitrusTaskState.isTerminal(binding.store.state)) continue;
-    if (binding.queueEntry && binding.queueEntry.state === 'queued') count++;
+function markQueuedBubble(userContent, assistantContent, entry) {
+  var queued = !!(entry && ['queued', 'claimed'].indexOf(entry.state) >= 0);
+  var row = assistantContent && assistantContent.closest('.message');
+  if (row) row.classList.toggle('turn-awaiting-dispatch', queued);
+  if (!userContent) return;
+  var badge = userContent.querySelector('.turn-user-queue-state');
+  if (!queued) { if (badge) badge.remove(); return; }
+  if (!badge) {
+    badge = document.createElement('span'); badge.className = 'turn-user-queue-state';
+    badge.setAttribute('role', 'status'); userContent.appendChild(badge);
   }
-  return count;
+  badge.textContent = '待发送';
 }
 
 // Only one turn can drive the composer: the executing job first, otherwise the
@@ -2779,72 +2647,43 @@ function unregisterTurnBinding(binding) {
 }
 
 function refreshTaskComposer() {
-  var available = activeSupplementBinding();
-  var activeJob = available ? available.store.state.job_id : '';
-  var currentTarget = composerSupplement && available && composerSupplement.controller === available.controls && composerSupplement.jobId === activeJob;
-  if (composerSupplement && !currentTarget && !userInput.value && !composerDraft(composerSupplement.key).pending) leaveComposerSupplement();
-  var supplement = composerSupplement;
-  var pendingUpdate = supplement && composerDraft(supplement.key).pending;
-  var targetReachable = supplement && supplement.controller.owns() && supplement.controller.store.state.job_id === supplement.jobId;
-  var mode = document.getElementById('composer-supplement');
-  if (mode) mode.hidden = !supplement && !activeJob;
-  var target = document.getElementById('composer-task-target');
-  if (target) {
-    target.textContent = supplement ? '补充任务 · ' + supplement.label + (targetReachable ? ' · 任务版本 ' + supplement.controller.store.state.task_version : '') : '作为新任务发送';
-    target.title = supplement ? supplement.jobId : '';
-  }
-  if (newMessageModeButton) newMessageModeButton.textContent = supplement ? '作为新任务' : '补充当前任务';
-  ['composer-browse', 'input-tools-menu', 'attachment-list', 'selected-skills'].forEach(function (id) {
-    var element = document.getElementById(id);
-    if (!element) return;
-    if (id === 'input-tools-menu' && supplement) element.open = false;
-    element.hidden = !!supplement || (id === 'selected-skills' && !element.textContent);
-  });
   var binding = activeTurnComposer && activeTurnComposer.owns() ? activeTurnComposer : null;
   var state = binding && binding.store.state;
   var terminal = state && CitrusTaskState.isTerminal(state);
-  var awaitingQuestion = state && state.question && state.question.status === 'pending';
   var stopping = binding && (binding.stopping || state.status === 'cancel_requested');
-  var executing = !!((binding && turnQueueIsExecuting(state)) || (binding && stopping && state.job_id && !terminal));
-  var queued = queuedTurnCount();
-  var button = document.getElementById('send-btn'), stop = document.getElementById('stop-btn');
-  var composerHasText = !!String((userInput && userInput.value) || '').trim();
-  var composerHasAttachments = !!((_selectedAttachments && _selectedAttachments.length) ||
+  var executing = !!(binding && (turnQueueIsExecuting(state) || (stopping && state.job_id && !terminal)));
+  var button = document.getElementById('send-btn');
+  var hasText = !!String((userInput && userInput.value) || '').trim();
+  var hasAttachments = !!((_selectedAttachments && _selectedAttachments.length) ||
     (window._selectedAccountFileRefs && window._selectedAccountFileRefs.length));
   if (button) {
-    button.disabled = !!historyRequest || !!(supplement && (supplement.controller.isBusy() || !(currentTarget || pendingUpdate && targetReachable)));
-    var sendLabel = pendingUpdate ? (currentTarget ? '核对并重试上次补充' : '核对上次补充') : supplement ? '提交补充' : '发送消息';
-    button.title = sendLabel + ' (Enter)';
-    button.setAttribute('aria-label', sendLabel);
-    button.setAttribute('aria-disabled', String(button.disabled || (!composerHasText && !pendingUpdate)));
-  }
-  if (stop) {
-    stop.disabled = !executing || !!stopping;
-    stop.classList.toggle('is-visible', executing);
-    stop.title = '停止执行中的任务；排队中的消息不会被取消';
-  }
-  if (userInput) {
-    if (supplement) userInput.maxLength = 8000;
-    else userInput.removeAttribute('maxlength');
-    userInput.placeholder = supplement ? '给此任务补充要求（仅正文）'
-      : '向 CitrusScholar 提问，或上传文件进行分析…';
+    var label = executing ? (stopping ? '正在停止当前任务' : '停止当前任务') : '发送消息';
+    button.disabled = !!historyRequest || !!(executing && stopping);
+    button.title = executing ? label + '。按 Enter 可将新消息加入队列' : label + ' (Enter)';
+    button.setAttribute('aria-label', label);
+    button.setAttribute('aria-disabled', String(button.disabled || (!executing && !hasText)));
+    button.classList.toggle('is-stop-mode', executing);
+    button.classList.toggle('is-stopping', !!(executing && stopping));
+    var icon = button.querySelector('use');
+    if (icon) icon.setAttribute('href', executing ? '#ui-stop' : '#ui-send');
   }
   var hint = document.getElementById('composer-task-status');
   if (hint) {
-    hint.textContent = supplement ? (supplement.controller.isBusy() ? '正在提交或核对补充…'
-      : !currentTarget && !pendingUpdate ? '此任务当前无法接收补充。草稿已保留，可选择「作为新任务」。'
-      : supplement.controller.updateNotice() || (pendingUpdate ? '上次补充的接收状态待确认。' : '附件、场景和联网选项可用于新任务。'))
-      : queueSyncUnavailable ? '队列状态待同步。可刷新重试。'
-      : _composerNotice && (composerHasText || composerHasAttachments) ? _composerNotice
-      : !composerHasText && composerHasAttachments ? '已选择附件；请填写正文后再发送。'
-      : awaitingQuestion ? '当前任务等待选择。新消息会排在它之后。'
-      : stopping ? '停止请求待确认，已完成的结果会保留。'
-      : executing ? '当前任务执行中；新消息会排队，不会打断本轮。'
-      : queued ? '有 ' + queued + ' 条消息排队中。'
-      : terminal && state.display_status === 'cancelled' ? '已停止。可继续发送新的消息。' : '';
+    hint.textContent = queueSyncUnavailable ? '消息状态待同步，可刷新重试。'
+      : _composerNotice && (hasText || hasAttachments) ? _composerNotice
+      : !hasText && hasAttachments ? '已选择附件，请填写正文后再发送。'
+      : stopping ? '停止请求待确认，已完成的结果会保留。' : '';
     hint.hidden = !hint.textContent;
     hint.title = hint.textContent;
   }
+}
+
+function activateComposer() {
+  var binding = activeTurnComposer;
+  if (binding && binding.owns() && turnQueueIsExecuting(binding.store.state)) {
+    return stopCurrentTask();
+  }
+  return sendMsg();
 }
 
 /* ─── Plan Mode state (synced from server flags) ─── */
@@ -2863,7 +2702,7 @@ var currentJobId = '';
 // Cancel only the job bound to the current composer.
 function stopCurrentTask() {
   var binding = activeTurnComposer && activeTurnComposer.owns() ? activeTurnComposer : null;
-  if (!binding || binding.stopping || CitrusTaskState.isTerminal(binding.store.state)) return;
+  if (!binding || binding.stopping || !turnQueueIsExecuting(binding.store.state)) return;
   var cancelJobId = binding.store.state.job_id;
   if (!cancelJobId) return;
   try { if (window.CitrusMascot) CitrusMascot.setState('idle', { force: true }); } catch (_) {}
@@ -2908,7 +2747,7 @@ function toggleSidebar() {
 })();
 
 // P2-1: 侧栏宽度可拖拽（240–480px），双击复位 300px，方向键 ±16px
-var SIDEBAR_MIN = 240, SIDEBAR_MAX = 480, SIDEBAR_DEFAULT = 300;
+var SIDEBAR_MIN = 218, SIDEBAR_MAX = 480, SIDEBAR_DEFAULT = 248;
 function applySidebarWidth(width, persist) {
   var shell = document.getElementById('mainContainer');
   var value = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, Math.round(width)));
@@ -2970,6 +2809,8 @@ function applySidebar(active) {
     el.classList.toggle('collapsed', !isActive);
     icon.classList.toggle('collapsed', !isActive);
     sec.classList.toggle('expanded', isActive);
+    var disclosure = document.getElementById(s + '-section-toggle');
+    if (disclosure) disclosure.setAttribute('aria-expanded', String(isActive));
   }
   localStorage.setItem('citrus_sidebar_active', active || '');
 }
@@ -3056,7 +2897,7 @@ function renderSessions() {
     var active = s.session_id === sessionId ? ' active' : '';
     var title = escapeHtml(s.title || '新会话');
     return '<div class="session-item' + active + '">' +
-      '<div class="session-title" onclick="switchSession(\'' + s.session_id + '\')" title="' + title + '">' + title + '</div>' +
+      '<button type="button" class="session-title" onclick="switchSession(\'' + s.session_id + '\')" title="' + title + '">' + title + '</button>' +
       '<span class="session-time">' + fmtSessionTime(s.updated_at) + '</span>' +
       '<div class="session-ops">' +
       '<button class="session-op" onclick="sessionMenu(event,\'' + s.session_id + '\')" title="更多">⋯</button>' +
@@ -3326,7 +3167,7 @@ function _updateCtxBtnRing(pct) {
   var dash = CTX_BTN_CIRCUM * (1 - Math.min(pct, 1));
   fg.style.strokeDasharray = CTX_BTN_CIRCUM + ' ' + CTX_BTN_CIRCUM;
   fg.style.strokeDashoffset = dash;
-  fg.className = 'ctx-btn-fg ' + (pct <= 0 ? 'none' : _ctxLevelClass(pct));
+  fg.setAttribute('class', 'ctx-btn-fg ' + (pct <= 0 ? 'none' : _ctxLevelClass(pct)));
 }
 
 function _ctxCacheNote(provider) {
@@ -4022,7 +3863,16 @@ function appendMessageActions(content, role, text) {
   var copy = document.createElement('button');
   copy.type = 'button'; copy.className = 'message-action'; copy.title = '复制内容';
   copy.setAttribute('aria-label', '复制内容'); copy.innerHTML = uiIcon('copy') + '<span>复制</span>';
-  copy.addEventListener('click', function() { copyMessageText(String(text || ''), copy); });
+  copy.addEventListener('click', function() {
+    var value = String(text || '');
+    if (assistant) {
+      var bubbles = Array.from(content.querySelectorAll('.turn-citation-bubble[href]')).map(function (link) {
+        return {kind: 'web', url: link.getAttribute('href')};
+      });
+      value = stripCitationMarkdown(value, bubbles);
+    }
+    copyMessageText(value, copy);
+  });
   actions.appendChild(copy);
   if (role === 'user') {
     var edit = document.createElement('button');
@@ -4424,14 +4274,13 @@ function toolStatusText(status, reason) {
 
 async function sendMsg() {
   if (!currentAccount || !sessionId || accountDocumentRetired || historyRequest) return;
-  if (composerSupplement) return submitComposerSupplement();
   var epoch = authEpoch, requestSessionId = sessionId;
   function ownsTurn() { return epoch === authEpoch && requestSessionId === sessionId && (!botContent || chatContainer.contains(botContent)); }
   function ownsControls() {
     return ownsTurn() && !!activeTurnComposer && activeTurnComposer.requestId === clientRequestId;
   }
   var sendBtnEl = document.getElementById('send-btn');
-  if (sendBtnEl && sendBtnEl.disabled) return;
+  if (sendBtnEl && sendBtnEl.disabled && !sendBtnEl.classList.contains('is-stop-mode')) return;
   var rawDraft = String(userInput.value || '');
   var query = rawDraft.trim();
   if (!query) {
@@ -4623,7 +4472,7 @@ async function sendMsg() {
   botContent.appendChild(deliveryDiv);
   botContent.appendChild(citationsDiv);
 
-  var fullText = '';
+  var fullText = '', citedBubbles = [];
   var isAnswerStarted = false;
   var isFinalAnswerArmed = false;
   var renderPending = false;
@@ -4637,13 +4486,12 @@ async function sendMsg() {
   });
   var taskControls = CitrusTaskControls.create({container: botContent, store: taskStore, transport: taskTransport, owns: ownsTurn,
     readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
-    onChange: function () { if (ownsControls() || composerSupplement && composerSupplement.controller.store === taskStore) refreshTaskComposer(); }});
+    onChange: function () { if (ownsControls()) refreshTaskComposer(); }});
   var myBinding = {
     requestId: clientRequestId, sessionId: requestSessionId, owns: ownsTurn, query: query,
     store: taskStore, controls: taskControls, cancel: stopCurrentTurn,
     stopping: false, following: false, queueEntry: null,
-    dispose: function (reason) { stopCurrentTurn(reason || 'switch'); },
-    cancelQueued: function () { cancelQueuedEntry(); }
+    dispose: function (reason) { stopCurrentTurn(reason || 'switch'); }
   };
   function syncWaiting() {
     processPanel.syncTask(taskStore.state, queueEntry, {hasAnswer: !!fullText.trim(),
@@ -4772,7 +4620,7 @@ async function sendMsg() {
             if (q) qs.push(q);
           }
         }
-        answerDiv.innerHTML = renderMarkdownSafe(main);
+        answerDiv.innerHTML = renderMarkdownSafe(main, citedBubbles);
         if (qs.length > 0) {
           var cc = document.createElement('div'); cc.className = 'follow-up-container';
           var cl = document.createElement('div'); cl.className = 'follow-up-label'; cl.textContent = '深入探索（点击追问）'; cc.appendChild(cl);
@@ -4786,7 +4634,6 @@ async function sendMsg() {
   }
 
   function handleSendFollowUp(q) {
-    useNewTaskComposer(false);
     userInput.value = q;
     sendMsg();
   }
@@ -4808,11 +4655,6 @@ async function sendMsg() {
     showBanner._t = setTimeout(function () { b.style.display = 'none'; }, 8000);
   }
 
-  function attachAnswerSources() {
-    if (window.CitrusCorpusReader && window.CitrusCorpusReader.attachTurnSources) {
-      window.CitrusCorpusReader.attachTurnSources(botMessage, clientRequestId);
-    }
-  }
 
   function handleEvent(type, data) {
     if (!ownsTurn()) return;
@@ -4842,24 +4684,31 @@ async function sendMsg() {
       }
       return;
     }
+    if (type === 'citations') {
+      if (data.display === 'bubble_only') {
+        citedBubbles = Array.isArray(data.bubbles) ? data.bubbles : [];
+        renderCitationBubbles(citationsDiv, citedBubbles, clientRequestId, requestSessionId);
+        if (fullText) renderAnswer();
+      }
+      return;
+    }
     // Retired rounds may finish replaying into their own DOM. They cannot
     // release the composer, alter context usage, permissions or the sidebar.
     if (!ownsControls()) {
       if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
         applyTurnEnvelope(data); hasTerminalEvent = true; clearTimeout(spinnerTimeout); finishStatus();
         if (data.answer) {
-          fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText);
+          fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText, citedBubbles);
           if (String(data.answer).trim()) processPanel.answerVisible();
         }
         loadTurnGeneratedFiles(data);
-        attachAnswerSources();
       }
       return;
     }
     if ((type === 'done' || type === 'error') && !CitrusTaskState.displayStatus(data)) {
       if (data.question || taskStore.state.question && taskStore.state.question.status === 'pending' || data.status === 'awaiting_input' || (data.turn_envelope || {}).display_status === 'awaiting_input') {
         statusLabel.textContent = '等待你的选择'; clearTimeout(spinnerTimeout); setSendDisabled(false);
-        if (data.answer) { fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText); }
+        if (data.answer) { fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText, citedBubbles); }
       } else { appendNoticeRow('任务状态待确认，正在等待执行记录。'); }
       return;
     }
@@ -4924,86 +4773,6 @@ async function sendMsg() {
       case 'plan_ready':
       case 'section_start':
       case 'section_done': break;
-      case 'citations':
-        if (data.display === 'bubble_only') {
-          renderCitationBubbles(citationsDiv, data.bubbles);
-          break;
-        }
-        // v9.2: 引用编号统一重排在后端完成（renumber_refs）——事件附带 remap，
-        // 前端按 remap 重写正文 [n]/[Wn]/[Hn] 与 cited ref_id 后写入 roundHistory，
-        // 侧栏与正文编号一致（替代 v8.17.3 前端 W 专用压缩）。
-        var _cited0 = data.cited || [];
-        var _remap = data.remap || {};
-        var _dropped = (data.dropped || []).map(String);
-        // v9.4.4（关键修复）: 后端 payload 的 ref_id 已是重排后的最终编号，
-        // 前端**不再**按 remap 改写 ref_id——历史 bug：把 remap 二次套用到
-        // 已重排编号上，与"已是新号的号"碰撞 → 不同条目撞号/跳号（[4][9]、
-        // [4][7]、[5]/[W4] 三次实测的统一根因）。remap 只用于重写正文旧编号；
-        // dropped（后端清除的无映射死号）同步从正文移除（如 [13]/[W3]）。
-        var _applied = (window._remapAppliedRounds = window._remapAppliedRounds || {});
-        // v10.5（F1b）: pre_renumbered=true 表示 done.answer 已是**终稿编号**——由后端
-        // 返修轮重跑 renumber_refs 得到（expert_graph.py 的 F1 块）。此时 done 事件
-        // 已用它覆盖 fullText，若此处再套一次 remap 就是二次重排：正文号相对侧栏
-        // ref_id 发生置换错配（丢号/重号）。故仅在**未**预重排时按 remap 重写正文；
-        // dropped 的清除保留（预重排时已无残留，属幂等兜底）。
-        // _fullTextFromDone 是更根本的判据（done.answer 恒为重排终稿），用于兜住
-        // done 事件期间流式全失败、fullText 只能取自 done.answer 的情况。
-        var _preRenumbered = !!data.pre_renumbered
-                             || !!(window._fullTextFromDone || {})[clientRequestId];
-        if ((Object.keys(_remap).length > 0 || _dropped.length > 0)
-            && !_applied[clientRequestId]) {
-          if (Object.keys(_remap).length > 0 && !_preRenumbered) {
-            fullText = _rewriteRefsByMap(fullText, _remap);
-          }
-          for (var _di = 0; _di < _dropped.length; _di++) {
-            var _tok = String(_dropped[_di]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            fullText = fullText.replace(new RegExp('\\[' + _tok + '\\]', 'g'), '');
-          }
-          renderAnswer();
-          _applied[clientRequestId] = 1;
-        }
-        // ── v10.14（阶段 3 · 修复「侧栏不显示联网条目」）────────────────────────
-        //   实测根因：`citations` 事件里 `web_separate` 有 26–27 条（每条带
-        //   `round_no` + `tier` + `tier_label` + `url` + `title`），但本文件
-        //   **从未引用 `web_separate`**（grep 命中数 = 0）⇒ 侧栏"联网搜索"组
-        //   恒为空，用户看到的就是"侧栏不显示"。
-        //   修法：把 `web_separate` 映射成侧栏条目（`source:'web'` ⇒ 落到 web 组），
-        //   存进 roundHistory 的新字段 `web`，由 `renderRoundSidebar` 并入渲染。
-        //   注：`ref_id` 用 `W1..Wn`（**仅侧栏展示用**，不进正文引用池 —— 引用池
-        //   隔离仍保留：正文第一段只挂本地 `[n]`）。
-        var _webSep = (data.web_separate || []).map(function (w, wi) {
-          return {
-            // v10.13-B（用户决策：恢复 `[Wn]`）：`ref_id` 用于**内部对齐**
-            // （后端已按"正文实际引用的 `[Wn]`"过滤过 web_separate，
-            //  这里只是把编号带过来）。**侧栏不显示编号本身** —— 仍显示「标题 🔗」。
-            ref_id: w.ref_id || '',
-            type: 'web',
-            source: 'web',
-            url: w.url || '',
-            title: w.title || w.host || '',
-            doi: '',
-            tier: w.tier || '',
-            tier_label: w.tier_label || '',
-            role: w.role || (w.cited ? 'cited' : 'candidate'),
-            cited: !!w.cited,
-            round_no: (w.round_no != null ? w.round_no : 1),
-            _isSummary: !!w.is_summary,
-            evidence_level: w.evidence_level, provenance: w.provenance,
-            origin: w.origin, source_ref: w.source_ref, locator: w.locator
-          };
-        });
-        roundHistory.push({roundId:currentRoundId,query:currentQuery,cited:_cited0,uncited:data.uncited||[],historical:data.historical||[],web:_webSep});
-        renderRoundSidebar(); citationsDiv.style.display='';
-        var cited = _cited0;
-        if (cited.length>0) {
-          var c=document.createElement('div'); c.style.cssText='margin-top:10px;padding-top:10px;border-top:1px solid var(--border-hairline)';
-          c.innerHTML='<div style="font-size:11px;color:var(--text-muted);margin-bottom:5px">引用 ('+cited.length+'篇)'+(data.ref_pool?' · '+data.ref_pool:'')+'</div>';
-          // v8.15.2: 徽章条按 ref_id 升序（此前按回答出现顺序显得混乱）
-          var order = _refIdSort(cited);
-          for (var k=0;k<order.length;k++) c.innerHTML+='<span style="display:inline-block;font-family:var(--font-mono);font-size:10px;background:var(--success-glow);color:var(--success);padding:1px 5px;border-radius:3px;margin:2px;font-weight:600">['+escapeHtml(order[k].ref_id)+']</span>';
-          citationsDiv.appendChild(c);
-        }
-        break;
       case 'job':
         if (data.job_id) botContent.dataset.jobId = String(data.job_id);
         // S1: 记下本轮 job_id——点停止时据此精确取消这一个任务。
@@ -5097,7 +4866,7 @@ async function sendMsg() {
           }
         } catch (_ae) {}
         if (fullText) {
-          answerDiv.innerHTML=renderMarkdownSafe(fullText.replace(/__NEED_COMPLEX__/g,''));
+          answerDiv.innerHTML=renderMarkdownSafe(fullText.replace(/__NEED_COMPLEX__/g,''), citedBubbles);
         }
         if (fullText.indexOf('__NEED_COMPLEX__')>=0) {
           var uc=document.createElement('div');uc.style.cssText='margin-top:12px;text-align:center';
@@ -5112,7 +4881,6 @@ async function sendMsg() {
           appendMessageActions(botContent, 'assistant', fullText.replace(/__NEED_COMPLEX__/g, ''));
         }
         loadTurnGeneratedFiles(data);
-        attachAnswerSources();
         setSendDisabled(false);userInput.focus();break;
       case 'error':
         snapshotOnly = false;
@@ -5208,7 +4976,8 @@ async function sendMsg() {
     var node = queueStatusNode();
     if (!node) return;
     var entry = queueEntry;
-    if (!['queued', 'claimed', 'reconcile_required'].includes(entry.state)) {
+    markQueuedBubble(userMessageContent, botContent, entry);
+    if (entry.state !== 'reconcile_required') {
       node.replaceChildren();
       if (entry.state !== 'terminal' || !entry.clear_reason) { node.hidden = true; return; }
       node.hidden = false;
@@ -5224,14 +4993,6 @@ async function sendMsg() {
     text.className = 'turn-queue-status';
     text.textContent = queueStateLabel(entry);
     node.appendChild(text);
-    if (entry.state === 'queued') {
-      var cancel = document.createElement('button');
-      cancel.type = 'button'; cancel.className = 'turn-queue-cancel';
-      cancel.textContent = '取消这条';
-      cancel.setAttribute('aria-label', '取消这条排队中的消息');
-      cancel.onclick = function () { cancelQueuedEntry(); };
-      node.appendChild(cancel);
-    }
     if (entry.state === 'reconcile_required') {
       var settle = document.createElement('button');
       settle.type = 'button'; settle.className = 'turn-queue-cancel turn-queue-reconcile';
@@ -5333,10 +5094,10 @@ async function sendMsg() {
   }
 
   function restoreNewDraft() {
-    if (!composerSupplement && userInput.value) saveComposerInput();
+    if (userInput.value) saveComposerInput();
     if (requestRoundId !== currentRoundId || composerDraft(draftKey).revision !== sentDraftRevision) return;
     writeComposerDraft(draftKey, rawDraft);
-    if (!composerSupplement) userInput.value = rawDraft;
+    userInput.value = rawDraft;
   }
 
   function restoreDraft(message) {
@@ -5346,7 +5107,7 @@ async function sendMsg() {
     answerDiv.style.display = ''; answerDiv.textContent = '';
     showBanner(message);
     setSendDisabled(false);
-    if (!composerSupplement && requestRoundId === currentRoundId) userInput.focus();
+    if (requestRoundId === currentRoundId) userInput.focus();
   }
 
   // A timeout or server-side error cannot prove the POST did not commit,
@@ -5400,32 +5161,6 @@ async function sendMsg() {
       statusLabel.textContent = '消息状态暂未同步';
       showQueueRetry();
     }, clientRequestId);
-  }
-
-  function cancelQueuedEntry() {
-    if (!queueEntry || queueEntry.state !== 'queued') return;
-    var node = queueStatusEl;
-    var cancel = node && node.querySelector ? node.querySelector('.turn-queue-cancel') : null;
-    if (cancel) cancel.disabled = true;
-    accountFetch(turnQueueURL(requestSessionId) + '/' + encodeURIComponent(clientRequestId), {method: 'DELETE'})
-      .then(function (response) {
-        return response.json().then(function (body) {
-          return {ok: response.ok, status: response.status, body: body};
-        }, function () { return {ok: response.ok, status: response.status, body: null}; });
-      })
-      .then(function (outcome) {
-        if (!ownsTurn()) return;
-        if (outcome.ok && outcome.body) adoptTurnEntry(outcome.body, true);
-        else {
-          if (cancel) cancel.disabled = false;
-          showBanner((outcome.body && outcome.body.detail && outcome.body.detail.message) || '消息已不在可取消状态。');
-        }
-      })
-      .catch(function () {
-        if (!ownsTurn()) return;
-        if (cancel) cancel.disabled = false;
-        showBanner('取消请求暂未确认，请稍后重试。');
-      });
   }
 
   function reconcileQueuedEntry() {
@@ -6385,10 +6120,12 @@ function isPublicAnswerEvent(data) {
   return data.private !== true && data.internal !== true && ['private', 'internal'].indexOf(data.visibility) < 0;
 }
 
-function bindHistoryTask(turn, content, answer, process, ownsContext, useComposer) {
+function bindHistoryTask(turn, content, answer, process, ownsContext, useComposer, userContent) {
   var epoch = authEpoch, sid = sessionId, round = currentRoundId, armed = false, streamedAnswer = '', closed = false;
   var binding = null, entry = turn.queueEntry, queuePoll = null, observed = '', queueStatus, disconnected = false;
   var hasSavedAnswer = !!String(turn.answer && turn.answer.content || '').trim(), finalAnswerReceived = false;
+  var savedCitations = turn.answer && turn.answer.citation_bubbles || [];
+  var citationContainer = content.querySelector('.turn-citation-bubbles');
   function syncWaiting() {
     process.syncTask(store.state, entry, {hasAnswer: hasSavedAnswer || !!streamedAnswer.trim(),
       disconnected: disconnected, stopping: !!(binding && binding.stopping)});
@@ -6429,7 +6166,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     renderArtifactDelivery(content, store.state.artifact_delivery);
     answer.dataset.displayStatus = store.state.display_status;
     if (!process.terminal(store.state.display_status)) {
-      var labels = {queued: '任务排队中', detached: '任务在后台执行'};
+      var labels = {detached: '任务在后台执行'};
       if (labels[store.state.status]) process.label.textContent = labels[store.state.status];
     }
     projectContext(); questionLabel(); syncWaiting(); reconcileControls();
@@ -6458,11 +6195,19 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       finalAnswerReceived = false; armed = false; streamedAnswer = '';
     }
     if (type.indexOf('context_') === 0 || data.context_snapshot) projectContext();
+    if (type === 'citations' && data.display === 'bubble_only') {
+      savedCitations = Array.isArray(data.bubbles) ? data.bubbles : [];
+      if (!citationContainer) {
+        citationContainer = document.createElement('div'); content.appendChild(citationContainer);
+      }
+      renderCitationBubbles(citationContainer, savedCitations, turn.turnRequestId, sid);
+      if (!hasSavedAnswer && streamedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer, savedCitations);
+    }
     if (!finalAnswerReceived && isPublicAnswerEvent(data)) {
       if (type === 'answer_start') armed = true;
       if (type === 'text' && armed && typeof data.content === 'string') {
         streamedAnswer += data.content;
-        if (!hasSavedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer);
+        if (!hasSavedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer, savedCitations);
       }
       if (type === 'text_reset') {
         armed = false; streamedAnswer = '';
@@ -6470,7 +6215,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       }
     }
     if ((type === 'done' || type === 'error') && data.answer) {
-      answer.innerHTML = renderMarkdownSafe(data.answer);
+      answer.innerHTML = renderMarkdownSafe(data.answer, savedCitations);
       if (String(data.answer).trim()) process.answerVisible();
     }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
@@ -6494,7 +6239,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
     onChange: function() {
       if (binding) reconcileControls();
-      else if (composerSupplement && composerSupplement.controller.store === store) refreshTaskComposer();
     }});
   var questionCard = CitrusTaskControls.createQuestion({container: content, store: store, transport: transport, owns: owns,
     onContinue: function (result) { if (!entry) refreshQuestionContinuation(result, owns, questionCard.element); }});
@@ -6514,7 +6258,8 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (!owns() || entry.state === 'terminal' && entryNow.state !== 'terminal') return;
     entry = entryNow;
     if (binding) binding.queueEntry = entry;
-    queueStatus.hidden = !['queued', 'claimed', 'reconcile_required'].includes(entry.state);
+    markQueuedBubble(userContent, content, entry);
+    queueStatus.hidden = entry.state !== 'reconcile_required';
     queueStatus.replaceChildren();
     var label = document.createElement('span');
     label.textContent = entry.state === 'terminal' && entry.clear_reason === 'cancelled' ? '已取消' : queueStateLabel(entry);
@@ -6523,21 +6268,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       var cancelled = entry.clear_reason === 'cancelled';
       answer.dataset.displayStatus = cancelled ? 'cancelled' : 'failed';
       answer.textContent = cancelled ? '已取消，这条消息不会执行。' : '这条消息未能开始执行，请重新发送。';
-    }
-    if (entry.state === 'queued') {
-      var button = document.createElement('button');
-      button.type = 'button'; button.className = 'turn-queue-cancel'; button.textContent = '取消这条';
-      button.onclick = async function () {
-        button.disabled = true;
-        try {
-          var response = await accountFetch(turnQueueURL(sid) + '/' + encodeURIComponent(entry.client_request_id), {method: 'DELETE'});
-          var result = await response.json();
-          if (response.ok && owns()) adopt(result);
-          else if (owns()) showBanner('消息已不在可取消状态。');
-        } catch (_) { if (owns()) showBanner('暂时无法取消这条消息，请重试。'); }
-        finally { button.disabled = false; }
-      };
-      queueStatus.appendChild(button);
     }
     var job = observeQueuedJob(entry);    if (entry.state === 'reconcile_required') {
       var settle = document.createElement('button');
@@ -6603,9 +6333,9 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
   if (composerIndex < 0) composerIndex = lastJobIndex;
   if (placement && (placement.prepend || activeTurnComposer)) composerIndex = -1;
   for (var ti = 0; ti < turns.length; ti++) {
-    var turn = turns[ti];
+    var turn = turns[ti], userContent = null;
     if (turn.user) {
-      var userContent = addMessage('user', escapeHtml(turn.user.content), before);
+      userContent = addMessage('user', escapeHtml(turn.user.content), before);
       // S3: stable anchors so a file can jump back to the exact turn.
       if (turn.user.message_id) userContent.dataset.messageId = String(turn.user.message_id);
       if (turn.user.request_id) userContent.dataset.requestId = String(turn.user.request_id);
@@ -6625,11 +6355,11 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     contentEl.dataset.sessionId = sessionId;
     var answerBody = document.createElement('div'); answerBody.className = 'turn-answer';
     answerBody.dataset.displayStatus = turn.displayStatus;
-    answerBody.innerHTML = renderMarkdownSafe(answer.content); contentEl.appendChild(answerBody);
+    answerBody.innerHTML = renderMarkdownSafe(answer.content, answer.citation_bubbles); contentEl.appendChild(answerBody);
     if (answer.citation_bubbles && answer.citation_bubbles.length) {
       var citationRow = document.createElement('div');
       contentEl.appendChild(citationRow);
-      renderCitationBubbles(citationRow, answer.citation_bubbles);
+      renderCitationBubbles(citationRow, answer.citation_bubbles, turn.turnRequestId, sessionId);
     }
     if (turn.artifactDelivery) renderArtifactDelivery(contentEl, turn.artifactDelivery);
     var process = createResearchProcessPanel(turn.intentSummary || (turn.user && turn.user.content));
@@ -6646,7 +6376,7 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
       // Unmarked legacy stage labels cannot establish a public model note.
     }
     var ownsContext = (!placement || placement.append) && ti === (composerIndex >= 0 ? composerIndex : turns.length - 1);
-    if (turn.jobId || turn.question || turn.queueEntry) bindHistoryTask(turn, contentEl, answerBody, process, ownsContext, ti === composerIndex);
+    if (turn.jobId || turn.question || turn.queueEntry) bindHistoryTask(turn, contentEl, answerBody, process, ownsContext, ti === composerIndex, userContent);
     else if (ownsContext) {
       var context = CitrusTaskState.createContext({session_id: sessionId, request_id: turn.turnRequestId});
       if (turn.contextSnapshot) context.receive('context_snapshot', turn.contextSnapshot);

@@ -13,9 +13,9 @@
   const dataFiles = [file('fixture-file-0', 'Measurements.csv'), file('workbook', 'Measurements.xlsx')];
   const svgId = 'imported-project';
   window.experienceRequests = () => ({posts: state().posts || [], imports: state().imports || [], saves: state().saves || [],
-    updates: state().updates || [], lookups: state().lookups || []});
-  window.experienceUpdateMode = (mode, hold = false) => save({updateMode: mode, lookupHeld: hold});
-  window.experienceApplyUpdates = () => save({appliedVersion: 1 + Object.keys(state().receipts || {}).length});
+    updates: state().updates || [], cancels: state().cancels || [], queueDeletes: state().queueDeletes || [],
+    sourceReads: state().sourceReads || []});
+  window.experienceActiveJob = job;
   window.experienceQueueAvailability = available => save({queueUnavailable: !available});
   window.experienceStep = phase => save({phase, start: phase === 'start' ? Date.now() / 1000 - 10 : start()});
   window.experienceScale = (turns, files) => save({turns, files});
@@ -27,6 +27,11 @@
       attempt_id: 'attempt-' + attempt, estimated_input_tokens: count, components, input_limit: 86000, model_window: null,
       tool_message_count: attempt - 1, history_load_status: 'loaded', status: 'admitted', ...options};
   };
+  const answer = '## 表格核对结果\n\n已读取数据。详见 [公开表格说明](https://example.org/cited-table#labels)、[本地：本地表格字典](/api/v2/corpus/source/table-dictionary) 和 [普通链接](https://example.org/ordinary)。';
+  const citations = [
+    {kind: 'web', title: '公开表格说明', url: 'https://example.org/cited-table'},
+    {kind: 'local', title: '本地表格字典', reader_id: 'table-dictionary'}
+  ];
   const envelope = () => has('done') ? {display_status: 'completed', history_saved: true, artifact_ids: []} : null;
   function frames() {
     if (has('queued')) return [];
@@ -50,8 +55,10 @@
     result.push(frame(result.length + 1, 'answer_start', {}));
     result.push(frame(result.length + 1, 'text', {content: '  \n'}));
     if (has('whitespace')) return result;
-    result.push(frame(result.length + 1, 'text', {content: '## 表格核对结果\n\n已读取数据，保留原始列名。'}));
-    if (has('done')) result.push(frame(result.length + 1, 'done', {turn_envelope: envelope(), answer: '## 表格核对结果\n\n已读取数据，保留原始列名。'}));
+    result.push(frame(result.length + 1, 'citations', {candidates: [{kind: 'web', title: '未引用的候选', url: 'https://example.org/candidate'}]}),
+      frame(result.length + 2, 'citations', {display: 'bubble_only', bubbles: citations}),
+      frame(result.length + 3, 'text', {content: answer}));
+    if (has('done')) result.push(frame(result.length + 1, 'done', {turn_envelope: envelope(), answer}));
     return result;
   }
   function queue() {
@@ -107,33 +114,19 @@
       return new Response(svg, {headers: {'Content-Type': 'image/svg+xml', 'Content-Disposition': 'attachment; filename=fixture.svg', 'Content-Length': String(new TextEncoder().encode(svg).length)}});
     } else if (p.endsWith('/messages')) body = {messages: [], turns: Array.from({length: state().turns || 0}, (_, i) => ({turn_request_id: 'saved-' + i, user: {content: '历史问题 ' + i}, answer: {content: '历史回答 ' + i}, display_status: 'completed'})), has_more: false};
     else if (p.startsWith('/api/v2/session/' + otherSid + '/')) body = {turns: []};
-    else if (p.startsWith('/api/v2/chat/jobs/' + job + '/updates/')) {
-      const id = p.split('/').at(-1);
-      save({lookups: [...(state().lookups || []), id]});
-      const receipt = (state().receipts || {})[id];
-      status = state().lookupHeld ? 503 : receipt ? 200 : 404;
-      body = status === 200 ? {...receipt, status: receipt.version <= (state().appliedVersion || 0) ? 'applied' : 'pending'} : {};
-    } else if (p === '/api/v2/chat/jobs/' + job + '/updates' && settings?.method === 'POST') {
-      const payload = JSON.parse(settings.body);
-      const receipts = state().receipts || {};
-      save({updates: [...(state().updates || []), payload]});
-      if (state().updateMode === 'conflict') {
-        status = 409;
-        body = {detail: {code: 'task_version_conflict'}};
-      } else {
-        const id = payload.update_request_id;
-        body = receipts[id] || {job_id: job, version: 2 + Object.keys(receipts).length, status: 'pending'};
-        save({receipts: {...receipts, [id]: body}});
-        if (state().updateMode === 'lost') throw new TypeError('Fixture dropped update receipt');
-      }
+    else if (p === '/api/v2/chat/jobs/' + job + '/cancel' && settings?.method === 'POST') {
+      save({cancels: [...(state().cancels || []), job]});
+      body = {accepted: true}; // Task observation, not this receipt, confirms terminal state.
+    } else if (p.includes('/updates')) {
+      save({updates: [...(state().updates || []), {path: p, method: settings?.method || 'GET'}]});
+      status = 404;
     } else if (p.includes('/turn-queue/') && settings?.method === 'DELETE') {
-      const id = p.split('/').at(-1);
-      const row = (state().posts || []).find(entry => entry.client_request_id === id);
-      if (!row) status = 404;
-      else {
-        save({cancelled: [...(state().cancelled || []), id]});
-        body = {...row, state: 'terminal', clear_reason: 'cancelled'};
-      }
+      save({queueDeletes: [...(state().queueDeletes || []), p]});
+      status = 405;
+    } else if (p.endsWith('/turn-sources')) {
+      const url = 'https://example.org/candidate';
+      save({sourceReads: [...(state().sourceReads || []), p]});
+      body = {sources: [{kind: 'web', title: '未引用的候选', url}]};
     } else if (p.endsWith('/turn-queue')) {
       if (state().queueUnavailable && settings?.method !== 'POST') return new Response('{}', {status: 503});
       let admissions = state().posts || [];
@@ -142,16 +135,13 @@
         save({posts: admissions});
       }
       const entries = admissions.map((entry, i) => ({...entry, session_id: sid, job_id: 'new-job-' + i, queue_seq: i + 10,
-        queue_position: i + 1, state: 'queued', accepted_at: Date.now() / 1000,
-        ...((state().cancelled || []).includes(entry.client_request_id) ? {state: 'terminal', clear_reason: 'cancelled'} : {})}));
+        queue_position: i + 1, state: 'queued', accepted_at: Date.now() / 1000}));
       body = settings?.method === 'POST' ? entries.at(-1) : {turns: [queue(), ...entries]};
     }
     else if (p === '/jobs/' + job || p === '/jobs/' + job + '/events') {
       const events = frames(), after = +(url.searchParams.get('after') || 0);
       body = {job_id: job, protocol: 'citrus-task/1', status: has('done') ? 'completed' : 'running',
         terminal_snapshot: envelope(), context_snapshot: events.filter(x => x.event === 'context_snapshot').at(-1)?.data,
-        task_version: 1 + Object.keys(state().receipts || {}).length, applied_version: state().appliedVersion || 0,
-        pending_updates: Object.values(state().receipts || {}).filter(receipt => receipt.version > (state().appliedVersion || 0)),
         event_cursor: events.length, next_cursor: events.length, has_more: false, events: events.filter(x => x.seq > after)};
       if (body.context_snapshot) body.context_snapshot = {...body.context_snapshot, seq: events.filter(x => x.event === 'context_snapshot').at(-1).seq};
     }

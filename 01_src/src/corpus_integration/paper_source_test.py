@@ -8,6 +8,7 @@ from queue import Queue
 import threading
 
 import pytest
+from urllib3.exceptions import ProtocolError
 
 from citrus_corpus.auto_intake import AutoIntake
 from citrus_corpus.store import Store
@@ -52,6 +53,8 @@ def _mock_http(monkeypatch, *, article=None, license_patch=None, original=RAW, d
         elif url == source._CLOUD + "/metadata/" + MEMBER + ".json":
             payload = {**LICENSE, **(license_patch or {})}
         elif url == source._CLOUD + TEXT:
+            if isinstance(original, Exception):
+                raise original
             payload = original
         else:
             pytest.fail(f"unexpected request: {url}")
@@ -173,6 +176,9 @@ def test_pmc_retraction_blocks_metadata_but_integrity_failure_keeps_link(monkeyp
     assert source.resolve(DOI, PMID, allowed=lambda: True) is None
     assert len(calls) == 3
     calls = _mock_http(monkeypatch, original=RAW + b"changed")
+    assert "raw" not in source.resolve(DOI, PMID, allowed=lambda: True)
+    assert len(calls) == 4
+    calls = _mock_http(monkeypatch, original=ProtocolError("incomplete body"))
     assert "raw" not in source.resolve(DOI, PMID, allowed=lambda: True)
     assert len(calls) == 4
     calls = _mock_http(monkeypatch, duplicate_version=True)

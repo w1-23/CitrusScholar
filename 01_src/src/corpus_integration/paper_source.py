@@ -10,6 +10,7 @@ from urllib.parse import quote, unquote, urlsplit
 from xml.etree import ElementTree
 
 import requests
+from urllib3.exceptions import HTTPError
 
 from citrus_refcheck.providers import norm_title
 
@@ -26,7 +27,7 @@ _MAX_ORIGINAL = 8 * 1024 * 1024
 _NETWORK_BUDGET_SECONDS = 22
 _NCBI_RATE_LOCK = Lock()
 _ncbi_next_request = 0.0
-_UNAVAILABLE = (OSError, ValueError, requests.RequestException, ElementTree.ParseError)
+_UNAVAILABLE = (OSError, ValueError, HTTPError, ElementTree.ParseError, RecursionError)
 _ARTICLE_TYPES = frozenset({
     "journal article", "research-article", "research article", "review", "review-article",
     "systematic review", "meta-analysis", "clinical trial", "comparative study", "observational study",

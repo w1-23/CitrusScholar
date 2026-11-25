@@ -1,4 +1,5 @@
 """Dedicated job lifecycle and fenced leases for single-work intake."""
+from contextlib import nullcontext
 from hashlib import sha256
 import json
 import re
@@ -58,7 +59,8 @@ class IntakeQueue:
         self.store = store
         self.now = now
 
-    def submit(self, identity, request, *, actor, expected_sha256=None, revision="", persist=None, timeout=0.2):
+    def submit(self, identity, request, *, actor, expected_sha256=None, revision="", persist=None, timeout=0.2,
+               connection=None, fingerprint_namespace=""):
         if expected_sha256 is not None and not SHA256.fullmatch(expected_sha256):
             raise ValueError("source_sha256_invalid")
         if expected_sha256 is None and request["kind"] != "explicit":
@@ -71,10 +73,12 @@ class IntakeQueue:
         payload = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
         if len(payload.encode()) > 8192:
             raise ValueError("intake_request_too_large")
-        fingerprint = sha256(json.dumps([identity, expected_sha256 or revision],
-                                       ensure_ascii=False).encode()).hexdigest()
+        key = [identity, expected_sha256 or revision]
+        if fingerprint_namespace:
+            key.insert(0, fingerprint_namespace)
+        fingerprint = sha256(json.dumps(key, ensure_ascii=False).encode()).hexdigest()
         now = self.now()
-        with self.store.write(timeout=timeout) as conn:
+        with (self.store.write(timeout=timeout) if connection is None else nullcontext(connection)) as conn:
             existing = conn.execute("SELECT * FROM intake WHERE fingerprint=?", (fingerprint,)).fetchone()
             if existing and existing["state"] not in {"failed", "expired"}:
                 return self._view(existing)

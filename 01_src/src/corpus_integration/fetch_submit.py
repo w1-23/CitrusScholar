@@ -1,4 +1,4 @@
-"""Bounded, best-effort handoff of an already returned Fetch observation."""
+"""Bounded, best-effort backend handoff from the dedicated Fetch Paper tool."""
 from contextvars import copy_context
 import logging
 import os
@@ -8,31 +8,28 @@ from threading import Lock, Thread
 from .settings import growth_enabled
 
 logger = logging.getLogger(__name__)
-MAX_OBSERVATION_CHARS = 1024 * 1024
 _pending = Queue(maxsize=8)
 _start_lock = Lock()
 _consumer = None
 
 
-def submit(winner, *, owner, doi="", title=""):
-    if not growth_enabled() or not owner:
-        return None
+def submit(*, owner: int | None, doi: str, pmid: str, winner_url: str = "") -> None:
+    from .paper_source import identifiers
+
+    if not growth_enabled() or type(owner) is not int or owner <= 0:
+        return
     root = os.getenv("CITRUS_ISOLATED_CORPUS_ROOT")
     if not root:
-        return {"retention_status": "handoff_unavailable"}
-    content = winner.get("content")
-    if winner.get("truncated") or type(content) is not str or not 0 < len(content) <= MAX_OBSERVATION_CHARS:
-        return {"retention_status": "source_out_of_bounds"}
-    if not _ensure_consumer():
-        return {"retention_status": "handoff_busy"}
-    # Passing the immutable string reference leaves byte encoding, disk and DB work to the consumer.
+        return
+    doi, pmid = identifiers(doi, pmid, winner_url)
+    if not (doi or pmid) or not _ensure_consumer():
+        return
+    # Nothing from the search tool's body, headers, title or license enters the
+    # queue. Items are not durable until the worker verifies and registers them.
     try:
-        _pending.put_nowait((copy_context(), owner, str(doi or "")[:512],
-                             str(winner.get("url") or "")[:2048],
-                             str(title or winner.get("title") or "")[:512], content))
+        _pending.put_nowait((copy_context(), owner, root, doi, pmid))
     except Full:
-        return {"retention_status": "queue_full"}
-    return {"retention_status": "handoff_unconfirmed"}
+        logger.debug("Isolated Fetch Paper handoff unavailable: queue_full")
 
 
 def _ensure_consumer():
@@ -56,28 +53,35 @@ def _drain():
         try:
             context.run(_persist, *receipt)
         except Exception as exc:
-            logger.warning("Isolated Fetch retention unavailable: %s", type(exc).__name__)
+            logger.warning("Isolated Fetch Paper handoff unavailable: %s", type(exc).__name__)
         finally:
             _pending.task_done()
 
 
-def _persist(owner, doi, url, title, content):
-    from citrus_corpus.intake import Intake
-    from citrus_corpus.store import Store
+def _persist(owner: int, root: str, doi: str, pmid: str):
     from src.auth import user_by_id
     from src.core.capability_policy import allows
+    from src.core.tracing import get_user_id
 
-    if not growth_enabled() or not allows("web_fetch"):
-        logger.info("Isolated Fetch handoff rejected: policy_denied")
+    from .paper_source import resolve
+
+    def allowed():
+        # Network capabilities also require external_data_network and the
+        # captured request's web opt-in, and consult live revocations.
+        return (growth_enabled() and root == os.getenv("CITRUS_ISOLATED_CORPUS_ROOT")
+                and get_user_id() == owner and allows("web_fetch") and allows("bibliographic_lookup"))
+
+    def approved():
+        user = user_by_id(owner) or {}
+        return (user.get("user_id") == owner and user.get("active") is True
+                and user.get("approval_status") == "approved")
+
+    if not allowed() or not approved():
         return
-    user = user_by_id(int(owner)) or {}
-    if not user.get("active") or user.get("approval_status") != "approved":
-        logger.info("Isolated Fetch handoff rejected: account_denied")
+    record = resolve(doi, pmid, allowed=allowed)
+    if record is None or not allowed() or not approved():
         return
-    root = os.getenv("CITRUS_ISOLATED_CORPUS_ROOT")
-    if not root:
-        logger.info("Isolated Fetch handoff rejected: root_unavailable")
-        return
-    prefix = content[:120].lstrip().lower()
-    fmt = "xml" if prefix.startswith("<?xml") else "html" if prefix.startswith("<") else "markdown"
-    Intake(Store(root)).submit_observed(content, fmt=fmt, actor=f"account-{owner}", doi=doi, url=url, title=title)
+    from citrus_corpus.auto_intake import AutoIntake
+    from citrus_corpus.store import Store
+
+    return AutoIntake(Store(root)).register(**record)

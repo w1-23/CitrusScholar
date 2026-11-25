@@ -159,3 +159,30 @@ def decision_evidence(decision, evidence, license_id):
             raise ValueError("rights_license_inadmissible")
         return "operator_verified_open_license", checked["license"], evidence
     return "admin_grant", "", evidence
+
+
+def automatic_evidence(pmcid, license_id, evidence_url, text_url):
+    """Check locator consistency; the trusted caller authenticates their contents."""
+    if (not isinstance(evidence_url, str) or len(evidence_url) > 2048
+            or not PMC_CLOUD_METADATA_URL.fullmatch(evidence_url)):
+        raise ValueError("automatic_pmc_evidence_invalid")
+    version = evidence_url.rsplit("/", 1)[1].removesuffix(".json")
+    prefix = evidence_url.split("/metadata/", 1)[0]
+    if pmcid != version.split(".", 1)[0] or text_url != f"{prefix}/{version}/{version}.txt":
+        raise ValueError("automatic_pmc_version_mismatch")
+    if not isinstance(license_id, str) or len(license_id) > 256:
+        raise ValueError("rights_license_inadmissible")
+    value = license_id.strip().casefold()
+    if value in TRUSTED_LICENSES:
+        token = value
+    elif re.fullmatch(r"cc-by(?:-sa)?-(?:[1-4]\.0)", value) or re.fullmatch(
+            r"https://creativecommons\.org/(?:licenses/by(?:-sa)?/[1-4]\.0|publicdomain/(?:zero|mark)/1\.0)/?",
+            value):
+        token = license_token(value)
+        if value.rstrip("/").endswith("/mark/1.0"):
+            token = "public-domain"
+    else:
+        raise ValueError("rights_license_inadmissible")
+    if token not in TRUSTED_LICENSES:
+        raise ValueError("rights_license_inadmissible")
+    return token, {"locator": evidence_url, "license": token, "text_url": text_url, "pmc_version": version}

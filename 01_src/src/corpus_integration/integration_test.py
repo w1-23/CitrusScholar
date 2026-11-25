@@ -13,7 +13,7 @@ from src.corpus_integration.migration import dry_run
 from src.shared_corpus import catalog, journal, prepare
 
 
-def test_fetch_observation_never_archives_or_fetches_inline(tmp_path, monkeypatch):
+def test_fetch_paper_handoff_never_archives_or_fetches_inline(tmp_path, monkeypatch):
     from src.core import tracing
     from src.tools import deepseek_search_fetch as fetch
 
@@ -22,23 +22,26 @@ def test_fetch_observation_never_archives_or_fetches_inline(tmp_path, monkeypatc
     monkeypatch.setenv("CITRUS_CORPUS_FETCH_GROWTH", "1")
     monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_ROOT", str(root.root))
     monkeypatch.setattr(tracing, "get_user_id", lambda: 7)
-    monkeypatch.setattr(fetch, "_enabled", lambda capability: capability == "web_fetch")
+    monkeypatch.setattr(fetch, "_enabled", lambda name: name in {"web_fetch", "bibliographic_lookup"})
     monkeypatch.setattr(fetch_submit, "_ensure_consumer", lambda: True)
     monkeypatch.setattr(fetch_submit, "_pending", Queue(maxsize=1))
 
-    content = "# A single permitted observation\n\nSource text containing a citation."
-    winner = {"url": "https://a.example/study", "content": content}
+    winner = {"url": "https://a.example/study", "content": "untrusted bytes", "validity": "valid"}
     before = winner.copy()
-    assert fetch._retain_paper(winner)["retention_status"] == "handoff_unconfirmed"
+    assert fetch._retain_paper(winner, doi="10.1234/work") is None
+    assert fetch_submit._pending.empty()
+    fetch._queue_paper_registration("10.1234/work", "", winner)
+    fetch._queue_paper_registration("10.1234/another", "", winner)
     assert winner == before and list(root.originals.iterdir()) == []
     with root.read() as conn:
         assert conn.execute("SELECT count(*) FROM intake").fetchone()[0] == 0
-    assert fetch._retain_paper(winner)["retention_status"] == "queue_full"
-    assert fetch_submit._pending.get_nowait()[-1] is content
+    assert fetch_submit._pending.get_nowait()[1:] == (7, str(root.root), "10.1234/work", "")
+    assert fetch_submit._pending.empty()
     assert fetch._retain_missing_paper(doi="", pmid="", title="", url="https://a.example") is None
 
-    monkeypatch.setattr(fetch, "_enabled", lambda capability: False)
-    assert fetch._retain_paper(winner) is None
+    monkeypatch.setattr(fetch, "_enabled", lambda name: name == "web_fetch")
+    fetch._queue_paper_registration("10.1234/work", "", winner)
+    assert fetch_submit._pending.empty()
 
 
 def test_legacy_citation_and_consistent_migration_dry_run(tmp_path):

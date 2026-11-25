@@ -509,14 +509,7 @@ def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "
     """Dispatch fetched content to the configured retention policy."""
     from src.corpus_integration.settings import legacy_enabled
     if not legacy_enabled():
-        from src.core.tracing import get_user_id
-        from src.corpus_integration.fetch_submit import submit
-        try:
-            return (submit(winner, owner=get_user_id(), doi=doi, title=title)
-                    if _enabled("web_fetch") else None)
-        except Exception as error:
-            logger.warning("Isolated Fetch handoff unavailable: %s", type(error).__name__)
-            return {"retention_status": "handoff_unavailable"}
+        return None
     if not _enabled("local_rag"):
         return None
     try:
@@ -564,6 +557,21 @@ def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "
     except Exception as error:
         logger.warning("Online paper retention unavailable: %s", type(error).__name__)
         return {"retention_status": "archive_unavailable"}
+
+
+def _queue_paper_registration(doi: str, pmid: str, winner: dict | None = None) -> None:
+    from src.corpus_integration.settings import growth_enabled
+
+    if not growth_enabled() or not (_enabled("web_fetch") and _enabled("bibliographic_lookup")):
+        return
+    try:
+        from src.core.tracing import get_user_id
+        from src.corpus_integration.fetch_submit import submit
+
+        winner_url = winner.get("url", "") if winner and winner.get("validity") == "valid" else ""
+        submit(owner=get_user_id(), doi=doi, pmid=pmid, winner_url=winner_url)
+    except Exception as error:
+        logger.warning("Isolated Fetch Paper handoff unavailable: %s", type(error).__name__)
 
 
 def _retain_missing_paper(*, doi: str, pmid: str, title: str, url: str) -> dict | None:
@@ -829,6 +837,7 @@ def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
             safe_candidates.append((value, kind))
     candidates = list(dict.fromkeys(safe_candidates))[:8]
     if not candidates:
+        _queue_paper_registration(doi, pmid)
         if attempts:
             return ("[WEB_FETCH_BLOCKED] No candidate URL passed the public-target check.",
                     {"web_results": [], "fetch_attempts": attempts})
@@ -863,10 +872,12 @@ def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
                     official = None
     elapsed_ms = round((time.monotonic() - started) * 1000)
     review_candidate = None
-    if winner is not None:
+    if not _legacy_corpus_enabled():
+        _queue_paper_registration(doi, pmid, winner)
+    elif winner is not None:
         review_candidate = _retain_paper(winner, doi=doi_value, title=title, pmid=pmid_value,
                                          **({"official": official} if official else {}))
-    elif _legacy_corpus_enabled():
+    else:
         partial = abstract_only[0] if abstract_only else {}
         from citrus_refcheck.providers import normalize_doi
         metadata = _matched_paper_metadata(attempts, normalize_doi(doi_value), pmid_value, title)

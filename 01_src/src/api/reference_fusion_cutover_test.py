@@ -133,3 +133,26 @@ def test_exact_historical_start_proof_and_saved_views(runtime, monkeypatch):
     assert client.post(base + draft_id + "/cancel", headers=HEADERS).status_code == 200
     user["user_id"] = OWNER + 1
     assert client.post(base + started_id + "/run", json={"resume": True}, headers=HEADERS).status_code == 404
+
+
+def test_private_library_accepts_svg_without_expanding_chat_attachment_list(monkeypatch):
+    from src.api import turn_envelope
+
+    app = FastAPI()
+    app.post("/api/v2/session/{session_id}/files/upload", status_code=201)(main.upload_account_library_file)
+    monkeypatch.setattr(main, "current_user", lambda _: {"user_id": OWNER})
+    monkeypatch.setattr(main, "_require_active_turn_session", lambda sid, user: None)
+    received = []
+
+    def store(**values):
+        received.append(values)
+        return dict(file_id="a" * 32, filename=values["name"], size_bytes=len(values["content"]), sha256="b" * 64)
+
+    monkeypatch.setattr(turn_envelope, "_register_upload", store)
+    raw = b'<svg xmlns="http://www.w3.org/2000/svg"><text>x</text></svg>'
+    client = TestClient(app)
+    assert client.post(BASE + "/files/upload?filename=panels.svg", content=raw).status_code == 201
+    assert received[0]["content"] == raw and received[0]["mime"] == "image/svg+xml"
+    assert received[0]["owner_user_id"] == OWNER and received[0]["session_id"] == SESSION
+    assert "svg" not in turn_envelope._ALLOWED_UPLOAD_SUFFIXES
+    assert client.post(BASE + "/files/upload?filename=panels.exe", content=raw).status_code == 400

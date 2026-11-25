@@ -6166,9 +6166,11 @@ async def upload_account_library_file(session_id: str, request: Request, filenam
     user = current_user(request)
     _require_active_turn_session(session_id, user)
     name = filename.strip()
+    # SVG is a private library original, not an inline chat attachment.
+    allowed_suffixes = _ALLOWED_UPLOAD_SUFFIXES | {"svg"}
     if (not name or len(name) > MAX_NAME_CHARS or any(c in name for c in ("/", "\\"))
             or any(ord(c) < 32 for c in name)
-            or Path(name).suffix.lower().lstrip(".") not in _ALLOWED_UPLOAD_SUFFIXES):
+            or Path(name).suffix.lower().lstrip(".") not in allowed_suffixes):
         raise HTTPException(400, "文件名或文件格式不受支持。")
     content = bytearray()
     async for block in request.stream():

@@ -4787,7 +4787,7 @@ async def health_check():
 def _agent_runtime_readiness():
     from importlib import import_module
     errors = []
-    for name in ("src.agent.harness", "src.agent.context_projection", "deepagents.backends",
+    for name in ("src.agent.harness", "src.agent.post_turn_compaction", "deepagents.backends",
                  "deepagents.middleware.skills", "src.agent.skill_adapter"):
         try:
             import_module(name)
@@ -4796,8 +4796,8 @@ def _agent_runtime_readiness():
             errors.append({"module": name, "error": type(exc).__name__})
     if not errors:
         try:
-            from src.agent.deep_agent_runtime import configure_host_profile
-            configure_host_profile()
+            from src.agent.deep_agent_runtime import configure_profile
+            configure_profile()
         except Exception as exc:
             errors.append({"module": "src.agent.deep_agent_runtime", "error": type(exc).__name__})
     return {"ready": not errors, "errors": errors}

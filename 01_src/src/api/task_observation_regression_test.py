@@ -210,3 +210,9 @@ def test_model_draft_is_not_a_public_answer(monkeypatch):
         preview.append(text)
         preview.clear()
         assert events == []
+
+
+def test_pinned_framework_runtime_passes_startup_readiness():
+    from src.api.main import _agent_runtime_readiness
+
+    assert _agent_runtime_readiness() == {"ready": True, "errors": []}

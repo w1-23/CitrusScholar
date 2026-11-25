@@ -12,9 +12,11 @@ from pathlib import Path
 import time
 
 from .identity import ExecutionIdentity
-from .checkpoint_store import (checkpoint_path, checkpoint_scope, open_checkpoint,
-                               native_checkpoint_path, native_checkpoint_scope,
-                               open_native_checkpoint)
+from .checkpoint_store import (
+    checkpoint_path, framework_checkpoint_path, framework_checkpoint_scope,
+    native_checkpoint_path, native_checkpoint_scope, open_framework_checkpoint,
+    open_legacy_native_reader,
+)
 from src.core.task_events import TaskConflict
 
 # Only stable server-prepared request/context fields are recoverable. Runtime
@@ -56,85 +58,153 @@ def validate_original_request_state(value, identity: ExecutionIdentity) -> dict:
     return deepcopy(value)
 
 
+def _checkpoint_reader(saver, *, maintenance=False):
+    from langgraph.graph import END, START, StateGraph
+    from .harness import HarnessState
+
+    # The reader and optional terminal update access storage only. There are
+    # no model nodes, callable tools, business middleware, or replay actions.
+    reader = StateGraph(HarnessState)
+    if maintenance:
+        reader.add_node("maintenance", lambda state: {})
+        reader.add_edge(START, "maintenance")
+        reader.add_edge("maintenance", END)
+    else:
+        reader.add_edge(START, END)
+    return reader.compile(checkpointer=saver)
+
+
+async def is_terminal_orphan(identity, values, *, answered_question=False):
+    """Use authoritative job ownership and durable operation state, not a job ID exception."""
+    from src.core import jobs, task_events
+    from .harness import has_unsettled_work
+
+    active = values.get("active_run_id")
+    if not isinstance(active, str) or not active or active == identity.run_id or has_unsettled_work(values, ignore_question=answered_question):
+        return False
+    original = (values.get("host_state") or {}).get("original_request_state") or {}
+    expected = (identity.owner_user_id, identity.session_id, original.get("request_id"), active)
+    if tuple(original.get(k) for k in ("user_id", "session_id", "request_id", "job_id")) != expected:
+        return False
+
+    def read_job():
+        with task_events.transaction() as conn:
+            row = conn.execute("SELECT owner_user_id,session_id,request_id,job_id,status,terminal_snapshot "
+                               "FROM task_jobs WHERE job_id=?", (active,)).fetchone()
+            if (not row or tuple(row[k] for k in ("owner_user_id", "session_id", "request_id", "job_id")) != expected
+                    or row["status"] not in ({"awaiting_input"} if answered_question else
+                        jobs.TERMINAL_STATUS - {"awaiting_input"}) or not row["terminal_snapshot"]):
+                return False
+            return conn.execute("SELECT 1 FROM task_operations WHERE job_id=? AND owner_user_id=? "
+                                "AND status IN ('running','interrupted','unknown') LIMIT 1",
+                                (active, identity.owner_user_id)).fetchone() is None
+    return await asyncio.to_thread(read_job)
+
+
+async def validate_legacy_native_head(root, identity, provider_scope, *, context_scope="", authorized_question_parent=""):
+    """Admit only a settled predecessor. Never invoke or change the legacy graph."""
+    from .deep_agent_runtime import LEGACY_NATIVE_EXECUTOR_ID
+    from .harness import has_unsettled_work
+    from .runtime import AdmissionStopped
+    from langgraph.types import Send
+
+    # Early native threads had no capability discriminator. Inspect them as
+    # well for the same owner/session/provider, without importing their context.
+    for scope in dict.fromkeys((context_scope, "")):
+        options = {"context_scope": scope}
+        if not native_checkpoint_path(root, identity, provider_scope, **options).is_file():
+            continue
+        async with open_legacy_native_reader(root, identity, provider_scope, **options) as saver:
+            saved = await saver.aget_tuple({"configurable": native_checkpoint_scope(identity, provider_scope, **options)})
+            if saved is None:
+                continue
+            values = (await _checkpoint_reader(saver).aget_state(saved.config)).values
+            pending = saved.pending_writes or ()
+            channels = saved.checkpoint.get("channel_values") or {}
+            pending_tool = any(k.startswith("branch:to:") and "tool" in k for k in channels)
+            pending_tool |= any(isinstance(v, Send) and "tool" in v.node for _, _, v in pending)
+            pending_tool |= any(channel == "__interrupt__" for _, channel, _ in pending)
+            answered_question = (authorized_question_parent == values.get("active_run_id")
+                                 and values.get("stop_status") == "waiting"
+                                 and values.get("stop_reason") == "user_input_required")
+            if (values.get("executor_id") != LEGACY_NATIVE_EXECUTOR_ID or not values.get("messages")
+                    or has_unsettled_work(values, ignore_question=answered_question) or pending_tool
+                    or not await is_terminal_orphan(identity, values, answered_question=answered_question)):
+                raise AdmissionStopped("native_thread_requires_reconciliation")
+
+
 async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                               provider_scope: tuple[str, str], *,
                               execution_wait: dict | None = None) -> dict:
-    """Read committed state; an internal wait admission must name its exact commit.
-
-    The wait argument is never accepted from an HTTP body. Its values come from
-    the Host suspension or the durable parked segment, under the original fence.
-    """
+    """Read the exact committed framework state. Legacy executors are never resumed."""
     from src.core.jobs import get_job
-    from .deep_agent_runtime import EXECUTOR_ID, NATIVE_EXECUTOR_ID
+    from .deep_agent_runtime import EXECUTOR_ID
+    from .harness import has_unsettled_work
+    from .runtime import _pending_calls, validate_execution_waits
 
-    native = not checkpoint_path(root, identity, provider_scope).is_file()
-    options = {}
-    if native:
-        job = await asyncio.to_thread(get_job, identity.run_id)
-        if job and (job["owner_user_id"], job["session_id"], job["request_id"]) != (
-                identity.owner_user_id, identity.session_id, identity.user_turn_id):
-            raise TaskConflict("recovery_identity_mismatch")
-        options["context_scope"] = (job or {}).get("native_context_scope", "")
-        if not native_checkpoint_path(root, identity, provider_scope, **options).is_file():
-            raise TaskConflict("recovery_checkpoint_missing")
-    opener = open_native_checkpoint if native else open_checkpoint
-    scope = native_checkpoint_scope if native else checkpoint_scope
-    executor_id = NATIVE_EXECUTOR_ID if native else EXECUTOR_ID
-    async with opener(root, identity, provider_scope, **options) as saver:
-        saved = await saver.aget_tuple({"configurable": scope(identity, provider_scope, **options)})
+    job = await asyncio.to_thread(get_job, identity.run_id)
+    if job and (job["owner_user_id"], job["session_id"], job["request_id"]) != (
+            identity.owner_user_id, identity.session_id, identity.user_turn_id):
+        raise TaskConflict("recovery_identity_mismatch")
+    options = {"context_scope": (job or {}).get("native_context_scope", "")}
+    if not framework_checkpoint_path(root, identity, provider_scope, **options).is_file():
+        if (checkpoint_path(root, identity, provider_scope).is_file()
+                or any(native_checkpoint_path(root, identity, provider_scope, context_scope=scope).is_file()
+                       for scope in {options["context_scope"], ""})):
+            raise TaskConflict("executor_checkpoint_incompatible")
+        raise TaskConflict("recovery_checkpoint_missing")
+    async with open_framework_checkpoint(root, identity, provider_scope, **options, read_only=True) as saver:
+        saved = await saver.aget_tuple({"configurable": framework_checkpoint_scope(identity, provider_scope, **options)})
         if saved is None:
             raise TaskConflict("recovery_checkpoint_missing")
-        raw_values = saved.checkpoint.get("channel_values", {})
-        if not isinstance(raw_values, dict) or raw_values.get("executor_id") != executor_id:
+        raw = saved.checkpoint.get("channel_values", {})
+        if raw.get("executor_id") != EXECUTOR_ID:
             raise TaskConflict("executor_checkpoint_incompatible")
-        if native and raw_values.get("active_run_id") != identity.run_id:
+        if raw.get("active_run_id") != identity.run_id:
             raise TaskConflict("recovery_identity_mismatch")
-        from langgraph.graph import END, START, StateGraph
-        from .harness import HarnessState
-        # A schema-only reader has no model, executor, tools or policy hooks.
-        # aget_state reconstructs DeltaChannel values through the saver's
-        # authenticated ancestor writes. Pin the saved checkpoint id: admission
-        # inspects committed state, while the real harness reconciles pending work.
-        reader = StateGraph(HarnessState)
-        reader.add_edge(START, END)
-        graph = reader.compile(checkpointer=saver)
-        values = (await graph.aget_state(saved.config)).values
+        values = (await _checkpoint_reader(saver).aget_state(saved.config)).values
+        pending_interrupts = [value for _, channel, value in saved.pending_writes or () if channel == "__interrupt__"]
     if not isinstance(values, dict) or not values.get("messages"):
         raise TaskConflict("recovery_checkpoint_invalid")
     status = values.get("stop_status")
     answered = status == "complete" and values.get("stop_reason") == "answered"
+    signals = list((values.get("operation_signals") or {}).values())
+    unsettled = (_pending_calls(values["messages"]) or values.get("unknown_operations")
+                 or any(item.get("uncertain") or item.get("pending_question") for item in signals))
+    if unsettled or (values.get("host_state") or {}).get("pending_question"):
+        raise TaskConflict("recovery_requires_reconciliation")
     if execution_wait is not None:
         from dataclasses import asdict
         from .execution_outcome import validate_execution_suspension
-        from .runtime import _pending_calls
         try:
             expected = validate_execution_suspension(
                 {"identity": asdict(identity), **execution_wait}, identity)
+            waits = validate_execution_waits(tuple(dict.fromkeys(wait for item in signals
+                for wait in item.get("execution_waits", ()))))
         except (TypeError, ValueError):
             raise TaskConflict("recovery_execution_wait_invalid") from None
+        interrupts = [interrupt for group in pending_interrupts for interrupt in group]
+        wake = values.get("execution_wake")
         if (set(execution_wait) != {"checkpoint_ref", "wait_ids"}
-                or saved.config.get("configurable", {}).get("checkpoint_id") != expected["checkpoint_ref"]
-                or saved.checkpoint.get("id") != expected["checkpoint_ref"]
-                or status != "suspended" or values.get("stop_reason") != "execution_pending"
-                or values.get("execution_waits") != expected["wait_ids"]
-                or values.get("execution_wake") or _pending_calls(values["messages"])
-                or (values.get("host_state") or {}).get("identity") != asdict(identity)):
+                or (values.get("host_state") or {}).get("identity") != asdict(identity)
+                or (not wake and (saved.config["configurable"]["checkpoint_id"] != expected["checkpoint_ref"]
+                    or saved.checkpoint["id"] != expected["checkpoint_ref"]
+                    or list(waits) != expected["wait_ids"] or len(interrupts) != 1
+                    or interrupts[0].value != {"kind": "execution_wait", "wait_ids": list(waits)}))
+                or (wake and (wake != expected["wait_ids"] or pending_interrupts))):
             raise TaskConflict("recovery_execution_wait_invalid")
-    elif status and not answered:
+    elif (status and not answered) or pending_interrupts or has_unsettled_work(values):
         raise TaskConflict("recovery_checkpoint_terminal")
-    if values.get("batch_status") in {"unknown", "waiting"} or values.get("unknown_operations"):
-        raise TaskConflict("recovery_requires_reconciliation")
     host_state = values.get("host_state")
     if not isinstance(host_state, dict):
         raise TaskConflict("recovery_original_request_missing")
     state = validate_original_request_state(host_state.get("original_request_state"), identity)
-    if native:
-        from src.core.capability_policy import CapabilityPolicy
-        snapshot = state.get("capability_snapshot")
-        policy = CapabilityPolicy.restore(snapshot) if snapshot is not None else CapabilityPolicy()
-        if options["context_scope"] != policy.history_key:
-            raise TaskConflict("recovery_context_scope_mismatch")
-        state["capability_snapshot"] = policy.snapshot()
+    from src.core.capability_policy import CapabilityPolicy
+    snapshot = state.get("capability_snapshot")
+    policy = CapabilityPolicy.restore(snapshot) if snapshot is not None else CapabilityPolicy()
+    if options["context_scope"] != policy.history_key:
+        raise TaskConflict("recovery_context_scope_mismatch")
+    state["capability_snapshot"] = policy.snapshot()
     # Candidate bytes were process-local and are not present in the protected
     # snapshot. Never pretend those search handles survived a restart.
     pool_id = (state.get("candidate_pool") or {}).get("pool_id")

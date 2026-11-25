@@ -103,42 +103,66 @@ def current_terminal_event(conn, job_id):
 
 def _append(conn, job_id, event, data):
     _job(conn, job_id)
-    from src.core.progress_bus import public_progress_payload, stamp_sse_event, _encode_event
+    from src.core.progress_bus import stamp_sse_event, _encode_event
+    from src.core.public_delivery import project_public_event
     if event != "task_state":
-        data = public_progress_payload(event, data)
+        data = project_public_event(event, data)
+    if event == "text" and "content" not in data:
+        return None
     if event == "assistant_progress":
         if not data.get("text"):
             return None
         data["job_id"] = job_id
     terminal = current_terminal_event(conn, job_id)
-    if terminal is not None and event not in {"operation", "agent_recovery"}:
+    if terminal is not None and event not in {"operation", "agent_recovery", "context_maintenance"}:
         # One terminal frame per explicitly admitted event generation. Earlier
         # terminal facts remain unchanged; safe-step recovery emits operation facts.
-        return {"seq": terminal[0], "event": terminal[1], "data": json.loads(terminal[2]), "created_at": terminal[3]}
+        return {"seq": terminal[0], "event": terminal[1], "data": project_public_event(terminal[1], json.loads(terminal[2])), "created_at": terminal[3]}
     seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM task_events WHERE job_id=?", (job_id,)).fetchone()[0]
     # task_state is also the model's private durable snapshot. Only its
     # public event view is reduced, without changing the event or sequence.
+    now = time.time()
+    if event == "done":
+        data["turn_timings"] = _terminal_timings(conn, job_id, data, now)
     frame = stamp_sse_event(_encode_event(event, data), seq)
     payload = json.loads(frame["data"])
-    now = time.time()
     conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", (job_id, seq, event, canonical(payload), now))
     if event == "assistant_progress":
         conn.execute("UPDATE task_jobs SET progress_summary=? WHERE job_id=?", (payload["text"][:200], job_id))
     if event == "done" and isinstance(payload.get("turn_envelope"), dict):
         conn.execute("UPDATE task_jobs SET terminal_snapshot=? WHERE job_id=?", (canonical(payload["turn_envelope"]), job_id))
     return {"seq": seq, "event": event,
-            "data": public_progress_payload(event, payload) if event == "task_state" else payload,
+            "data": project_public_event(event, payload) if event == "task_state" else payload,
             "created_at": now}
 
 
+def _terminal_timings(conn, job_id, payload, now):
+    from src.core.public_delivery import TurnTimingEvidence
+    turn = None
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='chat_turn_queue' AND type='table'").fetchone():
+        turn = conn.execute("SELECT accepted_at,started_at FROM chat_turn_queue WHERE root_job_id=?",
+                            (job_id,)).fetchone()
+    evidence = TurnTimingEvidence(accepted_at=turn[0] if turn else None, started_at=turn[1] if turn else None)
+    for purpose, observation, started_at in conn.execute(
+            "SELECT purpose,observation,created_at FROM task_model_attempts WHERE job_id=? ORDER BY created_at",
+            (job_id,)):
+        evidence.attempt(purpose, json.loads(observation), started_at=started_at)
+    for event, data, created_at in conn.execute(
+            "SELECT event,data,created_at FROM task_events WHERE job_id=? AND event IN "
+            "('answer_start','text','text_reset','agent_recovery','done','tool_result') ORDER BY seq", (job_id,)):
+        evidence.observe(event, json.loads(data), created_at=created_at)
+    evidence.observe("done", payload, created_at=now)
+    return evidence.values()
+
+
 def public_working_notes(job_id):
-    from src.core.progress_bus import public_progress_payload
+    from src.core.public_delivery import project_public_event
     with transaction() as conn:
         rows = conn.execute("SELECT seq,data FROM task_events WHERE job_id=? AND event='assistant_progress' "
                             "ORDER BY seq DESC LIMIT ?", (job_id, LIVE_QUEUE_SIZE)).fetchall()
     notes = []
     for row in reversed(rows):
-        data = public_progress_payload("assistant_progress", json.loads(row["data"]))
+        data = project_public_event("assistant_progress", json.loads(row["data"]))
         if data.get("text"):
             notes.append({"seq": row["seq"], "event": "assistant_progress", "data": data | {"seq": row["seq"]}})
     return notes
@@ -153,7 +177,8 @@ def _latest_context_snapshot(conn, job_id):
     row = conn.execute("SELECT seq,data FROM task_events WHERE job_id=? AND event='context_snapshot' ORDER BY seq DESC LIMIT 1", (job_id,)).fetchone()
     if not row:
         return None
-    return dict(json.loads(row["data"]), seq=row["seq"])
+    from src.core.public_delivery import project_public_event
+    return project_public_event("context_snapshot", dict(json.loads(row["data"]), seq=row["seq"]))
 
 
 def latest_context_snapshot(job_id):
@@ -169,10 +194,16 @@ def replay(job_id, after=0, limit=200):
         job = dict(_job(conn, job_id))
         rows = conn.execute("SELECT * FROM task_events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?", (job_id, after, limit + 1)).fetchall()
         events = [dict(row) | {"data": json.loads(row["data"])} for row in rows[:limit]]
-        from src.core.progress_bus import public_progress_payload
+        from src.core.public_delivery import project_public_event
+        # Old previews were written as unmarked text and later reset. Keep
+        # their cursors. The terminal frame itself still supplies the legacy
+        # final answer, including when the reset lies beyond this page.
         for event in events:
-            # Live SSE reads this same projection. Keep every legacy cursor.
-            event["data"] = public_progress_payload(event["event"], event["data"]) | {"seq": event["seq"]}
+            payload = event["data"]
+            if (event["event"] == "text" and isinstance(payload, dict)
+                    and payload.get("delivery") != "committed"):
+                payload = {}
+            event["data"] = project_public_event(event["event"], payload) | {"seq": event["seq"]}
         return {"protocol": PROTOCOL, "job_id": job_id, "events": events,
                 "next_cursor": events[-1]["seq"] if events else after,
                 "has_more": len(rows) > limit, "status": job["status"],
@@ -182,14 +213,18 @@ def replay(job_id, after=0, limit=200):
 
 
 def _public_terminal(envelope):
-    from src.core.turn_envelope import public_terminal_snapshot
     from src.core.progress_bus import public_tool_reason, public_tool_resolutions
-    envelope = public_terminal_snapshot(envelope)
-    visible = {key: envelope[key] for key in (
-        "schema_version", "display_status", "execution_status", "acceptance_status",
-        "acceptance_reason", "job_status", "stop_reason", "history_saved", "verified_artifacts",
-        "artifact_ids", "terminal_seq",
-    ) if key in envelope}
+    from src.core.public_delivery import private_record, project_artifact_delivery, project_fields
+    if not isinstance(envelope, dict) or private_record(envelope):
+        return {}
+    visible = project_fields(envelope,
+        ids="display_status execution_status acceptance_status acceptance_reason job_status stop_reason",
+        numbers="schema_version verified_artifacts terminal_seq", bools="history_saved")
+    if isinstance(envelope.get("artifact_ids"), (list, tuple)):
+        visible["artifact_ids"] = [item for item in envelope["artifact_ids"]
+                                  if project_fields({"id": item}, ids="id").get("id")]
+    if isinstance(envelope.get("artifact_delivery"), dict):
+        visible["artifact_delivery"] = project_artifact_delivery(envelope["artifact_delivery"])
     if "tool_resolutions" in envelope:
         visible["tool_resolutions"] = public_tool_resolutions(envelope["tool_resolutions"])
     snapshot = envelope.get("task_snapshot")
@@ -201,7 +236,7 @@ def _public_terminal(envelope):
     # Notices may embed requirement labels or model-supplied reasons. Keep only
     # system-owned notices and never replay arbitrary prose as progress.
     if isinstance(envelope.get("notices"), (list, tuple)):
-        visible["notices"] = [note for note in envelope["notices"] if note in (
+        visible["notices"] = [note for note in envelope["notices"] if isinstance(note, str) and note in (
             "本轮已停止", "本轮回答已完成，但历史写入未确认；刷新后可能无法恢复。",
             "服务进程在任务完成前停止；可恢复已验证的安全步骤。",
             "主模型尚未配置，请联系管理员配置模型后重试。附件仍可在资料库中查看。",
@@ -663,7 +698,9 @@ def _attempt_response(scope, response, error):
     else:
         response_type = "none" if response is None else "other"
     estimate = scope["estimate"]
-    return {"provider": scope["provider"], "estimated_input_tokens": estimate["estimated_input_tokens"],
+    return {"provider_first_packet_ms": scope.get("provider_first_packet_ms"),
+            "attempt_elapsed_ms": scope.get("attempt_elapsed_ms"),
+            "provider": scope["provider"], "estimated_input_tokens": estimate["estimated_input_tokens"],
             "max_output_tokens": estimate["output_tokens"], "streaming": streaming,
             "stream_state": terminal if streaming else "not_streaming",
             "finish_reason": finish if known else None,
@@ -730,6 +767,7 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
     scope_token = _active_model_attempt.set(attempt_id)
     observation_token = _observation.set(scope)
     response, error = None, ""
+    invoked_at = time.monotonic()
     try:
         maintenance = _checkpoint_scope.get()
         remaining = (max(0.0, maintenance["deadline"] - time.monotonic())
@@ -741,6 +779,8 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
         error = type(exc).__name__
         raise
     finally:
+        from src.core.public_delivery import duration_ms
+        scope["attempt_elapsed_ms"] = duration_ms((time.monotonic() - invoked_at) * 1000)
         redirected = scope.get("redirected", False)
         usage = {} if redirected else extract_usage(response) or {}
         error = scope.get("transport_error", error)

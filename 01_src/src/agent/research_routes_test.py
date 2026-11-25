@@ -121,7 +121,17 @@ def test_policy_has_no_candidate_final_alias_and_keeps_host_projection():
     assert "尝试一轮" not in prompt
     examples = prompt.split("<source_routing_examples>", 1)[1].split("</source_routing_examples>", 1)[0]
     assert examples.count("正确：") == examples.count("反例：") == 3
-    assert all(example in examples for example in ("分别查看本地资料和公开网络", "只查本地资料", "画箱线图"))
+    from src.graph.retrieval_router import plan_retrieval
+
+    available = {"local_hybrid_search", "deepseek_search"}
+
+    def routes(query, **facts):
+        return {call["name"] for call in plan_retrieval(query, allowed_names=available,
+                local_families=("citrus",), **facts).calls}
+
+    assert routes("请分别查看本地资料和公开网络，核对柑橘溃疡病。") == available
+    assert routes("只查本地库中的柑橘溃疡病文献，不用联网") == {"local_hybrid_search"}
+    assert not routes("请用附件画箱线图。", attachment_only=True)
     assert "宿主会在终答前核对本轮两路覆盖" not in prompt
 
 

@@ -4,6 +4,7 @@ import argparse
 from contextlib import closing
 from datetime import date, datetime, time, timedelta, timezone
 import gzip
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -11,6 +12,22 @@ import sqlite3
 import subprocess
 import tempfile
 from zoneinfo import ZoneInfo
+
+
+def _delivery_module():
+    """Load the reviewed stdlib-only boundary from source or a staged sibling."""
+    script = Path(__file__).resolve()
+    for path in (script.with_name("public_delivery.py"),
+                 script.parents[1] / "01_src" / "src" / "core" / "public_delivery.py"):
+        if path.is_file():
+            spec = importlib.util.spec_from_file_location("citrus_public_delivery_export", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise RuntimeError("public_delivery.py missing from the exporter installation")
+
+
+_delivery = _delivery_module()
 
 
 JOB_ID = re.compile(r"[a-f0-9]{12,32}")
@@ -27,7 +44,6 @@ SECRET_TEXT = re.compile(
     r"[\"']?\s*[=:]\s*(?:(?:bearer|basic)\s+[\w./+=~-]+|"
     r"\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]}&\"']+))"
 )
-PRIVATE_KEYS = {"reasoning", "reasoning_content", "system_prompt", "developer_message", "raw_request"}
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 HEADER = "CitrusScholar 任务诊断导出"
 RESULT_KEYS = {"status", "reason", "reason_class", "reason_code", "retryable", "stage",
@@ -41,6 +57,7 @@ EVENT_KEYS = RESULT_KEYS | {
     "history_load_reason", "history_load_status", "before_tokens", "after_tokens", "archive_only_count",
     "response_status", "source", "category", "gen_time_ms", "total_elapsed_ms", "history_saved", "turn_status",
     "tools_called", "unavailable_count", "resolution", "resolutions",
+    *_delivery.TIMING_KEYS, "attempt_elapsed_ms",
 }
 LOG_KEYS = EVENT_KEYS | {
     "ts", "observed_at", "event", "req", "request_id", "job", "job_id", "session", "session_id", "mode",
@@ -62,12 +79,15 @@ def unpack(value):
 
 def redact(value):
     if isinstance(value, dict):
+        if _delivery.private_record(value):
+            return {}
         return {key: "[REDACTED]" if SECRET_KEY.fullmatch(key) else redact(item)
-                for key, item in value.items() if key.casefold() not in PRIVATE_KEYS}
-    if isinstance(value, list):
-        return [redact(item) for item in value]
+                for key, item in value.items()
+                if not _delivery.private_key(key) and not _delivery.private_record(item)}
+    if isinstance(value, (list, tuple)):
+        return [redact(item) for item in value if not _delivery.private_record(item)]
     if isinstance(value, str):
-        return SECRET_TEXT.sub("[REDACTED]", value.replace("\x00", " "))
+        return SECRET_TEXT.sub("[REDACTED]", _delivery.strip_private_text(value).replace("\x00", " "))
     return value
 
 
@@ -79,8 +99,11 @@ def render(value):
 def details(value, keys):
     if not isinstance(value, dict):
         return {}
-    return {key: value[key] for key in sorted(keys) if key in value
-            and (value[key] is None or isinstance(value[key], (str, int, float, bool)))}
+    result = _delivery.project_fields(value, texts=" ".join(sorted(keys)), numbers=" ".join(sorted(keys)),
+                                      bools=" ".join(sorted(keys)), nullable=" ".join(sorted(keys)))
+    for key in set(result) & {*_delivery.TIMING_KEYS, "attempt_elapsed_ms"}:
+        result[key] = _delivery.duration_ms(result[key])
+    return result
 
 
 def error_details(value):
@@ -107,9 +130,12 @@ def receipt(raw, *, show_errors):
 
 
 def event_details(event, data):
+    if event == "context_maintenance":
+        return _delivery.project_public_event(event, data)
     value = details(data, EVENT_KEYS)
-    if event == "assistant_progress" and isinstance(data.get("text"), str):
-        value["text"] = data["text"]
+    if event == "assistant_progress" and data.get("visibility") == "public":
+        if text := _delivery.public_answer_text(data.get("text")):
+            value["text"] = text
     if event == "status" and isinstance(data.get("summary"), str):
         value["summary"] = data["summary"]
     if event == "citations":
@@ -125,6 +151,10 @@ def event_details(event, data):
     if event == "tool_resolution" and isinstance(data.get("resolutions"), list):
         value["resolutions"] = [details(item, {"tool_call_id", "resolved_by_tool_call_id", "reason_code"})
                                 for item in data["resolutions"]]
+    if isinstance(data.get("observation"), dict):
+        value["observation"] = _delivery.model_attempt_observation(data["observation"])
+    if isinstance(data.get("turn_timings"), dict):
+        value["turn_timings"] = _delivery.timing_fields(data["turn_timings"])
     value.update(details(data, {"error", "error_text", "notice", "message"}))
     return value
 
@@ -233,12 +263,14 @@ def export_turn(conn, root, turn, out):
         section("所选 Skill 与附件输入", {key: payload.get(key) for key in ("selected_skills", "inputs")})
     answers, events, operations, call_ids = [], [], [], list(proposals)
     streamed_answers = {}
+    timing = _delivery.TurnTimingEvidence(accepted_at=turn["accepted_at"], started_at=turn["started_at"])
     operations_by_call = {}
     tool_events = {}
 
     for job in jobs:
         current = job["job_id"]
         answer_armed, public_chunks = False, []
+        committed_chunks = False
         section(f"执行 {current}", {key: job[key] for key in (
             "status", "current_step", "stop_reason", "error", "created_at", "finished_at")})
         for table, order in (("task_model_attempts", "created_at"), ("task_updates", "version"),
@@ -248,7 +280,10 @@ def export_turn(conn, root, turn, out):
             )]
             if records:
                 for row in records:
-                    row.pop("observation", None)
+                    if table == "task_model_attempts":
+                        observation = _delivery.model_attempt_observation(unpack(row.get("observation")))
+                        timing.attempt(row.get("purpose"), observation, started_at=row.get("created_at"))
+                        row["observation"] = observation
                     if "usage" in row:
                         row["usage"] = unpack(row["usage"])
                 section(table, records)
@@ -268,22 +303,24 @@ def export_turn(conn, root, turn, out):
         for row in conn.execute("SELECT seq,event,data,created_at FROM task_events WHERE job_id=? ORDER BY seq", (current,)):
             event, data = row["event"], unpack(row["data"])
             if isinstance(data, dict):
-                private = (data.get("private") is True or data.get("internal") is True
-                           or data.get("visibility") in ("private", "internal"))
-                if private or (event == "assistant_progress" and data.get("visibility") != "public"):
+                timing.observe(event, data, created_at=row["created_at"])
+                if (_delivery.private_record(data) or event in {"draft", "reasoning", "thinking", "task_state", "plan"}
+                        or (event == "assistant_progress" and data.get("visibility") != "public")):
                     continue
                 if event == "answer_start":
                     answer_armed = True
                 if event == "text_reset" or (event == "agent_recovery" and data.get("status") == "admitted"):
                     answer_armed = False
                     public_chunks.clear()
+                    committed_chunks = False
                 if event == "text":
-                    if answer_armed and isinstance(data.get("content"), str):
+                    if answer_armed and data.get("delivery") == "committed" and isinstance(data.get("content"), str):
                         public_chunks.append(data["content"])
+                        committed_chunks = True
                     continue
                 if event in {"done", "error"}:
-                    answer = data.get("answer")
-                    if isinstance(answer, str) and answer.strip():
+                    answer = _delivery.public_answer_text(data.get("answer"))
+                    if answer.strip():
                         answers.append((current, answer))
                         public_chunks.clear()
                         answer_armed = False
@@ -295,13 +332,17 @@ def export_turn(conn, root, turn, out):
             events.append({"job_id": current, "seq": row["seq"], "event": event,
                            "timestamp": row["created_at"],
                            "data": event_details(event, data) if isinstance(data, dict) else {}})
-        if public_chunks and (partial := "".join(public_chunks)).strip():
+        if committed_chunks and (partial := _delivery.public_answer_text("".join(public_chunks))).strip():
             streamed_answers[current] = partial
+
+    section("耗时指标（毫秒）", timing.values())
 
     if not answers and turn["history_saved"] and turn["state"] == "terminal":
         last = next((msg for msg in reversed(messages) if msg["msg_type"] in {"ai", "tool"}), None)
         if last is not None and last["msg_type"] == "ai" and not unpack(last["tool_calls_json"]) and last["content"]:
-            answers.append((job_id, last["content"]))
+            answer = _delivery.public_answer_text(last["content"])
+            if answer.strip():
+                answers.append((job_id, answer))
     if not answers and not streamed_answers:
         section("最终回答", "没有已保存的最终回答。")
     for current, answer in dict.fromkeys(answers):

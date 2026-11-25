@@ -4,15 +4,16 @@
 统一收尾 _force_final_answer）：
   - astream 逐 chunk 聚合：AIMessageChunk 合并 → 完整 AIMessage
     （tool_calls / usage_metadata 完整，cache_metrics 计量路径不变）
-  - on_text: content 增量回调（前端 text 事件 → 回答区逐 token 渲染）
+  - on_text: optional internal observation of tentative content. It does not
+    authorize or publish a visible answer.
   - Private provider protocol state survives live aggregation in the adapter's
     excluded field. It is never streamed or persisted in conversation history.
-  - 失败语义：异常上抛，由调用方按原有重试逻辑处理。流式已上屏内容
-    在重试时会轻微重复——权衡后接受（生产网络稳定、重试概率低）。
+  - Failures propagate to the caller for retry. Draft bytes are not published here.
 """
 from __future__ import annotations
 
 import logging
+import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -25,20 +26,38 @@ async def stream_llm_response(
     on_reasoning: Optional[Callable[[str], None]] = None,
     *,
     verify_terminal: bool = False,
+    on_provider_first_packet: Optional[Callable[[int], None]] = None,
 ):
     """流式调用 LLM 并聚合完整响应，返回 AIMessage（与 ainvoke 同构）。
 
     Args:
         llm: 支持 astream 的 langchain chat model（CitrusChatOpenAI）
         messages: langchain 消息列表
-        on_text: content 增量回调（回答区逐 token）
+        on_text: tentative content observer, not a public-delivery callback
         on_reasoning: deprecated compatibility argument; never invoked
         verify_terminal: track finish reasons on physical chunks before merging
+        on_provider_first_packet: elapsed ms to the first observed stream packet,
+            even if it contains only role, usage, tool or private reasoning metadata
     """
+    from src.core.public_delivery import duration_ms
+    from src.core.request_context import _observation
     full = None
+    first_packet_seen = False
     terminal = None
     terminal_conflict = False
+    started = time.monotonic()
     async for chunk in llm.astream(messages):
+        if not first_packet_seen:
+            first_packet_seen = True
+            elapsed = duration_ms((time.monotonic() - started) * 1000)
+            observation = _observation.get()
+            if observation is not None:
+                observation["provider_first_packet_ms"] = elapsed
+            if on_provider_first_packet is not None:
+                try:
+                    on_provider_first_packet(elapsed)
+                except Exception:
+                    pass
         if verify_terminal:
             reason = chunk.response_metadata.get("finish_reason")
             private = getattr(chunk, "provider_protocol", None)

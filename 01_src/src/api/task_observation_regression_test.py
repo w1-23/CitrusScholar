@@ -190,7 +190,7 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual(self.client.get(f'{route}/update-1').status_code, 404)
 
 
-def test_public_answer_preview_is_temporary_and_filters_private_prefixes(monkeypatch):
+def test_model_draft_is_not_a_public_answer(monkeypatch):
     from src.core import progress_bus
     from src.core.public_progress import PublicAnswerPreview
 
@@ -202,11 +202,11 @@ def test_public_answer_preview_is_temporary_and_filters_private_prefixes(monkeyp
     preview.append("This is a safe plain-text preview of the visible answer. ")
     preview.append("This remains in the final answer stream.")
     preview.clear()
-    assert events == ["answer_start", "This is a safe plain-text preview of the visible answer.", "text_reset"]
+    assert events == []
     for text in ('{"answer": "This is a private completion envelope. "}',
                  '<think>This is privately authored reasoning material.</think> ',
                  'One should never disclose a Bearer example-private-token. '):
         preview = PublicAnswerPreview()
         preview.append(text)
         preview.clear()
-        assert len(events) == 3
+        assert events == []

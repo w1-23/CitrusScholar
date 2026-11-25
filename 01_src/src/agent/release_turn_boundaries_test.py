@@ -7,7 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from src.agent.harness import HarnessRuntime
 from src.agent.host import _same_repair_target
 from src.agent.identity import ExecutionIdentity
-from src.agent.runtime import BatchObservation, FinalCheck, RunLimits
+from src.agent.runtime import FinalCheck, RunLimits
 from src.core.task_result import effective_tool_records
 from src.core.turn_outcome import artifact_goal_evidence
 from src.graph.task_contract import contract_for_turn
@@ -25,11 +25,11 @@ def test_unconfigured_skill_release_never_activates_archived_prompts(monkeypatch
 
 
 def test_request_to_check_both_sources_preserves_authorized_search(monkeypatch):
-    from src.agent.host_policy import allowed_presets, system_prompt
+    from src.agent.host_policy import allowed_presets
     from src.core import tracing
     from src.core.capability_policy import CapabilityPolicy
     from src.graph import tool_availability
-    from src.graph.retrieval_router import retrieval_denied, source_scope
+    from src.graph.retrieval_router import plan_retrieval, retrieval_denied, source_scope
 
     monkeypatch.setattr(tracing, "web_search_enabled", lambda: True)
     monkeypatch.setattr(tool_availability, "provider_denials", lambda settings: frozenset())
@@ -41,7 +41,9 @@ def test_request_to_check_both_sources_preserves_authorized_search(monkeypatch):
     state = {"query": query, "capability_snapshot": CapabilityPolicy().snapshot()}
     available = allowed_presets(state, has_tables=False, has_pool=False)
     assert {"local_hybrid_search", "deepseek_search"} <= available
-    assert "用户明确要求本地资料和公开网络都查时" in system_prompt(available, native_skills=True)
+    plan = plan_retrieval(query, allowed_names=available, local_families=("citrus",))
+    assert {call["name"] for call in plan.calls} == {"local_hybrid_search", "deepseek_search"}
+    assert len(plan.calls) == 2
 
 
 def test_attachment_plot_needs_a_downloadable_svg():
@@ -153,8 +155,7 @@ def test_saved_identity_report_separates_rate_limit_from_unprocessed(monkeypatch
     assert reference_tools.saved_identity_report(1, "fixture-session", "fixture-audit") is None
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_reference_batch_returns_to_model_for_next_goal(native, tmp_path):
+def test_reference_batch_returns_to_model_for_next_goal(tmp_path):
     async def exercise():
         identity = ExecutionIdentity(1, "fixture-session", "fixture-turn", "fixture-run")
         calls = []
@@ -171,10 +172,9 @@ def test_reference_batch_returns_to_model_for_next_goal(native, tmp_path):
             assert history[-1].tool_call_id == "mean"
             return AIMessage(content="文献核验完成，样本均值为 3。")
 
-        async def execute(response, current_identity):
-            proposal = response.tool_calls[0]
+        async def execute(proposal, current_identity):
             observations.append(ToolMessage(content="result ready", name=proposal["name"], tool_call_id=proposal["id"]))
-            return BatchObservation(messages=(observations[-1],))
+            return observations[-1], {}
 
         async def accept(response, history, current_identity):
             return FinalCheck()
@@ -183,9 +183,9 @@ def test_reference_batch_returns_to_model_for_next_goal(native, tmp_path):
                     "parameters": {"type": "object", "properties": {}}}}
                    for name in (call["name"], "calculate")]
         runtime = HarnessRuntime(model, execute, lambda *_: None, accept, RunLimits(), schemas)
-        options = {"skill_root": tmp_path, "system_prompt": "fixture", "summary_model": None} if native else None
+        options = {"skill_root": tmp_path, "system_prompt": "fixture"}
         human = HumanMessage("核验这些文献，然后计算样本均值", additional_kwargs=identity.message_metadata("user"))
-        result = await runtime.run(identity, [human], saver=InMemorySaver(), native_options=options)
+        result = await runtime.run(identity, [human], saver=InMemorySaver(), agent_options=options)
         assert result.status == "complete"
         assert result.messages[-1].content == "文献核验完成，样本均值为 3。"
         assert len(calls) == 3 and len(observations) == 2

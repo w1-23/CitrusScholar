@@ -1,18 +1,8 @@
-"""Context Manager — 统一上下文加载与组装.
+"""Load authorized conversation history, account context and domain evidence.
 
-v8.1.1: 所有 LLM 调用前通过 ContextManager 获取上下文.
-  - 加载完整 messages (不自动压缩)
-  - 召回长期记忆
-  - 预生成 search_suggestions + format_hint
-  - 组装标准 HumanMessage
-
-v8.4 (存储全量·发送裁剪):
-  - SQLite 原始轨迹 append-only，压缩绝不写回历史
-  - 用户轮边界（load 时）基于 checkpoint 构建发送视图:
-      [首消息] + <conversation_summary> + [checkpoint 之后的原始消息]
-  - 视图超软阈值 → 批量压缩至 ~50%，checkpoint 持久化到 sessions 表
-    （原始消息永不删除，防摘要套摘要——旧摘要作为 prior_summary 增量整合）
-  - 单轮任务执行期间完整保留消息；仅在后续用户轮加载历史时压缩
+The raw transcript stays append-only. The runtime owns any framework context
+maintenance. Historical checkpoint documents may be checked for source integrity,
+but the loader never includes their navigation or uses it to replace history.
 """
 from __future__ import annotations
 
@@ -20,7 +10,6 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 from langchain_core.messages import (
     AIMessage,
@@ -30,7 +19,7 @@ from langchain_core.messages import (
 )
 
 from src.config import settings
-from src.core.context_budget import ContextBudget, ContextBudgetConfig, ContextBudgetLevel
+from src.core.context_budget import ContextBudget, ContextBudgetConfig
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +115,7 @@ class LoadedContext:
     account_files: list[dict] = field(default_factory=list)
     search_suggestions: list[str] = field(default_factory=list)
     format_hint: str | None = None
-    compacted: bool = False    # v8.4: 本轮是否触发过压缩（UI 展示用，摘要已在视图内）
+    compacted: bool = False  # Compatibility for load status consumers.
     context_working_state: dict = field(default_factory=dict)
     history_load_status: str = "unknown"
     history_load_reason: str = ""
@@ -159,13 +148,10 @@ class ContextManager:
         self._budget = budget
         self._fast_llm = None
         self._fast_llm_nothink = None
-        self._compact_llm = None
         # v8.16.3: format_hint 会话级缓存（(session_id, mode) → 非 fallback 格式），
         # 追问轮直接复用，省一次 fast 调用；上限 256 防会话膨胀
         self._hint_fmt_cache: dict[tuple, str] = {}
-        # Loading history never performs model compression. WorkingContextProjection
-        # at model-send time is the single physical summary path; ContextBudget is
-        # retained only for deterministic size estimates and status reporting.
+        # The loader has no compression path. ContextBudget only estimates size.
 
     def _get_fast_llm(self, thinking_off: bool = False):
         # v8.17.19: hints 属高频低价值 fast 调用——关思维链经 llm_pool extra_body
@@ -193,23 +179,6 @@ class ContextManager:
                 timeout=12,
             )
         return self._fast_llm
-
-    def _get_compact_llm(self):
-        """压缩用 fast 模型 (v8.4): 压缩是高频低价值操作，摘要质量由保留优先级提示保证，
-        无需 main 模型；触发频率低时 main 模型成本过高。
-        v8.17.19: 同步关思维链（extra_body 通道，fail-soft 自动去参回退）——
-        v4-flash 思维链会吃掉 compact_max_tokens=800 预算压缩截断。"""
-        if self._compact_llm is None:
-            from src.core.llm_pool import get_llm as _pool_get_llm
-            self._compact_llm = _pool_get_llm(
-                model=settings.RESOLVED_FAST_MODEL,
-                api_key=settings.RESOLVED_FAST_API_KEY,
-                base_url=settings.RESOLVED_FAST_BASE_URL,
-                temperature=0,
-                timeout=30,
-                thinking_off=True,
-            )
-        return self._compact_llm
 
     async def load(
         self,
@@ -264,7 +233,9 @@ class ContextManager:
                     working_state = checkpoint.get("working_state") or {}
                     if working_state.get("capability_history", "") != capability_policy.history_key:
                         checkpoint = {}
-                    elif not capability_policy.allows("summarization") or original_count != len(raw_messages):
+                    elif original_count != len(raw_messages):
+                        # A legacy full-session inventory cannot prove a separately
+                        # authorized experiment subset. Keep only scoped host state.
                         checkpoint = {"working_state": working_state}
                 view_msgs, compacted = await self._build_send_view(
                     session_id, raw_messages, row_ids, query, checkpoint=checkpoint,
@@ -375,38 +346,32 @@ class ContextManager:
         checkpoint: dict | None = None,
         diagnostics: list[str] | None = None,
     ) -> tuple[list, bool]:
-        """Build the model send view from raw history; never compact at load.
+        """Build an authorized view without ever substituting legacy navigation.
 
-        Returns (messages, compacted). A verified deterministic checkpoint
-        contributes only a bounded navigation view; every covered raw message
-        stays recoverable through the authorized read tools. Legacy or invalid
-        prose is not injected, and no model call occurs here.
+        A historical inventory can still flag corrupt raw rows. Exact tool call
+        pairing and business working state are preserved independently.
         """
         from src.core.model_context import historical_send_view, paired_history_indices
-        from src.core.checkpoint_restore import checkpoint_rejection, navigation_view, structured_checkpoint
+        from src.core.checkpoint_restore import checkpoint_rejection, structured_checkpoint
 
         if checkpoint is None:
             try:
-                checkpoint = self._session.get_checkpoint(session_id) if self._session else {}
+                checkpoint = (await asyncio.to_thread(self._session.get_checkpoint, session_id)
+                              if self._session else {})
             except Exception:
                 checkpoint = {}
                 if diagnostics is not None:
                     diagnostics.append("source_integrity_failed")
         usable_rows = paired_history_indices(raw_messages)
-        row_alignment_valid = len(row_ids) == len(raw_messages)
-        if len(usable_rows) != len(raw_messages) or not row_alignment_valid:
-            if diagnostics is not None:
-                diagnostics.append("raw_history_incomplete")
-            row_alignment_valid = False
-        projected = historical_send_view([raw_messages[index] for index in usable_rows])
+        aligned = len(row_ids) == len(raw_messages) == len(usable_rows)
+        if not aligned and diagnostics is not None:
+            diagnostics.append("raw_history_incomplete")
 
         cutoff = checkpoint.get("msg_id") or 0
         watermark = checkpoint.get("checkpoint_watermark") or 0
         summary = checkpoint.get("summary") or ""
         working_state = checkpoint.get("working_state") or {}
-        reason = None
-        navigation = ""
-        if (summary or cutoff) and row_alignment_valid and not diagnostics:
+        if (summary or cutoff) and aligned and not diagnostics:
             structured = structured_checkpoint(summary)
             if structured is None or self._session is None:
                 reason = "legacy_checkpoint_untrusted"
@@ -418,37 +383,21 @@ class ContextManager:
                 reason = "legacy_checkpoint_untrusted"
             else:
                 rejected_sources: set[str] = set()
-                reason = checkpoint_rejection(structured, self._session, session_id, cutoff,
-                                              rejected_sources=rejected_sources)
+                reason = await asyncio.to_thread(checkpoint_rejection,
+                    structured, self._session, session_id, cutoff, rejected_sources=rejected_sources)
                 if rejected_sources:
                     usable_rows = paired_history_indices(raw_messages, excluded={
                         index for index, row_id in enumerate(row_ids) if str(row_id) in rejected_sources})
-                    projected = historical_send_view([raw_messages[index] for index in usable_rows])
-                if reason is None:
-                    try:
-                        navigation = navigation_view(structured)
-                    except (TypeError, AttributeError):
-                        reason = "source_integrity_failed"
-                    if not navigation:
-                        reason = "source_integrity_failed"
-        if reason and diagnostics is not None:
-            diagnostics.append(reason)
-        view_msgs = projected
-        if navigation:
-            view_msgs = [SystemMessage(
-                content="<conversation_checkpoint>\n" + navigation + "\n</conversation_checkpoint>",
-                additional_kwargs={"context_origin": "summary", "context_trusted": True,
-                                   "checkpoint_schema": structured["schema"]},
-            )]
-            view_msgs.extend(message for message, mid in zip(projected, row_ids) if mid > cutoff)
+            if reason and diagnostics is not None:
+                diagnostics.append(reason)
+
+        view_msgs = historical_send_view([raw_messages[index] for index in usable_rows])
         if working_state:
             import json
             view_msgs.insert(0, SystemMessage(
                 content="<context_working_state>\n" + json.dumps(prompt_working_state(working_state), ensure_ascii=False)
                         + "\n</context_working_state>",
                 additional_kwargs={"context_origin": "working_state", "context_trusted": True}))
-        # Raw history is loaded verbatim. No load-time model compaction runs;
-        # WorkingContextProjection is the sole physical summary path.
         return view_msgs, False
 
     async def _generate_hints(

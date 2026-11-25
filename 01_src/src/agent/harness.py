@@ -6,22 +6,23 @@ scheduler, operation runner and publication boundary. No direct tool fallback.
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import inspect
 import os
 from pathlib import Path
 import time
-from typing import Any
+from typing import Annotated, Any
 
 from deepagents import DeepAgentState
-from langchain.agents.middleware import AgentMiddleware, hook_config
+from langchain.agents.middleware import AgentMiddleware, ModelResponse, hook_config
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 from langgraph.errors import NodeCancelledError
 from pydantic import Field
 from typing_extensions import NotRequired
@@ -29,14 +30,21 @@ from typing_extensions import NotRequired
 from .events import LoopCheckpoint, LoopEvent
 from .model import NON_SUCCESS_TERMINALS
 from .runtime import AdmissionStopped, RunResult, RunLimits
-from .deep_agent_runtime import (
-    EXECUTOR_ID, MODEL_PROVIDER, NATIVE_EXECUTOR_ID, NATIVE_MODEL_PROVIDER,
-    NATIVE_READ_TOOLS, NATIVE_UNCOMPRESSED_PROVIDER, create_host_agent, create_native_agent,
-)
+from .deep_agent_runtime import EXECUTOR_ID, MODEL_PROVIDER, NATIVE_READ_TOOLS, create_framework_agent
+
+
+def _merge_signals(left, right):
+    return {} if right is None else {**(left or {}), **right}
+
+
+_current_tool_call = ContextVar("citrus_framework_tool_call")
 
 
 class HarnessState(DeepAgentState):
     executor_id: NotRequired[str]
+    operation_signals: NotRequired[Annotated[dict | None, _merge_signals]]
+    working_context: NotRequired[dict]
+    seed_proposal: NotRequired[list[dict]]
     active_run_id: NotRequired[str]
     model_steps: NotRequired[int]
     host_state: NotRequired[dict]
@@ -60,16 +68,10 @@ class _DriverModel(BaseChatModel):
     identity: Any = Field(exclude=True)
     model_name: str = "citrus-host-main-loop"
     expected_tools: frozenset[str] = Field(default_factory=frozenset, exclude=True)
-    native: bool = Field(default=False, exclude=True)
-    summarize: bool = Field(default=True, exclude=True)
 
     def _get_ls_params(self, stop=None, **kwargs):
-        provider = MODEL_PROVIDER
-        if self.native:
-            provider = NATIVE_MODEL_PROVIDER if self.summarize else NATIVE_UNCOMPRESSED_PROVIDER
         return {**super()._get_ls_params(stop=stop, **kwargs),
-                "ls_provider": provider,
-                "ls_model_name": self.model_name}
+                "ls_provider": MODEL_PROVIDER, "ls_model_name": self.model_name}
 
     @property
     def _llm_type(self):
@@ -80,22 +82,17 @@ class _DriverModel(BaseChatModel):
         schemas = [convert_to_openai_tool(tool) for tool in tools]
         names = {schema["function"]["name"] for schema in schemas}
         added = names - self.expected_tools
-        if not added <= (NATIVE_READ_TOOLS if self.native else frozenset()):
+        if not added <= NATIVE_READ_TOOLS:
             raise RuntimeError("unexpected_deepagents_tool_inventory")
-        if self.native:
-            return self.bind(native_schemas=tuple(schema for schema in schemas
-                if schema["function"]["name"] in added))
-        if names != self.expected_tools:
-            raise RuntimeError("unexpected_deepagents_tool_inventory")
-        return self
+        return self.bind(native_schemas=tuple(schema for schema in schemas
+            if schema["function"]["name"] in added))
 
     def _generate(self, *args, **kwargs):
         raise RuntimeError("async_model_required")
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-        options = {"native_schemas": kwargs.get("native_schemas", ())} if self.native else {}
         try:
-            message = await self.driver(tuple(messages), self.identity, **options)
+            message = await self.driver(tuple(messages), self.identity, **kwargs)
         except asyncio.CancelledError as exc:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
@@ -106,10 +103,6 @@ class _DriverModel(BaseChatModel):
         message = message.model_copy(update={"additional_kwargs": {
             **message.additional_kwargs, **self.identity.message_metadata("assistant")}})
         return ChatResult(generations=[ChatGeneration(message=message)])
-
-
-def _forbidden_tool(**kwargs):
-    raise RuntimeError("direct_tool_execution_forbidden")
 
 
 @contextmanager
@@ -169,6 +162,14 @@ class HarnessRuntime:
     acknowledge_execution_waits: Any = None
     record_rejected: Any = None
     check_final_after_followup: Any = None
+    tool_mode: Any = None
+    not_run: Any = None
+    check_terminal_orphan: Any = None
+    seed_plan: Any = None
+    seed_message: Any = None
+    working_view: Any = None
+    restore_tool_observation: Any = None
+    authorized_question_parent: str = ""
 
     async def _publish_working_note(self, response, identity, model_step):
         try:
@@ -187,14 +188,17 @@ class HarnessRuntime:
             logging.getLogger(__name__).warning("public_progress_failed stage=tool_round kind=%s", type(exc).__name__)
 
     async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None,
-                  native_options=None, pinned_skills=()):
+                  agent_options=None, pinned_skills=()):
         adapter = self
-        native = native_options is not None
-        executor_id = NATIVE_EXECUTOR_ID if native else EXECUTOR_ID
         latest = {"messages": list(messages), "model_steps": 0}
-        batch_task = None
-        batch_key = None
-        native_read_permits = asyncio.Semaphore(4)
+        read_permits = asyncio.Semaphore(4)
+        exclusive = asyncio.Lock()
+        update_lock = asyncio.Lock()
+        prepared = {}
+        operation_blocked = False
+
+        def related_round(state):
+            return next(m for m in reversed(state["messages"]) if isinstance(m, AIMessage))
 
         def control(text):
             return SystemMessage(content=text, additional_kwargs=identity.message_metadata("internal_control"))
@@ -202,8 +206,6 @@ class HarnessRuntime:
         async def observed(state, phase="ready"):
             nonlocal latest
             latest = dict(state)
-            if adapter.restore_host and state.get("host_state") is not None:
-                adapter.restore_host(state["host_state"])
             if adapter.checkpoint:
                 from .runtime import _pending_calls
                 await adapter.checkpoint(LoopCheckpoint(identity, tuple(state["messages"]),
@@ -231,34 +233,57 @@ class HarnessRuntime:
             @hook_config(can_jump_to=["end"])
             async def abefore_model(self, state, runtime):
                 await observed(state)
-                status = state.get("batch_status", "")
-                if status == "execution":
-                    from .runtime import validate_execution_waits
-                    waits = validate_execution_waits(tuple(state.get("execution_waits", ())))
-                    if not waits:
-                        raise ValueError("execution_suspension_requires_wait")
-                    return {"stop_status": "suspended", "stop_reason": "execution_pending", "jump_to": "end"}
-                if status in {"waiting", "unknown"}:
-                    return {"stop_status": "waiting" if status == "waiting" else "incomplete",
-                            "stop_reason": "user_input_required" if status == "waiting" else "operation_outcome_unknown",
-                            "jump_to": "end"}
+                signals = list((state.get("operation_signals") or {}).values())
+                unknown = [item["operation_id"] for item in signals if item.get("uncertain")]
+                if unknown:
+                    return {"stop_status": "incomplete", "stop_reason": "operation_outcome_unknown",
+                            "unknown_operations": unknown, "host_state": host_snapshot(), "jump_to": "end"}
+                if state.get("execution_wake"):
+                    await acknowledge_wake(state)
                 followup_used = state.get("delivery_followup_used", False)
-                notes = list(state.get("batch_notes", []))
+                notes = [note for item in signals for note in item.get("notes", ())]
                 if state.get("model_steps", 0) >= adapter.limits.max_model_steps:
                     return {"stop_status": "incomplete", "stop_reason": "model_step_limit", "jump_to": "end"}
                 if time.monotonic() >= adapter.limits.deadline:
                     raise AdmissionStopped("deadline")
                 if adapter.prepare:
                     notes.extend(await adapter.prepare(identity))
+                seed = []
+                if adapter.seed_plan:
+                    earlier_seeds = {call["name"] for message in state["messages"]
+                        if isinstance(message, AIMessage) and message.additional_kwargs.get("citrus_retrieval_seed")
+                        and message.additional_kwargs.get("run_id") == identity.run_id for call in message.tool_calls}
+                    plan, guidance = await adapter.seed_plan(tuple(state["messages"]))
+                    seed = [call for call in plan if call["name"] not in earlier_seeds]
+                    if guidance and not any(isinstance(message, SystemMessage)
+                            and message.content == guidance and message.additional_kwargs.get("run_id") == identity.run_id
+                            for message in state["messages"]):
+                        notes.append(guidance)
                 additions = [control(note) for note in notes]
                 await admit(tuple([*state["messages"], *additions]))
-                update = {"messages": additions, "batch_notes": [], "batch_status": "",
+                update = {"messages": additions, "operation_signals": None,
+                          "execution_waits": [], "execution_wake": [], "batch_status": "",
                           "delivery_followup_used": followup_used,
-                          "model_steps": state.get("model_steps", 0)+1, "host_state": host_snapshot()}
+                          "seed_proposal": seed, "model_steps": state.get("model_steps", 0)+(not seed),
+                          "host_state": host_snapshot()}
                 # Before-model state is synchronously checkpointed before the call.
                 await observed({**state, **update, "messages": [*state["messages"], *additions]}, "model")
-                await event("model_started", latest)
+                if not seed:
+                    await event("model_started", latest)
                 return update
+
+            async def awrap_model_call(self, request, handler):
+                proposal = request.state.get("seed_proposal")
+                if proposal:
+                    metadata = {**identity.message_metadata("assistant"), "citrus_retrieval_seed": True}
+                    response = (adapter.seed_message(proposal, metadata) if adapter.seed_message
+                                else AIMessage(content="", tool_calls=proposal, additional_kwargs=metadata))
+                    return ModelResponse(result=[response])
+                if adapter.working_view:
+                    view = adapter.working_view(request.messages, request.state.get("working_context"))
+                    if view is not None:
+                        request = request.override(messages=view)
+                return await handler(request)
 
             @hook_config(can_jump_to=["model", "end"])
             async def aafter_model(self, state, runtime):
@@ -280,12 +305,15 @@ class HarnessRuntime:
                                 or any(ord(char) < 32 for char in cid) for cid in ids)
                             or len(set(ids)) != len(ids) or previous.intersection(ids)):
                     invalid = "invalid_or_reused_tool_call_id"
-                await event("model_finished", state, ids, output_limit_exhausted=(
+                await event("retrieval_seed" if response.additional_kwargs.get("citrus_retrieval_seed")
+                            else "model_finished", state, ids, output_limit_exhausted=(
                     response.response_metadata.get("citrus_output_limit_exhausted")
                     if invalid == "model_length" else None))
                 if response.response_metadata.get("citrus_stream_terminal_unconfirmed"):
                     await event("model_output_rejected", {**state, "stop_reason": "model_stream_unconfirmed"}, ids)
-                    return {"stop_status": "incomplete", "stop_reason": "model_stream_unconfirmed", "jump_to": "end"}
+                    return {"messages": [RemoveMessage(id=response.id)],
+                            "rejected_responses": [*state.get("rejected_responses", []), response],
+                            "stop_status": "incomplete", "stop_reason": "model_stream_unconfirmed", "jump_to": "end"}
                 if (adapter.recover_output and (invalid == "invalid_tool_call" or (
                         invalid == "model_length" and not response.response_metadata.get("citrus_output_limit_exhausted")))):
                     # No tool in this response has been dispatched. Preserve raw
@@ -328,7 +356,9 @@ class HarnessRuntime:
                             "host_state": host_snapshot(), "jump_to": "model"}
                 if invalid:
                     await event("model_output_rejected", {**state, "stop_reason": invalid}, ids)
-                    return {"stop_status": "incomplete", "stop_reason": invalid, "jump_to": "end"}
+                    return {"messages": [RemoveMessage(id=response.id)],
+                            "rejected_responses": [*state.get("rejected_responses", []), response],
+                            "stop_status": "incomplete", "stop_reason": invalid, "jump_to": "end"}
                 if not response.tool_calls:
                     followup_used = state.get("delivery_followup_used", False)
                     check_final = (adapter.check_final_after_followup if followup_used else None) or adapter.check_final
@@ -342,207 +372,213 @@ class HarnessRuntime:
                     return {"stop_status": "complete", "stop_reason": "answered", "host_state": host_snapshot()}
                 # Only a complete, valid native-tool round is public progress.
                 # Final candidates/review envelopes and rejected output stay private.
-                await adapter._publish_working_note(response, identity, state.get("model_steps", 0))
-                return None
+                if not response.additional_kwargs.get("citrus_retrieval_seed"):
+                    await adapter._publish_working_note(response, identity, state.get("model_steps", 0))
+                return {"seed_proposal": []}
 
             async def awrap_tool_call(self, request, handler):
-                nonlocal batch_task, batch_key
-                response = next(m for m in reversed(request.state["messages"]) if isinstance(m, AIMessage))
-                if native and request.tool_call["name"] in NATIVE_READ_TOOLS:
-                    from .batch_journal import persistent_message
+                nonlocal operation_blocked
+                from .batch_journal import persistent_message
+                from .runtime import validate_execution_waits
 
-                    call_id, name = request.tool_call["id"], request.tool_call["name"]
-                    async with native_read_permits:
-                        await admit(tuple(request.state["messages"]))
-                        if time.monotonic() >= adapter.limits.deadline:
-                            raise AdmissionStopped("deadline")
-                        if any(call["name"] == "request_user_input" for call in response.tool_calls):
-                            return persistent_message(ToolMessage(
-                                content="Tool was not executed: interaction_barrier",
-                                tool_call_id=call_id, name=name, status="error",
-                                additional_kwargs={**identity.message_metadata("tool"),
-                                                   "execution_dispatched": False},
-                                artifact={"_tool_outcome": {"status": "not_run",
-                                                            "reason_code": "interaction_barrier"}},
-                            ))
-                        await event("batch_started", request.state, (call_id,))
-                        result = await handler(request)
-                        if not isinstance(result, ToolMessage) or result.tool_call_id != call_id or (
-                            result.name and result.name != name
-                        ):
-                            raise ValueError("native_read_observation_pairing_mismatch")
-                        message = persistent_message(result.model_copy(update={
-                            "name": name, "additional_kwargs": {
-                                **result.additional_kwargs, **identity.message_metadata("tool")},
-                        }))
-                        await event("batch_finished", request.state, (call_id,))
-                        return message
-                calls = [call for call in response.tool_calls
-                         if not native or call["name"] not in NATIVE_READ_TOOLS]
-                dispatch_response = response.model_copy(update={"tool_calls": calls}) if native else response
-                key = tuple(call["id"] for call in calls)
-                if batch_key != key:
-                    batch_key = key
-                    async def dispatch():
+                call = request.tool_call
+                name, cid = call["name"], call["id"]
+                response = related_round(request.state)
+                modes = adapter.tool_mode or (lambda key: "interaction" if key == "request_user_input" else "parallel")
+                interaction = next((item["id"] for item in response.tool_calls if modes(item["name"]) == "interaction"), None)
+                # ToolNode schedules each call. A business lock only protects
+                # nonparallel capabilities from overlapping sibling operations.
+                permit = exclusive if any(modes(item["name"]) != "parallel" and
+                    item["name"] not in NATIVE_READ_TOOLS for item in response.tool_calls) else read_permits
+                async with permit:
+                    await admit(tuple(request.state["messages"]))
+                    if time.monotonic() >= adapter.limits.deadline:
+                        raise AdmissionStopped("deadline")
+                    async with update_lock:
+                        if response.id not in prepared:
+                            prepared[response.id] = await adapter.prepare(identity) if adapter.prepare else ()
+                    notes = prepared[response.id]
+                    reason = ("interaction_barrier" if interaction and cid != interaction else
+                              "prior_operation_unknown" if operation_blocked else
+                              "preparation_required" if notes else "")
+                    if reason:
+                        if adapter.not_run and name in model.expected_tools:
+                            message = await adapter.not_run(call, reason)
+                        else:
+                            message = ToolMessage(content="Tool was not executed: " + reason,
+                                name=name, tool_call_id=cid, status="error",
+                                additional_kwargs={"execution_dispatched": False},
+                                artifact={"_tool_outcome": {"status": "not_run", "reason_code": reason}})
+                        signal = {"notes": list(notes) if cid == response.tool_calls[0]["id"] else []}
+                    else:
                         await observed(request.state, "tools")
-                        await admit(tuple(request.state["messages"]))
-                        await event("batch_started", request.state, key)
-                        result = await adapter.execute(dispatch_response, identity)
-                        if {m.tool_call_id for m in result.messages} != set(key) or len(result.messages) != len(key):
-                            raise ValueError("executor_observation_pairing_mismatch")
-                        await event("batch_finished", request.state, key)
-                        return result
-                    batch_task = asyncio.create_task(dispatch())
-                batch = await batch_task
-                message = next(m for m in batch.messages if m.tool_call_id == request.tool_call["id"])
-                if message.name and message.name != request.tool_call["name"]:
-                    raise ValueError("executor_observation_name_mismatch")
-                message = message.model_copy(update={"additional_kwargs": {
-                    **message.additional_kwargs, **identity.message_metadata("tool")}})
-                if message.tool_call_id == key[0]:
-                    return Command(update={"messages": [message], "host_state": host_snapshot(),
-                        "batch_notes": list(batch.context_notes),
-                        "batch_status": "unknown" if batch.unknown_operations else "waiting" if batch.pending_question else "execution" if batch.execution_waits else "",
-                        "execution_waits": list(batch.execution_waits),
-                        "unknown_operations": list(batch.unknown_operations)})
-                return message
+                        await event("batch_started", request.state, (cid,))
+                        tool_result = {}
+                        token = _current_tool_call.set((call, tool_result))
+                        try:
+                            message = await handler(request)
+                        finally:
+                            _current_tool_call.reset(token)
+                        signal = tool_result
+                        if signal.get("uncertain"):
+                            operation_blocked = True
+                        if signal.get("pending_question") and name != "request_user_input":
+                            raise ValueError("non_interaction_tool_cannot_suspend_turn")
+                        await event("batch_finished", request.state, (cid,))
+                    if (not isinstance(message, ToolMessage) or message.tool_call_id != cid
+                            or message.name not in (None, name)):
+                        raise ValueError("operation_observation_pairing_mismatch")
+                    validate_execution_waits(tuple(signal.get("execution_waits", ())))
+                    message = persistent_message(message.model_copy(update={"name": name,
+                        "additional_kwargs": {**message.additional_kwargs,
+                                              **identity.message_metadata("tool")}}))
+                    if not signal:
+                        return message
+                    return Command(update={"messages": [message], "operation_signals": {cid: signal}})
+
+        async def invoke_tool(**kwargs):
+            call, signal = _current_tool_call.get()
+            # Authorization, real tool validation, operation claim and result
+            # storage are business boundaries around this single ToolNode call.
+            message, details = await adapter.execute(call, identity)
+            signal.update(details)
+            return message
+
+        class Suspension(AgentMiddleware):
+            state_schema = HarnessState
+
+            async def abefore_model(self, state, runtime):
+                signals = list((state.get("operation_signals") or {}).values())
+                if any(item.get("uncertain") for item in signals):
+                    return None
+                asking = any(item.get("pending_question") for item in signals)
+                waits = tuple(dict.fromkeys(wait for item in signals for wait in item.get("execution_waits", ())))
+                if not asking and not waits:
+                    return None
+                from .runtime import validate_execution_waits, _pending_calls
+                validate_execution_waits(waits)
+                if _pending_calls(state["messages"]) or (asking and waits):
+                    raise ValueError("execution_suspension_requires_paired_messages")
+                wake = interrupt({"kind": "user_input" if asking else "execution_wait", "wait_ids": list(waits)})
+                if asking or not isinstance(wake, dict) or set(wake) != {"completion_notes"}:
+                    raise ValueError("invalid_execution_resume")
+                notes = tuple(wake["completion_notes"])
+                if not notes or any(type(note) is not str for note in notes) or sum(map(len, notes)) > 65536:
+                    raise ValueError("invalid_execution_completion_observations")
+                return {"messages": [control(note) for note in notes], "operation_signals": None,
+                        "execution_wake": list(waits), "host_state": host_snapshot()}
 
         tools = [StructuredTool(name=s["function"]["name"], description=s["function"]["description"],
-                                args_schema=s["function"]["parameters"], func=_forbidden_tool) for s in self.schemas]
-        model = _DriverModel(driver=self.model, identity=identity, native=native,
-                             summarize=(native_options or {}).get("summary_model") is not None,
+                                args_schema=s["function"]["parameters"], coroutine=invoke_tool) for s in self.schemas]
+        model = _DriverModel(driver=self.model, identity=identity,
                              expected_tools=frozenset(tool.name for tool in tools))
-        if native:
-            graph = create_native_agent(model, tools, Policy(), saver, HarnessState,
-                                        **native_options)
-        else:
-            graph = create_host_agent(model, tools, Policy(), saver, HarnessState)
+        graph = create_framework_agent(model, tools, [Suspension(), Policy()], saver, HarnessState,
+                                       **(agent_options or {}))
         config = {"configurable": checkpoint_config or {"thread_id": identity.run_id},
                   "recursion_limit": max(64, self.limits.max_model_steps * 6 + 20)}
         snapshot = await graph.aget_state(config)
-        continuing_thread = bool(native and snapshot.values and not resume
-                                 and snapshot.values.get("active_run_id") != identity.run_id)
+        from .runtime import _pending_calls, validate_execution_waits
+
+        async def acknowledge_wake(state):
+            waits = validate_execution_waits(tuple(state["execution_wake"]))
+            if not adapter.acknowledge_execution_waits or _pending_calls(state["messages"]):
+                raise ValueError("execution_wake_requires_paired_messages")
+            committed = await graph.aget_state(config)
+            if committed.values.get("execution_wake") != list(waits):
+                raise ValueError("execution_wake_commit_required")
+            reference = committed.config["configurable"]["checkpoint_id"]
+            await adapter.acknowledge_execution_waits(identity, waits, reference)
+
+        prior = snapshot.values
+        continuing_thread = bool(prior and not resume and prior.get("active_run_id") != identity.run_id)
         if continuing_thread:
-            from .runtime import _pending_calls
-            previous = snapshot.values
-            closed = (not snapshot.next and previous.get("stop_status") in {"complete", "incomplete", "cancelled"})
-            stopped_before_tool = (
-                previous.get("stop_status") in {"incomplete", "cancelled"}
-                and previous.get("stop_reason") in {"cancelled", "deadline"}
-                and set(snapshot.next) <= {"model", "Policy.before_model"}
-            )
-            if (previous.get("executor_id") != executor_id or not (closed or stopped_before_tool)
-                    or previous.get("batch_status") in {"unknown", "waiting", "execution"}
-                    or previous.get("unknown_operations") or previous.get("execution_waits")
-                    or previous.get("execution_wake") or (previous.get("host_state") or {}).get("pending_question")
-                    or _pending_calls(previous["messages"])):
+            closed = not snapshot.next and prior.get("stop_status") in {"complete", "incomplete", "cancelled"}
+            before_model = set(snapshot.next) <= {"model", "Policy.before_model", "Suspension.before_model"}
+            orphan_closed = (before_model and adapter.check_terminal_orphan
+                             and await adapter.check_terminal_orphan(prior))
+            answered_question = (adapter.authorized_question_parent == prior.get("active_run_id")
+                                 and len(snapshot.interrupts) == 1 and snapshot.interrupts[0].value == {
+                                     "kind": "user_input", "wait_ids": []})
+            if (prior.get("executor_id") != EXECUTOR_ID or not (closed or orphan_closed or answered_question)
+                    or has_unsettled_work(prior, ignore_question=answered_question)
+                    or (snapshot.interrupts and not answered_question)):
                 raise AdmissionStopped("native_thread_requires_reconciliation")
-        if snapshot.values and not continuing_thread:
+        initial = None
+        if prior and not continuing_thread:
             if not resume:
                 raise ValueError("existing_turn_requires_explicit_resume")
-            # Old executor checkpoints remain readable but cannot silently adopt
-            # new graph behavior. Pause them without mutating or redispatching.
-            if (snapshot.values.get("executor_id") != executor_id
-                    or native and snapshot.values.get("active_run_id") != identity.run_id):
-                return self._result({**snapshot.values, "stop_status": "incomplete",
+            if prior.get("executor_id") != EXECUTOR_ID:
+                return self._result({**prior, "stop_status": "incomplete",
                     "stop_reason": "executor_checkpoint_incompatible"})
-            await observed(snapshot.values)
+            if prior.get("active_run_id") != identity.run_id:
+                raise ValueError("execution_checkpoint_identity_mismatch")
+            if adapter.restore_host:
+                adapter.restore_host(prior["host_state"])
+                # The suspension occurs after ToolNode committed canonical
+                # observations. Rehydrate outstanding publication without I/O replay.
+                if adapter.restore_tool_observation:
+                    proposed = {call["id"]: call for message in prior["messages"] if isinstance(message, AIMessage)
+                                and message.additional_kwargs.get("run_id") == identity.run_id
+                                for call in message.tool_calls}
+                    for message in prior["messages"]:
+                        if (isinstance(message, ToolMessage)
+                                and message.additional_kwargs.get("run_id") == identity.run_id
+                                and message.additional_kwargs.get("host_publication")):
+                            adapter.restore_tool_observation(message, proposed.get(message.tool_call_id))
+            await observed(prior)
             if self.validate_resume:
                 self.validate_resume()
-            async def acknowledge_wake(committed):
-                from .runtime import validate_execution_waits, _pending_calls
-                wait_ids = validate_execution_waits(tuple(committed.values["execution_wake"]))
-                if _pending_calls(committed.values["messages"]):
-                    raise ValueError("execution_wake_requires_paired_messages")
-                if not adapter.acknowledge_execution_waits:
-                    return False
-                reference = committed.config["configurable"]["checkpoint_id"]
-                await adapter.acknowledge_execution_waits(identity, wait_ids, reference)
-                # Ack failure leaves the committed wake intact. A new process
-                # retries only acknowledgment before it can enter the model.
-                cleared = await graph.aupdate_state(config, {"execution_wake": [], "jump_to": "model"},
-                                                   as_node="Policy.after_model")
-                # Deadline/cancellation may fire before the next graph hook.
-                # Its fallback must include the COMMITTED completion observation,
-                # not the old suspended state loaded at entry.
-                await observed((await graph.aget_state(cleared)).values)
-                return True
-
-            if snapshot.values.get("execution_wake"):
-                if not await acknowledge_wake(snapshot):
-                    return self._result({**snapshot.values, "stop_status": "suspended",
-                        "stop_reason": "execution_wake_commit_required",
-                        "execution_waits": snapshot.values["execution_wake"]})
-            elif snapshot.values.get("stop_status") == "suspended":
-                if (snapshot.values.get("stop_reason") != "execution_pending"
-                        or not adapter.resolve_execution_waits or not adapter.acknowledge_execution_waits):
-                    return self._result(snapshot.values)
-                from .runtime import validate_execution_waits, _pending_calls
-                wait_ids = validate_execution_waits(tuple(snapshot.values.get("execution_waits", ())))
-                if not wait_ids or _pending_calls(snapshot.values["messages"]):
-                    raise ValueError("execution_wake_requires_paired_messages")
-                notes = await adapter.resolve_execution_waits(identity, wait_ids)
+            if (_pending_calls(prior["messages"]) or set(snapshot.next) - {
+                    "model", "Policy.before_model", "Suspension.before_model"}):
+                raise AdmissionStopped("recovery_requires_reconciliation")
+            if snapshot.interrupts:
+                waiting = _interruption(snapshot)
+                await observed(waiting)
+                if waiting["stop_status"] != "suspended" or not adapter.resolve_execution_waits:
+                    return self._result(waiting)
+                waits = tuple(waiting["execution_waits"])
+                notes = await adapter.resolve_execution_waits(identity, waits)
                 if notes is None:
-                    return self._result(snapshot.values)
-                if (type(notes) is not tuple or not notes or any(type(note) is not str for note in notes)
-                        or sum(len(note) for note in notes) > 65536):
-                    raise ValueError("invalid_execution_completion_observations")
-                # A new host control observation reports actual completion. The
-                # original ToolMessage remains paired and immutable; this never
-                # fabricates another provider call or replays its operation.
-                committed_config = await graph.aupdate_state(config, {
-                    "messages": [control(note) for note in notes], "execution_waits": [],
-                    "execution_wake": list(wait_ids), "batch_status": "",
-                    "stop_status": "", "stop_reason": "", "host_state": host_snapshot(),
-                    "jump_to": "model"}, as_node="Policy.after_model")
-                committed = await graph.aget_state(committed_config)
-                await acknowledge_wake(committed)
-            elif snapshot.values.get("stop_status"):
-                notes = (await adapter.prepare(identity) if adapter.prepare
-                         and snapshot.values.get("stop_reason") == "answered" else ())
+                    return self._result(waiting)
+                initial = Command(resume={snapshot.interrupts[0].id: {"completion_notes": list(notes)}})
+            elif prior.get("stop_status"):
+                # An already accepted answer can be delivered without another
+                # model call. Supplementary requirements need a fresh model step.
+                notes = (await adapter.prepare(identity) if adapter.prepare and
+                         prior["stop_reason"] == "answered" else ())
                 if not notes:
-                    return self._result(snapshot.values)
-                # A crash can leave an accepted graph checkpoint before API
-                # finalization. New user requirements reopen the SAME graph.
-                await graph.aupdate_state(config, {"messages": [control(n) for n in notes],
-                    "stop_status": "", "stop_reason": "", "host_state": host_snapshot(),
-                    "jump_to": "model"}, as_node="Policy.after_model")
-            initial = None
+                    return self._result(prior)
+                initial = {"messages": [control(note) for note in notes], "stop_status": "",
+                           "stop_reason": "", "host_state": host_snapshot()}
         else:
             if resume:
                 raise ValueError("execution_checkpoint_missing")
-            initial = {"messages": list(messages), "model_steps": 0,
-                       "host_state": host_snapshot(), "executor_id": executor_id,
-                       "delivery_followup_used": False}
-            if native:
-                if continuing_thread:
-                    prior_request = (snapshot.values.get("host_state") or {}).get("original_request_state") or {}
-                    from src.core.capability_policy import CapabilityPolicy
-                    previous_policy = CapabilityPolicy.restore(prior_request["capability_snapshot"]) if prior_request.get("capability_snapshot") else CapabilityPolicy()
-                    policy = (native_options or {}).get("capability_policy") or CapabilityPolicy()
-                    if previous_policy.history_key != policy.history_key:
-                        raise AdmissionStopped("native_context_scope_mismatch")
-                    request_id = prior_request.get("request_id")
-                    anchor = next((index for index in range(len(messages) - 2, -1, -1)
-                                   if request_id and isinstance(messages[index], AIMessage)
-                                   and not messages[index].tool_calls
-                                   and messages[index].additional_kwargs.get("context_trusted") is True
-                                   and messages[index].additional_kwargs.get("context_origin") == "assistant"
-                                   and messages[index].additional_kwargs.get("request_id") == request_id),
-                                  len(messages) - 2)
-                    initial["messages"] = [message for message in messages[anchor + 1:]
-                                           if message.additional_kwargs.get("context_origin") != "historical_evidence"]
-                initial["skills_metadata"] = None
-                initial.update(active_run_id=identity.run_id, pinned_skills=list(pinned_skills),
-                    batch_notes=[], batch_status="",
-                    unknown_operations=[], execution_waits=[], execution_wake=[],
-                    stop_status="", stop_reason="", rejected_responses=[])
+            additions = list(messages)
+            if continuing_thread:
+                previous_request = (prior.get("host_state") or {}).get("original_request_state") or {}
+                previous_id = previous_request.get("request_id")
+                anchor = next((index for index in range(len(messages) - 2, -1, -1)
+                               if previous_id and isinstance(messages[index], AIMessage)
+                               and not messages[index].tool_calls
+                               and messages[index].additional_kwargs.get("context_trusted") is True
+                               and messages[index].additional_kwargs.get("context_origin") == "assistant"
+                               and messages[index].additional_kwargs.get("request_id") == previous_id),
+                              len(messages) - 2)
+                additions = [message for message in messages[anchor + 1:]
+                             if message.additional_kwargs.get("context_origin") != "historical_evidence"]
+            initial = {"messages": additions, "model_steps": 0, "host_state": host_snapshot(),
+                "executor_id": EXECUTOR_ID, "active_run_id": identity.run_id, "pinned_skills": list(pinned_skills),
+                "skills_metadata": None, "delivery_followup_used": False, "operation_signals": None,
+                "unknown_operations": [], "execution_waits": [], "execution_wake": [], "batch_status": "",
+                "stop_status": "", "stop_reason": "", "rejected_responses": [], "seed_proposal": []}
         await event("run_started", latest)
         timer = asyncio.timeout(max(0, self.limits.deadline-time.monotonic())
                                 if self.limits.deadline != float("inf") else None)
         try:
             async with timer:
                 state = await graph.ainvoke(initial, config, durability="sync")
+                if state.get("__interrupt__"):
+                    state = _interruption(await graph.aget_state(config))
             if timer.expired():
                 state = {**latest, "stop_status": "incomplete", "stop_reason": "deadline"}
         except AdmissionStopped as exc:
@@ -553,14 +589,9 @@ class HarnessRuntime:
             if not timer.expired():
                 raise
             state = {**latest, "stop_status": "incomplete", "stop_reason": "deadline"}
-        finally:
-            if batch_task and not batch_task.done():
-                batch_task.cancel()
-                await asyncio.gather(batch_task, return_exceptions=True)
-        # A cancelled tool may already have a durable operation observation.
-        # Keep the current host projection instead of restoring the pre-tool one.
         state = {**state, "host_state": host_snapshot()}
-        if state.get("stop_status") and state.get("stop_reason") != "answered":
+        if (state.get("stop_status") in {"incomplete", "cancelled"}
+                and state.get("stop_reason") in {"cancelled", "deadline"}):
             await graph.aupdate_state(config, {key: state[key] for key in
                 ("stop_status", "stop_reason", "host_state")})
         await observed(state, "stopped")
@@ -576,3 +607,61 @@ class HarnessRuntime:
             state.get("model_steps", 0), messages[-1] if status == "complete" else None,
             tuple(state.get("unknown_operations", [])), _pending_calls(messages),
             tuple(state.get("execution_waits", [])))
+
+
+def _interruption(snapshot):
+    from .runtime import _pending_calls, validate_execution_waits
+
+    state = snapshot.values
+    if len(snapshot.interrupts) != 1 or _pending_calls(state["messages"]):
+        raise ValueError("invalid_framework_interrupt")
+    value = snapshot.interrupts[0].value
+    if type(value) is not dict or set(value) != {"kind", "wait_ids"}:
+        raise ValueError("invalid_framework_interrupt")
+    waits = validate_execution_waits(tuple(value["wait_ids"]))
+    if value["kind"] == "execution_wait" and waits:
+        return {**state, "stop_status": "suspended", "stop_reason": "execution_pending",
+                "execution_waits": list(waits)}
+    if value["kind"] == "user_input" and not waits:
+        return {**state, "stop_status": "waiting", "stop_reason": "user_input_required"}
+    raise ValueError("invalid_framework_interrupt")
+
+
+def has_unsettled_work(values, *, ignore_question=False):
+    from .runtime import _pending_calls
+
+    return bool(values.get("batch_status") in ({"unknown", "execution"} if ignore_question else {"unknown", "waiting", "execution"})
+        or values.get("unknown_operations") or values.get("execution_waits") or values.get("execution_wake")
+        or (not ignore_question and (values.get("host_state") or {}).get("pending_question"))
+        or any(item.get("uncertain") or (not ignore_question and item.get("pending_question")) or item.get("execution_waits")
+               for item in (values.get("operation_signals") or {}).values())
+        or _pending_calls(values.get("messages", ())))
+
+
+@asynccontextmanager
+async def open_terminal_graph(root, identity, provider_scope, *, context_scope=""):
+    """Open the storage-only graph used by the separate terminal maintenance worker.
+
+    Caller validates the exact settled checkpoint and holds the session/OS
+    execution lock while reading or applying a compare-and-swap update.
+    """
+    from .checkpoint_store import framework_checkpoint_path, framework_checkpoint_scope, open_framework_checkpoint
+    from .recovery import _checkpoint_reader
+
+    if not framework_checkpoint_path(root, identity, provider_scope, context_scope=context_scope).is_file():
+        raise FileNotFoundError("framework_checkpoint_missing")
+    config = {"configurable": framework_checkpoint_scope(identity, provider_scope, context_scope=context_scope)}
+    async with open_framework_checkpoint(root, identity, provider_scope, context_scope=context_scope) as saver:
+        async def check_committed(snapshot):
+            stored = await saver.aget_tuple(snapshot.config)
+            if stored is None or snapshot.values.get("executor_id") != EXECUTOR_ID:
+                return False
+            channels = stored.checkpoint.get("channel_values") or {}
+            return (channels.get("active_run_id") == identity.run_id
+                    and channels.get("stop_status") == "complete"
+                    and not any(name.startswith("branch:to:") for name in channels)
+                    and not any(channel in {"__interrupt__", "__pregel_tasks", "__error__"}
+                                for _, channel, _ in stored.pending_writes or ())
+                    and not has_unsettled_work(snapshot.values))
+
+        yield _checkpoint_reader(saver, maintenance=True), config, check_committed

@@ -1,9 +1,4 @@
-"""Pinned Deep Agents factory with host-owned execution and file boundaries.
-
-The SDK owns the graph. HostTools owns every actual tool invocation, and the
-existing working-context projection owns compression. No native filesystem,
-subagent, synthetic tool repair or second summarizer is installed in the graph.
-"""
+"""The single public Deep Agents graph and its read-only skill filesystem."""
 from __future__ import annotations
 
 from functools import cache
@@ -11,11 +6,24 @@ from functools import cache
 from deepagents import (GeneralPurposeSubagentProfile, HarnessProfile,
                         create_deep_agent, register_harness_profile)
 from deepagents.backends.protocol import BackendProtocol
-from langchain.agents.middleware import AgentMiddleware
 
 SDK_VERSION = "0.7.38"
-EXECUTOR_ID = "citrus-deepagents-0.7.38-host-v1"
-MODEL_PROVIDER = "citrus_metered"
+EXECUTOR_ID = "citrus-deepagents-0.7.38-framework-v2"
+LEGACY_HOST_EXECUTOR_ID = "citrus-deepagents-0.7.38-host-v1"
+LEGACY_NATIVE_EXECUTOR_ID = "citrus-deepagents-0.7.38-native-v1"
+MODEL_PROVIDER = "citrus_metered_framework"
+NATIVE_READ_TOOLS = frozenset({"ls", "glob", "grep", "read_file"})
+
+
+@cache
+def configure_profile():
+    import deepagents
+    if deepagents.__version__ != SDK_VERSION:
+        raise RuntimeError("unsupported_deepagents_version")
+    register_harness_profile(MODEL_PROVIDER, HarnessProfile(
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute", "task", "write_todos"}),
+        excluded_middleware=frozenset({"PatchToolCallsMiddleware", "SummarizationMiddleware"})))
 
 
 class HostOnlyBackend(BackendProtocol):
@@ -31,82 +39,6 @@ class HostOnlyBackend(BackendProtocol):
         raise PermissionError("host_scoped_file_tool_required")
 
     ls = read = grep = glob = write = edit = delete = upload_files = download_files = _deny
-
-
-class HostFilesystemSlot(AgentMiddleware):
-    """Replace the SDK filesystem slot with the registered host file tools.
-
-    Same-name replacement is supported by the pinned SDK. Stock filesystem
-    permission/offload hooks are intentionally absent; the host enforces access.
-    """
-    tools = ()
-
-    @property
-    def name(self):
-        return "FilesystemMiddleware"
-
-    def bind_backend(self, backend):
-        self.backend = backend
-
-    async def awrap_model_call(self, request, handler):
-        # The factory authors an empty system message by default. Existing host
-        # controls already live in history; do not add an extra empty control.
-        if request.system_message is not None and not request.system_message.content:
-            request = request.override(system_message=None)
-        return await handler(request)
-
-
-@cache
-def configure_host_profile():
-    import deepagents
-    if deepagents.__version__ != SDK_VERSION:
-        raise RuntimeError("unsupported_deepagents_version")
-    # These private SDK hooks are deliberately version-pinned. Using the exact
-    # assembled caching names also handles optional provider integrations without
-    # unmatched profile exclusions or global patches to the SDK.
-    from deepagents.middleware._parent_notifier import _ParentNotifierMiddleware
-    from deepagents.middleware._prompt_caching import append_prompt_caching_middleware
-    caching = []
-    append_prompt_caching_middleware(caching)
-    excluded = {"SummarizationMiddleware", "PatchToolCallsMiddleware",
-                "UnsupportedContentMiddleware", "ModelRefusalMiddleware",
-                _ParentNotifierMiddleware, *(item.name for item in caching)}
-    register_harness_profile(MODEL_PROVIDER, HarnessProfile(
-        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-        excluded_middleware=frozenset(excluded)))
-
-
-def create_host_agent(model, tools, policy, saver, state_schema):
-    configure_host_profile()
-    return create_deep_agent(model=model, tools=tools,
-        middleware=[HostFilesystemSlot(), policy],
-        subagents=[], skills=None, memory=None,
-        backend=HostOnlyBackend(model.identity),
-        checkpointer=saver, state_schema=state_schema,
-        name="citrus_main_loop")
-
-
-NATIVE_EXECUTOR_ID = "citrus-deepagents-0.7.38-native-v1"
-NATIVE_MODEL_PROVIDER = "citrus_metered_native"
-NATIVE_UNCOMPRESSED_PROVIDER = "citrus_metered_native_uncompressed"
-NATIVE_READ_TOOLS = frozenset({"ls", "glob", "grep", "read_file"})
-
-
-@cache
-def configure_native_profile():
-    import deepagents
-    if deepagents.__version__ != SDK_VERSION:
-        raise RuntimeError("unsupported_deepagents_version")
-    for provider, summary_enabled in (
-        (NATIVE_MODEL_PROVIDER, True), (NATIVE_UNCOMPRESSED_PROVIDER, False),
-    ):
-        exclusions = {"PatchToolCallsMiddleware"}
-        if not summary_enabled:
-            exclusions.add("SummarizationMiddleware")
-        register_harness_profile(provider, HarnessProfile(
-            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-            excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute"}),
-            excluded_middleware=frozenset(exclusions)))
 
 
 class EmptySkillBackend(HostOnlyBackend):
@@ -165,14 +97,13 @@ class ScopedSkillBackend(HostOnlyBackend):
         return self._backend().download_files(paths)
 
 
-def create_native_agent(model, tools, policy, saver, state_schema, *,
-                        skill_root, system_prompt, summary_model,
-                        summary_trigger=48000, summary_keep=32000, capability_policy=None):
+def create_framework_agent(model, tools, middleware, saver, state_schema, *,
+                           skill_root=None, system_prompt=None, capability_policy=None):
     from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
     from deepagents.middleware.filesystem import FilesystemPermission
-    from deepagents.middleware.summarization import SummarizationMiddleware
+    from langchain.agents.middleware import ToolErrorMiddleware
 
-    configure_native_profile()
+    configure_profile()
     if skill_root is None:
         skill_backend = EmptySkillBackend(None)
     elif capability_policy is not None:
@@ -182,12 +113,6 @@ def create_native_agent(model, tools, policy, saver, state_schema, *,
     backend = CompositeBackend(default=StateBackend(), routes={"/skills/": skill_backend})
     permissions = [FilesystemPermission(
         operations=["write", "edit", "delete"], paths=["/**"], mode="deny")]
-    middleware = []
-    if summary_model is not None:
-        middleware.append(SummarizationMiddleware(summary_model, backend=backend,
-            trigger=("tokens", summary_trigger), keep=("tokens", summary_keep),
-            trim_tokens_to_summarize=4000))
-    from langchain.agents.middleware import ToolErrorMiddleware
 
     def read_error(error, request):
         if isinstance(error, PermissionError):
@@ -198,6 +123,37 @@ def create_native_agent(model, tools, policy, saver, state_schema, *,
 
     read_errors = ToolErrorMiddleware(on_error=read_error, tools=sorted(NATIVE_READ_TOOLS))
     return create_deep_agent(model=model, tools=tools,
-        middleware=[*middleware, policy, read_errors], system_prompt=system_prompt,
-        subagents=[], skills=["/skills/"] if skill_root is not None else [], backend=backend, permissions=permissions,
-        checkpointer=saver, state_schema=state_schema, name="citrus_native_loop")
+        middleware=[*middleware, read_errors], system_prompt=system_prompt,
+        subagents=[], skills=["/skills/"] if skill_root is not None else [], backend=backend,
+        permissions=permissions, checkpointer=saver, state_schema=state_schema, name="citrus_framework_loop")
+
+
+def metered_maintenance_model(transport, identity):
+    """Use the existing checkpoint-only accountant, never the foreground budget."""
+    from typing import Any
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from pydantic import Field
+    from src.core import task_events, tracing
+
+    class MaintenanceModel(BaseChatModel):
+        underlying: Any = Field(exclude=True, repr=False)
+
+        @property
+        def _llm_type(self):
+            return "citrus-metered-checkpoint"
+
+        def _generate(self, *args, **kwargs):
+            raise RuntimeError("async_maintenance_required")
+
+        async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+            original = tracing.get_job_id()
+            tracing.set_job_id(identity.run_id)
+            try:
+                reply = await task_events.counted_ainvoke(self.underlying, messages,
+                    stop=stop, purpose="turn_checkpoint", usage_session_id=identity.session_id)
+            finally:
+                tracing.set_job_id(original)
+            return ChatResult(generations=[ChatGeneration(message=reply)])
+
+    return MaintenanceModel(underlying=transport, profile=transport.profile)

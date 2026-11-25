@@ -94,7 +94,10 @@ async def persist_agent_turn(state: dict) -> dict:
         saved = await run_account_async(lease, write) if lease is not None else await write
         if not saved:
             logger.warning("[GeneralAgent:save] conversation history was not written")
-        else:
+        elif not history_key:
+            # The legacy session ledger is not partitioned. Restricted and
+            # experimental turns keep their state in the run/continuation,
+            # never merge their references into the default session ledger.
             working = state.get("context_working_state")
             if not isinstance(working, dict):
                 ledger = state.get("execution_ledger") or {}
@@ -106,12 +109,6 @@ async def persist_agent_turn(state: dict) -> dict:
                     session_manager.save_working_state, session_id, {**working, "capability_history": history_key})
                 if not accepted:
                     logger.warning("[GeneralAgent:save] working state was not accepted")
-
-        if saved and not history_key and policy.allows("summarization"):
-            # Completion maintenance is detached only after answer and trace commit.
-            # Its own account lease keeps deletion from racing source publication.
-            from src.guardrails.turn_checkpoint import schedule_checkpoint
-            schedule_checkpoint(session_manager, session_id, state, lease)
 
         main_results = state.get("main_results") or []
         web_results = state.get("web_results") or []

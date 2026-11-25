@@ -1,9 +1,7 @@
-"""Validate persisted post-turn navigation before hiding any raw history.
+"""Read-only integrity checks for historical deterministic checkpoints.
 
-Only deterministic host checkpoints are trusted. Legacy or model-authored prose
-is never injected: an unrecognized document leaves every raw message in the
-send view. Validation binds owner, session, coverage watermark, source
-inventory identity, pinned tool evidence and exact excerpts to the live store.
+A checkpoint can verify stored source identities, exact quotations and pinned
+results. Its navigation is never a model input or a replacement for raw history.
 """
 from __future__ import annotations
 
@@ -20,7 +18,7 @@ def structured_checkpoint(text):
     try:
         data = json.loads(text)
         return data if isinstance(data, dict) and data.get("schema") == SCHEMA else None
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return None
 
 
@@ -45,65 +43,9 @@ def inventory_digest(inventory) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def navigation_view(data: dict, *, limit: int = 6000) -> str:
-    """Render only the verified, explicitly bounded navigation the model sees."""
-    nav = data.get("navigation") or {}
-    inventory = data.get("source_inventory") or []
-    view = {
-        "goal": str(nav.get("goal") or "")[:2000],
-        "decisions": [str(item)[:1000] for item in (nav.get("decisions") or [])[:20]],
-        "unfinished": [str(item)[:1000] for item in (nav.get("unfinished") or [])[:20]],
-        "host_task_status": str(data.get("host_task_status") or ""),
-        "covered": {
-            "first_source_id": inventory[0].get("source_id") if inventory else None,
-            "last_source_id": inventory[-1].get("source_id") if inventory else None,
-            "message_count": len(inventory),
-        },
-        "tool_result_call_ids": [str(item) for item in
-                                 (data.get("tool_result_call_ids") or [])][:50],
-        "exact_excerpts": [{
-            "source_id": item.get("source_id"),
-            "start_char": item.get("start_char"),
-            "end_char": item.get("end_char"),
-            "quote": str(item.get("quote") or "")[:MAX_EXCERPT_CHARS],
-        } for item in (data.get("exact_excerpts") or [])[:MAX_EXCERPTS]],
-        "read_originals_with": {
-            "tool": "research_workspace",
-            "operation": "context_source",
-            "arguments": "message_id=<source_id>, start_char, max_chars",
-            "tool_results": "read_tool_result(tool_call_id=<tool_result_call_id>)",
-            "notice": "Raw messages are authoritative; read them before relying on omitted details.",
-        },
-    }
-    text = json.dumps(view, ensure_ascii=False)
-    while len(text) > limit and view["exact_excerpts"]:
-        view["exact_excerpts"].pop()
-        text = json.dumps(view, ensure_ascii=False)
-    while len(text) > limit and view["unfinished"]:
-        view["unfinished"].pop()
-        text = json.dumps(view, ensure_ascii=False)
-    while len(text) > limit and view["decisions"]:
-        view["decisions"].pop()
-        text = json.dumps(view, ensure_ascii=False)
-    # Enforce the caller's hard bound even when the goal itself is large.
-    if len(text) > limit:
-        view["goal"] = ""
-        text = json.dumps(view, ensure_ascii=False)
-    if len(text) > limit:
-        view["tool_result_call_ids"] = view["tool_result_call_ids"][:10]
-        text = json.dumps(view, ensure_ascii=False)
-    if len(text) > limit:
-        view["exact_excerpts"], view["decisions"], view["unfinished"] = [], [], []
-        view["read_originals_with"] = {}
-        text = json.dumps(view, ensure_ascii=False)
-    if len(text) > limit:
-        return ""
-    return text
-
-
 def checkpoint_rejection(data, manager, session_id, cutoff, *,
                          rejected_sources: set[str] | None = None) -> str | None:
-    """Validate history navigation and return a stable, content-free rejection code."""
+    """Validate historical evidence and return a stable, content-free rejection code."""
     try:
         from src.guardrails.turn_checkpoint import validate_pairs
         from src.core import tool_results

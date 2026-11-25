@@ -1,4 +1,4 @@
-"""Deterministic post-turn checkpoints: model-free build, strict restore."""
+"""Legacy checkpoint integrity and raw conversation loading without a writer."""
 import asyncio
 import hashlib
 import json
@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from src.core import tracing
 from src.core.context_manager import ContextManager, finalize_load_result
-from src.core.checkpoint_restore import (GENERATOR, SCHEMA, navigation_view,
+from src.core.checkpoint_restore import (GENERATOR, SCHEMA, inventory_digest, source_inventory,
                                          structured_checkpoint, validate_checkpoint)
 from src.guardrails import turn_checkpoint
 from src.session import manager
@@ -39,31 +39,39 @@ class DeterministicCheckpointTests(unittest.TestCase):
                       additional_kwargs={"request_id": "req-1"}),
         ], idempotency_key="crid:req-1"))
         self.watermark = self.manager.get_checkpoint(self.sid)["message_watermark"]
-        self.state = {
-            "answer": "A" * 300,
-            "query": "What changed?",
-            "request_id": "req-1",
-            "task_contract": {"query": "What changed?", "goal": "report"},
-            "coverage": {"known": 1},
-            "turn_outcome": {"status": "completed", "completion": {"remaining": []}},
+    def seed_legacy_snapshot(self, *, tool_hashes=None):
+        """Build an old-format row as test data, never through a runtime writer."""
+        cutoff = self.manager.get_checkpoint(self.sid)["message_watermark"]
+        sources = self.manager.get_checkpoint_sources(self.sid, cutoff)
+        inventory = source_inventory(sources)
+        first = sources[0]
+        quote = self.manager.get_context_source(self.sid, int(first["source_id"]), 0, 8)["text"]
+        hashes = tool_hashes or {}
+        document = {
+            "schema": SCHEMA, "generator": GENERATOR, "navigation_authoritative": False,
+            "owner_user_id": self.owner, "session_id": self.sid,
+            "navigation": {"goal": "legacy navigation must not be used"},
+            "host_task_status": "completed",
+            "host_task_state": {"turn_outcome": {"status": "completed"}},
+            "source_inventory": inventory, "inventory_sha256": inventory_digest(inventory),
+            "tool_result_call_ids": list(hashes), "tool_result_sha256": hashes,
+            "exact_excerpts": [{"source_id": first["source_id"], "start_char": 0,
+                                "end_char": len(quote), "quote": quote,
+                                "quote_sha256": hashlib.sha256(quote.encode()).hexdigest()}],
         }
+        with manager._connect_db(self.manager.db_path) as conn:
+            conn.execute("UPDATE sessions SET checkpoint_msg_id=?, checkpoint_watermark=?, "
+                         "checkpoint_summary=? WHERE session_id=?",
+                         (cutoff, cutoff, json.dumps(document), self.sid))
+            conn.commit()
+        return document
 
-    def build(self, snapshot=None):
-        snapshot = snapshot or self.manager.get_checkpoint(self.sid)
-        return asyncio.run(turn_checkpoint.build_checkpoint(
-            self.manager, self.sid, dict(self.state), snapshot))
-
-    def stored(self):
-        return json.loads(self.manager.get_checkpoint(self.sid)["summary"])
-
-    def test_build_is_deterministic_and_validates(self):
-        self.assertTrue(self.build())
-        doc = self.stored()
+    def test_stored_fixture_validates_in_read_only_mode(self):
+        doc = self.seed_legacy_snapshot()
         self.assertEqual(doc["schema"], SCHEMA)
         self.assertEqual(doc["generator"], GENERATOR)
         self.assertIs(doc["navigation_authoritative"], False)
         self.assertEqual(doc["host_task_status"], "completed")
-        self.assertNotIn("query", doc["host_task_state"]["task_contract"])
         self.assertEqual(doc["source_inventory"][-1]["source_id"], str(self.watermark))
         inventory = doc["source_inventory"]
         canonical = json.dumps(inventory, ensure_ascii=False, sort_keys=True,
@@ -80,15 +88,13 @@ class DeterministicCheckpointTests(unittest.TestCase):
         self.assertIsNone(structured_checkpoint("legacy model summary"))
         self.assertFalse(validate_checkpoint("legacy model summary", self.manager,
                                              self.sid, self.watermark))
-        self.assertTrue(self.build())
-        doc = self.stored()
+        doc = self.seed_legacy_snapshot()
         legacy = dict(doc)
         legacy.pop("generator")
         self.assertFalse(validate_checkpoint(legacy, self.manager, self.sid, self.watermark))
 
     def test_tampered_documents_are_rejected(self):
-        self.assertTrue(self.build())
-        doc = self.stored()
+        doc = self.seed_legacy_snapshot()
         cases = []
         wrong_generator = json.loads(json.dumps(doc))
         wrong_generator["generator"] = "model"
@@ -109,16 +115,16 @@ class DeterministicCheckpointTests(unittest.TestCase):
             self.assertFalse(validate_checkpoint(case, self.manager, self.sid,
                                                  self.watermark))
 
-    def restore(self, *, user_id=None, memory=None):
+    def restore(self, *, user_id=None, memory=None, capability_policy=None):
         with patch.object(manager.SessionManager, "_instance", None):
             reopened = manager.SessionManager()
             loader = ContextManager(session_manager=reopened, memory_store=memory)
             return asyncio.run(loader.load(self.sid, "follow-up", "general_agent",
-                                          user_id=user_id or self.owner, generate_hints=False))
+                                          user_id=user_id or self.owner, generate_hints=False,
+                                          capability_policy=capability_policy))
 
-    def test_reopened_preview_only_checkpoint_falls_back_and_can_be_rebuilt(self):
-        self.assertTrue(self.build())
-        old = self.stored()
+    def test_old_schema_falls_back_and_even_verified_schema_never_replaces_raw_history(self):
+        old = self.seed_legacy_snapshot()
         old["schema"] = "citrus-turn-checkpoint/1"
         with manager._connect_db(self.manager.db_path) as conn:
             conn.execute("UPDATE sessions SET checkpoint_summary=? WHERE session_id=?",
@@ -128,11 +134,13 @@ class DeterministicCheckpointTests(unittest.TestCase):
         self.assertEqual((ctx.history_load_status, ctx.history_load_reason),
                          ("degraded", "legacy_checkpoint_untrusted"))
         self.assertEqual([m.content for m in ctx.history_messages], ["What changed?", "A" * 300])
-        self.assertTrue(self.build())
-        restored = self.restore()
+        doc = self.seed_legacy_snapshot()
+        with patch.object(self.manager.__class__, "set_checkpoint", side_effect=AssertionError("write")):
+            restored = self.restore()
         self.assertEqual((restored.history_load_status, restored.history_load_reason), ("loaded", ""))
-        self.assertEqual(len(restored.history_messages), 1)
-        self.assertTrue(restored.history_messages[0].content.startswith("<conversation_checkpoint>"))
+        self.assertEqual([m.content for m in restored.history_messages], ["What changed?", "A" * 300])
+        self.assertFalse(restored.compacted)
+        self.assertEqual(json.loads(self.manager.get_checkpoint(self.sid)["summary"]), doc)
 
     def test_legacy_structured_checkpoint_without_publication_keeps_raw_history(self):
         call = {'id': 'legacy-read', 'name': 'read_data', 'args': {}}
@@ -157,7 +165,7 @@ class DeterministicCheckpointTests(unittest.TestCase):
         self.assertNotIn('host_publication', restored.history_messages[3].additional_kwargs)
 
     def test_missing_covered_row_preserves_remaining_history(self):
-        self.assertTrue(self.build())
+        self.seed_legacy_snapshot()
         with manager._connect_db(self.manager.db_path) as conn:
             conn.execute("DELETE FROM messages WHERE session_id=? AND msg_type='human'", (self.sid,))
             conn.commit()
@@ -168,8 +176,7 @@ class DeterministicCheckpointTests(unittest.TestCase):
     def test_corrupt_body_outside_checkpoint_excerpts_is_excluded(self):
         asyncio.run(self.manager.save_messages(self.sid, [AIMessage(
             content="final", additional_kwargs={"request_id": "req-2"})], idempotency_key="crid:req-2"))
-        self.state.update(request_id="req-2", answer="final")
-        self.assertTrue(self.build())
+        self.seed_legacy_snapshot()
         with manager._connect_db(self.manager.db_path) as conn:
             conn.execute("UPDATE messages SET content=? WHERE id=?",
                          ("A" * 200 + "X" + "A" * 99, self.watermark))
@@ -179,8 +186,7 @@ class DeterministicCheckpointTests(unittest.TestCase):
         self.assertEqual([m.content for m in ctx.history_messages], ["What changed?", "final"])
 
     def test_different_checkpoint_owner_preserves_authorized_messages(self):
-        self.assertTrue(self.build())
-        checkpoint = self.stored()
+        checkpoint = self.seed_legacy_snapshot()
         checkpoint["owner_user_id"] = self.owner + 1
         with manager._connect_db(self.manager.db_path) as conn:
             conn.execute("UPDATE sessions SET checkpoint_summary=? WHERE session_id=?",
@@ -228,33 +234,108 @@ class DeterministicCheckpointTests(unittest.TestCase):
                          ["What changed?", "A" * 300, "", "intact", "final"])
         self.assertNotIn("host_publication", ctx.history_messages[3].additional_kwargs)
 
-    def test_owner_unavailable_defers_without_writing(self):
-        before = self.manager.get_checkpoint(self.sid)["summary"]
-        with patch.object(turn_checkpoint, "_owner", return_value=0):
-            self.assertFalse(self.build())
-        self.assertEqual(self.manager.get_checkpoint(self.sid)["summary"], before)
+    def test_default_turn_with_lease_does_not_read_or_write_navigation(self):
+        from src.core import account_leases
+        from src.core.capability_policy import CapabilityPolicy
+        from src.graph.session_persistence import persist_agent_turn
 
-    def test_stale_snapshot_is_rejected_by_cas(self):
-        snapshot = self.manager.get_checkpoint(self.sid)
-        asyncio.run(self.manager.save_messages(self.sid, [
-            HumanMessage(content="Later turn", additional_kwargs={"request_id": "req-2"}),
-        ], idempotency_key="crid:req-2"))
-        self.assertFalse(self.build(snapshot))
-        self.assertEqual(self.manager.get_checkpoint(self.sid)["summary"], "")
+        existing = self.seed_legacy_snapshot()
+        checkpoint = self.manager.get_checkpoint(self.sid)
+        lease = object()
 
-    def test_navigation_view_is_bounded(self):
-        data = {"navigation": {"goal": "G" * 5000,
-                               "decisions": ["D" * 1000] * 40,
-                               "unfinished": ["U" * 1000] * 40},
-                "source_inventory": [{"source_id": str(i), "role": "human",
-                                      "total_chars": 10, "preview_sha256": "x"}
-                                     for i in range(200)],
-                "exact_excerpts": [{"source_id": "1", "start_char": 0,
-                                    "end_char": 2000, "quote": "Q" * 2000}] * 5,
-                "tool_result_call_ids": []}
-        text = navigation_view(data, limit=600)
-        self.assertLessEqual(len(text), 600)
-        self.assertNotIn("preview_sha256", text)
+        async def under_lease(actual, write):
+            self.assertIs(actual, lease)
+            return await write
+
+        with (patch.object(manager, "session_manager", self.manager),
+              patch.object(account_leases, "current_account_lease", return_value=lease),
+              patch.object(account_leases, "run_account_async", side_effect=under_lease),
+              patch.object(self.manager, "get_checkpoint") as read_legacy,
+              patch.object(self.manager, "set_checkpoint") as write_legacy):
+            result = asyncio.run(persist_agent_turn({
+                "session_id": self.sid, "request_id": "req-default", "query": "New prompt",
+                "answer": "New answer", "idempotency_key": "crid:req-default",
+                "turn_trace": [HumanMessage("New prompt")], "turn_outcome": {"status": "completed"},
+                "capability_snapshot": CapabilityPolicy().snapshot(),
+            }))
+            read_legacy.assert_not_called()
+            write_legacy.assert_not_called()
+        self.assertTrue(result["_trace"]["history_saved"])
+        after = self.manager.get_checkpoint(self.sid)
+        self.assertEqual(json.loads(after["summary"]), existing)
+        self.assertEqual(after["revision"], checkpoint["revision"])
+        self.assertEqual(after["checkpoint_watermark"], checkpoint["checkpoint_watermark"])
+        self.assertGreater(after["message_watermark"], checkpoint["message_watermark"])
+        self.assertEqual([m.content for m in self.restore().history_messages],
+                         ["What changed?", "A" * 300, "New prompt", "New answer"])
+
+    def test_new_persistence_never_generates_navigation_and_keeps_working_state(self):
+        from src.core.capability_policy import CapabilityPolicy
+        from src.graph.session_persistence import persist_agent_turn
+
+        self.assertFalse(hasattr(turn_checkpoint, "schedule_checkpoint"))
+        self.assertFalse(hasattr(turn_checkpoint, "build_checkpoint"))
+        self.assertFalse(hasattr(ContextManager, "_get_compact_llm"))
+        working = {"goal": "verify evidence", "verified_facts": ["check passed"]}
+        policy = CapabilityPolicy()
+        state = {"session_id": self.sid, "request_id": "req-new", "query": "New turn",
+                 "answer": "Verified answer", "idempotency_key": "crid:req-new",
+                 "turn_trace": [HumanMessage("New turn")], "context_working_state": working,
+                 "turn_outcome": {"status": "completed"}, "capability_snapshot": policy.snapshot()}
+        with patch.object(manager, "session_manager", self.manager), patch.object(
+                self.manager, "set_checkpoint", side_effect=AssertionError("legacy writer used")):
+            saved = asyncio.run(persist_agent_turn(state))
+        self.assertTrue(saved["_trace"]["history_saved"])
+        after = self.manager.get_checkpoint(self.sid)
+        self.assertEqual((after["summary"], after["msg_id"], after["checkpoint_watermark"]), ("", 0, 0))
+        self.assertEqual(after["working_state"], working)
+        ordinary = self.restore(capability_policy=policy)
+        self.assertEqual(ordinary.context_working_state, working)
+        self.assertEqual([m.content for m in ordinary.history_messages[1:]],
+                         ["What changed?", "A" * 300, "New turn", "Verified answer"])
+
+    def test_isolated_turn_cannot_overwrite_default_working_state(self):
+        from src.core.capability_policy import CapabilityPolicy
+        from src.graph.session_persistence import persist_agent_turn
+
+        def save(policy, key, value):
+            with patch.object(manager, "session_manager", self.manager):
+                return asyncio.run(persist_agent_turn({
+                    "session_id": self.sid, "query": key, "answer": key + " answer",
+                    "idempotency_key": "crid:" + key, "turn_trace": [HumanMessage(key)],
+                    "context_working_state": {"goal": key, "source_refs": [{"source_id": value}]},
+                    "capability_snapshot": policy.snapshot(),
+                }))
+
+        default = CapabilityPolicy()
+        isolated = CapabilityPolicy(local_rag=False, experiment_group="isolated-fixture")
+        self.assertTrue(save(default, "default", "default-ref")["_trace"]["history_saved"])
+        before = self.manager.get_checkpoint(self.sid)["working_state"]
+        self.assertTrue(save(isolated, "isolated", "isolated-ref")["_trace"]["history_saved"])
+        self.assertEqual(self.manager.get_checkpoint(self.sid)["working_state"], before)
+        default_context = self.restore(capability_policy=default)
+        restricted_context = self.restore(capability_policy=isolated)
+        self.assertEqual(default_context.context_working_state, before)
+        self.assertEqual(restricted_context.context_working_state, {})
+        self.assertEqual([m.content for m in restricted_context.history_messages], ["isolated", "isolated answer"])
+        self.assertNotIn("isolated-ref", str(default_context.history_messages))
+        self.assertNotIn("default-ref", str(restricted_context.history_messages))
+
+    def test_scoped_working_state_does_not_cross_history_partition(self):
+        from src.core.capability_policy import CapabilityPolicy
+
+        policy = CapabilityPolicy(local_rag=False, experiment_group="isolated-fixture")
+        working = {"goal": "scoped evidence", "capability_history": policy.history_key}
+        with manager._connect_db(self.manager.db_path) as conn:
+            conn.execute("UPDATE sessions SET context_working_state_json=? WHERE session_id=?",
+                         (json.dumps(working), self.sid))
+            conn.commit()
+        isolated = self.restore(capability_policy=policy)
+        self.assertEqual(isolated.context_working_state, working)
+        self.assertEqual(len(isolated.history_messages), 1)
+        ordinary = self.restore(capability_policy=CapabilityPolicy())
+        self.assertEqual([m.content for m in ordinary.history_messages], ["What changed?", "A" * 300])
+        self.assertEqual(ordinary.context_working_state, {})
 
     def test_tool_evidence_is_pinned_and_bound(self):
         from src.core import tool_results
@@ -270,14 +351,16 @@ class DeterministicCheckpointTests(unittest.TestCase):
         self.assertTrue(tool_results.record(
             tool_call_id="call-1", session_id=self.sid, request_id="req-tool",
             tool_name="read_data", status="ok", result_text=body))
-        watermark = self.manager.get_checkpoint(self.sid)["message_watermark"]
-        state = dict(self.state, request_id="req-tool", answer="final")
-        self.assertTrue(asyncio.run(turn_checkpoint.build_checkpoint(
-            self.manager, self.sid, state, self.manager.get_checkpoint(self.sid))))
-        doc = self.stored()
-        self.assertEqual(doc["tool_result_call_ids"], ["call-1"])
-        self.assertTrue(validate_checkpoint(doc, self.manager, self.sid, watermark))
+        self.assertTrue(tool_results.pin_references(self.sid, ["call-1"]))
         row = tool_results.fetch("call-1")
+        doc = self.seed_legacy_snapshot(tool_hashes={"call-1": row["full_sha256"]})
+        watermark = self.manager.get_checkpoint(self.sid)["message_watermark"]
+        self.assertEqual(doc["tool_result_call_ids"], ["call-1"])
+        with patch.object(tool_results, "pin_references", side_effect=AssertionError("readback repinned results")):
+            self.assertTrue(validate_checkpoint(doc, self.manager, self.sid, watermark))
+            ctx = self.restore()
+        self.assertIn(body[:20], ctx.history_messages[3].content)
+        self.assertNotIn("legacy navigation", str(ctx.history_messages))
         self.assertTrue(row["pinned"])
         self.assertEqual(row["full_sha256"],
                          hashlib.sha256(body.encode("utf-8")).hexdigest())

@@ -3580,11 +3580,14 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                 event_queue.put_nowait(None)
 
         async def run_graph_segment():
+            from src.core import turn_maintenance
+
+            maintenance_offers = []
             # This is the sole retained-handle owner. Parking becomes resumable
             # only after every inner finally and the handle release succeeded.
             cleanup_complete = False
             try:
-                await process_with_capacity()
+                await turn_maintenance.capture(process_with_capacity(), maintenance_offers)
                 cleanup_complete = True
             finally:
                 graph_lease.release()
@@ -3605,6 +3608,9 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                     segments.release_park(segment_claim)
             if queue_turn is not None:
                 _settle_dispatched_turn(queue_turn, job_id)
+                if maintenance_offers:
+                    turn_maintenance.schedule(queue_turn, job_id, callback=maintenance_offers[-1],
+                                              session_lock=_turn_session_lock(sid))
 
         from src.core.chat_turn_queue import find_turn_by_job
         queue_turn = find_turn_by_job(owner_user_id=identity.owner_user_id, session_id=sid, job_id=job_id)
@@ -3740,7 +3746,8 @@ async def get_job_status(job_id: str, request: Request):
         questions = list_questions(job_id, owner_user_id=int(user["user_id"]),
                                    session_id=job["session_id"])
         if questions:
-            payload["question"] = questions[0]
+            from src.core.public_delivery import project_public_question
+            payload["question"] = project_public_question(questions[0])
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
@@ -5544,7 +5551,8 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
     out: list[dict] = []
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
     from src.core.progress_bus import public_tool_reason, public_tool_status, tool_display_name
-    from src.core.public_progress import public_content_text, public_progress_text
+    from src.core.public_delivery import public_answer_text, project_citation_bubbles
+    from src.core.public_progress import public_progress_text
     from src.core.turn_notices import stopped_notice
 
     human_index = 0
@@ -5583,7 +5591,7 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
                         "turn_request_id": request_id,
                         "attachments": files_by_request.get(request_id, [])})
         elif isinstance(m, AIMessage):
-            content = public_content_text(m.content).strip()
+            content = public_answer_text(m.content).strip()
             tool_calls = getattr(m, "tool_calls", None) or []
             if tool_calls:
                 out.append({"role": "tool_calls", "message_id": message_id,
@@ -5620,7 +5628,9 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
                 if generation_ms > 0:
                     item["gen_time_ms"] = generation_ms
                 if not tool_calls and metadata.get("citrus_citation_bubbles"):
-                    item["citation_bubbles"] = metadata["citrus_citation_bubbles"]
+                    citations = project_citation_bubbles(metadata["citrus_citation_bubbles"])
+                    if citations:
+                        item["citation_bubbles"] = citations
                 out.append(item)
         elif isinstance(m, ToolMessage):
             # Keep only a high-level completion state in user-visible history.

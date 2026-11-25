@@ -29,7 +29,7 @@ async def read_context_evidence(checkpoint_id: str, message_count: int,
     from src.config import PROJECT_ROOT, settings, get_deepseek_model
     from src.core import jobs, tracing
     from .identity import ExecutionIdentity
-    from .context_projection import EncryptedContextArchive, ArchiveReference
+    from .context_projection import EncryptedContextArchiveReader, ArchiveReference
     job = jobs.get_job(tracing.get_job_id())
     if (not job or job["owner_user_id"] != tracing.get_user_id()
             or job["session_id"] != tracing.get_session_id()
@@ -60,7 +60,7 @@ async def read_context_evidence(checkpoint_id: str, message_count: int,
         identity = ExecutionIdentity(job["owner_user_id"], job["session_id"],
                                      job["request_id"], job["job_id"])
         provider_scope = (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())
-    archive = EncryptedContextArchive(PROJECT_ROOT / "state", identity, provider_scope)
+    archive = EncryptedContextArchiveReader(PROJECT_ROOT / "state", identity, provider_scope)
     ref = ArchiveReference(thread_id or archive.config["configurable"]["thread_id"],
                            checkpoint_id, message_count)
     messages = await archive.read_evidence(ref, start=message_index, stop=message_index + 1)

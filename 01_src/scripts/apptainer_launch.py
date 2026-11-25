@@ -224,9 +224,6 @@ def command(config, role):
                    '--env', 'CITRUS_BROWSE_CONFIG_SHA256=' + bundle.config_sha256,
                    '--env', 'CITRUS_BROWSE_APPTAINER=1']
     skill_release = verified_skill_release(config, binds)
-    native_runtime = config.get('native_runtime', False)
-    if type(native_runtime) is not bool:
-        raise ValueError('Invalid native runtime setting')
     # The release source tree is the single authority for both the application
     # and the method packages. Without ``packages/`` on PYTHONPATH the image's
     # site-packages copy shadows a freshly published skill package, so a fixed
@@ -254,10 +251,6 @@ def command(config, role):
             used.add(destination)
             result += ['--bind', f'{prior}:{destination}:ro']
     result += ['--env', 'PYTHONPATH=' + ':'.join(python_path)]
-    if native_runtime:
-        if skill_release is None:
-            raise ValueError('Native runtime requires a pinned Skill release; an empty method set is supported')
-        result += ['--env', 'CITRUS_NATIVE_RUNTIME=1']
     for path, mode in dict(binds).items():
         result += ['--bind', f'{path}:{path}:{mode}']
     result += [app, '/usr/local/bin/python']

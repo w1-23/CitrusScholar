@@ -1,4 +1,4 @@
-"""Send view: verified navigation only, raw history otherwise, no model work."""
+"""Send view keeps authorized raw history and independently scoped host state."""
 import asyncio
 import json
 import unittest
@@ -58,21 +58,17 @@ class SendViewTests(unittest.TestCase):
                                  budget=ExplodingBudget())
         reason = "source_integrity_failed" if valid is False else None
         context = patch.object(checkpoint_restore, "checkpoint_rejection", return_value=reason)
-        with context:
-            return asyncio.run(manager._build_send_view("s", self.raw, self.ids, "u2"))
+        with context as validator:
+            messages, compacted = asyncio.run(manager._build_send_view("s", self.raw, self.ids, "u2"))
+            if valid is not None:
+                validator.assert_called_once_with(json.loads(summary), manager._session, "s", 2,
+                                                  rejected_sources=set())
+            return messages, compacted
 
-    def test_verified_deterministic_checkpoint_injects_bounded_navigation(self):
-        summary = json.dumps(document())
-        messages, compacted = self.view(summary, valid=True)
+    def test_verified_checkpoint_is_checked_but_never_replaces_raw_history(self):
+        messages, compacted = self.view(json.dumps(document()), valid=True)
+        self.assertEqual([m.content for m in messages], ["u1", "a1", "u2", "a2"])
         self.assertFalse(compacted)
-        self.assertEqual(messages[0].content.splitlines()[0], "<conversation_checkpoint>")
-        rendered = "\n".join(str(m.content) for m in messages)
-        self.assertIn("UNIQUE-EXCERPT", rendered)
-        self.assertNotIn("preview_sha256", rendered)
-        self.assertNotIn("u1", rendered)
-        self.assertNotIn("a1", rendered)
-        self.assertIn("u2", rendered)
-        self.assertIn("a2", rendered)
 
     def test_legacy_prose_is_not_injected_and_raw_history_is_kept(self):
         messages, compacted = self.view("legacy model summary")
@@ -90,7 +86,8 @@ class SendViewTests(unittest.TestCase):
 
     def test_working_state_is_kept_without_authorizing_prose(self):
         messages, _ = self.view("legacy model summary",
-                                working_state={"verified": 1})
+                                working_state={"verified": 1, "projection_cache": {"private": "not prompt"}})
+        self.assertEqual(json.loads(messages[0].content.splitlines()[1]), {"verified": 1})
         self.assertTrue(messages[0].content.startswith("<context_working_state>"))
         self.assertEqual([m.content for m in messages[1:]], ["u1", "a1", "u2", "a2"])
 

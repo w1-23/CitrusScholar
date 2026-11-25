@@ -93,37 +93,17 @@ def sanitize(text: str) -> str:
 
 
 class PublicAnswerPreview:
-    def __init__(self):
-        self._prefix = ""
-        self._published = False
-        self._closed = False
+    """Compatibility shim for hosts still passing an unreviewed delta callback.
+
+    The first model round can become a tool round, be rejected, or be replaced.
+    A later reset cannot undo disclosure, so no preview reaches live or replay SSE.
+    """
 
     def append(self, chunk: str) -> None:
-        if self._closed or self._published:
-            return
-        if len(self._prefix) + len(chunk) > MAX_CHARS:
-            self._closed = True
-            return
-        self._prefix += chunk
-        boundary = max(self._prefix.rfind(char) for char in "。！？!?\n ")
-        if boundary < 48:
-            return
-        if re.search(r"\[[LWHClwhc]\d{0,3}$", self._prefix[:boundary + 1].rstrip()):
-            return
-        self._closed = True
-        text = sanitize(self._prefix[:boundary + 1]) if sanitize(self._prefix) else ""
-        if text:
-            from src.core.progress_bus import emit_answer_start, emit_text
-            emit_answer_start()
-            emit_text(text)
-            self._published = True
+        pass
 
     def clear(self) -> None:
-        self._closed = True
-        if self._published:
-            from src.core.progress_bus import emit_text_reset
-            emit_text_reset()
-            self._published = False
+        pass
 
 
 def emit_retrieval_stage(stage: str) -> None:
@@ -136,19 +116,9 @@ def emit_retrieval_stage(stage: str) -> None:
 
 
 def public_content_text(content) -> str:
-    """Extract public text blocks without exposing provider reasoning or data."""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, (list, tuple)):
-        return ""
-    return "".join(
-        block if isinstance(block, str) else block["text"]
-        for block in content
-        if isinstance(block, str) or (
-            isinstance(block, dict) and block.get("type") == "text"
-            and isinstance(block.get("text"), str)
-        )
-    )
+    """Extract only public text blocks and remove structured private spill."""
+    from src.core.public_delivery import public_answer_text
+    return public_answer_text(content)
 
 
 def public_progress_text(chunks, has_tool_calls: bool) -> str:

@@ -1,347 +1,108 @@
-"""P0-A: local model fixtures through deployed middleware and durable accounting."""
+"""Read-only archive compatibility and fail-closed old executor admission."""
 import asyncio
 import hashlib
-import json
-import tempfile
-import time
-import unittest
-from pathlib import Path
-from unittest.mock import patch
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.base import empty_checkpoint
+from langgraph.graph import END, START, StateGraph
 
-from src.agent.context_projection import EncryptedContextArchive, WorkingContextProjection, _complete_tool_groups
-from src.agent.context_tools import read_context_evidence
+from src.agent.checkpoint_store import (WORKING_CONTEXT_ARCHIVE_NAMESPACE, checkpoint_scope,
+    native_checkpoint_path, native_checkpoint_scope, open_checkpoint, open_native_checkpoint)
+from src.agent.context_projection import ArchiveReference, EncryptedContextArchiveReader
+from src.agent.deep_agent_runtime import LEGACY_NATIVE_EXECUTOR_ID
+from src.agent.harness import HarnessState
 from src.agent.identity import ExecutionIdentity
+from src.agent.recovery import load_recovery_state, validate_legacy_native_head
 from src.agent.runtime import AdmissionStopped
-from src.core import jobs, task_events, tracing
+from src.core import jobs, task_events
 from src.core.provider_protocol import _DeepSeekMessage, _ProtocolState
-from src.core.request_context import model_request
-from src.core.tool_result_view import INLINE_CHARS, first_delivery
+
+SCOPE = ("https://api.deepseek.com/v1", "deepseek-fixture")
 
 
-class FakeTransport:
-    max_retries = 0
-    max_tokens = 4096
-
-    def __init__(self, calls=None, replies=None):
-        self.calls = [] if calls is None else calls
-        self.replies = list(replies) if replies is not None else []
-
-    def model_copy(self, *, update):
-        copied = FakeTransport(self.calls)
-        copied.replies = self.replies
-        copied.max_tokens = update["max_tokens"]
-        return copied
-
-    async def ainvoke(self, messages):
-        self.calls.append((self.max_tokens, messages))
-        if self.replies:
-            item = self.replies.pop(0)
-            if isinstance(item, BaseException):
-                raise item
-            return item
-        return AIMessage(content="Historical context", response_metadata={"finish_reason": "stop"},
-                         usage_metadata={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12})
-
-
-def tool_group(body):
-    return [AIMessage(content="", id="call", tool_calls=[{"id": "tool-1", "name": "read_data", "args": {}}]),
-            ToolMessage(content=body, id="result", tool_call_id="tool-1", name="read_data")]
-
-
-class ProjectionTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.object(jobs, "_DB_PATH", self.root / "jobs.sqlite"))
-        self.enterContext(patch("src.config.PROJECT_ROOT", self.root))
-        self.enterContext(patch("src.config.get_deepseek_model", return_value="fixture"))
-        from src.config import settings
-        claim = jobs.claim_job("fixture-session", "fixture-turn", owner_user_id=11,
-                               client_request_id="test-req", payload={})
-        self.identity = ExecutionIdentity(11, "fixture-session", "fixture-turn", claim.job_id)
-        tracing.set_user_id(11)
-        tracing.set_session_id(self.identity.session_id)
-        tracing.set_job_id(self.identity.run_id)
-        self.events = []
-        self.model = FakeTransport()
-        self.archive = EncryptedContextArchive(self.root / "state", self.identity,
-                                               (settings.RESOLVED_MAIN_BASE_URL, "fixture"))
-        self.projector = WorkingContextProjection(archive=self.archive, summary_model=self.model,
-            enabled=True, deadline=time.monotonic() + 35, trigger_tokens=128, target_tokens=100,
-            readback_available=True, on_projection=self.observe)
-
-    async def observe(self, event):
-        self.events.append(event)
-
-    def budget(self, tokens=1_000_000, calls=10):
-        task_events.init_budget(self.identity.run_id, time.time() + 35, max_calls=calls, max_tokens=tokens)
-
-    def metered_calls(self):
-        return task_events.projection(self.identity.run_id)["budget"]["calls"]
-
-    def raw(self, groups):
-        return [SystemMessage(content="control", id="sys"), *groups,
-                HumanMessage(content="latest user request", id="tail")]
-
-    async def test_authenticated_legacy_calls_reopen_without_host_fields(self):
-        from src.agent.checkpoint_store import (CheckpointProtectionError, ProtectedCheckpointSerializer,
-                                                checkpoint_scope, open_checkpoint)
-        from langgraph.checkpoint.base import empty_checkpoint
-
-        scope = self.projector.archive.provider_scope
-        private = _ProtocolState(scope, "fixture private protocol")
+def test_archive_opens_without_writing_or_publishing_protocol_state(tmp_path):
+    async def run():
+        identity = ExecutionIdentity(1, "s", "t", "j")
+        private = _ProtocolState(SCOPE, "a synthetic private value")
         call = {"id": "legacy-call", "name": "read_data", "args": {}}
-        legacy = _DeepSeekMessage(content="", tool_calls=[call], provider_protocol=private)
-        legacy.tool_calls[0].update(_host_logical_key="host:" + "a" * 32, _attempt=1)
-        fixture_text = "Synthetic checkpoint content for long-context restoration. " * 3500
-        raw = [HumanMessage(content=fixture_text), legacy,
-               ToolMessage(content="fixture", name="read_data", tool_call_id="legacy-call")]
-        _, estimate = model_request(self.model, raw, output_tokens=4096)
-        self.assertTrue(40_000 < estimate["estimated_input_tokens"] < 60_000)
-        config = {"configurable": checkpoint_scope(self.identity, scope)}
+        proposal = _DeepSeekMessage(content="", tool_calls=[call], provider_protocol=private)
+        proposal.tool_calls[0].update(_host_logical_key="host:" + "a" * 32, _attempt=1)
+        tool = ToolMessage(content="原始证据", name="read_data", tool_call_id="legacy-call",
+                           additional_kwargs={"host_preflight_reconciled": {"schema_version": 1}})
+        raw = [HumanMessage("original"), proposal, tool]
+        config = {"configurable": {**checkpoint_scope(identity, SCOPE),
+                                    "checkpoint_ns": WORKING_CONTEXT_ARCHIVE_NAMESPACE}}
         checkpoint = empty_checkpoint()
         checkpoint["channel_values"] = {"messages": raw}
         checkpoint["channel_versions"] = {"messages": 1}
-        async with open_checkpoint(self.root, self.identity, scope) as saver:
+        async with open_checkpoint(tmp_path, identity, SCOPE) as saver:
             saved = await saver.aput(config, checkpoint, {"source": "input", "step": 0}, {"messages": 1})
-        async with open_checkpoint(self.root, self.identity, scope) as saver:
-            restored = (await saver.aget_tuple(saved)).checkpoint["channel_values"]["messages"]
-        self.assertEqual(restored[0].content, fixture_text)
-        self.assertEqual(restored[1].provider_protocol, private)
-        self.assertEqual(restored[1].tool_calls, [call | {"type": "tool_call"}])
-        self.assertIn("_host_logical_key", legacy.tool_calls[0])
-        serial = ProtectedCheckpointSerializer(bytes(32), self.identity, scope)
-        encrypted_format, encrypted = serial.dumps_typed(legacy)
-        with self.assertRaises(CheckpointProtectionError):
-            serial.loads_typed((encrypted_format, encrypted[:-1] + bytes([encrypted[-1] ^ 1])))
-        wrong_identity = ExecutionIdentity(12, self.identity.session_id, self.identity.user_turn_id, self.identity.run_id)
-        with self.assertRaises(CheckpointProtectionError):
-            ProtectedCheckpointSerializer(bytes(32), wrong_identity, scope).loads_typed((encrypted_format, encrypted))
-        with self.assertRaises(CheckpointProtectionError):
-            ProtectedCheckpointSerializer(bytes(32), self.identity, (scope[0], "other-model")).loads_typed(
-                (encrypted_format, encrypted))
-        legacy.tool_calls[0]["unknown_fixture_field"] = True
-        with self.assertRaises(CheckpointProtectionError):
-            serial.loads_typed(serial.dumps_typed(legacy))
+        reference = ArchiveReference(config["configurable"]["thread_id"], saved["configurable"]["checkpoint_id"], 3)
+        reader = EncryptedContextArchiveReader(tmp_path, identity, SCOPE)
+        snapshot = {p: hashlib.sha256(p.read_bytes()).digest() for p in tmp_path.rglob("*") if p.is_file()}
+        restored = await reader.read(reference)
+        assert restored[1].provider_protocol == private
+        assert restored[1].tool_calls == [call | {"type": "tool_call"}]
+        public = await reader.read_evidence(reference)
+        assert "a synthetic private value" not in str(public)
+        assert "host_preflight_reconciled" not in str(public)
+        assert "原始证据" in str(public)
+        assert {p: hashlib.sha256(p.read_bytes()).digest() for p in tmp_path.rglob("*") if p.is_file()} == snapshot
+        with pytest.raises(AdmissionStopped, match="scope_mismatch"):
+            await EncryptedContextArchiveReader(tmp_path, ExecutionIdentity(2, "s", "t", "j"), SCOPE).read(reference)
 
-    async def test_giant_tool_group_archive_only_and_paginated_hash(self):
-        self.budget()
-        raw = self.raw(tool_group('"\t\\字' * 160_000))
-        _, estimate = model_request(self.model, raw, output_tokens=4096)
-        self.assertGreater(estimate["estimated_input_tokens"], 167109)
-        view = await self.projector.project(raw)
-        self.assertEqual(self.model.calls, [])
-        self.assertEqual(self.metered_calls(), 0)
-        _complete_tool_groups(view)
-        self.assertEqual([m.id for m in view if not isinstance(m, SystemMessage)], ["tail"])
-        self.assertEqual(self.events[0]["event"], "working_context_archived")
-        receipt = json.loads(view[1].content.split("Raw evidence readback: ", 1)[1])
-        self.assertEqual(receipt["archive_only_indices"], [1, 2])
-        with self.assertRaises(PermissionError):
-            tracing.set_user_id(12)
-            try:
-                await read_context_evidence.coroutine(receipt["checkpoint_id"], receipt["message_count"], 2)
-            finally:
-                tracing.set_user_id(11)
-        start, pages = 0, []
-        while start is not None:
-            text, _ = await read_context_evidence.coroutine(receipt["checkpoint_id"],
-                receipt["message_count"], 2, start_char=start, max_chars=20000)
-            self.assertLessEqual(len(text.encode()), INLINE_CHARS)
-            tool = ToolMessage(content=text, tool_call_id="page", name="read_context_evidence")
-            self.assertIs(first_delivery(tool, call={}, reader_available=True), tool)
-            page = json.loads(text)
-            self.assertEqual(page["start_char"], start)
-            pages.append(page["text"])
-            start = page["next_start_char"]
-        joined = "".join(pages)
-        self.assertEqual(hashlib.sha256(joined.encode()).hexdigest(), page["public_message_sha256"])
-        self.assertEqual(json.loads(joined)["data"]["content"], raw[2].content)
+    asyncio.run(run())
 
-    async def test_mixed_source_uses_ledger_and_never_sends_giant_group(self):
-        self.budget()
-        raw = self.raw([*tool_group("x" * 680_000), AIMessage(id="later", content="small observation " * 60)])
-        view = await self.projector.project(raw)
-        self.assertEqual(len(self.model.calls), 1)
-        allowance, payload = self.model.calls[0]
-        _, estimate = model_request(self.model, payload, output_tokens=allowance)
-        self.assertLessEqual(estimate["estimated_input_tokens"], task_events.model_input_limit(allowance))
-        self.assertNotIn("x" * 100, payload[-1].content)
-        self.assertIn("small observation", payload[-1].content)
-        self.assertEqual(self.metered_calls(), 1)
-        self.assertEqual(task_events.projection(self.identity.run_id)["budget"]["tokens"], 12)
-        self.assertEqual(await self.projector.project(raw), view)
-        self.assertEqual(self.metered_calls(), 1)
 
-    async def test_ledger_rejection_remains_specific_and_does_not_dispatch(self):
-        self.budget(tokens=100)
-        raw = self.raw([AIMessage(id="past", content="prior evidence " * 100)])
-        with self.assertRaisesRegex(AdmissionStopped, "model_budget_exhausted:tokens"):
-            await self.projector.project(raw)
-        self.assertEqual(self.metered_calls(), 0)
-        self.assertEqual(self.model.calls, [])
-        self.assertEqual(self.events, [])
+@pytest.mark.parametrize("hazard", [None, "unpaired", "unknown", "journal_interrupted", "not_terminal"])
+def test_terminal_orphan_admits_only_paired_and_settled_old_thread(tmp_path, monkeypatch, hazard):
+    monkeypatch.setattr(jobs, "_DB_PATH", tmp_path / "jobs.sqlite3")
 
-    async def test_protected_tail_unchanged_and_hard_gate_rejects(self):
-        self.budget()
-        raw = self.raw([])
-        raw[-1] = raw[-1].model_copy(update={"content": "y" * 680_000})
-        view = await self.projector.project(raw)
-        self.assertIs(view[-1], raw[-1])
-        with self.assertRaisesRegex(task_events.TaskConflict, "context_budget_exhausted"):
-            await task_events.run_model_attempt(self.model, view, lambda: self.model.ainvoke(view),
-                                                purpose="main_loop")
-        self.assertEqual(self.model.calls, [])
-        self.assertEqual(self.metered_calls(), 0)
+    async def run():
+        previous_job = jobs.claim_job("session", "previous", owner_user_id=2, client_request_id="previous", payload={})
+        previous = ExecutionIdentity(2, "session", "previous", previous_job.job_id)
+        next_turn = ExecutionIdentity(2, "session", "new", "new-job")
+        async with open_native_checkpoint(tmp_path, previous, SCOPE) as saver:
+            old_graph = StateGraph(HarnessState)
+            old_graph.add_node("model", lambda state: {})
+            old_graph.add_edge(START, "model")
+            old_graph.add_edge("model", END)
+            compiled = old_graph.compile(checkpointer=saver, interrupt_before=["model"])
+            original = {"user_id": 2, "session_id": "session", "request_id": "previous", "job_id": previous.run_id}
+            messages = [HumanMessage("prior request")]
+            if hazard == "unpaired":
+                messages.append(AIMessage("", tool_calls=[{"name": "fake_effect", "id": "call", "args": {}}]))
+            await compiled.ainvoke({"messages": messages, "active_run_id": previous.run_id,
+                    "executor_id": LEGACY_NATIVE_EXECUTOR_ID,
+                    "unknown_operations": ["a" * 32] if hazard == "unknown" else [],
+                    "host_state": {"original_request_state": original}},
+                    {"configurable": native_checkpoint_scope(previous, SCOPE)}, durability="sync")
+        if hazard == "journal_interrupted":
+            op, lease = task_events.start_operation(previous.run_id, 2, "fake_effect", {}, recovery_mode="never",
+                                                          input_refs=[], tool_call_id="call", logical_key="host:" + "a" * 32)
+            task_events.abandon_operation(op, lease)
+        if hazard != "not_terminal":
+            with task_events.transaction() as conn:
+                conn.execute("UPDATE task_jobs SET status='failed',terminal_snapshot='{}' WHERE job_id=?", (previous.run_id,))
+        db = native_checkpoint_path(tmp_path, previous, SCOPE)
+        before = hashlib.sha256(db.read_bytes()).digest()
+        if hazard:
+            with pytest.raises(AdmissionStopped, match="requires_reconciliation"):
+                await validate_legacy_native_head(tmp_path, next_turn, SCOPE)
+        else:
+            await validate_legacy_native_head(tmp_path, next_turn, SCOPE)
+        with pytest.raises(task_events.TaskConflict, match="executor_checkpoint_incompatible"):
+            await load_recovery_state(tmp_path, previous, SCOPE)
+        assert hashlib.sha256(db.read_bytes()).digest() == before
 
-    async def test_length_retry_is_metered_and_increases_output_allowance(self):
-        self.budget()
-        self.model.replies.append(AIMessage(content="truncated", response_metadata={"finish_reason": "length"}))
-        await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
-        self.assertEqual([out for out, _ in self.model.calls], [4096, 8192])
-        self.assertEqual(self.metered_calls(), 2)
-        self.assertGreater(task_events.projection(self.identity.run_id)["budget"]["tokens"], 4096)
+    asyncio.run(run())
 
-    async def test_cancel_is_not_reported_as_model_failure(self):
-        self.budget()
-        events = self.capture_diag()
-        self.model.replies.append(asyncio.CancelledError())
-        with self.assertRaises(asyncio.CancelledError):
-            await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
-        self.assertEqual(len(self.model.calls), 1)
-        self.assertEqual(self.events, [])
-        self.assertEqual(events, [])
 
-    def capture_diag(self):
-        events = []
-
-        def record(event, **fields):
-            events.append((event, fields))
-
-        self.enterContext(patch("src.core.diag.diag", side_effect=record))
-        return events
-
-    async def test_program_error_diagnostic_is_bounded_and_sanitized(self):
-        self.budget()
-        sentinel = "SYNTHETIC-PRIVATE-SENTINEL user prose"
-        events = self.capture_diag()
-
-        async def fail(_messages):
-            raise RuntimeError(sentinel)
-
-        with patch.object(self.archive, "archive", fail):
-            with self.assertRaisesRegex(AdmissionStopped, "context_projection_failed"):
-                await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
-        self.assertEqual(len(events), 1)
-        event, fields = events[0]
-        self.assertEqual(event, "context_projection_failed")
-        self.assertEqual(fields["stage"], "archive")
-        self.assertEqual(fields["error_type"], "RuntimeError")
-        self.assertEqual(fields["message_count"], 3)
-        self.assertEqual(fields["protected_count"], 2)
-        self.assertEqual(fields["eligible_units"], 1)
-        self.assertIsInstance(fields["estimated_input_tokens"], int)
-        self.assertFalse(fields["archived"])
-        self.assertFalse(fields["summarized"])
-        self.assertGreaterEqual(fields["remaining_s"], 0.0)
-        rendered = repr(fields)
-        for private in (sentinel, "history", "latest user request", "fixture-turn"):
-            self.assertNotIn(private, rendered)
-
-    async def test_middleware_failure_reports_middleware_stage(self):
-        self.budget()
-        sentinel = "MIDDLEWARE-PRIVATE-SENTINEL"
-        events = self.capture_diag()
-
-        class FailingMiddleware:
-            def __init__(self, **_kwargs):
-                pass
-
-            async def abefore_model(self, _state, _runtime):
-                raise RuntimeError(sentinel)
-
-        with patch("src.agent.context_projection.SummarizationMiddleware", FailingMiddleware):
-            with self.assertRaisesRegex(AdmissionStopped, "context_projection_failed"):
-                await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
-        self.assertEqual(len(events), 1)
-        _, fields = events[0]
-        self.assertEqual(fields["stage"], "middleware")
-        self.assertTrue(fields["archived"])
-        self.assertFalse(fields["summarized"])
-        self.assertNotIn(sentinel, repr(fields))
-
-    async def test_summary_failure_reports_summary_stage(self):
-        self.budget()
-        sentinel = "SUMMARY-PRIVATE-SENTINEL"
-        events = self.capture_diag()
-
-        def fail(*_args, **_kwargs):
-            raise RuntimeError(sentinel)
-
-        with patch("src.agent.context_projection._summary_source", fail):
-            with self.assertRaisesRegex(AdmissionStopped, "context_projection_failed"):
-                await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
-        self.assertEqual(len(events), 1)
-        _, fields = events[0]
-        self.assertEqual(fields["stage"], "summary")
-        self.assertTrue(fields["archived"])
-        self.assertFalse(fields["summarized"])
-        self.assertNotIn(sentinel, repr(fields))
-
-    async def test_classified_budget_and_protocol_failures_are_not_program_errors(self):
-        events = self.capture_diag()
-        with self.assertRaisesRegex(AdmissionStopped, "context_projection_budget_required"):
-            await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
-
-        archive = EncryptedContextArchive(self.root / "state-deepseek", self.identity,
-                                          ("https://api.deepseek.com/v1", "deepseek-chat"))
-        projector = WorkingContextProjection(archive=archive, summary_model=self.model,
-            enabled=True, deadline=time.monotonic() + 35, trigger_tokens=128, target_tokens=100,
-            readback_available=True)
-        raw = [SystemMessage(content="control", id="sys"),
-               _DeepSeekMessage(content="thought", id="deep",
-                   provider_protocol=_ProtocolState(("https://other.example/v1", "deepseek-chat"), "r")),
-               HumanMessage(content="latest", id="tail")]
-        with self.assertRaisesRegex(AdmissionStopped, "context_projection_private_state_missing_or_mismatched"):
-            await projector.project(raw)
-        self.assertEqual(events, [])
-
-    async def test_timeout_is_deadline_not_program_error(self):
-        self.budget()
-        events = self.capture_diag()
-
-        async def timeout(_messages):
-            raise TimeoutError
-
-        with patch.object(self.archive, "archive", timeout):
-            with self.assertRaisesRegex(AdmissionStopped, "context_projection_deadline"):
-                await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
-        self.assertEqual(events, [])
-
-    async def test_middleware_contract_change_is_not_program_error(self):
-        self.budget()
-        events = self.capture_diag()
-
-        class NoUpdateMiddleware:
-            def __init__(self, **_kwargs):
-                pass
-
-            async def abefore_model(self, _state, _runtime):
-                return None
-
-        with patch("src.agent.context_projection.SummarizationMiddleware", NoUpdateMiddleware):
-            with self.assertRaisesRegex(AdmissionStopped, "context_projection_middleware_contract_changed"):
-                await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
-        self.assertEqual(events, [])
-
-    async def test_diagnostic_failure_does_not_change_admission(self):
-        self.budget()
-        self.enterContext(patch("src.core.diag.diag", side_effect=RuntimeError("sink failure")))
-
-        async def fail(_messages):
-            raise RuntimeError("archive failure")
-
-        with patch.object(self.archive, "archive", fail):
-            with self.assertRaisesRegex(AdmissionStopped, "context_projection_failed"):
-                await self.projector.project(self.raw([AIMessage(id="past", content="history " * 100)]))
+def test_legacy_projection_receipt_stays_off_model_working_prompt():
+    from src.core.context_manager import prompt_working_state
+    working = {"goal": "g", "dataset_refs": [{"file_id": "f"}],
+               "projection_cache": {"schema": "working_summary_cache/2", "digest": "0" * 64}}
+    assert prompt_working_state(working)["goal"] == "g"
+    assert "projection_cache" not in prompt_working_state(working)
+    assert prompt_working_state(None) == {}

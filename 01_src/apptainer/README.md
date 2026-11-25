@@ -56,7 +56,7 @@ python3 04_scripts/stage_skill_release.py --repositories /absolute/source-checko
 sha256sum /absolute/release/standalone-skills/inventory.json
 ```
 
-部署配置的 `skill_release` 使用该绝对目录，`skill_release_sha256` 使用上面的清单摘要。启动器逐文件核验，校验通过后以只读方式挂载，并使可信服务优先导入该发行的计算包。`native_runtime` 单独控制是否选择原生运行时。可用 `--enable` 指定曝光的方法，空清单用于基线，`--include-runtime` 使这些条件共用相同的执行库。
+部署配置的 `skill_release` 使用该绝对目录，`skill_release_sha256` 使用上面的清单摘要。启动器逐文件核验，校验通过后以只读方式挂载，并使可信服务优先导入该发行的计算包。所有任务统一使用框架运行时。运行链不再读取早期的 `native_runtime` 开关。可用 `--enable` 指定曝光的方法，空清单用于基线，`--include-runtime` 使这些条件共用相同的执行库。
 
 同一命令也从锁定的 Nature 包提取 `nature-qa/`。它包含工作台和绘图执行器实际调用的上游检查脚本，使用同一发行清单，且在 `--enable` 为空时仍随运行库安装。启用固定发行的环境应重建带匹配支持 wheel 的应用和 Worker 镜像。旧发布的 QA 回执仍可读取。
 

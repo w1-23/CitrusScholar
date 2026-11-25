@@ -77,7 +77,11 @@ SCOPE_LABELS = {
     SCOPE_WEB: "用户本轮限定只用联网资料",
 }
 
-NO_RETRIEVAL_LABEL = "用户本轮要求不检索"
+NO_RETRIEVAL_LABEL = "本轮不进行检索"
+
+_WEB_CAPABILITIES = frozenset({"network", "web_retrieval"})
+_LOCAL_CAPABILITIES = frozenset({"local_corpus", "local_retrieval", "shared_corpus"})
+_RETRIEVAL_CAPABILITIES = _WEB_CAPABILITIES | _LOCAL_CAPABILITIES | {"literature_retrieval"}
 
 
 @dataclass(frozen=True)
@@ -213,8 +217,13 @@ def runtime_env(*, source_scope: str = SCOPE_AUTO, attachments: int = 0,
     scope = str(source_scope or SCOPE_AUTO)
     if scope not in KNOWN_SCOPES:
         scope = SCOPE_AUTO
+    from src.core.tool_catalog import TOOL_METADATA
     from src.corpus_integration.settings import isolated_enabled
     denied = frozenset(denied or ())
+    # Some persisted-evidence reads do not require a live index or candidate
+    # pool. Removing those preconditions must not bypass explicit source scope.
+    denied |= frozenset(name for name, meta in TOOL_METADATA.items()
+                        if _blocked_source(meta.capabilities, scope, bool(retrieval)))
     if isolated_enabled():
         denied |= {"propose_document_ingest", "prepare_document", "commit_document_index"}
     return Env(
@@ -305,6 +314,23 @@ def _reason(token: str, env: Env) -> str:
     return REQUIREMENT_LABELS.get(token, token)
 
 
+def retrieval_tool_names() -> frozenset[str]:
+    """Tools that obtain new retrieval evidence, including candidate adapters."""
+    from src.core.tool_catalog import TOOL_METADATA
+
+    return frozenset(name for name, meta in TOOL_METADATA.items() if meta.capabilities & _RETRIEVAL_CAPABILITIES)
+
+
+def _blocked_source(capabilities, source_scope: str, retrieval: bool) -> str:
+    if not retrieval and capabilities & _RETRIEVAL_CAPABILITIES:
+        return "retrieval"
+    if source_scope == SCOPE_LOCAL and capabilities & _WEB_CAPABILITIES:
+        return "network"
+    if source_scope == SCOPE_WEB and capabilities & _LOCAL_CAPABILITIES:
+        return "local_corpus"
+    return ""
+
+
 def unavailable_capability(name: str, env: Env) -> str:
     """Return a capability that is explicitly unavailable, or an empty string."""
     from src.core.tool_catalog import capabilities
@@ -317,11 +343,7 @@ def unavailable_capability(name: str, env: Env) -> str:
     for capability in caps:
         if capability in env.capability_denials:
             return capability
-    if not env.retrieval and caps & {"network", "local_corpus", "shared_corpus",
-                                    "web_retrieval", "local_retrieval",
-                                    "literature_retrieval"}:
-        return "retrieval"
-    return ""
+    return _blocked_source(caps, env.source_scope, env.retrieval)
 
 
 def available_tool_names(env: Env) -> list[str]:
@@ -339,17 +361,21 @@ def available_tool_names(env: Env) -> list[str]:
 def explain(env: Env) -> dict[str, str]:
     """name -> "" when available, otherwise a short human-readable reason."""
     reasons: dict[str, str] = {}
+    from src.core.tool_catalog import capabilities
+
     declared = declarations()
-    for name in declared:
-        if name in env.denied:
-            reasons[name] = "用户在本轮禁用了该工具"
-            continue
-        missing = missing_requirements(name, env)
+    for name, (requires, _, _) in declared.items():
+        missing = tuple(sorted(token for token in requires if not env.has(token)))
+        blocked_source = _blocked_source(capabilities(name), env.source_scope, env.retrieval)
         capability = unavailable_capability(name, env)
-        if capability == "visualization":
-            reasons[name] = "本轮未开启可视化功能"
-        elif capability == "retrieval":
+        if blocked_source == "retrieval":
             reasons[name] = NO_RETRIEVAL_LABEL
+        elif blocked_source:
+            reasons[name] = SCOPE_LABELS[env.source_scope]
+        elif name in env.denied:
+            reasons[name] = "本轮未提供该工具"
+        elif capability == "visualization":
+            reasons[name] = "本轮未开启可视化功能"
         elif capability:
             reasons[name] = "本轮请求策略未授权该来源能力"
         else:
@@ -363,7 +389,7 @@ __all__ = [
     "SCOPE_AUTO", "SCOPE_FUSION", "SCOPE_LABELS", "SCOPE_LOCAL", "SCOPE_WEB",
     "Env", "available_tool_names", "declarations", "explain", "missing_requirements",
     "matching_producer_kinds",
-    "runtime_env", "script_sandbox_available", "shared_corpus_available",
+    "retrieval_tool_names", "runtime_env", "script_sandbox_available", "shared_corpus_available",
     "tool_metadata",
     "unavailable_capability",
 ]

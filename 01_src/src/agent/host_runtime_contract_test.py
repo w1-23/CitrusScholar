@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from src.agent import code_tools, workspace_tools
-from src.agent.context_projection import ArchiveReference, EncryptedContextArchive, WorkingContextProjection
+from src.agent.context_projection import ArchiveReference, EncryptedContextArchiveReader
 from src.agent.harness import HarnessRuntime
 from src.agent.identity import ExecutionIdentity
 from src.agent.model import ModelDriver
@@ -132,7 +132,7 @@ class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):
     async def run_tool(self, invoke, tool_name="code_write"):
         async def execute(_tool, call, **_kwargs):
             return invoke(call)
-        with patch.object(registry, "_execute_single_tool", execute):
+        with patch.object(registry, "_execute_single_tool", execute), code_tools.code_execution_context(IDENTITY, CALL["id"]):
             return await registry._run_single_tool(SimpleNamespace(name=tool_name),
                 {"name": tool_name, "id": CALL["id"], "args": {}}, require_durable=True)
 
@@ -353,28 +353,8 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ContextTests(unittest.IsolatedAsyncioTestCase):
-    async def test_archive_only_fallback_keeps_live_private_chain(self):
-        archive = Mock(provider_scope=SCOPE, identity=IDENTITY)
-        archive.archive = AsyncMock(return_value=ArchiveReference("fixture", "checkpoint", 5))
-        projector = WorkingContextProjection(archive=archive, summary_model=Mock(max_tokens=16),
-            enabled=True, deadline=time.monotonic() + 5, trigger_tokens=120, target_tokens=100,
-            readback_available=True)
-        projector._summary_unavailable = True
-        previous = _DeepSeekMessage(content="historical " * 180, provider_protocol=_ProtocolState(SCOPE, "old private"))
-        user = HumanMessage(content="request", additional_kwargs=IDENTITY.message_metadata("user"))
-        proposal = _DeepSeekMessage(content="", tool_calls=[CALL], provider_protocol=_ProtocolState(SCOPE, "private " * 100))
-        result = ToolMessage(content="observed", name=CALL["name"], tool_call_id=CALL["id"])
-        raw = (HumanMessage(content="older request"), previous, user, proposal, result)
-        view = await projector.project(raw)
-        self.assertNotIn(previous, view)
-        self.assertIs(view[-2], proposal)
-        self.assertIs(view[-1], result)
-        self.assertNotIn("old private", repr(view))
-        self.assertTrue(any(isinstance(msg, SystemMessage) and "checkpoint" in msg.content for msg in view))
-        archive.archive.assert_awaited_once_with(raw)
-
     async def test_archive_readback_omits_the_host_attestation(self):
-        archive = EncryptedContextArchive(Path("/unused"), IDENTITY, SCOPE)
+        archive = EncryptedContextArchiveReader(Path("/unused"), IDENTITY, SCOPE)
         observation = receipt(CALL, "fixture")
         observation.additional_kwargs["host_preflight_reconciled"] = {"schema_version": 1}
         with patch.object(archive, "read", AsyncMock(return_value=(observation,))):

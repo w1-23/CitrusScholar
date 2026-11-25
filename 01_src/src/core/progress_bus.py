@@ -167,9 +167,11 @@ def stamp_sse_event(event: dict, seq: int) -> dict:
 
 def emit_progress(event_type: str, data: dict) -> None:
     """Push a progress event to the current request's SSE queue (non-blocking)."""
+    from src.core.public_delivery import project_public_event
+
     q = get_progress_queue()
     try:
-        payload = public_progress_payload(event_type, data)
+        payload = project_public_event(event_type, data)
         if event_type != "assistant_progress" or payload.get("text"):
             q.put_nowait(_encode_event(event_type, payload))
     except asyncio.QueueFull:
@@ -245,8 +247,7 @@ def log_sse_frame(event_dict: dict) -> None:
     """Print an outgoing SSE frame for debugging purposes."""
     event_type = event_dict.get("event", "?")
     data_str = event_dict.get("data", "")
-    preview = data_str[:200] if len(data_str) > 200 else data_str
-    logger.debug(f"[SSE→] event={event_type} | data={preview}")
+    logger.debug("[SSE→] event=%s | chars=%d", event_type, len(data_str))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -710,7 +711,7 @@ def emit_tool_result(tool_name: str, output: str, tool_call_id: str = "",
 
 def emit_text(content: str) -> None:
     """Emit a FINAL_ANSWER text chunk."""
-    emit_encoded("text", {"content": content})
+    emit_encoded("text", {"content": content, "delivery": "committed"})
 
 
 def emit_answer_start() -> None:

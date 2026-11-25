@@ -493,7 +493,7 @@ async def _run_single_tool(tool: BaseTool, tool_call: dict, *, require_durable: 
         if name == "run_research_figure_script":
             from src.research.script_reconciliation import capture_script_failure
             reconciliation_scope = capture_script_failure(owner, job["session_id"])
-        elif name in {"deliver_research_artifact", "audit_uploaded_data"}:
+        elif name in {"deliver_research_artifact", "audit_uploaded_data", "collect_external_skill", "collect_nature_plot"}:
             from src.research.delivery_reconciliation import capture_delivery
             reconciliation_scope = capture_delivery(name, tool_call["id"])
         elif name in ZERO_WRITE_TOOL_NAMES:

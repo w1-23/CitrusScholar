@@ -102,6 +102,8 @@ def main(argv=None) -> int:
     parser.add_argument("--lock", type=Path, default=root / "02_config/standalone-skills.lock.json")
     parser.add_argument("--repositories", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--fusion-handoff", type=Path,
+                        help="Stage the reviewed fusion handoff instead of the legacy active skills.")
     parser.add_argument("--enable", nargs="*", help="Stage only this subset; an empty list stages no methods.")
     parser.add_argument("--include-runtime", action="store_true",
                         help="Stage executable Python packages independently of method visibility.")
@@ -109,8 +111,15 @@ def main(argv=None) -> int:
     entries = json.loads(args.lock.read_bytes())
     if not isinstance(entries, dict) or len(entries) > 100:
         raise ValueError("invalid_skill_lock")
-    names = set(entries) if args.enable is None else set(args.enable)
-    if not names <= set(entries):
+    available = set(entries)
+    if args.fusion_handoff is not None:
+        from stage_fusion_release import FUSION_IDS, NATURE
+
+        unchanged = "research-question-answering"
+        entries = {unchanged: entries[unchanged]}
+        available = {unchanged, NATURE} | FUSION_IDS
+    names = available if args.enable is None else set(args.enable)
+    if not names <= available:
         raise ValueError("unknown_skill")
     if args.output.exists() or args.output.is_symlink():
         raise ValueError("skill_release_output_already_exists")
@@ -134,7 +143,7 @@ def main(argv=None) -> int:
                           and nature_entry.get("skill_directory", ".") in {".", ""})
         nature_qa = ({"nature-figure"} & (set(entries) if args.include_runtime else names)
                      if adapted_nature else set())
-        for name in sorted(names | runtime_names | nature_qa):
+        for name in sorted((names & entries.keys()) | runtime_names | nature_qa):
             entry = entries[name]
             if (not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
                     or not isinstance(entry, dict)
@@ -186,6 +195,11 @@ def main(argv=None) -> int:
                             or not file.is_file() or file.stat().st_size > 65536):
                         raise ValueError("approved_skill_script_unavailable")
                     approved[f"skills/{name}/{relative}"] = hashlib.sha256(file.read_bytes()).hexdigest()
+        if args.fusion_handoff is not None:
+            from stage_fusion_release import stage_fusion
+
+            stage_fusion(root, args.fusion_handoff, release, names, include_runtime=args.include_runtime,
+                         selected=selected, approvals=approved)
         for module in runtime:
             if not (python_root / module / "__init__.py").is_file():
                 raise ValueError("incomplete_skill_python_package")

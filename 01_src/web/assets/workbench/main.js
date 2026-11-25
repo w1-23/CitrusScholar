@@ -105,6 +105,7 @@ function renderExports() {
   const project = state.project;
   if (!project) { menu.append(element('p', '请先打开图件。', 'muted')); return; }
   menu.append(element('p', `导出已保存版本 ${project.render_version}`, 'muted'));
+  if (project.presentation_note) menu.append(element('p', project.presentation_note, 'muted'));
   for (const format of ['svg', 'png', 'pdf']) {
     const row = element('div');
     const capability = project.format_capabilities[format];
@@ -144,6 +145,19 @@ function renderExports() {
     if (button.disabled && capability?.reason) row.append(element('small', capability.reason));
     menu.append(row);
   }
+  const originals = Object.values(project.original_exports || {});
+  if (originals.length) {
+    menu.append(element('p', '未修改的原始文件', 'muted'));
+    for (const original of originals) {
+      if (!/^\/api\/v2\/files\/[a-f0-9]{32}\/download$/.test(original.download_url)) continue;
+      const row = element('div');
+      const link = element('a', original.filename);
+      link.href = original.download_url;
+      link.download = original.filename;
+      row.append(link);
+      menu.append(row);
+    }
+  }
 }
 
 async function loadAsset(project) {
@@ -179,7 +193,7 @@ function activate(project, asset, { preserveFocus = false } = {}) {
   renderProperties();
   renderExports();
   renderToolbar();
-  status(project.read_only_reason || '请选择对象组。');
+  status(project.read_only_reason || project.presentation_note || '请选择对象组。');
 }
 
 function applyChanges(entries) {

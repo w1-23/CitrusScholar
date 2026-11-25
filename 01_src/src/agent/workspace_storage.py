@@ -36,11 +36,15 @@ def virtual_path(path: str, *, directory=False, writable=False) -> str:
     """Validate logical keys, never convert caller paths into physical paths."""
     if not isinstance(path, str) or len(path) > 240:
         raise ValueError("workspace_invalid_path")
+    # The SDK lists directories with one trailing slash. Accept those exact
+    # paths on the next directory operation without admitting empty segments.
+    if directory and path != "/" and not path.endswith("//"):
+        path = path.removesuffix("/")
     if directory and path in {"/", "/input", "/data", "/skills", "/01_src", "/workspace", "/outputs"}:
         return path
     parts = path.split("/")
     if (len(parts) < 3 or parts[0] or parts[1] not in {"input", "data", "skills", "01_src", "workspace", "outputs"}
-            or any(not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_. -]{0,119}", p)
+            or any(not re.fullmatch(r"[\w][\w. -]{0,119}", p)
                    or p.endswith((".", " ")) or ".." in p for p in parts[2:])):
         raise ValueError("workspace_invalid_path")
     if writable and parts[1] not in {"workspace", "outputs"}:
@@ -64,11 +68,11 @@ def _digest(data: bytes) -> str:
 class WorkspaceStorage:
     """One authenticated call's adapter; instances must never be globally cached."""
 
-    def __init__(self, owner: int, session: str):
+    def __init__(self, owner: int, session: str, run_id: str):
         from src.session import files
         if type(owner) is not int or owner <= 0 or not files.valid_session(session):
             raise PermissionError("workspace_scope_unavailable")
-        self.owner, self.session, self.files = owner, session, files
+        self.owner, self.session, self.run_id, self.files = owner, session, run_id, files
         for suffix in ("", "-wal", "-shm", "-journal"):
             _no_links(Path(str(files.DB_PATH) + suffix))
         _no_links(files.FILES_ROOT)
@@ -80,22 +84,31 @@ class WorkspaceStorage:
                 PRIMARY KEY(owner,session,path,version), UNIQUE(file_id))""")
 
     def _reference(self, row, path=None, version=None):
-        return {"kind": "workspace_file" if row["visibility"] == "internal" else "workspace_input",
-                "path": path or row["virtual_path"], "file_id": row["file_id"],
-                "version": version if version is not None else row["version"],
-                "sha256": row["sha256"]}
+        internal = row["visibility"] == "internal"
+        ref = {"kind": "workspace_file" if internal else "workspace_input",
+               "path": path or row["virtual_path"], "file_id": row["file_id"],
+               "version": version if version is not None else row["version"], "sha256": row["sha256"]}
+        return ref if internal else {**ref, "filename": row["filename"], "read_only": True}
 
     def _read_bytes(self, row) -> str:
-        path = Path(row["storage_path"])
+        if row["visibility"] == "public":
+            # Re-resolve the exact pin for this tool read, rather than treating
+            # a previously enumerated input descriptor as authority.
+            attached = self.files.get_task_input_file(self.owner, self.run_id, row["file_id"], row["sha256"])
+            if attached is None:
+                raise PermissionError("workspace_file_scope_denied")
+            path = attached["path"]
+        else:
+            # Private version bytes never cross their owning session boundary.
+            if (row["visibility"] != "internal" or row["owner_user_id"] != self.owner
+                    or row["session_id"] != self.session or row["origin"] != self.files.ORIGIN_UPLOADED):
+                raise PermissionError("workspace_file_scope_denied")
+            path = Path(row["storage_path"])
+            root = self.files.FILES_ROOT / f"user_{self.owner}" / self.session
+            _no_links(root)
+            if not path.resolve().is_relative_to(root.resolve()):
+                raise PermissionError("workspace_file_scope_denied")
         _no_links(path)
-        # Require the exact current owner/session upload area, not legacy roots
-        # or generated artifacts. A row cannot turn into an arbitrary host read.
-        root = self.files.FILES_ROOT / f"user_{self.owner}" / self.session
-        _no_links(root)
-        if (row["owner_user_id"] != self.owner or row["session_id"] != self.session
-                or row["origin"] != self.files.ORIGIN_UPLOADED
-                or not path.resolve().is_relative_to(root.resolve())):
-            raise PermissionError("workspace_file_scope_denied")
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
         try:
@@ -134,6 +147,8 @@ class WorkspaceStorage:
                 "SELECT f.*,v.path AS virtual_path,v.version,v.sha256 AS version_hash "
                 "FROM workspace_file_versions v JOIN session_files f ON f.file_id=v.file_id "
                 "WHERE " + where + " ORDER BY v.path LIMIT ?", (*args, MAX_FILES + 1))]
+            if len(rows) > MAX_FILES:
+                raise ValueError("workspace_file_count_limit")
             for row in rows:
                 if row["version_hash"] != row["sha256"] or row["visibility"] != "internal":
                     raise ValueError("workspace_index_integrity")
@@ -141,24 +156,33 @@ class WorkspaceStorage:
             rows = [row for row in rows if within(row["virtual_path"], scope)]
             if (path is None and scope in {"/", "/input", "/data"} or
                     (path or scope).startswith(("/input/", "/data/"))):
-                inputs = conn.execute(
-                    "SELECT * FROM session_files WHERE owner_user_id=? AND session_id=? "
-                    "AND origin='uploaded' AND visibility='public' ORDER BY file_id LIMIT ?",
-                    (self.owner, self.session, MAX_FILES + 1)).fetchall()
-                if len(inputs) > MAX_FILES:
-                    raise ValueError("workspace_input_count_limit")
-                for item in inputs:
-                    mount = "data" if (path or scope).startswith("/data") else "input"
-                    key = f"/{mount}/{item['file_id']}/{item['filename']}"
-                    try:
-                        virtual_path(key)
-                    except ValueError:
-                        continue  # Only supported text inputs are mounted.
-                    if (path is None or key == path) and within(key, scope):
-                        rows.append({**dict(item), "virtual_path": key, "version": 1})
-        if len(rows) > MAX_FILES:
-            raise ValueError("workspace_file_count_limit")
+                rows.extend(self._input_rows(conn, path, scope, within))
         return rows
+
+    def _input_rows(self, conn, path, scope, within):
+        # Chat admission (and recovery) pins only the turn's authenticated inputs.
+        # A library object from another session is not authorized by owner alone.
+        inputs = conn.execute(
+            "SELECT f.* FROM session_file_resource_refs r JOIN session_files f ON f.file_id=r.file_id "
+            "AND f.owner_user_id=r.owner_user_id AND f.sha256=r.sha256 "
+            "WHERE r.owner_user_id=? AND r.resource_kind='task_input' AND r.resource_id=? "
+            "AND f.visibility='public' ORDER BY f.file_id LIMIT ?",
+            (self.owner, self.run_id, MAX_FILES + 1)).fetchall()
+        if len(inputs) > MAX_FILES:
+            raise ValueError("workspace_input_count_limit")
+        mount = "data" if (path or scope).startswith("/data") else "input"
+        for item in inputs:
+            suffix = Path(item["filename"]).suffix.lower()
+            if suffix not in _TEXT_SUFFIXES:
+                continue  # Binary/published workbooks belong to the existing typed readers.
+            prefix = f"/{mount}/{item['file_id']}/"
+            key = prefix + item["filename"]
+            try:
+                virtual_path(key)
+            except ValueError:
+                key = prefix + "attachment" + suffix
+            if (path is None or key == path) and within(key, scope):
+                yield {**dict(item), "virtual_path": key, "version": 1}
 
     def view(self, *, path=None, version=None, _descriptor=None):
         if path is not None:
@@ -200,7 +224,7 @@ class WorkspaceStorage:
     def index(self, scope="/"):
         """StoreBackend directory/glob semantics over metadata, without bulk reads."""
         from . import workspace_projection as projection
-        virtual_path(scope, directory=True)
+        scope = virtual_path(scope, directory=True)
         store = InMemoryStore()
         namespace = (str(self.owner), self.session)
         refs = {row["virtual_path"]: self._reference(row) for row in self._rows(scope=scope)}
@@ -296,6 +320,8 @@ class WorkspaceStorage:
 
     def save(self, path, *, expected_version, expected_sha256, content=None,
              old_string=None, new_string=None, replace_all=False):
+        from src.core.cancel import raise_if_cancelled
+
         virtual_path(path, writable=True)
         with self.files._connect() as conn:
             self._cas(self._latest(conn, path), expected_version, expected_sha256)
@@ -333,6 +359,7 @@ class WorkspaceStorage:
         # Existing library owns byte persistence and quota enforcement. No
         # request deduplication: each immutable version has a distinct file ID.
         _no_links(self.files.FILES_ROOT / f"user_{self.owner}" / self.session)
+        raise_if_cancelled("workspace_before_staging")
         staged = self.files.register_file(session_id=self.session, owner_user_id=self.owner,
             filename=Path(path).name, content=data, visibility="internal", producer_tool="workspace_write")
         try:
@@ -361,6 +388,7 @@ class WorkspaceStorage:
                     staged["file_id"], [staged["file_id"]])
                 conn.execute("INSERT INTO workspace_file_versions VALUES(?,?,?,?,?,?)",
                              (self.owner, self.session, path, version, staged["file_id"], staged["sha256"]))
+                raise_if_cancelled("workspace_before_commit")
             return {"ref": {"kind": "workspace_file", "path": path, "version": version,
                             "file_id": staged["file_id"], "sha256": staged["sha256"]},
                     "previous_ref": refs.get(path), "size_bytes": len(data),

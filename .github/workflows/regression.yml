@@ -67,6 +67,13 @@ jobs:
             01_src/src/api/reference_views_test.py \
             01_src/src/core/corpus_review_originals_test.py \
             01_src/src/core/citation_reader_test.py \
+            01_src/src/agent/fusion_host_test.py \
+            01_src/src/agent/fusion_worker_test.py \
+            01_src/src/agent/file_baseline_autonomy_test.py \
+            01_src/src/api/reference_fusion_cutover_test.py \
+            01_src/src/research/fusion_workbook_test.py \
+            01_src/src/research/nature_skill_contract_test.py \
+            01_src/src/figures/workbench/nature_vectors_test.py \
             01_src/src/core/citation_stable_refs_test.py \
             01_src/src/research/render_script_contract_test.py \
             01_src/src/research/reference_kernel_test.py \

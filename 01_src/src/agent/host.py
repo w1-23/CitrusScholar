@@ -139,6 +139,14 @@ async def _run(state, identity, ledger):
     register_workspace_tools(catalog)
     from .code_tools import register_code_tools, CODE_TOOL_NAMES
     register_code_tools(catalog)
+    from .fusion_tools import FUSION_TOOL_NAMES, REPLACED_TOOLS, SKILL_IDS, installed_fusion, register_fusion_tools
+    from .nature_skill_tools import NATURE_TOOL_NAMES, installed_nature, register_nature_tools
+    external_release = installed_fusion(release, installed_rows)
+    external_nature = installed_nature(release, installed_rows)
+    if external_release:
+        register_fusion_tools(catalog)
+    if external_nature:
+        register_nature_tools(catalog)
     host = HostTools(identity, state, skill_release=release)
     host.assert_context()
     pool = ops._bind_request_candidate_pool(state) if policy.allows("local_rag") else None
@@ -177,12 +185,21 @@ async def _run(state, identity, ledger):
             host.allowed_names.difference_update(retrieval_tool_names())
         host.allowed_names.update(WORKSPACE_TOOL_NAMES)
         host.allowed_names.update(PLAN_TOOL_NAMES)
+        if external_release:
+            # Old analyzers are reachable only by exact historical releases.
+            host.allowed_names.difference_update(REPLACED_TOOLS)
         if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
             from src.code_execution.presence import worker_available
             from src.config import PROJECT_ROOT as runtime_root
             host.allowed_names.update(CODE_TOOL_NAMES)
-            if not worker_available(runtime_root / "state" / "code_executions.sqlite3"):
+            worker_ready = worker_available(runtime_root / "state" / "code_executions.sqlite3")
+            if not worker_ready:
                 host.allowed_names.difference_update({"code_execute", "code_environment_install"})
+            else:
+                if external_release and any(policy.allows("skill:" + name) for name in SKILL_IDS):
+                    host.allowed_names.update(FUSION_TOOL_NAMES)
+                if external_nature and policy.allows("skill:nature-figure"):
+                    host.allowed_names.update(NATURE_TOOL_NAMES)
         tracing.set_request_authorizations(executor_authorizations(str(state.get("query") or "")))
         return set(host.allowed_names)
     refresh_allowed()
@@ -216,6 +233,17 @@ async def _run(state, identity, ledger):
         else:
             human.content = str(human.content) + "\n当前主模型不支持图片输入；不可声称已看到原图。"
     prompt = await asyncio.to_thread(system_prompt, host.allowed_names, native_skills=True)
+    prompt += ("\nFile 是基础能力。按任务需要自主列举、搜索、读取已授权输入，在当前会话工作区创建或编辑中间文件。"
+               "不依赖所选 Skill、任务类型或逐次确认。读取已有文件版本后再编辑；不要修改输入原件。")
+    if host.allowed_names & FUSION_TOOL_NAMES:
+        prompt += ("\n外部核验、数据审查与科研诚信按已安装 Skill 和绑定的文件身份运行。"
+                   "文献先调用 run_external_skill 解析，再用 continue_external_literature 对同一执行补查，"
+                   "最后收集；没有联网权限时收集原结果并说明缺口。"
+                   "数据审查先明确真实工作表与区域。用户要求出具报告或标注文件时用 collect_external_skill 的 publish_excel，"
+                   "以实际附带的工作簿回执为准；仅请求文字结论时不自动发布工作簿。")
+    if host.allowed_names & NATURE_TOOL_NAMES:
+        prompt += ("\n使用已安装上游 Nature Skill。固定模板可用 run_nature_plot 然后 collect_nature_plot。"
+                   "以实收产物和工作台编辑能力为准。用户明确要求 R 而当前 Worker 不支持时，说明限制，不替换成 Python。")
     local_families = ()
     registry = None
     if "local_hybrid_search" in host.allowed_names:

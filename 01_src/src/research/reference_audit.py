@@ -916,7 +916,8 @@ def _kernel_result(entry, evidence, recorder, audit_id):
     return result
 
 
-def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resume=False, progress=None):
+def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resume=False, progress=None,
+              require_started=False):
     from src.core.cancel import is_cancelled
     from src.core.capability_policy import allows
     _scope(owner, session_id)
@@ -924,6 +925,16 @@ def run_audit(owner, session_id, audit_id, *, max_rows=20, time_budget=45, resum
         raise ValueError('max_rows must be 1..100')
     if not isinstance(time_budget, (int, float)) or not math.isfinite(time_budget) or not 0 < time_budget <= 120:
         raise ValueError('time_budget must be >0 and <=120 seconds')
+    if require_started:
+        with _lease(owner), _connect() as conn:
+            audit = _load(conn, owner, session_id, audit_id)
+            # A stored inventory alone was never admitted to verification. Require
+            # a durable run lease, lookup debit, or exact persisted attempt.
+            started = (audit['lease_token'] or audit['requests_used'] or audit['queries_used'] or
+                       conn.execute('SELECT 1 FROM reference_attempts WHERE audit_id=? LIMIT 1',
+                                    (audit_id,)).fetchone())
+            if not started:
+                return {'run_reason': 'legacy_audit_not_started'}
     if not (allows('bibliographic_lookup') or allows('web_search')):
         result = get_audit(owner, session_id, audit_id)
         result['run_reason'] = 'network_disabled'

@@ -1,11 +1,13 @@
 (function (root) {
   'use strict';
-  var titles = {'candidate-search':'科研检索', 'research-question-answering':'科研问答', 'reference-verification':'文献核验',
+  var titles = {'candidate-search':'科研检索', 'research-question-answering':'科研检索', 'reference-verification':'文献核验',
+    'literature-verification':'文献核验', 'research-integrity':'科研诚信',
     'data-audit':'数据审查', 'nature-figure':'科研绘图'};
   var icons = {'candidate-search':'search', 'research-question-answering':'search',
-    'reference-verification':'book', 'data-audit':'database', 'nature-figure':'chart'};
+    'reference-verification':'book', 'literature-verification':'book', 'research-integrity':'shield',
+    'data-audit':'database', 'nature-figure':'chart'};
   function create(options) {
-    var selected = [], catalog = [], generation = 0, revision = 0;
+    var selected = [], catalog = [], generation = 0, revision = 0, catalogKnown = false;
     var list = options.list, status = options.status, summary = options.summary;
     function closeMenu(focusInput) {
       if (options.menu) options.menu.open = false;
@@ -26,6 +28,13 @@
     function same(a, b) { return a.id === b.id && a.version === b.version && a.sha256 === b.sha256; }
     function identity(item) { return {id:item.id, version:item.version, sha256:item.sha256}; }
     function title(item) { return titles[item.id] || item.id; }
+    function pruneRetired() {
+      if (!catalogKnown) return false;
+      var before = selected.length;
+      selected = selected.filter(function (pick) { return catalog.some(function (item) { return same(pick, item); }); });
+      if (before === selected.length) return false;
+      revision++; return true;
+    }
     function draw() {
       list.replaceChildren();
       catalog.forEach(function (item) {
@@ -72,10 +81,8 @@
               typeof item.description !== 'string' || item.description.length > 10000) return false;
           seen[item.id] = true; return true;
         });
-        var before = selected.length;
-        selected = selected.filter(function (pick) { return catalog.some(function (item) { return same(pick, item); }); });
-        if (before !== selected.length) revision++;
-        status.textContent = before !== selected.length ? '部分场景已更新，已移除旧选择；请重新选择。' :
+        catalogKnown = true;
+        status.textContent = pruneRetired() ? '部分场景已更新，已移除旧选择；请重新选择。' :
           catalog.length ? '可选。不选择时，助手仍会按任务自动发现所需场景。' : '当前没有可选场景；仍可直接提问。';
         draw();
       } catch (_) {
@@ -84,14 +91,18 @@
       }
     }
     function reset() {
-      generation++; revision++; selected = []; catalog = [];
+      generation++; revision++; selected = []; catalog = []; catalogKnown = false;
       list.replaceChildren(); status.textContent = ''; drawSummary();
       if (options.menu) options.menu.open = false;
     }
     if (options.menu) options.menu.addEventListener('toggle', function () { if (options.menu.open) load(); });
     if (options.retry) options.retry.addEventListener('click', load);
     return {load:load, reset:reset,
-      restore:function (items) { selected = items.map(identity); revision++; draw(); },
+      restore:function (items) {
+        selected = items.map(identity); revision++;
+        if (pruneRetired()) status.textContent = '部分场景已更新，已移除旧选择；请重新选择。';
+        draw();
+      },
       capture:function () { return {items:selected.map(identity), revision:revision, scope:options.scope()}; },
       acknowledge:function (snapshot) {
         if (snapshot.scope === options.scope() && snapshot.revision === revision) {

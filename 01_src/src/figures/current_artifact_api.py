@@ -129,7 +129,8 @@ def _inputs(project, owner):
         identities["source"] = _identity(source_blob, "source", source_format)
     members["data/parameters.json"] = _json(source.get("parameters") or {})
 
-    refs = list(project.get("data_refs_json") or [])
+    refs = [ref for ref in (project.get("data_refs_json") or [])
+            if not (isinstance(ref, dict) and ref.get("kind") == "nature_plot_original")]
     refs.extend(source.get("input_snapshots") or [])
     refs.extend((source.get("frozen_render") or {}).get("input_snapshots") or [])
     if isinstance(source.get("dataset_ref"), dict):

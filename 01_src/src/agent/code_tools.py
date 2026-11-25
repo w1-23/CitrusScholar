@@ -27,6 +27,7 @@ from .workspace_reconciliation import observe_code_rejection
 __all__ = ["CODE_TOOL_NAMES", "EXECUTION_WAIT_TOOL_NAMES", "register_code_tools", "code_execution_context"]
 
 _context: ContextVar = ContextVar("code_execution_context", default=None)
+FUSION_CODE_SCOPE = "citrus.fusion-worker/1"
 Id = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 Task = Annotated[str, Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$")]
 Path = Annotated[str, Field(min_length=1, max_length=240)]
@@ -261,6 +262,17 @@ def _identity():
     return identity, call_id
 
 
+def authorize_fusion_code(identity, release):
+    authorized, call_id = _identity()
+    if authorized != identity or release is None or _context.get()[2] != release:
+        raise PermissionError("fusion_code_context_mismatch")
+    return call_id
+
+
+def _host_private_workspace(workspace):
+    return workspace.get("metadata", {}).get("code_scope") in {FUSION_CODE_SCOPE, "citrus.nature-plot/1"}
+
+
 def _key(*values):
     return hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -372,6 +384,15 @@ def _dispatch(operation, **args):
         with account_lease(identity.owner_user_id):
             service = _service(identity)
             workspace = service.workspace
+            if args.get("workspace_id") is not None:
+                try:
+                    if _host_private_workspace(workspace.open(args["workspace_id"])):
+                        return reject("workspace_scope_denied")
+                except (LookupError, PermissionError) as exc:
+                    reason = _workspace_preflight_reason(exc)
+                    if reason:
+                        return reject(reason)
+                    raise
             if operation == "workspace":
                 wid = args.pop("workspace_id")
                 if wid is None:
@@ -569,6 +590,9 @@ def _dispatch(operation, **args):
                 from src.code_execution.environments import EnvironmentConflict
                 environments = OfflineEnvironmentService(identity, executions=service)
                 try:
+                    execution = service.status(args["execution_id"])
+                    if _host_private_workspace(workspace.open(execution["workspace_id"])):
+                        return reject("workspace_scope_denied")
                     manifest = environments.publish(execution_id=args["execution_id"],
                         environment_id=args["environment_id"],
                         expected_revision=args["expected_revision"])
@@ -604,6 +628,9 @@ def _dispatch(operation, **args):
                 return _result({"environment": manifest, "archive_verified": True,
                                 "archive_bytes": len(data)}, reason="environment_read")
             execution_id = args.pop("execution_id")
+            execution = service.status(execution_id)
+            if _host_private_workspace(workspace.open(execution["workspace_id"])):
+                return reject("workspace_scope_denied")
             if operation in {"read", "deliver"}:
                 with _accepted_file(service, identity, execution_id, args["path"]) as (request, ref, data):
                     if operation == "read":
@@ -636,7 +663,8 @@ def _dispatch(operation, **args):
                 return _result(service.read_log(execution_id, **args))
             if operation == "cancel":
                 service.cancel(execution_id)
-            status = _public(service.status(execution_id), receipt=operation == "status")
+                execution = service.status(execution_id)
+            status = _public(execution, receipt=operation == "status")
             if operation == "wait":
                 return _result({**status, "_code_execution_id": status["execution_id"],
                     "completion_scope": "wait_registration_only"}, reason="execution_wait_registered")

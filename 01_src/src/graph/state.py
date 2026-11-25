@@ -19,6 +19,9 @@ class AgentState(TypedDict, total=False):
     context_compression: bool
     capability_snapshot: dict
     capability_runtime: dict
+    # Restored only from the protected same-run graph checkpoint, never HTTP.
+    native_skill_release: str
+    skill_release_inventory_sha256: str
     selected_skills: list[dict]
     request_tables: list[dict]
     request_deadline: float

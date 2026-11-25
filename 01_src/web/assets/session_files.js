@@ -126,6 +126,9 @@
       (svg
         ? '    <button type="button" role="menuitem" data-file-act="copy-svg" data-file-id="' + esc(f.file_id) + '">复制 SVG 源码</button>'
         : '') +
+      (svg && deletable && registeredSvgUrl(f)
+        ? '    <button type="button" role="menuitem" data-file-act="edit-svg-copy" data-file-id="' + esc(f.file_id) + '">在图件工作台创建 SVG 样式副本</button>'
+        : '') +
       (jump
         ? '    <button type="button" role="menuitem" data-file-act="jump" data-file-id="' + esc(f.file_id) + '">定位到来源会话</button>'
         : '') +
@@ -2118,6 +2121,30 @@
       });
   }
 
+  var svgCopyPending = new Set();
+  function createSvgCopy(fileId) {
+    var file = fileCache[fileId];
+    if (!file || file.origin !== 'uploaded' || !registeredSvgUrl(file) || svgCopyPending.has(fileId)) return;
+    var scope = catalogScope;
+    svgCopyPending.add(fileId);
+    toast('正在检查 SVG 是否可以安全创建样式副本…');
+    fetch(apiBase + '/api/v2/figure-workbench/import-svg', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ file_id: fileId })
+    }).then(exportJson).then(function (result) {
+      if (scope !== catalogScope) return;
+      if (result.origin === 'uploaded' && result.editable === true &&
+          /^\/figure-workbench\?project=[a-f0-9]{32}$/.test(result.workbench_url || '')) {
+        window.location.assign(result.workbench_url);
+      } else {
+        toast(result.edit_limitation || '此文件不可创建可编辑副本，仍可预览或下载原件。');
+      }
+    }).catch(function (error) {
+      if (scope === catalogScope) toast(error.message || '无法创建 SVG 样式副本，请重试。');
+    }).finally(function () { svgCopyPending.delete(fileId); });
+  }
+
   function onFileActionClick(event) {
     var target = event.target;
     if (!target || typeof target.closest !== 'function') return;
@@ -2140,6 +2167,12 @@
       event.preventDefault();
       copySvgSource(fileId);
       closeMoreMenus(null);
+      return;
+    }
+    if (action === 'edit-svg-copy') {
+      event.preventDefault();
+      closeMoreMenus(null);
+      createSvgCopy(fileId);
       return;
     }
     if (action === 'export') {

@@ -1571,7 +1571,7 @@ function appendSentAttachmentPreviews(contentEl, files) {
     card.appendChild(label);
     if (/\.pdf$/i.test(file.name || '')) {
       var review = document.createElement('button');
-      review.type = 'button'; review.className = 'paper-review-btn'; review.textContent = '解析引用';
+      review.type = 'button'; review.className = 'paper-review-btn'; review.textContent = '引用标记';
       review.onclick = function() { reviewUploadedPdf(file, card); };
       card.appendChild(review);
     }
@@ -1586,24 +1586,57 @@ async function reviewUploadedPdf(file, card) {
   var epoch = authEpoch, sid = sessionId, sessionVersion = paperReviewSessionVersion;
   function ownsReview() {
     return epoch === authEpoch && sid === sessionId && sessionVersion === paperReviewSessionVersion &&
-      card.querySelector('.paper-review-result') === panel;
+      card.isConnected !== false && card.querySelector('.paper-review-result') === panel;
   }
   if (!sid || !currentAccount) return;
   var old = card.querySelector('.paper-review-result'); if (old) old.remove();
-  var panel = document.createElement('div'); panel.className = 'paper-review-result'; panel.textContent = '正在提取引用…'; card.appendChild(panel);
+  var panel = document.createElement('div'); panel.className = 'paper-review-result'; panel.textContent = '正在处理 PDF 引用标记…'; card.appendChild(panel);
   try {
     var payload = {name:file.name, data:await fileAsDataUrl(file)};
     if (!ownsReview()) return;
     var response = await accountFetch('/api/v2/session/' + encodeURIComponent(sid) + '/paper-review', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     var result = await response.json(); if (!ownsReview()) return; if (!response.ok) throw new Error(result.detail || '解析失败');
     panel.textContent = '';
-    var status = document.createElement('div'); status.textContent = result.status === 'incomplete' ? result.reason : ((result.references || []).length + ' 条参考文献；' + (result.reason || '正文编号引用已标亮。'));
+    var external = result.verification_mode === 'external';
+    var status = document.createElement('div');
+    status.textContent = external || result.status === 'incomplete' ? result.reason :
+      ((result.references || []).length + ' 条参考文献；' + (result.reason || '正文编号引用已标亮。'));
     panel.appendChild(status);
     var highlightedUrl = safeProductUrl(result.highlighted_pdf_url, true);
     if (highlightedUrl) {
       var artifactId = highlightedUrl.split('/').pop();
       var link = document.createElement('a'); link.href = '/api/v2/session/' + encodeURIComponent(sid) + '/paper-preview/' + encodeURIComponent(artifactId); link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = '预览高亮 PDF'; panel.appendChild(link);
       var download = document.createElement('a'); download.href = highlightedUrl; download.textContent = ' · 下载副本'; panel.appendChild(download);
+    }
+    if (external) {
+      var verify = document.createElement('button');
+      verify.type = 'button'; verify.className = 'paper-review-btn'; verify.textContent = '核验文献';
+      var notice = document.createElement('div'); notice.setAttribute('role', 'status');
+      verify.onclick = async function () {
+        if (!ownsReview() || verify.disabled) return;
+        verify.disabled = true;
+        notice.textContent = '';
+        try {
+          var catalog = await accountFetch('/api/v2/skills');
+          if (!catalog.ok) throw new Error('读取文献核验场景失败，请稍后重试。');
+          var body = await catalog.json();
+          if (!ownsReview()) return;
+          var skill = body && Array.isArray(body.skills) && body.skills.find(function (row) {
+            return row && row.id === 'literature-verification' && typeof row.version === 'string' &&
+              row.version.length > 0 && /^[a-f0-9]{64}$/.test(row.sha256);
+          });
+          if (!skill) throw new Error('当前没有可用的文献核验场景。');
+          if (!await sendMsg({file: file, skill: {id: skill.id, version: skill.version, sha256: skill.sha256}}) && ownsReview()) {
+            notice.textContent = '当前无法提交核验，请稍后重试。';
+          }
+        } catch (error) {
+          if (ownsReview()) notice.textContent = error.message || '无法打开文献核验场景，请稍后重试。';
+        } finally {
+          if (ownsReview()) verify.disabled = false;
+        }
+      };
+      panel.appendChild(verify); panel.appendChild(notice);
+      return;
     }
     var auditBase = result.audit_id ? '/api/v2/session/' + encodeURIComponent(sid) + '/reference-audits/' + encodeURIComponent(result.audit_id) : '';
     var rowNodes = {}, rowIndex = {};
@@ -4272,17 +4305,17 @@ function toolStatusText(status, reason) {
   return '未完成' + reasonText;
 }
 
-async function sendMsg() {
-  if (!currentAccount || !sessionId || accountDocumentRetired || historyRequest) return;
+async function sendMsg(paperVerification) {
+  if (!currentAccount || !sessionId || accountDocumentRetired || historyRequest) return false;
   var epoch = authEpoch, requestSessionId = sessionId;
   function ownsTurn() { return epoch === authEpoch && requestSessionId === sessionId && (!botContent || chatContainer.contains(botContent)); }
   function ownsControls() {
     return ownsTurn() && !!activeTurnComposer && activeTurnComposer.requestId === clientRequestId;
   }
   var sendBtnEl = document.getElementById('send-btn');
-  if (sendBtnEl && sendBtnEl.disabled && !sendBtnEl.classList.contains('is-stop-mode')) return;
+  if (sendBtnEl && sendBtnEl.disabled && !sendBtnEl.classList.contains('is-stop-mode')) return false;
   var rawDraft = String(userInput.value || '');
-  var query = rawDraft.trim();
+  var query = paperVerification ? '请核验所附原始 PDF 的参考文献，区分已核实、建议更正和尚未确认，并提供结果及证据。' : rawDraft.trim();
   if (!query) {
     if (_selectedAttachments.length || window._selectedAccountFileRefs.length) {
       _composerNotice = '已选择附件；请填写正文后再发送，附件会保留。';
@@ -4291,17 +4324,19 @@ async function sendMsg() {
     }
     return;
   }
-  _composerNotice = '';
+  if (!paperVerification) _composerNotice = '';
   mascotSay('planning');
   var _firstTokenElapsedMs = null;
-  var visualizeForRequest = visualizationEnabled;
-  var browseForRequest = !!(browseCheckbox && browseCheckbox.checked);
-  if (browseCheckbox) browseCheckbox.checked = false;
+  var visualizeForRequest = !paperVerification && visualizationEnabled;
+  var browseForRequest = !paperVerification && !!(browseCheckbox && browseCheckbox.checked);
+  if (!paperVerification && browseCheckbox) browseCheckbox.checked = false;
   var draftKey = composerDraftKey();
-  var filesForRequest = _selectedAttachments.slice();
-  var fileRefsForRequest = window._selectedAccountFileRefs.slice();
-  // Freeze the exact skills snapshot; later picker edits must not alter this turn.
-  var capturedSkills = skillPicker ? skillPicker.capture() : {items: []};
+  // The PDF action sends one original File in its own turn, without consuming
+  // unrelated composer inputs or replacing the regular selection snapshot.
+  var filesForRequest = paperVerification ? [paperVerification.file] : _selectedAttachments.slice();
+  var fileRefsForRequest = paperVerification ? [] : window._selectedAccountFileRefs.slice();
+  var capturedSkills = paperVerification ? {items: [paperVerification.skill]} :
+    skillPicker ? skillPicker.capture() : {items: []};
   var skillsForRequest = (capturedSkills.items || []).map(function (item) { return Object.assign({}, item); });
 
   // v8.3.7 M1: 每次点击生成稳定幂等 ID，重试复用（防重发重复写历史）
@@ -4316,7 +4351,7 @@ async function sendMsg() {
   // v8.4.11: 新发送清理停止提示，恢复输入框占位
   var stopMsg = document.getElementById('stop-msg');
   if (stopMsg) stopMsg.style.display = 'none';
-  userInput.placeholder = '有什么想做的？';
+  if (!paperVerification) userInput.placeholder = '有什么想做的？';
   var userMessageContent = addMessage('user', escapeHtml(query) +
     (filesForRequest.length + fileRefsForRequest.length ? '<div class="sent-attachment-count">已附加 ' + (filesForRequest.length + fileRefsForRequest.length) + ' 个文件</div>' : ''), null, true);
   var _sentPreviewStart = _sentAttachmentPreviewUrls.length;
@@ -4327,9 +4362,11 @@ async function sendMsg() {
   appendMessageActions(userMessageContent, 'user', query);
   // P0: 提交瞬间先给导航一个临时刻度，服务端确认后换成正式 message_id
   if (window.turnRail && window.turnRail.addPending) window.turnRail.addPending(clientRequestId, query);
-  saveComposerInput();
-  userInput.value = '';
-  writeComposerDraft(draftKey, '');
+  if (!paperVerification) {
+    saveComposerInput();
+    userInput.value = '';
+    writeComposerDraft(draftKey, '');
+  }
   var sentDraftRevision = composerDraft(draftKey).revision;
 
   var botContent = addMessage('bot', '', null, true);
@@ -5075,8 +5112,8 @@ async function sendMsg() {
     myBinding.queueEntry = entry;
     if (entry.job_id) botContent.dataset.jobId = String(entry.active_child_job_id || entry.job_id);
     if (!silent) {
-      if (skillPicker) skillPicker.acknowledge(capturedSkills);
-      if (filesForRequest.length || fileRefsForRequest.length) {
+      if (!paperVerification && skillPicker) skillPicker.acknowledge(capturedSkills);
+      if (!paperVerification && (filesForRequest.length || fileRefsForRequest.length)) {
         window.dispatchEvent(new Event('citrus-turn-finished'));
         _selectedAttachments = _selectedAttachments.filter(function (f) { return filesForRequest.indexOf(f) < 0; });
         window._selectedAccountFileRefs = window._selectedAccountFileRefs.filter(function (f) { return fileRefsForRequest.indexOf(f) < 0; });
@@ -5094,6 +5131,7 @@ async function sendMsg() {
   }
 
   function restoreNewDraft() {
+    if (paperVerification) return;
     if (userInput.value) saveComposerInput();
     if (requestRoundId !== currentRoundId || composerDraft(draftKey).revision !== sentDraftRevision) return;
     writeComposerDraft(draftKey, rawDraft);
@@ -5248,6 +5286,7 @@ async function sendMsg() {
   }
 
   streamOnce();
+  return true;
 }
 
   // Shared by live citations and session restoration before any new chat.

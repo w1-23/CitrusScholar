@@ -667,7 +667,7 @@ def detail_for_owner(figure_id: str, owner: int, *, upgrade_manifest: bool = Fal
     if public["source_kind"] == "svg":
         from src.figures.svg_projects import editable_svg_targets
         source = project.get("source_json") or {}
-        targets = editable_svg_targets(source["svg"]) if "svg" in source else []
+        targets = editable_svg_targets(source["svg"], plot=bool(source.get("nature_plot"))) if "svg" in source else []
         svg_detail = {"svg_targets": targets, "editable": bool(targets and "svg" in public["exports"])}
     legacy_edit = (public["source_kind"] != "svg" and public["editable"] and "svg" in public["exports"]
                    and manifest.get("version", 1) < MANIFEST_VERSION)

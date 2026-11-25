@@ -35,6 +35,18 @@ _FORMATS = {"json": "application/json", "xlsx":
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "ris": "application/x-research-info-systems", "bibtex": "application/x-bibtex"}
 _MAX_BYTES = 20 * 1024 * 1024
+EXTERNAL_REFERENCE_VERIFICATION_DETAIL = "新文献核验请通过会话中的文献核验场景提交。"
+
+
+def external_reference_verification_active() -> bool:
+    from src.agent.fusion_tools import installed_fusion
+    from src.agent.installed_skills import list_installed, release_path
+
+    try:
+        release = release_path()
+        return installed_fusion(release, list_installed(release)) if release is not None else False
+    except (OSError, ValueError, KeyError) as exc:
+        raise HTTPException(503, "无法确认当前文献核验发行版本。") from exc
 
 
 def _user(request: Request) -> dict:
@@ -173,6 +185,9 @@ def _rate(owner, operation, count):
 async def create_audit(session_id: str, body: AuditCreate, request: Request):
     user = _user(request)
     _same_origin(request)
+    if external_reference_verification_active():
+        _owned_session(session_id, user)
+        raise HTTPException(409, EXTERNAL_REFERENCE_VERIFICATION_DETAIL)
     content = _create_input(body)
     _rate(user["user_id"], "create", 30)
     return _response(await _call(user, session_id, "create_audit", name=body.name,
@@ -202,8 +217,11 @@ async def run_audit(session_id: str, audit_id: str, body: AuditRun, request: Req
     user = _user(request)
     _same_origin(request)
     _rate(user["user_id"], "run", 240)
-    result = await _call(user, session_id, "run_audit", audit_id,
-                         max_rows=body.max_rows, time_budget=body.time_budget, resume=body.resume)
+    result = await _call(user, session_id, "run_audit", audit_id, max_rows=body.max_rows,
+                         time_budget=body.time_budget, resume=body.resume,
+                         require_started=external_reference_verification_active())
+    if result.get("run_reason") == "legacy_audit_not_started":
+        raise HTTPException(409, EXTERNAL_REFERENCE_VERIFICATION_DETAIL)
     conflict = result.get("run_reason") in {"already_running", "lease_lost"}
     return _response(result, status_code=409 if conflict else 200)
 

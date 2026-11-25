@@ -251,17 +251,26 @@ def export_snapshot(snapshot, *, presentation='annotated', explain_visible=False
 
 
 def export_reviewed_workbook(data, *, targets, source_sha256, original=True,
-                             status='complete', issue_list=False, overview=False, rules=False):
-    """Render absolute coordinates from an existing review on verified workbook bytes."""
+                             status='complete', issue_list=False, overview=False, rules=False,
+                             presentation='legacy', exact_locations=False, summary_findings=None):
+    """Render absolute coordinates from an existing review on verified workbook bytes.
+
+    Exact-only reviews never redirect a merged placeholder to a different cell.
+    A caller can supply one summary row per original finding when it spans targets.
+    """
     if original and hashlib.sha256(data).hexdigest() != source_sha256:
         raise ValueError('Reviewed workbook hash mismatch')
+    if original:
+        from ._zip_safety import validate_zip_bytes
+        validate_zip_bytes(data)
     wb = load_workbook(io.BytesIO(data), rich_text=True)
     entries = [{'table': {**target, 'sheet': target['sheet_name']},
                 'result': {'data': {'findings': target['findings'],
                                     'rule_execution': target.get('rule_execution') or {}}}}
                for target in targets]
     return _render_workbook(wb, entries, source_bytes=data, source_sha256=source_sha256,
-                            status=status, original=original, issue_list=issue_list, overview=overview, rules=rules)
+                            status=status, original=original, issue_list=issue_list, overview=overview, rules=rules,
+                            presentation=presentation, exact_locations=exact_locations, summary_findings=summary_findings)
 
 
 def finding_coordinates(item, columns):
@@ -297,7 +306,7 @@ def finding_coordinates(item, columns):
 
 def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, original,
                      keep_vba=False, explain_visible=False, issue_list=False, overview=False, rules=False,
-                     presentation='legacy'):
+                     presentation='legacy', exact_locations=False, summary_findings=None):
     original_names=list(wb.sheetnames)
     bounds={ws.title:(ws.max_row,ws.max_column) for ws in wb.worksheets}
     if sum(height*width for height,width in bounds.values()) > 2_000_000:
@@ -338,6 +347,8 @@ def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, origin
                     continue
                 cell = ws.cell(row, column)
                 if isinstance(cell, MergedCell):
+                    if exact_locations:
+                        continue
                     merged = next((area for area in ws.merged_cells.ranges if cell.coordinate in area), None)
                     if merged is None or merged.min_row not in rows or merged.min_col not in columns:
                         continue
@@ -348,10 +359,12 @@ def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, origin
         cell = wb[name].cell(row, column)
         unique = {json.dumps(item, ensure_ascii=False, sort_keys=True, default=_json_default): item for item in findings}
         ordered = sorted(unique.values(), key=_sort)
-        previous = cell.comment.text if cell.comment else ''
         text, ref = _comment(ordered)
         references[ref] = ordered
-        cell.comment = Comment(previous + '\n\n' + text if previous else text, 'Citrus Audit')
+        if cell.comment is None:
+            cell.comment = Comment(text, 'Citrus Audit')
+        else:
+            cell.comment.text += '\n\nCitrus Audit\n' + text
         fill_color, line_color = 'FDE2E1', 'E06666'
         if all(item.get('check') == 'row_annotation' for item in ordered):
             fill_color, line_color = _ANNOTATION_COLORS.get(ordered[0].get('severity'), (fill_color, line_color))
@@ -402,7 +415,8 @@ def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, origin
         for column, title in enumerate(('位置', '类型', '结论'), start=1):
             put(ws, 2, column, title)
         summary_rows = 0
-        reportable = sorted((x for x in all_findings if not x.get('coverage_only')), key=_sort)
+        reportable = sorted((x for x in all_findings if not x.get('coverage_only'))
+                            if summary_findings is None else summary_findings, key=_sort)
         for item in reportable:
             ranges = list((item.get('evidence') or {}).get('ranges') or [])
             coords = finding_coordinates(item, item.get('reviewed_columns') or ())
@@ -421,14 +435,15 @@ def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, origin
             label, _, action = _kind(str(item.get('check','')))
             conclusion = ' '.join(str(item.get('detail','')).split())[:2000]
             row_number = 3 + summary_rows
-            put(ws, row_number, 1, location or item.get('sheet', ''))
-            put(ws, row_number, 2, label)
+            put(ws, row_number, 1, item.get('summary_location') or location or item.get('sheet', ''))
+            put(ws, row_number, 2, item.get('summary_label') or label)
             put(ws, row_number, 3, conclusion)
-            if locations:
-                try:
-                    ws.cell(row_number, 1).hyperlink = f"#'{item.get('sheet','')}'!{locations[0].split('!',1)[-1]}"
-                except (ValueError, IndexError):
-                    pass
+            link = item.get('summary_link')
+            if link is None and locations:
+                link = (item.get('sheet', ''), locations[0].rsplit('!', 1)[-1])
+            if link is not None and link[0] in original_names:
+                from openpyxl.utils.cell import quote_sheetname
+                ws.cell(row_number, 1).hyperlink = f"#{quote_sheetname(link[0])}!{link[1]}"
             summary_rows += 1
         if not summary_rows:
             put(ws, 3, 1, '已审范围')

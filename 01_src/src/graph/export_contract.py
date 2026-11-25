@@ -32,7 +32,7 @@ from src.graph.intent_text import (
 )
 
 _EXPORT_FORMAT_RE = re.compile(
-    r"(?i)(?<![a-z])(?:html?|xlsx|xlsm?|excel|word|docx|pdf|json|csv|tsv|ris|bibtex|svg|png|zip|tar\.gz|"
+    r"(?i)(?<![a-z])(?:html?|xlsx|xlsm?|excel|word|docx|pdf|json|csv|tsv|ris|bibtex|svg|png|tiff?|zip|tar\.gz|"
     r"report|brief|document|file|workbook|spreadsheet|figure|chart|diagram|table|sheet|"
     r"bibliography|archive|报告|简报|文档|文件|表格|清单|核验表|审查表|标注|书目|压缩包)(?![a-z])")
 # Longer forms first: "另存为" must not leave "为可直接下载的 XLSX" as the tail.
@@ -93,7 +93,7 @@ _KIND_FORMATS = {
     "supplement_report": {"xlsx"},
     "gap_csv": {"csv"},
     "figure": {"svg"},
-    "figure_package": {"svg", "png", "pdf"},
+    "figure_package": {"svg", "png", "pdf", "tiff"},
     "report_html": {"html"},
     "report_docx": {"docx"},
     "report_json": {"json"},
@@ -104,10 +104,10 @@ _FORMAT_ALIASES = {
     "xlsm": "xlsm", "excel": "xlsx", "workbook": "xlsx",
     "spreadsheet": "xlsx", "word": "docx", "docx": "docx", "pdf": "pdf",
     "json": "json", "csv": "csv", "tsv": "tsv", "ris": "ris", "bibtex": "bibtex",
-    "svg": "svg", "png": "png", "zip": "zip", "tar.gz": "tar.gz",
+    "svg": "svg", "png": "png", "tif": "tiff", "tiff": "tiff", "zip": "zip", "tar.gz": "tar.gz",
 }
 _FORMAT_TOKEN_RE = re.compile(
-    r"(?i)(?<![a-z])(?:html?|xlsx|xlsm?|excel|workbook|spreadsheet|word|docx|pdf|json|csv|tsv|ris|bibtex|svg|png|zip|tar\.gz)(?![a-z])")
+    r"(?i)(?<![a-z])(?:html?|xlsx|xlsm?|excel|workbook|spreadsheet|word|docx|pdf|json|csv|tsv|ris|bibtex|svg|png|tiff?|zip|tar\.gz)(?![a-z])")
 _DELIVERABLE_SPLIT_RE = re.compile(r"(?i)\s+(?:and|&|plus|also)\s+|以及|和|与|并且|同时|、")
 _CHINESE_DIGITS = {
     "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
@@ -156,7 +156,7 @@ _FORMAT_EXTENSIONS = {
     "html": {".html", ".htm"}, "xlsx": {".xlsx"}, "xls": {".xls"},
     "xlsm": {".xlsm"}, "docx": {".docx"}, "pdf": {".pdf"},
     "json": {".json"}, "csv": {".csv"}, "tsv": {".tsv"}, "ris": {".ris"},
-    "bibtex": {".bib", ".bibtex"}, "svg": {".svg"}, "png": {".png"}, "zip": {".zip"},
+    "bibtex": {".bib", ".bibtex"}, "svg": {".svg"}, "png": {".png"}, "tiff": {".tif", ".tiff"}, "zip": {".zip"},
     "tar.gz": {".tar.gz", ".tgz"},
 }
 _DOI_RE = re.compile(r"10\.\d{4,9}/[^\s<>\[\]{}\"']+", re.I)
@@ -579,7 +579,7 @@ _IDENTITY_CJK_NOISE = (
 )
 _IDENTITY_ASCII_NOISE = frozenset({
     "html", "htm", "xlsx", "xlsm", "xls", "excel", "word", "docx", "pdf",
-    "json", "csv", "tsv", "ris", "bibtex", "svg", "png", "zip", "tar.gz",
+    "json", "csv", "tsv", "ris", "bibtex", "svg", "png", "tiff", "zip", "tar.gz",
     "reports", "report", "briefs", "brief", "documents", "document", "files",
     "file", "workbooks", "workbook", "spreadsheets", "spreadsheet", "tables",
     "table", "checklists", "checklist", "figures", "figure", "charts", "chart",

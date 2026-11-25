@@ -859,6 +859,42 @@ def list_files(session_id: str, owner_user_id: int = 0) -> list[dict[str, Any]]:
     return valid
 
 
+def get_task_input_file(owner_user_id: int, run_id: str, file_id: str,
+                        expected_sha256: str) -> dict[str, Any] | None:
+    """Read one exact public attachment pinned at this run's API admission.
+
+    The caller supplies authenticated account/run identity. Explicitly attached
+    same-owner library files may originate in another session. The pin does not
+    authorize an unmanaged path or unverified bytes: consumers must hash the
+    bytes they read before use, in addition to checking this metadata boundary.
+    """
+    if (type(owner_user_id) is not int or owner_user_id < 1 or type(run_id) is not str
+            or not 1 <= len(run_id) <= 256 or type(file_id) is not str
+            or re.fullmatch(r"[a-f0-9]{32}", file_id) is None or type(expected_sha256) is not str
+            or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None):
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT f.* FROM session_file_resource_refs r JOIN session_files f "
+            "ON f.file_id=r.file_id AND f.owner_user_id=r.owner_user_id AND f.sha256=r.sha256 "
+            "WHERE r.owner_user_id=? AND r.resource_kind='task_input' AND r.resource_id=? "
+            "AND f.visibility='public' AND f.file_id=? AND f.sha256=?",
+            (owner_user_id, run_id, file_id, expected_sha256)).fetchone()
+    if row is None:
+        return None
+    path = Path(row["storage_path"])
+    if (not path.is_absolute() or any(part.is_symlink() or
+            (hasattr(part, "is_junction") and part.is_junction()) for part in (path, *path.parents))
+            or not _allowed_file_path(row["session_id"], path, row["origin"], owner_user_id)):
+        return None
+    try:
+        if path.stat(follow_symlinks=False).st_nlink != 1:
+            return None
+    except OSError:
+        return None
+    return {**_row_to_public(row), "path": path}
+
+
 def get_file(session_id: str, file_id: str, *, touch: bool = False,
              owner_user_id: int = 0, allow_internal: bool = False) -> dict[str, Any] | None:
     """Resolve one file inside its session. Returns internal ``path`` too."""

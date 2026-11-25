@@ -15,7 +15,8 @@ def _reference_start(pages: list[str]) -> tuple[int, int] | None:
     return None
 
 
-def review_pdf(name: str, data_url: str, session_id: str, *, owner_user_id: int | None = None) -> dict[str, Any]:
+def review_pdf(name: str, data_url: str, session_id: str, *, owner_user_id: int | None = None,
+               presentation_only: bool = False) -> dict[str, Any]:
     raw = str(data_url or "")
     if raw.startswith("data:") and "," in raw:
         raw = raw.split(",", 1)[1]
@@ -31,33 +32,33 @@ def review_pdf(name: str, data_url: str, session_id: str, *, owner_user_id: int 
     import fitz
     doc = fitz.open(stream=content, filetype="pdf")
     pages = [doc.load_page(i).get_text("text") for i in range(min(len(doc), 300))]
-    from src.research.reference_extraction import extract_inventory
-    from src.research.reference_audit import _create_inventory
-    try:
-        inventory = extract_inventory(name=name, content=content, _pdf_pages=pages, _pdf_page_count=len(doc))
-        audit = _create_inventory(owner_user_id, session_id, inventory) if owner_user_id is not None else None
-    except BaseException:
-        doc.close()
-        raise
+    inventory = audit = None
+    if not presentation_only:
+        from src.research.reference_extraction import extract_inventory
+        from src.research.reference_audit import _create_inventory
+        try:
+            inventory = extract_inventory(name=name, content=content, _pdf_pages=pages, _pdf_page_count=len(doc))
+            audit = _create_inventory(owner_user_id, session_id, inventory) if owner_user_id is not None else None
+        except BaseException:
+            doc.close()
+            raise
     audit_info = ({'audit_id': audit['audit_id'], 'audit': {key: value for key, value in audit.items() if key != 'rows'}}
                   if audit else {})
     if not any(text.strip() for text in pages):
         doc.close()
-        return {"status": "incomplete", "reason": "未提取到文本，可能是扫描版 PDF；未执行 OCR。",
-                "references": [], "highlighted_pdf_url": "", "pages": len(pages),
-                'extraction': inventory['extraction'], **audit_info}
+        result = {"status": "incomplete", "reason": "未提取到文本，可能是扫描版 PDF；未执行 OCR。",
+                  "highlighted_pdf_url": "", "pages": len(pages)}
+        if presentation_only:
+            return result
+        return {**result, "references": [], 'extraction': inventory['extraction'], **audit_info}
     start = _reference_start(pages)
-    refs = [{**entry['claims'], 'number': entry['record_index'] + 1,
-             'record_id': entry['record_id'], 'record_index': entry['record_index'],
-             'text': entry['citation'], 'positions': entry['positions'],
-             'parse_status': entry['parse_status']}
-            for entry in inventory['entries']]
 
     # Add visible PDF highlight annotations to numbered in-text citation markers.
     citation_pattern = re.compile(
         r"\[(?:\d{1,3})(?:\s*[,–-]\s*\d{1,3})*\]"
         r"|\([A-Z][A-Za-z'’.-]+(?:\s+et\s+al\.)?[,]?\s*(?:19|20)\d{2}[a-z]?(?:\s*;[^)]*)?\)"
     )
+    highlighted = False
     for page_no, text in enumerate(pages):
         if start and page_no > start[0]:
             continue
@@ -72,18 +73,28 @@ def review_pdf(name: str, data_url: str, session_id: str, *, owner_user_id: int 
                 annot = page.add_highlight_annot(rect)
                 annot.set_info(title="CitrusScholar 引用标记", content="正文中检测到的编号引用，供人工核对。")
                 annot.update()
+                highlighted = True
     output = doc.tobytes(garbage=3, deflate=True)
     doc.close()
     if owner_user_id is not None:
         from src.research.artifacts import publish_artifact
         receipt = publish_artifact(owner=owner_user_id, session_id=session_id,
             filename=_safe_pdf_name(name), content=output, mime="application/pdf",
-            producer_tool="paper_review", request_id=audit['audit_id'])
+            producer_tool="paper_review", request_id=audit['audit_id'] if audit else "")
         artifact_url = receipt['artifact_url']
     else:
         # Retain the internal adapter for callers that already bind identity.
         from src.research.tools import _save_artifact
         artifact_url = _save_artifact(_safe_pdf_name(name), output, "application/pdf")
+    if presentation_only:
+        reason = "已标亮检测到的正文引用标记，未执行文献核验。" if highlighted else "未检测到可标亮的正文引用标记，未执行文献核验。"
+        return {"status": "presentation_only", "reason": reason, "pages": len(pages),
+                "highlighted_pdf_url": artifact_url}
+    refs = [{**entry['claims'], 'number': entry['record_index'] + 1,
+             'record_id': entry['record_id'], 'record_index': entry['record_index'],
+             'text': entry['citation'], 'positions': entry['positions'],
+             'parse_status': entry['parse_status']}
+            for entry in inventory['entries']]
     return {"status": "partial",
             "reason": "参考文献使用保守解析，条目边界和字段需复核；不代表全文参考文献已全部识别。",
             "pages": len(pages), "references": refs, 'extraction': inventory['extraction'],

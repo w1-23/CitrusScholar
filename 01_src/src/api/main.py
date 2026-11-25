@@ -5069,9 +5069,11 @@ async def download_workspace_file(session_id: str, path: str, request: Request):
 
 @app.post("/api/v2/session/{session_id}/paper-review")
 async def paper_review_pdf(session_id: str, req: PdfReviewRequest, request: Request):
-    """Extract bibliography and generate a copy highlighting numbered citations."""
+    """Generate a copy highlighting citation markers, independently of verification."""
     user = current_user(request)
     require_owned_session(session_id, user)
+    from src.api.reference_router import external_reference_verification_active
+    external = external_reference_verification_active()
     from src.auth import check_rate_limit
     if not check_rate_limit("pdf_review", str(user["user_id"]), 10, 3600):
         raise HTTPException(status_code=429, detail="PDF 引用解析每小时最多 10 次，请稍后再试。")
@@ -5079,12 +5081,11 @@ async def paper_review_pdf(session_id: str, req: PdfReviewRequest, request: Requ
     set_session_id(session_id)
     try:
         from src.research.pdf_citations import review_pdf
-        # The same review now also lands in the owner-bound ReferenceAudit, so the
-        # panel can run one click-to-verify batch instead of per-row requests.
         from src.core.account_leases import account_lease, run_account_thread
         with account_lease(int(user["user_id"])) as lease:
-            return await run_account_thread(lease, review_pdf, req.name, req.data, session_id,
-                                            owner_user_id=int(user["user_id"]))
+            result = await run_account_thread(lease, review_pdf, req.name, req.data, session_id,
+                                              owner_user_id=int(user["user_id"]), presentation_only=external)
+        return {**result, "verification_mode": "external"} if external else result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -5096,6 +5097,11 @@ async def paper_review_pdf(session_id: str, req: PdfReviewRequest, request: Requ
 async def citation_metadata_check(session_id: str, req: CitationCheckRequest, request: Request):
     user = current_user(request)
     require_owned_session(session_id, user)
+    from src.api.reference_router import (
+        EXTERNAL_REFERENCE_VERIFICATION_DETAIL, external_reference_verification_active,
+    )
+    if external_reference_verification_active():
+        raise HTTPException(409, EXTERNAL_REFERENCE_VERIFICATION_DETAIL)
     from src.auth import check_rate_limit
     if not check_rate_limit("citation_check", str(user["user_id"]), 60, 3600):
         raise HTTPException(status_code=429, detail="文献核验请求过于频繁，请稍后再试。")

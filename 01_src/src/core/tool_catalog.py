@@ -134,6 +134,11 @@ HOST_TOOL_LABELS = {
     "workspace_search": "搜索工作区内容",
     "workspace_read": "读取工作区文件",
     "workspace_write": "保存工作区文件",
+    "run_external_skill": "运行外部科研方法",
+    "continue_external_literature": "查询公开文献登记",
+    "collect_external_skill": "读取并交付审查结果",
+    "run_nature_plot": "使用上游 Nature 模板绘图",
+    "collect_nature_plot": "交付图件和工作台项目",
     "workspace_edit": "修改工作区文件",
 }
 

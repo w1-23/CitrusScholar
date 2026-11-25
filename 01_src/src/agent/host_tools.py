@@ -282,14 +282,17 @@ class HostTools:
         try:
             from contextlib import nullcontext
             from .code_tools import CODE_TOOL_NAMES, EXECUTION_WAIT_TOOL_NAMES, code_execution_context
+            from .fusion_tools import FUSION_TOOL_NAMES, FUSION_WAIT_TOOLS
+            from .nature_skill_tools import NATURE_TOOL_NAMES, NATURE_WAIT_TOOLS
+            from .workspace_projection import bind_skill_release
             binding = (code_execution_context(identity, call['id'], skill_release=self.skill_release)
-                       if call['name'] in CODE_TOOL_NAMES or call['name'] == 'audit_uploaded_data'
+                       if call['name'] in (CODE_TOOL_NAMES | FUSION_TOOL_NAMES | NATURE_TOOL_NAMES) or call['name'] == 'audit_uploaded_data'
                        else nullcontext())
             retry_binding = nullcontext()
             if retry_target:
                 from src.tools.browse_web import bind_navigation_retry
                 retry_binding = bind_navigation_retry(retry_target)
-            with binding, retry_binding:
+            with binding, retry_binding, bind_skill_release(self.skill_release):
                 message = await _run_single_tool(tool, call, require_durable=True,
                                                  on_dispatch=dispatched, retry_of=retry_of or None,
                                                  logical_key=logical_key, attempt=attempt)
@@ -305,7 +308,7 @@ class HostTools:
         if call["name"] == "request_user_input" and isinstance(question, dict):
             self.pending_question = question
         execution_waits = ()
-        if (call['name'] in EXECUTION_WAIT_TOOL_NAMES
+        if (call['name'] in (EXECUTION_WAIT_TOOL_NAMES | FUSION_WAIT_TOOLS | NATURE_WAIT_TOOLS)
                 and artifact.get('_code_execution_id')
                 and (artifact.get('_tool_outcome') or {}).get('status') == 'complete'):
             import asyncio

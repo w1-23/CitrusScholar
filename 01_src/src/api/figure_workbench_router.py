@@ -34,6 +34,25 @@ class GroupBatch(BaseModel):
     draft_revision: int = Field(default=0, ge=0, le=9007199254740991, strict=True)
 
 
+class ImportSvgRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    file_id: str = Field(pattern=r"^[a-f0-9]{32}$", strict=True)
+
+
+@router.post("/import-svg")
+async def import_uploaded_svg(body: ImportSvgRequest, request: Request):
+    """Opt in to an editable copy of a compatible SVG from the owner's library."""
+    from src.figures.nature_plot_project import import_uploaded_nature_svg
+
+    owner = _owner(request)
+    with _write_scope(owner) as lease:
+        try:
+            result = await run_account_thread(lease, import_uploaded_nature_svg, owner, body.file_id)
+        except projects.ProjectError as exc:
+            return _fail(exc)
+    return JSONResponse(result, headers=_HEADERS)
+
+
 @page_router.get("/figure-workbench", include_in_schema=False)
 async def workbench_page(request: Request):
     from src.auth import user_for_token

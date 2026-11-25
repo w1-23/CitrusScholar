@@ -230,8 +230,8 @@ class Repository:
         result["saved"], result["pinned"] = bool(result["saved"]), bool(result["pinned"])
         return result
 
-    def create(self, owner, session, *, task_id, request_id, saved=False, metadata=None):
-        """Create a NEW task and select it as current; exact request retry is inert.
+    def create(self, owner, session, *, task_id, request_id, saved=False, metadata=None, make_current=True):
+        """Create a new task, optionally selecting it; exact request retry is inert.
 
         Reusing a task_id under a different request is a conflict. Use open or
         touch to resume. A retry never changes the current task selected later.
@@ -240,8 +240,14 @@ class Repository:
         _token(request_id)
         if type(saved) is not bool:
             raise ValueError("workspace_invalid_saved")
+        if type(make_current) is not bool:
+            raise ValueError("workspace_invalid_current")
         metadata = _json_object({} if metadata is None else metadata)
-        fingerprint = hashlib.sha256(json.dumps([task_id, saved, metadata]).encode()).hexdigest()
+        # Preserve the original exact-replay key for ordinary Workspaces.
+        identity = [task_id, saved, metadata]
+        if not make_current:
+            identity.append(False)
+        fingerprint = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         with self._transaction(owner, session) as (conn, _):
             prior = conn.execute("SELECT * FROM task_workspace_requests WHERE owner=? AND session=? AND request_id=?",
                                  (owner, session, request_id)).fetchone()
@@ -257,7 +263,8 @@ class Repository:
                          (wid, owner, session, task_id, 1, int(saved), now, now, metadata))
             conn.execute("INSERT INTO task_workspace_requests VALUES(?,?,?,?,?)",
                          (owner, session, request_id, fingerprint, wid))
-            self._select_current(conn, owner, session, wid)
+            if make_current:
+                self._select_current(conn, owner, session, wid)
             return self._manifest(self._workspace(conn, owner, session, wid))
 
     @staticmethod

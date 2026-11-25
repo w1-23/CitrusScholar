@@ -100,6 +100,9 @@ def _artifact_format_matches(path: Path, filename: str, mime: str) -> bool:
         return (mime_l == "image/png" and sample.startswith(b"\x89PNG\r\n\x1a\n")
                 and len(sample) >= 33 and sample[12:16] == b"IHDR"
                 and tail.endswith(b"\x00\x00\x00\x00IEND\xaeB\x60\x82"))
+    if suffix in {".tif", ".tiff"}:
+        return (mime_l == "image/tiff" and len(sample) >= 8
+                and sample[:4] in {b"II*\x00", b"MM\x00*"})
     if suffix in {".gz", ".tgz"} or "gzip" in mime_l:
         return sample.startswith(b"\x1f\x8b") and "gzip" in mime_l
     if suffix == ".svg":

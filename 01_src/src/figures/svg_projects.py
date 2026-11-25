@@ -31,124 +31,15 @@ from src.figures.projects import ProjectError
 
 _LOG = logging.getLogger(__name__)
 
-_NS = "http://www.w3.org/2000/svg"
-_SVG_TAGS = {
-    "svg", "g", "path", "rect", "circle", "ellipse", "line", "polyline",
-    "polygon", "text", "tspan", "title", "desc", "defs", "linearGradient",
-    "radialGradient", "stop", "clipPath", "marker",
-}
-_SVG_ATTRS = {
-    "viewBox", "preserveAspectRatio", "stroke-width", "stroke-linecap",
-    "stroke-linejoin", "stroke-dasharray", "stroke-dashoffset", "fill-opacity",
-    "stroke-opacity", "font-family", "font-size", "font-weight", "font-style",
-    "text-anchor", "dominant-baseline", "gradientUnits", "gradientTransform",
-    "stop-color", "stop-opacity", "clipPathUnits", "markerWidth",
-    "markerHeight", "markerUnits", "marker-start", "marker-mid", "marker-end",
-    "aria-label", "clip-path", "role", "id", "href", "x", "y", "x1", "y1", "x2", "y2",
-    "cx", "cy", "r", "rx", "ry", "width", "height", "d", "points", "fill",
-    "stroke", "opacity", "transform", "offset",
-}
-_FORBIDDEN_TAGS = frozenset({
-    "script", "foreignObject", "iframe", "object", "embed", "handler",
-    "listener", "audio", "video", "canvas",
-})
-_FORBIDDEN_ATTRS = frozenset({
-    "src", "action", "formaction", "srcdoc", "target", "download",
-    "ping", "poster", "data", "srcset",
-})
-_ID_RE = re.compile(r"[A-Za-z][\w:.-]{0,100}")
-_LOCAL_URL_RE = re.compile(r"url\(\s*#[A-Za-z][\w:.-]{0,100}\s*\)", re.I)
-_LOCAL_HREF_RE = re.compile(r"#[A-Za-z][\w:.-]{0,100}")
-_ACTIVE_VALUE_RE = re.compile(r"javascript:|data:|https?:|file:|//", re.I)
-_MAX_SOURCE_BYTES = 100_000
-_MAX_NODES = 5000
+from src.figures.plot_vectors import PLOT_PROPERTIES, plot_objects, validate_plot_edits
+from src.figures.svg_safety import _ID_RE, _PAINTABLE_TAGS, sanitize_svg
+
 _MAX_EDITS = 100
-
-# ── The shared sanitizer ──────────────────────────────────────────────────
-
-def sanitize_svg(source: str | bytes) -> str:
-    """Return canonical, bounded SVG markup or raise ``ValueError``.
-
-    The allowlist is unchanged in spirit from ``draw_svg``'s original
-    sanitizer. Documents that use scripts, ``foreignObject`` or other active
-    containers, event handlers, navigation attributes, external ``href``-like
-    attributes or non-local ``url()`` references are rejected rather than
-    silently rewritten. Unknown benign attributes are still dropped so legacy
-    chat drawings keep working.
-    """
-    if isinstance(source, bytes):
-        try:
-            source = source.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("SVG must be UTF-8 text") from exc
-    source = str(source or "").strip()
-    if not source or len(source.encode("utf-8")) > _MAX_SOURCE_BYTES:
-        raise ValueError("SVG is empty or too large")
-    if re.search(r"<!DOCTYPE|<!ENTITY", source, re.I):
-        raise ValueError("SVG contains a forbidden declaration")
-    root = ET.fromstring(source)
-    if root.tag != f"{{{_NS}}}svg":
-        raise ValueError("Root element must be an SVG document")
-    nodes = 0
-
-    def clean(node: ET.Element) -> None:
-        nonlocal nodes
-        nodes += 1
-        if nodes > _MAX_NODES:
-            raise ValueError("Unsupported SVG complexity")
-        if node.tag.startswith("{"):
-            namespace = node.tag.split("}", 1)[0][1:]
-            if namespace != _NS:
-                raise ValueError("Unsupported SVG namespace")
-        tag = node.tag.split("}", 1)[-1]
-        if tag in _FORBIDDEN_TAGS:
-            raise ValueError(f"Forbidden SVG element: {tag}")
-        if tag not in _SVG_TAGS:
-            raise ValueError(f"Unsupported SVG element: {tag}")
-        node.tag = tag
-        for key in list(node.attrib):
-            value = node.attrib[key]
-            local = key.split("}", 1)[-1]
-            if len(local) > 2 and local.casefold().startswith("on"):
-                raise ValueError(f"Forbidden active SVG attribute: {local}")
-            if local.casefold() in _FORBIDDEN_ATTRS:
-                raise ValueError(f"Forbidden SVG attribute: {local}")
-            if local.casefold() == "href":
-                if not _LOCAL_HREF_RE.fullmatch(value):
-                    raise ValueError("External SVG href reference")
-                if key not in _SVG_ATTRS:
-                    del node.attrib[key]
-                continue
-            if key not in _SVG_ATTRS:
-                del node.attrib[key]
-                continue
-            if len(value) > 4000 or re.search(r"[<>\x00-\x1f]", value):
-                del node.attrib[key]
-                continue
-            if key == "id" and not _ID_RE.fullmatch(value):
-                del node.attrib[key]
-                continue
-            if re.search(r"url\s*\(", value, re.I) and not _LOCAL_URL_RE.fullmatch(value):
-                raise ValueError("External or non-local SVG url() reference")
-            if _ACTIVE_VALUE_RE.search(value):
-                raise ValueError("External or active SVG attribute value")
-        for child in list(node):
-            clean(child)
-
-    clean(root)
-    if not root.get("viewBox") and not root.get("width"):
-        raise ValueError("SVG must provide viewBox or width")
-    root.set("xmlns", _NS)
-    return ET.tostring(root, encoding="unicode", short_empty_elements=True)
 
 
 # ── The closed edit vocabulary ────────────────────────────────────────────
 
 _TEXT_TAGS = frozenset({"text", "tspan", "title", "desc"})
-_PAINTABLE_TAGS = frozenset({
-    "path", "rect", "circle", "ellipse", "line", "polyline", "polygon",
-    "text", "tspan",
-})
 _EDITABLE_GROUPS = {
     "set_color": frozenset({"fill", "stroke", "stop-color"}),
     "set_stroke": frozenset({
@@ -302,8 +193,12 @@ def _tag_allows(tag: str, attribute: str) -> bool:
     return tag in _PAINTABLE_TAGS
 
 
-def editable_svg_targets(svg_text: str) -> list[dict[str, Any]]:
+def editable_svg_targets(svg_text: str, *, plot: bool = False) -> list[dict[str, Any]]:
     """Expose editable object values without returning any SVG markup."""
+    if plot:
+        return [{"id": ident, "tag": tag, "text": None,
+                 "attributes": {PLOT_PROPERTIES[key]: str(value) for key, value in values.items()}}
+                for ident, tag, _, values in plot_objects(svg_text)]
     root = ET.fromstring(svg_text)
     by_id = {}
     duplicates = set()
@@ -328,10 +223,15 @@ def editable_svg_targets(svg_text: str) -> list[dict[str, Any]]:
     return targets
 
 
-def apply_svg_edits(svg_text: str, edits: Any) -> str:
+def apply_svg_edits(svg_text: str, edits: Any, *, plot: bool = False) -> str:
     """Apply a validated batch to one SVG document and re-sanitize the result."""
     normalized = normalize_edits(edits)
-    safe = sanitize_svg(svg_text)
+    safe = sanitize_svg(svg_text, plot=plot)
+    if plot:
+        try:
+            validate_plot_edits(safe, normalized)
+        except ValueError as exc:
+            raise ProjectError("plot_edit_unsupported", "仅支持所选原始对象的颜色和线宽。", 422) from exc
     try:
         root = ET.fromstring(safe)
     except ET.ParseError as exc:
@@ -367,7 +267,7 @@ def apply_svg_edits(svg_text: str, edits: Any) -> str:
         node.set(attribute, edit["value"])
     serialized = ET.tostring(root, encoding="unicode", short_empty_elements=True)
     try:
-        return sanitize_svg(serialized)
+        return sanitize_svg(serialized, plot=plot)
     except (ET.ParseError, ValueError) as exc:
         raise ProjectError("svg_invalid", f"编辑后的 SVG 未通过安全校验：{exc}。", 400) from exc
 
@@ -400,11 +300,15 @@ def _label(value: Any) -> str:
 
 
 def _verify_svg(blob: bytes, *, mode: str, supersedes: str | None = None,
-                vendor_root: Any = None) -> tuple[dict, list]:
-    from src.figures.nature_runtime import (current_security_findings,
+                vendor_root: Any = None, backend: str | None = None) -> tuple[dict, list]:
+    from src.figures.nature_runtime import (current_security_findings, run_current_qa,
                                             verify_svg_bytes)
-    receipt = verify_svg_bytes(blob, mode=mode, supersedes=supersedes,
-                               vendor_root=vendor_root)
+    if backend is None:
+        receipt = verify_svg_bytes(blob, mode=mode, supersedes=supersedes,
+                                   vendor_root=vendor_root)
+    else:
+        receipt = run_current_qa(artifacts={"svg": blob}, mode=mode, supersedes=supersedes,
+                                 vendor_root=vendor_root, backend=backend)
     return receipt, current_security_findings(receipt)
 
 
@@ -477,16 +381,17 @@ def _publish_receipt(owner: int, session_id: str, filename: str,
 
 def create_svg_project(*, owner: Any, session_id: Any, svg: Any,
                        alt_text: Any = "图形", title: Any = "",
-                       vendor_root: Any = None) -> dict[str, Any]:
+                       vendor_root: Any = None, plot_provenance: dict | None = None) -> dict[str, Any]:
     """Sanitize, audit and publish one authorized SVG as a figure project."""
     owner = _valid_owner(owner)
     sid = _require_session(owner, session_id)
     try:
-        safe = sanitize_svg(svg)
+        safe = sanitize_svg(svg, plot=plot_provenance is not None)
     except (ET.ParseError, ValueError) as exc:
         raise ProjectError("svg_invalid", f"SVG 未通过安全校验：{exc}。", 400) from exc
     blob = safe.encode("utf-8")
-    receipt, security = _verify_svg(blob, mode="initial", vendor_root=vendor_root)
+    receipt, security = _verify_svg(blob, mode="initial", vendor_root=vendor_root,
+                                    backend=(plot_provenance or {}).get("backend"))
     _reject_security(security)
     digest = hashlib.sha256(blob).hexdigest()
     label = _label(alt_text)
@@ -521,9 +426,18 @@ def create_svg_project(*, owner: Any, session_id: Any, svg: Any,
             "只有稳定 id 上的文字和有限表现属性可编辑；未重算数值几何、统计或科学流程。",
         ],
     }
+    if plot_provenance is not None:
+        if not list(plot_objects(safe)):
+            raise ProjectError("plot_svg_unsupported", "当前图件不包含可编辑的原始样式对象。", 422)
+        source["nature_plot"] = plot_provenance
+        manifest["nature_plot"] = plot_provenance
+        manifest["figure_kind"] = "nature_plot_vector"
+        manifest["claims"] = ["Only supported paint attributes of native SVG objects may be edited. "
+                              "Geometry, labels, data and the original exports are unchanged."]
     project = projects.create_project(
         owner_user_id=owner, title=name, source_kind="svg", source=source,
-        session_id=sid)
+        session_id=sid, data_refs=[{**original, "kind": "nature_plot_original"}
+            for original in (plot_provenance or {}).get("original_exports", {}).values()])
     figure_id = str(project.get("figure_id") or "")
     if not figure_id:
         raise ProjectError("project_failed", "图件项目创建失败。", 500)
@@ -578,13 +492,14 @@ def apply_svg_project_edits(*, figure_id: Any, owner: Any, edits: Any,
     source = project.get("source_json") or {}
     if source.get("kind") != "svg" or not isinstance(source.get("svg"), str):
         raise ProjectError("source_unavailable", "图件缺少可编辑的安全 SVG 源。", 409)
+    plot = bool(source.get("nature_plot"))
     previous_blob = _read_current_export(project, owner)
     if hashlib.sha256(previous_blob).hexdigest() != source.get("svg_sha256"):
         raise ProjectError("artifact_changed",
                            "当前导出与保存的 SVG 源摘要不一致。", 409)
     normalized = normalize_edits(edits)
     try:
-        new_text = apply_svg_edits(source["svg"], normalized)
+        new_text = apply_svg_edits(source["svg"], normalized, plot=plot)
     except ProjectError:
         raise
     except (ET.ParseError, ValueError) as exc:
@@ -598,7 +513,7 @@ def apply_svg_project_edits(*, figure_id: Any, owner: Any, edits: Any,
     previous_receipt_id = (previous_receipt.get("receipt_id")
                            if isinstance(previous_receipt, dict) else None)
     receipt, security = _verify_svg(new_blob, mode="edit", supersedes=previous_receipt_id,
-                                    vendor_root=vendor_root)
+                                    vendor_root=vendor_root, backend=(source.get("nature_plot") or {}).get("backend"))
     _reject_security(security)
     digest = hashlib.sha256(new_blob).hexdigest()
     accepted_by_property = {(item["target"], item.get("attribute")): item
@@ -613,7 +528,7 @@ def apply_svg_project_edits(*, figure_id: Any, owner: Any, edits: Any,
     manifest = dict(previous_manifest)
     manifest.update({
         "version": 1,
-        "figure_kind": "svg_schematic",
+        "figure_kind": "nature_plot_vector" if plot else "svg_schematic",
         "svg_sha256": digest,
         "svg_bytes": len(new_blob),
         "current_qa_receipt": receipt,
@@ -661,7 +576,7 @@ def apply_svg_project_edits(*, figure_id: Any, owner: Any, edits: Any,
         "links": _links(figure_id, new_revision, published),
         "changed": [item["target"] for item in normalized],
         "accepted_edits": accepted,
-        "svg_targets": editable_svg_targets(new_text),
+        "svg_targets": editable_svg_targets(new_text, plot=plot),
         "initial_receipt_id": (initial.get("receipt_id")
                                if isinstance(initial, dict) else None),
         "current_receipt_id": receipt.get("receipt_id"),
@@ -699,7 +614,7 @@ def reaudit_svg_project(*, figure_id: Any, owner: Any, expected_revision: Any,
     supersedes = supersedes_receipt_id or (
         current.get("receipt_id") if isinstance(current, dict) else None)
     receipt, security = _verify_svg(blob, mode="reaudit", supersedes=supersedes,
-                                    vendor_root=vendor_root)
+                                    vendor_root=vendor_root, backend=(source.get("nature_plot") or {}).get("backend"))
     _reject_security(security)
     result: dict[str, Any] = {
         "figure_id": str(figure_id),

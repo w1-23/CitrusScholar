@@ -27,6 +27,9 @@ def task_release(state: dict, *, resume: bool) -> Path | None:
     if not resume:
         configured = release_path()
     if configured is None:
+        if resume and (state.get("skill_release_inventory_sha256")
+                       or (state.get("capability_runtime") or {}).get("skill_release_inventory_sha256")):
+            raise ValueError("skill_release_missing_during_recovery")
         state["native_skill_release"] = ""
         state["skill_release_inventory_sha256"] = ""
         return None

@@ -13,4 +13,6 @@ RENDERER_OUTPUT_KINDS = {
     "export_corpus_gap_report": frozenset({"gap_csv"}),
     "render_research_report": frozenset({"report_html"}),
     "figure_workspace": frozenset({"figure", "figure_package"}),
+    "run_nature_plot": frozenset({"figure", "figure_package"}),
+    "collect_external_skill": frozenset({"annotation_table"}),
 }

@@ -27,6 +27,9 @@ def prepare_context(context: Path, base: str, install_dependencies: bool) -> Non
     requirements = (ROOT / "01_src/docker/requirements.sandbox.txt").read_bytes()
     (context / "requirements.txt").write_bytes(requirements)
     digests["requirements.sandbox.txt"] = hashlib.sha256(requirements).hexdigest()
+    fusion_lock = (ROOT / "02_config/skill-fusion-worker.requirements.lock").read_bytes()
+    (context / "fusion-lock.txt").write_bytes(fusion_lock)
+    digests["skill-fusion-worker.requirements.lock"] = hashlib.sha256(fusion_lock).hexdigest()
     # Embed source hashes in the Dockerfile, independently of copied bytes.
     # A truncated COPY must fail before the destination tag is updated.
     integrity = ("import hashlib; from pathlib import Path; "
@@ -35,10 +38,14 @@ def prepare_context(context: Path, base: str, install_dependencies: bool) -> Non
                  "bad=[name for name,digest in expected.items() "
                  "if hashlib.sha256((root/name).read_bytes()).hexdigest()!=digest]; "
                  "assert not bad, 'Worker bundle content mismatch: '+str(bad)")
-    lines = [f"FROM {base}", "COPY requirements.txt /opt/citrusfig/requirements.sandbox.txt"]
+    lines = [f"FROM {base}", "COPY requirements.txt /opt/citrusfig/requirements.sandbox.txt",
+             "COPY fusion-lock.txt /opt/citrusfig/skill-fusion-worker.requirements.lock"]
     if install_dependencies:
-        lines += ["USER root", "RUN pip install --no-cache-dir -r /opt/citrusfig/requirements.sandbox.txt",
-                  "USER 65534:65534"]
+        lines += ["USER root", "RUN apt-get update && apt-get install -y --no-install-recommends libseccomp2"
+                  " && rm -rf /var/lib/apt/lists/*",
+                  "RUN pip install --no-cache-dir -r /opt/citrusfig/requirements.sandbox.txt",
+                  "RUN pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes"
+                  " -r /opt/citrusfig/skill-fusion-worker.requirements.lock", "USER 65534:65534"]
     # Fail the build before retagging when an old base lacks the pinned runtime.
     check = ("from importlib.metadata import version; from pathlib import Path; "
              "requirements=Path('/opt/citrusfig/requirements.sandbox.txt').read_text().splitlines(); "

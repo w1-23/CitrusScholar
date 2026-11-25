@@ -5,7 +5,7 @@ from citrus_figures.workbench_styles import COLORMAPS
 from src.figures import projects, store
 from src.figures.declarative_snapshot import SnapshotError, load_snapshot
 from src.figures.document import SCHEMA, _digest
-from src.figures.workbench import artifacts
+from src.figures.workbench import artifacts, nature_vectors
 from src.figures.workbench.groups import Inventory, invalid
 
 _OPTIONS = {"fontfamily": "font_families", "fontweight": "font_weights", "fontstyle": "font_styles",
@@ -35,8 +35,14 @@ def list_assets(owner, *, limit, offset, query="", kind="", chart="", access="")
                 continue
             editable = None
             if access:
-                _, inventory = _inventory(row, owner)
-                editable = not inventory.disabled and any(group.props for group in inventory.groups.values())
+                if nature_vectors.is_plot(row):
+                    try:
+                        editable = bool(nature_vectors.detail(row, owner)["groups"])
+                    except projects.ProjectError:
+                        editable = False
+                else:
+                    _, inventory = _inventory(row, owner)
+                    editable = not inventory.disabled and any(group.props for group in inventory.groups.values())
                 if editable != (access == "editable"):
                     continue
             consumed += 1
@@ -133,6 +139,10 @@ def _present(project, manifest, inventory, *, formats):
 
 def detail(figure_id, owner, revision):
     project = projects._load_revision(figure_id, owner, revision)
+    if nature_vectors.is_plot(project):
+        result = nature_vectors.detail(project, owner)
+        projects._assert_current(project, owner)
+        return result
     manifest, inventory = _inventory(project, owner)
     capabilities = artifacts.capabilities(project, owner, replayable=not inventory.disabled and bool(project.get("session_id")))
     result = _present(project, manifest, inventory, formats=capabilities)
@@ -142,6 +152,8 @@ def detail(figure_id, owner, revision):
 
 def edit(figure_id, owner, revision, commands, *, draft_revision=0, save=False):
     project = projects._load_revision(figure_id, owner, revision)
+    if nature_vectors.is_plot(project):
+        return nature_vectors.edit(project, owner, commands, draft_revision=draft_revision, save=save)
     _, inventory = _inventory(project, owner)
     submitted, expected = inventory.translate(commands)
 

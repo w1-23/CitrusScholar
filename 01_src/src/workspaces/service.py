@@ -14,9 +14,10 @@ class TaskWorkspaceService:
         self.owner, self.session = owner, session
         self.repository = repository if repository is not None else Repository()
 
-    def create(self, *, task_id, request_id, saved=False, metadata=None):
+    def create(self, *, task_id, request_id, saved=False, metadata=None, make_current=True):
         return self.repository.create(self.owner, self.session, task_id=task_id,
-                                      request_id=request_id, saved=saved, metadata=metadata)
+                                      request_id=request_id, saved=saved, metadata=metadata,
+                                      make_current=make_current)
 
     def open(self, workspace_id=None):
         return self.repository.open(self.owner, self.session, workspace_id)

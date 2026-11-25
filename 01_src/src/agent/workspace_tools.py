@@ -55,13 +55,14 @@ class EditArgs(_Args):
 def _storage():
     from src.core import jobs, tracing
     from .workspace_storage import WorkspaceStorage
-    job = jobs.get_job(tracing.get_job_id())
+    run_id = tracing.get_job_id()
+    job = jobs.get_job(run_id)
     if (not job or type(tracing.get_user_id()) is not int or tracing.get_user_id() <= 0
             or job["owner_user_id"] != tracing.get_user_id()
             or job["session_id"] != tracing.get_session_id()
             or job["status"] not in {"running", "detached"}):
         raise PermissionError("workspace_scope_unavailable")
-    return WorkspaceStorage(job["owner_user_id"], job["session_id"])
+    return WorkspaceStorage(job["owner_user_id"], job["session_id"], run_id)
 
 
 def _result(data, *, failed=False, reason="workspace_complete", status=None):
@@ -129,13 +130,13 @@ def _call(operation, **kwargs):
 
 @tool(args_schema=ListArgs, response_format="content_and_artifact")
 def workspace_list(path: str = "/", offset: int = 0, limit: int = 30):
-    """List bounded virtual mounts: /skills is exact catalog guidance; /01_src is allowlisted product text; /data and /input are this owner's session uploads. These are read-only. /workspace and /outputs hold private session versions; outputs staging is not publication. Page via next_offset."""
+    """List bounded virtual mounts: /skills is exact catalog guidance; /01_src is allowlisted product text; /data and /input are this turn's authorized text attachments. These are read-only. /workspace and /outputs hold private session versions; outputs staging is not publication. Page via next_offset."""
     return _call("list", path=path, offset=offset, limit=limit)
 
 
 @tool(args_schema=GlobArgs, response_format="content_and_artifact")
 def workspace_glob(pattern: str, path: str = "/", offset: int = 0, limit: int = 30):
-    """Find virtual text resources by Deep Agents glob pattern; bare *.txt matches basenames at any depth. /skills and /01_src return typed current hashed readonly refs, never executable script refs or upload IDs. /data aliases authorized session uploads. Results are paged."""
+    """Find virtual text resources by Deep Agents glob pattern; bare *.txt matches basenames at any depth. /skills and /01_src return typed current hashed readonly refs, never executable script refs or upload IDs. /data aliases this turn's authorized text attachments. Results are paged."""
     return _call("glob", pattern=pattern, path=path, offset=offset, limit=limit)
 
 
@@ -172,12 +173,23 @@ _TOOLS = (workspace_list, workspace_glob, workspace_search, workspace_read, work
 WORKSPACE_TOOL_NAMES = frozenset(t.name for t in _TOOLS)
 
 
+def _validate_mutation(path, **_):
+    from src.core.tool_errors import ToolArgumentError
+    from .workspace_storage import virtual_path
+
+    try:
+        virtual_path(path, writable=True)
+    except (PermissionError, ValueError) as exc:
+        raise ToolArgumentError(str(exc)) from exc
+
+
 def _load(item, mutates):
     from src.tools.registry import register_tool
     register_tool(item, category="files", is_readonly=not mutates,
                   concurrency_key="workspace_files" if mutates else None,
                   write_scope="session_artifact" if mutates else None,
-                  recovery_mode="never" if mutates else "local_read")
+                  recovery_mode="never" if mutates else "local_read",
+                  preflight=_validate_mutation if mutates else None)
     return item
 
 

@@ -5,6 +5,8 @@ requested page/reference or a bounded search, with the private-store link rules.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -25,6 +27,27 @@ SOURCE_FILES = frozenset({
     "01_src/src/figures/spec.py", "01_src/src/figures/manifest.py",
 })
 ROOTS = ("/input", "/data", "/skills", "/01_src", "/workspace", "/outputs")
+_UNBOUND = object()
+_skill_release = ContextVar("workspace_projection_skill_release", default=_UNBOUND)
+
+
+@contextmanager
+def bind_skill_release(release: Path | None):
+    """Expose the host's authenticated release snapshot to this tool call."""
+    token = _skill_release.set(release)
+    try:
+        yield
+    finally:
+        _skill_release.reset(token)
+
+
+def _projection_release():
+    release = _skill_release.get()
+    if release is _UNBOUND:
+        # Standalone projection callers have no task checkpoint to restore.
+        from .installed_skills import release_path
+        return release_path()
+    return release  # Explicit None must not pick up a newly activated release.
 
 
 def within(key, scope):
@@ -91,10 +114,8 @@ def resources(scope):
                 yield key, {"kind": "workspace_source", "path": key, "read_only": True}
     if scope != "/" and not scope.startswith("/skills"):
         return
-    from .installed_skills import release_path
-
     try:
-        release = release_path()
+        release = _projection_release()
         if release is not None:
             yield from _installed_resources(release, scope)
             return
@@ -111,10 +132,9 @@ def read(key, descriptor):
         root = ROOT
     else:
         from src.core.capability_policy import allows
-        from .installed_skills import release_path
         if not allows("skill:" + descriptor["skill_id"]):
             raise PermissionError("skill_disabled")
-        root = release_path()
+        root = _projection_release()
         if root is None:
             raise PermissionError("workspace_projection_denied")
     path = root.joinpath(*key[1:].split("/"))

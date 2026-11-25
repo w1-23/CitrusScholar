@@ -288,12 +288,11 @@ test('the shared button stops the active job while Enter admits exactly one inde
   assertNoUpdates(b);
 });
 
-test('Enter behind an active task freezes attachments, Skills, and Browse on its own queue admission', async () => {
+test('Enter behind an active task freezes attachments and Skills without a Browse flag on its own queue admission', async () => {
   const b = browser();
   const binding = await startRunningTurn(b);
   b.userInput.value = '第二条';
   b.context._selectedAccountFileRefs.push({file_id: 'stored-file', name: 'data.csv'});
-  b.get('browse-requested').checked = true;
   const skills = {items: [{id: 's1', version: '2', digest: 'digest'}]};
   let acknowledged;
   b.context.skillPicker = {capture: () => acknowledged ? {items: []} : skills,
@@ -307,8 +306,7 @@ test('Enter behind an active task freezes attachments, Skills, and Browse on its
   assert.equal(payload.query, '第二条');
   assert.deepEqual(payload.file_refs, ['stored-file']);
   assert.deepEqual(payload.selected_skills, skills.items);
-  assert.equal(payload.browse_requested, true);
-  assert.equal(b.get('browse-requested').checked, false);
+  assert.equal(Object.hasOwn(payload, 'browse_requested'), false);
   assertNoUpdates(b);
   b.respond(r => r === second, turnEntry({client_request_id: payload.client_request_id,
     job_id: 'root-2', state: 'queued', queue_position: 2}), 202);
@@ -522,6 +520,17 @@ test('only API-designated citations render as answer bubbles and never as duplic
   assert.match(answer.textContent, /文献/);
   assert.equal(bot.querySelector('.cr-turn-sources'), null);
   assert.equal(b.requests.filter(r => r.url.includes('/turn-sources?')).length, 0);
+});
+
+test('long verified citation lists are folded without losing evidence or scoped links', () => {
+  const {context} = browser();
+  const target = context.document.createElement('div');
+  const rows = Array.from({length: 7}, (_, i) => ({kind: 'web', url: 'https://example.org/source-' + i, title: 'Source ' + i}));
+  context.renderCitationBubbles(target, [...rows, rows[6]], 'request', 'session', 'job');
+  assert.equal(target.childElementCount, 6);
+  const disclosure = target.querySelector('.turn-citation-more');
+  assert.match(disclosure.querySelector('summary').textContent, /另外 2 条引证/);
+  assert.deepEqual(target.querySelectorAll('.turn-citation-bubble').map(el => el.href), rows.map(row => row.url));
 });
 
 test('restoring a stored answer projects only its persisted citations without candidate hydration', async () => {

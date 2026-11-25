@@ -331,9 +331,10 @@
       (counts.approved || 0) + ' 篇 · 已拒绝 ' + (counts.rejected || 0) +
       ' 篇';
     corpusLegacyMutation = data.legacy_mutation_enabled === true;
+    el('corpusHeading').textContent = corpusLegacyMutation ? '文献候审库' : '历史文献候审库';
     el('corpusModeHelp').textContent = corpusLegacyMutation
       ? '查看抓取原文与共享上传资料。未取得全文的条目可在这里补录。'
-      : '历史候审记录仅供查看。未取得全文的条目只显示书目信息。';
+      : '此处仅显示历史候审，不代表第六库。网页读取用于当前回答，不等于全文归档或索引发布。';
     el('corpusMissingOption').textContent = corpusLegacyMutation ? '待补全文' : '未取得全文';
     var capacity = data.shared_capacity;
     if (capacity) {

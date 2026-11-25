@@ -92,6 +92,7 @@ jobs:
             01_src/src/research/artifact_logical_identity_test.py \
             01_src/src/shared_corpus/maintenance_regression_test.py \
             01_src/src/shared_corpus/pmc_intake_test.py \
+            01_src/src/tools/deepseek_fetch_latency_test.py \
             01_src/src/corpus_integration \
             packages/citrus_corpus/tests \
             01_src/src/research/nature_composition_test.py \

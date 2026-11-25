@@ -12,14 +12,14 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/assets/app.css?v=45">
-<link rel="stylesheet" href="/assets/skill-picker.css?v=4">
+<link rel="stylesheet" href="/assets/skill-picker.css?v=6">
 <link rel="stylesheet" href="/assets/guide.css?v=4">
 <link rel="stylesheet" href="/assets/loading-sprout.css?v=5">
 <link rel="stylesheet" href="/assets/session_files.css?v=8">
-<link rel="stylesheet" href="/assets/corpus_reader.css?v=8">
+<link rel="stylesheet" href="/assets/corpus_reader.css?v=9">
 <link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
-<link rel="stylesheet" href="/assets/chat-ui.css?v=5">
-<link rel="stylesheet" href="/assets/context-view.css?v=3">
+<link rel="stylesheet" href="/assets/chat-ui.css?v=6">
+<link rel="stylesheet" href="/assets/context-view.css?v=4">
 </head>
 <body data-page="chat">
 
@@ -236,7 +236,6 @@
 
     <footer>
       <div id="selected-skills" class="selected-skills" aria-live="polite" hidden></div>
-      <p class="composer-research-status" id="research-method-status" role="status" hidden></p>
       <div id="composer-admission-recovery" class="composer-admission-recovery" aria-live="polite" hidden></div>
       <!-- 输入区：自然语言请求、附件与发送控件 -->
       <div class="composer-meta">
@@ -261,19 +260,12 @@
             <details class="input-tools" id="skill-picker-menu">
               <summary class="attach-btn composer-scenes" aria-label="本轮场景" aria-controls="skill-picker-panel" title="选择本轮场景"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-sliders"></use></svg><span>场景</span></summary>
               <div class="input-tools-panel" id="skill-picker-panel">
-                <h3>本轮场景（可选）</h3>
-                <p id="skill-picker-status" role="status">按任务选择；科研检索方法由输入区开关单独控制。</p>
-                <div id="skill-picker-list"></div>
+                <h3 id="skill-picker-heading">本轮场景（可选）</h3>
+                <p id="skill-picker-status" role="status">选择适合本轮任务的场景。</p>
+                <div id="skill-picker-list" role="group" aria-labelledby="skill-picker-heading"></div>
                 <button type="button" class="skill-refresh" id="skill-picker-refresh">刷新场景目录</button>
-                <label class="composer-browse" id="composer-browse" title="仅请求本轮联网浏览，仍按服务权限处理。">
-                  <input type="checkbox" id="browse-requested" autocomplete="off" role="switch"><span class="browse-track" aria-hidden="true"></span><span>本轮联网浏览</span>
-                </label>
               </div>
             </details>
-            <label class="composer-browse composer-research" title="为本轮开启 RAG 科研检索方法，不改变联网或本地资料权限。">
-              <input type="checkbox" id="research-method" autocomplete="off" role="switch" aria-label="科研检索" aria-describedby="research-method-help"><span class="browse-track" aria-hidden="true"></span><span>科研检索</span>
-              <span class="composer-visually-hidden" id="research-method-help">为本轮开启 RAG 科研检索方法。未开启也可按需检索，不改变联网或本地资料权限。</span>
-            </label>
             <div class="composer-controls">
               <button type="button" class="send-btn" id="send-btn" onclick="activateComposer()" aria-disabled="true" aria-label="发送消息" title="发送 (Enter)"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-send"></use></svg></button>
             </div>
@@ -498,11 +490,11 @@
   <div class="ctx-drawer-header">
     <h2 class="ctx-drawer-title">上下文窗口</h2>
     <div class="ctx-view-picker" role="group" aria-label="上下文显示方式">
-      <label title="网格"><input type="radio" id="ctxViewGrid" name="ctx-view" aria-label="网格" checked>
-        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor" stroke="none"><path fill="currentColor" stroke="none" d="M4 4h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 10h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 16h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4z"/></svg>
+      <label title="矩形树图"><input type="radio" id="ctxViewTreemap" name="ctx-view" aria-label="矩形树图" checked>
+        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor" stroke="none"><path fill="currentColor" stroke="none" d="M4 4h9v16H4zm11 0h5v7h-5zm0 9h5v7h-5z"/></svg>
       </label>
-      <label title="气泡"><input type="radio" id="ctxViewBubble" name="ctx-view" aria-label="气泡">
-        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/></svg>
+      <label title="网格"><input type="radio" id="ctxViewGrid" name="ctx-view" aria-label="网格">
+        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor" stroke="none"><path fill="currentColor" stroke="none" d="M4 4h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 10h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 16h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4z"/></svg>
       </label>
     </div>
     <button class="ctx-drawer-close" id="ctxClose" type="button" onclick="toggleCtxDrawer()" aria-label="关闭上下文窗口"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
@@ -512,11 +504,16 @@
       <div><strong id="ctxUsed" aria-describedby="ctxValueNote">—</strong><p id="ctxValueNote">占用量暂不可用</p></div>
       <span class="context-level" id="ctxStatus" hidden></span>
     </div>
+    <p class="context-meta" id="ctxMetadata" hidden></p>
+    <div class="context-treemap" id="ctxTreemap" role="group" aria-label="上下文令牌构成图" hidden></div>
     <div class="context-gauge-grid" id="ctxGrid" aria-hidden="true" hidden></div>
-    <div class="context-gauge-bubble" id="ctxBubble" aria-hidden="true" hidden>
-      <svg viewBox="0 0 120 120"><circle class="context-bubble-track" cx="60" cy="60" r="54"/><circle id="ctxBubbleFill" class="context-bubble-fill" cx="60" cy="60" r="0"/></svg>
-    </div>
-    <p class="context-mosaic-note" id="ctxGridPct" hidden></p>
+    <p class="context-meta" id="ctxChartNote" hidden></p>
+    <div class="context-legend" id="ctxLegend" role="group" aria-label="令牌分类和估算值" hidden></div>
+    <p class="context-category-detail" id="ctxCategoryDetail" hidden></p>
+    <details class="ctx-disclosure context-provider" id="ctxUsage" hidden>
+      <summary>服务商回报（本次调用）</summary>
+      <dl class="context-usage-rows" id="ctxUsageRows"></dl>
+    </details>
   </div>
 </aside>
 
@@ -540,13 +537,13 @@
   </div>
 </template>
 <script src="/assets/guide.js?v=5"></script>
-<script src="/assets/task-state.js?v=10"></script>
-<script src="/assets/context-view.js?v=2"></script>
+<script src="/assets/task-state.js?v=11"></script>
+<script src="/assets/context-view.js?v=3"></script>
 <script src="/assets/task-transport.js?v=6"></script>
-<script src="/assets/task-cards.js?v=9"></script>
+<script src="/assets/task-cards.js?v=10"></script>
 <script src="/assets/task-controls.js?v=5"></script>
-<script src="/assets/skill-picker.js?v=9"></script>
-<script src="/assets/app.js?v=73"></script>
+<script src="/assets/skill-picker.js?v=11"></script>
+<script src="/assets/app.js?v=74"></script>
 <script src="/assets/turn_rail.js?v=2"></script>
 <script src="/assets/corpus_reader.js?v=12"></script>
 <script src="/assets/xlsx.full.min.js?v=1"></script>

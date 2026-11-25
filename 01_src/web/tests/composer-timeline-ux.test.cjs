@@ -284,16 +284,16 @@ test('timeline keeps failed and retried attempts distinct, then freezes without 
   assert.match(rows[1].className, /is-complete/);
   assert.match(rows[1].textContent, /第 2 次尝试/);
   const summary = view.element.querySelector('.research-action-summary');
-  assert.match(summary.textContent, /使用了 1 个工具/);
+  assert.match(summary.textContent, /1 项操作/);
   assert.match(summary.textContent, /1 次失败/);
-  assert.match(summary.textContent, /共 2 次尝试/);
+  assert.match(summary.textContent, /共 2 条尝试记录/);
   view.action({tool_call_id: 't3', operation_id: 'op2', logical_key: 'op2', attempt: 1,
     status: 'running', display_name: '统计'});
-  assert.match(summary.textContent, /执行中 · 统计.*2 个工具.*3 次尝试.*1 次失败/);
+  assert.match(summary.textContent, /执行中 · 统计.*2 项操作.*3 条尝试记录.*1 次失败/);
   assert.equal(summary.classList.contains('is-running'), true);
   view.pause(true);
   assert.equal(summary.classList.contains('is-running'), false);
-  assert.match(summary.textContent, /2 个工具.*3 次尝试.*1 次失败/);
+  assert.match(summary.textContent, /2 项操作.*3 条尝试记录.*1 次失败/);
   view.pause(false);
   assert.equal(summary.classList.contains('is-running'), true);
   view.terminal('completed');

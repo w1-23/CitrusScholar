@@ -2,6 +2,7 @@
 from hashlib import md5
 import json
 import re
+from time import monotonic
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
@@ -19,25 +20,34 @@ PMC_CLOUD_EVIDENCE = "ncbi_pmc_cloud"
 PMC_CLOUD_METADATA_URL = re.compile(rf"{re.escape(_BASE)}/metadata/PMC[0-9]+\.[1-9][0-9]*\.json")
 
 
-def _read(path: str, max_bytes: int, *, params=None) -> bytes:
+def _remaining(deadline: float | None) -> float:
+    budget = float("inf") if deadline is None else deadline - monotonic()
+    if budget <= 0:
+        raise requests.Timeout("PMC Cloud deadline exceeded")
+    return budget
+
+
+def _read(path: str, max_bytes: int, *, params=None, deadline: float | None = None) -> bytes:
     from src.core.capability_policy import allows
     if not (allows("web_fetch") and allows("bibliographic_lookup")):
         raise PermissionError("licensed_full_text_disabled")
-    with requests.get(_BASE + path, params=params, timeout=(2, 3), stream=True,
+    budget = _remaining(deadline)
+    with requests.get(_BASE + path, params=params, timeout=(min(2, budget), min(3, budget)), stream=True,
                       allow_redirects=False) as response:
         if response.status_code != 200:
             raise ValueError("pmc_cloud_response_unavailable")
         data = bytearray()
         for chunk in response.iter_content(chunk_size=8192):
+            _remaining(deadline)
             if len(data) + len(chunk) > max_bytes:
                 raise ValueError("pmc_cloud_response_too_large")
             data.extend(chunk)
         return bytes(data)
 
 
-def _only_version(pmcid: str) -> str:
+def _only_version(pmcid: str, deadline: float | None) -> str:
     prefix = f"metadata/{pmcid}."
-    data = _read("/", 32768, params={"list-type": "2", "prefix": prefix, "max-keys": "2"})
+    data = _read("/", 32768, params={"list-type": "2", "prefix": prefix, "max-keys": "2"}, deadline=deadline)
     # S3 listings have no DTD or entity declarations.
     if b"<!" in data:
         return ""
@@ -52,7 +62,8 @@ def _only_version(pmcid: str) -> str:
     return match[1] if match else ""
 
 
-def licensed_full_text(source_url: str, *, doi: str, pmid: str, max_bytes: int) -> tuple[dict, str, str] | None:
+def licensed_full_text(source_url: str, *, doi: str, pmid: str, max_bytes: int,
+                       deadline: float | None = None) -> tuple[dict, str, str] | None:
     """Return the official body, normalized license and the exact metadata URL."""
     from citrus_refcheck.providers import normalize_doi
 
@@ -63,12 +74,12 @@ def licensed_full_text(source_url: str, *, doi: str, pmid: str, max_bytes: int) 
         if match is None:
             return None
         pmcid = match[1]
-        version = match.groupdict().get("version") or _only_version(pmcid)
+        version = match.groupdict().get("version") or _only_version(pmcid, deadline)
         if not version:
             return None
         key = f"{pmcid}.{version}"
         metadata_path = f"/metadata/{key}.json"
-        record = json.loads(_read(metadata_path, 131072).decode("utf-8"))
+        record = json.loads(_read(metadata_path, 131072, deadline=deadline).decode("utf-8"))
         if not isinstance(record, dict):
             return None
         license = license_token(record.get("license_code"))
@@ -86,7 +97,7 @@ def licensed_full_text(source_url: str, *, doi: str, pmid: str, max_bytes: int) 
                                 text_uri if isinstance(text_uri, str) else "")
         if expected is None:
             return None
-        raw = _read(text_path, max_bytes)
+        raw = _read(text_path, max_bytes, deadline=deadline)
         if md5(raw, usedforsecurity=False).hexdigest() != expected[1]:
             return None
         body = raw.decode("utf-8")

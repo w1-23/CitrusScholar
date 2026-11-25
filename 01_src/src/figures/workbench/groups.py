@@ -82,7 +82,7 @@ class Group:
 class Inventory:
     """One revision's groups and the closed translation into renderer overrides."""
 
-    def __init__(self, project, manifest, *, disabled="", frozen=None):
+    def __init__(self, project, manifest, *, disabled="", frozen=None, native=None):
         self.figure_id = project["figure_id"]
         self.source_kind = project.get("source_kind")
         self.groups = {}
@@ -90,6 +90,7 @@ class Inventory:
         self.rows = {}
         self.saved = {}
         self.declarative = DeclarativeIdentity(frozen) if self.source_kind == "spec" else None
+        self.native = native
         self._build(manifest, project.get("overrides_json") or [])
 
     def _add(self, key, kind, label, parent=None, rows=()):
@@ -141,7 +142,7 @@ class Inventory:
                             "transparent": row.get("transparent", False)}]
         root = self._add(("figure",), "figure", "整张图", rows=figure_rows)
         root.hits.clear()
-        panel_ids = verified_panels(axes, self.declarative)
+        panel_ids = self.native.panels if self.native else verified_panels(axes, self.declarative)
         panel_keys = {index: ("verified", panel_ids[index]) if index in panel_ids else ("unverified", index)
                       for index in axes}
         panels = {}
@@ -170,6 +171,8 @@ class Inventory:
             if role == "series":
                 source_key = self.declarative.series_key(index, row) if self.declarative is not None else (
                     row.get("semantic_key") if row.get("identity_scope") == "semantic" else None)
+                if not source_key and self.native:
+                    source_key = self.native.series_key(index, row)
                 key = (panel_keys.get(index), "series", source_key if source_key else ("read-only", row["gid"]))
                 label = row.get("label") or _ARTISTS.get(row.get("artist"), "未命名系列")
             elif role in _ALLOWED:
@@ -270,6 +273,8 @@ class Inventory:
         return raw, expected
 
     def confirm(self, expected, manifest, accepted):
+        if self.native and not self.native.confirms(manifest):
+            raise invalid("group_members_changed", "重绘时所选组成员发生变化。", 409)
         actual = {row.get("gid"): row for row in manifest.get("objects", []) if isinstance(row, dict)}
         if len(actual) != len(manifest.get("objects", [])):
             raise invalid("group_members_changed", "重绘返回的对象地址不唯一。", 409)

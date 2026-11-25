@@ -170,21 +170,12 @@ class TaskObservationTests(unittest.TestCase):
         self.assertIn("fixture-progress", str(live))
         self.assertNotIn("private fixture input", str(live) + str(saved))
 
-    def test_model_public_note_survives_delivery_replay_and_history(self):
+    def test_only_previously_published_notes_survive_history_and_replay(self):
         from src.core import progress_bus
-        from src.core.public_progress import emit_public_progress, public_progress_text, reset_emitted
+        from src.core.public_progress import emit_public_progress, reset_emitted
 
         job_id = self.claim.job_id
         public_note = "我已识别两块数据，接下来用第二块绘图。"
-        chunks = [{"type": "reasoning", "text": "private fixture"},
-                  {"type": "text", "text": public_note}]
-        self.assertEqual(public_progress_text(chunks, has_tool_calls=True), public_note)
-        self.assertEqual(public_progress_text(chunks, has_tool_calls=False), "")
-        for private in ('<think>private fixture</think>', '<invoke name="tool">private args</invoke>',
-                        '进度 {"args":"private fixture"}', '["private fixture"]',
-                        'Bearer fixture-token', '密码：fixture-password'):
-            self.assertEqual(public_progress_text(private, has_tool_calls=True), "")
-
         queue = task_events.DurableEventQueue(job_id)
         reset_emitted()
         self.addCleanup(reset_emitted)
@@ -199,7 +190,12 @@ class TaskObservationTests(unittest.TestCase):
 
         with patch.object(progress_bus, 'get_progress_queue', return_value=queue), \
                 patch.object(queue, '_notify', side_effect=check_notification):
-            self.assertTrue(emit_public_progress(public_note, note_id="model-note", job_id='caller-claimed-id'))
+            # New emitters cannot publish model text. A previously persisted
+            # public model event still projects consistently in old history.
+            self.assertFalse(emit_public_progress(public_note, note_id="model-note", job_id='caller-claimed-id'))
+            queue.put_nowait(progress_bus._encode_event('assistant_progress', {
+                'origin': 'model', 'visibility': 'public', 'text': public_note,
+                'note_id': 'model-note', 'job_id': 'caller-claimed-id'}))
         frame = queue.get_nowait()
         asyncio.run(self.sessions.save_messages(self.sid, [HumanMessage(content='Question'),
             AIMessage(content='Unidentified checkpoint narration', tool_calls=[{
@@ -215,7 +211,39 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual(saved['data']['job_id'], job_id)
         self.assertEqual(saved['data']['note_id'], 'model-note')
         self.assertNotIn('Unidentified checkpoint narration', str(history))
+        self.assertIn('Saved answer', str(history))
+        self.assertNotIn('Unidentified checkpoint narration', str(replay))
         self.assertNotIn('private fixture', str(replay) + str(history))
+
+    def test_verified_milestones_are_idempotent_across_reconnect_and_history(self):
+        from src.core import progress_bus
+        from src.core.public_progress import emit_public_progress, emit_retrieval_stage, reset_emitted
+
+        job_id = self.claim.job_id
+        queue = task_events.DurableEventQueue(job_id)
+        self.addCleanup(reset_emitted)
+        categories = ['agent_model_wait', 'retrieval_full_text_read', 'agent_review_evidence', 'agent_review_answer']
+        with patch.object(progress_bus, 'get_progress_queue', return_value=queue):
+            self.assertTrue(emit_public_progress('provider draft fixture', category=categories[0], step_id='attempt-1',
+                                                 note_id='attempt-1:wait', job_id=job_id))
+            emit_retrieval_stage('full_text_read')
+            emit_retrieval_stage('private_fixture_page')
+            for category in categories[2:]:
+                self.assertTrue(emit_public_progress('private tool fixture', category=category,
+                                                     note_id=category, job_id=job_id))
+            reset_emitted()  # Simulate a separate task context after reconnect.
+            emit_retrieval_stage('full_text_read')
+        frames = [json.loads(queue.get_nowait()['data']) for _ in categories]
+        self.assertTrue(queue.empty())
+        replay = self.client.get(f'/jobs/{job_id}/events').json()
+        history = self.client.get(f'/sessions/{self.sid}/messages').json()
+        replay_notes = [entry['data'] for entry in replay['events'] if entry['event'] == 'assistant_progress']
+        history_notes = [entry['data'] for entry in history['turns'][0]['trace'] if entry.get('event') == 'assistant_progress']
+        self.assertEqual(frames, replay_notes)
+        self.assertEqual(frames, history_notes)
+        self.assertEqual([frame['category'] for frame in frames], categories)
+        assert all(frame['text'] == progress_bus.PUBLIC_WORK_NOTES[frame['category']] for frame in frames)
+        self.assertNotIn('fixture', str(replay_notes) + str(history_notes))
 
     def test_rejected_progress_is_absent_from_queue_storage_replay_and_history(self):
         from src.core.progress_bus import _encode_event

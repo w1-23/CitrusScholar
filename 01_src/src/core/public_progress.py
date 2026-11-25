@@ -1,21 +1,7 @@
-"""S2: public working notes (``assistant_progress``).
+"""Emit host-verified working notes through the durable public event path.
 
-The model already streams assistant text next to its tool calls.  That text
-has two very different meanings depending on how the *round* ends:
-
-* round ends with tool calls -> sanitized public content goes to the timeline.
-* round ends without tool calls -> the text **is** the final answer and keeps
-  using the existing ``text`` path.
-
-Mixing the two (the "``on_text`` -> ``emit_text``" shortcut) pollutes the
-answer, duplicates content and can persist progress text as the reply.  This
-module therefore classifies at round level and never touches the answer path.
-
-Hard rules:
-* private ``reasoning_content`` is never a source here;
-* private protocol markup, structured payloads and credential-like text do not
-  create a progress note;
-* every failure here is swallowed: public progress must never block the agent.
+Only fixed host milestones are emitted. Sanitization of model narration is
+kept for historical rendering, never for new execution progress.
 """
 
 from __future__ import annotations
@@ -108,46 +94,24 @@ class PublicAnswerPreview:
 
 def emit_retrieval_stage(stage: str) -> None:
     """Publish retrieval milestones without query or source data."""
-    try:
-        emit_progress("tool_progress", {"retrieval_stage": stage, "visibility": "public",
-                                        "origin": "host"})
-    except Exception:
-        pass
-
-
-def public_content_text(content) -> str:
-    """Extract only public text blocks and remove structured private spill."""
-    from src.core.public_delivery import public_answer_text
-    return public_answer_text(content)
-
-
-def public_progress_text(chunks, has_tool_calls: bool) -> str:
-    """Classify one model round: working note vs final answer.
-
-    The final round produces no progress note and uses the answer path.
-    """
-    if not has_tool_calls:
-        return ""
-    if not chunks:
-        return ""
-    try:
-        return sanitize(public_content_text(chunks))
-    except Exception:  # noqa: BLE001 - progress must never break execution
-        return ""
+    category = f"retrieval_{stage}"
+    if category in PUBLIC_WORK_NOTES:
+        emit_public_progress("", category=category, note_id=category)
 
 
 def emit_public_progress(text: str, *, step_id: str = "",
                          phase: str = "working", note_id: str = "",
                          model_step: int = 0, tool_call_ids=(),
                          job_id: str = "", category: str = "") -> bool:
-    """Publish a sanitized note through the existing request/durable queue.
+    """Publish a fixed host note through the existing request/durable queue.
+
+    The legacy positional text parameter cannot supply a new public note.
 
     ``job_id`` is host identity, never a model argument. DurableEventQueue owns
     persistence; this emitter must not append the same event separately.
     """
     try:
-        label = PUBLIC_WORK_NOTES.get(category)
-        note = label or sanitize(text)
+        note = PUBLIC_WORK_NOTES.get(category)
         if not enabled() or not note:
             return False
         from src.core.tracing import get_job_id
@@ -157,8 +121,8 @@ def emit_public_progress(text: str, *, step_id: str = "",
         if _last_emitted.get() == event_key:
             return False
         emit_progress("assistant_progress", {
-            "visibility": "public", "origin": "host" if label else "model",
-            "category": category if label else "", "step_id": step_id or "analysis",
+            "visibility": "public", "origin": "host",
+            "category": category, "step_id": step_id or "analysis",
             "phase": phase,
             "text": note,
             "chars": len(note),

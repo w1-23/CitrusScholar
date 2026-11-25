@@ -1,12 +1,14 @@
 (function (root) {
   'use strict';
-  var researchId = 'research-question-answering';
-  var titles = {'candidate-search':'查找候选文献', 'research-question-answering':'科研检索', 'reference-verification':'文献核验',
-    'literature-verification':'文献核验', 'research-integrity':'科研诚信',
-    'data-audit':'数据审查', 'nature-figure':'科研绘图'};
-  var icons = {'candidate-search':'search', 'research-question-answering':'search',
-    'reference-verification':'book', 'literature-verification':'book', 'research-integrity':'shield',
-    'data-audit':'database', 'nature-figure':'chart'};
+  var sceneDetails = {
+    'candidate-search': ['查找候选文献', '查找与主题相关的文献供筛选。', 'search'],
+    'research-question-answering': ['科研检索', '检索相关资料，基于证据回答科研问题。', 'search'],
+    'reference-verification': ['文献核验', '核对参考文献，标明可确认与存疑的条目。', 'book'],
+    'literature-verification': ['文献核验', '核对参考文献，标明可确认与存疑的条目。', 'book'],
+    'research-integrity': ['科研诚信', '检查图表、数据与引用中的一致性问题。', 'shield'],
+    'data-audit': ['数据审查', '检查数据表的缺失、重复和异常。', 'database'],
+    'nature-figure': ['科研绘图', '根据数据绘制或调整科研图表。', 'chart']
+  };
   // Keep native disclosure keyboard behavior. Only one anchored panel may open.
   function bindComposerMenus(menus) {
     if (!menus.length) return;
@@ -30,15 +32,35 @@
     document.addEventListener('focusin', closeOutside);
   }
 
+  function fitScenePanel(menu) {
+    if (!menu) return;
+    var panel = menu.querySelector('#skill-picker-panel');
+    var composer = menu.closest('.input-box'), header = document.querySelector('.app-header');
+    var viewport = window.visualViewport;
+    function fit() {
+      if (!menu.open) return;
+      var zoom = panel.currentCSSZoom || Number(getComputedStyle(panel).getPropertyValue('--ui-scale')) || 1;
+      var floor = Math.max(header ? header.getBoundingClientRect().bottom : 0, viewport ? viewport.offsetTop : 0);
+      var room = (panel.getBoundingClientRect().bottom - floor) / zoom - 8;
+      panel.style.setProperty('--scene-panel-room', Math.max(0, Math.floor(room)) + 'px');
+    }
+    menu.addEventListener('toggle', function () {
+      if (!menu.open) return;
+      fit();
+      panel.scrollTop = 0;
+    });
+    window.addEventListener('resize', fit);
+    if (viewport) viewport.addEventListener('resize', fit);
+    if (typeof ResizeObserver === 'function') {
+      var observer = new ResizeObserver(fit);
+      if (composer) observer.observe(composer);
+      if (header) observer.observe(header);
+    }
+  }
+
   function create(options) {
     var selected = [], catalog = [], generation = 0, revision = 0, catalogKnown = false;
     var list = options.list, status = options.status, summary = options.summary;
-    var research = options.research, researchStatus = options.researchStatus, researchEpoch = 0;
-    function noteResearch(message) {
-      if (!researchStatus) return;
-      researchStatus.textContent = message;
-      researchStatus.hidden = !message;
-    }
     function setChoice(item, on) {
       var other = selected.filter(function (pick) { return pick.id !== item.id; });
       if (on && other.length >= 4) return false;
@@ -48,32 +70,15 @@
       drawSummary();
       return true;
     }
-    async function changeResearch() {
-      var owner = options.scope();
-      var ticket = ++researchEpoch;
-      if (!owner) { drawSummary(); noteResearch('登录后可选择科研检索方法。'); return; }
-      if (!research.checked) { noteResearch(''); setChoice({id:researchId}, false); return; }
-      var currentRevision = revision;
-      function findMethod() { return catalog.find(function (item) { return item.id === researchId; }); }
-      var method = findMethod();
-      if (!catalogKnown || !method) {
-        research.checked = false;
-        research.disabled = true;
-        noteResearch('正在读取本轮科研检索方法…');
-        await load();
-        if (ticket !== researchEpoch || owner !== options.scope()) return;
-        research.disabled = false;
-        if (currentRevision !== revision) { drawSummary(); noteResearch('如仍需要科研检索，请为下一轮再次开启。'); return; }
-        method = findMethod();
-      }
-      if (!method) { drawSummary(); noteResearch('科研检索方法暂不可用，未为本轮开启。可以重试或直接提问。'); return; }
-      if (!setChoice(method, true)) { drawSummary(); noteResearch('每轮最多选择 4 项场景或方法。'); return; }
-      noteResearch('');
-    }
     bindComposerMenus([options.attachmentMenu, options.menu].filter(Boolean));
+    fitScenePanel(options.menu);
     function same(a, b) { return a.id === b.id && a.version === b.version && a.sha256 === b.sha256; }
     function identity(item) { return {id:item.id, version:item.version, sha256:item.sha256}; }
-    function title(item) { return titles[item.id] || item.id; }
+    function details(item) {
+      return Object.prototype.hasOwnProperty.call(sceneDetails, item.id) ? sceneDetails[item.id] :
+        [item.id, item.description, 'file'];
+    }
+    function title(item) { return details(item)[0]; }
     function pruneRetired() {
       if (!catalogKnown) return false;
       var before = selected.length;
@@ -84,26 +89,32 @@
     function draw() {
       list.replaceChildren();
       catalog.forEach(function (item) {
-        if (research && item.id === researchId) return;
+        var row = details(item);
         var label = document.createElement('label'); label.className = 'skill-choice';
         var check = document.createElement('input'); check.type = 'checkbox';
         check.setAttribute('data-skill-id', item.id);
         check.checked = selected.some(function (pick) { return same(pick, item); });
         check.addEventListener('change', function () {
           if (!options.scope()) { reset(); return; }
-          if (!setChoice(item, check.checked)) { check.checked = false; status.textContent = '每轮最多选择 4 项场景或方法。'; }
+          if (!setChoice(item, check.checked)) { check.checked = false; status.textContent = '每轮最多选择 4 项场景。'; }
+          else if (status.textContent === '每轮最多选择 4 项场景。') status.textContent = '选择适合本轮任务的场景。';
         });
         var icon = document.createElement('span'); icon.className = 'skill-choice-icon';
-        icon.innerHTML = window.uiIcon(icons[item.id] || 'file');
+        icon.setAttribute('aria-hidden', 'true');
+        icon.innerHTML = window.uiIcon(row[2]);
         var text = document.createElement('span'), name = document.createElement('strong'), description = document.createElement('small');
-        name.textContent = title(item);
-        description.textContent = item.description;
+        text.className = 'skill-choice-copy';
+        name.id = 'scene-name-' + item.id;
+        description.id = 'scene-description-' + item.id;
+        check.setAttribute('aria-labelledby', name.id);
+        check.setAttribute('aria-describedby', description.id);
+        name.textContent = row[0];
+        description.textContent = row[1];
         text.appendChild(name); text.appendChild(description); label.appendChild(check); label.appendChild(icon); label.appendChild(text); list.appendChild(label);
       });
       drawSummary();
     }
     function drawSummary() {
-      if (research) research.checked = selected.some(function (pick) { return pick.id === researchId; });
       summary.textContent = selected.length ? '本轮场景：' + selected.map(title).join('、') : '';
       summary.hidden = !selected.length;
     }
@@ -128,7 +139,7 @@
         });
         catalogKnown = true;
         status.textContent = pruneRetired() ? '部分场景已更新，已移除旧选择；请重新选择。' :
-          catalog.length ? '按任务选择；科研检索方法由输入区开关单独控制。' : '当前没有可选场景；仍可直接提问。';
+          catalog.length ? '选择适合本轮任务的场景。' : '当前没有可选场景；仍可直接提问。';
         draw();
       } catch (_) {
         if (ticket !== generation || scope !== options.scope()) return;
@@ -137,15 +148,12 @@
     }
     function reset() {
       generation++; revision++; selected = []; catalog = []; catalogKnown = false;
-      researchEpoch++; if (research) research.disabled = false;
-      noteResearch('');
       list.replaceChildren(); status.textContent = ''; drawSummary();
       if (options.menu) options.menu.open = false;
       if (options.attachmentMenu) options.attachmentMenu.open = false;
     }
     if (options.menu) options.menu.addEventListener('toggle', function () { if (options.menu.open) load(); });
     if (options.retry) options.retry.addEventListener('click', load);
-    if (research) research.addEventListener('change', changeResearch);
     return {load:load, reset:reset,
       restore:function (items) {
         selected = items.map(identity); revision++;

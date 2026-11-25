@@ -17,6 +17,10 @@ SCALES = (125, 150)
 RESEARCH = {'id': 'research-question-answering', 'version': 'frozen-rag', 'sha256': 'e' * 64}
 SPRITE = '/assets/citrus-icons.svg#ui-'
 SHA = 'f' * 64
+SCENES = [{'id': skill_id, 'version': 'frozen-fixture', 'sha256': SHA,
+           'description': 'Verbose English catalog fixture: ' + 'unbroken-text-' * 50}
+          for skill_id in ('data-audit', 'literature-verification', 'nature-figure', 'research-integrity')]
+SCENES.append({**RESEARCH, 'description': 'Verbose original RQA catalog description'})
 ROWS = [['样品', '温度', '得率'], ['A02', '28', '94.2'], ['B14', '31', '95.1']]
 CSV = '样品,温度,得率\r\nA02,28,94.2\r\nB14,31,95.1\r\n'
 
@@ -71,8 +75,7 @@ def verify(page, output, origin, image_bytes):
             payload = {'turns': [{'message_id': entry['user']['message_id'],
                 'request_id': entry['turn_request_id'], 'text': entry['user']['content']} for entry in history]}
         elif p == '/api/v2/skills':
-            payload = {'skills': [{'id': 'data-audit', 'version': 'frozen-fixture', 'sha256': SHA, 'description': '核对表格'},
-                                  {**RESEARCH, 'description': '本轮 RAG 科研检索方法'}]}
+            payload = {'skills': SCENES}
         elif p.endswith('/turn-queue'):
             if route.request.method == 'POST':
                 posted = route.request.post_data_json
@@ -147,15 +150,15 @@ def verify(page, output, origin, image_bytes):
         assert page.locator('#ctxUsed').text_content() == '4.3K / 10K'
         assert page.locator('#ctxBackdrop').is_hidden()
         page.locator('#ctxViewGrid').check()
-        assert page.locator('#ctxGrid').is_visible() and not page.locator('#ctxBubble').is_visible()
+        assert page.locator('#ctxGrid').is_visible() and not page.locator('#ctxTreemap').is_visible()
         assert page.locator('#ctxGrid i').count() == 100
         assert page.locator('#ctxGrid i.is-used').count() == 43
         page.screenshot(path=output / f'porcelain-{scale}-context-grid.png', animations='disabled')
-        page.locator('#ctxViewBubble').focus()
+        page.locator('#ctxViewTreemap').focus()
         page.keyboard.press('Space')
-        assert page.locator('#ctxBubble').is_visible() and not page.locator('#ctxGrid').is_visible()
-        assert abs(float(page.locator('#ctxBubbleFill').get_attribute('r')) - 54 * .43 ** .5) < .01
-        page.screenshot(path=output / f'porcelain-{scale}-context-bubble.png', animations='disabled')
+        assert page.locator('#ctxTreemap').is_visible() and not page.locator('#ctxGrid').is_visible()
+        assert page.locator('#ctxTreemap [data-category="other"]').evaluate('el => parseFloat(el.style.width)') == 43
+        page.screenshot(path=output / f'porcelain-{scale}-context-treemap.png', animations='disabled')
         page.keyboard.press('Escape')
         assert collapsed.get_attribute('aria-expanded') == 'false'
         assert collapsed.evaluate('el => el === document.activeElement')
@@ -208,18 +211,38 @@ def verify(page, output, origin, image_bytes):
     page.screenshot(path=output / 'porcelain-attachment-menu.png', animations='disabled')
     scenes.locator('summary').click()
     assert not attachments.evaluate('node => node.open')
-    page.locator('[data-skill-id=data-audit]').check()
+    panel = scenes.locator('#skill-picker-panel')
+    rows = scenes.get_by_role('group', name='本轮场景（可选）')
+    audit_control = rows.get_by_role('checkbox', name='数据审查')
+    audit_control.wait_for()
+    assert page.evaluate('CitrusTheme.scale.effective()') == 1.5
+    assert page.locator('#attachment-list .attachment-preview-card').count() == 2
+    hit = """el => {
+        const frame = el.getBoundingClientRect();
+        const header = document.querySelector('.app-header').getBoundingClientRect();
+        const topmost = document.elementFromPoint(frame.x + frame.width / 2, frame.y + frame.height / 2);
+        return frame.top >= header.bottom && frame.bottom <= innerHeight && el.contains(topmost);
+    }"""
+    assert panel.evaluate('el => el.scrollTop') == 0
+    assert panel.get_by_role('heading').evaluate(hit)
+    assert audit_control.evaluate(hit)
+    audit_control.check()
+    assert rows.get_by_role('checkbox').count() == 5
+    assert rows.locator('strong').all_text_contents() == ['数据审查', '文献核验', '科研绘图', '科研诚信', '科研检索']
+    assert all(len(text) <= 30 and any('\u4e00' <= char <= '\u9fff' for char in text)
+               for text in rows.locator('small').all_text_contents())
     page.screenshot(path=output / 'porcelain-scene-menu.png', animations='disabled')
-    assert page.evaluate('skillPicker.capture().items') == [{'id': 'data-audit', 'version': 'frozen-fixture', 'sha256': SHA}]
-    assert scenes.locator('#browse-requested').is_visible()
+    audit = {key: SCENES[0][key] for key in ('id', 'version', 'sha256')}
+    assert page.evaluate('skillPicker.capture().items') == [audit]
+    assert page.locator('#browse-requested, #research-method').count() == 0
+    method = rows.get_by_role('checkbox', name='科研检索', exact=True)
+    method.focus()
+    page.keyboard.press('Space')
+    assert page.evaluate('skillPicker.capture().items') == [audit, RESEARCH]
+    page.keyboard.press('Space')
+    assert page.evaluate('skillPicker.capture().items') == [audit]
     page.keyboard.press('Escape')
     assert scenes.locator('summary').evaluate('node => node === document.activeElement && !node.parentNode.open')
-    method = page.locator('#research-method')
-    method.check()
-    assert page.evaluate('skillPicker.capture().items')[-1] == RESEARCH
-    assert not page.locator('#browse-requested').is_checked()
-    method.uncheck()
-    assert page.evaluate('skillPicker.capture().items') == [{'id': 'data-audit', 'version': 'frozen-fixture', 'sha256': SHA}]
     attachments.locator('summary').click()
     page.locator('#attachment-library-btn').click()
     page.locator(f'[data-file-id="{TABLE_ID}"].session-file-item [data-file-act="reference"]').click()
@@ -259,11 +282,23 @@ def verify(page, output, origin, image_bytes):
     assert page.locator('#chat-container').evaluate('el => el.scrollWidth <= el.clientWidth')
     assert abs(page.locator('.message.user .avatar').last.bounding_box()['y'] - page.locator('.message.user .content').last.bounding_box()['y']) < 3
     page.keyboard.press('Escape')
-    page.locator('.composer-research').click()
-    page.wait_for_function('document.getElementById("research-method").checked')
+    scenes.locator('summary').click()
+    panel = scenes.locator('#skill-picker-panel')
+    method = panel.get_by_role('checkbox', name='科研检索', exact=True)
+    method.wait_for()
+    for width in (320, 390):
+        page.set_viewport_size({'width': width, 'height': 800})
+        geometry = panel.bounding_box()
+        assert geometry and 0 <= geometry['x'] < geometry['x'] + geometry['width'] <= width
+        assert panel.evaluate('el => el.scrollWidth <= el.clientWidth')
+        assert scenes.locator('summary span', has_text='场景').is_visible()
+        assert panel.get_by_role('heading').evaluate(hit)
+        assert audit_control.evaluate(hit)
+        page.screenshot(path=output / f'porcelain-mobile-scenes-{width}.png', animations='disabled')
+    method.check()
     page.locator('#user-input').fill('验收真实场景信封')
     page.locator('#send-btn').click()
-    page.wait_for_function('!document.getElementById("research-method").checked')
+    page.wait_for_function('skillPicker.capture().items.length === 0')
     assert len(posts) == 1 and posts[0]['selected_skills'] == [RESEARCH], posts
     assert 'browse_requested' not in posts[0]
     assert not errors, errors

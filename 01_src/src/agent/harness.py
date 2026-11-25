@@ -113,9 +113,6 @@ class HarnessRuntime:
     restore_host: Any = None
     validate_resume: Any = None
     recover_output: bool = False
-    # Optional sync/async emitter with emit_public_progress's keyword contract.
-    # Kept last so existing positional adapters remain compatible.
-    on_public_progress: Any = None
     # Trusted host callbacks only. Resolution reads actual queue facts; ack is
     # called only after a synchronous checkpoint commit, before another model.
     resolve_execution_waits: Any = None
@@ -129,22 +126,6 @@ class HarnessRuntime:
     restore_tool_observation: Any = None
     authorized_question_parent: str = ""
     model_call: Any = None
-
-    async def _publish_working_note(self, response, identity, model_step):
-        try:
-            from src.core.public_progress import emit_public_progress, public_progress_text
-            note = public_progress_text(response.content, has_tool_calls=bool(response.tool_calls))
-            if not note:
-                return
-            emitted = (self.on_public_progress or emit_public_progress)(
-                note, phase="working", step_id=f"model_{model_step}",
-                note_id=f"{identity.run_id}:model:{model_step}", model_step=model_step,
-                tool_call_ids=[call["id"] for call in response.tool_calls], job_id=identity.run_id)
-            if inspect.isawaitable(emitted):
-                await emitted
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("public_progress_failed stage=tool_round kind=%s", type(exc).__name__)
 
     async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None,
                   agent_options=None, pinned_skills=()):
@@ -303,9 +284,7 @@ class HarnessRuntime:
                         return {"messages": [control(delivery_feedback(check))], "delivery_followup_used": True,
                                 "host_state": host_snapshot(), "jump_to": "model"}
                     return {"stop_status": "complete", "stop_reason": "answered", "host_state": host_snapshot()}
-                # Only a complete, valid native-tool round is public progress.
-                # Final candidates/review envelopes and rejected output stay private.
-                await adapter._publish_working_note(response, identity, state.get("model_steps", 0))
+                # Tool-round draft text stays inside the execution graph.
                 return None
 
             async def awrap_tool_call(self, request, handler):

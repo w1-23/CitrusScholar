@@ -128,7 +128,7 @@
     return {entry: entry, key: key, status: status};
   }
   function createProcessView(options) {
-    var projection = root.CitrusTaskState.createProcess(), rows = new Map(), groups = new Map(), settled = false, paused = false;
+    var projection = root.CitrusTaskState.createProcess(), rows = new Map(), settled = false, paused = false;
     function isRunning(item) { return item.kind === 'action' && ['running', 'resuming'].indexOf(item.data.status) >= 0; }
     function activeTool() {
       if (settled || paused) return '';
@@ -137,9 +137,13 @@
       var data = active.data;
       return options.clean(data.display_name || options.toolName(data.tool_name || data.name)) || '工具执行中';
     }
-    // Public model paragraphs and real operations are the complete transcript.
-    // Stage labels and inferred plans are not conversation content.
+    // Keep milestones readable while preserving every actual attempt under one
+    // disclosure. A milestone between retries must not split the operation.
     var host = node('div', 'research-process-timeline'); options.container.appendChild(host);
+    var disclosure = node('details', 'research-action-group');
+    var heading = node('summary', 'research-action-summary');
+    var actionList = node('div', 'research-action-list');
+    disclosure.appendChild(heading); disclosure.appendChild(actionList);
     function owns(row) { return (!options.owns || options.owns()) && host.contains(row); }
     function addTextSection(container, title, text) {
       container.appendChild(node('div', 'research-tool-section-title', title));
@@ -214,16 +218,13 @@
       if (before) parent.insertBefore(child, before); else parent.appendChild(child);
     }
     function draw() {
-      var hostIndex = 0, activeRows = new Set(), activeGroups = new Set(), group = null, groupIndex = 0, groupOperations = new Set(), groupFailed = 0, groupAttempts = 0;
-      function finishGroup() {
-        if (!group) return;
-        var executing = group.active && !paused && !settled;
-        group.summary.classList.toggle('is-running', !!executing);
-        var text = '使用了 ' + groupOperations.size + ' 个工具 · 共 ' + groupAttempts + ' 次尝试';
-        if (groupFailed) text += ' · ' + groupFailed + ' 次失败';
-        group.summary.textContent = executing ? '执行中 · ' + group.active + ' · ' + text : text;
-      }
+      var hostIndex = 0, actionIndex = 0, activeRows = new Set(), operations = new Set(), failed = 0, attempts = 0;
+      var milestones = new Set();
       projection.entries.forEach(function (item) {
+        if (item.kind === 'note' && item.category) {
+          if (milestones.has(item.category)) return;
+          milestones.add(item.category);
+        }
         var row = rows.get(item.id);
         if (!row) { row = node('div', item.kind === 'note' ? 'research-process-note' : 'term-line'); rows.set(item.id, row); }
         activeRows.add(item.id);
@@ -233,25 +234,13 @@
           row.dataset.noteId = item.note_id; row.dataset.phase = item.phase; row.dataset.stepId = item.step_id;
           row.dataset.modelStep = item.model_step == null ? '' : String(item.model_step);
           row.dataset.toolCallIds = JSON.stringify(item.tool_call_ids);
-          finishGroup(); group = null;
           place(host, row, hostIndex++); return;
-        }
-        if (!group) {
-          group = groups.get(item.id);
-          if (!group) {
-            var disclosure = node('details', 'research-action-group'); disclosure.open = false;
-            var heading = node('summary', 'research-action-summary');
-            var list = node('div', 'research-action-list'); disclosure.appendChild(heading); disclosure.appendChild(list);
-            group = {element: disclosure, summary: heading, body: list}; groups.set(item.id, group);
-          }
-          activeGroups.add(item.id); groupIndex = 0; groupOperations.clear(); groupFailed = 0; groupAttempts = 0; group.active = '';
-          place(host, group.element, hostIndex++);
         }
         var data = item.data, status = data.status || 'running';
         var operationId = data.logical_key || data.operation_id || data.tool_call_id || item.id;
-        groupOperations.add(operationId);
-        groupAttempts++;
-        if (status === 'failed' || status === 'error') groupFailed++;
+        operations.add(operationId);
+        attempts++;
+        if (status === 'failed' || status === 'error') failed++;
         var resolution = item.resolution && ['failed', 'partial', 'error', 'not_run'].indexOf(status) >= 0 ? item.resolution : null;
         row.dataset.resolution = resolution ? resolution.resolution : '';
         row.dataset.resolvedBy = resolution ? resolution.resolved_by_tool_call_id : '';
@@ -261,7 +250,6 @@
         var running = ['running', 'resuming'].indexOf(status) >= 0;
         if (resolution) row.className = 'term-line is-resolved';
         if ((settled || paused) && running) row.className = 'term-line is-unconfirmed';
-        if (running) group.active = options.clean(data.display_name || options.toolName(data.tool_name || data.name)) || '科研任务';
         if (!settled && !paused && running) row.setAttribute('aria-current', 'step');
         row.dataset.toolCallId = data.tool_call_id || ''; row.dataset.stepId = data.step_id || '';
         row.dataset.attempt = item.attempt; row.dataset.operationId = operationId;
@@ -272,7 +260,7 @@
         var summary = /^\s*[\[{]/.test(rawSummary || '') ? '执行结果已记录' : options.clean(rawSummary);
         var hint = options.clean(data.action_hint);
         if (summary) text += ' · ' + summary;
-        if (hint) text += ' · ' + hint;
+        if (hint && hint !== title) text += ' · ' + hint;
         if (Number(item.attempt) > 1) text += ' · 第 ' + item.attempt + ' 次尝试';
         if (data.elapsed_ms > 0) text += ' · ' + options.elapsed(data.elapsed_ms);
         var msg = row.querySelector('.term-msg');
@@ -280,12 +268,18 @@
         msg.textContent = text;
         // Keep actual operations under their disclosure; records load only
         // after the user explicitly expands a tool's parameters/results.
-        place(group.body, row, groupIndex++);
+        place(actionList, row, actionIndex++);
         details(row, item);
-        if (row._toolDetails) place(group.body, row._toolDetails.element, groupIndex++);
+        if (row._toolDetails) place(actionList, row._toolDetails.element, actionIndex++);
       });
-      finishGroup();
-      groups.forEach(function (value, id) { if (!activeGroups.has(id)) { value.element.remove(); groups.delete(id); } });
+      if (attempts) {
+        var tool = activeTool();
+        var text = operations.size + ' 项操作 · 共 ' + attempts + ' 条尝试记录';
+        if (failed) text += ' · ' + failed + ' 次失败';
+        heading.classList.toggle('is-running', !!tool);
+        heading.textContent = tool ? '执行中 · ' + tool + ' · ' + text : text;
+        place(host, disclosure, hostIndex);
+      }
       rows.forEach(function (row, id) {
         if (!activeRows.has(id)) {
           if (row._toolDetails) row._toolDetails.element.remove();
@@ -297,7 +291,9 @@
       pause: function (value) { if (paused !== value) { paused = value; draw(); } },
       note: function (text, id, metadata) {
         var clean = (metadata && metadata.public_note && options.publicNote ? options.publicNote : options.clean)(text);
-        if (clean) { projection.note(clean, id, metadata); draw(); }
+        var item = clean ? projection.note(clean, id, metadata) : null;
+        if (item) draw();
+        return item;
       },
       plan: function (data) { if (projection.plan(data)) draw(); },
       terminal: function (value) { settled = value !== false; host.classList.toggle('is-terminal', settled); draw(); },

@@ -66,7 +66,7 @@ class AttachmentRetrievalScopeTests(unittest.TestCase):
                     self.assertIn("run_research_figure_script", available)
                     self.assertEqual("deepseek_search" in available, permits_search)
                     self.assertEqual("local_hybrid_search" in available, permits_search)
-                    self.assertNotIn("browse_web", available)
+                    self.assertEqual("browse_web" in available, permits_search)
 
 
 class DeliveryDispatchTests(unittest.IsolatedAsyncioTestCase):
@@ -340,14 +340,29 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         for tool_calls in ([], [CALL]):
             model = AsyncMock(return_value=AIMessage(content="provisional", tool_calls=tool_calls,
                 response_metadata={"citrus_stream_terminal_unconfirmed": True}))
-            execute, check, progress = AsyncMock(), AsyncMock(), Mock()
+            execute, check = AsyncMock(), AsyncMock()
             harness = HarnessRuntime(ScriptedModel(script=model), execute, AsyncMock(), check, RunLimits(2, time.monotonic() + 5),
-                [SCHEMA], on_public_progress=progress)
-            result = await harness.run(IDENTITY, [HumanMessage(content="request")], saver=InMemorySaver())
+                [SCHEMA])
+            with patch('src.core.public_progress.emit_public_progress') as progress:
+                result = await harness.run(IDENTITY, [HumanMessage(content="request")], saver=InMemorySaver())
             self.assertEqual((result.status, result.reason), ("incomplete", "model_stream_unconfirmed"))
             execute.assert_not_called()
             check.assert_not_called()
             progress.assert_not_called()
+
+    async def test_confirmed_tool_round_does_not_publish_model_draft(self):
+        model = AsyncMock(side_effect=[AIMessage(content="Unreviewed draft fixture", tool_calls=[CALL],
+            response_metadata={"finish_reason": "tool_calls"}), AIMessage(content="final")])
+        execute = AsyncMock(return_value=(receipt(CALL, "fixture"), {}))
+        check = AsyncMock(return_value=FinalCheck())
+        harness = HarnessRuntime(ScriptedModel(script=model), execute, AsyncMock(), check,
+                                 RunLimits(2, time.monotonic() + 5), [SCHEMA])
+        with patch('src.core.public_progress.emit_public_progress') as progress:
+            result = await harness.run(IDENTITY, [HumanMessage(content="request")], saver=InMemorySaver())
+        self.assertEqual(result.status, "complete")
+        execute.assert_awaited_once()
+        check.assert_awaited_once()
+        progress.assert_not_called()
 
     async def test_confirmed_text_finishes_once_and_filtered_tools_never_dispatch(self):
         for reason, tool_calls, status in (("stop", [], "complete"),

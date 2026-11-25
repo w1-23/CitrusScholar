@@ -315,8 +315,12 @@ class HostTools:
             return self._retry_rejected(call)
         attempt = 1
         if retry_target:
-            _, parent = self._find_retry_parent(retry_of)
+            parent_message, parent = self._find_retry_parent(retry_of)
             attempt += parent['attempt']
+            # The parent was verified against its durable operation before
+            # reusing its trace group. Independent same-name calls never merge.
+            parent_trace = (parent_message.artifact or {}).get('_citrus_execution') or {}
+            logical_key = parent_trace.get('logical_key') or logical_key
         ledger = current_execution_ledger()
         if ledger:
             ledger.start(call["id"], call["name"], call["args"], source="provider",

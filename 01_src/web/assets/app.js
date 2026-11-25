@@ -113,7 +113,6 @@ var skillPicker = window.CitrusSkillPicker ? window.CitrusSkillPicker.create({
   menu: document.getElementById('skill-picker-menu'), list: document.getElementById('skill-picker-list'),
   status: document.getElementById('skill-picker-status'), summary: document.getElementById('selected-skills'),
   retry: document.getElementById('skill-picker-refresh'), fetch: accountFetch,
-  research: document.getElementById('research-method'), researchStatus: document.getElementById('research-method-status'),
   scope: function () { return currentAccount && sessionId && !accountDocumentRetired ? authEpoch + ':' + sessionId : ''; }
 }) : null;
 function advanceAuthEpoch() {
@@ -1182,8 +1181,6 @@ var composerDrafts = new Map();
 var composerSelections = new Map();
 var composerAdmissions = new Map();
 var queueSyncUnavailable = false;
-var browseCheckbox = document.getElementById('browse-requested');
-if (browseCheckbox) browseCheckbox.addEventListener('change', refreshTaskComposer);
 
 function composerDraftKey(jobId) {
   return currentAccount && sessionId && !accountDocumentRetired
@@ -1248,7 +1245,6 @@ function clearComposerDrafts() {
   var recovery = document.getElementById('composer-admission-recovery');
   if (recovery) { recovery.replaceChildren(); recovery.hidden = true; }
   queueSyncUnavailable = false;
-  if (browseCheckbox) browseCheckbox.checked = false;
   try {
     for (var index = sessionStorage.length - 1; index >= 0; index--) {
       var key = sessionStorage.key(index);
@@ -1270,7 +1266,6 @@ function restoreComposerSession(preserve) {
   var saved = composerSelections.get(key);
   _composerNotice = '';
   queueSyncUnavailable = false;
-  if (browseCheckbox) browseCheckbox.checked = false;
   if (preserve) saveComposerInput();
   else {
     userInput.value = composerDraft(key).text;
@@ -2121,7 +2116,7 @@ function isCitationLink(href, label, bubbles) {
 function renderCitationBubbles(container, bubbles, requestId, sid, producerJobId) {
   container.replaceChildren();
   container.classList.add('turn-citation-bubbles');
-  var seen = new Set();
+  var seen = new Set(), links = [];
   (Array.isArray(bubbles) ? bubbles : []).forEach(function (source) {
     var title = String(source.title || '来源');
     if (source.kind === 'web' && safeProductUrl(source.url, false) && /^https?:/i.test(source.url)) {
@@ -2130,7 +2125,7 @@ function renderCitationBubbles(container, bubbles, requestId, sid, producerJobId
       seen.add(webKey);
       var link = document.createElement('a'); link.className = 'turn-citation-bubble';
       link.href = source.url; link.target = '_blank'; link.rel = 'noopener noreferrer';
-      link.textContent = '联网：' + title; container.appendChild(link);
+      link.textContent = '联网：' + title; links.push(link);
     } else if (source.kind === 'local' || source.kind === 'shared') {
       var id = String(source.reader_id || source.record_key || source.ref_id || '');
       if (!id || seen.has(id) || !requestId || !sid) return;
@@ -2142,10 +2137,22 @@ function renderCitationBubbles(container, bubbles, requestId, sid, producerJobId
           window.CitrusCorpusReader.openCitation(source, {sessionId: sid, requestId: requestId, producerJobId: producerJobId || ""});
         }
       });
-      container.appendChild(button);
+      links.push(button);
     }
   });
-  container.hidden = !container.childElementCount;
+  // Preserve every verified citation and its readback scope without a wall of links.
+  var initial = 5;
+  links.slice(0, initial).forEach(function (link) { container.appendChild(link); });
+  if (links.length > initial) {
+    var more = document.createElement('details'); more.className = 'turn-citation-more';
+    var summary = document.createElement('summary');
+    summary.textContent = '另外 ' + (links.length - initial) + ' 条引证';
+    more.appendChild(summary);
+    var rest = document.createElement('div'); rest.className = 'turn-citation-rest';
+    links.slice(initial).forEach(function (link) { rest.appendChild(link); });
+    more.appendChild(rest); container.appendChild(more);
+  }
+  container.hidden = !links.length;
 }
 
 function stripCitationMarkdown(text, bubbles) {
@@ -3353,7 +3360,9 @@ function publicTaskNote(value) {
 
 function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
-  var settled = false, browsePhase = '';
+  var settled = false, browsePhase = '', activeMilestone = null;
+  var liveMilestones = ['agent_prepare', 'agent_model_wait', 'agent_model_connected',
+    'agent_review_evidence', 'agent_review_answer'];
   var browseStages = {waiting: '等待浏览器', navigating: '正在访问网页', interacting: '正在读取或操作网页',
     downloading: '正在下载资料', verifying: '正在核验附件', organizing: '正在组织回答'};
   var panel = document.createElement('div'); panel.className = 'research-process';
@@ -3374,8 +3383,20 @@ function createResearchProcessPanel(goal) {
   function tick() {
     if (!ownsDetails()) { stopClock(); return; }
     if (!document.hidden && presentation && presentation.start > 0) {
-      var text = '· ' + timeText(Math.max(0, Math.floor(Date.now() / 1000 - presentation.start)));
+      var text = '· 已运行 ' + timeText(Math.max(0, Math.floor(Date.now() / 1000 - presentation.start)));
       if (elapsed.textContent !== text) elapsed.textContent = text;
+    }
+  }
+  function activeLabel() {
+    var tool = view.activeTool();
+    return browseStages[browsePhase] || (tool ? '正在执行 · ' + tool : '') ||
+      (activeMilestone && activeMilestone.text) || '正在处理';
+  }
+  function refreshActiveLabel() {
+    if (!settled && presentation && ['waiting', 'tool'].includes(presentation.kind)) {
+      var text = activeLabel();
+      if (label.textContent !== text) label.textContent = text;
+      lastLabel = text;
     }
   }
   function syncTask(state, entry, ui) {
@@ -3387,21 +3408,21 @@ function createResearchProcessPanel(goal) {
     var same = presentation && presentation.kind === next.kind && presentation.start === next.start && presentation.finish === next.finish;
     presentation = next;
     line.dataset.state = next.kind;
-    var labels = {waiting: '正在处理', tool: '正在处理', awaiting_input: '等待你的选择',
+    var labels = {awaiting_input: '等待你的选择',
       settling: '正在保存', stopping: '已请求停止；等待服务端确认',
       disconnected: '连接中断，任务可能仍在后台运行', completed: '已完成',
       partial: '部分完成', failed: '未完成', cancelled: '已停止'};
-    var text = labels[next.kind] || '';
+    var active = next.kind === 'waiting' || next.kind === 'tool';
+    var text = active ? activeLabel() : labels[next.kind] || '';
     if ((text || label.textContent === lastLabel || wasActive) && label.textContent !== text) label.textContent = text;
     lastLabel = text;
     if (same) return;
-    var active = next.kind === 'waiting' || next.kind === 'tool';
     if (active && next.start > 0) {
       tick(); if (timer === null) timer = setInterval(tick, 1000);
     } else {
       stopClock();
       elapsed.textContent = active ? '· 等待开始时间' : next.start > 0 && next.finish >= next.start
-        ? '· 用时 ' + timeText(Math.floor(next.finish - next.start)) : '';
+        ? '· 运行用时 ' + timeText(Math.floor(next.finish - next.start)) : '';
     }
   }
   function ownsDetails() { return epoch === authEpoch && sid === sessionId && chatContainer.contains(panel); }
@@ -3420,7 +3441,12 @@ function createResearchProcessPanel(goal) {
     elapsed: function (ms) { return (Math.max(0, Number(ms) || 0) / 1000).toFixed(1) + ' 秒'; }});
   function note(text, id, metadata) {
     if (!metadata || metadata.visibility !== 'public' || (metadata.origin !== 'model' && !(metadata.origin === 'host' && metadata.category)) || metadata.internal === true || metadata.private === true) return;
-    view.note(text, id, Object.assign({}, metadata, {public_note: true}));
+    var item = view.note(text, id, Object.assign({}, metadata, {public_note: true}));
+    if (item && !settled && metadata.origin === 'host' && liveMilestones.includes(metadata.category) &&
+        (!metadata.job_id || !knownJobId || metadata.job_id === knownJobId)) {
+      activeMilestone = {text: text, category: metadata.category, step: metadata.step_id};
+      refreshActiveLabel();
+    }
   }
   function answerVisible() { /* Public paragraphs remain visible beside the answer. */ }
   function receive(type, data) {
@@ -3428,21 +3454,29 @@ function createResearchProcessPanel(goal) {
     if (data.internal === true || data.private === true || ['private', 'internal'].indexOf(data.visibility) >= 0) return;
     var savedResolutions = (data.turn_envelope || data.terminal_snapshot || data).tool_resolutions;
     if (Array.isArray(savedResolutions)) view.resolution({resolutions: savedResolutions});
-    if (type === 'job') knownJobId = String(data.job_id || knownJobId);
+    if (type === 'job') {
+      var nextJobId = String(data.job_id || knownJobId);
+      if (knownJobId && nextJobId !== knownJobId) { activeMilestone = null; browsePhase = ''; }
+      knownJobId = nextJobId;
+    }
     else if (type === 'task_plan' || type === 'status' && data.stage === 'task_plan') {
       if (!knownJobId || String(data.plan_id) === knownJobId) view.plan(data);
     }
     else if (type === 'agent_recovery' && data.status === 'admitted') {
-      settled = false; browsePhase = '';
+      settled = false; browsePhase = ''; activeMilestone = null;
       view.terminal(false); label.textContent = '正在恢复任务'; panel.classList.remove('has-failure');
     }
     else if (type === 'browse_phase' && !settled && ownsDetails() &&
         Object.prototype.hasOwnProperty.call(browseStages, data.phase)) {
-      browsePhase = data.phase; label.textContent = browseStages[browsePhase];
+      browsePhase = data.phase; refreshActiveLabel();
     }
     else if (type === 'tool_resolution') view.resolution(data);
     else if ((type === 'answer_start' || type === 'thinking') && browsePhase === 'organizing' && !settled) {
-      browsePhase = ''; label.textContent = '';
+      browsePhase = ''; refreshActiveLabel();
+    }
+    else if (type === 'model_attempt' && data.purpose === 'main_loop' && data.status !== 'running' &&
+        activeMilestone && (activeMilestone.step === data.attempt_id || activeMilestone.category === 'agent_review_evidence')) {
+      activeMilestone = null; refreshActiveLabel();
     }
     else if (type === 'request_user_input' || type === 'question') label.textContent = '等待你的选择';
     else if (['assistant_progress', 'commentary', 'working_note'].indexOf(type) >= 0) {
@@ -3469,17 +3503,18 @@ function createResearchProcessPanel(goal) {
     else if (['tool_call_start', 'tool_executing', 'tool_result', 'operation'].indexOf(type) >= 0 &&
         (data.tool_call_id || data.operation_id || data.logical_key || Array.isArray(data.aliases) && data.aliases.length) &&
         data.internal !== true && ['private', 'internal'].indexOf(data.visibility) < 0) {
-      if (type === 'tool_result' && data.tool_name === 'browse_web' && browsePhase && !settled) {
-        browsePhase = ''; label.textContent = '';
-      }
-      view.action(Object.assign({}, data.outcome || {}, data, {status: data.status || (type === 'tool_result' ? (data.is_error ? 'failed' : 'complete') : 'running')}));
+      var actionStatus = data.status || (type === 'tool_result' ? (data.is_error ? 'failed' : 'complete') : 'running');
+      if (actionStatus === 'running' || actionStatus === 'resuming') activeMilestone = null;
+      if (type === 'tool_result' && data.tool_name === 'browse_web') browsePhase = '';
+      view.action(Object.assign({}, data.outcome || {}, data, {status: actionStatus}));
+      refreshActiveLabel();
     }
     // status/plan/thinking/section/context events are never promoted to prose.
   }
   function terminal(status) {
     var names = {completed: '已完成', partial: '部分完成', cancelled: '已停止', failed: '未完成'};
     if (!Object.prototype.hasOwnProperty.call(names, status)) return false;
-    settled = true; browsePhase = '';
+    settled = true; browsePhase = ''; activeMilestone = null;
     stopClock(); line.dataset.state = status;
     label.textContent = names[status]; view.terminal();
     panel.classList.toggle('has-failure', status === 'failed');
@@ -3994,8 +4029,6 @@ async function sendMsg(paperVerification) {
   mascotSay('planning');
   var _firstTokenElapsedMs = null;
   var visualizeForRequest = !paperVerification && visualizationEnabled;
-  var browseForRequest = !paperVerification && !!(browseCheckbox && browseCheckbox.checked);
-  if (!paperVerification && browseCheckbox) browseCheckbox.checked = false;
   var draftKey = composerDraftKey();
   // The PDF action sends one original File in its own turn, without consuming
   // unrelated composer inputs or replacing the regular selection snapshot.
@@ -4947,7 +4980,6 @@ async function sendMsg(paperVerification) {
           selected_skills: skillsForRequest, attachments: attachments,
           file_refs: fileRefsForRequest.map(function (file) { return file.file_id; })
         };
-        if (browseForRequest) payload.browse_requested = true;
         requestSubmitted = true;
         admission.state = 'posting'; setComposerAdmission(draftKey, clientRequestId, admission, false);
         var outcome = await submitTurnBeforeDeadline(turnQueueURL(requestSessionId), payload, streamAbortController);
@@ -6220,7 +6252,7 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
 function createElapsedBadge(milliseconds) {
   var badge = document.createElement('div');
   badge.style.cssText = 'margin-top:8px;font-size:11px;color:var(--text-muted);font-family:var(--font-mono)';
-  badge.textContent = '生成 ' + (Math.max(0, Number(milliseconds) || 0) / 1000).toFixed(1) + 's';
+  badge.textContent = '开始执行到首段答复 ' + (Math.max(0, Number(milliseconds) || 0) / 1000).toFixed(1) + ' 秒';
   return badge;
 }
 

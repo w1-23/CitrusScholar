@@ -176,6 +176,13 @@ def observe_provider_request(request):
     if changed and scope.get("publish_context"):
         scope["publish_context"]()
     scope["provider_request_admitted"] = True
+    # The main-loop driver may observe this verified send boundary. Observation
+    # cannot authorize, alter or prevent transport.
+    if notify := scope.pop("on_provider_request_admitted", None):
+        try:
+            notify()
+        except Exception:
+            pass
 
 
 async def observe_async_provider_request(request):

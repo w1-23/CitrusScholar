@@ -188,11 +188,13 @@ def run(browser, origin, output):
         browser.call('Page.reload', ignoreCache=True)
         check('Refresh preserves durable clock', "document.querySelector('[data-state=waiting]') && Number((document.querySelector('.research-task-elapsed')?.innerText||'').replace(/\\D/g,'')) >= " + ''.join(filter(str.isdigit, elapsed)))
         browser.click('#ctxCircleBtn')
-        check('Unknown capacity shows only the known count', f"({text('#ctxUsed')}) === '9.2K' && ({text('#ctxValueNote')}).includes('容量未知') && document.querySelector('#ctxViewGrid').disabled")
+        check('Unknown model window uses the explicitly labelled application input limit',
+              f"({text('#ctxUsed')}) === '9.2K / 86K' && ({text('#ctxValueNote')}).includes('应用单次输入上限') "
+              "&& !document.querySelector('#ctxViewGrid').disabled")
         capture('context-missing')
         browser.click('#ctxClose')
         phase('tool')
-        check('Running tool replaces dot phase', "document.querySelector('[data-state=tool]') && document.querySelector('.is-running')")
+        check('Running tool replaces dot phase', "document.querySelector('[data-state=tool]') && document.querySelector('.is-running') && document.querySelector('.research-task-status').textContent.includes('正在执行 ·')")
         capture('tool')
         offline(True)
         check('Disconnect stops the running display', "document.querySelector('[data-state=disconnected]') && !document.querySelector('.is-running')")
@@ -202,18 +204,19 @@ def run(browser, origin, output):
         phase('zero')
         browser.click('#ctxCircleBtn')
         check('Provider reporting does not overwrite context occupancy',
-              f"({text('#ctxUsed')}) === '9.2K' && !document.querySelector('#ctxCacheNote')")
+              f"({text('#ctxUsed')}) === '9.2K / 86K' && !({text('#ctxUsageRows')}).includes('缓存覆盖率')")
         capture('context-zero')
         phase('usage')
-        check('Known capacity is displayed with the estimate', f"({text('#ctxUsed')}) === '10.4K / 131K' && ({text('#ctxRingPct')}) === '8%'")
+        check('Known capacity is displayed with the estimate', f"({text('#ctxUsed')}) === '10.4K / 131K' && ({text('#ctxTriggerPct')}) === '8%'")
         capture('context-reported')
-        evaluate("pickTheme('navy'); setReduceMotion(true)")
-        check('Reduced motion in dark theme', "document.documentElement.dataset.theme === 'navy' && getComputedStyle(document.querySelector('.research-task-orbit')).animationName === 'none'")
-        capture('dark-reduced-motion')
+        evaluate("setReduceMotion(true)")
+        check('Reduced motion in Porcelain theme', "document.documentElement.dataset.theme === 'porcelain' && getComputedStyle(document.querySelector('.research-task-orbit')).animationName === 'none'")
+        capture('porcelain-reduced-motion')
         browser.click('#ctxClose')
         phase('whitespace')
         check('Thirty completed tools preserve metrics and whitespace keeps waiting',
-              f"({text('.research-process-body')}).includes('共 30 次尝试') && ({text('#ctxUsed')}) === '10.4K / 131K' && document.querySelector('[data-state=waiting]')")
+              f"({text('.research-process-body')}).includes('共 30 条尝试记录') && ({text('#ctxUsed')}) === '10.4K / 131K' && document.querySelector('[data-state=waiting]')")
+        check('Thirty attempts remain in one collapsed disclosure', "document.querySelectorAll('.research-action-group').length === 1 && !document.querySelector('.research-action-group').open && document.querySelectorAll('.research-action-group .term-line').length === 30")
         phase('answer')
         check('First visible answer stops dots', f"([...document.querySelectorAll('.turn-answer')].some(node => node.textContent.includes('表格核对结果'))) && !document.querySelector('[data-state=waiting]')")
         capture('answer')
@@ -229,7 +232,7 @@ def run(browser, origin, output):
               "&& document.querySelector('#send-btn').getAttribute('aria-label') === '停止当前任务' "
               "&& document.querySelector('#send-btn use').getAttribute('href') === '/assets/citrus-icons.svg#ui-stop'  "
               "&& !document.querySelector('#stop-btn, #composer-supplement, #composer-new-message') "
-              "&& !document.querySelector('#input-tools-menu').hidden && !document.querySelector('#browse-requested').checked")
+              "&& !document.querySelector('#input-tools-menu').hidden && !document.querySelector('#browse-requested, #research-method')")
         fill('保留在原会话的独立草稿')
         switch_session('另一个会话')
         check('Different session receives an independent new-message draft',
@@ -263,13 +266,12 @@ def run(browser, origin, output):
               "&& document.querySelector('.sent-attachment-gallery img') && document.querySelector('#selected-skills').hidden "
               "&& document.querySelectorAll('.message.user .turn-user-queue-state').length === 1 "
               "&& document.querySelector('#send-btn').getAttribute('aria-label') === '停止当前任务' && experienceRequests().updates.length === 0")
-        browser.click('#composer-browse')
         fill('第二条独立消息')
         browser.click('#send-btn')
         check('Clicking Stop cancels just the executing job and does not submit the draft or cancel its follower',
               "experienceRequests().cancels.length === 1 && experienceRequests().cancels[0] === experienceActiveJob "
               "&& experienceRequests().queueDeletes.length === 0 && experienceRequests().posts.length === 1 "
-              "&& document.querySelector('#user-input').value === '第二条独立消息' && document.querySelector('#browse-requested').checked "
+              "&& document.querySelector('#user-input').value === '第二条独立消息' "
               "&& document.querySelector('#send-btn').getAttribute('aria-label') === '正在停止当前任务'")
         phase('done')
         check('Terminal answer returns the shared control to Send with the draft preserved',
@@ -280,8 +282,8 @@ def run(browser, origin, output):
         browser.click('#send-btn')
         check('Separate FIFO admissions keep their request identity',
               "experienceRequests().posts.length === 2 && experienceRequests().posts[0].client_request_id !== experienceRequests().posts[1].client_request_id && experienceRequests().posts[1].query === '第二条独立消息'")
-        check('Browse opt-in is sent only for the explicitly selected request',
-              "experienceRequests().posts[1].browse_requested === true && document.querySelector('#browse-requested').checked === false")
+        check('Independent requests do not need a Browse flag',
+              "experienceRequests().posts.every(post => !('browse_requested' in post))")
         fill('第三条独立消息')
         browser.click('#send-btn')
         check('Subsequent new request omits the Browse flag',

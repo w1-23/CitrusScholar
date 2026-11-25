@@ -59,6 +59,7 @@
       if (!identity && last && last.kind === 'note' && last.text === text) return last;
       var item = {kind: 'note', id: ++nextId, text: text,
         note_id: metadata.note_id || '', phase: metadata.phase || '', step_id: metadata.step_id || '',
+        category: metadata.origin === 'host' ? metadata.category : '',
         model_step: metadata.model_step, tool_call_ids: list(metadata.tool_call_ids).map(String)};
       entries.push(item); return item;
     }

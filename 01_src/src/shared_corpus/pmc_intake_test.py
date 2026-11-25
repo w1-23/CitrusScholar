@@ -74,6 +74,33 @@ def test_versioned_source_and_response_cap(monkeypatch):
     assert len(calls) == 2
 
 
+def test_foreground_deadline_prevents_next_cloud_http_leg(monkeypatch):
+    at = [100.0]
+    calls = []
+
+    class Listing:
+        status_code = 200
+
+        def __enter__(self): return self
+
+        def __exit__(self, *_): pass
+
+        def iter_content(self, chunk_size):
+            yield (b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                   b'<Prefix>metadata/PMC100.</Prefix><IsTruncated>false</IsTruncated>'
+                   b'<Contents><Key>metadata/PMC100.1.json</Key></Contents></ListBucketResult>')
+            at[0] = 101.0
+
+    def get(url, *, timeout, **_kwargs):
+        calls.append((url, timeout))
+        return Listing()
+
+    monkeypatch.setattr(pmc, 'monotonic', lambda: at[0])
+    monkeypatch.setattr(requests, 'get', get)
+    assert pmc.licensed_full_text(URL, doi=DOI, pmid='99', max_bytes=10000, deadline=101.0) is None
+    assert calls == [(pmc._BASE+'/', (1.0, 1.0))]
+
+
 def test_actual_retention_dedup_and_publication_rights(monkeypatch, runtime, tmp_path):
     monkeypatch.setattr(corpus_review, '_schema_ready', False)
     corpus = shared.SharedCorpusRuntime(tmp_path/'shared', quiet_sec=0)

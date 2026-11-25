@@ -341,6 +341,10 @@ body.corpus-reader-open { overflow: hidden; }
 
 /* The answer's attributed sources are separate from the body prose. */
 .turn-citation-bubbles:not([hidden]) { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.turn-citation-more { flex-basis: 100%; min-width: 0; }
+.turn-citation-more > summary { width: fit-content; padding: 4px 0; color: var(--text-muted); cursor: pointer; }
+.turn-citation-more[open] > summary { margin-bottom: 4px; }
+.turn-citation-rest { display: flex; flex-wrap: wrap; gap: 6px; }
 .turn-citation-bubble {
   display: inline-flex; align-items: center; max-width: 100%; min-height: 28px;
   border: 1px solid var(--border-hairline); border-radius: 999px;

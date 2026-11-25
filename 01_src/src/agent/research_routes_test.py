@@ -43,6 +43,9 @@ def test_policy_has_no_candidate_final_alias_and_keeps_host_projection():
     assert "宿主发布前会移除这些标记" in prompt
     assert "本地：题名" in prompt and "联网：" in prompt
     assert "尝试一轮" not in prompt
+    assert "小范围精确查询，目录记录足以核对时无需再抓网页" in prompt
+    assert "只有实质证据缺口需要正文时才 Fetch" in prompt
+    assert "证据足以支持回答后即综合作答" in prompt
     examples = prompt.split("<source_routing_examples>", 1)[1].split("</source_routing_examples>", 1)[0]
     assert examples.count("正确：") == examples.count("反例：") == 3
     from src.graph.retrieval_router import decide_retrieval, required_route_groups

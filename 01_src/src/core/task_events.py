@@ -110,6 +110,13 @@ def _append(conn, job_id, event, data):
         if not data.get("text"):
             return None
         data["job_id"] = job_id
+        # The same milestone can be reached by separate parallel/recovered
+        # contexts. Durable identity, not a process-local debounce, wins.
+        if data.get("origin") == "host" and data.get("note_id") and conn.execute(
+                "SELECT 1 FROM task_events WHERE job_id=? AND event='assistant_progress' "
+                "AND json_extract(data, '$.note_id')=? LIMIT 1",
+                (job_id, data["note_id"])).fetchone():
+            return None
     terminal = current_terminal_event(conn, job_id)
     if terminal is not None and event not in {"operation", "agent_recovery", "context_maintenance"}:
         # One terminal frame per explicitly admitted event generation. Earlier

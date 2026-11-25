@@ -5751,7 +5751,7 @@ def build_history_turns(items: list[dict]) -> list[dict]:
                 # separately so a work note can still find the calls it
                 # introduces (insertion point above them).
                 "tool_message_id": mid or entry.get("tool_message_id") or 0,
-                **({"result_id": item["result_id"]} if item.get("result_id") else {}),
+                **{field: item[field] for field in ("result_id", "logical_key", "attempt") if item.get(field)},
             })
         elif role == "assistant":
             # Keep answer candidates until turn boundaries are known. Only
@@ -5828,9 +5828,8 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
     """
     out: list[dict] = []
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-    from src.core.progress_bus import public_tool_reason, public_tool_status, tool_display_name
+    from src.core.progress_bus import public_progress_payload, public_tool_reason, public_tool_status, tool_display_name
     from src.core.public_delivery import public_answer_text, project_citation_bubbles
-    from src.core.public_progress import public_progress_text
     from src.core.turn_notices import stopped_notice
 
     human_index = 0
@@ -5871,7 +5870,6 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
                         "turn_request_id": request_id,
                         "attachments": files_by_request.get(request_id, [])})
         elif isinstance(m, AIMessage):
-            content = public_answer_text(m.content).strip()
             tool_calls = getattr(m, "tool_calls", None) or []
             if tool_calls:
                 out.append({"role": "tool_calls", "message_id": message_id,
@@ -5881,25 +5879,18 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
                     "name": tool_display_name(tc.get("name")),
                     "summary": tool_display_name(tc.get("name")),
                 } for tc in tool_calls]})
-                content = public_progress_text(m.content, has_tool_calls=True)
-            elif content.startswith(stopped_notice() + "\n\n停止前已执行的步骤："):
+                # Public working notes come only from the durable public event
+                # stream. A tool-round draft is not published on history reload.
+                continue
+            content = public_answer_text(m.content).strip()
+            if content.startswith(stopped_notice() + "\n\n停止前已执行的步骤："):
                 # Legacy cancellation history embedded the private tool summary
                 # in the stop notice; the actual steps already have trace rows.
                 content = stopped_notice()
             if content:
-                # A stored assistant message that also carries tool calls is the
-                # model's public work note for this turn, not the answer: the
-                # live stream shows it inside the execution trace (S2
-                # assistant_progress), so history must do the same instead of
-                # giving every note its own bubble.
                 item = {"role": "assistant", "content": content, "message_id": message_id,
-                        "request_id": turn_request_id,
-                        "turn_request_id": turn_request_id,
-                        "progress": bool(tool_calls)}
-                if tool_calls:
-                    # The fixed label marks the presence of a model work note;
-                    # neither the original assistant text nor reasoning is exposed.
-                    item.update(visibility="public", origin="model")
+                        "request_id": turn_request_id, "turn_request_id": turn_request_id,
+                        "progress": False}
                 metadata = getattr(m, "response_metadata", None) or {}
                 try:
                     generation_ms = int(metadata.get("citrus_generation_ms") or 0)
@@ -5907,7 +5898,7 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
                     generation_ms = 0
                 if generation_ms > 0:
                     item["gen_time_ms"] = generation_ms
-                if not tool_calls and metadata.get("citrus_citation_bubbles"):
+                if metadata.get("citrus_citation_bubbles"):
                     citations = project_citation_bubbles(metadata["citrus_citation_bubbles"])
                     if citations:
                         item["citation_bubbles"] = citations
@@ -5926,9 +5917,12 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
             result_id = ""
             completed_at_ms = 0
             elapsed_ms = 0
+            correlation = {}
             if isinstance(execution_trace, dict):
                 from src.core.progress_bus import public_result_receipt_id
                 result_id = public_result_receipt_id(execution_trace.get("result_id"))
+                public_trace = public_progress_payload("operation", execution_trace)
+                correlation = {key: public_trace[key] for key in ("logical_key", "attempt") if public_trace.get(key)}
                 saved_status = public_tool_status(execution_trace.get("status"), default="")
                 if saved_status and saved_status not in {"running", "resuming"}:
                     status = saved_status
@@ -5953,6 +5947,7 @@ def _history_items_from_messages(msgs: list, row_ids: list, request_ids: list,
                 "name": tool_display_name(tool_name),
                 "tool_call_id": getattr(m, "tool_call_id", "") or "",
                 **({"result_id": result_id} if result_id else {}),
+                **correlation,
                 "content": status,
                 "status": status,
                 "reason_code": reason_code,

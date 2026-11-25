@@ -421,6 +421,129 @@ def test_legacy_known_address_migrates_while_conflicting_or_absent_address_stays
     assert sibling["color"] != "#123456"
 
 
+def native_multipanel(library, monkeypatch):
+    """Two unregistered axes with repeated categories and mixed native marks."""
+    from src.config import settings
+    from src.figures import sandbox
+    from src.figures.script_outputs import output_slots
+
+    renderer = """
+fig, axes = plt.subplots(1, 2, figsize=(7.4, 3.1))
+fig.subplots_adjust(wspace=.34, left=.12, right=.97, bottom=.22, top=.84)
+for i, ax in enumerate(axes):
+    key = 'A' if i == 0 else 'B'
+    x = data['categories']['x'].to_numpy()
+    y = data['summary']['y'].to_numpy() + i * .6
+    ax.errorbar(x, y, yerr=[.2, .3, .1, .25], fmt='s-', capsize=3,
+                color='#28638a', label='Trend ' + key)
+    ax.scatter(x.repeat(3), (y - .7).repeat(3) + [-.12, 0, .12] * 4,
+               s=20, color='#b84a35', label='Points ' + key)
+    ax.hlines(y - 1.25, x - .2, x + .2, color='#387442', label='Range ' + key)
+    ax.set_xticks(x, ['G1', 'G2', 'G3', 'G4'])
+    ax.set(title='Panel ' + key, xlabel='Group', ylabel='Response')
+    ax.grid(axis='y', alpha=.2)
+    if i:
+        ax.legend(loc='lower right', fontsize=8)
+"""
+    script = ("import pandas as pd\n"
+              "emit.table('categories', pd.DataFrame({'x': [0, 1, 2, 3]}))\n"
+              "emit.table('summary', pd.DataFrame({'y': [3, 5, 4, 4.7]}))\n")
+    names = ("categories", "summary")
+    contract = {"version": 2, "tables": [{"name": name} for name in names], "figures": [
+        {"name": "main", "title": "Native two-panel figure", "formats": ["svg"], "parents": list(names),
+         "render_script": renderer}]}
+    runner = sandbox.LocalBackend()
+    monkeypatch.setattr(settings, "FIGURES_SANDBOX_BACKEND", "local")
+    monkeypatch.setattr(settings, "FIGURES_SANDBOX_ALLOW_LOCAL", True)
+    monkeypatch.setattr(sandbox, "select_backend", lambda **kwargs: runner)
+    initial = runner.run(sandbox.SandboxJob(script=script, output_contract=contract, outputs=output_slots(contract)))
+    assert initial.ok, initial.describe()
+    manifest = json.loads(initial.outputs["figure:main:manifest"])
+    snapshots, refs = [], []
+    for index, name in enumerate(names):
+        table = json.dumps(json.loads(initial.outputs[f"table:{name}"]), ensure_ascii=False,
+                           sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        entry = library.publish(OWNER, "isolated-session", name + ".json", table, "application/json")
+        refs.append(entry)
+        snapshots.append({"variable": name, "sha256": entry["sha256"], "file_id": entry["file_id"],
+                          "size_bytes": len(table), "sandbox_name": f"input_{index}.json"})
+    receipt = manifest["frozen_render_receipt"]
+    assert receipt["data_sha256"] == {row["variable"]: row["sha256"] for row in snapshots}
+    source = {"kind": "script", "version": 3, "script": script, "output_contract": contract, "output_key": "main",
+              "frozen_render": {"version": 1, "receipt": receipt, "input_snapshots": snapshots}}
+    return source, manifest, initial.outputs["figure:main:svg"], refs
+
+
+def test_frozen_script_unregistered_multipanel_owner_replay_and_cas(library, monkeypatch):
+    from collections import Counter
+
+    source, manifest, original, refs = native_multipanel(library, monkeypatch)
+    shape = Counter((row["role"], row["locator"].get("axes_index")) for row in manifest["objects"])
+    for index in (0, 1):
+        assert (shape["axes", index], shape["series", index], shape["point", index],
+                shape["errorbar", index]) == (1, 3, 12, 1)
+    assert all(row["identity_scope"] == "render" for row in manifest["objects"])
+    fid = library.project(source, manifest, original, kind="script", refs=refs)
+    before = store.get_project(fid, OWNER)
+    opened = service.detail(fid, OWNER, 1)
+    target = group(opened, "Trend A", "series")
+    sibling = group(opened, "Trend B", "series")
+    assert not opened["read_only_reason"] and target["pick_ids"] and "color" in target["properties"], opened["groups"]
+    assert all(not group(opened, f"子图 {n}")["reason"] for n in (1, 2))
+    assert service.download(fid, OWNER, 1, "svg").body == original
+    assert store.get_project(fid, OWNER) == before
+    commands = [command(target, "color", "#7a3c96")]
+    with pytest.raises(projects.ProjectError) as error:
+        service.edit(fid, OTHER, 1, commands, save=True)
+    assert error.value.code == "not_found"
+    draft = service.edit(fid, OWNER, 1, commands, draft_revision=4)
+    draft_target = group(draft, "Trend A", "series")
+    assert draft["draft_revision"] == 4 and draft_target["id"] == target["id"]
+    assert draft_target["values"]["color"] == "#7a3c96" and draft["svg"].count('stroke="#7a3c96"') >= 1
+    assert group(draft, "Trend B", "series")["values"] == sibling["values"]
+    assert store.get_project(fid, OWNER) == before and service.download(fid, OWNER, 1, "svg").body == original
+    saved = service.edit(fid, OWNER, 1, commands, save=True)
+    committed = store.get_project(fid, OWNER)
+    assert saved["render_version"] == 2 and group(saved, "Trend A", "series")["id"] == target["id"]
+    assert committed["source_json"] == before["source_json"] and committed["data_refs_json"] == before["data_refs_json"]
+    assert committed["manifest_json"]["style_replay_proof"]["coordinates_sha256"] == (
+        source["frozen_render"]["receipt"]["style_replay"]["coordinates_sha256"])
+    assert library.get(before["exports_json"]["svg"]["file_id"], OWNER)["path"].read_bytes() == original
+    assert store.get_revision_export(fid, OWNER, 1, "svg") is None
+    for action in (lambda: service.edit(fid, OWNER, 1, commands, save=True),
+                   lambda: service.download(fid, OWNER, 1, "svg")):
+        with pytest.raises(projects.ProjectError) as error:
+            action()
+        assert error.value.code == "revision_conflict"
+
+
+def test_frozen_script_rejects_unverified_geometry_and_ambiguous_targets(library, monkeypatch):
+    from copy import deepcopy
+
+    source, manifest, original, refs = native_multipanel(library, monkeypatch)
+    for variant in ("saved_bounds", "ambiguous", "receipt", "foreign_locator"):
+        candidate = deepcopy(manifest)
+        axes = [row for row in candidate["objects"] if row["role"] == "axes"]
+        if variant == "saved_bounds":
+            axes[0]["bbox"]["x0"] += 1
+        elif variant == "ambiguous":
+            axes[0].update(identity_reason="ambiguous_key", semantic_key="not-unique")
+        elif variant == "receipt":
+            candidate["frozen_render_receipt"]["style_replay"]["targets_sha256"] = "0" * 64
+        else:
+            next(row for row in candidate["objects"] if row.get("label") == "Trend A")["locator"]["series_index"] = 99
+        fid = library.project(source, candidate, original, kind="script", refs=refs)
+        before = store.get_project(fid, OWNER)
+        opened = service.detail(fid, OWNER, 1)
+        target = group(opened, "Trend A", "series")
+        assert not target["properties"] and target["reason"]
+        with pytest.raises(projects.ProjectError) as error:
+            service.edit(fid, OWNER, 1, [command(target, "color", "#7a3c96")], save=True)
+        assert error.value.code == "group_property_unavailable"
+        assert store.get_project(fid, OWNER) == before
+        assert service.download(fid, OWNER, 1, "svg").body == original
+
+
 def serve_fixture(path, port):
     """Run only the test router and assets on loopback for real Chromium QA."""
     import uvicorn
@@ -429,6 +552,8 @@ def serve_fixture(path, port):
         first = library.spec(leaf())
         library.spec(leaf("bar"), title="Separate bar groups")
         library.spec(five_series(), title="Five independent groups")
+        source, manifest, original, refs = native_multipanel(library, patch)
+        library.project(source, manifest, original, title="Native two-panel figure", kind="script", refs=refs)
         library.spec(leaf(), OTHER, "Foreign")
         static = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 30"><rect width="40" height="30"/></svg>'
         library.project({}, {}, static, title="Static only", kind="svg")

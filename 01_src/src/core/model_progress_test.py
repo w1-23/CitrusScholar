@@ -11,30 +11,52 @@ from src.core import public_progress
 from src.core.request_context import _observation
 
 
-@pytest.mark.parametrize(("purpose", "delay", "public"), [
-    ("main_loop", 11, True), ("main_loop", 1, False), ("history_maintenance", 11, False),
+@pytest.mark.parametrize(("purpose", "during", "expected"), [
+    ("main_loop", "before_first_packet", ["agent_model_wait", "agent_model_connected"]),
+    ("main_loop", "after_first_packet", ["agent_model_connected"]),
+    ("main_loop", "short", []),
+    ("main_loop", "no_admission", []),
+    ("history_maintenance", "after_first_packet", []),
 ])
-def test_provider_first_packet_only_emits_a_fixed_public_status(purpose, delay, public):
+def test_only_admitted_slow_provider_attempts_emit_fixed_statuses(purpose, during, expected):
     scope = {"purpose": purpose, "attempt_id": "test-attempt"}
     saved = _observation.set(scope)
     try:
-        with patch.object(model, "time") as clock, patch.object(public_progress, "emit_public_progress") as emit:
-            clock.monotonic.side_effect = [10, 10 + delay]
+        with patch.object(model.asyncio, "get_running_loop") as running_loop, \
+                patch.object(model, "time") as clock, patch.object(public_progress, "emit_public_progress") as emit:
+            clock.monotonic.side_effect = [10, 11]
             evidence = model._StreamEvidence(on_delta=None)
+            evidence.watch_public_wait(scope)
+            scheduler = running_loop.return_value.call_later
+            admitted = scope.pop("on_provider_request_admitted", None)
+            if admitted and during != "no_admission":
+                scheduler.assert_not_called()  # No request went to transport yet.
+                admitted()
+                delay, notify, attempt_id = scheduler.call_args.args
+                assert delay == model._PUBLIC_WAIT_SECONDS
+                assert attempt_id == "test-attempt"
+                if during == "before_first_packet":
+                    notify(attempt_id)
+            else:
+                scheduler.assert_not_called()
             evidence.on_llm_new_token("", chunk=ChatGenerationChunk(message=AIMessageChunk(
                 content="", additional_kwargs={"reasoning_content": "private fixture"})))
+            if admitted and during == "after_first_packet":
+                notify(attempt_id)
             evidence.on_llm_new_token("draft fixture", chunk=ChatGenerationChunk(message=AIMessageChunk(
                 content="draft fixture", response_metadata={"finish_reason": "stop"})))
+            evidence.stop_public_wait(scope)
+            if scheduler.called:
+                scheduler.return_value.cancel.assert_called_once_with()
+            assert "on_provider_request_admitted" not in scope
             response = evidence.check(AIMessage(content="draft fixture", additional_kwargs={
                 "reasoning_content": "private fixture"}), allow_tool_stop=False, output_limit=None)
-        assert scope["provider_first_packet_ms"] == delay * 1000
+        assert scope["provider_first_packet_ms"] == 1000
         assert response.content == "draft fixture"
         assert "reasoning_content" not in response.additional_kwargs
-        if public:
-            emit.assert_called_once_with("", category="agent_model_connected", phase="working",
-                                         note_id="test-attempt:first-packet")
-        else:
-            emit.assert_not_called()
+        assert [(call.args, call.kwargs) for call in emit.call_args_list] == [
+            (("",), {"category": category, "step_id": "test-attempt", "note_id": f"test-attempt:{category}"})
+            for category in expected]
     finally:
         _observation.reset(saved)
 

@@ -193,7 +193,7 @@ def test_reference_batch_returns_to_model_for_next_goal(tmp_path):
     asyncio.run(exercise())
 
 
-def test_generic_public_network_fallback_respects_readiness_scope_and_browser_selection(monkeypatch):
+def test_public_browse_uses_backend_readiness_and_preserves_source_boundaries(monkeypatch):
     from types import SimpleNamespace
 
     from src.agent.host_policy import allowed_presets, system_prompt
@@ -212,20 +212,39 @@ def test_generic_public_network_fallback_respects_readiness_scope_and_browser_se
              "capability_snapshot": CapabilityPolicy().snapshot()}
     ready = allowed_presets(state, has_tables=False, has_pool=False)
     assert {"deepseek_fetch", "deepseek_fetch_paper", "search_literature", "local_hybrid_search"} <= ready
-    assert not {"deepseek_search", "browse_web"} & ready
+    assert "deepseek_search" not in ready
+    assert "browse_web" in ready
     prompt = system_prompt(ready)
     assert "优先用本轮已授权的公开网络 Search" in prompt
     assert "不必两路都查或比较搜索提供方" in prompt
     assert "已知公开 URL 可 Fetch" in prompt and "不得把私有附件原文" in prompt
+    assert "Browse 已对本轮开放时，可按需" in prompt
     catalog = build_preset_catalog()
     assert catalog.resolve("deepseek_fetch", ready).name == "deepseek_fetch"
     assert catalog.resolve("search_literature", ready).name == "search_literature"
     assert catalog.resolve("research_workspace", ready).name == "research_workspace"
-    assert "browse_web" in allowed_presets(dict(state, browse_requested=True), has_tables=False, has_pool=False)
+    assert catalog.resolve("browse_web", ready).name == "browse_web"
+    assert allowed_presets(dict(state, browse_requested=True), has_tables=False, has_pool=False) == ready
+    provider.RESOLVED_DEEPSEEK_WEB_API_KEY = ""
+    assert "browse_web" in allowed_presets(state, has_tables=False, has_pool=False)
     provider.RESOLVED_ZHIPU_API_KEY = "ready"
     assert "deepseek_search" in allowed_presets(state, has_tables=False, has_pool=False)
-    private = dict(state, query="分析上传数据，请勿将附件外发", attachment_refs=[{"file_id": "fixture"}])
-    assert not {"deepseek_search", "deepseek_fetch", "search_literature", "browse_web"} & allowed_presets(
-        private, has_tables=True, has_pool=False)
+    legacy = dict(state, browse_requested=True)
+    for query in ("只查本地资料", "别联网，帮我解释校准问题", "不要检索，解释校准问题"):
+        assert "browse_web" not in allowed_presets(dict(legacy, query=query), has_tables=False, has_pool=False)
+    for query in ("分析上传数据，请勿将附件外发", "根据附件画箱线图", "仅根据附件整理发现"):
+        private = dict(legacy, query=query, attachment_refs=[{"file_id": "fixture"}])
+        assert not {"deepseek_search", "deepseek_fetch", "search_literature", "browse_web"} & allowed_presets(
+            private, has_tables=True, has_pool=False)
     web_only = dict(state, query="Search only the web for calibration")
     assert "local_hybrid_search" not in allowed_presets(web_only, has_tables=False, has_pool=False)
+    explicit_external = dict(state, query="根据附件画箱线图，并请联网搜索公开论文",
+                             attachment_refs=[{"file_id": "fixture"}])
+    assert "browse_web" in allowed_presets(explicit_external, has_tables=True, has_pool=False)
+    for policy in (CapabilityPolicy(browser=False), CapabilityPolicy(external_data_network=False),
+                   CapabilityPolicy(revoked=("browser",))):
+        blocked = dict(legacy, capability_snapshot=policy.snapshot())
+        assert "browse_web" not in allowed_presets(blocked, has_tables=False, has_pool=False)
+    assert "browse_web" not in allowed_presets(dict(legacy, session_id=""), has_tables=False, has_pool=False)
+    monkeypatch.setattr("src.browse.service.enabled", lambda: False)
+    assert "browse_web" not in allowed_presets(legacy, has_tables=False, has_pool=False)

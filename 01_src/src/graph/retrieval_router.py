@@ -245,14 +245,22 @@ _EXTERNAL_EVIDENCE = re.compile(
     r'|\b(?:use|find|cite|based on|with)\b.{0,25}\b(?:papers?|studies|external sources|literature)\b', re.I)
 
 
-def attachment_processing_only(query: str, *, has_source: bool, browse_requested: bool = False) -> bool:
-    if not has_source or browse_requested:
+_ATTACHMENT_ONLY = re.compile(
+    r'(?:只|仅)(?:能|可)?(?:用|使用|依据|根据|基于|参考|处理|分析)(?:本轮|当前|给定|已上传的?)?附件'
+    r'|\b(?:only|exclusively)\s+(?:use|consider|process|analy[sz]e|based on)\s+(?:the\s+)?(?:attached\s+files?|attachments?)\b'
+    r'|\buse\s+(?:the\s+)?(?:attached\s+files?|attachments?)\s+(?:only|exclusively)\b', re.I)
+
+
+def attachment_processing_only(query: str, *, has_source: bool) -> bool:
+    if not has_source:
         return False
     from src.graph.agent_operations import (_explicit_data_audit, _explicit_reference_check,
                                             _explicit_visualization_request)
     from src.graph.intent_text import intent_with_negation, mask_literal_payload
 
     query = mask_literal_payload(query)
+    if intent_with_negation(query, _ATTACHMENT_ONLY):
+        return True
     if not (_explicit_visualization_request(query) or _explicit_data_audit(query)):
         return False
     constraints = parse_request_constraints(query, source_scope(query))

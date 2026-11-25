@@ -293,6 +293,25 @@ def run(browser, origin, output):
     page.screenshot(path=str(output / "workbench-150-value.png"))
     page.locator('[data-ui-scale-pick="125"]').click()
 
+    choose(page, "Native two-panel figure")
+    expect(page.get_by_role("heading", name="Native two-panel figure")).to_be_visible(timeout=15000)
+    expect(page.get_by_role("button", name="画布选取")).to_have_attribute("aria-pressed", "true")
+    detail = next(url for method, url in reversed(requests) if method == "GET" and "/projects/" in url and "/preview/" not in url)
+    page.evaluate("url => {window.fixtureDetail = url}", detail)
+    baseline = page.request.get(detail.replace("?revision=", "/preview/svg?revision=")).body()
+    for label, control in [("Points B", "系列颜色"), ("Trend A", "系列颜色")]:
+        page.mouse.click(**pick_geometry(page, label))
+        selected(page, label)
+        expect(page.get_by_label(control, exact=True)).to_be_visible()
+    page.get_by_label("系列颜色", exact=True).fill("#7a3c96")
+    native_draft = apply(page)
+    assert 'stroke="#7a3c96"' in native_draft["svg"]
+    assert page.request.get(detail.replace("?revision=", "/preview/svg?revision=")).body() == baseline
+    page.get_by_role("button", name="保存图件", exact=True).click()
+    expect(page.locator("#revision")).to_have_text("版本 2", timeout=45000)
+    selected(page, "Trend A")
+    expect(page.get_by_label("系列颜色", exact=True)).to_have_value("#7a3c96")
+
     page.set_viewport_size({"width": 390, "height": 760})
     choose(page, "Separate bar groups")
     expect(page.get_by_role("heading", name="Separate bar groups")).to_be_visible(timeout=15000)

@@ -35,7 +35,7 @@ from src.core.progress_bus import (
     emit_tool_call_start, emit_tool_executing, emit_tool_result,
 )
 from src.core.public_progress import (
-    emit_public_progress, public_progress_text, reset_emitted,
+    emit_public_progress, reset_emitted,
 )
 from src.graph.state import AgentState
 from src.graph.tool_availability import available_tool_names, runtime_env

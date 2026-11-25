@@ -229,8 +229,7 @@ def allowed_presets(state: dict, *, has_tables: bool, has_pool: bool) -> set[str
     query = str(state.get("query") or "")
     scope = source_scope(query, exclusive_only=True)
     local_processing = attachment_processing_only(query,
-        has_source=bool(has_tables or state.get("attachment_refs")),
-        browse_requested=state.get("browse_requested") is True)
+        has_source=bool(has_tables or state.get("attachment_refs")))
     env = runtime_env(source_scope=scope,
         attachments=int(has_tables), account_files=len(state.get("account_files") or []),
         session=bool(state.get("session_id")), network=web_search_enabled(),
@@ -241,8 +240,6 @@ def allowed_presets(state: dict, *, has_tables: bool, has_pool: bool) -> set[str
     policy = policy_for_state(state)
     names = set()
     for name, (requires, _, _) in preset_bindings().items():
-        if name == "browse_web" and state.get("browse_requested") is not True:
-            continue
         caps = TOOL_METADATA[name].capabilities
         if local_processing and (name == "verify_uploaded_references" or
                                  caps & {"network", "local_corpus", "shared_corpus"}):

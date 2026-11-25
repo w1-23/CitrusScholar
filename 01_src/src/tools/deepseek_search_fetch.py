@@ -144,37 +144,19 @@ def _public_http_url_error(url: str) -> str | None:
     return None
 
 
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-
-
-def _post_json(url: str, payload: dict, timeout: float, attempts: int = 2):
-    """POST with one retry for transient gateway failures (never for 402)."""
-    last_exc: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        if not _enabled("web_fetch"):
-            raise PermissionError("web_fetch_disabled")
-        try:
-            response = requests.post(url, headers=_headers(), json=payload, timeout=timeout)
-        except requests.RequestException as exc:
-            last_exc = exc
-            if attempt >= attempts:
-                raise
-            logger.warning("web tool request failed (%s); retrying once", type(exc).__name__)
-            time.sleep(2.0)
-            continue
-        if response.status_code in _RETRYABLE_STATUS and attempt < attempts:
-            logger.warning("web tool returned HTTP %s; retrying once", response.status_code)
-            time.sleep(2.0)
-            continue
-        return response
-    raise last_exc or RuntimeError("web tool request failed")
-
-
-def _fetch_url(url: str, timeout: float | None = None) -> dict:
+def _fetch_url(url: str, *, deadline: float | None = None) -> dict:
     if not _enabled("web_fetch"):
         return {"url": url, "ok": False, "error": "web_fetch_disabled"}
-    response = _post_json("https://api.deepseek.com/v1/tools/fetch",
-                          {"url": url}, timeout or _timeout())
+    headers, timeout = _headers(), _timeout()
+    if deadline is not None:
+        # DNS, policy checks and executor queueing consume the same race deadline.
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            return {"url": url, "ok": False, "error": "race_deadline_exceeded"}
+    # A gateway failure or timeout can consume the entire foreground budget.
+    # Return that evidence gap instead of silently repeating the same request.
+    response = requests.post("https://api.deepseek.com/v1/tools/fetch",
+                             headers=headers, json={"url": url}, timeout=timeout)
     if response.status_code != 200:
         return {"url": url, "ok": False, "error": _error_text(response)}
     body = response.json()
@@ -414,6 +396,7 @@ _DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\]\[<>\"']+", re.I)
 
 
 _RACE_PARALLEL = 2
+_RACE_DEADLINE_SECONDS = 20.0
 _RACE_VALID_MIN_CHARS = 1500
 _RACE_ABSTRACT_MIN_CHARS = 200
 _SECTION_MARKERS = re.compile(
@@ -687,6 +670,28 @@ def _pmcid_expansion(item: dict) -> list[tuple[str, str]]:
         return []
 
 
+def _fetch_paper_candidate(url: str, kind: str, deadline: float) -> dict:
+    def allowed() -> bool:
+        return (_enabled("web_fetch")
+                and (kind != "identifier_metadata" or _enabled("bibliographic_lookup")))
+
+    if time.monotonic() >= deadline:
+        return {"url": url[:8192], "ok": False, "error": "race_deadline_exceeded"}
+    if not allowed():
+        return {"url": url[:8192], "ok": False, "error": "paper_source_disabled"}
+    target_error = _public_http_url_error(url)
+    if target_error:
+        return {"url": url[:8192], "ok": False, "error": f"blocked: {target_error}"}
+    if not allowed():
+        return {"url": url, "ok": False, "error": "paper_source_disabled"}
+    try:
+        result = _fetch_url(url, deadline=deadline)
+    except (requests.RequestException, ValueError) as exc:
+        result = {"url": url, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    result["target_validated"] = True
+    return result
+
+
 def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
                      target_doi: str, target_title: str,
                      attempts: list[dict]) -> dict | None:
@@ -697,7 +702,7 @@ def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
     their late results are never read, so exactly one body can reach the caller.
     """
     from contextvars import copy_context
-    from src.core.executors import WEB_FETCH_EXECUTOR
+    from src.core.executors import ExecutorSaturatedError, WEB_FETCH_EXECUTOR
     queue = list(candidates)
     inflight: dict = {}
     timings: dict = {}
@@ -710,10 +715,15 @@ def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
     def _submit_more() -> None:
         while queue and len(inflight) < _RACE_PARALLEL and time.monotonic() < deadline:
             url, kind = queue.pop(0)
-            budget = min(_fetch_timeout(), max(0.1, deadline - time.monotonic()))
             if not _enabled("web_fetch") or (kind == "identifier_metadata" and not _enabled("bibliographic_lookup")):
                 continue
-            future = WEB_FETCH_EXECUTOR.submit(copy_context().run, _fetch_url, url, budget)
+            try:
+                future = WEB_FETCH_EXECUTOR.submit(copy_context().run, _fetch_paper_candidate,
+                                                   url, kind, deadline)
+            except ExecutorSaturatedError:
+                attempts.append({"url": url[:8192], "format": kind, "ok": False,
+                                 "error": "paper_source_executor_saturated"})
+                continue
             future.add_done_callback(_swallow)
             inflight[future] = (url, kind)
             timings[(url, kind)] = time.monotonic()
@@ -723,17 +733,16 @@ def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        done, _ = wait(list(inflight.keys()), timeout=min(0.5, remaining),
-                       return_when=FIRST_COMPLETED)
-        if not done:
-            continue
+        done, _ = wait(inflight, timeout=remaining, return_when=FIRST_COMPLETED)
+        if not done or time.monotonic() >= deadline:
+            break
         for future in done:
             url, kind = inflight.pop(future)
             started_at = timings.pop((url, kind), None)
             try:
                 result = future.result()
             except Exception as exc:  # noqa: BLE001
-                result = {"url": url, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                result = {"url": url[:8192], "ok": False, "error": f"{type(exc).__name__}: {exc}"}
             result["format"] = kind
             if started_at is not None:
                 result["elapsed_ms"] = round((time.monotonic() - started_at) * 1000)
@@ -756,25 +765,50 @@ def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
     if winner is not None:
         for future, (url, kind) in list(inflight.items()):
             cancelled = future.cancel()
-            attempts.append({"url": url, "format": kind, "ok": False,
+            attempts.append({"url": url[:8192], "format": kind, "ok": False,
                              "error": "cancelled_after_winner" if cancelled
                              else "in_flight_discarded_after_winner"})
         inflight.clear()
         for url, kind in queue:
-            attempts.append({"url": url, "format": kind, "ok": False,
+            attempts.append({"url": url[:8192], "format": kind, "ok": False,
                              "error": "not_started_after_winner"})
         queue.clear()
     else:
         for future, (url, kind) in list(inflight.items()):
             future.cancel()
-            attempts.append({"url": url, "format": kind, "ok": False,
+            attempts.append({"url": url[:8192], "format": kind, "ok": False,
                              "error": "race_deadline_exceeded"})
         inflight.clear()
         for url, kind in queue:
-            attempts.append({"url": url, "format": kind, "ok": False,
+            attempts.append({"url": url[:8192], "format": kind, "ok": False,
                              "error": "not_started_deadline_exceeded"})
         queue.clear()
     return winner
+
+
+def _paper_cloud_fallback(pmc_url: str, doi: str, pmid: str, deadline: float):
+    """Use the existing official PMC reader only within the remaining race time."""
+    from contextvars import copy_context
+    from citrus_refcheck.providers import normalize_doi
+    from src.core.corpus_review import MAX_ARCHIVE_BYTES
+    from src.core.executors import ExecutorSaturatedError, WEB_FETCH_EXECUTOR
+    from src.shared_corpus.pmc import licensed_full_text
+
+    if time.monotonic() >= deadline:
+        return None
+    try:
+        future = WEB_FETCH_EXECUTOR.submit(copy_context().run, licensed_full_text, pmc_url,
+                                           doi=normalize_doi(doi), pmid=pmid,
+                                           max_bytes=MAX_ARCHIVE_BYTES, deadline=deadline)
+    except ExecutorSaturatedError:
+        return None
+    try:
+        result = future.result(timeout=max(0.0, deadline - time.monotonic()))
+        if time.monotonic() < deadline:
+            return result
+    except TimeoutError:
+        future.cancel()
+    return None
 
 
 def _fetch_attempt_line(index: int, item: dict) -> str:
@@ -805,14 +839,7 @@ def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
         return _disabled("web_fetch")
     candidates: list[tuple[str, str]] = []
     attempts: list[dict] = []
-    for url in (urls or [])[:5]:
-        value = str(url or "").strip()
-        target_error = _public_http_url_error(value)
-        if not target_error:
-            candidates.append((value, "search_result"))
-        else:
-            attempts.append({"url": value[:8192], "format": "search_result",
-                             "ok": False, "error": f"blocked: {target_error}"})
+    candidates.extend((str(url or "").strip(), "search_result") for url in (urls or [])[:5])
     doi_value = str(doi or "").strip().lower().removeprefix("https://doi.org/")
     doi_value = doi_value.rstrip(".,;) ")
     pmid_value = re.sub(r"\D", "", str(pmid or ""))
@@ -825,43 +852,35 @@ def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
         metadata_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=" + requests.utils.quote(term) + "&format=json"
         candidates.append((metadata_url, "identifier_metadata"))
     candidates = list(dict.fromkeys(candidates))[:8]
-    # Fixed metadata endpoints and DOI hosts are public constants; arbitrary
-    # user/model URLs must pass the same public-target check before dispatch.
-    safe_candidates: list[tuple[str, str]] = []
-    for value, kind in candidates:
-        target_error = _public_http_url_error(value)
-        if target_error:
-            attempts.append({"url": value[:8192], "format": kind, "ok": False,
-                             "error": f"blocked: {target_error}"})
-        else:
-            safe_candidates.append((value, kind))
-    candidates = list(dict.fromkeys(safe_candidates))[:8]
     if not candidates:
         _queue_paper_registration(doi, pmid)
-        if attempts:
-            return ("[WEB_FETCH_BLOCKED] No candidate URL passed the public-target check.",
-                    {"web_results": [], "fetch_attempts": attempts})
         return "[WEB_FETCH_ERROR] Provide at least one valid URL, DOI, PMID, or title.", {"web_results": []}
 
     started = time.monotonic()
-    deadline = started + 20.0
+    deadline = started + _RACE_DEADLINE_SECONDS
     winner = _race_candidates(candidates, deadline, doi_value, title.strip(), attempts)
+    if attempts and all(str(item.get("error", "")).startswith("blocked: ") for item in attempts):
+        _queue_paper_registration(doi, pmid)
+        return ("[WEB_FETCH_BLOCKED] No candidate URL passed the public-target check.",
+                {"web_results": [], "fetch_attempts": attempts})
     from src.core.web_failure_ledger import record_fetch_failures
     record_fetch_failures(attempts, doi=doi_value, title=title)
     abstract_only = [a for a in attempts if a.get("validity") == "abstract_only"]
     official = None
-    if winner is None and _enabled("web_fetch") and _enabled("bibliographic_lookup"):
-        # If the web provider could not read PMC, try the official text object directly.
-        from citrus_refcheck.providers import normalize_doi
-        from src.core.corpus_review import MAX_ARCHIVE_BYTES, MIN_CONTENT_CHARS
-        from src.shared_corpus.pmc import licensed_full_text
-        sources = [item["url"] for item in attempts if item.get("format") in {"pmc_html", "europe_pmc_xml"}]
-        sources.extend(url for url, _ in candidates if url.startswith(("https://pmc.ncbi.nlm.nih.gov/articles/",
-                                                                       "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC")))
-        pmc_url = next(iter(sources), "")
-        if pmc_url:
-            official = licensed_full_text(pmc_url, doi=normalize_doi(doi_value), pmid=pmid_value,
-                                          max_bytes=MAX_ARCHIVE_BYTES)
+    if (winner is None and time.monotonic() < deadline
+            and _enabled("web_fetch") and _enabled("bibliographic_lookup")):
+        from src.core.corpus_review import MIN_CONTENT_CHARS
+
+        # Only consider routes already validated by a candidate worker.
+        eligible = [item for item in attempts if item.get("target_validated")]
+        pmc_formats = {"pmc_html", "europe_pmc_xml"}
+        pmc_prefixes = ("https://pmc.ncbi.nlm.nih.gov/articles/",
+                        "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC")
+        sources = [item["url"] for item in eligible if item.get("format") in pmc_formats]
+        sources.extend(url for url, _ in candidates if url.startswith(pmc_prefixes)
+                       and any(item.get("url") == url for item in eligible))
+        if sources:
+            official = _paper_cloud_fallback(sources[0], doi_value, pmid_value, deadline)
             if official is not None:
                 paper = official[0]
                 if (len(paper["content"].strip()) >= MIN_CONTENT_CHARS
@@ -870,6 +889,8 @@ def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
                     attempts.append(winner)
                 else:
                     official = None
+    for item in attempts:
+        item.pop("target_validated", None)
     elapsed_ms = round((time.monotonic() - started) * 1000)
     review_candidate = None
     if not _legacy_corpus_enabled():

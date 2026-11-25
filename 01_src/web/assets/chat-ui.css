@@ -15,8 +15,10 @@
   padding:12px 13px 9px; gap:5px; border:1px solid var(--border-hairline);
   border-radius:19px; background:var(--bg-surface); box-shadow:var(--ui-shadow);
 }
-.chat-panel .input-box:focus-within { border:1px solid var(--ui-focus); box-shadow:var(--ui-shadow); }
+.chat-panel .input-box:has(> #user-input:focus) { border-color:var(--ui-focus); }
 .chat-panel .input-box textarea { min-height:40px; padding:0 3px; font-size:14px; }
+/* The shared focus indicator for the message field is the rounded composer border above. */
+.chat-panel .input-box > #user-input:focus-visible { outline:none; }
 .chat-panel .input-box .input-actions { width:100%; gap:8px; margin-left:0; min-height:36px; }
 .composer-admission-recovery { display:flex; flex-wrap:wrap; gap:5px; width:100%; max-width:800px; }
 .composer-admission-recovery[hidden] { display:none; }
@@ -36,19 +38,6 @@
 .composer-meta .composer-task-status { margin:0 auto 0 3px; text-align:left; font-size:11px; color:var(--text-muted); }
 .composer-meta .composer-task-status { overflow-wrap:anywhere; }
 .composer-meta:has(.composer-task-status[hidden]) { display:none; }
-.input-box .composer-browse { position:relative; display:inline-flex; align-items:center; gap:6px; color:var(--text-primary); cursor:pointer; font-size:12px; white-space:nowrap; }
-.composer-browse input { position:absolute; inset:0; opacity:0; margin:0; width:100%; height:100%; cursor:pointer; }
-.browse-track { pointer-events:none; width:29px; height:17px; display:inline-block; background:var(--border-hover); flex:none; border-radius:20px; position:relative; }
-.browse-track::after { content:""; position:absolute; width:13px; height:13px; border-radius:50%; top:2px; left:2px; background:white; transition:transform .16s ease; }
-.composer-browse input:checked + .browse-track { background:var(--ui-control); }
-.composer-browse input:checked + .browse-track::after { transform:translateX(12px); }
-.composer-browse input:focus-visible + .browse-track { outline:1px solid var(--ui-focus); outline-offset:2px; }
-.input-box .composer-research { min-height:33px; padding:0 5px; }
-.composer-research input:disabled { cursor:wait; }
-.composer-research:has(input:disabled) { opacity:.7; }
-#skill-picker-panel .composer-browse { margin:7px 0 0; min-height:30px; }
-.composer-visually-hidden { position:absolute; inline-size:1px; block-size:1px; clip-path:inset(50%); overflow:hidden; white-space:nowrap; }
-.composer-research-status { width:min(100%,800px); color:var(--text-primary); font-size:12px; padding:4px 0; }
 .input-box .input-tools { position:static; }
 .input-box .input-tools > summary {
   display:inline-flex; align-items:center; justify-content:center; gap:5px; min-height:33px;
@@ -79,7 +68,7 @@
 .skill-choice strong { font-size:13px; display:block; }
 .skill-choice-icon { display:grid; place-items:center; width:32px; height:32px; flex:0 0 32px; font-size:17px; color:var(--ui-ink); background:var(--bg-surface); border:1px solid var(--border-hairline); border-radius:9px; }
 @media (pointer:coarse) {
-  .input-box .input-tools > summary, .attachment-options button, .input-box .send-btn, .input-box .composer-browse { min-height:44px; }
+  .input-box .input-tools > summary, .attachment-options button, .input-box .send-btn { min-height:44px; }
   .input-box .input-tools > .composer-plus, .input-box .send-btn { min-width:44px; }
 }
 
@@ -186,10 +175,6 @@ body[data-page="chat"] { --rail-w:60px; --app-header-h:54px; --context-w:clamp(2
   .chat-panel #chat-container { padding:17px 10px 10px; }
   .chat-panel .message.user > .content { max-width:calc(100% - var(--msg-avatar-size) - var(--msg-gap)); }
   .chat-panel > footer { padding-inline:8px; }
-}
-@media (max-width:355px) {
-  .input-box .input-tools > .composer-scenes span { display:none; }
-  .input-box .composer-browse { gap:4px; }
 }
 
 /* Keep the turn controls inside the chat column even when side docks open. */

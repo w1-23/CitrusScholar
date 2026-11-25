@@ -16,6 +16,8 @@ from .capabilities import CapabilityCatalog
 from .identity import ExecutionIdentity
 from .runtime import AdmissionStopped
 
+_PUBLIC_WAIT_SECONDS = 12
+
 _TEXT_TERMINALS = frozenset({"stop", "end_turn", "stop_sequence"})
 _TOOL_TERMINALS = frozenset({"tool_calls", "tool_use", "function_call"})
 _LENGTH_TERMINALS = frozenset({"length", "max_tokens", "max_output_tokens"})
@@ -68,6 +70,31 @@ class _StreamEvidence(BaseCallbackHandler):
         self.terminal_conflict = False
         self.cancelled = False
         self.tool_chunks = []
+        self.public_wait_timer = None
+        self.public_wait_published = False
+
+    def watch_public_wait(self, scope):
+        if scope and scope.get("purpose") == "main_loop" and scope.get("attempt_id"):
+            loop = asyncio.get_running_loop()
+
+            def admitted():
+                self.public_wait_timer = loop.call_later(
+                    _PUBLIC_WAIT_SECONDS, self._publish_slow_provider, scope["attempt_id"])
+            scope["on_provider_request_admitted"] = admitted
+
+    def stop_public_wait(self, scope):
+        if scope is not None:
+            scope.pop("on_provider_request_admitted", None)
+        if self.public_wait_timer is not None:
+            self.public_wait_timer.cancel()
+
+    def _publish_slow_provider(self, attempt_id):
+        from src.core.public_progress import emit_public_progress
+        category = "agent_model_connected" if self.first_packet else "agent_model_wait"
+        if category == "agent_model_wait":
+            self.public_wait_published = True
+        emit_public_progress("", category=category, step_id=attempt_id,
+                             note_id=f"{attempt_id}:{category}")
 
     def on_llm_error(self, error, **_):
         self.cancelled = isinstance(error, asyncio.CancelledError)
@@ -85,11 +112,8 @@ class _StreamEvidence(BaseCallbackHandler):
             observation = _observation.get()
             if observation is not None:
                 observation["provider_first_packet_ms"] = elapsed
-                if (elapsed >= 10_000 and observation.get("purpose") == "main_loop"
-                        and observation.get("attempt_id")):
-                    from src.core.public_progress import emit_public_progress
-                    emit_public_progress("", category="agent_model_connected", phase="working",
-                                         note_id=f"{observation['attempt_id']}:first-packet")
+                if self.public_wait_published:
+                    self._publish_slow_provider(observation["attempt_id"])
         fragments = message.tool_call_chunks
         if self.terminal is not None and (message.content or fragments):
             self.terminal_conflict = True
@@ -210,11 +234,14 @@ class ModelDriver:
             nonlocal model_response
             if offered:
                 historical_readback.historical_result_offers.update(offered)
+            from src.core.request_context import _observation
+            scope = _observation.get()
             evidence = _StreamEvidence(on_delta)
             observed_model = model.model_copy(update={"cache": False, "callbacks": AsyncCallbackManager.configure(
                 inheritable_callbacks=model.callbacks, local_callbacks=[evidence])})
             try:
                 async with async_deepseek_attempt(observed_model, [*system, *view], options) as private:
+                    evidence.watch_public_wait(scope)
                     model_response = await handler(request.override(model=observed_model, messages=view, tools=schemas,
                                                                      model_settings=options))
             except AttributeError as error:
@@ -223,6 +250,8 @@ class ModelDriver:
                 if evidence.cancelled:
                     raise asyncio.CancelledError() from error
                 raise
+            finally:
+                evidence.stop_public_wait(scope)
             if len(model_response.result) != 1 or not isinstance(model_response.result[0], AIMessage):
                 raise TypeError("model_must_return_ai_message")
             if private is not None and private.terminal_conflict:

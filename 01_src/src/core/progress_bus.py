@@ -497,9 +497,16 @@ def _fields(data: dict, *, tokens=(), numbers=()) -> dict:
 
 
 PUBLIC_WORK_NOTES = {
-    "agent_prepare": "正在准备本轮上下文",
-    "agent_model_wait": "已开始请求模型，正在等待输出",
-    "agent_model_connected": "模型已开始返回数据。答复仍在准备中。",
+    "agent_prepare": "正在准备本轮任务",
+    "agent_model_wait": "已向模型发送请求，正在等待首批响应。",
+    "agent_model_connected": "已收到模型的初步响应，仍在等待本次输出完成。",
+    "agent_review_evidence": "已收到工具结果，正在结合已有资料继续处理。",
+    "agent_review_answer": "正在做答复的最后核对。",
+    "retrieval_web_search_finished": "联网检索已返回候选来源。",
+    "retrieval_web_search_zero_hits": "这次联网检索未返回候选来源。",
+    "retrieval_full_text_read": "已读取可核对的网页正文，可用于本轮答复。",
+    "retrieval_abstract_only": "该来源目前只取得摘要或部分正文。",
+    "retrieval_full_text_unavailable": "该来源未取得可核对的正文。",
     "table_processed": "已完成表格处理。",
     "checking_references": "正在核验文献来源。",
     "figure_registered": "图件已登记，可查看或下载。",

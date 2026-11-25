@@ -548,6 +548,14 @@ async def _run(state, identity, ledger):
                          "pending_question": execution.pending_question,
                          "execution_waits": list(execution.execution_waits)}
 
+    public_milestones = set()
+
+    def public_milestone(category):
+        if category not in public_milestones:
+            emit_public_progress("", category=category, note_id=f"{identity.run_id}:{category}",
+                                 job_id=identity.run_id)
+            public_milestones.add(category)
+
     async def check_final(answer, history, _, *, allow_delivery_gaps=False):
         notes = await prepare(identity)
         if notes:
@@ -558,6 +566,8 @@ async def _run(state, identity, ledger):
             return FinalCheck(False, ("尚未形成有效答复。需要工具时使用原生工具调用；不要用工具协议文本冒充答案。",))
         from src.core.turn_outcome import claims_file_delivery, completion_from_answer, repairable_proposal_reason
         statement = completion_from_answer(text, host.records)
+        if time.monotonic() - started >= 12:
+            public_milestone("agent_review_answer")
         if any(row.get('name') == 'browse_web' for row in host.records):
             from src.core.progress_bus import emit_progress
             emit_progress('browse_phase', {'phase': 'organizing'})
@@ -728,10 +738,7 @@ async def _run(state, identity, ledger):
                                    framework_checkpoint_path, framework_checkpoint_scope, open_framework_checkpoint)
     from .recovery import is_terminal_orphan, validate_legacy_native_head
 
-    announced_model_request = False
-
     async def metered_model(request, handler, current_identity, host_tools):
-        nonlocal announced_model_request
         model_allowed = set(refresh_allowed())
         historical_readback = (host if "read_tool_result" in model_allowed
             and policy.allows("summarization") and state.get("context_compression") is not False else None)
@@ -739,10 +746,10 @@ async def _run(state, identity, ledger):
             model_allowed.discard("read_tool_result")
         # before_model's host_state watermark is already synchronously committed.
         task_events.acknowledge_updates(identity.run_id, update_version)
-        if not announced_model_request:
-            emit_public_progress("", category="agent_model_wait",
-                                 note_id=f"{identity.run_id}:first-model", job_id=identity.run_id)
-            announced_model_request = True
+        if "agent_review_evidence" not in public_milestones and any(
+                item.get("tool_call_id") in host.dispatched and item.get("status") in {"complete", "partial", "no_results"}
+                for item in host.records):
+            public_milestone("agent_review_evidence")
         from src.core.public_progress import PublicAnswerPreview
         preview = PublicAnswerPreview() if not requirements and not host.messages and not resume else None
         try:

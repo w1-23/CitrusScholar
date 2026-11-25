@@ -8,6 +8,7 @@ from src.figures import projects, store, svg_projects
 from src.figures.declarative_snapshot import SnapshotError, load_snapshot
 from src.figures.document import SCHEMA, _digest
 from src.figures.workbench import artifacts, nature_vectors
+from src.figures.workbench.frozen_script_identity import FrozenScriptIdentity
 from src.figures.workbench.groups import Inventory, invalid
 
 _OPTIONS = {"fontfamily": "font_families", "fontweight": "font_weights", "fontstyle": "font_styles",
@@ -120,7 +121,7 @@ def _read_only(project, manifest, owner, frozen, *, check_document=True):
     return ""
 
 
-def _inventory(project, owner, *, check_preview=True):
+def _inventory(project, owner, *, check_preview=True, preview_svg=None):
     raw = project.get("manifest_json")
     try:
         manifest = projects._normalise_manifest(raw)
@@ -145,13 +146,15 @@ def _inventory(project, owner, *, check_preview=True):
     if not reason and (not isinstance(raw, dict) or not isinstance(raw.get("objects"), list)
                        or len(raw["objects"]) != len(manifest["objects"])):
         reason = "图件的已保存对象清单无法验证。"
+    svg = preview_svg
     if not reason and check_preview:
         try:
-            artifacts.read_entry(artifacts.entries(project, owner).get("svg"), owner, "svg")
+            svg = artifacts.read_entry(artifacts.entries(project, owner).get("svg"), owner, "svg").body
         except projects.ProjectError as exc:
             reason = exc.message
     try:
-        return manifest, Inventory(project, manifest, disabled=reason, frozen=frozen)
+        native = None if reason else FrozenScriptIdentity.create(project, manifest, svg)
+        return manifest, Inventory(project, manifest, disabled=reason, frozen=frozen, native=native)
     except (projects.ProjectError, TypeError, AttributeError):
         return {"objects": []}, Inventory({**project, "overrides_json": []}, {"objects": []},
                                             disabled="图件的已保存对象清单无法验证。")
@@ -206,7 +209,8 @@ def edit(figure_id, owner, revision, commands, *, draft_revision=0, save=False):
         result = projects.preview_overrides(figure_id, owner, submitted, expected_revision=revision,
                                             draft_revision=draft_revision, confirm_targets=confirm)
         preview_project = {**project, "manifest_json": result["manifest"], "overrides_json": result["overrides"]}
-        manifest, projected = _inventory(preview_project, owner, check_preview=False)
+        manifest, projected = _inventory(preview_project, owner, check_preview=False,
+                                         preview_svg=result["svg"].encode("utf-8"))
         return {**_present(project, manifest, projected, formats={}),
                 "svg": result["svg"], "draft_revision": result["draft_revision"]}
     result = projects.save_overrides(figure_id, owner, submitted, expected_revision=revision,

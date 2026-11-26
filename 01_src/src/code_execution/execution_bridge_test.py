@@ -350,10 +350,11 @@ def test_the_sandbox_timeout_is_reported_as_124_with_partial_output(worker, view
     assert "timed out after 30s" in result.output
 
 
-def test_a_worker_side_timeout_is_reported_as_124(worker, view):
+def test_a_worker_side_timeout_has_no_confirmed_command_exit(worker, view):
     service = worker(statuses=("timed_out",), manifest=False)
     result = run(service, view)
-    assert result.exit_code == 124
+    assert result.exit_code is None
+    assert result.not_run_reason == ""
     assert "Worker timed out" in result.output
 
 
@@ -364,11 +365,12 @@ def test_a_cancelled_run_has_no_exit_code(worker, view):
     assert "cancelled before it completed" in result.output
 
 
-def test_an_expired_budget_cancels_the_worker_and_reports_124(worker, view, monkeypatch):
+def test_an_expired_budget_has_no_confirmed_command_exit(worker, view, monkeypatch):
     service = worker(statuses=("running",), manifest=False)
     monkeypatch.setattr(execution_bridge, "_wait", lambda *args: (service.status("a" * 32), True))
     result = run(service, view, timeout=20)
-    assert result.exit_code == 124
+    assert result.exit_code is None
+    assert result.not_run_reason == ""
     assert "budget ran out" in result.output
 
 
@@ -493,3 +495,35 @@ def test_workspace_preparation_cannot_submit_after_run_deadline(worker, view, mo
     result = run(service, view)
     assert result.exit_code is None and "execute_run_deadline_exhausted" in result.output
     assert service.submissions == []
+
+
+@pytest.mark.parametrize("stage", ["prepare", "submission", "status"])
+def test_submit_boundary_distinguishes_not_run_from_unknown(worker, view, monkeypatch, stage):
+    service = worker()
+
+    def unavailable(*args, **kwargs):
+        raise OSError("fixture")
+
+    if stage == "prepare":
+        monkeypatch.setattr(execution_bridge, "_prepare", unavailable)
+    elif stage == "submission":
+        submit = service.submit
+
+        def submit_then_lose_reply(**kwargs):
+            submit(**kwargs)
+            unavailable()
+
+        monkeypatch.setattr(service, "submit", submit_then_lose_reply)
+    else:
+        monkeypatch.setattr(service, "status", unavailable)
+
+    result = run(service, view)
+    assert result.exit_code is None
+    if stage == "prepare":
+        assert not service.submissions
+        assert result.not_run_reason == "workspace_preparation_failed"
+    else:
+        assert len(service.submissions) == 1
+        assert not result.not_run_reason
+        assert "could not be confirmed" in result.output
+        assert "not run" not in result.output

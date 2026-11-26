@@ -327,11 +327,13 @@ def test_a_binary_or_oversized_output_is_reported_and_not_stored(scope, worker, 
     for path in ("/outputs/big.txt", "/outputs/huge.txt", "/outputs/plot.bin"):
         assert path not in stored
 
-def test_a_worker_timeout_is_124_and_a_user_cancel_has_no_exit_code(scope, worker, monkeypatch):
+def test_worker_timeout_and_user_cancel_have_no_confirmed_command_exit(scope, worker, monkeypatch):
     monkeypatch.setattr(execution_bridge, "identify", lambda owner, session, run_id: scope)
     timed = worker(statuses=("timed_out",))
     monkeypatch.setattr("src.code_execution.service.ExecutionService", lambda identity: timed)
-    assert backend_for(scope).execute("sleep 999").exit_code == 124
+    response = backend_for(scope).execute("sleep 999")
+    assert response.exit_code is None
+    assert "Worker timed out" in response.output
 
     cancelled = worker(statuses=("cancelled",))
     monkeypatch.setattr("src.code_execution.service.ExecutionService", lambda identity: cancelled)

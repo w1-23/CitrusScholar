@@ -39,8 +39,8 @@ def _json_arg(raw: Any, name: str) -> Any:
             return json.loads(raw)
         except (TypeError, ValueError):
             raise ToolArgumentError(
-                f"{name} 需要 JSON 文本；例如 {{\"chart\": \"bar\"}}。") from None
-    raise ToolArgumentError(f"{name} 需要 JSON 文本。")
+                f"{name} 不是有效的 JSON；请直接传对象或数组，勿把它再编码为字符串。") from None
+    raise ToolArgumentError(f"{name} 需要 JSON 对象或数组。")
 
 
 def _requested_formats(raw: Any) -> tuple[str, ...] | None:
@@ -155,8 +155,11 @@ def _run_research_figure_script(
     研究目的分面/热图，保留原始点及明确的聚合/变换；缺少关键设计时询问。
     单套底部/左侧刻度，实际 draw 后验证标签密度及固定画布边界；布局不合格
     会返回可修正错误，不能以文件生成代替科学表达与视觉检查。
-    inputs_json 是变量名到当前账号文件的 JSON 映射，例如
-    {"data":{"file_id":"..."}}；脚本中 pd.read_csv(data) 或 pd.read_excel(data,
+    inputs_json、outputs_json、qa_profile_json 直接传 JSON 对象；formats_json 直接传数组。
+    render_script 是 outputs_json 对象中的源码字符串，不要再把整个对象编码成字符串。
+    inputs_json 是变量名到当前账号文件的映射，优先照用 inspect 返回的 inputs_binding。
+    例如 {"data":{"file_id":"..."}}，也接受同一文件的 {"file_id":"...","sha256":"..."}；
+    提供 sha256 时必须与当前授权文件的真实字节完全匹配。脚本中 pd.read_csv(data) 或 pd.read_excel(data,
     sheet_name=..., header=...) 读取完整固定字节快照。模型只需列/类型/维度与
     少量样例的结构摘要；不要分页读出、复述全表或把全表手写进脚本字面量。
     预览截短不等于源数据截短，不用 nrows/head 代替全表；纯绘图不需先做推断检验。
@@ -166,7 +169,8 @@ def _run_research_figure_script(
     qa_profile_json 支持 name(scientific/nature_single/nature_double)、final_size_mm、
     min_font_pt、min_linewidth_pt、caption，返回实际测量及明确的 unsupported 检查。
     inputs_json也可绑定 {"tidy":{"dataset_ref":上一执行返回的dataset_ref}}，
-    用 df=load_dataset(tidy) 读取保留类型/精度的内部表；普通文件仍用pandas读取。
+    主脚本用 df=load_dataset(tidy) 读取该绑定，保留表的类型和精度；普通文件仍用 pandas。
+    不要用 pandas 读取内部快照 JSON 或自行解码。独立 render_script 只读取 data 中的冻结 DataFrame。
     可选 outputs_json.input_contract 版本 1 区分原始文件和读入的表。raw 声明 Path 变量。tables 逐项声明 name、input、format（csv/tsv/excel/dataset）及需要时的 sheet、header，主脚本收到对应 DataFrame。独立 renderer 只收到冻结表映射 data。可用 render 指定 renderer 键到父表的映射。emit.table 的 parents 使用 inputs_json 中的原始绑定名。省略 input_contract 时沿用旧变量合同。
     默认用冻结表与独立渲染的outputs_json版本2协议，支持后续保真样式编辑。例如：
     {"version":2,"tables":[{"name":"tidy","parents":["data"]}],
@@ -442,14 +446,18 @@ def _run_research_figure_script(
                           "workspace_url": workspace_url})
 
     placeholder = ""
-    stage_failures = [] if project else [{"reason_code": "project_persistence_failed"}]
+    stage_failures = [] if project else [{"reason_code": "project_persistence_failed",
+                                          "error": "图件可下载，工作台项目未保存。"}]
     svg_export = next((item for item in published if item["format"] == "svg"), None)
     if svg_export:
         try:
             placeholder = _register_figure(result.outputs["svg"], title or "科研图件", svg_export,
                                            workbench_url=workspace_url)
+            if not placeholder:
+                raise LookupError("inline figure was not registered")
         except Exception:
-            stage_failures.append({"reason_code": "inline_registration_failed"})
+            stage_failures.append({"reason_code": "inline_registration_failed",
+                                   "error": "图件可下载，内联预览未登记。"})
 
     summary = {
         "figure_id": project["figure_id"] if project else "",
@@ -470,7 +478,8 @@ def _run_research_figure_script(
         "editable": False,
         "mode": "template" if template_meta else "script",
         "timeout": timeout_receipt,
-        "failures": publish_failures + stage_failures,
+        "failures": publish_failures,
+        "presentation_warnings": stage_failures,
         "note": ("脚本图件已保存，可在「图表工作台」查看和下载（/figures）。"
                  "这份脚本尚未分离分析与渲染；样式编辑需要冻结中间表和独立render_script，避免重算改变数值。"
                  if project else "图件已导出，但未能保存工作台项目；当前只能下载。"),
@@ -481,10 +490,9 @@ def _run_research_figure_script(
     qa_failures = _failed_qa_checks(receipt)
     summary["qa_failures"] = qa_failures
     summary["_tool_outcome"] = {
-        "status": "partial" if publish_failures or qa_failures or stage_failures else "complete",
+        "status": "partial" if publish_failures or qa_failures else "complete",
         "reason_code": ("format_publication_failed" if publish_failures else
-                        "figure_qa_needs_attention" if qa_failures else
-                        stage_failures[0]["reason_code"] if stage_failures else "figure_published"),
+                        "figure_qa_needs_attention" if qa_failures else "figure_published"),
         "artifacts": [item["artifact_url"] for item in published
                       if item.get("artifact_url")],
     }
@@ -680,12 +688,12 @@ def _compile_template_request(*, template_id: str, template_parameters_json: Any
 
 
 def run_research_figure_script(
-    script: str = "", title: str = "", formats_json: str | list[str] = "",
-    output_name: str = "", inputs_json: str | dict = "", qa_profile_json: str | dict = "",
-    analysis_result_ref_json: str | dict = "", outputs_json: str | dict = "",
-    script_ref_json: str | dict = "", parameters_json: str | dict = "",
+    script: str = "", title: str = "", formats_json: list[str] | str = "",
+    output_name: str = "", inputs_json: dict | str = "", qa_profile_json: dict | str = "",
+    analysis_result_ref_json: dict | str = "", outputs_json: dict | str = "",
+    script_ref_json: dict | str = "", parameters_json: dict | str = "",
     repair_from_run_id: str = "", mode: str = "script", template_id: str = "",
-    template_parameters_json: str | dict = "",
+    template_parameters_json: dict | str = "",
 ) -> tuple[str, dict]:
     # Pure caller-option checks precede source/run/input persistence. A rejected
     # option therefore cannot be mistaken for an uncertain worker dispatch.

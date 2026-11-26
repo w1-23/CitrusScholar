@@ -492,9 +492,7 @@ def run(job_path: Path) -> int:
     except ValueError as exc:
         return _report(EXIT_FORBIDDEN, str(exc))
 
-    if job.get("output_contract"):
-        namespace["load_dataset"] = _dataset_loader(tuple(paths.values()))
-
+    namespace["load_dataset"] = _dataset_loader(tuple(paths.values()))
     if job.get("output_contract"):
         return _run_outputs(job, script_text, namespace, out_dir, core, exporter,
                             manifest_module, inputs_contract=input_contract, paths=paths)

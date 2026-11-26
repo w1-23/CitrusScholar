@@ -174,6 +174,8 @@ class ScopedSkillBackend(HostOnlyBackend):
         self.required_capability = {}
 
         def mount(directory, capability):
+            if turn_skills is not None and turn_skills.scope and capability.removeprefix("skill:") not in turn_skills.scope:
+                return
             prefix = "skills/" + directory.name + "/"
             entries = {key.removeprefix(prefix): digest for key, digest in inventory.items()
                        if key.startswith(prefix)}

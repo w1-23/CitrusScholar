@@ -126,6 +126,7 @@ def runtime(monkeypatch, tmp_path):
     for path, handler, method in (
         ("/api/v2/sessions", main.list_sessions, "GET"),
         (root + "/messages", main.session_messages, "GET"),
+        (root + "/artifacts/{artifact_id}", main.download_research_artifact, "GET"),
         ("/api/v1/session/{session_id}/clear", main.clear_session_endpoint, "POST"),
         ("/sessions/{session_id}/jobs", main.list_session_jobs, "GET"),
         (root + "/turn-queue/{client_request_id}/reconcile/publications", main.list_chat_turn_publications, "GET"),
@@ -1038,3 +1039,285 @@ def test_owned_http_approval_resumes_only_the_original_native_call(runtime, deci
         runtime.client.cookies.set("citrus_auth", owner_cookie)
         if not future.done():
             future.cancel()
+
+
+
+@pytest.mark.parametrize(("task", "retry_svg"), [
+    ("figure", False), ("figure", True), ("data-audit", False), ("question-answering", False),
+], ids=["figure", "figure-after-preflight-rejection", "data-audit", "question-answering"])
+def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime, monkeypatch, tmp_path, task, retry_svg):
+    """Real HTTP handlers, official graph and operations; only the LLM wire is a fixture."""
+    import json
+    import httpx
+    from langchain_openai import ChatOpenAI
+    from src.agent.native_send_budget_test import BASE, PROVIDER, _chat_stream
+    from src.config import ModelTransport, settings
+    from src.core.provider_transport import AsyncDeepSeekTransport
+    from src.graph.general_agent_graph import build_general_agent_graph
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.config.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.research.tools.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.figures.store._STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(type(settings), "model_transport",
+        lambda *_args, **_kwargs: ModelTransport("deepseek", PROVIDER, BASE, "fixture", {}))
+    monkeypatch.setattr("src.core.tool_results._schema_ready", False)
+    monkeypatch.setattr(graph, "build_graph", lambda _: build_general_agent_graph())
+    wire = []
+    fixture = b"sample,value\nA,1\nA,1\nB,2\n"
+    query, tool, args, answer = {
+        "figure": ("把这个数据绘制成图，导出 SVG。", "draw_svg", {
+            "svg": '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80"><rect x="10" y="20" width="30" height="50" fill="blue"/><rect x="50" y="10" width="30" height="60" fill="green"/></svg>',
+            "alt_text": "合成绘图用例"}, "图已生成。"),
+        "data-audit": ("审查这个数据有没有异常，只要文字结论。", "audit_uploaded_data", {
+            "file_indexes_json": [0]}, "数据审查结果已返回。"),
+        "question-answering": ("转座子是什么？", "", {}, "转座子是能在基因组中改变位置的 DNA 序列。"),
+    }[task]
+
+    def receive(request):
+        body = json.loads(request.content)
+        wire.append(body)
+        assert len(wire) <= (2 + int(retry_svg) if tool else 1)
+        names = {entry["function"]["name"] for entry in body.get("tools", ())}
+        if task == "figure":
+            assert not names & {"audit_uploaded_data", "run_external_skill", "execute", "task", "deepseek_search"}
+        if task == "data-audit":
+            assert not names & {"draw_svg", "run_research_figure_script", "execute", "task", "deepseek_search"}
+        if not tool:
+            return _chat_stream(answer=answer)
+        assert tool in names
+        if retry_svg and len(wire) == 1:
+            return _chat_stream([("rejected-svg", tool, {**args, "svg": "<svg>"})])
+        if len(wire) == 1 + int(retry_svg):
+            if retry_svg:
+                rejection, = [row["content"] for row in body["messages"] if row.get("tool_call_id") == "rejected-svg"]
+                assert "SVG_FORMAT_ERROR" in rejection
+            return _chat_stream([("source-chain-tool", tool, args)])
+        assert any(row.get("tool_call_id") == "source-chain-tool" for row in body["messages"])
+        return _chat_stream(answer=answer)
+
+    client = httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(receive)), trust_env=False)
+    monkeypatch.setattr("src.core.llm_pool.get_llm", lambda **kwargs: ChatOpenAI(use_responses_api=False,
+        model=PROVIDER, api_key="fixture", base_url=BASE, max_retries=0,
+        max_tokens=kwargs["max_tokens"], stream_usage=True, http_async_client=client))
+    try:
+        # Real chat explicitly enables visualization; the API default is off.
+        payload = {"query": query, "client_request_id": "scientific-source-chain",
+                   "visualization_enabled": task == "figure"}
+        if tool:
+            payload["attachments"] = [{"name": "example.csv", "type": "text/csv",
+                                      "data": base64.b64encode(fixture).decode()}]
+        admitted = runtime.client.post(runtime.path, json=payload)
+        assert admitted.status_code == 202, admitted.text
+        run = admitted.json()["job_id"]
+        wait_for(lambda: state(runtime, "scientific-source-chain") == "terminal")
+        events = runtime.client.get(f"/jobs/{run}/events").json()["events"]
+        terminal, = [item["data"] for item in events if item["event"] == "done"]
+        assert terminal.get("history_saved"), terminal
+        assert terminal["turn_status"] == "completed", (terminal.get("answer"), terminal.get("turn_envelope"))
+        assert answer in terminal["answer"]
+        with task_events.read_transaction() as conn:
+            operations = conn.execute("SELECT tool_name,status FROM task_operations WHERE job_id=? ORDER BY rowid",
+                                      (run,)).fetchall()
+        expected = [(tool, "not_run")] if retry_svg else []
+        if tool:
+            expected.append((tool, "complete"))
+        assert [tuple(row) for row in operations] == expected
+        if task == "figure":
+            import re
+
+            link, = re.findall(r"\]\((/api/v2/session/[^/]+/artifacts/[a-f0-9]{32})\)", terminal["answer"])
+            download = runtime.client.get(link)
+            assert download.status_code == 200, download.text
+            assert download.headers["content-type"].startswith("image/svg+xml")
+            assert b"<svg" in download.content and b"<rect" in download.content
+            runtime.client.cookies.set("citrus_auth", runtime.other)
+            assert runtime.client.get(link).status_code in {403, 404}
+    finally:
+        runtime.client.portal.call(client.aclose)
+
+
+def _settle_scientific_fixture_worker(identity, execution_id, release, skill, root, expected_input):
+    """Supply stopped-worker bytes to the real repository and output acceptance."""
+    from src.agent import fusion_worker_contract as contract
+    from src.code_execution.protocol import ExecutionRequest
+    from src.code_execution.results import accept_outputs, collect_outputs
+    from src.code_execution.service import ExecutionService
+
+    service = ExecutionService(identity)
+    worker = "http-fusion-fixture"
+    claimed = service.repository.claim(worker)
+    assert claimed["execution_id"] == execution_id
+    fence = claimed["fence"]
+    request = ExecutionRequest.parse(claimed["request"])
+    assert request.identity == identity and request.network_policy == "offline"
+    bind = {item.path: item for item in request.inputs}
+    source, = [item for path, item in bind.items() if path.startswith(contract.INPUT_ROOT)]
+    assert source.sha256 == contract.sha(expected_input)
+    assert service.workspace.read_bytes(request.workspace_id, path=source.path,
+        version=source.version, expected_sha256=source.sha256) == expected_input
+    snap = bind[contract.REQUEST]
+    manifest = contract.decode(service.workspace.read_bytes(request.workspace_id, path=snap.path,
+        version=snap.version, expected_sha256=snap.sha256))
+    bundle = contract.load_bundle(release, skill)
+    report = {key: [] for key in contract.REPORT_KEYS}
+    report.update(status="complete", execution={"skill": skill, "version": bundle.version,
+        "python": "3.12.16", "inputs": manifest["inputs"], "options": manifest["options"]}, worker={
+            "schema": contract.SCOPE, "request_sha256": snap.sha256, "bundle_sha256": bundle.sha256,
+            "environment": {"python": "3.12.16", "platform": "linux-x86_64",
+                "libseccomp_fchmodat2": True, "dependencies": bundle.pins, "lock_sha256": bundle.lock_sha256}})
+    if skill == "research-integrity":
+        report["coverage"] = [{"check": "duplicate_numeric_block", "status": "checked"}]
+    else:
+        report["records"] = [{"record_index": 0, "status": "verified", "submitted": {"doi": "10.5555/fixture"},
+                              "attempts": [{"provider": "crossref", "status": 200,
+                                            "queried_at": "2026-01-01T00:00:00Z"}]}]
+    output = root / contract.OUTPUT.lstrip("/")
+    output.parent.mkdir(parents=True)
+    output.write_bytes(contract.encode(report))
+    service.repository.transition(execution_id, worker, fence, "running")
+    service.repository.transition(execution_id, worker, fence, "collecting")
+
+    def accept():
+        return {**accept_outputs(request, execution_id=execution_id, fence=fence,
+            blobs=collect_outputs(root, request), workspace_repository=service.workspace.repository),
+            "process_stopped": True, "network_policy": "offline", "request_fingerprint": request.fingerprint}
+
+    return service.repository.complete_success(execution_id, worker, fence,
+        accept_result=accept, process_stopped=True)
+
+
+@pytest.mark.parametrize("skill, name, mime, role, source, query, answer", [
+    ("research-integrity", "synthetic.csv", "text/csv", "table", b"x,y\n1,2\n1,2\n",
+     "请对附件做科研诚信审查，检查重复数值，只给文字，不联网，不导出。", "已收集本轮科研诚信审查报告。"),
+    ("literature-verification", "synthetic.pdf", "application/pdf", "bibliography", None,
+     "请对附件中的参考文献做文献核验，只给文字，不联网，不导出。", "已收集本轮文献核验报告。"),
+], ids=["research-integrity", "literature-verification"])
+def test_external_scientific_source_chain_accepts_worker_report(runtime, monkeypatch, tmp_path,
+        skill, name, mime, role, source, query, answer):
+    """Authenticated queue, selected release, official graph and host report acceptance."""
+    import json
+    import os
+
+    import httpx
+    from langchain_openai import ChatOpenAI
+    from src import admin_audit
+    from src.agent import fusion_worker, installed_skills
+    from src.agent.native_send_budget_test import BASE, PROVIDER, _chat_stream
+    from src.config import ModelTransport, settings
+    from src.code_execution.presence import worker_presence
+    from src.core.provider_transport import AsyncDeepSeekTransport
+    from src.graph.general_agent_graph import build_general_agent_graph
+
+    release = os.environ.get("CITRUS_HTTP_ACCEPTANCE_SKILLS_RELEASE")
+    if not release:
+        pytest.skip("requires the read-only official inventory and fusion bundle")
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", release)
+    monkeypatch.setenv("CITRUS_EXTERNAL_FUSION", "required")
+    monkeypatch.setenv("CITRUS_CODE_EXECUTION", "offline-development")
+    monkeypatch.setattr("src.agent.recovery.load_recovery_state", runtime.real_checkpoint_loader)
+    from src.agent.execution_coordinator import ExecutionCompletionCoordinator
+
+    monkeypatch.setattr("src.agent.execution_coordinator.load_recovery_state", runtime.real_checkpoint_loader)
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.config.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.research.tools.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.core.tool_results._schema_ready", False)
+    monkeypatch.setattr(graph, "build_graph", lambda _: build_general_agent_graph())
+    monkeypatch.setattr(type(settings), "model_transport",
+        lambda *_args, **_kwargs: ModelTransport("deepseek", PROVIDER, BASE, "fixture", {}))
+    selected = next(row for row in installed_skills.active_skills(installed_skills.release_path()) if row["id"] == skill)
+    selected = {key: selected[key] for key in ("id", "version", "sha256")}
+    if source is None:
+        import fitz
+
+        with fitz.open() as doc:
+            doc.new_page().insert_text((72, 72), "References\nExample 2026. doi:10.5555/fixture")
+            source = doc.tobytes()
+    worker_receipts, wire = [], []
+    schedule = fusion_worker.schedule_fusion
+
+    def schedule_and_settle(identity, **values):
+        receipt = schedule(identity, **values)
+        assert receipt["status"] == "queued" and receipt["completion_scope"] == "submission_only"
+        worker_receipts.append(_settle_scientific_fixture_worker(identity, receipt["execution_id"],
+            values["skill_release"], skill, tmp_path / "worker-output", source))
+        return receipt
+
+    monkeypatch.setattr(fusion_worker, "schedule_fusion", schedule_and_settle)
+
+    def receive(request):
+        body = json.loads(request.content)
+        wire.append(body)
+        assert len(wire) <= 3
+        names = {entry["function"]["name"] for entry in body.get("tools", ())}
+        assert {"run_external_skill", "collect_external_skill"} <= names
+        assert not names & {"draw_svg", "audit_uploaded_data", "verify_uploaded_references", "execute", "task",
+                            "deepseek_search", "local_hybrid_search"}
+        if skill == "research-integrity":
+            assert "continue_external_literature" not in names
+        else:
+            assert "inspect_uploaded_table" not in names
+        observations = {row["tool_call_id"]: row["content"] for row in body["messages"] if row["role"] == "tool"}
+        if len(wire) == 1:
+            attached, = files.list_files(runtime.sid, runtime.owner)
+            assert attached["filename"] == name
+            reference = {key: attached[key] for key in ("file_id", "sha256")}
+            return _chat_stream([("fixture-submit", "run_external_skill", {"skill_id": skill,
+                "inputs": {role: reference}})])
+        if len(wire) == 2:
+            submission = json.loads(observations["fixture-submit"])
+            assert submission["completion_scope"] == "submission_only" and submission["collect_required"]
+            return _chat_stream([("fixture-collect", "collect_external_skill", {"skill_id": skill,
+                "execution_id": submission["execution_id"]})])
+        report = json.loads(observations["fixture-collect"])
+        assert report["status"] == "complete" and report["execution"]["skill"] == skill
+        if skill == "research-integrity":
+            assert report["result_lifecycle"] == "external_worker_report"
+            assert report["coverage"] == [{"check": "duplicate_numeric_block", "status": "checked"}]
+        else:
+            assert report["registry_coverage"]["counts"] == {"queried": 1}
+            assert report["records"][0]["submitted"]["doi"] == "10.5555/fixture"
+        return _chat_stream(answer=answer)
+
+    client = httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(receive)), trust_env=False)
+    monkeypatch.setattr("src.core.llm_pool.get_llm", lambda **kwargs: ChatOpenAI(use_responses_api=False,
+        model=PROVIDER, api_key="fixture", base_url=BASE, max_retries=0,
+        max_tokens=kwargs["max_tokens"], stream_usage=True, http_async_client=client))
+    path = tmp_path / "state" / "code_executions.sqlite3"
+    path.parent.mkdir(exist_ok=True)
+    monkeypatch.setattr(admin_audit, "DB_PATH", path.parent / "admin_audit.sqlite3")
+    admin_audit.init_store()
+    coordinator = ExecutionCompletionCoordinator(path.parent, (BASE, PROVIDER),
+        dispatch=main._resume_execution_segment, settle=main._settle_coordinator_turn,
+        busy=main._turn_execution_busy)
+    cid = "external-scientific-acceptance"
+    try:
+        with worker_presence(path):
+            admitted = runtime.client.post(runtime.path, json={"query": query, "client_request_id": cid,
+                "selected_skills": [selected], "web_search_enabled": False, "visualization_enabled": False,
+                "attachments": [{"name": name, "type": mime, "data": base64.b64encode(source).decode()}]})
+            assert admitted.status_code == 202, admitted.text
+            run = admitted.json()["job_id"]
+            wait_for(lambda: state(runtime, cid) == "terminal" or (bool(worker_receipts)
+                and main._turn_segment_phase(jobs.get_job(run)) == "parked"
+                and not main._turn_execution_busy(run)))
+            runtime.client.portal.call(coordinator.tick)
+            wait_for(lambda: state(runtime, cid) == "terminal")
+        response = runtime.client.get(f"/jobs/{run}/events")
+        assert response.status_code == 200, response.text
+        events = response.json()["events"]
+        terminal, = [item["data"] for item in events if item["event"] == "done"]
+        assert terminal.get("history_saved") and terminal["turn_status"] == "completed", terminal
+        assert answer in terminal["answer"] and len(wire) == 3
+        receipt, = worker_receipts
+        assert receipt["process_stopped"] and len(receipt["files"]) == 1
+        with task_events.read_transaction() as conn:
+            operations = conn.execute("SELECT tool_name,status FROM task_operations WHERE job_id=? ORDER BY rowid",
+                                      (run,)).fetchall()
+        assert [tuple(row) for row in operations] == [("run_external_skill", "complete"),
+                                                     ("collect_external_skill", "complete")]
+    finally:
+        runtime.client.portal.call(client.aclose)

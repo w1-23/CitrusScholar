@@ -83,8 +83,19 @@ def _exercise_real_figure():
         return original(job)
 
     runner = SimpleNamespace(run=run)
+    from src.figures.projects import ProjectError
+    from src.research.script_runtime import _validate_new_script_inputs
+
+    binding = {'data': {**overview['inputs_binding']['data'], 'sha256': digest}}
+    _validate_new_script_inputs(binding, OWNER)
+    wrong = {'data': {**binding['data'], 'sha256': '0' * 64}}
+    with pytest.raises(ProjectError, match='sha256'):
+        _validate_new_script_inputs(wrong, OWNER)
+    _, rejected = figure_tools._run_research_figure_script(script=source, title='Synthetic scatter',
+        inputs_json=wrong, outputs_json=contract, _sandbox_runner=runner)
+    assert 'sha256' in rejected['error'] and calls == []
     _, result = figure_tools._run_research_figure_script(script=source, title='Synthetic scatter',
-        inputs_json=overview['inputs_binding'], outputs_json=contract, _sandbox_runner=runner)
+        inputs_json=binding, outputs_json=contract, _sandbox_runner=runner)
     assert calls == [{'input_0.csv': digest}], result
     assert result['deliverable_stage'] == 'figure_published', result
     figure = result['figures'][0]
@@ -100,6 +111,23 @@ def _exercise_real_figure():
     [card] = figures.snapshot().values()
     assert card['svg'].encode() == payload
     assert (card['download_url'], card['workbench_url']) == (entry['download_url'], figure['workspace_url'])
+
+    from unittest.mock import patch
+
+    # An outage of both optional presentation surfaces must not erase verified downloads.
+    legacy_source = source.split('emit.figure(')[0]
+    with (patch.object(figure_tools, '_record_project', return_value={}),
+          patch.object(figure_tools, '_register_figure', side_effect=OSError('preview down'))):
+        for index, (drawing, output_contract) in enumerate(((legacy_source, ''), (source, contract))):
+            _, file_only = figure_tools._run_research_figure_script(script=drawing,
+                title=f'File-only scatter {index}', inputs_json=binding,
+                outputs_json=output_contract, _sandbox_runner=runner)
+            assert file_only['_tool_outcome']['status'] == 'complete', file_only
+            assert file_only['_tool_outcome']['artifacts'], file_only
+            result_figure = file_only['figures'][0] if output_contract else file_only
+            assert not result_figure['project_registered'] and not result_figure['inline_registered']
+            assert {item['reason_code'] for item in result_figure['presentation_warnings']} == {
+                'project_persistence_failed', 'inline_registration_failed'}
 
     _, analysis = figure_tools._run_research_figure_script(script="emit.report({'checked': 5})\n",
         outputs_json={'version': 2, 'tables': [], 'figures': []}, _sandbox_runner=runner)

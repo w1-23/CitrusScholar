@@ -381,8 +381,8 @@ def _closed(task: str, label: str, reason_code: str, hint: str, *,
 def _collector_advice(facts: _Facts, *,
                       prefix: str = "按返回的 execution_id 取结果") -> str:
     if facts.has(COLLECT_TOOL):
-        return ("用返回的 execution_id 调 " + COLLECT_TOOL +
-                " 取本轮结果；追问或交付不要再派发")
+        return ("只有返回等待状态和 execution_id 才调用 " + COLLECT_TOOL +
+                "；同步报告直接使用并交付，review_id 不是 execution_id；追问不重派发")
     return prefix
 def _figure_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
     tools = facts.first(FIGURE_TOOL)
@@ -405,9 +405,9 @@ def _figure_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
     rows = [CapabilityRow(
         task="figure.script", label="科研绘图（脚本模式）", status=RUNNABLE, tools=tools,
         modes=("script",) if "mode" in arguments else (),
-        inputs=("本账号授权表（CSV/XLSX/PDF，按 file_id+sha256 绑定）与完整脚本或 script_ref",),
+        inputs=("本账号授权表（CSV/XLSX/PDF，按工具 schema 绑定 file_id）与完整脚本或 script_ref",),
         artifacts=artifacts, waits=facts.waits_for(tools),
-        hint="沙箱内一次性执行，渲染与 QA 由 Worker 完成，以工具回执与工作台项目为准" + forward_note,
+        hint="渲染和 QA 由 Worker 完成；分析不等于出图，只交付回执已确认的文件，不重复运行成功步骤" + forward_note,
         source="tool_specs+available_names")]
     template_hint = ("固定图型 " + "/".join(FIGURE_TEMPLATES)
                      + " 与脚本模式共用同一冻结输入、Worker、超时、输出合同、QA 与工作台项目")

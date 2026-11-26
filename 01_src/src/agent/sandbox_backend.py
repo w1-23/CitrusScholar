@@ -28,6 +28,7 @@ from deepagents.backends.protocol import (DeleteResult, EditResult, ExecuteRespo
 
 from src.code_execution import execution_bridge
 
+from .native_execute_receipt import backend_evidence
 from .workspace_backend import CitrusWorkspaceBackend
 from .workspace_storage import virtual_path
 
@@ -83,14 +84,22 @@ class CitrusSandboxBackend(SandboxBackendProtocol):
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Run one shell command inside the offline Code Worker sandbox."""
         owner, session, run_id = self._scope
+        evidence = backend_evidence.get()
+        if evidence is not None:
+            evidence.entered = True
         try:
             view = _SessionFiles(self._files.storage)
+        except Exception:
+            if evidence is not None:
+                evidence.not_run_reason = "execution_session_unavailable"
+            return ExecuteResponse(output="Error: execute not run (execution_session_unavailable).")
+        try:
             result = execution_bridge.execute(owner, session, run_id, command,
                                               timeout=timeout, view=view)
-        except Exception as exc:  # never let a host error become model text
-            return ExecuteResponse(output="Error: execute not run (backend_unavailable). "
-                                          f"{type(exc).__name__}",
-                                   exit_code=None, truncated=False)
+        except Exception:  # an unexpected error may have followed submission
+            return ExecuteResponse(output="The command's execution status could not be confirmed.")
+        if evidence is not None:
+            evidence.not_run_reason = result.not_run_reason
         return ExecuteResponse(output=result.output, exit_code=result.exit_code,
                                truncated=result.truncated)
 

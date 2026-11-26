@@ -70,7 +70,7 @@ class ToolSpec:
     write_scope: Optional[str] = None
     authorization: str = ""
     recovery_mode: str = "never"
-    # Code-owned pure validation, never supplied by model arguments or Skills.
+    # Code-owned preparation without persistent effects, never authored by a model.
     preflight: Optional[Callable] = None
 
 
@@ -693,14 +693,14 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
     args = normalized_args
     tool_call = {**tool_call, "args": args}
 
-    # Pure, code-owned extension validation belongs before dispatch as well.
-    # This handles JSON configuration semantics that the outer type schema
-    # cannot express; never infer no-side-effects from an arbitrary error text.
+    # Code-owned preparation runs before persistent effects and only in this
+    # invocation's context; it may carry validated data into the worker.
+    ctx = contextvars.copy_context()
     spec = get_tool_spec(tool_name)
     if spec is not None and spec.preflight is not None:
         from src.core.tool_errors import ToolArgumentError
         try:
-            spec.preflight(**args)
+            ctx.run(spec.preflight, **args)
         except ToolArgumentError as exc:
             return ToolMessage(content=f"[ERR_ARG] {exc}；本次未执行。请修正配置后重新提议。",
                 tool_call_id=tool_call["id"], name=tool_name, status="error",
@@ -716,7 +716,6 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
         token.set_deadline(exec_timeout)
 
     response_format = getattr(tool, "response_format", None)
-    ctx = contextvars.copy_context()
     # 记下真正在执行的工具名（写进 ctx，随 ctx.run 传入工具线程）。工具内部的
     # 成果登记用它记录生产者，使"文件由谁产出"可核查。
     from src.core.tracing import set_current_tool_name

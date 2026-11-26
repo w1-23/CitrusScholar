@@ -325,3 +325,21 @@ def test_live_research_prompt_and_stable_schemas_reach_actual_model_body():
     assert "source_routing_examples" not in prompt
     assert all(len(row["function"]["description"]) <= 230 for row in body["tools"])
     assert size > 0 and metrics["components"]["system"] > 0 and metrics["components"]["tool_schemas"] > 0
+
+
+
+def test_svg_correction_requires_same_label_and_verified_current_file():
+    from src.core.turn_outcome import repairable_proposal_reason
+
+    rejected = {"id": "bad-svg", "name": "draw_svg", "args": {"svg": "<svg>", "alt_text": "same plot"}}
+    corrected = {"id": "good-svg", "name": "draw_svg", "args": {"svg": "<svg/>", "alt_text": "same plot"}}
+    artifact = {"valid": True, "request_matches": True, "filename": "chart.svg",
+                "mime": "image/svg+xml", "producer_tool": "draw_svg", "link": "/verified-fixture"}
+    row = {"name": "draw_svg", "tool_call_id": "good-svg", "status": "complete",
+           "artifact_validations": [artifact]}
+    assert repairable_proposal_reason("svg_input_missing") and repairable_proposal_reason("svg_format_error")
+    assert not repairable_proposal_reason("svg_attempt_limit")
+    assert _same_repair_target(rejected, corrected, records=[row])
+    assert not _same_repair_target(rejected, corrected | {"args": {"alt_text": "another plot"}}, records=[row])
+    assert not _same_repair_target(rejected, corrected, records=[row | {"status": "unknown"}])
+    assert not _same_repair_target(rejected, corrected, records=[row | {"artifact_validations": []}])

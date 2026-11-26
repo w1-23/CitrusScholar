@@ -46,14 +46,14 @@ def _exercise(monkeypatch):
     tracing.set_user_id(OWNER)
     tracing.set_client_request_id(REQUEST)
     tracing.set_current_tool_name("run_research_figure_script")
-    tracing.set_original_query("用固定模板 volcano 绘制火山图并导出 PDF。")
+    tracing.set_original_query("用固定模板 volcano 绘制火山图并导出 SVG、PNG 和 PDF。")
     figures.begin_request()
     material = files.register_file(session_id=SESSION, owner_user_id=OWNER, filename="volcano.csv",
                                    mime="text/csv", content=CSV)
     digest = hashlib.sha256(CSV).hexdigest()
     compiled = template_registry.compile_request(
         "volcano", {"gene_col": "gene", "effect_col": "log2fc", "p_col": "padj", "top_labels": 2},
-        binding="data", title="Volcano", formats=("svg", "pdf"))
+        binding="data", title="Volcano", formats=("svg", "png", "pdf"))
     backend = LocalBackend()
     original = backend.run
     calls = []
@@ -65,7 +65,7 @@ def _exercise(monkeypatch):
     content, result = figure_tools._run_research_figure_script(
         script=compiled.main_script, outputs_json=compiled.output_contract,
         inputs_json={"data": {"file_id": material["file_id"]}},
-        formats_json='["svg", "pdf"]', title="Volcano",
+        formats_json='["svg", "png", "pdf"]', title="Volcano",
         _sandbox_runner=SimpleNamespace(run=run))
 
     assert isinstance(content, str) and content.startswith("{")
@@ -97,7 +97,13 @@ def _exercise(monkeypatch):
     figure = result["figures"][0]
     assert figure["project_registered"] and figure["inline_registered"], figure
     formats = {item["format"] for item in figure["exports"]}
-    assert {"svg", "pdf"} <= formats, formats
+    assert formats == {"svg", "png", "pdf"}, formats
+    from src.research.tools import validate_artifact_links
+
+    validated = validate_artifact_links([item["artifact_url"] for item in figure["exports"]],
+        session_id=SESSION, owner_user_id=OWNER, request_id=REQUEST)
+    assert len(validated) == 3 and all(item["valid"] and item["request_matches"]
+                                       for item in validated), validated
     project = store.get_project(figure["figure_id"], OWNER)
     source = project["source_json"]
     assert source["kind"] == "script"  # replay stays on the one worker byte path

@@ -121,6 +121,7 @@ def test_csv_is_scheduled_through_the_table_protocol_when_the_analyzer_supports_
     assert options["csv_table"]["source_sha256"] == CSV_DIGEST
     result = json.loads(body)
     assert result["status"] == "queued" and result["execution_id"] == "b" * 32
+    assert result["collect_required"] is True and result["completion_scope"] == "submission_only"
     assert result["input_contract"]["kind"] == "csv_table"
     assert result["input_contract"]["sheet_name"] is None
     assert artifact["_tool_outcome"]["status"] == "complete"
@@ -137,6 +138,9 @@ def test_csv_review_runs_through_the_real_generic_audit_route(generic):
     assert len(review_sheet_calls) == 1
     assert published == {}  # the host contract asked for text only
     assert result["route"] == "generic_data_audit" and result["review_id"]
+    assert result["collect_required"] is False and result["completion_scope"] == "final_report"
+    assert "execution_id" not in result and "_code_execution_id" not in artifact
+    assert result["review_url"].endswith(result["review_id"])
     assert result["input_contract"]["kind"] == "csv_table" and result["input_contract"]["sheet_name"] is None
     assert result["status"] in {"complete", "partial"}
     assert isinstance(result["findings"], list) and isinstance(result["coverage"], list)
@@ -327,3 +331,11 @@ def test_repeated_export_reuses_the_saved_report_without_rerunning_the_review(to
             assert artifact["_tool_outcome"]["artifacts"] == [urls[-1]]
     assert urls[0] == urls[1] and len(published) == 1
     assert json.loads(body)["saved_report"]["filename"].endswith(".csv")
+
+
+def test_csv_rejects_sheet_regions_on_generic_route(generic):
+    _, calls, _ = generic["cv"]
+    _, result = fusion_tools.run_external_skill.func(
+        "data-audit", {"csv_table": _ref()}, {"regions": [{"sheet": "Sheet1", "range": "A1:C4"}]})
+    assert result["_tool_outcome"]["reason_code"] == "external_csv_table_regions_not_allowed"
+    assert not calls

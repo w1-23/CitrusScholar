@@ -118,7 +118,8 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
                            profile: dict, settings, replay: tuple[dict, dict, dict]) -> tuple[str, dict]:
     from src.figures.sandbox import SandboxJob
     from src.figures.script_outputs import output_slots, strict_json, validate_receipt
-    from src.research.figure_tools import _owner, _session, _error, _publish, _record_project, _register_figure, _failed_qa_checks
+    from src.research.figure_tools import (_owner, _session, _error, _publish, _record_project,
+                                           _register_figure, _failed_qa_checks)
     from src.research.analysis_results import persist_prepared_dataset
     from src.research.tools import _safe_name
     from src.core.tracing import get_client_request_id, get_job_id, original_query
@@ -315,29 +316,38 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
             figure["delivery_stage"] = "figure_published"
             manifest["data_provenance"] = {"input_snapshots": source.get("input_snapshots", []),
                                           "dataset_refs": selected_refs, "execution_id": execution_id}
+            presentation_warnings = []
             started = monotonic()
-            project = _record_project(title=figure["title"], source_kind="script", source=figure_source,
-                manifest=manifest, exports=figure["exports"], data_refs=data_refs + selected_refs + frozen_refs)
-            timing["project_initialization"] += int((monotonic() - started) * 1000)
-            if project:
+            try:
+                project = _record_project(title=figure["title"], source_kind="script", source=figure_source,
+                    manifest=manifest, exports=figure["exports"], data_refs=data_refs + selected_refs + frozen_refs)
+                if not project:
+                    raise LookupError("figure project was not persisted")
                 from src.figures.projects import _can_edit
                 figure.update(figure_id=project["figure_id"], project_registered=True,
                               editable=_can_edit({**project, "source_kind": "script", "source_json": figure_source}),
                               workspace_url=f"/figures?project={project['figure_id']}")
                 if not figure["editable"]:
                     figure["edit_limitation"] = "已保存并可下载；仅样式编辑需要独立渲染和受支持的数值几何校验。"
-            else:
-                figure_errors.append({"reason_code": "project_persistence_failed", "error": "图件可下载，工作台项目未保存。"})
+            except Exception:
+                presentation_warnings.append({"reason_code": "project_persistence_failed",
+                                              "error": "图件可下载，工作台项目未能登记。"})
+            finally:
+                timing["project_initialization"] += int((monotonic() - started) * 1000)
             svg_export = next((entry for entry in figure["exports"] if entry["format"] == "svg"), None)
             if svg_export:
                 try:
                     figure["figure_placeholder"] = _register_figure(result.outputs[f"figure:{name}:svg"],
                         figure["title"], svg_export, workbench_url=figure.get("workspace_url", ""))
+                    if not figure["figure_placeholder"]:
+                        raise LookupError("inline figure was not registered")
                     placeholders.append(figure["figure_placeholder"])
                     figure["inline_registered"] = True
                 except Exception:
-                    figure_errors.append({"reason_code": "inline_registration_failed", "error": "图件可下载，内联预览未登记。"})
-            figure.update(status="partial" if figure_errors else "complete", failures=figure_errors)
+                    presentation_warnings.append({"reason_code": "inline_registration_failed",
+                                                  "error": "图件可下载，内联预览未登记。"})
+            figure.update(status="partial" if figure_errors else "complete", failures=figure_errors,
+                          presentation_warnings=presentation_warnings)
         except Exception as exc:
             stage = figure["delivery_stage"]
             reason = {"render_missing": "figure_render_missing", "rendered": "figure_verification_failed",

@@ -75,6 +75,7 @@ class ExecuteResult:
     output: str
     exit_code: int | None
     truncated: bool = False
+    not_run_reason: str = ""
 
 
 def _reason(exc):
@@ -84,10 +85,16 @@ def _reason(exc):
     return type(exc).__name__
 
 
-def _text(reason, detail=""):
-    return (f"Error: execute not run ({reason}). "
+def _not_run(reason, detail=""):
+    text = (f"Error: execute not run ({reason}). "
             "Commands run only inside the isolated offline Code Worker; there is no host "
             "shell fallback." + (f" {detail}" if detail else ""))
+    return ExecuteResult(text, None, not_run_reason=reason)
+
+
+def _unconfirmed(reason, detail=""):
+    text = f"Execution status could not be confirmed ({reason}). Do not retry automatically."
+    return ExecuteResult(text + (f" {detail}" if detail else ""), None)
 
 
 def enabled():
@@ -458,20 +465,26 @@ def _wait(service, execution_id, budget):
 def execute(owner, session, run_id, command, *, timeout=None, service=None, view=None):
     """Run one command in the offline Worker and return its bounded result."""
     if not enabled():
-        return ExecuteResult(_text("code_execution_disabled"), None)
+        return _not_run("code_execution_disabled")
     if not isinstance(command, str) or not command.strip():
-        return ExecuteResult(_text("empty_command"), None)
-    if len(command.encode("utf-8")) > MAX_COMMAND_BYTES:
-        return ExecuteResult(_text("command_too_long",
-                                   f"The limit is {MAX_COMMAND_BYTES} UTF-8 bytes."), None)
+        return _not_run("empty_command")
+    try:
+        size = len(command.encode("utf-8"))
+    except UnicodeEncodeError:
+        return _not_run("invalid_command_encoding")
+    if size > MAX_COMMAND_BYTES:
+        return _not_run("command_too_long", f"The limit is {MAX_COMMAND_BYTES} UTF-8 bytes.")
     try:
         identity = identify(owner, session, run_id)
     except Exception:
-        return ExecuteResult(_text("execution_scope_unavailable"), None)
-    if service is None:
-        from .service import ExecutionService
+        return _not_run("execution_scope_unavailable")
+    try:
+        if service is None:
+            from .service import ExecutionService
 
-        service = ExecutionService(identity)
+            service = ExecutionService(identity)
+    except Exception as exc:
+        return _not_run("execution_service_unavailable", _reason(exc))
     from .presence import worker_available
 
     try:
@@ -479,20 +492,23 @@ def execute(owner, session, run_id, command, *, timeout=None, service=None, view
     except Exception:
         ready = False
     if not ready:
-        return ExecuteResult(_text("code_worker_unavailable"), None)
+        return _not_run("code_worker_unavailable")
     if view is None:
-        return ExecuteResult(_text("execution_session_unavailable"), None)
+        return _not_run("execution_session_unavailable")
     try:
         deadline = run_deadline(identity)
+    except Exception as exc:
+        return _not_run("execution_deadline_unavailable", _reason(exc))
+    try:
         budget = effective_timeout(timeout, None if deadline is None else deadline - time.time())
     except ValueError as exc:
-        return ExecuteResult(_text(_reason(exc)), None)
+        return _not_run(_reason(exc))
 
     run_token, nonce = uuid.uuid4().hex, uuid.uuid4().hex
     try:
         prepared = _prepare(identity, service, view, command, budget, nonce, run_token)
     except Exception as exc:
-        return ExecuteResult(_text("workspace_preparation_failed", _reason(exc)), None)
+        return _not_run("workspace_preparation_failed", _reason(exc))
 
     # The Worker needs its own room to stop, collect and accept inside the row
     # deadline, so the sandbox budget always exceeds the command timeout.
@@ -502,8 +518,13 @@ def execute(owner, session, run_id, command, *, timeout=None, service=None, view
         # Workspace preparation can take time or overlap a stop request.
         # Do not enter the Worker queue after the run has lost admission.
         identify(owner, session, run_id)
-        if deadline is not None and deadline - time.time() < MIN_TIMEOUT_SEC + ACCEPTANCE_HEADROOM_SEC:
-            return ExecuteResult(_text("execute_run_deadline_exhausted"), None)
+    except Exception:
+        return _not_run("execution_scope_unavailable")
+    if deadline is not None and deadline - time.time() < MIN_TIMEOUT_SEC + ACCEPTANCE_HEADROOM_SEC:
+        return _not_run("execute_run_deadline_exhausted")
+    try:
+        # submit may raise after committing a queue row. An exception is no
+        # longer evidence that a command was never dispatched.
         row = service.submit(task_id=prepared["task_id"],
                              workspace_id=prepared["workspace_id"],
                              expected_revision=prepared["revision"],
@@ -515,13 +536,13 @@ def execute(owner, session, run_id, command, *, timeout=None, service=None, view
                              limits=ExecutionLimits(timeout_sec=sandbox_budget),
                              network_policy="offline", absolute_deadline=deadline)
     except Exception as exc:
-        return ExecuteResult(_text("submission_rejected", _reason(exc)), None)
+        return _unconfirmed("submission_unconfirmed", _reason(exc))
 
-    execution_id = row["execution_id"]
     try:
+        execution_id = row["execution_id"]
         status, expired = _wait(service, execution_id, sandbox_budget)
     except Exception as exc:
-        return ExecuteResult(_text("status_unavailable", _reason(exc)), None)
+        return _unconfirmed("status_unavailable", _reason(exc))
 
     fence = status.get("fence")
     stdout, stdout_size, stderr, stderr_size = b"", 0, b"", 0
@@ -569,13 +590,13 @@ def execute(owner, session, run_id, command, *, timeout=None, service=None, view
                                     f"command]" + tail, 124, True)
     if expired:
         return ExecuteResult(body + f"\n[timed out: the {budget}s budget ran out and the "
-                                    "Worker was asked to stop]" + tail, 124, True)
+                                    "Worker was asked to stop]" + tail, None, True)
     if state == "cancelled":
         return ExecuteResult(body + "\n[execution cancelled before it completed; no exit code "
                                     "is known]" + tail, None, truncated)
     if state == "timed_out":
         return ExecuteResult(body + f"\n[the Worker timed out after {sandbox_budget}s]" + tail,
-                             124, True)
+                             None, True)
     if state != "succeeded":
         reason = status.get("reason") or "worker_failure"
         return ExecuteResult(body + f"\n[execution ended as {state} "

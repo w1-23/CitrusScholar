@@ -79,6 +79,7 @@ def repairable_proposal_reason(reason: str) -> bool:
     """
     return reason in {"invalid_tool_arguments", "required_skill_not_loaded",
                       "preparation_required", "script_execution_rejected",
+                      "svg_input_missing", "svg_format_error",
                       "workspace_version_conflict", "workspace_revision_conflict",
                       "script_patch_target_missing", "script_patch_empty",
                       "script_patch_match_count", "script_patch_no_match",

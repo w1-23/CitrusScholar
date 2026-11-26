@@ -200,6 +200,19 @@ class RealCaptureContractTests(unittest.TestCase):
             "line": 1,
         }, result.message)
 
+    def test_legacy_single_figure_reads_a_frozen_dataset(self):
+        from src.figures.dataset_codec import encode_frame
+
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "dataset.json"
+            source.write_text(json.dumps(encode_frame(_frame())), encoding="utf-8")
+            result = LocalBackend().run(SandboxJob(job_id="legacy-dataset-fixture",
+                script="frame = load_dataset(tidy)\nfig, ax = plt.subplots()\nax.plot(frame['x'], frame['y'])\n",
+                inputs={"tidy": "dataset.json"}, sources={"tidy": str(source)},
+                outputs={"svg": "figure.svg"}))
+        self.assertTrue(result.ok, result.message)
+        self.assertIn(b"<svg", result.outputs["svg"])
+
     def test_legacy_v2_emit_figure_still_works(self):
         contract = normalize_output_contract({
             "version": 2, "tables": [], "figures": [

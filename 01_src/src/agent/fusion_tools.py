@@ -244,8 +244,9 @@ def _response(data, status="complete", reason="external_skill_ready", *, receipt
 
 def _queued(receipt, contract=None):
     execution_id = receipt["execution_id"]
-    payload = {"execution_id": execution_id, "status": receipt["status"], "instruction":
-               "Worker 已受理。等待框架恢复后，再读取执行结果。"}
+    payload = {"execution_id": execution_id, "status": receipt["status"],
+               "completion_scope": "submission_only", "collect_required": True,
+               "instruction": "这是 Worker 受理回执，不是审查结论。框架恢复后，用此 execution_id 调用 collect_external_skill。"}
     if contract is not None:
         payload["input_contract"] = contract
     return _response(payload, execution_id=execution_id)
@@ -386,11 +387,17 @@ def _csv_table_audit(*, data, filename, file_id, table, query, allow_publication
                                    % (table["record_count"], table["column_count"]),
                           "n_rows": table["record_count"], "n": table["column_count"]}],
             "evidence": []}
-    public = {"skill_id": "data-audit", "input_contract": table, "review_id": review_id,
+    public = {"completion_scope": "final_report", "collect_required": False,
+              "instruction": "此 CSV 已同步审查并返回结论，请直接使用本结果。review_id 不是 Worker execution_id，不调用 collect_external_skill。",
+              "skill_id": "data-audit", "input_contract": table, "review_id": review_id,
+              "review_url": (artifact.get("integrity_review") or {}).get("review_url", ""),
               "input": {"file_id": file_id, "sha256": table["source_sha256"], "filename": table["filename"]},
               "route": "generic_data_audit",
               "projection_status": projection.get("status"), "result_refs": result_refs,
               "publication_receipts": receipts, **evidence, **_summary(view)}
+    if public["findings_page"]["next_offset"] is not None:
+        public["findings_page"] = {**public["findings_page"], "next_offset": None, "truncated": True}
+        public["instruction"] += " 此处是发现摘要，完整记录见已保存的审查。"
     if isinstance(artifact.get("plot_datasets"), list):
         # Frozen by the adapter; passed through unchanged (no second dataset).
         public["plot_datasets"] = artifact["plot_datasets"]
@@ -399,7 +406,7 @@ def _csv_table_audit(*, data, filename, file_id, table, query, allow_publication
 
 @tool(args_schema=RunArgs, response_format="content_and_artifact")
 def run_external_skill(skill_id: SkillID, inputs=None, options=None):
-    """Run the pinned external literature, XLSX/XLSM/CSV data-audit, or research-integrity Skill. Use exact authorized file_id and sha256 per input role. Data audit accepts one workbook (workbook + confirmed sheet/A1 regions) or one CSV table (csv_table, no sheet). Literature accepts bibliography and/or typed references. No raw observations or URLs are accepted."""
+    """Run the pinned external literature, XLSX/XLSM/CSV data-audit, or research-integrity Skill. Use exact authorized file_id and sha256 per input role. Data audit accepts one workbook (workbook + confirmed sheet/A1 regions) or one CSV table (csv_table, no sheet). Literature accepts bibliography and/or typed references. No raw observations or URLs are accepted. Only call collect_external_skill when collect_required is true and execution_id is returned. A synchronous CSV result with collect_required=false is the final report. Never pass its review_id to collect_external_skill."""
     from .fusion_worker import schedule_fusion
     from .fusion_worker_contract import (CSV_TABLE_ROLE, WORKBOOK_EXTENSIONS, WORKBOOK_ROLE, csv_data_audit_route,
         confirmed_workbook_regions, csv_table_contract, data_audit_input_kind,
@@ -439,6 +446,9 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
                 # A CSV is a single table with logical records, not a workbook:
                 # no sheet name is invented and no regions are confirmed.
                 table = csv_table_contract(data, filename)
+                if (options or {}).get("regions"):
+                    return _response({"error": "CSV 是单表输入，不接受工作表区域；请按列名和记录范围审查。"},
+                                     "not_run", "external_csv_table_regions_not_allowed")
                 if csv_data_audit_route("data-audit", release) == "generic":
                     # The pinned analyzer cannot read a table. Reuse the real
                     # generic data-audit route on the same authorized bytes and
@@ -453,9 +463,6 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
                         return _response({"error": "CSV 表审查未能通过通用数据审查路径完成：%s" % exc,
                                           "csv_table": table, "route": "generic_data_audit"},
                                          "not_run", "external_csv_table_audit_unavailable")
-                if (options or {}).get("regions"):
-                    return _response({"error": "CSV 是单表输入，不接受工作表区域；请按列名和记录范围审查。"},
-                                     "not_run", "external_csv_table_regions_not_allowed")
                 options = {**(options or {}), "csv_table": {"header_rows": table["header_rows"],
                                                             "column_names": table["column_names"],
                                                             "source_sha256": table["source_sha256"]}}
@@ -695,7 +702,7 @@ def _deliver(identity, value, execution_id, skill_id, *, findings_offset=0, hist
 
 @tool(args_schema=CollectArgs, response_format="content_and_artifact")
 def collect_external_skill(execution_id: str, skill_id: SkillID, publish_excel: bool = False, findings_offset: int = 0):
-    """Read the current turn's settled external Skill result by exact execution_id. The host decides whether to publish a requested file. When findings_page.next_offset is present, pass that offset to read the next page of the same exact report."""
+    """Read a Worker result from the current turn. Pass only the exact execution_id from a response with collect_required=true. A synchronous CSV report is already returned by run_external_skill and has only a review_id, which is not collectible. The host authorizes publication. For a collected report, pass findings_page.next_offset to read its next page."""
     from .fusion_worker import consume_fusion
 
     try:
@@ -703,7 +710,8 @@ def collect_external_skill(execution_id: str, skill_id: SkillID, publish_excel: 
         value = consume_fusion(identity, execution_id=execution_id, skill_release=release, skill_id=skill_id)
         return _deliver(identity, value, execution_id, skill_id, findings_offset=findings_offset)
     except (KeyError, LookupError, PermissionError, ValueError, OSError):
-        return _response({"error": "执行结果不可用。"}, "not_run", "external_skill_report_unavailable")
+        return _response({"error": "未找到本轮可读取的 Worker 执行结果。请核对受理回执返回的 execution_id；同步 CSV 的 review_id 不用于收集，请直接使用运行工具已返回的结果。"},
+                         "not_run", "external_skill_report_unavailable")
 
 
 @tool(args_schema=ReportPage, response_format="content_and_artifact")

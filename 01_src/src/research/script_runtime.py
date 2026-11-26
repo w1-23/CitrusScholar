@@ -93,7 +93,7 @@ def _validate_new_script_inputs(bindings, owner, analysis_result_ref=None):
     resolved = normalize_script_bindings(bindings)
     total = 0
 
-    def check_file(file_id, *, allow_internal=False):
+    def check_file(file_id, *, allow_internal=False, expected_sha256=None):
         nonlocal total
         original = files.get_account_file(file_id, owner, allow_internal=allow_internal)
         if not original:
@@ -107,8 +107,8 @@ def _validate_new_script_inputs(bindings, owner, analysis_result_ref=None):
         if len(payload) > 32 * 1024 * 1024 or total > 64 * 1024 * 1024:
             raise ProjectError("invalid_inputs", "脚本输入超过体积上限。")
         digest = hashlib.sha256(payload).hexdigest()
-        if original.get("sha256") and original["sha256"] != digest:
-            raise ProjectError("source_changed", "原始输入已改变，请登记新的数据版本。")
+        if any(expected != digest for expected in (original.get("sha256"), expected_sha256) if expected):
+            raise ProjectError("source_changed", "输入字节与登记或调用提供的 sha256 不匹配。请重新探查并绑定正确的文件版本。")
 
     if analysis_result_ref:
         analysis = load_analysis_result(owner, analysis_result_ref)
@@ -133,7 +133,7 @@ def _validate_new_script_inputs(bindings, owner, analysis_result_ref=None):
             if payload_file_ref:
                 check_file(payload_file_ref, allow_internal=True)
         else:
-            check_file(raw["file_id"])
+            check_file(raw["file_id"], expected_sha256=raw.get("sha256"))
 
 
 def _finalize(assets, owner, session, run, status, payload):

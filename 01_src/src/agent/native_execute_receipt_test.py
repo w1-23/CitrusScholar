@@ -60,3 +60,54 @@ def test_unavailable_worker_is_not_run(scope, monkeypatch):
     receipt = asyncio.run(dispatch_once(scope, call, invoke))
     assert receipt.additional_kwargs["execution_dispatched"] is False
     assert receipt.artifact["_tool_outcome"]["status"] == "not_run"
+
+
+@pytest.mark.parametrize("args, reason", [
+    ({"command": " "}, "empty_command"),
+    ({"command": "echo fixture", "timeout": -1}, "native_execute_rejected"),
+])
+def test_pinned_sdk_preflight_reaches_durable_not_run(scope, monkeypatch, args, reason):
+    from types import SimpleNamespace
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+    from src.agent.sandbox_backend import CitrusSandboxBackend
+
+    monkeypatch.setenv("CITRUS_CODE_EXECUTION", "offline-development")
+    backend = CitrusSandboxBackend(scope.owner_user_id, scope.session_id, scope.run_id)
+    tool = next(tool for tool in FilesystemMiddleware(backend=backend).tools if tool.name == "execute")
+    call = {"id": "sdk-refusal", "args": args}
+
+    async def invoke():
+        return await tool.coroutine(**args, runtime=SimpleNamespace(tool_call_id=call["id"]))
+
+    result = asyncio.run(dispatch_once(scope, call, invoke))
+    assert result.status == "error"
+    assert result.additional_kwargs["execution_dispatched"] is False
+    assert result.additional_kwargs["operation_uncertain"] is False
+    assert result.artifact["_tool_outcome"] == {"status": "not_run", "reason_code": reason}
+    with task_events.transaction() as conn:
+        [row] = conn.execute("SELECT status FROM task_operations WHERE job_id=?", (scope.run_id,))
+    assert row["status"] == "not_run"
+
+
+def test_backend_exception_is_not_relabelled_not_run(scope, monkeypatch):
+    from types import SimpleNamespace
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+    from src.agent.sandbox_backend import CitrusSandboxBackend
+
+    def lose_observation(*args, **kwargs):
+        raise OSError("not for model output")
+
+    monkeypatch.setattr(execution_bridge, "execute", lose_observation)
+    backend = CitrusSandboxBackend(scope.owner_user_id, scope.session_id, scope.run_id)
+    tool = next(tool for tool in FilesystemMiddleware(backend=backend).tools if tool.name == "execute")
+    call = {"id": "backend-unconfirmed", "args": {"command": "echo fixture"}}
+
+    async def invoke():
+        return await tool.coroutine(**call["args"], runtime=SimpleNamespace(tool_call_id=call["id"]))
+
+    result = asyncio.run(dispatch_once(scope, call, invoke))
+    assert result.artifact["_tool_outcome"]["status"] == "unknown"
+    assert result.additional_kwargs["operation_uncertain"] is True
+    assert result.additional_kwargs.get("execution_dispatched") is not False
+    assert "could not be confirmed" in result.content
+    assert "not for model output" not in result.content

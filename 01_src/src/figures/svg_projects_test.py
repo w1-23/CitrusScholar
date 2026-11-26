@@ -16,6 +16,7 @@ import pytest
 
 pytest.importorskip("citrus_figures")
 
+from src.agent.workspace_backend_test import scope  # admitted test job
 from src.figures import projects, store, svg_projects
 from src.figures.nature_runtime import current_vendor_root
 
@@ -382,3 +383,85 @@ def test_chat_figure_link_allowlist_keeps_historical_and_exact_legacy_routes():
     ):
         _, placeholder = figures.register(_architecture_svg(), "Synthetic", workbench_url=url)
         assert (f"]({url})" in figures.expand(placeholder)) is accepted
+
+
+@pytest.mark.parametrize("source, marker", [("", "SVG_INPUT_MISSING"), ("<svg>", "SVG_FORMAT_ERROR")])
+def test_draw_svg_invalid_input_never_dispatches(scope, source, marker, monkeypatch):
+    import asyncio
+    from src.core import figures, task_events
+    from src.tools import registry
+    from src.tools.draw_svg import draw_svg
+    from src.tools.outcome import safe_tool_step
+    from src.tools.tool_specs import spec_by_name
+
+    def unexpected_dispatch(*args, **kwargs):
+        pytest.fail("an SVG preflight failure must not dispatch or publish")
+
+    figures.begin_request()
+    monkeypatch.setattr(registry, "_TOOL_SPECS", {})
+    monkeypatch.setattr("src.tools.draw_svg._persist_svg", unexpected_dispatch)
+    registry.register_declared_tool(spec_by_name("draw_svg"), draw_svg)
+    message = asyncio.run(registry.run_tool_operation(draw_svg, {
+        "name": "draw_svg", "id": "invalid-svg", "args": {"svg": source},
+    }, require_durable=True, on_dispatch=unexpected_dispatch))
+    outcome = safe_tool_step("draw_svg", message.content, message.artifact)
+    assert f"[{marker}]" in message.content
+    assert message.additional_kwargs["execution_dispatched"] is False
+    assert outcome["status"] == "not_run" and not outcome["retryable"]
+    assert figures.count() == 0
+    with task_events.transaction() as conn:
+        [row] = conn.execute("SELECT status FROM task_operations WHERE job_id=?", (scope.run_id,))
+    assert row["status"] == "not_run"
+
+
+def test_draw_svg_attempt_budget_is_shared_by_preflight_and_dispatch(scope, monkeypatch):
+    import asyncio
+    from src.core import figures
+    from src.tools import draw_svg as module, registry
+    from src.tools.outcome import safe_tool_step
+    from src.tools.tool_specs import spec_by_name
+
+    sanitized = []
+    original = module.sanitize_svg
+
+    def count_sanitizations(source):
+        sanitized.append(source)
+        return original(source)
+
+    dispatched = []
+    figures.begin_request()
+    monkeypatch.setattr(registry, "_TOOL_SPECS", {})
+    monkeypatch.setattr(module, "sanitize_svg", count_sanitizations)
+    monkeypatch.setattr(module, "_persist_svg", lambda *args: None)
+    registry.register_declared_tool(spec_by_name("draw_svg"), module.draw_svg)
+
+    async def run():
+        sources = ["<svg>"] * (module._MAX_ATTEMPTS_PER_REQUEST - 1) + [_architecture_svg()] * 2
+        results = []
+        for i, source in enumerate(sources):
+            message = await registry.run_tool_operation(module.draw_svg, {
+                "name": "draw_svg", "id": f"svg-{i}", "args": {"svg": source},
+            }, require_durable=True, on_dispatch=lambda: dispatched.append(i))
+            results.append((message, safe_tool_step("draw_svg", message.content, message.artifact)))
+        return results
+
+    results = asyncio.run(run())
+    assert [outcome["status"] for _, outcome in results] == ["not_run"] * 3 + ["complete", "not_run"]
+    assert "[SVG_ATTEMPT_LIMIT]" in results[-1][0].content
+    assert dispatched == [3]
+    assert len(sanitized) == module._MAX_ATTEMPTS_PER_REQUEST
+    assert figures.count() == 1
+
+
+def test_draw_svg_attempt_limit_reports_no_drawing():
+    from src.core import figures
+    from src.tools.draw_svg import _MAX_ATTEMPTS_PER_REQUEST, draw_svg
+    from src.tools.outcome import normalize_tool_outcome
+
+    figures.begin_request()
+    for _ in range(_MAX_ATTEMPTS_PER_REQUEST):
+        figures.bump_attempts()
+    text = draw_svg.invoke({"svg": _architecture_svg()})
+    outcome = normalize_tool_outcome("draw_svg", text)
+    assert (outcome.status, outcome.reason_code) == ("not_run", "svg_attempt_limit")
+    assert figures.count() == 0

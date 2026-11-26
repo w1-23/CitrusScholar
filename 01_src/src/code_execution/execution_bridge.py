@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -157,7 +158,10 @@ def effective_timeout(requested, remaining=None):
     else:
         value = requested or DEFAULT_TIMEOUT_SEC
     value = max(MIN_TIMEOUT_SEC, min(int(value), MAX_TIMEOUT_SEC))
-    if remaining is not None:
+    # The run ledger uses +inf when only per-command limits apply.
+    if remaining is not None and remaining != math.inf:
+        if not math.isfinite(remaining):
+            raise ValueError("execute_run_deadline_exhausted")
         usable = int(remaining) - ACCEPTANCE_HEADROOM_SEC
         if usable < MIN_TIMEOUT_SEC:
             raise ValueError("execute_run_deadline_exhausted")

@@ -382,6 +382,10 @@ def test_wait_cancels_a_stuck_worker(worker, monkeypatch):
 
 def test_a_run_deadline_caps_the_command_timeout():
     assert execution_bridge.effective_timeout(None, None) == 120
+    assert execution_bridge.effective_timeout(None, float("inf")) == 120
+    for invalid in (float("nan"), -float("inf")):
+        with pytest.raises(ValueError, match="execute_run_deadline_exhausted"):
+            execution_bridge.effective_timeout(None, invalid)
     assert execution_bridge.effective_timeout(30, None) == 30
     assert execution_bridge.effective_timeout(10_000, None) == execution_bridge.MAX_TIMEOUT_SEC
     assert execution_bridge.effective_timeout(None, 90) == 60

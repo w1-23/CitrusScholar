@@ -600,6 +600,14 @@ class HarnessRuntime:
             from src.config import settings as runtime_settings
             options["task_subagent"] = bool(getattr(runtime_settings, "AGENT_ENABLE_TASK_SUBAGENT", True))
         middleware = [Suspension(), Policy(), ProviderPolicy()]
+        from src.config import settings as project_rule_settings
+
+        bindings = project_rule_settings.AGENT_PROJECT_RULE_BINDINGS
+        if bindings:
+            from .project_memory import configured_project_memory
+
+            if project_memory := configured_project_memory(identity, bindings):
+                middleware.append(project_memory)
         approval_tools = adapter.native_approval_tools
         denied_approval_calls = set()
         if approval_tools:

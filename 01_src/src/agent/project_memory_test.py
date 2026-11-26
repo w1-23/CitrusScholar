@@ -78,3 +78,47 @@ def test_framework_checkpoint_does_not_keep_an_old_project(tmp_path):
         assert "Project Beta rules only" in sent[1] and "Project Alpha rules only" not in sent[1]
 
     asyncio.run(scenario())
+
+
+
+def test_configured_project_rules_reach_only_the_exact_harness_session(monkeypatch):
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    from src.agent.framework_test_support import ScriptedModel
+    from src.agent.harness import HarnessRuntime, RunLimits
+    from src.config import settings
+
+    one = ExecutionIdentity(7, "session-a", "turn-a", "run-a")
+    sent = []
+    text = "Project Alpha style fixture only"
+    entry = dict(owner_user_id=7, session_id="session-a", namespace="project/alpha", version=1,
+                 content=text, digest=sha256(text.encode()).hexdigest())
+
+    async def model(messages, identity, **_):
+        sent.append("\n".join(msg.text for msg in messages if isinstance(msg, SystemMessage)))
+        return AIMessage("done", additional_kwargs=identity.message_metadata("assistant"))
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail("unexpected tool call")
+
+    async def noop(*args, **kwargs):
+        pass
+
+    async def accepted(*args, **kwargs):
+        return SimpleNamespace(accepted=True)
+
+    async def ask(identity, bindings):
+        monkeypatch.setattr(settings, "AGENT_PROJECT_RULE_BINDINGS", bindings)
+        harness = HarnessRuntime(ScriptedModel(script=model), unexpected, noop, accepted, RunLimits(4), [])
+        await harness.run(identity, [HumanMessage("fixture")], saver=InMemorySaver(),
+                          agent_options={"task_subagent": False, "summary_enabled": False})
+
+    async def scenario():
+        await ask(one, [entry])
+        await ask(replace(one, session_id="session-b", run_id="run-b"), [entry])
+        await ask(one, [entry, entry])
+        await ask(one, [{**entry, "digest": "0" * 64}])
+
+    asyncio.run(scenario())
+    assert len(sent) == 4 and text in sent[0]
+    assert all(text not in request for request in sent[1:])

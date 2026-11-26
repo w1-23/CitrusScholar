@@ -349,6 +349,8 @@ class Settings(BaseSettings):
     # Opt-in only for the bounded shared index build request; does not grant publication rights.
     PERMISSION_NATIVE_SHARED_INDEX: bool = Field(
         default_factory=lambda: _yaml_val("permission", "native_shared_index", default=False))
+    AGENT_PROJECT_RULE_BINDINGS: list[dict[str, Any]] = Field(
+        default_factory=lambda: _yaml_val("agent", "project_rule_bindings", default=[]), repr=False)
     # A workspace-scoped grant is still session-bound by default. Operators may
     # explicitly opt into cross-session reuse; the agent never assumes it.
     PERMISSION_WORKSPACE_CROSS_SESSION: bool = Field(

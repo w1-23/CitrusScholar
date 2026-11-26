@@ -42,6 +42,26 @@ class _PinnedRules:
         return self.download_files(paths)
 
 
+def configured_project_memory(identity, bindings):
+    """Resolve one exact, operator-owned session binding. No input paths or ambient lookup."""
+    if type(bindings) is not list or not 1 <= len(bindings) <= 128:
+        return None
+    matching = [row for row in bindings if type(row) is dict and
+                row.get("owner_user_id") == identity.owner_user_id and row.get("session_id") == identity.session_id]
+    if len(matching) != 1:
+        return None
+    entry = matching[0]
+    if set(entry) != {"owner_user_id", "session_id", "namespace", "version", "digest", "content"}:
+        return None
+    text = entry["content"]
+    if type(text) is not str or not 0 < len(text) <= MAX_RULES_BYTES:
+        return None
+    try:
+        return ScopedProjectMemory(identity, AuthorizedProjectRules(**{**entry, "content": text.encode("utf-8")}))
+    except (TypeError, ValueError):
+        return None
+
+
 class ScopedProjectMemory(MemoryMiddleware):
     """Reuse native loading/formatting without trusting cached checkpoint memory."""
 

@@ -34,7 +34,7 @@ STYLE_VERSION = "citrus-manuscript/1"
 
 LATIN_FAMILIES: tuple[str, ...] = ("Arial", "Helvetica", "DejaVu Sans", "Liberation Sans")
 CJK_FAMILIES: tuple[str, ...] = (
-    "Noto Sans CJK SC", "Source Han Sans SC", "Noto Sans SC", "SimHei", "Microsoft YaHei",
+    "Noto Sans CJK SC", "Source Han Sans SC", "Noto Sans SC", "SimHei", "Microsoft YaHei", "Noto Sans CJK JP",
 )
 
 # Families the worker is allowed to offer as verified choices. The workbench

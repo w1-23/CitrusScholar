@@ -139,3 +139,37 @@ def test_template_mode_rejects_script_source_and_contract_overrides(monkeypatch)
         assert payload["_tool_outcome"]["status"] == "not_run", options
         assert payload["_tool_outcome"]["reason_code"] == "template_request_rejected"
     runner.assert_not_called()
+
+
+
+def test_figure_support_uses_sealed_members_and_rejects_changed_bytes(tmp_path):
+    import pytest
+    from src.figures.engine_bundle import _sealed_support_files
+
+    relative = "packages/citrus_figures/__init__.py"
+    module = tmp_path / relative
+    module.parent.mkdir(parents=True)
+    module.write_bytes(b"# sealed package")
+    signed = module.read_bytes()
+    pin = {"bytes": len(signed), "sha256": hashlib.sha256(signed).hexdigest()}
+    inventory = tmp_path / "LINUX-SOURCE-MANIFEST.json"
+    commit = "a" * 40
+    inventory.write_text(json.dumps({"schema": "citrusscholar.linux-source/1",
+        "integrated_branch_commit": commit, "members": {relative: pin},
+        "inventory_scope": "All archived regular members except this manifest"}))
+    for path in (module, inventory):
+        path.chmod(0o400)
+    tmp_path.chmod(0o500)
+    try:
+        bundle = _sealed_support_files(tmp_path, {"citrus_figures"}, commit)
+        assert bundle["citrus_figures/__init__.py"] == signed
+        assert json.loads(bundle["support-manifest.json"])["source_commit"] == commit
+        with pytest.raises(ValueError, match="identity mismatch"):
+            _sealed_support_files(tmp_path, {"citrus_figures"}, "b" * 40)
+        module.chmod(0o600)
+        module.write_bytes(b"# altered bytes!")
+        module.chmod(0o400)
+        with pytest.raises(ValueError, match="integrity mismatch"):
+            _sealed_support_files(tmp_path, {"citrus_figures"}, commit)
+    finally:
+        tmp_path.chmod(0o700)

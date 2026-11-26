@@ -80,6 +80,8 @@ def test_workbench_menu_is_the_verified_set_not_the_host_list():
     menu = typography.verified_families(installed)
     assert set(menu) == {"DejaVu Sans", "Liberation Sans", "Arial"}
     assert "Random Host Font" not in menu
+    assert typography.verified_families(["DejaVu Sans", "Noto Sans CJK JP", "Other"]) == [
+        "DejaVu Sans", "Noto Sans CJK JP"]
     assert typography.verified_families(["Only Some Host Font"]) == ["Only Some Host Font"]
 
 

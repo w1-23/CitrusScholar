@@ -1,133 +1,78 @@
-"""Installed tool contracts; implementations are imported only on resolution.
+"""Installed tool contracts, projected from the single declarative ToolSpec table.
 
-The adjacent JSON is a code-owned package resource, generated at development
-time from the installed tools. It is never supplied by a request, skill, model,
-or workspace document. Import targets and policy metadata live in Python below;
-the manifest cannot introduce executable targets or grant permissions.
+``src.tools.tool_specs`` declares every installed tool once: name, import target,
+category, concurrency key, write scope, ``requires``, ``produces``,
+``authorization``, recovery mode, extension validator and the presentation facts.
+This module only projects those rows:
+
+* the lazy Host ``CapabilityCatalog`` (``build_preset_catalog``);
+* the readiness/authorization bindings (``preset_bindings``);
+* the scheduling and presentation metadata (``preset_metadata``);
+* the packaged JSON schema manifest (``generate_tool_manifest``).
+
+The adjacent JSON is a code-owned package resource, generated at development time
+from the same rows. It is never supplied by a request, skill, model, or workspace
+document: the manifest cannot introduce executable targets, grant permissions or
+change a capability. Implementations are imported only when one selected tool is
+loaded, never while describing the catalogue.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
 from functools import partial
-from importlib import import_module
 from importlib.resources import files
 import json
 import inspect
-from types import MappingProxyType
 
 from src.agent.capabilities import CapabilityCatalog, CapabilityDefinition, CapabilityLoadError
+from src.tools.tool_specs import IMPORT_TARGETS, TOOL_DECLARATIONS, ToolSpec
 
 # One process uses one installed contract snapshot, including lazily loaded tools.
 # Updating package files requires a new process; no request hot-reloads metadata.
 _INSTALLED_MANIFEST = files(__package__).joinpath("preset_tool_schemas.json").read_text(encoding="utf-8")
 
-__all__ = ["build_preset_catalog", "preset_bindings", "preset_metadata"]
+__all__ = ["build_preset_catalog", "canonical_tool_schema", "generate_tool_manifest",
+           "preset_bindings", "preset_metadata"]
 
-# Original named imports in tools/legacy_registry.py. Never resolve a module or
-# attribute from manifest/request text. Updating this whitelist is a code change.
-_TARGETS = MappingProxyType({
-    "request_user_input": "src.tools.interaction",
-    "deepseek_search": "src.tools.deepseek_search_fetch",
-    "deepseek_fetch": "src.tools.deepseek_search_fetch",
-    "browse_web": "src.tools.browse_web",
-    "deepseek_fetch_paper": "src.tools.deepseek_search_fetch",
-    "local_hybrid_search": "src.tools.deepseek_search_fetch",
-    "read_candidate": "src.tools.candidate_tools",
-    "search_candidates": "src.tools.candidate_tools",
-    "draw_svg": "src.tools.draw_svg",
-    "read_account_file": "src.tools.account_files",
-    "read_tool_result": "src.research.result_tools",
-    "research_workspace": "src.research.workspace_tools",
-    "inspect_uploaded_table": "src.research.tools",
-    "audit_uploaded_data": "src.research.tools",
-    "search_literature": "src.research.tools",
-    "verify_uploaded_references": "src.research.tools",
-    "fetch_and_audit_open_supplements": "src.research.tools",
-    "word_document": "src.research.word_tools",
-    "deliver_research_artifact": "src.research.delivery_tools",
-    "save_research_note": "src.research.tools",
-    "recall_research_notes": "src.research.tools",
-    "analyze_research_data": "src.research.statistics_tools",
-    "audit_research_images": "src.research.image_integrity_tools",
-    "run_research_figure_script": "src.research.figure_tools",
-    "propose_document_ingest": "src.shared_corpus.tool_adapter",
-    "prepare_document": "src.shared_corpus.tool_adapter",
-    "commit_document_index": "src.shared_corpus.tool_adapter",
-    "search_agent_corpus": "src.shared_corpus.tool_adapter",
-})
+# Compatibility views of the one declaration table. They are projections of the
+# ToolSpec rows, never a second hand-written copy: ``_TARGETS`` is the import
+# target of each row and ``_PRESETS`` is the row itself. The manifest script and
+# older callers read these names; new code should read the rows directly.
+_TARGETS: Mapping[str, str] = IMPORT_TARGETS
+_PRESETS: tuple[ToolSpec, ...] = TOOL_DECLARATIONS
 
 
-@dataclass(frozen=True)
-class _Preset:
-    name: str
-    category: str
-    concurrency_key: str
-    write_scope: str | None
-    requires: tuple[str, ...]
-    produces: tuple[str, ...]
-    authorization: str = ""
-    recovery_mode: str = "never"
-
-    @property
-    def execution_mode(self) -> str:
-        if self.category == "interaction":
-            return "interaction"
-        return "sequential" if self.write_scope is not None else "parallel"
+def _rows(specs: Iterable[ToolSpec] | None) -> tuple[ToolSpec, ...]:
+    """The declared rows, or an explicit set when a caller supplies one."""
+    return TOOL_DECLARATIONS if specs is None else tuple(specs)
 
 
-# Snapshot of _TOOL_DECLARATIONS, with registry.py's effective recovery policy.
-# The development equivalence test checks these against the installed legacy
-# declarations, but production discovery never imports that eager registry.
-_PRESETS = (
-    _Preset("request_user_input", "interaction", "user_question", None, ("session",), ()),
-    _Preset("deepseek_search", "web", "deepseek_search", None, ("network",), ()),
-    _Preset("deepseek_fetch", "web", "deepseek_fetch", None, ("network",), ()),
-    _Preset("browse_web", "web", "browse_web", "session_artifact", ("network", "session"), ()),
-    _Preset("deepseek_fetch_paper", "web", "deepseek_fetch_paper", None, ("network",), ()),
-    _Preset("local_hybrid_search", "rag", "local_hybrid_search", None, ("local_corpus",), ()),
-    _Preset("read_candidate", "rag", "candidate_pool", None, ("local_corpus", "candidate_pool"), ()),
-    _Preset("search_candidates", "rag", "candidate_pool", None, ("local_corpus", "candidate_pool"), ()),
-    _Preset("draw_svg", "analysis", "draw_svg", "session_artifact", (), ("figure",)),
-    _Preset("read_account_file", "files", "read_account_file", None, ("account_files",), (), recovery_mode="local_read"),
-    _Preset("read_tool_result", "files", "read_tool_result", None, ("session",), ()),
-    _Preset("research_workspace", "research", "research_workspace", "session_artifact", ("session", "research_tools"), ()),
-    _Preset("inspect_uploaded_table", "research", "research_data", None, ("research_tools", "session"), ()),
-    _Preset("audit_uploaded_data", "research", "research_data", "session_artifact", ("research_tools", "session"), ("annotation_table", "report_json")),
-    _Preset("search_literature", "web", "literature_search", None, ("network",), ()),
-    _Preset("verify_uploaded_references", "research", "research_references", "session_artifact", ("research_tools", "session"), ("verification_sheet",)),
-    _Preset("fetch_and_audit_open_supplements", "research", "research_web_fetch", "session_artifact", ("network", "research_tools", "session"), ("supplement_archive", "supplement_report")),
-    _Preset("word_document", "research", "word_documents", "session_artifact", ("session", "research_tools"), ("report_docx",)),
-    _Preset("deliver_research_artifact", "research", "research_artifacts", "session_artifact", ("session", "research_tools"), ("table_file", "bibliography", "report_html", "gap_csv")),
-    _Preset("save_research_note", "research", "research_notes", "account_record", ("session", "research_tools"), ("note",), "explicit_user_request"),
-    _Preset("recall_research_notes", "research", "research_notes", None, ("research_tools",), ()),
-    _Preset("analyze_research_data", "research", "research_statistics", "session_artifact", ("research_tools", "session"), ("statistics_report",)),
-    _Preset("audit_research_images", "research", "research_image_integrity", "session_artifact", ("account_files", "research_tools", "session"), ("report_json",)),
-    _Preset("run_research_figure_script", "research", "research_artifacts", "session_artifact", ("session", "research_tools", "script_sandbox"), ("figure_package",)),
-    # Administrator-published shared literature; visibility is gated by the
-    # shared corpus runtime through the ``shared_corpus`` requirement.
-    _Preset("propose_document_ingest", "research", "shared_corpus_proposal", "account_record", ("shared_corpus",), ()),
-    _Preset("prepare_document", "research", "shared_corpus_prepare", "account_record", ("shared_corpus",), ()),
-    _Preset("commit_document_index", "research", "shared_corpus_build", "account_record", ("shared_corpus",), ()),
-    _Preset("search_agent_corpus", "rag", "shared_corpus_search", None, ("shared_corpus",), ()),
-)
-
-
-def preset_bindings() -> dict[str, tuple[tuple[str, ...], tuple[str, ...], str]]:
+def preset_bindings(specs: Iterable[ToolSpec] | None = None
+                    ) -> dict[str, tuple[tuple[str, ...], tuple[str, ...], str]]:
     """Host readiness/authorization inputs; discovery itself grants no rights."""
-    return {p.name: (p.requires, p.produces, p.authorization) for p in _PRESETS}
+    return {p.name: (p.requires, p.produces, p.authorization) for p in _rows(specs)}
 
 
-def preset_metadata() -> dict[str, dict]:
-    """Return independent policy records without loading implementations."""
+def preset_metadata(specs: Iterable[ToolSpec] | None = None) -> dict[str, dict]:
+    """Return independent policy and presentation records without loading tools."""
     return {p.name: {
         "category": p.category, "concurrency_key": p.concurrency_key,
-        "write_scope": p.write_scope, "is_readonly": p.write_scope is None,
+        "write_scope": p.write_scope, "is_readonly": p.is_readonly,
         "authorization": p.authorization, "recovery_mode": p.recovery_mode,
         "execution_mode": p.execution_mode,
-    } for p in _PRESETS}
+        # Presentation facts live on the same row, so a front end, an API tool
+        # directory and the model schema cannot disagree about one tool.
+        "display_label": p.display_label, "link_label": p.link_label,
+        "capabilities": list(p.capabilities),
+    } for p in _rows(specs)}
 
 
-def _read_manifest() -> dict[str, dict]:
+def _read_manifest(specs: Iterable[ToolSpec] | None = None) -> dict[str, dict]:
+    rows = _rows(specs)
+    # The fail-closed name check is against the projection being built: an
+    # installed manifest may never name a tool that is not declared here, and a
+    # caller that supplies explicit rows (tests, tooling) gets the same rule.
+    targets = _TARGETS if specs is None else {p.name: p.import_target for p in rows}
     manifest = json.loads(_INSTALLED_MANIFEST)
     if set(manifest) != {"version", "tools"} or manifest["version"] != 1:
         raise ValueError("invalid_preset_manifest")
@@ -135,20 +80,24 @@ def _read_manifest() -> dict[str, dict]:
         raise ValueError("invalid_preset_schemas")
     schemas = {}
     for schema in manifest["tools"]:
-        if not isinstance(schema, dict) or set(schema) != {"type", "function"} or schema["type"] != "function":
+        if (not isinstance(schema, dict) or set(schema) != {"type", "function"}
+                or schema["type"] != "function"):
             raise ValueError("invalid_preset_schema")
         function = schema["function"]
         if not isinstance(function, dict) or set(function) != {"name", "description", "parameters"}:
             raise ValueError("invalid_preset_function")
         name = function["name"]
-        if not isinstance(name, str) or name not in _TARGETS or name in schemas:
+        # ``targets`` is derived from the same rows; the lookup stays fail-closed
+        # so a hand-edited manifest still cannot name an undeclared tool.
+        if not isinstance(name, str) or name not in targets or name in schemas:
             raise ValueError("unknown_or_duplicate_preset")
         if not isinstance(function["description"], str) or not function["description"].strip():
             raise ValueError("invalid_preset_description")
-        if not isinstance(function["parameters"], dict) or function["parameters"].get("type") != "object":
+        if (not isinstance(function["parameters"], dict)
+                or function["parameters"].get("type") != "object"):
             raise ValueError("invalid_preset_parameters")
         schemas[name] = schema
-    if set(schemas) != set(_TARGETS) or set(schemas) != {p.name for p in _PRESETS}:
+    if set(schemas) != set(targets) or set(schemas) != {p.name for p in rows}:
         raise ValueError("incomplete_preset_manifest")
     return schemas
 
@@ -163,9 +112,10 @@ def canonical_tool_schema(tool):
         'description': inspect.cleandoc(function['description'])}}
 
 
-def _load(preset: _Preset, expected: dict):
-    # Both names are closed-over code-owned values, never manifest targets.
-    tool = getattr(import_module(_TARGETS[preset.name]), preset.name)
+def _load(preset: ToolSpec, expected: dict):
+    # Import target and name are closed-over code-owned row values, never text
+    # from a manifest, request, Skill or workspace document.
+    tool = preset.resolve()
     actual = canonical_tool_schema(tool)
     if actual != expected:
         def difference(left, right, path=""):
@@ -179,42 +129,53 @@ def _load(preset: _Preset, expected: dict):
             return path.strip("/") or "schema"
         raise CapabilityLoadError("preset_schema_drift", difference(actual, expected))
     # Register only the validated selected tool; preserve all existing specs.
-    from src.tools.registry import register_tool
+    from src.tools.registry import register_declared_tool
 
-    # Extension validators are server code, outside the provider schema and
-    # Skill payload. The runner invokes them before marking execution dispatched.
-    validator = {"audit_uploaded_data": "validate_audit_request",
-                 "inspect_uploaded_table": "validate_inspection_request",
-                 "audit_research_images": "validate_image_audit_request"}.get(preset.name)
-    preflight = getattr(import_module(_TARGETS[preset.name]), validator) if validator else None
-    register_tool(tool, category=preset.category,
-                  is_readonly=preset.write_scope is None,
-                  concurrency_key=preset.concurrency_key,
-                  write_scope=preset.write_scope,
-                  authorization=preset.authorization,
-                  recovery_mode=preset.recovery_mode, preflight=preflight)
+    # Extension validators are server code, outside the provider schema and Skill
+    # payload. The row names the validator; the runner invokes it before marking
+    # execution dispatched. ``register_declared_tool`` is the same projection the
+    # compatibility registry uses, so both paths register one identical policy.
+    register_declared_tool(preset, tool)
     return tool
 
 
-def build_preset_catalog() -> CapabilityCatalog:
-    """Describe all installed tools without importing any implementation.
+def build_preset_catalog(specs: Iterable[ToolSpec] | None = None) -> CapabilityCatalog:
+    """Describe all declared tools without importing any implementation.
 
     The host must still supply its authorized/ready name set to the catalogue.
     A missing dependency or changed implementation fails closed on resolution,
     before registration/dispatch, and affects only the selected capability.
     """
-    schemas = _read_manifest()
+    rows = _rows(specs)
+    schemas = _read_manifest(rows)
     catalog = CapabilityCatalog()
-    for preset in _PRESETS:
+    for preset in rows:
         schema = schemas[preset.name]
         function = schema["function"]
         catalog.register(CapabilityDefinition(
             name=preset.name, description=function["description"],
             parameters=function["parameters"], load=partial(_load, preset, schema),
-            provider=_TARGETS[preset.name], mutates=preset.write_scope is not None,
+            provider=preset.import_target, mutates=preset.mutates,
             execution_mode=preset.execution_mode,
         ))
     return catalog
+
+
+def generate_tool_manifest(specs: Iterable[ToolSpec] | None = None) -> dict:
+    """Regenerate the packaged schema manifest from the same declarative rows.
+
+    This is the only writer of ``preset_tool_schemas.json``; ``--check`` compares
+    this projection with the installed file so generation and loading can never
+    disagree about a tool.
+    """
+    schemas = []
+    for preset in _rows(specs):
+        # The loader compares this exact normalized form; keep both sides equal.
+        schema = canonical_tool_schema(preset.resolve())
+        if schema["function"]["name"] != preset.name:
+            raise ValueError("preset_tool_name_drift:" + preset.name)
+        schemas.append(schema)
+    return {"version": 1, "tools": schemas}
 
 
 def allowed_presets(state: dict, *, has_tables: bool, has_pool: bool) -> set[str]:
@@ -223,7 +184,6 @@ def allowed_presets(state: dict, *, has_tables: bool, has_pool: bool) -> set[str
     from src.config import settings
     from src.core.capability_policy import policy_for_state
     from src.core.tracing import web_search_enabled
-    from src.core.tool_catalog import TOOL_METADATA
     from src.graph.retrieval_router import attachment_processing_only, retrieval_denied, source_scope
     from src.graph.tool_availability import runtime_env, provider_denials
     query = str(state.get("query") or "")
@@ -239,15 +199,23 @@ def allowed_presets(state: dict, *, has_tables: bool, has_pool: bool) -> set[str
         denied=provider_denials(settings))
     policy = policy_for_state(state)
     names = set()
-    for name, (requires, _, _) in preset_bindings().items():
-        caps = TOOL_METADATA[name].capabilities
+    # Capability facts, readiness preconditions and authorization are read from
+    # the same rows the catalogue was built from.
+    for preset in TOOL_DECLARATIONS:
+        name = preset.name
+        caps = frozenset(preset.capabilities)
         if local_processing and (name == "verify_uploaded_references" or
                                  caps & {"network", "local_corpus", "shared_corpus"}):
             continue
         # A persisted evidence ref is readable without a process-local pool or
         # a currently loaded index. The adapter rechecks session/corpus rights.
-        needed = tuple(r for r in requires if r not in {"candidate_pool", "local_corpus"}) if name == "read_candidate" else requires
-        if not policy.tool_allowed(name) or name in env.denied or not all(env.has(requirement) for requirement in needed):
+        if name == "read_candidate":
+            needed = tuple(r for r in preset.requires
+                           if r not in {"candidate_pool", "local_corpus"})
+        else:
+            needed = preset.requires
+        if (not policy.tool_allowed(name) or name in env.denied
+                or not all(env.has(requirement) for requirement in needed)):
             continue
         if not state.get("visualization_enabled", True) and "visualization" in caps:
             continue

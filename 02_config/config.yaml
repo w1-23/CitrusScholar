@@ -44,7 +44,16 @@ web_search:
 model:
   # 主模型可按 {provider_id: {model_id: {max_output_tokens: 整数, context_window_tokens: 整数}}} 配置。
   # 填写已核验的服务商和模型能力。缺少条目时使用 chat.max_tokens 作为输出配置。
-  # provider_budgets: {}
+  provider_budgets:
+    # 线上实际 provider/model 由 runtime/state/model_config.json 覆盖 yaml 的 model.main，
+    # 当前为 opencode_go / deepseek-v4.1-flash。
+    # 依据：8043 运行时 task_model_attempts 的 527 条带 usage 记录中，单次输出最大 8192 tokens，
+    # 其中 8 次超过 4096；因此单次输出上限按 8192 配置，不再被 chat.max_tokens=4096 截断。
+    # 若更换服务商或模型，请先核验真实能力再按同样格式补充条目；无条目时仍回退 chat.max_tokens 并在诊断中标注来源。
+    opencode_go:
+      deepseek-v4.1-flash:
+        max_output_tokens: 8192
+        context_window_tokens: 1000000
   main: "deepseek-flash"   # v9.5.1: 官方现行模型名 deepseek-flash（服务 DeepSeek-V4.1-Flash）；旧名 deepseek-v4-flash 已下线但可调用并路由到 V4.1
   fast: "deepseek-flash"
   embedding: "intfloat/multilingual-e5-large"
@@ -122,6 +131,9 @@ agent:
   # 按约 35k/次计，1M 聚合上限会在收尾前耗尽并误报“未完成”。默认 2M，
   # 管理员仍可在 02_config/config.yaml 下调；调用次数上限 max_model_calls 独立生效。
   max_model_tokens: 2000000
+  # 原生 task 子 Agent（general-purpose）：只持有原生文件工具，模型调用计入同一 job 预算。
+  # 置 false 可整体关闭委派能力而不改代码。
+  enable_task_subagent: true
 
 # ── Write Pipeline (Plan-Execute 长文写作流水线, v8.3.2) ──
 pipeline:

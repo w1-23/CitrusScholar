@@ -3263,6 +3263,9 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
         async def process_graph():
             nonlocal park_prepared, question_wake_deferred
             from src.agent.recovery import QuestionWakeDeferred
+            from src.core.progress_bus import emit_progress
+            from src.core.public_progress import (
+                NATIVE_STREAM_MODES, NativeStreamProjector, unpack_stream_chunk)
             from src.core.tracing import set_session_id, set_user_id, set_user_role
             set_session_id(sid)
             set_user_id(int(user["user_id"]))
@@ -3276,11 +3279,44 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             # The shared Agent reasons directly from the user's original query;
             # no separate intake model or confirmation card rewrites it.
 
+            # F-14: the native LangGraph stream is the execution source of truth.
+            # Frames are projected onto the existing public protocol and stored by
+            # the durable event queue; this never rebuilds the Agent Loop and a
+            # projection failure can only lose progress detail, never the turn.
+            native_stream = NativeStreamProjector(job_id=job_id, run_id=identity.run_id)
+
+            def emit_native(frames) -> None:
+                for frame in frames or ():
+                    try:
+                        emit_progress("assistant_progress", frame)
+                    except Exception as exc:
+                        logger.warning("native_stream_emit_failed kind=%s",
+                                       type(exc).__name__)
+
+            if recovery_cursor or recovery_state:
+                emit_native(native_stream.resume("recovery"))
+
             pending_supervisor_output = None
-            graph_stream = graph.astream(initial_state, stream_mode="updates",
+            graph_stream = graph.astream(initial_state, stream_mode=list(NATIVE_STREAM_MODES),
+                                         subgraphs=True,
                                          recursion_limit=settings.RECURSION_LIMIT)
             try:
-                async for node_output in graph_stream:
+                async for stream_chunk in graph_stream:
+                    namespace, mode, node_output = unpack_stream_chunk(stream_chunk)
+                    if mode == "messages":
+                        emit_native(native_stream.feed("messages", node_output, namespace))
+                        continue
+                    if namespace:
+                        # Sub-agent activity is reported as lifecycle only; its
+                        # tokens and state never cross the public projection.
+                        emit_native(native_stream.feed(mode, node_output, namespace))
+                        continue
+                    # Settle the held-back model tail before a state transition,
+                    # so preview text always precedes the fact that replaced it.
+                    emit_native(native_stream.flush())
+                    if mode != "updates":
+                        continue
+                    emit_native(native_stream.feed("updates", node_output))
                     for node_name, output in node_output.items():
                         if node_name == "session_load":
                             continue

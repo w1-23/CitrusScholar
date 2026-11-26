@@ -121,7 +121,8 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
             return FinalCheck()
 
         runtime = HarnessRuntime(model, execute, lambda *_: None, check_final, RunLimits(8, float("inf")),
-            self.catalog.schemas({EVIDENCE, TABLE, READER}), model_call=metered, **kwargs)
+            self.catalog.schemas({EVIDENCE, TABLE, READER}), model_call=metered,
+            can_recover_output=lambda: task_events.budget_headroom(identity.run_id), **kwargs)
         async with open_framework_checkpoint(self.root, identity, self.provider) as saver:
             result = await runtime.run(identity, [human], saver=saver,
                 checkpoint_config=framework_checkpoint_scope(identity, self.provider),
@@ -222,7 +223,9 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(READER, names[1])
         self.assertIn(READER, names[2])
         self.assertTrue(all(payload["model"] == PROVIDER and payload["stream"] for payload in wire))
-        self.assertTrue(all(not (row & {"write_file", "edit_file", "delete", "execute", "task"}) for row in names))
+        # Native file tools, the isolated execute tool and the metered task
+        # subagent are all advertised from one capability surface.
+        self.assertTrue(all({"write_file", "edit_file", "delete", "execute", "task"} <= row for row in names))
         current_pair = [m for m in wire[3]["messages"] if m.get("tool_call_id") == "current"]
         self.assertEqual([m["content"] for m in current_pair], ["current bytes"])
         current_assistant = [m for m in wire[3]["messages"] if any(c["id"] == "current" for c in m.get("tool_calls", []))]

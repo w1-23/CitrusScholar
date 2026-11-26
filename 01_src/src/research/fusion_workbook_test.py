@@ -267,6 +267,102 @@ def test_unmatched_or_failed_report_is_never_published(fault, monkeypatch):
                                 source_name="book.xlsx", source_bytes=data)
 
 
+def test_publication_binds_one_receipt_per_published_file(registry, monkeypatch):
+    from src.research.delivery_reconciliation import capture_delivery, delivery_outcome
+
+    monkeypatch.setattr("src.core.tracing.get_current_tool_name", lambda: "fusion_annotated_workbook")
+    source = _source()
+    digest = sha256(source).hexdigest()
+    with capture_delivery("collect_external_skill", "one-file") as evidence:
+        receipt = publish_fusion_workbook(_report(digest), source_file_id="a" * 32, source_sha256=digest,
+                                          source_name="book.xlsx", source_bytes=source)
+        outcome = delivery_outcome("partial", "external_skill_report", [receipt])
+    bound, = evidence.receipts
+    assert bound.status == "confirmed" and bound.url == receipt["url"]
+    assert bound.sha256 == receipt["sha256"] and bound.file_index == 1
+    assert bound.filename == receipt["filename"]
+    assert outcome["status"] == "partial" and outcome["files"][0]["confirmed"] is True
+
+
+def test_lost_publish_confirmation_keeps_that_file_unknown(registry, monkeypatch):
+    from src.research import tools
+    from src.research.delivery_reconciliation import (capture_delivery, delivery_outcome,
+        publication_committed, publication_started)
+
+    def loses_confirmation(name, content, mime, **options):
+        publication_started(filename=name, file_index=1)
+        publication_committed(sha256=sha256(content).hexdigest(), filename=name, file_index=1)
+        raise OSError("registry never returned a URL")
+
+    monkeypatch.setattr(tools, "_save_artifact", loses_confirmation)
+    source = _source()
+    digest = sha256(source).hexdigest()
+    with capture_delivery("collect_external_skill", "lost") as evidence:
+        with pytest.raises(OSError):
+            publish_fusion_workbook(_report(digest), source_file_id="a" * 32, source_sha256=digest,
+                                    source_name="book.xlsx", source_bytes=source)
+        outcome = delivery_outcome("complete", "external_skill_report", [])
+    assert outcome["status"] == "unknown" and outcome["reason_code"] == "write_requires_reconciliation"
+    assert outcome["files"][0]["status"] == "committed" and outcome["files"][0]["url"] == ""
+    assert evidence.receipts[0].committed and not evidence.receipts[0].confirmed
+
+
+def test_authorized_resume_republishes_only_the_unconfirmed_file(registry, monkeypatch):
+    """Executable per-file resume: the confirmed copy is reused, the failed one re-registers once."""
+    from src.research import fusion_delivery, tools
+    from src.research.delivery_reconciliation import (capture_delivery, delivery_outcome,
+        publication_committed, publication_started, reconciliation_plan, resume_publication)
+
+    source = _source()
+    digest = sha256(source).hexdigest()
+    report = _report(digest)
+    real_save_artifact = tools._save_artifact
+    fields = dict(source_file_id="a" * 32, source_sha256=digest, source_name="book.xlsx", source_bytes=source)
+    listing = {"status": "complete", "findings": [{"finding_id": "one", "rule_id": "required",
+               "severity": "error", "observed_value": None, "expected_value": "有数值",
+               "evidence": {"reason": "缺失"}, "locations": [{"scope": "csv_range", "row_index": 2,
+               "end_row_index": 2, "column_index": 1, "source_file_hash": digest}]}]}
+    result_receipt = {"result": {"file_id": "a" * 32, "sha256": digest}}
+    with capture_delivery("collect_external_skill", "batch") as evidence:
+        workbook = publish_fusion_workbook(report, **fields)
+
+        def loses_confirmation(name, content, mime, **options):
+            publication_started(filename=name, file_index=2)
+            publication_committed(sha256=sha256(content).hexdigest(), filename=name, file_index=2)
+            raise OSError("registry never returned a URL")
+
+        monkeypatch.setattr(tools, "_save_artifact", loses_confirmation)
+        with pytest.raises(OSError):
+            fusion_delivery.publish_report(listing, execution_id="c" * 32, skill_id="research-integrity",
+                                           fmt="csv", receipt=result_receipt)
+        outcome = delivery_outcome("complete", "", [workbook])
+
+    plan = reconciliation_plan(outcome)
+    assert [item["filename"] for item in plan["confirmed"]] == [workbook["filename"]]
+    assert [item["filename"] for item in plan["resume"]] == ["外部审查发现清单.csv"]
+    assert plan["rerun_review"] is False and plan["rerun_plot"] is False
+
+    calls = []
+
+    def republish(item):
+        calls.append(item["filename"])
+        return fusion_delivery.publish_report(listing, execution_id="c" * 32, skill_id="research-integrity",
+                                              fmt="csv", receipt=result_receipt)["url"]
+
+    monkeypatch.setattr(tools, "_save_artifact", real_save_artifact)
+    with capture_delivery("collect_external_skill", "resume") as resumed_evidence:
+        resumed = resume_publication(plan, republish=republish, authorized=True)
+    assert calls == ["外部审查发现清单.csv"]
+    assert resumed["status"] == "complete" and resumed["complete"] is True
+    assert [item["filename"] for item in resumed["reused"]] == [workbook["filename"]]
+    assert resumed["reused"][0]["url"] == workbook["url"]
+    assert resumed["resumed"][0]["url"].startswith("/api/v2/session/")
+    # The confirmed workbook was not republished: exactly two artifacts exist.
+    with closing(sqlite3.connect(registry[1] / "research_artifacts.sqlite3")) as db:
+        assert db.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 2
+    assert resumed_evidence.receipts and evidence.receipts
+
+
 def test_csv_derived_marks_only_verified_record_positions_and_keeps_literal_text(registry):
     source = b'column1,column2\r\n"multi\nline",42\r\n=1+2,42\r\nline,42\r\nline,42\r\nunrelated,5\r\n'
     digest = sha256(source).hexdigest()

@@ -3356,6 +3356,19 @@ function publicTaskStage(value) {
   return text.replace(/\s+/g, ' ').slice(0, 600);
 }
 
+/* F-14: provisional model text is opt-in. The default surface shows only
+   lifecycle rows (tool proposals, sub-agent start/end, interrupt, resume) so a
+   streamed fragment is never mistaken for the delivered answer. Enable with
+   ?native_preview=1 or window.CITRUS_NATIVE_PREVIEW = true (or by setting this
+   binding before the first frame is rendered). */
+var NATIVE_STREAM_PREVIEW = (function () {
+  try {
+    if (typeof location !== 'undefined' && location.search &&
+        /(?:^\?|&)native_preview=1(?:&|$)/.test(location.search)) return true;
+    return typeof window !== 'undefined' && window.CITRUS_NATIVE_PREVIEW === true;
+  } catch (_) { return false; }
+}());
+
 function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
   var settled = false, activeMilestone = '', progressSeq = 0;
@@ -3444,6 +3457,41 @@ function createResearchProcessPanel(goal) {
       return result;
     },
     elapsed: function (ms) { return (Math.max(0, Number(ms) || 0) / 1000).toFixed(1) + ' 秒'; }});
+  // F-14: native LangGraph stream (model/tool/sub-agent/interrupt lifecycle).
+  // Frames are already ordered and de-duplicated by the durable event cursor,
+  // so this layer only redraws the current projection — it never appends twice
+  // and never invents an ending the server did not report. Both globals are
+  // feature-detected so a mixed-cache client keeps its previous behaviour.
+  var nativeStream = typeof CitrusTaskState.createNativeStream === 'function'
+    ? CitrusTaskState.createNativeStream({}) : null;
+  var nativeHost = document.createElement('div');
+  nativeHost.className = 'task-native-host';
+  body.appendChild(nativeHost);
+  function renderNativeStreamPanel() {
+    if (!nativeStream || typeof CitrusTaskCards.renderNativeStream !== 'function') return;
+    if (!ownsDetails()) return;
+    CitrusTaskCards.renderNativeStream(nativeHost, CitrusTaskCards.nativeStreamModel(
+      nativeStream.view(), {toolName: displayToolName, clean: publicTaskStage,
+        preview: NATIVE_STREAM_PREVIEW}));
+  }
+  function receiveNativeStreamEvent(type, data) {
+    if (!nativeStream) return;
+    if (type === 'assistant_progress') {
+      if (!nativeStream.receive(type, data)) return;
+    } else if (type === 'text' && data && data.delivery === 'committed') {
+      if (!nativeStream.commit()) return;
+    } else if (type === 'text_reset') {
+      if (!nativeStream.discard()) return;
+    } else if (type === 'done' || type === 'error') {
+      if (!nativeStream.terminal()) return;
+    } else return;
+    renderNativeStreamPanel();
+  }
+  function resetNativeStreamPanel() {
+    if (!nativeStream) return;
+    nativeStream.reset();
+    renderNativeStreamPanel();
+  }
   function progress(data) {
     if (!CitrusTaskState.nativeProgress(data) || knownJobId && data.job_id !== knownJobId) return;
     var item = data.status === 'in_progress' ? view.note(data) : null;
@@ -3457,6 +3505,7 @@ function createResearchProcessPanel(goal) {
   function receive(type, data) {
     data = data || {};
     if (data.internal === true || data.private === true || ['private', 'internal'].indexOf(data.visibility) >= 0) return;
+    receiveNativeStreamEvent(type, data);
     var savedResolutions = (data.turn_envelope || data.terminal_snapshot || data).tool_resolutions;
     if (Array.isArray(savedResolutions)) view.resolution({resolutions: savedResolutions});
     if (type === 'job') {
@@ -3471,6 +3520,7 @@ function createResearchProcessPanel(goal) {
       view.begin(String(data.job_id || knownJobId) + '/' + String(data.seq || data.recovery_cursor || 'recovery'));
       settled = false; activeMilestone = ''; progressSeq = Number.isSafeInteger(data.seq) ? data.seq : progressSeq;
       readFailures.clear(); readState('', false);
+      resetNativeStreamPanel();
       view.terminal(false); label.textContent = '正在恢复任务'; panel.classList.remove('has-failure');
     }
     else if (type === 'tool_resolution') view.resolution(data);

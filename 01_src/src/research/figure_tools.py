@@ -214,6 +214,19 @@ def _run_research_figure_script(
     if len(text) > _MAX_SCRIPT_CHARS + (65000 if script_record else 0):
         return _error("ARG", f"脚本超过 {_MAX_SCRIPT_CHARS} 字符上限，请精简后重试。")
 
+    # F-04: a compiled template carries its own provenance line and its renderer
+    # already carries the pinned style. F-08: every *user* script gets the same
+    # versioned manuscript style at the worker entry, unless it sets typography
+    # itself — an explicit override is respected and recorded as such.
+    from citrus_figures.template_registry import parse_marker
+    template_meta = parse_marker(text)
+    if template_meta is None:
+        from citrus_figures.typography import inject as _inject_style
+        text, style_record = _inject_style(text)
+    else:
+        from citrus_figures.typography import STYLE_VERSION
+        style_record = {"policy": "template_registry", "style_version": STYLE_VERSION}
+
     try:
         requested_formats = _requested_formats(formats_json)
     except ToolArgumentError as exc:
@@ -279,7 +292,9 @@ def _run_research_figure_script(
             script_record["input_snapshots"] = snapshots
         source = {"kind": "script", "version": 2, "script": text,
                   "input_snapshots": snapshots, "qa_profile": profile,
+                  "style": style_record,
                   "snapshot_policy": "immutable_bytes_new_source_for_changed_data", **analysis_meta,
+                  **({"template": template_meta} if template_meta else {}),
                   **({key: script_record[key] for key in ("script_ref", "run_id", "parameters")
                       if key in script_record} if script_record else {})}
         inputs, sources, hashes = script_replay_inputs(source, _owner())
@@ -287,19 +302,52 @@ def _run_research_figure_script(
         return _error("INPUT", str(exc))
     except Exception as exc:
         return _error("INPUT", f"脚本数据或分析引用无法验证：{exc}")
+
+    # F-05: one timeout policy decides this Worker budget. The 120 s sandbox
+    # default and the 90 s template budget are gone; a receipt can now explain
+    # the number from the kind, the frozen input size and the figure count.
+    from citrus_figures.timeouts import describe as _describe_timeout
+    from citrus_figures.timeouts import resolve_timeout as _resolve_timeout
+    figure_count = max(1, len(contract.get("figures") or ())) if contract else 1
+    input_bytes = sum(int(item.get("size_bytes") or 0) for item in snapshots
+                      if isinstance(item, dict) and type(item.get("size_bytes")) is int)
+    timeout_kind = "template" if template_meta else "script"
+    timeout_sec = _resolve_timeout(
+        kind=timeout_kind, input_bytes=input_bytes, figures=figure_count,
+        template_id=str((template_meta or {}).get("template_id") or ""),
+        configured_sec=int(getattr(settings, "FIGURES_SANDBOX_TIMEOUT_SEC", 0) or 0))
+    timeout_receipt = _describe_timeout(
+        kind=timeout_kind, timeout_sec=timeout_sec, input_bytes=input_bytes,
+        figures=figure_count, template_id=str((template_meta or {}).get("template_id") or ""))
     if contract:
         from src.research.script_execution import publish_script_outputs
-        return publish_script_outputs(runner=runner, text=text, title=title,
+        captured: dict[str, Any] = {}
+        published = publish_script_outputs(
+            runner=_capturing_runner(runner, captured), text=text, title=title,
             output_name=output_name, contract=contract, source=source,
-            data_refs=data_refs, profile=profile, settings=settings,
+            data_refs=data_refs, profile=profile,
+            settings=_WorkerSettings(settings, timeout_sec),
             replay=(inputs, sources, hashes))
+        try:
+            content, payload = published
+        except (TypeError, ValueError):
+            # A patched/legacy publisher may not return the (content, payload)
+            # pair; pass its value through rather than inventing a second shape.
+            return published
+        if isinstance(payload, dict):
+            payload["timeout"] = timeout_receipt
+            _attach_typography(payload, style_record, captured.get("result"))
+            payload.setdefault("mode", "template" if template_meta else "script")
+            if template_meta:
+                payload["template"] = template_meta
+        return content, payload
     outputs = {fmt: f"figure.{fmt}" for fmt in formats}
     outputs["manifest"] = "objects.json"
     job = SandboxJob(
         script=text, inputs=inputs, sources=sources, expected_input_sha256=hashes,
         qa_profile=profile,
         outputs=outputs,
-        timeout_sec=int(getattr(settings, "FIGURES_SANDBOX_TIMEOUT_SEC", 120) or 120),
+        timeout_sec=timeout_sec,
         memory_mb=int(getattr(settings, "FIGURES_SANDBOX_MEMORY_MB", 1024) or 1024),
         cpus=str(getattr(settings, "FIGURES_SANDBOX_CPUS", "1.0") or "1.0"),
         image=str(getattr(settings, "FIGURES_SANDBOX_IMAGE", "") or ""),
@@ -405,11 +453,16 @@ def _run_research_figure_script(
         "backend": result.backend,
         "duration_ms": result.duration_ms,
         "editable": False,
+        "mode": "template" if template_meta else "script",
+        "timeout": timeout_receipt,
         "failures": publish_failures + stage_failures,
         "note": ("脚本图件已保存，可在「图表工作台」查看和下载（/figures）。"
                  "这份脚本尚未分离分析与渲染；样式编辑需要冻结中间表和独立render_script，避免重算改变数值。"
                  if project else "图件已导出，但未能保存工作台项目；当前只能下载。"),
     }
+    if template_meta:
+        summary["template"] = template_meta
+    _attach_typography(summary, style_record, result)
     qa_failures = _failed_qa_checks(receipt)
     summary["qa_failures"] = qa_failures
     summary["_tool_outcome"] = {
@@ -421,6 +474,90 @@ def _run_research_figure_script(
                       if item.get("artifact_url")],
     }
     return json.dumps(summary, ensure_ascii=False, default=str), summary
+
+
+class _WorkerSettings:
+    """A read-through settings view with the policy-resolved Worker timeout.
+
+    The version-2 contract publisher builds its own SandboxJob and reads the
+    timeout from ``settings``. Rather than teaching that module a second
+    policy, the host hands it the settings it expects with exactly one value
+    replaced, so there is still one timeout decision for both output paths.
+    """
+
+    def __init__(self, base: Any, timeout_sec: int) -> None:
+        object.__setattr__(self, "_base", base)
+        object.__setattr__(self, "_timeout_sec", int(timeout_sec))
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "FIGURES_SANDBOX_TIMEOUT_SEC":
+            return object.__getattribute__(self, "_timeout_sec")
+        return getattr(object.__getattribute__(self, "_base"), name)
+
+
+def _capturing_runner(runner: Any, captured: dict) -> Any:
+    """Remember the worker result so publication-time evidence can read it."""
+    class _Capturing:
+        def run(self, job):
+            result = runner.run(job)
+            captured["result"] = result
+            return result
+
+    return _Capturing()
+
+
+def _worker_typography(payload: dict) -> dict:
+    """The worker's post-render font evidence, from either publication shape."""
+    receipt = payload.get("qa_receipt")
+    if isinstance(receipt, dict) and isinstance(receipt.get("typography"), dict):
+        return dict(receipt["typography"])
+    for figure in payload.get("figures") or []:
+        receipt = figure.get("qa_receipt") if isinstance(figure, dict) else None
+        if isinstance(receipt, dict) and isinstance(receipt.get("typography"), dict):
+            return dict(receipt["typography"])
+    return {}
+
+
+def _outputs_by_format(outputs: Any) -> dict[str, bytes]:
+    """Worker bytes by format, for slot keys (``figure:<name>:<fmt>``) too."""
+    found: dict[str, bytes] = {}
+    if not isinstance(outputs, dict):
+        return found
+    for key, value in outputs.items():
+        if not isinstance(key, str) or not isinstance(value, bytes):
+            continue
+        token = key.rsplit(":", 1)[-1].lower() if ":" in key else key.lower().lstrip(".")
+        if token in FIGURE_FORMATS and token not in found:
+            found[token] = value
+    return found
+
+
+def _attach_typography(payload: dict, style_record: dict, result: Any) -> dict:
+    """Record the typography actually used, including format embedding (F-08).
+
+    The worker records the families it resolved in the manifest QA receipt; the
+    host adds what only it can see — the exported bytes — so a publication
+    receipt states the style version, the requested stack and whether the PDF
+    carries an embedded font program.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    from citrus_figures.typography import STYLE_VERSION, embedding_report
+    outputs = _outputs_by_format(getattr(result, "outputs", None))
+    formats = [fmt for fmt in FIGURE_FORMATS if fmt in outputs]
+    block = {**_worker_typography(payload), **dict(payload.get("typography") or {})}
+    block.setdefault("style_version", style_record.get("style_version") or STYLE_VERSION)
+    block["style_policy"] = style_record.get("policy") or "unknown"
+    if style_record.get("requested_family"):
+        block.setdefault("requested_family", style_record["requested_family"])
+    block["embedding"] = {**(block.get("embedding") or {}),
+                          **embedding_report(formats=formats or FIGURE_FORMATS,
+                                             pdf_bytes=outputs.get("pdf"))}
+    payload["typography"] = block
+    warnings = list(block.get("warnings") or [])
+    if warnings:
+        payload["typography_warnings"] = warnings
+    return payload
 
 
 def _failed_qa_checks(receipt: dict) -> list[str]:
@@ -469,12 +606,71 @@ def _record_project(*, title: str, source_kind: str, source: Any,
         return {}
 
 
+def _template_bindings(inputs_json: str | dict, analysis_result_ref_json: str | dict,
+                       *, repair_from_run_id: str = "") -> tuple[str, str]:
+    """The single data binding a template execution reads, and its kind.
+
+    A template is one table in, one figure out. Accepting several bindings here
+    would let a template silently pick a table, so the request is rejected
+    instead. A repair inherits the bindings of the run it repairs.
+    """
+    if repair_from_run_id:
+        from src.research import script_assets
+        try:
+            previous = script_assets.get_run(_owner(), _session(), repair_from_run_id)
+        except Exception:
+            raise ToolArgumentError("找不到要修复的运行；请先 read_run 再重试。") from None
+        bindings = previous.get("inputs") or {}
+    else:
+        bindings = _json_arg(inputs_json, "inputs_json") or {}
+        analysis_ref = _json_arg(analysis_result_ref_json, "analysis_result_ref_json")
+        if bindings and analysis_ref:
+            raise ToolArgumentError("analysis_result_ref_json 与 inputs_json 只能二选一。")
+        if not bindings and analysis_ref:
+            return "analysis_data", "csv"
+    if not isinstance(bindings, dict) or not bindings:
+        raise ToolArgumentError("template 模式需要一个数据绑定：inputs_json 绑定一张表，或传 analysis_result_ref_json。")
+    if len(bindings) > 1:
+        names = sorted(bindings)
+        if "analysis_data" not in names:
+            raise ToolArgumentError("template 模式只接受一个数据绑定；请只绑定一张表。")
+        return "analysis_data", "csv"
+    name = next(iter(bindings))
+    value = bindings[name]
+    kind = "dataset" if isinstance(value, dict) and value.get("dataset_ref") else "csv"
+    return str(name), kind
+
+
+def _compile_template_request(*, template_id: str, template_parameters_json: Any,
+                              inputs_json: str | dict, analysis_result_ref_json: str | dict,
+                              title: str, formats_json: Any, script: str,
+                              outputs_json: Any, script_ref_json: Any,
+                              repair_from_run_id: str):
+    """Turn a typed template request into the same script contract as script mode."""
+    from citrus_figures.template_registry import compile_request
+
+    if str(script or "").strip():
+        raise ToolArgumentError("template 模式不接受 script 源码；模板由注册表生成。")
+    if str(script_ref_json or "").strip():
+        raise ToolArgumentError("template 模式不接受 script_ref_json；模板由注册表生成。")
+    if _json_arg(outputs_json, "outputs_json") not in (None, {}):
+        raise ToolArgumentError("template 模式不接受 outputs_json；输出契约由模板注册表决定。")
+    if not str(template_id or "").strip():
+        raise ToolArgumentError("template 模式需要 template_id；可用模板见 registry。")
+    binding, kind = _template_bindings(inputs_json, analysis_result_ref_json,
+                                       repair_from_run_id=repair_from_run_id)
+    formats = _requested_formats(formats_json) or ("svg",)
+    return compile_request(template_id, template_parameters_json, binding=binding,
+                           binding_kind=kind, title=title, formats=formats)
+
+
 def run_research_figure_script(
     script: str = "", title: str = "", formats_json: str | list[str] = "",
     output_name: str = "", inputs_json: str | dict = "", qa_profile_json: str | dict = "",
     analysis_result_ref_json: str | dict = "", outputs_json: str | dict = "",
     script_ref_json: str | dict = "", parameters_json: str | dict = "",
-    repair_from_run_id: str = "",
+    repair_from_run_id: str = "", mode: str = "script", template_id: str = "",
+    template_parameters_json: str | dict = "",
 ) -> tuple[str, dict]:
     # Pure caller-option checks precede source/run/input persistence. A rejected
     # option therefore cannot be mistaken for an uncertain worker dispatch.
@@ -483,6 +679,36 @@ def run_research_figure_script(
     from src.figures.spec import parse_qa_profile
     from src.figures.script_outputs import (RenderScriptEmitUnavailable,
                                             normalize_output_contract)
+    mode_value = str(mode or "script").strip().lower()
+    compiled = None
+    if mode_value not in {"script", "template"}:
+        payload = {"error": "mode 只能是 script 或 template。", "_tool_outcome": {
+            "status": "not_run", "reason_code": "script_execution_rejected", "artifacts": []}}
+        from src.research.script_reconciliation import observe_preflight_rejection
+        observe_preflight_rejection(payload)
+        return json.dumps(payload, ensure_ascii=False), payload
+    if mode_value == "template":
+        # F-04: a template request is validated and compiled *before* any source
+        # is saved or a run reserved, so a wrong column, threshold or binding is
+        # an explicit not_run instead of an uncertain execution.
+        try:
+            compiled = _compile_template_request(
+                template_id=template_id, template_parameters_json=template_parameters_json,
+                inputs_json=inputs_json, analysis_result_ref_json=analysis_result_ref_json,
+                title=title, formats_json=formats_json, script=script,
+                outputs_json=outputs_json, script_ref_json=script_ref_json,
+                repair_from_run_id=repair_from_run_id)
+        except (ValueError, TypeError) as exc:
+            payload = {"error": f"模板请求未通过执行前校验：{exc}",
+                       "error_code": getattr(exc, "code", "template_request_rejected"),
+                       "_tool_outcome": {"status": "not_run",
+                                         "reason_code": "template_request_rejected",
+                                         "artifacts": []}}
+            from src.research.script_reconciliation import observe_preflight_rejection
+            observe_preflight_rejection(payload)
+            return json.dumps(payload, ensure_ascii=False), payload
+        script, outputs_json = compiled.main_script, compiled.output_contract
+        title = str(title or "").strip() or compiled.template_id
     try:
         parse_qa_profile(_json_arg(qa_profile_json, "qa_profile_json"))
         normalize_output_contract(_json_arg(outputs_json, "outputs_json"))
@@ -518,6 +744,11 @@ def run_research_figure_script(
     from functools import partial
     from src.research.script_runtime import execute_script_request
     executor = partial(_run_research_figure_script, _sandbox_runner=runner)
+    if compiled is not None and repair_from_run_id:
+        # A template repair inherits the frozen bindings, parameters and output
+        # contract of the run it repairs; only the compiled source is new.
+        return execute_script_request(executor, script=compiled.main_script,
+                                      repair_from_run_id=repair_from_run_id)
     return execute_script_request(executor, script=script,
         script_ref_json=script_ref_json, parameters_json=parameters_json,
         repair_from_run_id=repair_from_run_id,
@@ -538,6 +769,14 @@ script与script_ref_json二选一；源码执行前自动暂存，返回script_r
 内置脚本可自动使用其声明的输出契约；任务脚本需要明确绑定输入和输出。
 同一任务局部修改用research_workspace.patch创建子版本，再按引用执行。
 已有工具或参数化脚本能完成时，不从头重写算法。中间表和脚本默认不是下载附件。
+
+唯一绘图入口（F-04）：任意 Matplotlib/Seaborn 脚本用 mode="script"；五种固定科研图型
+（volcano/ROC/dotplot/marginal/paired）用 mode="template" + template_id + 类型化
+template_parameters_json + 单张表绑定 inputs_json（或 analysis_result_ref_json）。
+模板与脚本共用同一冻结输入快照、同一 Worker、同一超时策略、同一输出合同、同一 QA 与
+同一工作台项目；模板不接受 script/script_ref_json/outputs_json，参数或绑定错误在派发前
+返回 not_run。旧工具 run_nature_plot/collect_nature_plot 已弃用并只转发到这里，
+不得同时使用两套入口。
 """
 run_research_figure_script = tool(response_format="content_and_artifact")(run_research_figure_script)
 

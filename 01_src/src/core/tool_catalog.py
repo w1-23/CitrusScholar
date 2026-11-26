@@ -1,14 +1,21 @@
-"""One declarative catalog for tool capability groups and public labels.
+"""Capability facts and public labels, derived from the one ToolSpec table.
 
-The executable tool objects and their ``requires/produces/authorization`` live in
-``src.tools._TOOL_DECLARATIONS``. This module adds the other facts that used to
-be copied into four separate name lists: user-facing labels and derived source
-capabilities. Importing it never imports the tool implementations, so the low
-level progress bus can use it without creating an import cycle.
+``src.tools.tool_specs`` declares every installed tool once, including the
+capability facts and the user-facing labels. This module projects that table into
+``TOOL_METADATA`` and derives the source/route capability groups from it, so the
+execution contract, the front end labels and ``requires``/``produces`` cannot
+disagree about one tool.
+
+Importing this module never imports a tool implementation: the projection reads
+declared values only. It also stays free of application imports, so the low level
+progress bus and the routing tables can use it without creating an import cycle.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+
+from src.tools.tool_specs import TOOL_DECLARATIONS, ToolSpec
 
 
 @dataclass(frozen=True)
@@ -31,74 +38,32 @@ ARTIFACT = "artifact"
 VISUALIZATION = "visualization"
 SHARED_CORPUS = "shared_corpus"
 
-TOOL_METADATA: dict[str, ToolMetadata] = {
-    "request_user_input": ToolMetadata("请你确认", capabilities=frozenset({"interaction"})),
-    "deepseek_search": ToolMetadata(
-        "网页搜索", capabilities=frozenset({NETWORK, WEB_RETRIEVAL, ROUTE_WEB,
-                                           LITERATURE_RETRIEVAL})),
-    "deepseek_fetch": ToolMetadata(
-        "读取网页", capabilities=frozenset({NETWORK, WEB_RETRIEVAL, ROUTE_WEB,
-                                           LITERATURE_RETRIEVAL})),
-    "browse_web": ToolMetadata("交互式浏览网页", "下载网页资料", frozenset({NETWORK, WEB_RETRIEVAL, ARTIFACT})),
-    "deepseek_fetch_paper": ToolMetadata(
-        "获取论文全文", capabilities=frozenset({NETWORK, WEB_RETRIEVAL, ROUTE_WEB,
-                                               LITERATURE_RETRIEVAL})),
-    "local_hybrid_search": ToolMetadata(
-        "本地检索", capabilities=frozenset({LOCAL_CORPUS, LOCAL_RETRIEVAL,
-                                           ROUTE_LOCAL, LITERATURE_RETRIEVAL})),
-    # Candidate tools expose the request-scoped candidate pool. They declare
-    # LOCAL_CORPUS only: the "local search was done" completion gate must keep
-    # being satisfied by local_hybrid_search, never by a candidate tool.
-    "read_candidate": ToolMetadata(
-        "读取候选原文", capabilities=frozenset({LOCAL_CORPUS})),
-    "search_candidates": ToolMetadata(
-        "补充候选检索", capabilities=frozenset({LOCAL_CORPUS})),
-    "draw_svg": ToolMetadata(
-        "绘图", "下载 SVG", frozenset({VISUALIZATION, ARTIFACT})),
-    "read_account_file": ToolMetadata(
-        "读取账户文件", capabilities=frozenset()),
-    "read_tool_result": ToolMetadata(
-        "读取工具结果", capabilities=frozenset()),
-    "research_workspace": ToolMetadata(
-        "科研工作区", capabilities=frozenset({RESEARCH})),
 
-    "inspect_uploaded_table": ToolMetadata(
-        "读取表格", capabilities=frozenset({RESEARCH})),
-    "audit_uploaded_data": ToolMetadata(
-        "数据审查", "下载数据审查 Excel", frozenset({RESEARCH, ARTIFACT})),
-    "audit_research_images": ToolMetadata(
-        "图像复用核查", "下载图像复用证据", frozenset({RESEARCH, ARTIFACT})),
-    "search_literature": ToolMetadata(
-        "文献检索", capabilities=frozenset({NETWORK, LITERATURE_RETRIEVAL})),
-    "verify_uploaded_references": ToolMetadata(
-        "文献核验", "下载 DOI 核验表", frozenset({RESEARCH, ARTIFACT})),
-    "fetch_and_audit_open_supplements": ToolMetadata(
-        "获取补充数据", "下载补充材料",
-        frozenset({NETWORK, RESEARCH, ARTIFACT, LITERATURE_RETRIEVAL})),
-    "word_document": ToolMetadata(
-        "处理 Word 文档", "下载 Word 文档", frozenset({RESEARCH, ARTIFACT})),
-    "deliver_research_artifact": ToolMetadata(
-        "保存研究成果", "打开成果", frozenset({RESEARCH, ARTIFACT})),
-    "save_research_note": ToolMetadata(
-        "保存课题记录", "下载课题记录", frozenset({RESEARCH, ARTIFACT})),
-    "recall_research_notes": ToolMetadata(
-        "查阅课题记录", capabilities=frozenset({RESEARCH})),
-    "analyze_research_data": ToolMetadata(
-        "统计分析", "下载统计结果", frozenset({RESEARCH, ARTIFACT})),
-    "run_research_figure_script": ToolMetadata(
-        "执行绘图脚本", "下载图件", frozenset({RESEARCH, ARTIFACT, VISUALIZATION})),
-    # Administrator-published shared literature. Visibility is gated by the
-    # shared corpus runtime; this capability stays out of route/completion
-    # groups so default behavior is unchanged.
-    "propose_document_ingest": ToolMetadata(
-        "申请收录文献", capabilities=frozenset({SHARED_CORPUS})),
-    "prepare_document": ToolMetadata(
-        "准备文献入库", capabilities=frozenset({SHARED_CORPUS})),
-    "commit_document_index": ToolMetadata(
-        "更新共享索引", capabilities=frozenset({SHARED_CORPUS})),
-    "search_agent_corpus": ToolMetadata(
-        "检索共享文献库", capabilities=frozenset({SHARED_CORPUS})),
-}
+def metadata_catalog(specs: Iterable[ToolSpec] | None = None) -> dict[str, ToolMetadata]:
+    """Project the declared rows into presentation metadata.
+
+    Every row produces exactly one record: the key set of the result equals the
+    declared name set by construction, and a missing label fails closed instead of
+    silently degrading to a bare tool name.
+    """
+    rows = TOOL_DECLARATIONS if specs is None else tuple(specs)
+    catalog: dict[str, ToolMetadata] = {}
+    for spec in rows:
+        name = spec.name
+        if name in catalog:
+            raise ValueError("duplicate_tool_metadata:" + name)
+        if not spec.display_label.strip():
+            raise ValueError("tool_metadata_label_required:" + name)
+        catalog[name] = ToolMetadata(spec.display_label, spec.link_label,
+                                     frozenset(spec.capabilities))
+    if set(catalog) != {spec.name for spec in rows}:
+        # Never a silent union/difference: a partial projection is a bug.
+        raise ValueError("tool_metadata_name_drift")
+    return catalog
+
+
+# One projection of the declared rows; no second hand-written table.
+TOOL_METADATA: dict[str, ToolMetadata] = metadata_catalog()
 
 
 def capability_groups() -> dict[str, frozenset[str]]:
@@ -162,5 +127,5 @@ __all__ = [
     "ARTIFACT", "LITERATURE_RETRIEVAL", "LOCAL_CORPUS", "LOCAL_RETRIEVAL",
     "NETWORK", "RESEARCH", "ROUTE_LOCAL", "ROUTE_WEB", "SHARED_CORPUS", "TOOL_METADATA",
     "ToolMetadata", "VISUALIZATION", "WEB_RETRIEVAL", "artifact_link_labels",
-    "capabilities", "capability_groups", "display_labels",
+    "capabilities", "capability_groups", "display_labels", "metadata_catalog",
 ]

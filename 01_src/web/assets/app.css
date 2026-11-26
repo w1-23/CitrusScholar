@@ -2436,3 +2436,78 @@ html[data-reduce-motion="1"] :is(.ctx-drawer, .ctx-drawer-backdrop) { transition
   line-height: 1.4;
   border-bottom: 1px solid currentColor;
 }
+
+/* ── F-14: native LangGraph stream timeline ────────────────────────────────
+   Lifecycle rows only (tool proposals, sub-agent start/end, interrupt, resume).
+   Provisional model text is opt-in and visually marked as a preview. Every
+   value comes from the shared Porcelain theme tokens, so both the light and the
+   dark palette stay readable without a second rule set. */
+.task-native-host { margin: 0; }
+.task-native-host[hidden],
+.task-native-stream[hidden] { display: none; }
+.task-native-stream {
+  display: grid;
+  gap: 5px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-hairline);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.task-native-row {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: start;
+  gap: 6px;
+  min-width: 0;
+}
+.task-native-row::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  margin-top: .62em;
+  border-radius: 50%;
+  background: var(--border-hover, var(--border-hairline));
+}
+.task-native-row.is-active::before,
+.task-native-row.is-proposed::before {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.task-native-row.is-completed::before { background: var(--success); }
+.task-native-row.is-failed::before { background: var(--error); }
+.task-native-row.is-unrecorded::before { background: var(--warning); }
+.task-native-row.is-requested::before { background: var(--accent); }
+.task-native-title { color: var(--text-primary); }
+.task-native-detail { color: var(--text-muted); }
+.task-native-preview {
+  display: grid;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px dashed var(--border-hairline);
+  border-radius: 6px;
+  /* Token-driven surface: readable on the light porcelain canvas and on any
+     future dark palette without a second rule set or a hardcoded colour. */
+  background: var(--bg-elevated, transparent);
+}
+.task-native-preview-text {
+  margin: 0;
+  max-height: 9em;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+@media (max-width: 560px) {
+  .task-native-stream { font-size: 12px; gap: 4px; }
+  .task-native-preview { padding: 5px 6px; }
+  .task-native-preview-text { max-height: 7em; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-native-row.is-active::before,
+  .task-native-row.is-proposed::before { box-shadow: none; }
+}

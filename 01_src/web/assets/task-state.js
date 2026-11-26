@@ -19,6 +19,194 @@
     return data.status === 'in_progress' && typeof data.text === 'string' && data.text.length >= 2 &&
       data.text.length <= 80 && /^[\p{L}\p{M} -]+$/u.test(data.text);
   }
+  // F-14: native LangGraph stream projection. The server maps native model,
+  // tool, sub-agent and interrupt facts onto the existing ``assistant_progress``
+  // event with a stable ``kind`` and ``schema_version``. Anything unknown is
+  // ignored, so an older or newer client never breaks on a newer kind.
+  var NATIVE_SCHEMA_VERSION = 1;
+  var NATIVE_SOURCE = 'native_stream';
+  var NATIVE_STATUS = {model_preview: 'streaming', tool_proposed: 'proposed',
+    subagent_started: 'started', subagent_completed: 'completed',
+    subagent_failed: 'failed', interrupt: 'requested', resume: 'resumed'};
+  var NATIVE_KEYS = {
+    model_preview: ['call_id', 'delta_index', 'text'],
+    tool_proposed: ['tool_call_id', 'tool_name'],
+    subagent_started: ['subagent_id', 'subagent_depth'],
+    subagent_completed: ['subagent_id', 'reason_code'],
+    subagent_failed: ['subagent_id', 'reason_code'],
+    interrupt: ['interrupt_id'],
+    resume: ['reason_code']
+  };
+  var NATIVE_BASE_KEYS = ['origin', 'source', 'visibility', 'schema_version', 'job_id',
+    'run_id', 'status', 'kind', 'at_ms', 'note_id'];
+  var ID = /^[A-Za-z0-9_-]{1,128}$/;
+  function isObject(value) { return !!value && typeof value === 'object' && !Array.isArray(value); }
+  function nativeStreamEvent(data) {
+    if (!isObject(data) || data.origin !== 'langgraph' || data.source !== NATIVE_SOURCE ||
+        data.visibility !== 'public' || data.internal === true || data.private === true) return false;
+    if (data.schema_version !== NATIVE_SCHEMA_VERSION) return false;
+    var kind = data.kind;
+    if (typeof kind !== 'string' || !Object.prototype.hasOwnProperty.call(NATIVE_STATUS, kind)) return false;
+    if (data.status !== NATIVE_STATUS[kind]) return false;
+    var allowed = NATIVE_BASE_KEYS.concat(NATIVE_KEYS[kind]);
+    var keys = Object.keys(data).filter(function (key) { return key !== 'seq'; });
+    if (keys.some(function (key) { return allowed.indexOf(key) < 0; })) return false;
+    if (typeof data.job_id !== 'string' || !ID.test(data.job_id) ||
+        typeof data.run_id !== 'string' || !ID.test(data.run_id)) return false;
+    if (typeof data.note_id !== 'string' || !/^stream:[a-f0-9]{64}$/.test(data.note_id)) return false;
+    if (!Number.isSafeInteger(data.at_ms) || data.at_ms <= 0) return false;
+    if (kind === 'model_preview') {
+      if (typeof data.call_id !== 'string' || !/^mdl:[a-f0-9]{16}$/.test(data.call_id)) return false;
+      if (!Number.isSafeInteger(data.delta_index) || data.delta_index < 0) return false;
+      if (typeof data.text !== 'string' || !data.text.trim() || data.text.length > 400) return false;
+      return true;
+    }
+    if (kind === 'tool_proposed') {
+      return typeof data.tool_call_id === 'string' && ID.test(data.tool_call_id) &&
+        typeof data.tool_name === 'string' && ID.test(data.tool_name);
+    }
+    if (kind === 'subagent_started') {
+      return typeof data.subagent_id === 'string' && /^sa:[a-f0-9]{16}$/.test(data.subagent_id) &&
+        Number.isSafeInteger(data.subagent_depth) && data.subagent_depth >= 1 && data.subagent_depth <= 8;
+    }
+    if (kind === 'subagent_completed' || kind === 'subagent_failed') {
+      return typeof data.subagent_id === 'string' && /^sa:[a-f0-9]{16}$/.test(data.subagent_id) &&
+        typeof data.reason_code === 'string';
+    }
+    if (kind === 'interrupt') {
+      return data.interrupt_id === undefined ||
+        (typeof data.interrupt_id === 'string' && ID.test(data.interrupt_id));
+    }
+    return typeof data.reason_code === 'string';
+  }
+  // A pure projection: replay, live SSE and a reconnected cursor all feed the
+  // same reducer, so a recovered page can never duplicate a shown operation.
+  function createNativeStream(options) {
+    options = options || {};
+    var maxPreview = 4000, maxTools = 64, maxSubagents = 32;
+    var state = {schema_version: NATIVE_SCHEMA_VERSION, job_id: '', run_id: '',
+      preview: null, tools: [], subagents: [], interrupt: null, resume: null,
+      closed: false, committed: false, unrecorded: 0};
+    function sameJob(data) {
+      if (!state.job_id && data.job_id) { state.job_id = data.job_id; state.run_id = data.run_id; }
+      return !state.job_id || data.job_id === state.job_id;
+    }
+    function find(list, key, value) {
+      for (var i = 0; i < list.length; i++) if (list[i][key] === value) return i;
+      return -1;
+    }
+    function preview(data) {
+      var current = state.preview;
+      if (current && current.call_id === data.call_id && data.delta_index <= current.delta_index) return false;
+      if (current && current.call_id !== data.call_id) current = null;
+      var text = (current ? current.text : '') + data.text;
+      if (text.length > maxPreview) text = text.slice(text.length - maxPreview);
+      state.preview = {call_id: data.call_id, delta_index: data.delta_index, text: text,
+        seq: Number.isSafeInteger(data.seq) ? data.seq : 0, status: 'streaming'};
+      return true;
+    }
+    function tool(data) {
+      var index = find(state.tools, 'tool_call_id', data.tool_call_id);
+      if (index >= 0) {
+        var previous = state.tools[index];
+        if (Number.isSafeInteger(data.seq) && Number.isSafeInteger(previous.seq) && data.seq <= previous.seq) return false;
+        state.tools[index] = {tool_call_id: data.tool_call_id, tool_name: data.tool_name,
+          seq: data.seq, status: 'proposed'};
+        return true;
+      }
+      state.tools.push({tool_call_id: data.tool_call_id, tool_name: data.tool_name,
+        seq: Number.isSafeInteger(data.seq) ? data.seq : 0, status: 'proposed'});
+      if (state.tools.length > maxTools) state.tools.splice(0, state.tools.length - maxTools);
+      return true;
+    }
+    function subagent(data, status) {
+      var index = find(state.subagents, 'subagent_id', data.subagent_id);
+      if (index < 0) {
+        // A terminal state for an unseen sub-agent is not a start: report the
+        // settled fact without inventing a start time or a parent.
+        state.subagents.push({subagent_id: data.subagent_id, depth: data.subagent_depth || 0,
+          status: status, reason_code: data.reason_code || '',
+          started_seq: status === 'active' ? data.seq : 0, settled_seq: status === 'active' ? 0 : data.seq});
+        if (state.subagents.length > maxSubagents) state.subagents.splice(0, state.subagents.length - maxSubagents);
+        return true;
+      }
+      var item = state.subagents[index];
+      if (item.status !== 'active') return false;
+      if (Number.isSafeInteger(data.seq) && Number.isSafeInteger(item.started_seq) && data.seq <= item.started_seq) return false;
+      item.status = status;
+      item.reason_code = data.reason_code || '';
+      item.settled_seq = data.seq || 0;
+      return true;
+    }
+    function receive(type, data) {
+      if (state.closed || !nativeStreamEvent(data) || !sameJob(data)) return false;
+      // Once the delivered answer owns the text surface, a late token can never
+      // resurrect a provisional preview.
+      if (state.committed && data.kind === 'model_preview') return false;
+      var changed = false;
+      switch (data.kind) {
+        case 'model_preview': changed = preview(data); break;
+        case 'tool_proposed': changed = tool(data); break;
+        case 'subagent_started': changed = subagent(data, 'active'); break;
+        case 'subagent_completed': changed = subagent(data, 'completed'); break;
+        case 'subagent_failed': changed = subagent(data, 'failed'); break;
+        case 'interrupt':
+          state.interrupt = {interrupt_id: data.interrupt_id || '', seq: data.seq || 0, status: 'requested'};
+          changed = true; break;
+        case 'resume':
+          state.resume = {reason_code: data.reason_code, seq: data.seq || 0};
+          changed = true; break;
+        default: return false;
+      }
+      state.unrecorded = countUnrecorded();
+      return changed;
+    }
+    // "Unrecorded" is a claim about endings only: work that never reported a
+    // terminal fact after the turn closed. Pending work during a live turn is
+    // not counted, because it simply has not finished yet.
+    function countUnrecorded() {
+      var count = 0;
+      state.subagents.forEach(function (item) { if (item.status === 'unrecorded') count++; });
+      state.tools.forEach(function (item) { if (item.status === 'unrecorded') count++; });
+      return count;
+    }
+    // The committed answer always owns the answer surface: a preview is a
+    // provisional reading, never a second copy of the delivered text.
+    function commit() {
+      var changed = !!state.preview || !state.committed;
+      state.preview = null;
+      state.committed = true;
+      return changed;
+    }
+    // A recovered turn may discard the preview without owning the answer yet.
+    function discard() {
+      var changed = !!state.preview;
+      state.preview = null;
+      return changed;
+    }
+    function reset() {
+      state.preview = null; state.tools = []; state.subagents = []; state.interrupt = null;
+      state.resume = null; state.closed = false; state.committed = false; state.unrecorded = 0;
+      if (options.job_id) state.job_id = String(options.job_id);
+    }
+    function terminal() {
+      if (state.closed) return false;
+      state.closed = true;
+      state.preview = null;
+      state.tools.forEach(function (item) { if (item.status === 'proposed') item.status = 'unrecorded'; });
+      state.subagents.forEach(function (item) { if (item.status === 'active') item.status = 'unrecorded'; });
+      state.unrecorded = countUnrecorded();
+      return true;
+    }
+    function view() {
+      return {schema_version: state.schema_version, job_id: state.job_id, run_id: state.run_id,
+        preview: state.preview, tools: state.tools.slice(), subagents: state.subagents.slice(),
+        interrupt: state.interrupt, resume: state.resume, closed: state.closed,
+        committed: state.committed, unrecorded: state.unrecorded};
+    }
+    return {receive: receive, view: view, commit: commit, discard: discard,
+      terminal: terminal, reset: reset, state: state};
+  }
   // Artifact delivery is an explicit terminal-tail fact: which verified files
   // the turn actually delivered, and how many expected files are unavailable.
   // Unknown status values stay truthful; file ids are never guessed.
@@ -264,9 +452,11 @@
     options = options || {};
     var state = {job_id: '', cursor: 0, task_version: 0, applied_version: 0, status: '', started_at: 0, finished_at: 0,
       display_status: '', terminal_snapshot: null, question: null, pending_updates: [], not_applied_updates: [], operations: [], approvals: [],
-      artifact_delivery: null, recovery_cursor: 0};
+      artifact_delivery: null, recovery_cursor: 0, native_stream: null};
     var pending = new Map(), subscribers = [], recoveryFloor = 0, context = createContext(options);
+    var nativeStream = createNativeStream(options);
     state.context_snapshot = null;
+    state.native_stream = nativeStream.view();
     function notify() { subscribers.slice().forEach(function (fn) { fn(state); }); }
     // Ordered events own the newest delivery. A snapshot without a sequence
     // (terminal_snapshot / hydrated job) fills only when no ordered fact exists.
@@ -344,6 +534,15 @@
     }
     function reduce(type, data) {
       if (type === 'artifact_delivery') applyDelivery(data);
+      // F-14: native stream facts share the ordered event stream, so they are
+      // reduced after sequencing and before any presentation. The committed
+      // answer always clears a provisional preview.
+      if (type === 'assistant_progress') nativeStream.receive(type, data);
+      else if (type === 'text' && data.delivery === 'committed') nativeStream.commit();
+      else if (type === 'text_reset') nativeStream.discard();
+      else if (type === 'done' || type === 'error') nativeStream.terminal();
+      state.native_stream = nativeStream.view();
+      if (type === 'artifact_delivery') applyDelivery(data);
       if (data.artifact_delivery) applyDelivery(Object.assign({}, data.artifact_delivery,
         {seq: Number.isSafeInteger(data.seq) ? data.seq : (data.artifact_delivery.seq || 0)}));
       var envelope = data.turn_envelope || data.terminal_snapshot;
@@ -360,13 +559,19 @@
       ['task_version', 'applied_version'].forEach(function (key) {
         if (Number.isSafeInteger(data[key])) state[key] = Math.max(state[key], data[key]);
       });
-      if (type === 'job') state.status = String(data.status || 'running');
+      if (type === 'job') {
+        if (data.job_id && nativeStream.state.job_id && data.job_id !== nativeStream.state.job_id) {
+          nativeStream.reset(); state.native_stream = nativeStream.view();
+        }
+        state.status = String(data.status || 'running');
+      }
       if (type === 'agent_recovery' && data.status === 'admitted' && Number.isSafeInteger(data.seq)) {
         state.recovery_cursor = data.seq;
         state.status = 'running'; state.display_status = ''; state.terminal_snapshot = null;
         state.question = null; state.approvals = []; state.operations = []; state.artifact_delivery = null;
         state.started_at = 0; state.finished_at = 0; recordTimes(data);
         context = createContext(options); state.context_snapshot = null;
+        nativeStream.reset(); state.native_stream = nativeStream.view();
         var reopened = Array.isArray(data.reactivated_updates) ? data.reactivated_updates.filter(function (item) {
           return Number.isSafeInteger(item.version) && item.version > state.applied_version;
         }) : [];
@@ -446,6 +651,7 @@
     }
     function reset(jobId) {
       pending.clear(); recoveryFloor = 0; context = createContext(options); state.context_snapshot = null;
+      nativeStream.reset(); state.native_stream = nativeStream.view();
       Object.assign(state, {job_id: jobId, cursor: 0, task_version: 0, applied_version: 0, status: '', started_at: 0, finished_at: 0,
         display_status: '', terminal_snapshot: null, question: null, approvals: [], operations: [], pending_updates: [], not_applied_updates: [],
         artifact_delivery: null, recovery_cursor: 0});
@@ -459,7 +665,9 @@
       resetJob: function (jobId) { reset(jobId); notify(); },
       clear: function () { subscribers.length = 0; reset(''); }};
   }
-  root.CitrusTaskState = {nativeProgress: nativeProgress,create: create, createProcess: createProcess, createContext: createContext, waitingView: waitingView, displayStatus: displayStatus,
+  root.CitrusTaskState = {nativeProgress: nativeProgress, nativeStreamEvent: nativeStreamEvent,
+    createNativeStream: createNativeStream, create: create, createProcess: createProcess,
+    createContext: createContext, waitingView: waitingView, displayStatus: displayStatus,
     snapshotStatus: snapshotStatus, isTerminal: function (state) { return terminal.indexOf(state.display_status) >= 0; },
     resumable: function (state) { return list(state.operations).filter(function (op) {
       return op.resumable === true && op.status === 'interrupted' && ['local_read', 'pure_computation'].indexOf(op.recovery_mode) >= 0;

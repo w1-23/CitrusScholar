@@ -69,11 +69,20 @@ TEXT_ROLES = frozenset({"title", "xlabel", "ylabel", "legend", "annot", "ticklab
 
 
 def available_font_families() -> list[str]:
-    """Installed family names backed by existing files, never invented options."""
+    """Families the worker verified, not whatever the host happens to have.
+
+    The workbench offers exactly the curated scientific set that is installed
+    in the image (see ``citrus_figures.typography``). An image that installed
+    none of the curated families keeps its installed list so the menu is never
+    empty; the missing-family warning still reports the gap instead of quietly
+    substituting a different typeface.
+    """
     from pathlib import Path
     from matplotlib import font_manager
-    return sorted({entry.name for entry in font_manager.fontManager.ttflist
-                   if Path(entry.fname).is_file()}, key=str.casefold)
+    from citrus_figures.typography import verified_families
+    installed = {entry.name for entry in font_manager.fontManager.ttflist
+                 if Path(entry.fname).is_file()}
+    return verified_families(installed)
 
 _BBOX_KEYS = ("x0", "y0", "x1", "y1")
 
@@ -812,6 +821,24 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
     }
 
 
+def typography_receipt(figure, *, formats=("svg", "pdf"), pdf_bytes=None) -> dict:
+    """Post-render font evidence for the publication record (audit F-08).
+
+    The receipt names the requested stack, the family Matplotlib resolved, the
+    font file behind it and what each exported format carries. A family the
+    image does not have appears in ``missing_family``/``warnings`` with the
+    fallback named; it is never reported as a silent success.
+    """
+    from citrus_figures.typography import available_families, font_evidence
+
+    evidence = font_evidence(figure, pdf_bytes=pdf_bytes, formats=formats,
+                             available=available_families())
+    evidence["warnings"] = list(evidence.get("warnings") or [])
+    evidence["scope"] = ("Requested and resolved family, font file and per-format embedding. "
+                         "A family absent from the Worker is recorded here, not silently replaced.")
+    return evidence
+
+
 def scientific_qa_receipt(rendered: RenderedFigure) -> dict[str, Any]:
     """Measure the saved canvas in points; never claim scientific peer review."""
     import numpy as np
@@ -935,7 +962,13 @@ def scientific_qa_receipt(rendered: RenderedFigure) -> dict[str, Any]:
             checks[name] = {**checks[name], "status": "warn", "measured_status": "fail"}
     status = ("needs_attention" if any(result["status"] == "fail" for result in checks.values())
               else "warn" if any(result["status"] == "warn" for result in checks.values()) else "measured_checks_pass")
+    # F-08: publication records the typography that actually ran — the requested
+    # stack, the family Matplotlib resolved, the font file behind it and what
+    # each exported format carries. A missing family is a warning with the
+    # fallback named, never a silent substitution. It sits beside ``checks``
+    # because it is evidence, not a pass/fail scientific check.
     return {"version": 1, "profile": profile, "checks": checks, "status": status, "advisory": advisory,
+            "typography": typography_receipt(figure, formats=("svg", "pdf")),
             "unsupported": [key for key, value in checks.items() if value["status"] == "unsupported"]}
 
 

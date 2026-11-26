@@ -176,8 +176,13 @@ def snapshot_script_inputs(bindings: Any, owner: int, session_id: str, *,
             if set(raw) == {"dataset_ref"}:
                 from src.research.analysis_results import load_dataset_snapshot
                 dataset = load_dataset_snapshot(owner, raw["dataset_ref"])
+                metadata = dataset.to_dict()
+                provenance = metadata.get("source")
+                if (isinstance(provenance, dict) and provenance.get("tool_name") == "audit_uploaded_data"
+                        and metadata.get("session_id") != session_id):
+                    raise ProjectError("data_unavailable", "审查冻结数据只在生成它的会话内可用。")
                 dataset_ref = dataset.ref
-                file_id = dataset.to_dict().get("payload_file_ref")
+                file_id = metadata.get("payload_file_ref")
                 if not file_id:
                     from src.figures.dataset_codec import encode_frame
                     payload = json.dumps(encode_frame(dataset.to_frame()), ensure_ascii=False, allow_nan=False).encode("utf-8")

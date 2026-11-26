@@ -301,6 +301,9 @@ class Settings(BaseSettings):
     # the model context window; explicit administrator values remain binding.
     AGENT_MAX_MODEL_TOKENS: int = Field(default_factory=lambda: _yaml_val(
         "agent", "max_model_tokens", default=1000000), ge=1)
+    # Native `task` subagent: explicit, file-only, metered on the same job ledger.
+    AGENT_ENABLE_TASK_SUBAGENT: bool = Field(default_factory=lambda: _yaml_val(
+        "agent", "enable_task_subagent", default=True))
     # Auxiliary model calls use the configured provider's supported reasoning-off
     # payload. The main conversation request does not inherit this setting.
     MODEL_REASONING_OFF_BODY: dict = Field(default_factory=lambda: _yaml_val(

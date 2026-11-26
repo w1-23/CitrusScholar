@@ -325,6 +325,11 @@ def publish_fusion_workbook(report, *, source_file_id, source_sha256, source_nam
                                    logical_task_id="audit_workbook:" + publication_key)
     if not url:
         raise ValueError("Fusion workbook was not registered")
+    from src.research.delivery_reconciliation import publication_bound
+
+    # One file, one receipt: identity and hash are attached to this exact
+    # publication so a partly confirmed batch keeps per-file status.
+    publication_bound(url, sha256=digest, filename=filename, file_index=1)
     return {"url": url, "filename": filename, "sha256": digest, "size_bytes": len(content),
             "source_file_id": source_file_id, "source_sha256": source_sha256,
             "file_index": 1, "cells": stats["marked_cells"], "source_format": suffix[1:],

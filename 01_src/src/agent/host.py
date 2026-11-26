@@ -114,12 +114,12 @@ async def _run(state, identity, ledger):
     catalog = build_preset_catalog()
     from .context_tools import register_context_reader
     register_context_reader(catalog)
-    from .workspace_tools import register_workspace_tools, WORKSPACE_TOOL_NAMES
-    register_workspace_tools(catalog)
     from .code_tools import register_code_tools, CODE_TOOL_NAMES
     register_code_tools(catalog)
-    from .fusion_tools import (FUSION_TOOL_NAMES, REPLACED_TOOLS, SKILL_IDS, external_fusion_required,
-                               fusion_delivery_scope, installed_fusion, register_fusion_tools, verified_report_route)
+    from .fusion_tools import (CAPABILITY_UNAVAILABLE, FUSION_TOOL_NAMES, REPLACED_TOOLS, SKILL_IDS,
+                               external_fusion_required, fusion_capability_notice, fusion_capability_state,
+                               fusion_delivery_scope, fusion_retires_legacy_tools, installed_fusion,
+                               register_fusion_tools, verified_report_route)
     from src.graph.task_contract import fusion_delivery_for_turn
     from .nature_skill_tools import NATURE_TOOL_NAMES, installed_nature, register_nature_tools
     external_release = installed_fusion(release, installed_rows)
@@ -157,6 +157,11 @@ async def _run(state, identity, ledger):
         tables = get_request_tables()
     except ImportError:
         tables = []
+    # One atomic capability decision per refresh: the new Fusion surface is only
+    # enabled when release + Worker + an authorized Skill are all ready. The old
+    # analyzers are withdrawn only in that same transition.
+    fusion_capability = {"state": "capability_unavailable", "reason": ""}
+
     def refresh_allowed():
         # A ToolNode task may populate the verified candidate handoff in its
         # own context. Resolve readiness from the current authenticated scope.
@@ -173,25 +178,25 @@ async def _run(state, identity, ledger):
         if retrieval_suppressed(str(state.get("query") or "")):
             from src.graph.tool_availability import retrieval_tool_names
             host.allowed_names.difference_update(retrieval_tool_names())
-        host.allowed_names.update(WORKSPACE_TOOL_NAMES)
-        if external_release or external_required:
-            # Old analyzers are reachable only by exact historical releases.
+        from src.code_execution.presence import worker_available
+        from src.config import PROJECT_ROOT as runtime_root
+        worker_ready = worker_available(runtime_root / "state" / "code_executions.sqlite3")
+        capability, fusion_names, capability_reason = fusion_capability_state(
+            release=release, installed_rows=installed_rows, worker_ready=worker_ready,
+            allowed_skills=[name for name in SKILL_IDS if policy.allows("skill:" + name)],
+            external_release=external_release, external_required=external_required,
+            report_followup=report_followup())
+        fusion_capability.update(state=capability, reason=capability_reason,
+                                 notice=fusion_capability_notice(capability, capability_reason))
+        if fusion_retires_legacy_tools(capability) or capability == CAPABILITY_UNAVAILABLE:
             host.allowed_names.difference_update(REPLACED_TOOLS)
+        host.allowed_names.update(fusion_names)
         if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
-            from src.code_execution.presence import worker_available
-            from src.config import PROJECT_ROOT as runtime_root
             host.allowed_names.update(CODE_TOOL_NAMES)
-            worker_ready = worker_available(runtime_root / "state" / "code_executions.sqlite3")
-            if external_release and any(policy.allows("skill:" + name) for name in SKILL_IDS):
-                if worker_ready:
-                    host.allowed_names.update(FUSION_TOOL_NAMES - {"resolve_external_report"})
-                if report_followup():
-                    host.allowed_names.add("resolve_external_report")
             if not worker_ready:
                 host.allowed_names.difference_update({"code_execute", "code_environment_install"})
-            else:
-                if external_nature and policy.allows("skill:nature-figure"):
-                    host.allowed_names.update(NATURE_TOOL_NAMES)
+            elif external_nature and policy.allows("skill:nature-figure"):
+                host.allowed_names.update(NATURE_TOOL_NAMES)
         if report_followup():
             # A report continuation cannot rerun the audit, invoke code, or
             # advertise another source of findings if exact evidence is absent.
@@ -229,23 +234,28 @@ async def _run(state, identity, ledger):
                 for image in images if image.get("url")]
         else:
             human.content = str(human.content) + "\n当前主模型不支持图片输入；不可声称已看到原图。"
-    prompt = await asyncio.to_thread(system_prompt, host.allowed_names)
-    prompt += ("\nFile 是基础能力。按任务需要自主列举、搜索、读取已授权输入，在当前会话工作区创建或编辑中间文件。"
-               "不依赖所选 Skill、任务类型或逐次确认。读取已有文件版本后再编辑；不要修改输入原件。")
-    if external_required and not (host.allowed_names & FUSION_TOOL_NAMES):
-        prompt += ("\n外部审查运行能力暂不可用，或已安装的审查 Skill 未获本轮授权。不得替换为旧分析器，"
-                   "不得引用未经验证的检查结果。仍可提供独立的原文读取及普通问答。")
-    if host.allowed_names & FUSION_TOOL_NAMES:
-        prompt += ("\n外部核验、数据审查与科研诚信按已安装 Skill 和绑定的文件身份运行。"
-                   "文献先从原件或类型化输入提取条目，再调用 run_external_skill 解析。"
-                   "用 continue_external_literature 对同一执行批量补查，只有回执 can_continue 明确为真时再继续；"
-                   "最后收集证据和缺口。通用搜索结果不能替代核验回执。"
-                   "数据审查先确认实际工作表及明确 A1 矩形（如 'Sheet 1'!A1:D20）；不能自行确认候选区域。collect_external_skill 按本轮用户明确需要的格式交付，"
-                   "以实际附带的文件回执为准。仅文字结论及未要求文件时不发布工作簿。"
-                   "追问审查清单，应读取可验证的既有报告，而不重新执行检查或编造位置和数量。")
-    if host.allowed_names & NATURE_TOOL_NAMES:
-        prompt += ("\n使用已安装上游 Nature Skill。固定模板可用 run_nature_plot 然后 collect_nature_plot。"
-                   "以实收产物和工作台编辑能力为准。用户明确要求 R 而当前 Worker 不支持时，说明限制，不替换成 Python。")
+    from src.code_execution.execution_bridge import sandbox_ready as native_execute_ready
+    from .runtime_capability_table import build as build_runtime_capabilities
+
+    read_only_followup = report_followup()
+    execute_ready = not read_only_followup and native_execute_ready()
+    task_enabled = not read_only_followup and settings.AGENT_ENABLE_TASK_SUBAGENT
+    allowed = set(host.allowed_names)
+    args_by_name = {row["function"]["name"]: tuple(row["function"]["parameters"].get("properties", {}))
+                    for row in catalog.schemas(allowed)}
+    runtime_capabilities = build_runtime_capabilities(
+        available_names=allowed | ({"execute"} if execute_ready else set()),
+        authorized_skills=[name for name in SKILL_IDS if policy.allows("skill:" + name)],
+        fusion_state=fusion_capability["state"], tool_arguments=args_by_name,
+        sandbox_ready=execute_ready, read_only_report=read_only_followup, release=release)
+    prompt = await asyncio.to_thread(system_prompt, allowed)
+    prompt += ("\n原生文件工具 ls/glob/grep/read_file 可读取本轮获授权的文件、技能和只读资源。")
+    if not read_only_followup:
+        prompt += (" write_file/edit_file/delete 仅作用于 /workspace 或 /outputs。"
+                   "编辑前先读取当前版本；/outputs 只是暂存，正式交付仍须宿主产物发布回执。")
+    if fusion_capability.get("notice"):
+        prompt += fusion_capability["notice"]
+    prompt += "\n" + runtime_capabilities.prompt_fragment()
     if "local_hybrid_search" in host.allowed_names:
         try:
             from src.retrieval.corpus_registry import load_corpus_registry
@@ -307,15 +317,19 @@ async def _run(state, identity, ledger):
         completion_digest, completion_errors, reviewed_turn_outcome,
     )
     from .recovery import capture_original_request_state
-    from .deep_agent_runtime import EXECUTOR_ID, NATIVE_READ_TOOLS
+    from .deep_agent_runtime import EXECUTOR_ID, NATIVE_FILE_TOOLS, NATIVE_READ_TOOLS
 
+    summary_enabled = policy.allows("summarization") and state.get("context_compression") is not False
     if not resume or not state.get("capability_runtime"):
         state["capability_runtime"] = {
             "schema": 1,
             "executor": EXECUTOR_ID,
             "model": provider_scope[1], "provider_protocol": "deepseek" if uses_deepseek_protocol(provider_scope[1], provider_scope[0]) else "openai",
             "search_provider": settings.RESOLVED_WEB_SEARCH_PROVIDER,
-            "summary_enabled": False,
+            "summary_enabled": summary_enabled,
+            "native_execute_ready": execute_ready,
+            "native_task_enabled": task_enabled,
+            "runtime_capabilities": runtime_capabilities.as_dict(),
             "skills": [{key: row[key] for key in ("id", "version", "sha256")}
                        for row in installed_rows if policy.allows("skill:" + row["id"])],
             "skill_release_inventory_sha256": state["skill_release_inventory_sha256"],
@@ -327,8 +341,12 @@ async def _run(state, identity, ledger):
             "host_prompt_sha256": digest(prompt),
             "host_tool_schema_sha256": digest(catalog.schemas(host.allowed_names)),
             "native_read_tools": sorted(NATIVE_READ_TOOLS),
+            "native_file_tools": sorted(NATIVE_FILE_TOOLS),
             "budget": {"max_output_tokens": budget.max_output_tokens, "model_window": budget.model_window,
                        "input_limit": budget.input_limit(), "output_limit_source": budget.output_limit_source,
+                       "provider_id": transport.provider_id, "provider_model": transport.model,
+                       "max_model_calls": settings.AGENT_MAX_MODEL_CALLS,
+                       "max_model_tokens": settings.AGENT_MAX_MODEL_TOKENS,
                        "working_max_input_tokens": settings.CONTEXT_WORKING_MAX_INPUT_TOKENS,
                        "working_soft_tokens": settings.CONTEXT_WORKING_SOFT_TOKENS},
             "retrieval": {"rrf_k": settings.RRF_K, "candidate_window": settings.CANDIDATE_WINDOW,
@@ -802,6 +820,8 @@ async def _run(state, identity, ledger):
         except (OSError, sqlite3.Error, task_events.TaskConflict) as exc:
             raise QuestionWakeDeferred("question_wake_ack_deferred") from exc
 
+    from .native_execute_receipt import dispatch_once as guard_native_execute
+
     runtime = HarnessRuntime(model, execute, admit, check_final,
         RunLimits(max_model_steps=settings.AGENT_MAX_MODEL_CALLS, deadline=deadline),
         schemas=catalog.schemas({row["name"] for row in catalog.describe()}),
@@ -813,6 +833,8 @@ async def _run(state, identity, ledger):
         check_final_after_followup=check_final_after_followup, tool_mode=catalog.execution_mode,
         not_run=not_run, check_terminal_orphan=lambda values: is_terminal_orphan(identity, values),
         restore_tool_observation=restore_tool_observation, model_call=metered_model,
+        can_recover_output=lambda: task_events.budget_headroom(identity.run_id),
+        guard_native_execute=guard_native_execute,
         user_input=state.get("agent_question_resume"), bind_user_input=bind_user_input,
         accept_user_input=accept_user_input, acknowledge_user_input=acknowledge_user_input,
         check_retired_question=lambda run_id: asyncio.to_thread(user_questions.retired_question, identity, run_id))
@@ -828,7 +850,10 @@ async def _run(state, identity, ledger):
             async with open_framework_checkpoint(state_root, identity, provider_scope, **checkpoint_options) as saver:
                 result = await runtime.run(identity, messages, saver=saver, resume=resume,
                     checkpoint_config=checkpoint_config, agent_options={"skill_root": skill_root,
-                        "system_prompt": prompt, "capability_policy": policy, "turn_skills": host.turn_skills}, pinned_skills=pinned_skills)
+                        "system_prompt": prompt, "capability_policy": policy, "turn_skills": host.turn_skills,
+                        "model_budget": budget, "summary_enabled": summary_enabled, "execute_ready": execute_ready,
+                        "task_subagent": task_enabled, "workspace_read_only": read_only_followup},
+                    pinned_skills=pinned_skills)
                 if result.status == "suspended" and result.reason == "execution_pending":
                     if parked_execution is None:
                         raise ValueError("execution_suspension_checkpoint_invalid")

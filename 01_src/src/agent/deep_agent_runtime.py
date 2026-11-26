@@ -13,6 +13,14 @@ EXECUTOR_ID = "citrus-deepagents-0.7.38-framework-v2"
 LEGACY_NATIVE_EXECUTOR_ID = "citrus-deepagents-0.7.38-native-v1"
 GRAPH_PROFILE_KEY = "citrus_metered_framework:main"
 NATIVE_READ_TOOLS = frozenset({"ls", "glob", "grep", "read_file"})
+NATIVE_WRITE_TOOLS = frozenset({"write_file", "edit_file", "delete"})
+NATIVE_FILE_TOOLS = NATIVE_READ_TOOLS | NATIVE_WRITE_TOOLS
+# Native delegation: present only when an explicit, metered subagent is built.
+NATIVE_TASK_TOOLS = frozenset({"task"})
+# Native shell: present only through an isolated SandboxBackendProtocol backend.
+NATIVE_EXECUTE_TOOLS = frozenset({"execute"})
+# Registered here; `execute` runs only through the isolated Code Worker backend.
+FILE_MIDDLEWARE_TOOLS = ("ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute")
 
 
 @cache
@@ -22,7 +30,10 @@ def configure_profile():
         raise RuntimeError("unsupported_deepagents_version")
     register_harness_profile(GRAPH_PROFILE_KEY, HarnessProfile(
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-        excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute", "task"}),
+        # `execute` is omitted by the filesystem tool allowlist unless a sandbox
+        # backend is supplied, and `task` only exists when this graph is given
+        # an explicit, metered subagent. No capability is removed by name.
+        excluded_tools=frozenset(),
         # A missing tool observation needs reconciliation, not an invented
         # error. Stock summaries are neither metered nor evidence authority.
         excluded_middleware=frozenset({"PatchToolCallsMiddleware", "SummarizationMiddleware"})))
@@ -204,7 +215,10 @@ class ScopedSkillBackend(HostOnlyBackend):
 
 
 def create_framework_agent(model, tools, middleware, saver, state_schema, *,
-                           skill_root=None, system_prompt=None, capability_policy=None, context_schema=None, turn_skills=None):
+                           skill_root=None, system_prompt=None, capability_policy=None, context_schema=None,
+                           turn_skills=None, workspace_scope=None, identity=None,
+                           task_subagent=True, model_budget=None, execute_ready=True, summary_enabled=True,
+                           workspace_read_only=False):
     from deepagents.backends import CompositeBackend, StateBackend
     from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
     from langchain.agents.middleware import TodoListMiddleware, ToolErrorMiddleware
@@ -216,9 +230,31 @@ def create_framework_agent(model, tools, middleware, saver, state_schema, *,
         skill_backend = EmptySkillBackend(None)
     else:
         skill_backend = ScopedSkillBackend(skill_root, capability_policy, turn_skills)
-    backend = CompositeBackend(default=StateBackend(), routes={"/skills/": skill_backend})
-    permissions = [FilesystemPermission(
-        operations=["write", "edit", "delete"], paths=["/**"], mode="deny")]
+    if workspace_scope is None:
+        # Direct callers without an authenticated run keep the previous
+        # read-only state backend; only an admitted run gets a real workspace.
+        default_backend = StateBackend()
+        artifacts_root = "/"
+        permissions = [FilesystemPermission(
+            operations=["write", "edit", "delete"], paths=["/**"], mode="deny")]
+    else:
+        from .sandbox_backend import CitrusSandboxBackend
+
+        # The sandbox adapter subclasses SandboxBackendProtocol, so the SDK
+        # derives the native `execute` tool. It delegates file operations to the
+        # same Workspace storage: one view, no second store.
+        default_backend = CitrusSandboxBackend(*workspace_scope)
+        # Offloaded tool results land in the run's writable staging area, not a
+        # throwaway in-memory state backend.
+        artifacts_root = "/workspace"
+        # SDK 0.7.38 rejects tool-level path permissions on an execution-capable
+        # backend unless every rule is scoped to a route. /input, /data, /skills
+        # and /01_src are therefore refused by the backend itself (and /skills by
+        # its read-only route); the sandbox is the real execution boundary.
+        permissions = [FilesystemPermission(
+            operations=["write", "edit", "delete"], paths=["/skills/**"], mode="deny")]
+    backend = CompositeBackend(default=default_backend,
+                               routes={"/skills/": skill_backend}, artifacts_root=artifacts_root)
 
     def read_error(error, request):
         if isinstance(error, PermissionError):
@@ -227,20 +263,41 @@ def create_framework_agent(model, tools, middleware, saver, state_schema, *,
             return "路径与读取方式不匹配。请检查授权目录中实际存在的资源。"
         return None
 
-    # Keep SDK filesystem reads, but leave message admission to the shared hard
-    # limit. Default eviction otherwise replaces even the current user/tools
-    # with filesystem stubs before the provider-bound budget sees them.
+    # Native tool-result offload is restored now that the backend persists:
+    # oversized results are written under the run's writable artifacts root
+    # (/workspace/large_tool_results) and the message keeps a readable ref.
+    # Human-message eviction stays off: the original user instruction must never
+    # be silently replaced, only summarized meaningfully.
+    native_tools = tuple(name for name in FILE_MIDDLEWARE_TOOLS
+                         if (execute_ready or name != "execute")
+                         and (not workspace_read_only or name in NATIVE_READ_TOOLS))
     filesystem = FilesystemMiddleware(backend=backend, permissions=permissions,
-        human_message_token_limit_before_evict=None, tool_token_limit_before_evict=None)
-    read_errors = ToolErrorMiddleware(on_error=read_error, tools=sorted(NATIVE_READ_TOOLS))
+        tools=list(native_tools),
+        human_message_token_limit_before_evict=None, tool_token_limit_before_evict=20000)
+    read_errors = ToolErrorMiddleware(on_error=read_error, tools=sorted(NATIVE_FILE_TOOLS))
     # SDK 0.7.38 selects a profile from the configured model identifier and
     # has no per-call profile argument. Scope this alias to graph construction
     # and restore the real provider model at the final model middleware hook.
     profiled_model = model.model_copy(update={"model_name": GRAPH_PROFILE_KEY})
     todos = TodoListMiddleware(tool_description=f"{WRITE_TODOS_TOOL_DESCRIPTION}\n\n{PUBLIC_TODO_INSTRUCTIONS}")
+    subagents = []
+    if workspace_scope is not None and identity is not None and task_subagent:
+        # Explicit, restricted, metered: no implicit general-purpose profile.
+        from .subagent_runtime import general_purpose_subagent
+
+        subagents = [general_purpose_subagent(model=model, identity=identity, backend=backend,
+                                              permissions=permissions,
+                                              file_tools=FILE_MIDDLEWARE_TOOLS, budget=model_budget)]
+    context_middleware = []
+    if summary_enabled and workspace_scope is not None and identity is not None and model_budget is not None:
+        from .context_compaction import MeteredContextCompaction
+
+        context_middleware.append(MeteredContextCompaction(
+            model, identity=identity, budget=model_budget, backend=backend,
+            allowed=capability_policy.allows if capability_policy is not None else None))
     return create_deep_agent(model=profiled_model, tools=tools,
-        middleware=[filesystem, todos, *middleware, read_errors], system_prompt=system_prompt,
-        subagents=[], skills=["/skills/"] if skill_root is not None else [], backend=backend,
+        middleware=[filesystem, todos, *context_middleware, *middleware, read_errors], system_prompt=system_prompt,
+        subagents=subagents, skills=["/skills/"] if skill_root is not None else [], backend=backend,
         permissions=permissions, checkpointer=saver, state_schema=state_schema,
          context_schema=context_schema, name="citrus_framework_loop")
 

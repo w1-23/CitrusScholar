@@ -1,4 +1,12 @@
-"""Tool Registry — tool classification, partitioned concurrency, offload"""
+"""Tool Registry — tool classification, partitioned concurrency, offload.
+
+This module holds the *runtime* projection of a tool: the callable plus the
+policy that was declared for it in ``src.tools.tool_specs``. Policy is never
+authored here — ``register_declared_tool`` is the single place a declarative
+``ToolSpec`` row becomes a registered tool, so the lazy agent path
+(``src.agent.preset_catalog``) and the compatibility reader
+(``src.tools.legacy_registry``) cannot register the same tool differently.
+"""
 import asyncio
 import json
 import contextvars
@@ -53,6 +61,8 @@ def signal_legacy_permission(session_id: str, tool_name: str, decision: str) -> 
 
 @dataclass
 class ToolSpec:
+    """Runtime projection of one ``src.tools.tool_specs.ToolSpec`` declaration."""
+
     func: Callable
     category: str = "general"
     is_readonly: bool = True
@@ -81,8 +91,6 @@ def register_tool(tool: BaseTool, category: str = "general", is_readonly: bool =
         raise ValueError("unsupported recovery_mode")
     if recovery_mode != "never" and not is_readonly:
         raise ValueError("only local read/computation tools may be resumed")
-    if tool.name == "read_account_file" and is_readonly:
-        recovery_mode = "local_read"
     if write_scope not in {None, "session_artifact", "account_record"}:
         raise ValueError(f"unsupported write scope for {tool.name}: {write_scope}")
     if authorization not in {"", "explicit_user_request"}:
@@ -95,6 +103,25 @@ def register_tool(tool: BaseTool, category: str = "general", is_readonly: bool =
         func=tool, category=category, is_readonly=is_readonly,
         concurrency_key=concurrency_key, write_scope=write_scope,
         authorization=authorization, recovery_mode=recovery_mode, preflight=preflight)
+
+
+def register_declared_tool(declaration, tool: BaseTool | None = None) -> BaseTool:
+    """Register one declarative ``ToolSpec`` row; the only row -> registry mapping.
+
+    ``recovery_mode`` is a declared fact, not a tool-name special case: a tool
+    whose local read can be safely resumed says so in its row. Both the lazy
+    capability path and the compatibility reader go through here, so the same
+    row cannot register two different policies.
+    """
+    target = declaration.resolve() if tool is None else tool
+    if getattr(target, "name", None) != declaration.name:
+        raise ValueError("declared_tool_name_mismatch:" + declaration.name)
+    register_tool(
+        target, category=declaration.category, is_readonly=declaration.is_readonly,
+        concurrency_key=declaration.concurrency_key, write_scope=declaration.write_scope,
+        authorization=declaration.authorization, recovery_mode=declaration.recovery_mode,
+        preflight=declaration.preflight())
+    return target
 
 
 def get_tool_spec(name: str) -> Optional[ToolSpec]:

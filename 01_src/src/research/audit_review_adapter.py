@@ -118,8 +118,12 @@ def run_review(tables, indexes, validated, *, sheet_name, query):
     from src.research.integrity_review import get_review
 
     owner, session = int(get_user_id() or 0), str(get_session_id() or "")
+    plot_fields = checks.get("plot_fields")
     request = get_client_request_id() or get_job_id()
-    review_id = sha256(json.dumps(["standalone-audit-review/1", owner, session, request, plans],
+    review_key = ["standalone-audit-review/1", owner, session, request, plans]
+    if plot_fields is not None:
+        review_key.append(plot_fields)
+    review_id = sha256(json.dumps(review_key,
                                   sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:32] if request else None
     previous = get_review(owner, review_id) if review_id else None
     if previous and previous["session_id"] != session:
@@ -148,6 +152,25 @@ def run_review(tables, indexes, validated, *, sheet_name, query):
     else:
         report = {"schema": "standalone-audit-review/1", "table_results": targets, "snapshots": snapshots,
                   "input_errors": errors.copy()}
+        if not errors and all(item["report"]["status"] == "complete" for item in snapshots):
+            from src.agent.evidence_cache import publish_audit_dataset
+            import sqlite3
+
+            datasets = []
+            for item in snapshots:
+                for entry in item["report"]["tables"]:
+                    if len(datasets) >= 8:
+                        break
+                    raise_if_cancelled("audit_dataset_projection")
+                    try:
+                        dataset = publish_audit_dataset(owner=owner, session=session,
+                            source_file_id=item["source_file_id"], source_sha256=item["source_sha256"],
+                            execution_id=review_id or item["report_sha256"], table=entry["table"], fields=plot_fields)
+                    except (ValueError, TypeError, LookupError, OSError, sqlite3.Error):
+                        continue  # An unpublishable projection does not invalidate the review.
+                    datasets.append({"file_index": item["file_index"], **dataset})
+            if datasets:
+                report["plot_datasets"] = datasets
         result = record_report(owner, session, report, review_id=review_id)
     errors = list(report.get("input_errors", ()))
     findings = []
@@ -179,5 +202,7 @@ def run_review(tables, indexes, validated, *, sheet_name, query):
         status, reason = "failed", "audit_workbook_not_published"
     artifact = {"integrity_review": result, "coverage": coverage, "finding_count": len(findings),
                 "findings": findings[:6], "coverage_gaps": coverage_notes[:10], "publication_receipts": receipts}
+    if status == "complete" and report.get("plot_datasets"):
+        artifact["plot_datasets"] = report["plot_datasets"]
     artifact["_tool_outcome"] = delivery_outcome(status, reason, receipts)
     return json.dumps(artifact, ensure_ascii=False, allow_nan=False, separators=(",", ":")), artifact

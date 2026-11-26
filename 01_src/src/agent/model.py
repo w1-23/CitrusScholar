@@ -185,7 +185,8 @@ class ModelDriver:
                       historical_readback, edit_history):
         from src.core.provider_transport import async_deepseek_attempt
         from src.core.task_events import TaskConflict, run_model_attempt
-        from .deep_agent_runtime import NATIVE_READ_TOOLS
+        from .deep_agent_runtime import (NATIVE_EXECUTE_TOOLS, NATIVE_FILE_TOOLS,
+                                         NATIVE_TASK_TOOLS)
         from .plan_tools import NATIVE_PLAN_TOOL
 
         if request.response_format is not None:
@@ -195,7 +196,8 @@ class ModelDriver:
             name = tool["function"]["name"] if isinstance(tool, dict) else tool.name
             if name in host_tools:
                 available.add(name)
-            elif name in NATIVE_READ_TOOLS or name == NATIVE_PLAN_TOOL:
+            elif (name in NATIVE_FILE_TOOLS or name in NATIVE_TASK_TOOLS
+                  or name in NATIVE_EXECUTE_TOOLS or name == NATIVE_PLAN_TOOL):
                 native_schemas.append(convert_to_openai_tool(tool))
         allowed = set(allowed) & available
         model = request.model

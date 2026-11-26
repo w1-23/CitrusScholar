@@ -228,11 +228,36 @@ def _load(name: str):
     return module
 
 
-def configure_style() -> None:
-    """Apply the upstream manuscript palette/typography drawing configuration."""
+def configure_style(*, chinese: bool = False) -> dict[str, Any]:
+    """Apply the pinned manuscript palette and the versioned typography (F-08).
+
+    The upstream helper still runs first because it carries the vendor palette.
+    The application's versioned style is applied on top, so every worker entry
+    point — fixed template or arbitrary script — resolves Latin and CJK families
+    the same way, and a family the image does not have is reported as a warning
+    with the fallback named instead of silently substituting another typeface.
+    """
     module = _load("plot_templates")
     module.require_dependencies()
     module.configure_style()
+    from citrus_figures.typography import apply_style
+
+    return apply_style(chinese=chinese)
+
+
+def style_version() -> str:
+    """The typography policy version this worker applies by default."""
+    from citrus_figures.typography import STYLE_VERSION
+
+    return STYLE_VERSION
+
+
+def font_evidence(figure, **options) -> dict[str, Any]:
+    """Publication-time font record for a rendered figure (family/file/embedding)."""
+    from citrus_figures.typography import font_evidence as record
+
+    return record(figure, **options)
+
 
 
 def interp_monotone(target: Any, xp: Any, fp: Any):

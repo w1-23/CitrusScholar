@@ -859,6 +859,29 @@ def init_budget(job_id, deadline, max_calls=64, max_tokens=None):
         conn.execute("INSERT OR IGNORE INTO task_budgets(job_id,deadline,max_calls,max_tokens) VALUES (?,?,?,?)", (job_id, deadline, max_calls, max_tokens))
 
 
+def budget_headroom(job_id, *, calls=1, tokens=0):
+    """Whether another bounded model attempt still fits this job's budget.
+
+    Used by the harness before re-asking a length- or JSON-truncated proposal:
+    a recovery attempt is a real provider call, so a job with no remaining
+    calls/tokens/time must surface the original reason instead of a budget one.
+    """
+    if not job_id:
+        return False
+    with read_transaction() as conn:
+        row = conn.execute("SELECT calls,max_calls,tokens,max_tokens,deadline "
+                           "FROM task_budgets WHERE job_id=?", (job_id,)).fetchone()
+    if row is None:
+        return False
+    if row["deadline"] is not None and time.time() >= row["deadline"]:
+        return False
+    if row["max_calls"] and row["calls"] + calls > row["max_calls"]:
+        return False
+    if row["max_tokens"] and row["tokens"] + tokens > row["max_tokens"]:
+        return False
+    return True
+
+
 def reserve_attempt(job_id, purpose, estimated_tokens):
     """Reserve every attempt, including failures with unknown provider usage."""
     if not job_id:

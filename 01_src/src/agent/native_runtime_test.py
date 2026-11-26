@@ -102,7 +102,10 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
 
     async def model(history, identity, *, native_schemas):
         histories.append(history)
-        assert {entry["function"]["name"] for entry in native_schemas} == {"read_file", "ls", "glob", "grep", "write_todos"}
+        # One native file surface plus the metered delegation and sandbox tools.
+        assert {entry["function"]["name"] for entry in native_schemas} == {
+            "ls", "glob", "grep", "read_file", "write_file", "edit_file", "delete",
+            "execute", "write_todos", "task"}
         if len(histories) == 1:
             assert any("Read-only demo" in str(message.content) for message in history)
             return AIMessage(content="", tool_calls=[{"id": "read-1", "name": "read_file",

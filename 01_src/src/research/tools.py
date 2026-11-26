@@ -2439,7 +2439,7 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
                         'groups', 'values', 'column_mapping', 'integer_data_confirmed', 'sd_kind',
                         'mean_decimals', 'sd_decimals', 'reported_summaries', 'reported_p_values', 'composite_keys',
                         'pattern_checks', 'expected_structure', 'selected_checks', 'audit_plan', 'custom_findings',
-                        'regions', 'field_roles', 'requested_checks', 'profile'}
+                        'regions', 'field_roles', 'requested_checks', 'profile', 'plot_fields'}
     from citrus_audit.review import PROFILES
     allowed_profiles = (*PROFILES, "on_demand")
     if ("field_roles" in checks and not isinstance(checks["field_roles"], dict)
@@ -2449,6 +2449,12 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
         raise ToolArgumentError(
             "field_roles 必须为对象，requested_checks 必须为字符串数组，"
             f"profile 必须为 {'/'.join(allowed_profiles)} 之一。")
+    if "plot_fields" in checks:
+        fields = checks["plot_fields"]
+        if (not isinstance(fields, list) or not 1 <= len(fields) <= 32
+                or any(not isinstance(name, str) or not 1 <= len(name) <= 512 for name in fields)
+                or len(set(fields)) != len(fields)):
+            raise ToolArgumentError("plot_fields 必须是 1–32 个不同的真实列名。")
     if 'selected_checks' in checks:
         from citrus_audit.data_audit_rules import RULES
         selected = checks['selected_checks']
@@ -2602,6 +2608,8 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
     publish_formats 接受 JSON 字符串或字符串数组，默认 xlsx。
     reported_summaries / reported_p_values 只接受核实后的区域与统计量绑定。
     默认每份原件交付一份 XLSX。再次导出用已有 review_id，无需重扫。
+    checks_json.plot_fields 可指定冻结绘图快照需要的真实列名；后续绘图用
+    plot_datasets[].inputs_binding，不再读取整份原表或重跑审查。
     显式旧审查计划保留兼容；工具返回有限摘要和已有成果引用。
     """
     def summarize_findings(targets, digest):
@@ -2637,7 +2645,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         return text, artifact
     from src.core.tracing import original_query
     query = original_query()
-    modern_options = {"field_roles", "requested_checks", "profile", "reported_p_values"}
+    modern_options = {"field_roles", "requested_checks", "profile", "reported_p_values", "plot_fields"}
     current_chat = bool(query) and not (validated["plan"] or validated["custom_findings"])
     if current_chat or modern_options.intersection(validated["checks"]):
         from .audit_review_adapter import run_review

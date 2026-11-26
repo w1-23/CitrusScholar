@@ -40,6 +40,63 @@ def external_fusion_required():
     return os.environ.get("CITRUS_EXTERNAL_FUSION") == "required"
 
 
+CAPABILITY_NEW = "new_capability"
+CAPABILITY_LEGACY = "legacy_tools_retained"
+CAPABILITY_UNAVAILABLE = "capability_unavailable"
+
+
+def fusion_capability_state(*, release, installed_rows, worker_ready, allowed_skills,
+                            external_release=None, external_required=None, report_followup=False):
+    """One atomic decision for the Fusion tool surface.
+
+    The new tools are enabled only when the pinned release, the Code Worker and
+    at least one authorized Skill capability are all ready. Otherwise the caller
+    keeps the still-safe old tools (``legacy_tools_retained``) or states
+    ``capability_unavailable`` instead of leaving a silent empty window between
+    withdrawn old tools and unopened new ones.
+
+    Returns ``(state, tool_names, reason)``. Pure: it reads no environment and
+    mutates no host state beyond the explicitly supplied readiness facts.
+    """
+    if external_release is None:
+        external_release = installed_fusion(release, installed_rows) if release is not None else False
+    if external_required is None:
+        external_required = external_fusion_required()
+    skills = frozenset(allowed_skills or ()) & SKILL_IDS
+    fallback = CAPABILITY_UNAVAILABLE if external_required else CAPABILITY_LEGACY
+    if not external_release:
+        return fallback, frozenset(), ("fusion_required_without_release" if external_required
+                                       else "fusion_release_not_installed")
+    if not worker_ready:
+        return fallback, frozenset(), "code_worker_unavailable"
+    if not skills:
+        return fallback, frozenset(), "skill_capability_unauthorized"
+    return CAPABILITY_NEW, fusion_tool_names_for(CAPABILITY_NEW, report_followup=report_followup), "external_skill_ready"
+
+
+def fusion_tool_names_for(state, *, report_followup=False):
+    """Tool names for an already decided capability state (no host mutation)."""
+    if state != CAPABILITY_NEW:
+        return frozenset()
+    names = FUSION_TOOL_NAMES - {"resolve_external_report"}
+    return frozenset(names | ({"resolve_external_report"} if report_followup else set()))
+
+
+def fusion_retires_legacy_tools(state):
+    """Old analyzers may only be withdrawn after the replacement surface opened."""
+    return state == CAPABILITY_NEW
+
+
+def fusion_capability_notice(state, reason):
+    """Prompt text for a non-ready state; never claims a Skill can be invoked."""
+    if state == CAPABILITY_NEW:
+        return ""
+    if state == CAPABILITY_UNAVAILABLE:
+        return ("\n外部审查运行能力暂不可用（%s），已安装的审查 Skill 本轮不可调用；"
+                "不得替换为旧分析器或引用未经验证的检查结果。" % reason)
+    return "\n本轮未启用外部审查 Skill（%s）；可继续使用仍然安全可用的既有工具。" % reason
+
+
 _FINDINGS_REQUEST = re.compile(
     r"(?:(?:把|将)?[^，。！？!?]{0,30}(?:审查|发现|异常|重复|核验|具体位置)[^，。！？!?]{0,20}"
     r"(?:清单|名单|列表|列出|罗列|导出|下载|标红|标注|工作簿)|"
@@ -185,10 +242,13 @@ def _response(data, status="complete", reason="external_skill_ready", *, receipt
     return json.dumps(data, ensure_ascii=False, allow_nan=False), artifact
 
 
-def _queued(receipt):
+def _queued(receipt, contract=None):
     execution_id = receipt["execution_id"]
-    return _response({"execution_id": execution_id, "status": receipt["status"], "instruction":
-                      "Worker 已受理。等待框架恢复后，再读取执行结果。"}, execution_id=execution_id)
+    payload = {"execution_id": execution_id, "status": receipt["status"], "instruction":
+               "Worker 已受理。等待框架恢复后，再读取执行结果。"}
+    if contract is not None:
+        payload["input_contract"] = contract
+    return _response(payload, execution_id=execution_id)
 
 
 def _consumed(value):
@@ -215,11 +275,135 @@ def _workbook_source(identity, reference):
     return data, metadata["filename"]
 
 
+_EVIDENCE_KEYS = frozenset({"dataset_ref", "evidence_ref", "evidence", "freeze_receipt", "audit_receipt"})
+_EVIDENCE_SUFFIXES = ("_ref", "_receipt")
+
+
+def _evidence_fields(artifact):
+    """Pass upstream evidence refs and receipts through unchanged.
+
+    F-06 freezes them inside the generic adapter; this module never derives a
+    second identity and never re-publishes a dataset the adapter already froze.
+    """
+    return {key: value for key, value in artifact.items()
+            if (key in _EVIDENCE_KEYS or key.endswith(_EVIDENCE_SUFFIXES))
+            and key not in {"publication_receipts", "plot_datasets", "integrity_review"}}
+
+
+def _plot_fields(options):
+    """Optional model-chosen columns the frozen dataset should project."""
+    fields = (options or {}).get("plot_fields")
+    if fields is None:
+        return []
+    if (type(fields) is not list or not 1 <= len(fields) <= 64
+            or any(type(name) is not str or not name.strip() or len(name) > 120 for name in fields)):
+        raise ValueError("csv_table_plot_fields_invalid")
+    return list(dict.fromkeys(name.strip() for name in fields))
+
+
+def _table_findings(report, digest, filename):
+    """Project saved standalone-audit findings into the shared Finding Schema.
+
+    The projection is the existing ``audit_projection`` view of the immutable
+    report; coordinates stay logical CSV records and fields, with no worksheet
+    name because a CSV table has none.
+    """
+    from src.research.audit_projection import project_findings
+
+    projection = project_findings(report)
+    findings = []
+    for item in projection["findings"]:
+        locations = []
+        for location in item.get("locations") or ():
+            rows = [row for row in location.get("rows") or () if type(row) is int]
+            columns = [entry.get("index") for entry in location.get("columns") or ()
+                       if type(entry.get("index")) is int]
+            mapped = {"source_file_hash": digest, "filename": filename}
+            if rows:
+                mapped["row_index"], mapped["end_row_index"] = min(rows), max(rows)
+            if columns:
+                mapped["column_index"], mapped["end_column_index"] = min(columns), max(columns)
+            mapped["scope"] = ("csv_range" if rows and columns else
+                               "column" if columns else "row" if rows else "table")
+            locations.append(mapped)
+        evidence = dict(item.get("evidence") or {})
+        if item.get("detail"):
+            evidence["message"] = item["detail"]
+        if item.get("rule_version"):
+            evidence.setdefault("method_version", item["rule_version"])
+        finding = {"rule_id": item["rule"], "severity": item.get("severity") or "review",
+                   "evidence": evidence, "locations": locations}
+        if item.get("finding_id"):
+            finding["finding_id"] = item["finding_id"]
+        findings.append(finding)
+    return findings, projection
+
+
+def _csv_table_audit(*, data, filename, file_id, table, query, allow_publication, plot_fields=()):
+    """Review one authorized CSV through the existing generic data-audit route.
+
+    ``audit_review_adapter.run_review`` is the same adapter ``audit_uploaded_data``
+    uses: it runs ``citrus_audit`` on the immutable table bytes, persists one
+    integrity review, and reuses that review instead of rescanning. Publication
+    stays under host authority: the annotated workbook is only requested when
+    the turn's delivery contract asked for it. Frozen dataset refs are whatever
+    the adapter already produced; they are never re-derived here.
+    """
+    from src.core.tracing import get_user_id
+    from src.research.audit_review_adapter import run_review
+    from src.research.integrity_review import get_review
+
+    checks = {"plot_fields": list(plot_fields)} if plot_fields else {}
+    validated = {"checks": checks, "formats": ["xlsx"], "header_rows": [1], "plan": None,
+                 "file_ids": [], "file_indexes": [0], "custom_findings": [], "regions": []}
+    audit_query = query if allow_publication else (
+        (query or "审查这张表") + "\n（本轮只要文字结论，不要生成文件）")
+    _, artifact = run_review([{"name": filename, "data": data, "file_id": file_id}], [0],
+                             validated, sheet_name="", query=audit_query)
+    outcome = artifact.get("_tool_outcome") or {}
+    review_id = (artifact.get("integrity_review") or {}).get("review_id") or ""
+    saved = get_review(int(get_user_id() or 0), review_id) if review_id else None
+    report = (saved or {}).get("report") or {}
+    if report.get("schema") != "standalone-audit-review/1":
+        raise ValueError("csv_table_review_not_saved")
+    findings, projection = _table_findings(report, table["source_sha256"], table["filename"])
+    evidence = _evidence_fields(artifact)
+    receipts = [dict(item) for item in artifact.get("publication_receipts") or () if isinstance(item, dict)]
+    result_refs = [{"kind": "integrity_review", "review_id": review_id}]
+    for ref in artifact.get("result_refs") or ():
+        if isinstance(ref, dict) and ref not in result_refs:
+            result_refs.append(ref)
+    status = str(outcome.get("status") or "complete")
+    if status not in {"complete", "partial", "failed", "unknown"}:
+        status = "partial"
+    reason = str(outcome.get("reason_code") or ("external_csv_table_review_complete"
+                                                if status == "complete" else "external_csv_table_review_partial"))
+    view = {"status": status, "limitations": list(artifact.get("coverage_gaps") or [])[:10],
+            "execution": {"skill": "data-audit", "version": "generic/citrus_audit", "python": ""},
+            "findings": findings,
+            "coverage": [{"check": "csv_table_review", "status": "checked",
+                          "scope": "CSV 单表：%d 条记录 × %d 列（逻辑记录与字段，无工作表）"
+                                   % (table["record_count"], table["column_count"]),
+                          "n_rows": table["record_count"], "n": table["column_count"]}],
+            "evidence": []}
+    public = {"skill_id": "data-audit", "input_contract": table, "review_id": review_id,
+              "input": {"file_id": file_id, "sha256": table["source_sha256"], "filename": table["filename"]},
+              "route": "generic_data_audit",
+              "projection_status": projection.get("status"), "result_refs": result_refs,
+              "publication_receipts": receipts, **evidence, **_summary(view)}
+    if isinstance(artifact.get("plot_datasets"), list):
+        # Frozen by the adapter; passed through unchanged (no second dataset).
+        public["plot_datasets"] = artifact["plot_datasets"]
+    return _response(public, status, reason, receipts=receipts)
+
+
 @tool(args_schema=RunArgs, response_format="content_and_artifact")
 def run_external_skill(skill_id: SkillID, inputs=None, options=None):
-    """Run the pinned external literature, XLSX/XLSM data-audit, or research-integrity Skill. Use exact authorized file_id and sha256 per input role. Data audit needs workbook and scoped regions. Literature accepts bibliography and/or typed references. No raw observations or URLs are accepted."""
+    """Run the pinned external literature, XLSX/XLSM/CSV data-audit, or research-integrity Skill. Use exact authorized file_id and sha256 per input role. Data audit accepts one workbook (workbook + confirmed sheet/A1 regions) or one CSV table (csv_table, no sheet). Literature accepts bibliography and/or typed references. No raw observations or URLs are accepted."""
     from .fusion_worker import schedule_fusion
-    from .fusion_worker_contract import WORKBOOK_EXTENSIONS, confirmed_workbook_regions
+    from .fusion_worker_contract import (CSV_TABLE_ROLE, WORKBOOK_EXTENSIONS, WORKBOOK_ROLE, csv_data_audit_route,
+        confirmed_workbook_regions, csv_table_contract, data_audit_input_kind,
+        excel_workbook_contract)
 
     try:
         identity, call_id, release = _bound(skill_id)
@@ -230,11 +414,57 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
             from citrus_audit.readers import open_xlsx_readonly
             from citrus_audit._zip_safety import validate_macro_workbook
 
-            data, filename = _workbook_source(identity, refs["workbook"])
-            suffix = Path(filename).suffix.lower()
-            if suffix not in WORKBOOK_EXTENSIONS:
+            roles = set(refs)
+            if roles not in ({WORKBOOK_ROLE}, {CSV_TABLE_ROLE}):
+                return _response({"error": "数据审查需要且只接受一个源文件：工作簿（workbook）或单表 CSV（csv_table）。"},
+                                 "not_run", "external_data_audit_input_ambiguous")
+            role = next(iter(roles))
+            # Optional model-chosen columns for the frozen dataset projection;
+            # the pinned analyzer requests do not carry this host-side hint.
+            try:
+                plot_fields = _plot_fields(options)
+            except ValueError:
+                return _response({"error": "plot_fields 必须是 1–64 个非空列名。"}, "not_run",
+                                 "external_data_audit_plot_fields_invalid")
+            options = {key: value for key, value in (options or {}).items() if key != "plot_fields"}
+            data, filename = _workbook_source(identity, refs[role])
+            kind = data_audit_input_kind(filename)
+            if kind is None:
+                return _response({"error": "此 Skill 只支持 .xlsx、.xlsm 工作簿或单表 CSV。"}, "not_run",
+                                 "external_workbook_format_unsupported")
+            if role != {"excel_workbook": WORKBOOK_ROLE, "csv_table": CSV_TABLE_ROLE}[kind]:
+                return _response({"error": "输入角色与文件类型不一致：工作簿用 workbook，CSV 用 csv_table。"},
+                                 "not_run", "external_data_audit_input_role_mismatch")
+            if kind == "csv_table":
+                # A CSV is a single table with logical records, not a workbook:
+                # no sheet name is invented and no regions are confirmed.
+                table = csv_table_contract(data, filename)
+                if csv_data_audit_route("data-audit", release) == "generic":
+                    # The pinned analyzer cannot read a table. Reuse the real
+                    # generic data-audit route on the same authorized bytes and
+                    # project its saved report into the shared Finding Schema.
+                    contract_, query, _, _ = _delivery.get()
+                    try:
+                        return _csv_table_audit(data=data, filename=filename,
+                                                file_id=refs[role]["file_id"], table=table, query=query,
+                                                allow_publication=contract_.intent == "annotated_xlsx",
+                                                plot_fields=plot_fields)
+                    except (KeyError, LookupError, PermissionError, ValueError, OSError) as exc:
+                        return _response({"error": "CSV 表审查未能通过通用数据审查路径完成：%s" % exc,
+                                          "csv_table": table, "route": "generic_data_audit"},
+                                         "not_run", "external_csv_table_audit_unavailable")
+                if (options or {}).get("regions"):
+                    return _response({"error": "CSV 是单表输入，不接受工作表区域；请按列名和记录范围审查。"},
+                                     "not_run", "external_csv_table_regions_not_allowed")
+                options = {**(options or {}), "csv_table": {"header_rows": table["header_rows"],
+                                                            "column_names": table["column_names"],
+                                                            "source_sha256": table["source_sha256"]}}
+                receipt = schedule_fusion(identity, operation_id=call_id, skill_release=release,
+                                          skill_id=skill_id, inputs=refs, options=options)
+                return _queued(receipt, contract=table)
+            if Path(filename).suffix.lower() not in WORKBOOK_EXTENSIONS:
                 return _response({"error": "此 Skill 只支持 .xlsx 或 .xlsm 工作簿。"}, "not_run", "external_workbook_format_unsupported")
-            if suffix == ".xlsm":
+            if Path(filename).suffix.lower() == ".xlsm":
                 try:
                     validate_macro_workbook(data)
                 except ValueError:
@@ -252,6 +482,10 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
             with closing(open_xlsx_readonly(data, filename, data_only=True)) as workbook:
                 if any(region["sheet"] not in workbook.sheetnames for region in options["regions"]):
                     return _response({"error": "确认的工作表不在源文件中。"}, "not_run", "external_workbook_sheet_missing")
+                contract = excel_workbook_contract(workbook.sheetnames, normalized)
+            receipt = schedule_fusion(identity, operation_id=call_id, skill_release=release,
+                                      skill_id=skill_id, inputs=refs, options=options or {})
+            return _queued(receipt, contract=contract)
         receipt = schedule_fusion(identity, operation_id=call_id, skill_release=release,
                                   skill_id=skill_id, inputs=refs, options=options or {})
         return _queued(receipt)
@@ -366,7 +600,8 @@ def _deliver(identity, value, execution_id, skill_id, *, findings_offset=0, hist
     contract, query, previous_query, _ = _delivery.get()
     curated = report
     if skill_id == "data-audit":
-        source = (value.get("inputs") or {}).get("workbook", {})
+        bound = value.get("inputs") or {}
+        source = bound.get("workbook") or bound.get("csv_table") or {}
         digest = source.get("sha256")
         file_id = source.get("file_id")
         if digest and file_id:
@@ -422,7 +657,11 @@ def _deliver(identity, value, execution_id, skill_id, *, findings_offset=0, hist
         from src.core.account_leases import account_lease
         from .fusion_worker import historical_fusion_source
 
-        ref = value["inputs"]["workbook" if skill_id == "data-audit" else "table"]
+        report_inputs = value["inputs"]
+        ref = (report_inputs.get("workbook") or report_inputs.get("csv_table")
+               if skill_id == "data-audit" else report_inputs.get("table"))
+        if ref is None:
+            raise ValueError("fusion_source_input_missing")
         with account_lease(identity.owner_user_id):
             raw, name = (historical_fusion_source(identity, value, ref) if historical else _workbook_source(identity, ref))
             artifact = publish_fusion_workbook(curated, source_file_id=ref["file_id"],

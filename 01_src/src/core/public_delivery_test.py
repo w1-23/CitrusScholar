@@ -130,26 +130,26 @@ class PublicDeliveryTests(unittest.TestCase):
             "seq": exported["events"][-1]["seq"], "status": "compacted", "elapsed_ms": 55})
         conn.close()
 
-    def test_native_first_packet_is_recorded_before_preview_and_never_exposes_reasoning(self):
+    def test_native_first_packet_is_recorded_without_publishing_drafts_or_reasoning(self):
         from langchain_core.messages import AIMessage, AIMessageChunk
         from langchain_core.outputs import ChatGenerationChunk
         from src.agent.model import _StreamEvidence
         from src.core.request_context import _observation
 
-        observed, scope = [], {}
+        scope = {}
         saved = _observation.set(scope)
         try:
-            evidence = _StreamEvidence(lambda piece: observed.append((scope["provider_first_packet_ms"], piece)))
+            evidence = _StreamEvidence()
             evidence.on_llm_new_token("", chunk=ChatGenerationChunk(message=AIMessageChunk(
                 content="", additional_kwargs={"reasoning_content": "private fixture"})))
             packet = scope["provider_first_packet_ms"]
-            self.assertEqual(observed, [])
-            evidence.on_llm_new_token("preview text", chunk=ChatGenerationChunk(message=AIMessageChunk(
-                content="preview text", response_metadata={"finish_reason": "stop"})))
-            response = evidence.check(AIMessage(content="preview text", additional_kwargs={
+            self.assertIsInstance(packet, int)
+            evidence.on_llm_new_token("draft fixture", chunk=ChatGenerationChunk(message=AIMessageChunk(
+                content="draft fixture", response_metadata={"finish_reason": "stop"})))
+            response = evidence.check(AIMessage(content="draft fixture", additional_kwargs={
                 "reasoning_content": "private fixture"}), allow_tool_stop=False, output_limit=None)
-            self.assertEqual(observed, [(packet, "preview text")])
-            self.assertEqual(response.content, "preview text")
+            self.assertEqual(scope["provider_first_packet_ms"], packet)
+            self.assertEqual(response.content, "draft fixture")
             self.assertNotIn("reasoning_content", response.additional_kwargs)
             self.assertEqual(project_public_event("text", {"content": response.content, "phase": "draft"}), {})
         finally:

@@ -343,12 +343,12 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             execute, check = AsyncMock(), AsyncMock()
             harness = HarnessRuntime(ScriptedModel(script=model), execute, AsyncMock(), check, RunLimits(2, time.monotonic() + 5),
                 [SCHEMA])
-            with patch('src.core.public_progress.emit_public_progress') as progress:
+            with patch('src.core.progress_bus.get_progress_queue', return_value=asyncio.Queue()) as queue:
                 result = await harness.run(IDENTITY, [HumanMessage(content="request")], saver=InMemorySaver())
             self.assertEqual((result.status, result.reason), ("incomplete", "model_stream_unconfirmed"))
             execute.assert_not_called()
             check.assert_not_called()
-            progress.assert_not_called()
+            self.assertNotIn("provisional", str(list(queue.return_value._queue)))
 
     async def test_confirmed_tool_round_does_not_publish_model_draft(self):
         model = AsyncMock(side_effect=[AIMessage(content="Unreviewed draft fixture", tool_calls=[CALL],
@@ -357,12 +357,12 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         check = AsyncMock(return_value=FinalCheck())
         harness = HarnessRuntime(ScriptedModel(script=model), execute, AsyncMock(), check,
                                  RunLimits(2, time.monotonic() + 5), [SCHEMA])
-        with patch('src.core.public_progress.emit_public_progress') as progress:
+        with patch('src.core.progress_bus.get_progress_queue', return_value=asyncio.Queue()) as queue:
             result = await harness.run(IDENTITY, [HumanMessage(content="request")], saver=InMemorySaver())
         self.assertEqual(result.status, "complete")
         execute.assert_awaited_once()
         check.assert_awaited_once()
-        progress.assert_not_called()
+        self.assertNotIn("Unreviewed draft fixture", str(list(queue.return_value._queue)))
 
     async def test_confirmed_text_finishes_once_and_filtered_tools_never_dispatch(self):
         for reason, tool_calls, status in (("stop", [], "complete"),

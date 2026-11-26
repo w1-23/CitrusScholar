@@ -18,8 +18,6 @@ from .capabilities import CapabilityCatalog
 from .identity import ExecutionIdentity
 from .runtime import AdmissionStopped
 
-_PUBLIC_WAIT_SECONDS = 12
-
 _TEXT_TERMINALS = frozenset({"stop", "end_turn", "stop_sequence"})
 _TOOL_TERMINALS = frozenset({"tool_calls", "tool_use", "function_call"})
 _LENGTH_TERMINALS = frozenset({"length", "max_tokens", "max_output_tokens"})
@@ -64,44 +62,18 @@ class _StreamEvidence(BaseCallbackHandler):
 
     run_inline = True
 
-    def __init__(self, on_delta):
-        self.on_delta = on_delta
+    def __init__(self):
         self.started = time.monotonic()
         self.first_packet = False
         self.terminal = None
         self.terminal_conflict = False
         self.cancelled = False
         self.tool_chunks = []
-        self.public_wait_timer = None
-        self.public_wait_published = False
-
-    def watch_public_wait(self, scope):
-        if scope and scope.get("purpose") == "main_loop" and scope.get("attempt_id"):
-            loop = asyncio.get_running_loop()
-
-            def admitted():
-                self.public_wait_timer = loop.call_later(
-                    _PUBLIC_WAIT_SECONDS, self._publish_slow_provider, scope["attempt_id"])
-            scope["on_provider_request_admitted"] = admitted
-
-    def stop_public_wait(self, scope):
-        if scope is not None:
-            scope.pop("on_provider_request_admitted", None)
-        if self.public_wait_timer is not None:
-            self.public_wait_timer.cancel()
-
-    def _publish_slow_provider(self, attempt_id):
-        from src.core.public_progress import emit_public_progress
-        category = "agent_model_connected" if self.first_packet else "agent_model_wait"
-        if category == "agent_model_wait":
-            self.public_wait_published = True
-        emit_public_progress("", category=category, step_id=attempt_id,
-                             note_id=f"{attempt_id}:{category}")
 
     def on_llm_error(self, error, **_):
         self.cancelled = isinstance(error, asyncio.CancelledError)
 
-    def on_llm_new_token(self, token, *, chunk=None, **_):
+    def on_llm_new_token(self, _token, *, chunk=None, **_):
         message = getattr(chunk, "message", None)
         if not isinstance(message, AIMessageChunk):
             return
@@ -114,8 +86,6 @@ class _StreamEvidence(BaseCallbackHandler):
             observation = _observation.get()
             if observation is not None:
                 observation["provider_first_packet_ms"] = elapsed
-                if self.public_wait_published:
-                    self._publish_slow_provider(observation["attempt_id"])
         fragments = message.tool_call_chunks
         if self.terminal is not None and (message.content or fragments):
             self.terminal_conflict = True
@@ -127,11 +97,6 @@ class _StreamEvidence(BaseCallbackHandler):
                 self.terminal = reason
         if fragments:
             self.tool_chunks.append(AIMessageChunk(content="", tool_call_chunks=fragments))
-        if self.on_delta and isinstance(token, str) and token:
-            try:
-                self.on_delta(token)
-            except Exception:
-                pass
 
     def check(self, response, *, allow_tool_stop, output_limit):
         metadata = dict(response.response_metadata)
@@ -208,19 +173,18 @@ class ModelDriver:
                 else schema for schema in self.catalog.schemas(names)]
 
     async def __call__(self, request, handler, identity: ExecutionIdentity, *, allowed, host_tools,
-                       on_delta=None, historical_readback=None):
+                       historical_readback=None, edit_history=True):
         token = _main_model_budget.set(self.budget)
         try:
             return await self._invoke(request, handler, identity, allowed=allowed, host_tools=host_tools,
-                                      on_delta=on_delta, historical_readback=historical_readback)
+                                      historical_readback=historical_readback, edit_history=edit_history)
         finally:
             _main_model_budget.reset(token)
 
     async def _invoke(self, request, handler, identity: ExecutionIdentity, *, allowed, host_tools,
-                      on_delta, historical_readback):
+                      historical_readback, edit_history):
         from src.core.provider_transport import async_deepseek_attempt
-        from src.core.request_context import model_request
-        from src.core.task_events import TaskConflict, model_input_limit, run_model_attempt
+        from src.core.task_events import TaskConflict, run_model_attempt
         from .deep_agent_runtime import NATIVE_READ_TOOLS
         from .plan_tools import NATIVE_PLAN_TOOL
 
@@ -252,17 +216,15 @@ class ModelDriver:
         view, offered = list(request.messages), ()
         system = [request.system_message] if request.system_message else []
         if historical_readback is not None and "read_tool_result" in available:
-            _, original = model_request(estimate_model, [*system, *view])
-            if original["estimated_input_tokens"] > model_input_limit(original["output_tokens"]):
-                from .deep_agent_runtime import edit_context_for_send
+            from .deep_agent_runtime import prepare_context_for_send
 
-                read_schemas = [*self._schemas_for(allowed | {"read_tool_result"}), *native_schemas]
-                if any(schema["function"]["name"] == "read_tool_result" for schema in read_schemas):
-                    candidate = model.bind(**(options | {"tools": read_schemas}))
-                    edited, offered = await edit_context_for_send(
-                        model, candidate, [*system, *view], identity, historical_readback.historical_result_reference)
-                    if offered:
-                        view, estimate_model, schemas = edited[len(system):], candidate, read_schemas
+            read_schemas = [*self._schemas_for(allowed | {"read_tool_result"}), *native_schemas]
+            if any(schema["function"]["name"] == "read_tool_result" for schema in read_schemas):
+                candidate = model.bind(**(options | {"tools": read_schemas}))
+                edited, offered = await prepare_context_for_send(model, candidate, [*system, *view], identity,
+                    historical_readback.historical_result_reference, edit=edit_history)
+                if offered:
+                    view, estimate_model, schemas = edited[len(system):], candidate, read_schemas
 
         model_response = None
 
@@ -272,12 +234,11 @@ class ModelDriver:
                 historical_readback.historical_result_offers.update(offered)
             from src.core.request_context import _observation
             scope = _observation.get()
-            evidence = _StreamEvidence(on_delta)
+            evidence = _StreamEvidence()
             observed_model = model.model_copy(update={"cache": False, "callbacks": AsyncCallbackManager.configure(
                 inheritable_callbacks=model.callbacks, local_callbacks=[evidence])})
             try:
                 async with async_deepseek_attempt(observed_model, [*system, *view], options) as private:
-                    evidence.watch_public_wait(scope)
                     model_response = await handler(request.override(model=observed_model, messages=view, tools=schemas,
                                                                      model_settings=options))
             except AttributeError as error:
@@ -286,8 +247,6 @@ class ModelDriver:
                 if evidence.cancelled:
                     raise asyncio.CancelledError() from error
                 raise
-            finally:
-                evidence.stop_public_wait(scope)
             if len(model_response.result) != 1 or not isinstance(model_response.result[0], AIMessage):
                 raise TypeError("model_must_return_ai_message")
             if private is not None and private.terminal_conflict:

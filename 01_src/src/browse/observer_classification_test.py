@@ -7,7 +7,8 @@ import pytest
 
 from src.browse.relay import BrowseError, browse_reason_class
 from src.browse.service import Renderer
-from src.core.progress_bus import public_progress_payload, public_tool_outcome
+from src.core.progress_bus import public_tool_outcome
+from src.core.public_delivery import project_public_event
 from src.tools.browse_web import _output
 
 
@@ -39,11 +40,7 @@ def test_trusted_relay_reason_classifies_only_failed_top_level_navigation(top_le
     assert renderer.send.await_args_list[-1].args == ({'ok': False},)
 
 
-def test_resume_preparation_has_a_distinct_fixed_label_under_replay():
-    data = {'category': 'agent_prepare', 'origin': 'host', 'note_id': 'job:prepare'}
-    new = public_progress_payload('assistant_progress', data)
-    restore = public_progress_payload('assistant_progress', {**data, 'note_id': 'run:resume-prepare'})
-    assert new['category'] == 'agent_prepare'
-    assert restore['category'] == 'agent_resume_prepare'
-    assert restore['text'] != new['text']
-    assert public_progress_payload('assistant_progress', restore) == restore
+def test_fixed_prepare_captions_are_not_public_events_on_replay():
+    for note_id in ("job:prepare", "run:resume-prepare"):
+        data = {"category": "agent_prepare", "origin": "host", "note_id": note_id, "text": "legacy caption"}
+        assert not project_public_event("assistant_progress", data)

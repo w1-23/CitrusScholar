@@ -153,104 +153,89 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual(older["next_before"], 0)
         self.assertFalse(any(turn.get("history_pending") for turn in older["turns"]))
 
-    def test_history_and_replay_use_the_same_public_note_identity(self):
-        from src.core.progress_bus import PUBLIC_WORK_NOTES
-        job_id = self.claim.job_id
-        observed = task_events.append_event(job_id, "assistant_progress", {
-            "job_id": job_id, "visibility": "public", "origin": "host", "category": "table_processed",
-            "note_id": "fixture-progress", "text": "private fixture input"})
-        task_events.append_event(job_id, "text_reset", {"job_id": job_id})
-        live = self.client.get(f"/jobs/{job_id}/events").json()
-        saved = self.client.get(f"/sessions/{self.sid}/messages").json()
-        rows = [item for item in saved["turns"][0]["trace"] if item.get("event") == "assistant_progress"]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["seq"], observed["seq"])
-        self.assertEqual(rows[0]["data"]["note_id"], "fixture-progress")
-        self.assertEqual(rows[0]["data"]["text"], PUBLIC_WORK_NOTES["table_processed"])
-        self.assertIn("fixture-progress", str(live))
-        self.assertNotIn("private fixture input", str(live) + str(saved))
+    def test_flat_history_does_not_resurrect_legacy_narration(self):
+        items = [{'role': 'user', 'content': 'Question', 'request_id': 'turn', 'message_id': 1},
+                 {'role': 'assistant', 'content': 'Legacy fixed caption', 'progress': True,
+                  'origin': 'host', 'request_id': 'turn', 'message_id': 2},
+                 {'role': 'assistant', 'content': 'Saved answer', 'request_id': 'turn', 'message_id': 3}]
+        [turn] = main.build_history_turns(items)
+        self.assertEqual(turn['answer']['content'], 'Saved answer')
+        self.assertNotIn('Legacy fixed caption', str(turn))
+        [unfinished] = main.build_history_turns(items[:-1])
+        self.assertIsNone(unfinished['answer'])
+        self.assertNotIn('Legacy fixed caption', str(unfinished))
 
-    def test_only_previously_published_notes_survive_history_and_replay(self):
+    def _native_progress(self, *, marker="a", text="核对两种实验方法", status="in_progress"):
+        return {"job_id": self.claim.job_id, "origin": "langgraph", "source": "write_todos",
+                "visibility": "public", "note_id": "todo:" + marker * 64, "status": status,
+                **({"text": text} if status == "in_progress" else {})}
+
+    def test_native_progress_is_durable_before_notification_and_deduplicated(self):
         from src.core import progress_bus
-        from src.core.public_progress import emit_public_progress, reset_emitted
-
         job_id = self.claim.job_id
-        public_note = "我已识别两块数据，接下来用第二块绘图。"
         queue = task_events.DurableEventQueue(job_id)
-        reset_emitted()
-        self.addCleanup(reset_emitted)
         notify = queue._notify
+        frames = []
 
         def check_notification(frame):
             data = json.loads(frame['data'])
-            stored = task_events.public_working_notes(job_id)
-            self.assertEqual([(row['seq'], row['data']) for row in stored], [(int(frame['id']), data)])
-            self.assertEqual(jobs.get_job(job_id)['progress_summary'], data['text'])
+            self.assertEqual(task_events.public_working_notes(job_id)[-1]['data'], data)
+            frames.append(data)
             notify(frame)
 
+        active = self._native_progress()
+        inactive = self._native_progress(marker="b", status="inactive")
         with patch.object(progress_bus, 'get_progress_queue', return_value=queue), \
                 patch.object(queue, '_notify', side_effect=check_notification):
-            # New emitters cannot publish model text. A previously persisted
-            # public model event still projects consistently in old history.
-            self.assertFalse(emit_public_progress(public_note, note_id="model-note", job_id='caller-claimed-id'))
-            queue.put_nowait(progress_bus._encode_event('assistant_progress', {
-                'origin': 'model', 'visibility': 'public', 'text': public_note,
-                'note_id': 'model-note', 'job_id': 'caller-claimed-id'}))
-        frame = queue.get_nowait()
-        asyncio.run(self.sessions.save_messages(self.sid, [HumanMessage(content='Question'),
+            for payload in (active, active, inactive, inactive):
+                progress_bus.emit_progress('assistant_progress', payload)
+        self.assertEqual([row['status'] for row in frames], ['in_progress', 'inactive'])
+        self.assertEqual([json.loads(queue.get_nowait()['data']) for _ in frames], frames)
+        self.assertTrue(queue.empty())
+        asyncio.run(self.sessions.save_messages(self.sid, [HumanMessage('Question'),
             AIMessage(content='Unidentified checkpoint narration', tool_calls=[{
-                'id': 'fixture-tool', 'name': 'fixture_tool', 'args': {}}]), AIMessage(content='Saved answer')],
+                'id': 'fixture-tool', 'name': 'fixture_tool', 'args': {}}]), AIMessage('Saved answer')],
             idempotency_key='crid:original-client-request'))
         replay = self.client.get(f'/jobs/{job_id}/events').json()
         history = self.client.get(f'/sessions/{self.sid}/messages').json()
-        saved = next(row for row in history['turns'][0]['trace'] if row.get('event') == 'assistant_progress')
-        replayed = next(row for row in replay['events'] if row.get('event') == 'assistant_progress')
-        self.assertEqual(saved['seq'], int(frame['id']))
-        self.assertEqual(saved['data'], replayed['data'])
-        self.assertEqual(saved['data'], json.loads(frame['data']))
-        self.assertEqual(saved['data']['job_id'], job_id)
-        self.assertEqual(saved['data']['note_id'], 'model-note')
-        self.assertNotIn('Unidentified checkpoint narration', str(history))
+        for records in (history['turns'][0]['trace'], replay['events']):
+            self.assertEqual([row['data'] for row in records if row.get('event') == 'assistant_progress'], frames)
+        self.assertNotIn('Unidentified checkpoint narration', str(history) + str(replay))
         self.assertIn('Saved answer', str(history))
-        self.assertNotIn('Unidentified checkpoint narration', str(replay))
-        self.assertNotIn('private fixture', str(replay) + str(history))
 
-    def test_verified_milestones_are_idempotent_across_reconnect_and_history(self):
-        from src.core import progress_bus
-        from src.core.public_progress import emit_public_progress, emit_retrieval_stage, reset_emitted
-
+    def test_legacy_narrative_stays_stored_but_never_projects(self):
         job_id = self.claim.job_id
-        queue = task_events.DurableEventQueue(job_id)
-        self.addCleanup(reset_emitted)
-        categories = ['agent_model_wait', 'retrieval_full_text_read', 'agent_review_evidence', 'agent_review_answer']
-        with patch.object(progress_bus, 'get_progress_queue', return_value=queue):
-            self.assertTrue(emit_public_progress('provider draft fixture', category=categories[0], step_id='attempt-1',
-                                                 note_id='attempt-1:wait', job_id=job_id))
-            emit_retrieval_stage('full_text_read')
-            emit_retrieval_stage('private_fixture_page')
-            for category in categories[2:]:
-                self.assertTrue(emit_public_progress('private tool fixture', category=category,
-                                                     note_id=category, job_id=job_id))
-            reset_emitted()  # Simulate a separate task context after reconnect.
-            emit_retrieval_stage('full_text_read')
-        frames = [json.loads(queue.get_nowait()['data']) for _ in categories]
-        self.assertTrue(queue.empty())
+        with task_events.transaction() as conn:
+            legacy = {"job_id": job_id, "origin": "host", "visibility": "public", "note_id": "legacy",
+                      "category": "agent_model_wait", "text": "已向模型发送请求，正在等待首批响应。"}
+            conn.execute('INSERT INTO task_events VALUES (?,?,?,?,?)',
+                         (job_id, 1, 'assistant_progress', json.dumps(legacy), 1))
+            conn.execute('UPDATE task_jobs SET progress_summary=? WHERE job_id=?', (legacy['text'], job_id))
+        self.assertIsNone(task_events.append_event(job_id, 'assistant_progress', legacy))
+        new = task_events.append_event(job_id, 'assistant_progress', self._native_progress())
+        self.assertEqual(new['seq'], 2)
         replay = self.client.get(f'/jobs/{job_id}/events').json()
+        self.assertEqual(replay['events'][0]['data'], {'seq': 1})
+        self.assertEqual(replay['events'][1]['data'], new['data'])
         history = self.client.get(f'/sessions/{self.sid}/messages').json()
-        replay_notes = [entry['data'] for entry in replay['events'] if entry['event'] == 'assistant_progress']
-        history_notes = [entry['data'] for entry in history['turns'][0]['trace'] if entry.get('event') == 'assistant_progress']
-        self.assertEqual(frames, replay_notes)
-        self.assertEqual(frames, history_notes)
-        self.assertEqual([frame['category'] for frame in frames], categories)
-        assert all(frame['text'] == progress_bus.PUBLIC_WORK_NOTES[frame['category']] for frame in frames)
-        self.assertNotIn('fixture', str(replay_notes) + str(history_notes))
+        self.assertEqual([row['data'] for row in history['turns'][0]['trace'] if row.get('event') == 'assistant_progress'],
+                         [new['data']])
+        status = self.client.get(f'/jobs/{job_id}').json()
+        self.assertNotIn(legacy['text'], str(replay) + str(history) + str(status))
+        self.assertEqual(jobs.get_job(job_id)['progress_summary'], legacy['text'])
+        with task_events.read_transaction() as conn:
+            self.assertEqual(json.loads(conn.execute(
+                'SELECT data FROM task_events WHERE job_id=? AND seq=1', (job_id,)).fetchone()[0]), legacy)
 
     def test_rejected_progress_is_absent_from_queue_storage_replay_and_history(self):
         from src.core.progress_bus import _encode_event
         job_id = self.claim.job_id
         queue = task_events.DurableEventQueue(job_id)
-        for text in ('<analysis>private fixture</analysis>', 'Bearer fixture-secret', '{"args": "private"}'):
-            payload = {'origin': 'model', 'category': 'table_processed', 'text': text}
+        for override in ({'text': '<analysis>private fixture</analysis>'}, {'text': 'Bearer fixture-secret'},
+                         {'text': '{"args": "private"}'}, {'text': '我认为先隐去原始信息'},
+                         {'origin': 'model'}, {'job_id': 'wrong-job'}, {'visibility': 'private'},
+                         {'status': 'inactive'}, {'reasoning_content': 'unpublished analysis'}, {'note_id': 'bad'}):
+            payload = self._native_progress() | override
             self.assertIsNone(task_events.append_event(job_id, 'assistant_progress', payload))
             queue.put_nowait(_encode_event('assistant_progress', payload))
         self.assertTrue(queue.empty())
@@ -293,28 +278,6 @@ class TaskObservationTests(unittest.TestCase):
         self.assertEqual(self.client.get(f'{route}/update-2').status_code, 404)
         self.owner += 1
         self.assertEqual(self.client.get(f'{route}/update-1').status_code, 404)
-
-
-def test_model_draft_is_not_a_public_answer(monkeypatch):
-    from src.core import progress_bus
-    from src.core.public_progress import PublicAnswerPreview
-
-    events = []
-    monkeypatch.setattr(progress_bus, "emit_answer_start", lambda: events.append("answer_start"))
-    monkeypatch.setattr(progress_bus, "emit_text", lambda value: events.append(value))
-    monkeypatch.setattr(progress_bus, "emit_text_reset", lambda: events.append("text_reset"))
-    preview = PublicAnswerPreview()
-    preview.append("This is a safe plain-text preview of the visible answer. ")
-    preview.append("This remains in the final answer stream.")
-    preview.clear()
-    assert events == []
-    for text in ('{"answer": "This is a private completion envelope. "}',
-                 '<think>This is privately authored reasoning material.</think> ',
-                 'One should never disclose a Bearer example-private-token. '):
-        preview = PublicAnswerPreview()
-        preview.append(text)
-        preview.clear()
-        assert events == []
 
 
 def test_pinned_framework_runtime_passes_startup_readiness():

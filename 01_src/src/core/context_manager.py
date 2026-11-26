@@ -62,10 +62,8 @@ def assemble_supervisor_messages(system_prompt: str, state: dict, human_msg):
     （save 节点完整持久化定位、与 tool_calls/ToolMessage 配对基线用）。
     """
     messages: list = [SystemMessage(content=system_prompt)]
-    from src.core.model_context import historical_send_view
-    history_msgs = historical_send_view(list(state.get("messages", [])))
-    if history_msgs:
-        messages.extend(history_msgs)
+    # ContextManager.load has already prepared this authorized history view.
+    messages.extend(state.get("messages", []))
     # v8.3.8: 历史检索证据块（跨轮复用）——注入在系统与历史之后、本轮问题之前
     if state.get("history_evidence_block"):
         messages.append(AIMessage(content=state["history_evidence_block"], additional_kwargs={

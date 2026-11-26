@@ -114,13 +114,11 @@ def _append(conn, job_id, event, data):
     if event == "text" and "content" not in data:
         return None
     if event == "assistant_progress":
-        if not data.get("text"):
+        if not data.get("status") or data.get("job_id") != job_id:
             return None
-        data["job_id"] = job_id
-        # The same milestone can be reached by separate parallel/recovered
-        # contexts. Durable identity, not a process-local debounce, wins.
-        if data.get("origin") == "host" and data.get("note_id") and conn.execute(
-                "SELECT 1 FROM task_events WHERE job_id=? AND event='assistant_progress' "
+        # The native tool update may be observed again after recovery.
+        if conn.execute("SELECT 1 FROM task_events WHERE job_id=? AND event='assistant_progress' "
+                "AND json_extract(data, '$.origin')='langgraph' "
                 "AND json_extract(data, '$.note_id')=? LIMIT 1",
                 (job_id, data["note_id"])).fetchone():
             return None
@@ -140,8 +138,6 @@ def _append(conn, job_id, event, data):
     frame = stamp_sse_event(_encode_event(event, data), seq)
     payload = json.loads(frame["data"])
     conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", (job_id, seq, event, canonical(payload), now))
-    if event == "assistant_progress":
-        conn.execute("UPDATE task_jobs SET progress_summary=? WHERE job_id=?", (payload["text"][:200], job_id))
     if event == "done" and isinstance(payload.get("turn_envelope"), dict):
         conn.execute("UPDATE task_jobs SET terminal_snapshot=? WHERE job_id=?", (canonical(payload["turn_envelope"]), job_id))
     return {"seq": seq, "event": event,
@@ -172,11 +168,13 @@ def public_working_notes(job_id):
     from src.core.public_delivery import project_public_event
     with read_transaction() as conn:
         rows = conn.execute("SELECT seq,data FROM task_events WHERE job_id=? AND event='assistant_progress' "
+                            "AND json_extract(data, '$.origin')='langgraph' "
+                            "AND json_extract(data, '$.source')='write_todos' "
                             "ORDER BY seq DESC LIMIT ?", (job_id, LIVE_QUEUE_SIZE)).fetchall()
     notes = []
     for row in reversed(rows):
         data = project_public_event("assistant_progress", json.loads(row["data"]))
-        if data.get("text"):
+        if data.get("status"):
             notes.append({"seq": row["seq"], "event": "assistant_progress", "data": data | {"seq": row["seq"]}})
     return notes
 

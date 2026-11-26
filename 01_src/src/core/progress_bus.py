@@ -171,7 +171,7 @@ def emit_progress(event_type: str, data: dict) -> None:
     q = get_progress_queue()
     try:
         payload = project_public_event(event_type, data)
-        if event_type != "assistant_progress" or payload.get("text"):
+        if event_type != "assistant_progress" or payload.get("status"):
             q.put_nowait(_encode_event(event_type, payload))
     except asyncio.QueueFull:
         pass
@@ -500,24 +500,6 @@ def _fields(data: dict, *, tokens=(), numbers=()) -> dict:
             **{key: data[key] for key in numbers if type(data.get(key)) is int}}
 
 
-PUBLIC_WORK_NOTES = {
-    "agent_prepare": "正在准备本轮任务",
-    "agent_resume_prepare": "正在准备恢复本轮任务",
-    "agent_model_wait": "已向模型发送请求，正在等待首批响应。",
-    "agent_model_connected": "已收到模型的初步响应，仍在等待本次输出完成。",
-    "agent_review_evidence": "已收到工具结果，正在结合已有资料继续处理。",
-    "agent_review_answer": "正在做答复的最后核对。",
-    "retrieval_web_search_finished": "联网检索已返回候选来源。",
-    "retrieval_web_search_zero_hits": "这次联网检索未返回候选来源。",
-    "retrieval_full_text_read": "已读取可核对的网页正文，可用于本轮答复。",
-    "retrieval_abstract_only": "该来源目前只取得摘要或部分正文。",
-    "retrieval_full_text_unavailable": "该来源未取得可核对的正文。",
-    "table_processed": "已完成表格处理。",
-    "checking_references": "正在核验文献来源。",
-    "figure_registered": "图件已登记，可查看或下载。",
-}
-
-
 def public_result_receipt_id(value) -> str:
     """Only expose server-issued receipt handles, not arbitrary strings."""
     return _token(value, r"tr_[a-f0-9]{64}")
@@ -546,29 +528,8 @@ def public_progress_payload(event: str, data: dict) -> dict:
             if isinstance(data.get("outcome"), dict):
                 public["outcome"] = public_tool_outcome(data["outcome"])
     elif event == "assistant_progress":
-        if data.get("visibility", "public") != "public":
-            return cursor
-        category = data.get("category")
-        origin = data.get("origin")
-        note_id = _token(data.get("note_id"), r"[A-Za-z0-9_:-]{1,160}")
-        if origin == "host" and category == "agent_prepare" and note_id.endswith(":resume-prepare"):
-            category = "agent_resume_prepare"
-        label = PUBLIC_WORK_NOTES.get(category) if origin == "host" and isinstance(category, str) else None
-        from src.core.public_progress import sanitize
-        text = label or (sanitize(data.get("text")) if origin == "model" else "")
-        if not text:
-            return cursor
-        public = _fields(data, tokens=("job_id", "note_id", "step_id"), numbers=("model_step",))
-        # Note IDs include ':' in both graph and agent producers.
-        if note_id:
-            public["note_id"] = note_id
-        call_ids = data.get("tool_call_ids")
-        if label:
-            public["category"] = category
-        public.update(visibility="public", origin=origin, phase="working",
-                      text=text, chars=len(text),
-                      tool_call_ids=[cid for item in call_ids if (cid := _token(item))]
-                      if isinstance(call_ids, (list, tuple)) else [])
+        from src.core.public_progress import project_native_progress
+        public = project_native_progress(data)
     elif event == "task_update":
         public = _fields(data, numbers=("version",))
         if data.get("status") in ("pending", "applied", "not_applied"):
@@ -604,10 +565,10 @@ def public_progress_payload(event: str, data: dict) -> dict:
         if stage == "task_plan":
             public.update(_fields(data, tokens=("plan_id",)))
             steps = data.get("steps")
-            public["steps"] = [{"id": _public_logical_key(step.get("id")),
-                                "title": f"任务步骤 {index}", "status": step["status"]}
-                               for index, step in enumerate(steps, 1)
-                               if isinstance(step, dict) and step.get("status") in
+            public["steps"] = [{"id": step_id, "status": step["status"]}
+                               for step in steps if isinstance(step, dict)
+                               and (step_id := _public_logical_key(step.get("id")))
+                               and step.get("status") in
                                ("pending", "in_progress", "completed", "blocked", "cancelled")
                                ] if isinstance(steps, list) else []
     elif event in {"task_state", "reasoning", "thinking", "draft", "plan"}:
@@ -747,12 +708,7 @@ def emit_answer_start() -> None:
 
 
 def emit_text_reset(reason: str = "") -> None:
-    """作废前端已收到的临时正文（流式增量只对最终回答有效）。
-
-    模型在"工具轮"里也会产出 content，但那不是回答；这些增量可能已经
-    随流式通道上屏。轮次结束时一旦确认是工具轮，就发这个事件让前端清空
-    临时文本，再由 ``assistant_progress`` 把它作为工作说明写进时间线。
-    """
+    """Reset the displayed answer on recovery without publishing any draft."""
     emit_encoded("text_reset", {"reason": reason})
 
 

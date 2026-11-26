@@ -34,9 +34,6 @@ from src.core.progress_bus import (
     emit_answer_start, emit_status, emit_text,
     emit_tool_call_start, emit_tool_executing, emit_tool_result,
 )
-from src.core.public_progress import (
-    emit_public_progress, reset_emitted,
-)
 from src.graph.state import AgentState
 from src.graph.tool_availability import available_tool_names, runtime_env
 from src.graph.retrieval_router import (
@@ -47,30 +44,6 @@ from src.graph.tool_policy import resolve_tool_policy
 from src.prompts.loader import assemble_system_prompt
 
 logger = logging.getLogger(__name__)
-
-_MAX_MODEL_TOOL_TURNS = 8
-# A request that must end with a file spends its last turns assembling and exporting
-# it; without headroom the loop stops right after evidence collection and the
-# deliverable never happens.  The budget therefore grows for deliverable requests
-# and two turns are reserved for the export itself.
-_DELIVERABLE_TURN_HEADROOM = 4
-
-
-def _tool_turn_budget(query: str) -> int:
-    base = int(getattr(settings, "MAX_REACT_STEPS", _MAX_MODEL_TOOL_TURNS) or _MAX_MODEL_TOOL_TURNS)
-    base = max(6, min(base, 24))
-    if _deliverable_export_requested(query):
-        base += _DELIVERABLE_TURN_HEADROOM
-        if any("docx" in r.get("formats", []) for r in _deliverable_contract(query)):
-            base += 4  # create + batched commits + explicit finalization
-    return max(6, min(base, 24))
-
-
-
-
-
-
-
 
 _MAX_TOOL_CALLS_PER_BATCH = 8
 _COMPLETION_TOKEN_BUCKETS = (512, 1024, 1536, 2048, 4096, 8192, 12288, 16384, 32768)
@@ -109,8 +82,6 @@ _EXPLICIT_LOCAL_TOOL_REQUEST = re.compile(
 
 from src.graph.export_contract import (
     artifact_matches_requirement as _artifact_matches_requirement,
-    deliverable_contract as _deliverable_contract,
-    deliverable_export_requested as _deliverable_export_requested,
     deliverable_match_map as _deliverable_match_map,
     deliverable_tool_groups as _deliverable_tool_groups,
     deliverables_satisfied as _deliverables_satisfied,

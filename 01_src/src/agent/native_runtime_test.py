@@ -544,7 +544,7 @@ def test_question_resume_continues_original_interrupt_without_replaying_tools(tm
     from dataclasses import asdict
     from langchain_core.messages import ToolMessage
     from src.agent.recovery import QuestionWakeDeferred, load_recovery_state
-    from src.core import jobs
+    from src.core import jobs, progress_bus, task_events, tracing
     from src.agent.runtime import AdmissionStopped
     from src.core.task_events import TaskConflict
 
@@ -558,6 +558,11 @@ def test_question_resume_continues_original_interrupt_without_replaying_tools(tm
         original = {"user_id": 1, "session_id": identity.session_id,
                     "request_id": identity.user_turn_id, "job_id": identity.run_id,
                     "query": "request", "client_request_id": "client", "idempotency_key": "key"}
+        for name, value in (("user_id", identity.owner_user_id), ("session_id", identity.session_id),
+                            ("request_id", identity.user_turn_id), ("job_id", identity.run_id)):
+            monkeypatch.setattr(tracing, f"get_{name}", lambda value=value: value)
+        queue = task_events.DurableEventQueue(identity.run_id)
+        monkeypatch.setattr(progress_bus, "get_progress_queue", lambda: queue)
         next_turn = ExecutionIdentity(1, "session-fixture", "other-turn", "other-run")
         calls, model_calls, bindings, acks = [], [], [], []
         question = {"name": "request_user_input", "id": "ask", "args": {}}
@@ -570,6 +575,11 @@ def test_question_resume_continues_original_interrupt_without_replaying_tools(tm
             assert sum(isinstance(message, HumanMessage) and message.content == "request" for message in history) == 1
             assert sum(isinstance(message, HumanMessage) and "fixture answer" in str(message.content)
                        for message in history) == 1
+            if len(model_calls) == 2:
+                return AIMessage("Unpublished model draft after clarification", tool_calls=[{
+                    "name": "write_todos", "id": "resumed-progress", "args": {"todos": [
+                        {"content": "公开步骤：核对附件范围", "status": "in_progress"}]}}])
+            assert [n["data"]["text"] for n in task_events.public_working_notes(identity.run_id)] == ["核对附件范围"]
             return AIMessage("final")
 
         async def execute(call, _):
@@ -619,7 +629,9 @@ def test_question_resume_continues_original_interrupt_without_replaying_tools(tm
         async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
             result = await runtime.run(identity, [], saver=saver, checkpoint_config=config, resume=True)
         assert result.status == "complete" and calls == ["ask"]
-        assert len(model_calls) == 2 and len(set(checkpoint for _, checkpoint in acks)) == 1
+        assert result.messages[-1].content == "final" and len(model_calls) == 3
+        assert len(set(checkpoint for _, checkpoint in acks)) == 1
+        assert "Unpublished model draft" not in repr(task_events.replay(identity.run_id))
         assert len(acks) == (2 if crash_ack else 1)
 
     asyncio.run(run())

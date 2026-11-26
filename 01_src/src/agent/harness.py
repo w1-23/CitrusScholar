@@ -707,7 +707,10 @@ class HarnessRuntime:
                                 if self.limits.deadline != float("inf") else None)
         try:
             async with timer:
-                result = await graph.ainvoke(initial, config, durability="sync", context=run_context, version="v2")
+                from src.core.public_progress import invoke_with_public_progress
+
+                result = await invoke_with_public_progress(graph, initial, config,
+                    context=run_context, job_id=identity.run_id)
                 state = _interruption(await graph.aget_state(config)) if result.interrupts else result.value
             if timer.expired():
                 state = {**latest, "stop_status": "incomplete", "stop_reason": "deadline"}

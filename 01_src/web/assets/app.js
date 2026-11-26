@@ -3356,21 +3356,9 @@ function publicTaskStage(value) {
   return text.replace(/\s+/g, ' ').slice(0, 600);
 }
 
-function publicTaskNote(value) {
-  if (typeof value !== 'string' || /^\s*[\[{]/.test(value) || /<\/?(?:think|analysis|reasoning)\b|reasoning_content/i.test(value)) return '';
-  var text = value.trim();
-  // Apply the existing privacy/code guard, but keep the complete public prose
-  // and its paragraph breaks rather than reducing it to a stage label.
-  return publicTaskStage(text) ? text : '';
-}
-
 function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
-  var settled = false, browsePhase = '', activeMilestone = null;
-  var liveMilestones = ['agent_prepare', 'agent_model_wait', 'agent_model_connected',
-    'agent_review_evidence', 'agent_review_answer', 'agent_resume_prepare'];
-  var browseStages = {waiting: '等待浏览器', navigating: '正在访问网页', interacting: '正在读取或操作网页',
-    downloading: '正在下载资料', verifying: '正在核验附件', organizing: '正在组织回答'};
+  var settled = false, activeMilestone = '', progressSeq = 0;
   var panel = document.createElement('div'); panel.className = 'research-process';
   var body = document.createElement('div'); body.className = 'research-process-body'; panel.appendChild(body);
   var label = document.createElement('span'); label.className = 'research-task-status';
@@ -3407,8 +3395,7 @@ function createResearchProcessPanel(goal) {
   }
   function activeLabel() {
     var tool = view.activeTool();
-    return browseStages[browsePhase] || (tool ? '正在执行 · ' + tool : '') ||
-      (activeMilestone && activeMilestone.text) || '正在处理';
+    return tool ? '正在执行 · ' + tool : activeMilestone;
   }
   function refreshActiveLabel() {
     if (!settled && presentation && ['waiting', 'tool'].includes(presentation.kind)) {
@@ -3444,7 +3431,7 @@ function createResearchProcessPanel(goal) {
     }
   }
   function ownsDetails() { return epoch === authEpoch && sid === sessionId && chatContainer.contains(panel); }
-  var view = CitrusTaskCards.createProcessView({container: body, clean: publicTaskStage, publicNote: publicTaskNote,
+  var view = CitrusTaskCards.createProcessView({container: body, clean: publicTaskStage,
     toolName: displayToolName, statusText: toolStatusText, owns: ownsDetails,
     loadToolResult: async function (callId) {
       if (!ownsDetails()) return null;
@@ -3457,15 +3444,14 @@ function createResearchProcessPanel(goal) {
       return result;
     },
     elapsed: function (ms) { return (Math.max(0, Number(ms) || 0) / 1000).toFixed(1) + ' 秒'; }});
-  function note(text, id, metadata) {
-    if (!metadata || metadata.visibility !== 'public' || (metadata.origin !== 'model' && !(metadata.origin === 'host' && metadata.category)) || metadata.internal === true || metadata.private === true) return;
-    var preparation = metadata.origin === 'host' && ['agent_prepare', 'agent_resume_prepare'].includes(metadata.category);
-    var item = view.note(text, id, Object.assign({}, metadata, {public_note: true, status_only: preparation}));
-    if (item && !settled && metadata.origin === 'host' && liveMilestones.includes(metadata.category) &&
-        (!metadata.job_id || !knownJobId || metadata.job_id === knownJobId)) {
-      activeMilestone = {text: text, category: metadata.category, step: metadata.step_id};
-      refreshActiveLabel();
-    }
+  function progress(data) {
+    if (!CitrusTaskState.nativeProgress(data) || knownJobId && data.job_id !== knownJobId) return;
+    var item = data.status === 'in_progress' ? view.note(data) : null;
+    var seq = Number.isSafeInteger(data.seq) ? data.seq : 0;
+    if (settled || seq && seq <= progressSeq || !item && data.status !== 'inactive') return;
+    if (seq) progressSeq = seq;
+    activeMilestone = item ? item.text : '';
+    refreshActiveLabel();
   }
   function answerVisible() { /* Public paragraphs remain visible beside the answer. */ }
   function receive(type, data) {
@@ -3475,7 +3461,7 @@ function createResearchProcessPanel(goal) {
     if (Array.isArray(savedResolutions)) view.resolution({resolutions: savedResolutions});
     if (type === 'job') {
       var nextJobId = String(data.job_id || knownJobId);
-      if (nextJobId && nextJobId !== knownJobId) { activeMilestone = null; browsePhase = ''; view.begin(nextJobId); }
+      if (nextJobId && nextJobId !== knownJobId) { activeMilestone = ''; progressSeq = 0; view.begin(nextJobId); refreshActiveLabel(); }
       knownJobId = nextJobId;
     }
     else if (type === 'task_plan' || type === 'status' && data.stage === 'task_plan') {
@@ -3483,49 +3469,23 @@ function createResearchProcessPanel(goal) {
     }
     else if (type === 'agent_recovery' && data.status === 'admitted') {
       view.begin(String(data.job_id || knownJobId) + '/' + String(data.seq || data.recovery_cursor || 'recovery'));
-      settled = false; browsePhase = ''; activeMilestone = null; readFailures.clear(); readState('', false);
+      settled = false; activeMilestone = ''; progressSeq = Number.isSafeInteger(data.seq) ? data.seq : progressSeq;
+      readFailures.clear(); readState('', false);
       view.terminal(false); label.textContent = '正在恢复任务'; panel.classList.remove('has-failure');
     }
-    else if (type === 'browse_phase' && !settled && ownsDetails() &&
-        Object.prototype.hasOwnProperty.call(browseStages, data.phase)) {
-      browsePhase = data.phase; refreshActiveLabel();
-    }
     else if (type === 'tool_resolution') view.resolution(data);
-    else if ((type === 'answer_start' || type === 'thinking') && browsePhase === 'organizing' && !settled) {
-      browsePhase = ''; refreshActiveLabel();
-    }
-    else if (type === 'model_attempt' && data.purpose === 'main_loop' && data.status !== 'running' &&
-        activeMilestone && (activeMilestone.step === data.attempt_id || activeMilestone.category === 'agent_review_evidence')) {
-      activeMilestone = null; refreshActiveLabel();
+    else if (type === 'answer_start') {
+      activeMilestone = '';
+      if (Number.isSafeInteger(data.seq)) progressSeq = Math.max(progressSeq, data.seq);
+      refreshActiveLabel();
     }
     else if (type === 'request_user_input' || type === 'question') label.textContent = '等待你的选择';
-    else if (['assistant_progress', 'commentary', 'working_note'].indexOf(type) >= 0) {
-      note(data.text || data.working_note || data.content,
-        data.seq ? 'seq-' + data.seq : data.message_id ? 'message-' + data.message_id : '', data);
-    } else if (type === 'tool_progress') {
-      var stages = {
-        local_prefetch_finished: '本地候选预取完成',
-        local_prefetch_rewrite_failed: '查询改写失败，本地候选预取未执行',
-        web_search_finished: '联网检索已返回候选来源',
-        web_search_zero_hits: '联网检索未返回候选来源',
-        local_search_finished: '本地检索已返回候选片段',
-        local_search_zero_hits: '本地检索未返回候选片段',
-        local_search_rewrite_failed: '查询改写失败，本地检索未执行',
-        full_text_read: '已读取可核对的全文',
-        abstract_only: '目前只取得摘要或部分正文',
-        full_text_unavailable: '未取得可核对的全文'
-      };
-      if (data.origin === 'host' && data.visibility === 'public' &&
-          Object.prototype.hasOwnProperty.call(stages, data.retrieval_stage)) {
-        view.note(stages[data.retrieval_stage], data.seq ? 'seq-' + data.seq : '', {public_note: true});
-      } else view.progress(data);
-    }
+    else if (type === 'assistant_progress') progress(data);
+    else if (type === 'tool_progress') view.progress(data);
     else if (['tool_call_start', 'tool_executing', 'tool_result', 'operation'].indexOf(type) >= 0 &&
         (data.tool_call_id || data.operation_id || data.logical_key || Array.isArray(data.aliases) && data.aliases.length) &&
         data.internal !== true && ['private', 'internal'].indexOf(data.visibility) < 0) {
       var actionStatus = data.status || (type === 'tool_result' ? (data.is_error ? 'failed' : 'complete') : 'running');
-      if (actionStatus === 'running' || actionStatus === 'resuming') activeMilestone = null;
-      if (type === 'tool_result' && data.tool_name === 'browse_web') browsePhase = '';
       view.action(Object.assign({}, data.outcome || {}, data, {status: actionStatus}));
       refreshActiveLabel();
     }
@@ -3534,14 +3494,14 @@ function createResearchProcessPanel(goal) {
   function terminal(status) {
     var names = {completed: '已完成', partial: '部分完成', cancelled: '已停止', failed: '未完成'};
     if (!Object.prototype.hasOwnProperty.call(names, status)) return false;
-    settled = true; browsePhase = ''; activeMilestone = null; readFailures.clear(); readState('', false);
+    settled = true; activeMilestone = ''; readFailures.clear(); readState('', false);
     stopClock(); line.dataset.state = status;
     label.textContent = names[status]; view.terminal();
     panel.classList.toggle('has-failure', status === 'failed');
     return true;
   }
   return {element: panel, label: label, elapsed: elapsed, body: body,
-    note: note, receive: receive, terminal: terminal, answerVisible: answerVisible, projection: view.projection,
+    receive: receive, terminal: terminal, answerVisible: answerVisible, projection: view.projection,
     syncTask: syncTask, stopClock: stopClock, readState: readState};
 }
 
@@ -5574,6 +5534,7 @@ function groupHistoryTurns(msgs) {
     if (!m || typeof m !== 'object') continue;
     var mid = String(m.message_id || '');
     var role = String(m.role || '');
+    if (role === 'assistant' && m.progress) continue;
     if (mid) {
       var itemKey = mid + '|' + role;
       if (seenItems[itemKey]) continue;         // same page merged twice
@@ -5634,24 +5595,8 @@ function groupHistoryTurns(msgs) {
       // 它下面那批调用并插到其上方）。
       entry.toolMessageId = mid || entry.toolMessageId || '';
     } else if (role === 'assistant') {
-      // 每条助手消息先都当作执行轨迹里的"工作说明"；一轮的最后一条在收尾时
-      // 提升为回答。实时流正是这个语义：旁白走 assistant_progress 进 term-log，
-      // done.answer 覆盖气泡正文。
-      var noteEntry = {kind: 'note', content: String(m.content || ''), message_id: mid,
-                       visibility: m.visibility, origin: m.origin,
-                       gen_time_ms: Number(m.gen_time_ms) || 0, answerCandidate: !m.progress};
-      if (m.progress === true) {
-        // 与 tool_calls 同一条消息的旁白，说的是它下面那批调用，紧贴其上方。
-        var insertAt = current.trace.length;
-        for (var p = current.trace.length - 1; p >= 0; p--) {
-          var prev = current.trace[p];
-          if (prev.kind === 'call' && String(prev.message_id || '') === mid) insertAt = p;
-          else break;
-        }
-        current.trace.splice(insertAt, 0, noteEntry);
-      } else {
-        current.trace.push(noteEntry);
-      }
+      current.trace.push({kind: 'note', content: String(m.content || ''), message_id: mid,
+                          gen_time_ms: Number(m.gen_time_ms) || 0, answerCandidate: true});
     }
   }
   // 整页最后一条不是助手消息 => 最后一轮还在进行中（分页窗口截断在轮中），
@@ -5935,7 +5880,6 @@ function projectHistoryTrace(process, trace) {
   entries.forEach(function (entry) {
     if (Number.isSafeInteger(entry.seq)) { if (seenSeq.has(entry.seq)) return; seenSeq.add(entry.seq); }
     if (entry.event) { process.receive(entry.event, Object.assign({}, entry.data || {}, entry.seq != null ? {seq: entry.seq} : {})); return; }
-    if (entry.kind === 'note') { process.receive('assistant_progress', Object.assign({}, entry, {text: entry.content, message_id: entry.message_id})); return; }
     if (entry.kind === 'call' || entry.kind === 'tool') process.receive('tool_result', Object.assign({}, entry, {
       tool_name: entry.tool_name || entry.name, display_name: entry.display_name || displayToolName(entry.name),
       summary: entry.result_summary || entry.summary, status: entry.status || 'unavailable'

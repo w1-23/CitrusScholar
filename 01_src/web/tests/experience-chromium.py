@@ -278,7 +278,7 @@ def run(browser, origin, output, *, observation_only=False):
         check('First visible answer stops dots', f"([...document.querySelectorAll('.turn-answer')].some(node => node.textContent.includes('表格核对结果'))) && !document.querySelector('[data-state=waiting]')")
         capture('answer')
         check('Only explicitly public progress is rendered',
-              "document.querySelector('.research-process').textContent.includes('公开进度：正在核查列名') && !document.querySelector('#chat-container').textContent.includes('INTERNAL_FIXTURE_MARKER')")
+              "document.querySelector('.research-process').textContent.includes('核查列名') && !document.querySelector('#chat-container').textContent.includes('INTERNAL_FIXTURE_MARKER')")
         check('One visible group shows verified titles and preserves literal citation examples',
               "Array.from(document.querySelectorAll('.message.bot .turn-citation-bubbles .turn-citation-bubble'), el => el.textContent).join('|') === '联网：公开表格说明|本地：本地表格字典' "
               "&& document.querySelector('.turn-citation-bubbles a')?.href === 'https://example.org/cited-table' "

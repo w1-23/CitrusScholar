@@ -5835,6 +5835,8 @@ def build_history_turns(items: list[dict]) -> list[dict]:
         except (TypeError, ValueError):
             mid = 0
         role = str(item.get("role") or "")
+        if role == "assistant" and item.get("progress"):
+            continue  # Historical narration is not an answer or a public event.
         # The same page can be merged twice by the browser; (message_id, role)
         # is the only safe identity here — never text equality.
         if mid:
@@ -5910,9 +5912,7 @@ def build_history_turns(items: list[dict]) -> list[dict]:
                 **{field: item[field] for field in ("result_id", "logical_key", "attempt") if item.get(field)},
             })
         elif role == "assistant":
-            # Keep answer candidates until turn boundaries are known. Only
-            # notes explicitly classified as public model text are rendered as
-            # commentary; the final plain assistant row becomes the answer.
+            # The final plain assistant row becomes the answer.
             try:
                 gen_ms = int(item.get("gen_time_ms") or 0)
             except (TypeError, ValueError):
@@ -5923,19 +5923,7 @@ def build_history_turns(items: list[dict]) -> list[dict]:
                      "answer_candidate": True}
             if item.get("citation_bubbles"):
                 entry["citation_bubbles"] = item["citation_bubbles"]
-            if item.get("progress") is True:
-                # Narration attached to tool calls: it was spoken right before
-                # those calls, so it sits immediately above them.
-                insert_at = len(current["trace"])
-                for pos in range(len(current["trace"]) - 1, -1, -1):
-                    prev = current["trace"][pos]
-                    if prev.get("kind") == "call" and prev.get("message_id") == mid:
-                        insert_at = pos
-                    else:
-                        break
-                current["trace"].insert(insert_at, entry)
-            else:
-                current["trace"].append(entry)
+            current["trace"].append(entry)
 
     # A turn is only complete when it ends with a plain assistant row (the
     # answer). Ending on a tool result, a call, or a work note means the window
@@ -6214,8 +6202,7 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
         except Exception as exc:
             logger.warning("public_progress_failed stage=history kind=%s", type(exc).__name__)
             notes = []
-        turn["trace"] = [item for item in turn["trace"]
-                         if not (item.get("kind") == "note" and item.get("origin") == "model")]
+        turn["trace"] = [item for item in turn["trace"] if item.get("kind") != "note"]
         turn["trace"].extend(notes)
         return questions
 

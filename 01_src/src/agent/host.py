@@ -89,12 +89,8 @@ async def _run(state, identity, ledger):
 
     from src.config import PROJECT_ROOT
     from src.core.provider_protocol import uses_deepseek_protocol
-    from src.core.public_progress import emit_public_progress
 
     started = time.monotonic()
-    if state.get("agent_resume") is True:
-        emit_public_progress("", category="agent_prepare", note_id=f"{identity.run_id}:resume-prepare",
-                             job_id=identity.run_id)
     transport = settings.model_transport()
     provider_scope = (transport.base_url, transport.model)
     state_root = PROJECT_ROOT / "state"
@@ -527,14 +523,6 @@ async def _run(state, identity, ledger):
                               "version": host.pending_question["version"]} if execution.pending_question else None,
                          "execution_waits": list(execution.execution_waits)}
 
-    public_milestones = set()
-
-    def public_milestone(category):
-        if category not in public_milestones:
-            emit_public_progress("", category=category, note_id=f"{identity.run_id}:{category}",
-                                 job_id=identity.run_id)
-            public_milestones.add(category)
-
     async def check_final(answer, history, _, *, allow_delivery_gaps=False):
         notes = await prepare(identity)
         if notes:
@@ -545,8 +533,6 @@ async def _run(state, identity, ledger):
             return FinalCheck(False, ("尚未形成有效答复。需要工具时使用原生工具调用；不要用工具协议文本冒充答案。",))
         from src.core.turn_outcome import claims_file_delivery, completion_from_answer, repairable_proposal_reason
         statement = completion_from_answer(text, host.records)
-        if time.monotonic() - started >= 12:
-            public_milestone("agent_review_answer")
         if any(row.get('name') == 'browse_web' for row in host.records):
             from src.core.progress_bus import emit_progress
             emit_progress('browse_phase', {'phase': 'organizing'})
@@ -719,28 +705,17 @@ async def _run(state, identity, ledger):
 
     async def metered_model(request, handler, current_identity, host_tools):
         model_allowed = set(refresh_allowed())
-        historical_readback = (host if "read_tool_result" in model_allowed
-            and policy.allows("summarization") and state.get("context_compression") is not False else None)
+        historical_readback = host if "read_tool_result" in model_allowed else None
+        edit_history = policy.allows("summarization") and state.get("context_compression") is not False
         if not host.has_result_readback():
             model_allowed.discard("read_tool_result")
         # before_model's host_state watermark is already synchronously committed.
         task_events.acknowledge_updates(identity.run_id, update_version)
-        if "agent_review_evidence" not in public_milestones and any(
-                item.get("tool_call_id") in host.dispatched and item.get("status") in {"complete", "partial", "no_results"}
-                for item in host.records):
-            public_milestone("agent_review_evidence")
-        from src.core.public_progress import PublicAnswerPreview
-        preview = PublicAnswerPreview() if not requirements and not host.messages and not resume else None
-        try:
-            from .installed_skills import project_rqa_history
-            history = project_rqa_history(request.messages, current_identity, host.turn_skills)
-            return await driver(request.override(messages=list(history)), handler, current_identity,
-                                allowed=model_allowed, host_tools=host_tools,
-                                on_delta=preview.append if preview is not None else None,
-                                historical_readback=historical_readback)
-        finally:
-            if preview is not None:
-                preview.clear()
+        from .installed_skills import project_rqa_history
+        history = project_rqa_history(request.messages, current_identity, host.turn_skills)
+        return await driver(request.override(messages=list(history)), handler, current_identity,
+                            allowed=model_allowed, host_tools=host_tools,
+                            historical_readback=historical_readback, edit_history=edit_history)
 
     def restore_tool_observation(message, call):
         if message.tool_call_id not in host.messages:

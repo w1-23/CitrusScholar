@@ -10,6 +10,15 @@
     return displayStatus(job) || (job && terminal.indexOf(job.status) >= 0 ? job.status : '');
   }
   function list(value) { return Array.isArray(value) ? value : []; }
+  function nativeProgress(data) {
+    if (!data || data.origin !== 'langgraph' || data.source !== 'write_todos' || data.visibility !== 'public' ||
+        data.internal === true || data.private === true || data.is_draft === true || data.draft === true ||
+        typeof data.job_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(data.job_id) ||
+        typeof data.note_id !== 'string' || !/^todo:[a-f0-9]{64}$/.test(data.note_id)) return false;
+    if (data.status === 'inactive') return !Object.prototype.hasOwnProperty.call(data, 'text');
+    return data.status === 'in_progress' && typeof data.text === 'string' && data.text.length >= 2 &&
+      data.text.length <= 80 && /^[\p{L}\p{M} -]+$/u.test(data.text);
+  }
   // Artifact delivery is an explicit terminal-tail fact: which verified files
   // the turn actually delivered, and how many expected files are unavailable.
   // Unknown status values stay truthful; file ids are never guessed.
@@ -49,20 +58,11 @@
       });
       return changed;
     }
-    function note(text, id, metadata) {
-      metadata = metadata || {};
-      if (typeof text !== 'string' || metadata.visibility !== 'public' || (metadata.origin !== 'model' && !(metadata.origin === 'host' && metadata.category)) || metadata.internal === true || metadata.private === true) return null;
-      var key = metadata.note_id ? 'note:' + metadata.note_id : id;
-      var identity = key && generation + '/' + key;
-      if (!text || identity && seen.has(identity)) return null;
-      if (identity) seen.add(identity);
-      var last = entries[entries.length - 1];
-      if (!identity && last && last.kind === 'note' && last.generation === generation && last.text === text) return last;
-      var item = {kind: 'note', id: ++nextId, text: text, generation: generation,
-        note_id: metadata.note_id || '', phase: metadata.phase || '', step_id: metadata.step_id || '',
-        category: metadata.origin === 'host' ? metadata.category : '',
-        model_step: metadata.model_step, tool_call_ids: list(metadata.tool_call_ids).map(String)};
-      if (!metadata.status_only) entries.push(item);
+    function note(data) {
+      if (!nativeProgress(data) || data.status !== 'in_progress' || seen.has(data.note_id)) return null;
+      seen.add(data.note_id);
+      var item = {kind: 'note', id: ++nextId, text: data.text, generation: generation, note_id: data.note_id};
+      entries.push(item);
       return item;
     }
     function plan(data) {
@@ -70,7 +70,7 @@
       var statuses = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
       var ids = new Set();
       if (data.steps.some(function (step) {
-        if (!step || !step.id || typeof step.title !== 'string' || !step.title.trim() || statuses.indexOf(step.status) < 0 || ids.has(String(step.id))) return true;
+        if (!step || !step.id || statuses.indexOf(step.status) < 0 || ids.has(String(step.id))) return true;
         ids.add(String(step.id)); return false;
       })) return false;
       if (currentPlan) {
@@ -79,7 +79,7 @@
         if (Number.isSafeInteger(data.version) && Number.isSafeInteger(currentPlan.version) && data.version < currentPlan.version) return false;
       }
       currentPlan = {plan_id: String(data.plan_id), seq: data.seq, version: data.version,
-        steps: data.steps.map(function (step) { return {id: String(step.id), title: step.title, status: step.status}; })};
+        steps: data.steps.map(function (step) { return {id: String(step.id), status: step.status}; })};
       return true;
     }
     function action(data) {
@@ -459,7 +459,7 @@
       resetJob: function (jobId) { reset(jobId); notify(); },
       clear: function () { subscribers.length = 0; reset(''); }};
   }
-  root.CitrusTaskState = {create: create, createProcess: createProcess, createContext: createContext, waitingView: waitingView, displayStatus: displayStatus,
+  root.CitrusTaskState = {nativeProgress: nativeProgress,create: create, createProcess: createProcess, createContext: createContext, waitingView: waitingView, displayStatus: displayStatus,
     snapshotStatus: snapshotStatus, isTerminal: function (state) { return terminal.indexOf(state.display_status) >= 0; },
     resumable: function (state) { return list(state.operations).filter(function (op) {
       return op.resumable === true && op.status === 'interrupted' && ['local_read', 'pure_computation'].indexOf(op.recovery_mode) >= 0;

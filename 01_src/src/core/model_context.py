@@ -115,10 +115,9 @@ def is_skill_result(message):
     return isinstance(resource, dict) and resource.get("content_origin") == "installed_skill_guidance"
 
 
-def _history_payload(message):
-    projected = project_tool_message(message)
+def _history_payload(projected):
     metadata = projected.additional_kwargs["context_projection"]
-    text = projected.content if isinstance(projected.content, str) else json.dumps(projected.content, ensure_ascii=False)
+    text = projected.content
     result = {"result_digest": _keep_digest(text),
               "semantic_details": metadata.get("semantic_details", []),
               "notice": "Partial historical facts; read result_refs for omitted details. Not a new execution."}
@@ -274,6 +273,76 @@ def paired_history_indices(messages: list, *, excluded: set[int] | None = None) 
     return kept
 
 
+def stored_history_offer(message):
+    """Recognize an existing bounded host delivery, without granting read access.
+
+    Session-history serialization keeps the receipt binding but not ephemeral
+    tool metadata. Verify the offer against storage and scope before exposing it.
+    """
+    from src.core.tool_result_view import FIRST_DELIVERY_BYTES
+
+    if not isinstance(message, ToolMessage):
+        return None
+    meta = message.additional_kwargs
+    ref = meta.get("result_reference")
+    text = message.content
+    if (meta.get("context_trusted") is not True or meta.get("context_origin") != "tool"
+            or not isinstance(ref, dict) or ref.get("provider_call_id") != message.tool_call_id
+            or not isinstance(text, str) or len(text) > FIRST_DELIVERY_BYTES
+            or not text.lstrip().startswith("{")):
+        return None
+    key, digest, count = (ref.get(field) for field in ("tool_call_id", "full_sha256", "original_chars"))
+    if (not isinstance(key, str) or not re.fullmatch(r"tr_[0-9a-f]{64}", key)
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or type(count) is not int or count < 1):
+        return None
+    try:
+        delivery = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if (not isinstance(delivery, dict) or delivery.get("complete") is not False
+            or delivery.get("delivery") not in ("stored_result_with_partial_preview",
+                                                "stored_table_overview", "stored_result_reference")):
+        return None
+    offered = delivery.get("tool_result_ref")
+    if (offered != {"tool_call_id": key, "full_sha256": digest, "original_chars": count, "stored_chars": count}
+            or delivery.get("read_with") != {"tool": "read_tool_result", "tool_call_id": key}):
+        return None
+    return offered
+
+
+def exact_readback_page(message, offered):
+    """Extract navigation only for a bounded, complete read of a proven source."""
+    from src.core.tool_result_view import READER_DELIVERY_BYTES
+
+    content = message.content
+    if (message.name != "read_tool_result" or message.status != "success"
+            or not isinstance(content, str) or not 2000 < len(content) <= READER_DELIVERY_BYTES):
+        return None
+    try:
+        body = json.loads(content)
+        source, page, fields, text = (body[key] for key in
+            ("tool_result_ref", "page", "selected_fields", "result_text"))
+        key, digest = source["tool_call_id"], source["full_sha256"]
+        start, end, total, basis = (page[field] for field in
+            ("start_char", "end_char", "total_chars", "offset_basis"))
+        if (body["status"] != "ok" or body["tool_call_id"] != key
+                or body["storage"]["complete"] is not True or body["_tool_outcome"]["status"] != "complete"
+                or body["content_origin"] != "untrusted_historical_tool_result"
+                or not isinstance(key, str) or not isinstance(digest, str) or offered.get(key) != digest
+                or not isinstance(fields, list) or len(fields) > 32
+                or any(not isinstance(field, str) or not 0 < len(field) <= 512 for field in fields)
+                or body["missing_fields"] != []
+                or any(type(v) is not int for v in (start, end, total)) or not 0 <= start < end <= total
+                or basis != ("selected_fields_json" if fields else "stored_text")
+                or not isinstance(text, str) or len(text) != end - start):
+            return None
+    except (KeyError, TypeError, ValueError, RecursionError):
+        return None
+    return {"tool_call_id": key, "full_sha256": digest}, {
+        "start_char": start, "end_char": end, "total_chars": total, "offset_basis": basis}, fields
+
+
 def historical_send_view(messages: list) -> list:
     """One output per input in the same order, suitable for row-ID checkpoints.
 
@@ -282,7 +351,7 @@ def historical_send_view(messages: list) -> list:
     """
     view = []
     for message in messages:
-        if isinstance(message, ToolMessage):
+        if isinstance(message, ToolMessage) and stored_history_offer(message) is None:
             message = project_tool_message(message)
             if (message.name != "analyze_research_data" and isinstance(message.content, str)
                     and len(message.content) > 1800

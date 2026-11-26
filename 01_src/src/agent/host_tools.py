@@ -34,11 +34,11 @@ class HostTools:
     pending_result_reads: dict[str, str] = field(default_factory=dict)
     skill_release: Path | None = None
     turn_skills: "TurnSkills | None" = None
-    # Populated only by the send seam after native context editing and admission.
+    # Populated by admitted send views, never by a model-supplied result ID.
     historical_result_offers: set[str] = field(default_factory=set)
 
-    def historical_result_reference(self, message):
-        """Prove exact older inline bytes are available through the existing reader."""
+    def historical_result_reference(self, message, *, existing_delivery=False, current_readback=False):
+        """Prove retained bytes; the current-readback mode is verification only."""
         from sqlite3 import Error as StorageError
         from src.core import jobs, tool_results
         from .installed_skills import is_rqa_tool_result
@@ -47,15 +47,27 @@ class HostTools:
             return None
         meta = message.additional_kwargs
         record, ref = meta.get("host_publication"), meta.get("result_reference")
+        terminal = {"complete", "partial", "no_results", "failed", "not_run"}
         if (meta.get("context_trusted") is not True or meta.get("context_origin") != "tool"
-                or meta.get("session_id") != self.identity.session_id
-                or not isinstance(record, dict) or not isinstance(ref, dict)
-                or record.get("tool_call_id") != message.tool_call_id
-                or record.get("status") not in {"complete", "partial", "no_results", "failed", "not_run"}
-                or record.get("reason_code") == "batch_observation_not_stored"
+                or meta.get("session_id") != self.identity.session_id or not isinstance(ref, dict)
                 or meta.get("operation_uncertain") or meta.get("model_delivery_issue")
                 or not isinstance(message.content, str)):
             return None
+        if existing_delivery:
+            from src.core.model_context import stored_history_offer
+            if stored_history_offer(message) is None:
+                return None
+        if record is not None or not existing_delivery:
+            if (not isinstance(record, dict) or record.get("tool_call_id") != message.tool_call_id
+                    or record.get("status") not in terminal
+                    or "batch_observation_not_stored" in (record.get("reason"), record.get("reason_code"))):
+                return None
+        if current_readback:
+            observed = self.messages.get(message.tool_call_id)
+            if (existing_delivery or message.name != "read_tool_result" or message.status != "success"
+                    or not isinstance(observed, ToolMessage) or observed.name != message.name
+                    or observed.content != message.content or record.get("status") != "complete"):
+                return None
         artifact = message.artifact if isinstance(message.artifact, dict) else {}
         if artifact.get("user_question") or artifact.get("_code_execution_id") or any(
                 isinstance(artifact.get(key), dict) and artifact[key].get("status") in
@@ -67,31 +79,39 @@ class HostTools:
 
             origin = ExecutionIdentity(self.identity.owner_user_id, self.identity.session_id,
                                        meta["context_turn_id"], meta["run_id"])
-            if origin.turn_key == self.identity.turn_key or origin.run_id == self.identity.run_id:
-                return None
+            if current_readback:
+                if origin != self.identity:
+                    return None
+                job_statuses = {"running", "detached"}
+            else:
+                if origin.turn_key == self.identity.turn_key or origin.run_id == self.identity.run_id:
+                    return None
+                job_statuses = jobs.TERMINAL_STATUS - {"awaiting_input"}
             key = tool_results.execution_receipt_key(origin, message.tool_call_id)
             if ref.get("tool_call_id") != key or ref.get("provider_call_id") != message.tool_call_id:
                 return None
             job = jobs.get_job(origin.run_id)
             if (not job or job["owner_user_id"] != origin.owner_user_id
                     or job["session_id"] != origin.session_id or job["request_id"] != origin.user_turn_id
-                    or job["status"] not in jobs.TERMINAL_STATUS - {"awaiting_input"}):
+                    or job["status"] not in job_statuses):
                 return None
             row = tool_results.fetch_for_current_request(key, strict=True)
             if (not row or row["tool_call_id"] != key or row["provider_call_id"] != message.tool_call_id
                     or row["session_id"] != origin.session_id or row["tool_name"] != message.name
                     or row["request_id"] != (job.get("client_request_id") or origin.user_turn_id)
-                    or ref.get("request_id") != row["request_id"]
-                    or row["status"] != record["status"] or row["result_text"] != message.content
+                    or ref.get("request_id") != row["request_id"] or row["status"] not in terminal
+                    or (record is not None and row["status"] != record["status"])
+                    or (not existing_delivery and row["result_text"] != message.content)
                     or not row["pinned"] or not tool_results.storage_integrity(row)["complete"]
                     or ref.get("full_sha256") != row["full_sha256"]
-                    or not _shared_result_accessible(row, message.content, tool_results.fetch_for_current_request,
+                    or ref.get("original_chars") != len(row["result_text"])
+                    or not _shared_result_accessible(row, row["result_text"], tool_results.fetch_for_current_request,
                                                      allow_rqa=False)):
                 return None
         except (ImportError, KeyError, OSError, StorageError, TypeError, ValueError, RecursionError):
             return None
         return {"tool_call_id": key, "full_sha256": row["full_sha256"],
-                "original_chars": len(message.content), "execution_status": row["status"]}
+                "original_chars": len(row["result_text"]), "execution_status": row["status"]}
 
     def result_readbacks(self):
         """Index issued continuation cursors for authorized result offers."""
@@ -337,9 +357,6 @@ class HostTools:
             and not retrieval_denied(query, "web"))
         def dispatched():
             self.dispatched[call["id"]] = call["name"]
-            if call['name'] == 'verify_uploaded_references' and call['args'].get('operation', 'run') == 'run':
-                from src.core.public_progress import emit_tool_milestone
-                emit_tool_milestone('checking_references', job_id=identity.run_id, tool_call_id=call['id'])
         try:
             from contextlib import nullcontext
             from .code_tools import CODE_TOOL_NAMES, EXECUTION_WAIT_TOOL_NAMES, code_execution_context
@@ -485,15 +502,6 @@ class HostTools:
             target = call["args"].get("tool_call_id")
             if isinstance(target, str) and self.pending_result_reads.get(target) == call["id"]:
                 self.pending_result_reads.pop(target)
-        if record.get('status') == 'complete':
-            category = ''
-            if call['name'] in {'inspect_uploaded_table', 'audit_uploaded_table', 'audit_uploaded_data', 'audit_uploaded_data_bundle'}:
-                category = 'table_processed'
-            elif call['name'] in {'run_research_figure_script', 'draw_svg'} and record.get('artifact_count'):
-                category = 'figure_registered'
-            if category:
-                from src.core.public_progress import emit_tool_milestone
-                emit_tool_milestone(category, job_id=identity.run_id, tool_call_id=call['id'])
         self.publish_resolutions()
         return delivered
 

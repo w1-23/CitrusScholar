@@ -9,40 +9,50 @@ function mount() {
   b.get('chat-container').appendChild(panel.element);
   return {b, panel};
 }
-const waiting = {job_id: 'job', step_id: 'attempt-1', note_id: 'attempt-1:wait',
-  origin: 'host', visibility: 'public', category: 'agent_model_wait',
-  text: '已向模型发送请求，正在等待首批响应。', seq: 2};
-const review = {job_id: 'job', note_id: 'review', origin: 'host', visibility: 'public',
-  category: 'agent_review_evidence', text: '已收到工具结果，正在结合已有资料继续处理。', seq: 5};
+function native(marker, text, seq, extra = {}) {
+  return {job_id: 'job', note_id: 'todo:' + marker.repeat(64), origin: 'langgraph', source: 'write_todos',
+    visibility: 'public', status: 'in_progress', text, seq, ...extra};
+}
+const waiting = native('a', '核对两种实验方法', 2);
+const review = native('b', '整理交付证据', 5);
+const legacy = {job_id: 'job', note_id: 'old', origin: 'host', visibility: 'public',
+  category: 'agent_model_wait', text: '已向模型发送请求，正在等待首批响应。', seq: 1};
 
-test('live status prefers verified milestones or current tool family, and never estimates completion', t => {
+test('native note drives waiting, tool activity takes priority, and finish clears the active stage', t => {
   const {b, panel} = mount();
   t.after(panel.stopClock);
   const start = Math.floor(Date.now() / 1000) - 40;
   const state = {job_id: 'job', status: 'running', started_at: start};
   panel.syncTask(state, null, {});
   panel.receive('job', {job_id: 'job', seq: 1});
+  panel.receive('assistant_progress', legacy);
+  panel.receive('tool_progress', {origin: 'host', visibility: 'public', retrieval_stage: 'full_text_read'});
+  assert.equal(panel.label.textContent, '');
+  assert.equal(panel.body.textContent, '');
   panel.receive('assistant_progress', waiting);
   assert.equal(panel.label.textContent, waiting.text);
   assert.match(panel.elapsed.textContent, /^· 已运行 \d+ 秒$/);
-  panel.receive('assistant_progress', {...waiting, origin: 'model', note_id: 'legacy', text: '历史模型工作说明。'});
+  panel.receive('assistant_progress', {...waiting, origin: 'model', text: '历史模型工作说明'});
+  panel.receive('assistant_progress', native('d', '外部任务信息', 10, {job_id: 'other'}));
+  panel.receive('assistant_progress', native('e', '内部工作说明', 10, {private: true}));
   assert.equal(panel.label.textContent, waiting.text);
-  panel.receive('model_attempt', {attempt_id: 'unrelated', purpose: 'main_loop', status: 'complete'});
-  assert.equal(panel.label.textContent, waiting.text);
-  panel.receive('model_attempt', {attempt_id: 'attempt-1', purpose: 'main_loop', status: 'complete'});
-  assert.equal(panel.label.textContent, '正在处理');
   panel.receive('tool_call_start', {tool_call_id: 'step-1', display_name: '读取网页内容', args: 'private fixture'});
   assert.equal(panel.label.textContent, '正在执行 · 读取网页内容');
-  panel.receive('tool_result', {tool_call_id: 'step-1', display_name: '读取网页内容', status: 'complete'});
   panel.receive('assistant_progress', review);
+  assert.equal(panel.label.textContent, '正在执行 · 读取网页内容');
+  assert.match(panel.body.textContent, /整理交付证据/);
+  panel.receive('tool_result', {tool_call_id: 'step-1', display_name: '读取网页内容', status: 'complete'});
   assert.equal(panel.label.textContent, review.text);
-  panel.receive('assistant_progress', {...waiting, seq: 89});  // Replay must not reset the current phase.
+  panel.receive('assistant_progress', {...waiting, seq: 89});
   assert.equal(panel.label.textContent, review.text);
-  panel.receive('assistant_progress', {...waiting, note_id: 'attempt-2:wait', step_id: 'attempt-2', seq: 90});
-  assert.equal(panel.label.textContent, waiting.text, 'a new verified attempt updates the live heading');
+  const {text, ...inactive} = native('c', '', 7, {status: 'inactive'});
+  panel.receive('assistant_progress', inactive);
+  assert.equal(panel.label.textContent, '');
+  panel.receive('assistant_progress', native('f', '旧的重放说明', 4));
+  assert.equal(panel.label.textContent, '', 'a late historical note may not reactivate the heading');
   assert.equal([...panel.element.querySelectorAll('.research-process-note')]
-    .filter(note => note.textContent === waiting.text).length, 1, 'repeated fixed host label stays one milestone');
-  assert.equal(panel.element.textContent.includes('private fixture'), false);
+    .filter(note => note.textContent === waiting.text).length, 1);
+  assert.doesNotMatch(panel.element.textContent, /private fixture|内部工作说明|外部任务信息|首批响应/);
   b.ctx.renderTurnTimings(panel.element, {turn_timings: {visible_answer_first_ms: 2500, provider_first_packet_ms: 350}});
   assert.equal(panel.element.querySelector('.turn-timings').textContent,
     '提交到首段可见答复 2.5 秒 · 模型调用到服务商首包 0.3 秒');
@@ -63,6 +73,7 @@ test('one collapsed disclosure preserves 30 attempts and stable milestone IDs li
   }
   const action = (call, key, attempt, status) => ({tool_call_id: call, logical_key: key, attempt, status,
     display_name: '读取网页内容'});
+  emit('assistant_progress', legacy);
   emit('assistant_progress', waiting);
   emit('tool_result', action('first', 'verified-retry', 1, 'failed'));
   emit('assistant_progress', review);
@@ -79,6 +90,7 @@ test('one collapsed disclosure preserves 30 attempts and stable milestone IDs li
   const again = mount().panel;
   again.terminal('completed');
   b.ctx.projectHistoryTrace(again, [
+    {kind: 'note', ...legacy, content: legacy.text},
     {...action('first', 'verified-retry', 1, 'failed'), kind: 'call'},
     {...action('second', 'verified-retry', 2, 'complete'), kind: 'call'},
   ]);
@@ -97,26 +109,38 @@ test('one collapsed disclosure preserves 30 attempts and stable milestone IDs li
 });
 
 
-test('preparation is shown only in the status and replay cannot replace the next milestone', t => {
+test('recovery fences the previous stage, never synthesizes a note, then shows new native progress', t => {
   const {panel} = mount();
   t.after(panel.stopClock);
   const started = {job_id: 'job', status: 'running', started_at: Math.floor(Date.now() / 1000)};
   panel.syncTask(started, null, {});
   panel.receive('job', started);
-  const prepare = {job_id: 'job', note_id: 'job:prepare', origin: 'host', visibility: 'public',
-    category: 'agent_prepare', text: '正在准备本轮任务'};
-  panel.receive('assistant_progress', prepare);
-  assert.equal(panel.label.textContent, prepare.text);
-  assert.doesNotMatch(panel.body.textContent, /正在准备本轮任务/);
   panel.receive('assistant_progress', waiting);
-  panel.receive('assistant_progress', prepare);
   assert.equal(panel.label.textContent, waiting.text);
   panel.receive('agent_recovery', {job_id: 'job', status: 'admitted', seq: 10});
-  const resumed = {...prepare, note_id: 'job:resume-prepare', category: 'agent_resume_prepare', text: '正在准备恢复本轮任务'};
+  panel.receive('assistant_progress', {...waiting, seq: 11});
+  assert.equal(panel.label.textContent, '正在恢复任务');
+  panel.receive('assistant_progress', {...legacy, seq: 12});
+  assert.equal(panel.label.textContent, '正在恢复任务');
+  const resumed = native('c', '核对附件范围', 13);
   panel.receive('assistant_progress', resumed);
   assert.equal(panel.label.textContent, resumed.text);
-  assert.doesNotMatch(panel.body.textContent, /正在准备恢复本轮任务/);
+  panel.receive('answer_start', {seq: 14});
+  assert.equal(panel.label.textContent, '');
   panel.terminal('completed');
   panel.receive('assistant_progress', resumed);
   assert.equal(panel.label.textContent, '已完成');
+});
+
+test('flat history fallback ignores old narrated rows', () => {
+  const {ctx} = browser();
+  const rows = [{role: 'user', content: 'Question', request_id: 'turn', message_id: 1},
+    {role: 'assistant', content: legacy.text, origin: 'host', progress: true, request_id: 'turn', message_id: 2},
+    {role: 'assistant', content: 'Saved answer', request_id: 'turn', message_id: 3}];
+  const [turn] = ctx.groupHistoryTurns(rows);
+  assert.equal(turn.answer.content, 'Saved answer');
+  assert.doesNotMatch(JSON.stringify(turn), /首批响应/);
+  const [unfinished] = ctx.groupHistoryTurns(rows.slice(0, -1));
+  assert.equal(unfinished.answer, null);
+  assert.doesNotMatch(JSON.stringify(unfinished), /首批响应/);
 });

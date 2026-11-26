@@ -23,7 +23,6 @@ import requests
 from langchain_core.tools import tool
 
 from src.config import settings
-from src.core.public_progress import emit_retrieval_stage
 
 logger = logging.getLogger(__name__)
 from src.core.record_label import display_label
@@ -324,7 +323,6 @@ def deepseek_search(query: str, count: int = 5,
                 f"\n[{ref}] {_bounded_excerpt(item['title'], 220)}\n"
                 f"source_ref: {source_ref or 'unavailable'}\n"
                 f"Excerpt: {_bounded_excerpt(item['snippet'] or item['summary'], 375)}")
-        emit_retrieval_stage("web_search_finished" if items else "web_search_zero_hits")
         return "\n".join(parts), {"web_results": items, "query_used": query,
                                   "query_language": language_info}
     except requests.Timeout:
@@ -986,8 +984,6 @@ async def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
              "attempts": len(attempts),
              "won": (winner or {}).get("url") or "",
              "chars_returned": len(str(body_item.get("content") or ""))}
-    emit_retrieval_stage({"full_text": "full_text_read", "abstract_only": "abstract_only",
-                          "failed": "full_text_unavailable"}[fetch_status])
     return "\n".join(lines), {"web_results": web_rows, "fetch_status": fetch_status,
                                "fetch_attempts": [{k: v for k, v in a.items() if k != "content"}
                                                   for a in attempts],
@@ -1154,8 +1150,6 @@ def _search_base_and_shared(runtime, query, families, limit, topics, *, family_i
     if status in ready_statuses:
         from src.core.web_failure_ledger import record_local_check
         record_local_check(normalized, families, status, [row for row, _ in selected])
-    if progress and status in ready_statuses:
-        emit_retrieval_stage("local_search_finished" if selected else "local_search_zero_hits")
     return (json.dumps(observation, ensure_ascii=False) if render else ""), result
 
 
@@ -1244,8 +1238,6 @@ def _base_hybrid_search(query: str, corpus_types: list[str], limit: int = 6,
     query, language_info = normalize_local_query(original_query)
     if query is None:
         reason = str(language_info.get("error") or "English local query unavailable")
-        if progress:
-            emit_retrieval_stage("local_search_rewrite_failed")
         logger.warning("Local hybrid search skipped before retrieval: %s", reason)
         try:
             from src.core.diag import diag
@@ -1449,8 +1441,6 @@ def _base_hybrid_search(query: str, corpus_types: list[str], limit: int = 6,
                  "translation_used": translation_used, "rag_cache_status": cache_miss_status}
         if query_cache is not None and not degradation and render:
             query_cache.set(cache_key, {"content": no_hit_content, "artifact": no_hit_artifact})
-        if progress and project:
-            emit_retrieval_stage("local_search_zero_hits")
         return no_hit_content, no_hit_artifact
 
     result_artifact = {
@@ -1471,8 +1461,6 @@ def _base_hybrid_search(query: str, corpus_types: list[str], limit: int = 6,
         return "", result_artifact
     result_artifact = _attach_local_evidence(result_artifact, corpus_scope.index_generation)
     result_content = _local_candidate_observation(result_artifact, corpus_scope.index_generation) if render else ""
-    if progress:
-        emit_retrieval_stage("local_search_finished")
     return result_content, result_artifact
 
 

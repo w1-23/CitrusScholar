@@ -1,150 +1,135 @@
-"""Emit host-verified working notes through the durable public event path.
-
-Only fixed host milestones are emitted. Sanitization of model narration is
-kept for historical rendering, never for new execution progress.
-"""
+"""Bridge explicitly public native TodoList titles onto durable progress events."""
 
 from __future__ import annotations
 
-from contextvars import ContextVar
+from contextlib import aclosing
+from dataclasses import dataclass
+import hashlib
 import logging
-import os
 import re
-import uuid
+import unicodedata
 
-from src.core.progress_bus import PUBLIC_WORK_NOTES, emit_progress, get_turn_scope
+from langgraph.config import get_stream_writer
+from langgraph.types import GraphOutput
 
-logger = logging.getLogger(__name__)
+PUBLIC_TODO_INSTRUCTIONS = ("Todos are private. An active title prefixed 公开步骤： is public. "
+    "Use a generic action phrase of at most 80 characters in the user's language. No user text, "
+    "names, IDs, queries, paths, code, results, secrets, reasoning or drafts. Omit the prefix "
+    "if unsure. Never add a todo solely to announce progress.")
 
-#: Longest single public note kept. The timeline row is one line; longer text
-#: is truncated instead of silently blowing up the trace.
-MAX_CHARS = 400
-
-_ENV_FLAG = "CITRUS_PUBLIC_PROGRESS"
-
-_PRIVATE_TEXT_RE = re.compile(
-    r'</?\s*(?:think|analysis|reasoning|tool_calls?|tool_result|calls|invoke|parameter|function)\b'
-    r'|\bDSML\b|\bBearer\s+\S+|(?:\{|,)\s*"[^"]+"\s*:', re.I)
-_TOOL_MARKER_RE = re.compile(r"\[(?:TOOL_[A-Z_]+|[LWHClwhc]?\d{1,3})\]")
-
-# Credential-ish material must never reach the timeline.
-_SECRET_PATTERNS = (
-    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"(?i)\bapi[_\- ]?key\b\s*[:=]"),
-    re.compile(r"(?i)\b(?:password|passwd|secret|token)\b\s*[:=]\s*\S+"),
-    re.compile(r"(?:密码|密钥|访问令牌)\s*[：:=]\s*\S+"),
-    re.compile(r"\bhttps?://[^/\s:@]+:[^/\s@]+@", re.I),
-    re.compile(r"\b[A-Fa-f0-9]{40,}\b"),
-    re.compile(r"\b[A-Za-z0-9+/]{60,}={0,2}\b"),
-)
-
-_WHITESPACE_RE = re.compile(r"\s+")
-
-# Completion declarations are private validation inputs, including truncated or
-# fenced JSON. Reject before truncation so an envelope cannot become a note.
-_COMPLETION_RE = re.compile(
-    r'"(?:schema_version|answer|incidental_partials|proposal_repairs)"\s*:|\bCompletionEnvelope\b',
-    re.I)
-
-#: Immutable request-local state: inherited task contexts never mutate a shared
-#: default/list. Include the request/job scope for sequential requests as well.
-_last_emitted: ContextVar[tuple | None] = ContextVar("public_progress_last_emitted", default=None)
+_PREFIX = "公开步骤："
+_MAX_TITLE = 80
+_TODO_STATUSES = ("pending", "in_progress", "completed")
+_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_NOTE_ID = re.compile(r"todo:[a-f0-9]{64}")
+_PRIVATE_MARKER = re.compile(
+    r"\b(?:i\s+(?:think|need|should|must|will|reason|have)|let me|chain of thought|"
+    r"reasoning|thought process|system prompt|developer message|bearer|api key|"
+    r"password|secret|token|private|draft|dsml|https?|sk[- ]\w+)\b"
+    r"|我(?:认为|需要|应该|必须|先|将|会)|让我|思考过程|推理过程|思维链|草稿|内部指令|"
+    r"系统提示|开发者消息|密码|密钥|访问令牌|\d{4,}|[A-Za-z0-9]{26,}", re.I)
+_EVENT_KEYS = {"origin", "source", "visibility", "status", "note_id", "job_id", "text", "seq"}
+_LOG = logging.getLogger(__name__)
 
 
-def enabled() -> bool:
-    """Public working notes are on unless explicitly disabled."""
-    return os.getenv(_ENV_FLAG, "1").strip().lower() not in ("0", "false", "off", "no")
-
-
-def sanitize(text: str) -> str:
-    """Return a single-line, bounded, credential-free public note or ``\"\"``."""
-    if not isinstance(text, str) or len(text) > 16_000:
+def _title(value: str) -> str:
+    """Require a bounded, plain action label. Reject rather than truncate or repair."""
+    if not isinstance(value, str) or len(value) > _MAX_TITLE:
         return ""
-    raw = text.strip()
-    if (not raw or raw.startswith(("{", "[")) or "```" in raw
-            or _COMPLETION_RE.search(raw) or _PRIVATE_TEXT_RE.search(raw)):
+    value = value.strip(" ")
+    if len(value) < 2 or _PRIVATE_MARKER.search(value):
         return ""
-    cleaned = _TOOL_MARKER_RE.sub("", raw)
-    for pattern in _SECRET_PATTERNS:
-        if pattern.search(cleaned):
-            return ""
+    if any(not (unicodedata.category(char)[0] in "LM" or char in " -") for char in value):
+        return ""
+    if not any(char.isalpha() for char in value):
+        return ""
     from src.core.pii_mask import mask_sensitive
-    cleaned = _WHITESPACE_RE.sub(" ", mask_sensitive(cleaned)).strip()
-    # Leading punctuation only ("…") is noise, not a note.
-    if len(cleaned) <= 1:
+
+    return value if mask_sensitive(value) == value else ""
+
+
+def _source_copy(title: str, protected_text: tuple[str, ...]) -> bool:
+    def normalize(value):
+        return "".join(ch for ch in unicodedata.normalize("NFKC", value).casefold() if ch.isalpha())
+    clean = normalize(title)
+    return any(clean == source or len(clean) >= 8 and clean in source
+               for value in protected_text if isinstance(value, str) and value
+               if (source := normalize(value)))
+
+
+def public_todo_title(todos, *, protected_text: tuple[str, ...] = ()) -> str:
+    """Select only the one unambiguous in-progress label, never other todos."""
+    if not isinstance(todos, list) or not 1 <= len(todos) <= 12:
         return ""
-    if len(cleaned) > MAX_CHARS:
-        cleaned = cleaned[: MAX_CHARS - 1].rstrip() + "…"
-    return cleaned
+    if any(not isinstance(item, dict) or item.keys() != {"content", "status"}
+           or not isinstance(item["content"], str) or item["status"] not in _TODO_STATUSES
+           for item in todos):
+        return ""
+    active = [item["content"] for item in todos if item["status"] == "in_progress"]
+    if len(active) != 1 or not active[0].startswith(_PREFIX):
+        return ""
+    title = _title(active[0][len(_PREFIX):])
+    return title if title and not _source_copy(title, protected_text) else ""
 
 
-class PublicAnswerPreview:
-    """Compatibility shim for hosts still passing an unreviewed delta callback.
-
-    The first model round can become a tool round, be rejected, or be replaced.
-    A later reset cannot undo disclosure, so no preview reaches live or replay SSE.
-    """
-
-    def append(self, chunk: str) -> None:
-        pass
-
-    def clear(self) -> None:
-        pass
-
-
-def emit_retrieval_stage(stage: str) -> None:
-    """Publish retrieval milestones without query or source data."""
-    category = f"retrieval_{stage}"
-    if category in PUBLIC_WORK_NOTES:
-        emit_public_progress("", category=category, note_id=category)
+def project_native_progress(data: dict) -> dict:
+    """Accept the typed public event, never older host or model narration."""
+    if (data.keys() - _EVENT_KEYS or data.get("origin") != "langgraph"
+            or data.get("source") != "write_todos" or data.get("visibility") != "public"
+            or not isinstance(data.get("job_id"), str) or not _ID.fullmatch(data["job_id"])
+            or not isinstance(data.get("note_id"), str) or not _NOTE_ID.fullmatch(data["note_id"])):
+        return {}
+    if data.get("status") == "in_progress":
+        title = _title(data.get("text"))
+        if not title or title != data["text"]:
+            return {}
+    elif data.get("status") != "inactive" or "text" in data:
+        return {}
+    return {k: v for k, v in data.items() if k != "seq"}
 
 
-def emit_public_progress(text: str, *, step_id: str = "",
-                         phase: str = "working", note_id: str = "",
-                         model_step: int = 0, tool_call_ids=(),
-                         job_id: str = "", category: str = "") -> bool:
-    """Publish a fixed host note through the existing request/durable queue.
+@dataclass(frozen=True)
+class _PublicTodoProgress:
+    job_id: str
+    native_update_id: str
+    title: str
 
-    The legacy positional text parameter cannot supply a new public note.
-
-    ``job_id`` is host identity, never a model argument. DurableEventQueue owns
-    persistence; this emitter must not append the same event separately.
-    """
-    try:
-        note = PUBLIC_WORK_NOTES.get(category)
-        if not enabled() or not note:
-            return False
-        from src.core.tracing import get_job_id
-        job_id = str(job_id or get_job_id() or "")
-        scope = (*get_turn_scope(), job_id)
-        event_key = (scope, note_id or (model_step, step_id))
-        if _last_emitted.get() == event_key:
-            return False
-        emit_progress("assistant_progress", {
-            "visibility": "public", "origin": "host",
-            "category": category, "step_id": step_id or "analysis",
-            "phase": phase,
-            "text": note,
-            "chars": len(note),
-            "note_id": note_id or uuid.uuid4().hex,
-            "model_step": max(0, int(model_step)),
-            "tool_call_ids": list(tool_call_ids),
-            "job_id": job_id,
-        })
-        _last_emitted.set(event_key)
-    except Exception as exc:
-        logger.warning("public_progress_failed stage=emit kind=%s", type(exc).__name__)
-        return False
-    return True
+    def event(self) -> dict:
+        status = "in_progress" if self.title else "inactive"
+        title = {"text": self.title} if self.title else {}
+        digest = hashlib.sha256(
+            f"{self.job_id}\0{self.native_update_id}\0{status}\0{self.title}".encode()).hexdigest()
+        return project_native_progress({"origin": "langgraph", "source": "write_todos",
+            "visibility": "public", "job_id": self.job_id, "note_id": f"todo:{digest}",
+            "status": status, **title})
 
 
-def emit_tool_milestone(category: str, *, job_id: str, tool_call_id: str) -> bool:
-    if category not in PUBLIC_WORK_NOTES:
-        return False
-    return emit_public_progress("", note_id=f"{job_id}:{category}:{tool_call_id}",
-                                tool_call_ids=(tool_call_id,), job_id=job_id, category=category)
+def write_native_todo_progress(job_id: str, native_update_id: str, todos: list, *,
+                               protected_text: tuple[str, ...]) -> None:
+    """Call from the authorized graph node after the native todo commit."""
+    title = public_todo_title(todos, protected_text=protected_text)
+    get_stream_writer()(_PublicTodoProgress(job_id, native_update_id, title))
 
 
-def reset_emitted() -> None:
-    """Clear per-request dedupe state (called when a request finishes)."""
-    _last_emitted.set(None)
+async def invoke_with_public_progress(graph, initial, config, *, context, job_id):
+    """Match native ainvoke(v2) values/interrupts, plus opt-in root custom events."""
+    from src.core.progress_bus import emit_progress
+
+    latest, interrupts, active = None, [], ""
+    async with aclosing(graph.astream(initial, config, context=context, durability="sync",
+            stream_mode=["values", "custom"], output_keys=graph.output_channels, version="v2")) as events:
+        async for part in events:
+            if part["type"] == "values":
+                latest = part["data"]
+                interrupts.extend(part.get("interrupts", ()))
+            elif part["type"] == "custom" and not part["ns"]:
+                value = part["data"]
+                if type(value) is not _PublicTodoProgress or value.job_id != job_id or value.title == active:
+                    continue
+                if event := value.event():
+                    try:
+                        emit_progress("assistant_progress", event)
+                        active = value.title
+                    except Exception as exc:
+                        _LOG.warning("public_todo_progress_failed kind=%s", type(exc).__name__)
+    return GraphOutput(value=latest, interrupts=tuple(interrupts))

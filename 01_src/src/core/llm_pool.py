@@ -37,7 +37,7 @@ def _new_client(model, api_key, base_url, temperature, timeout, max_tokens,
         temperature=temperature,
         timeout=timeout,
         max_tokens=max_tokens,
-        max_retries=0,  # Retry attempts are owned and charged by the coordinator.
+        max_retries=0,  # One metered attempt admits exactly one provider request.
         **kw,
     )
 

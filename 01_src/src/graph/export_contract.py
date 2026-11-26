@@ -10,23 +10,17 @@ instead of inside the agent graph:
 * :func:`deliverable_tool_groups` — which registered tools can produce them?
 * :func:`artifact_matches_requirement` /
   :func:`deliverable_match_map` — one verified artifact per requirement.
-* :func:`forced_export_plan` — the registered exporter (and arguments) for an
-  outstanding requirement, or an explicit reason why none exists.
 
 Nothing here executes a tool, emits progress, or touches configuration, which
 keeps the rules unit-testable and keeps the graph module focused on execution.
 """
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
-from langchain_core.messages import ToolMessage
-
 from src.graph.intent_text import (
     intent_clauses,
-    intent_with_negation,
     mask_literal_payload,
     negated_before,
 )
@@ -877,186 +871,3 @@ def deliverable_tool_groups(
         if names:
             groups.append(names)
     return groups
-
-
-def svg_from_answer(text: str) -> str:
-    """Return the SVG source the answer already contains, never synthesize one."""
-    fenced = re.search(
-        r"```(?:svg|xml)?\s*(<svg\b[\s\S]*?</svg>)\s*```", str(text or ""), re.I)
-    if fenced:
-        return fenced.group(1).strip()
-    raw = re.search(r"<svg\b[\s\S]*?</svg>", str(text or ""), re.I)
-    return raw.group(0).strip() if raw else ""
-
-
-def observed_gap_rows(query: str, messages) -> list[dict[str, str]]:
-    """Build gap rows only from retrieval failures already observed this turn."""
-    rows: list[dict[str, str]] = []
-    for message in messages or ():
-        if not isinstance(message, ToolMessage):
-            continue
-        name = str(getattr(message, "name", "") or "")
-        if name not in _retrieval_tools():
-            continue
-        artifact = getattr(message, "artifact", None) or {}
-        if not isinstance(artifact, dict):
-            artifact = {}
-        errors = artifact.get("errors")
-        if isinstance(errors, dict) and errors:
-            for source, failure in errors.items():
-                rows.append({
-                    "topic": str(query or "")[:400],
-                    "doi_or_title": "",
-                    "failure": f"{source}: {str(failure)[:400]}",
-                    "local_result": name,
-                    "source_url": "",
-                })
-            continue
-        execution = artifact.get("_citrus_execution")
-        status = str(execution.get("status") or "") if isinstance(execution, dict) else ""
-        reason = str(execution.get("reason_code") or "") if isinstance(execution, dict) else ""
-        if status in {"failed", "partial", "no_results"}:
-            rows.append({
-                "topic": str(query or "")[:400],
-                "doi_or_title": "",
-                "failure": reason or status,
-                "local_result": name,
-                "source_url": "",
-            })
-    return rows
-
-
-def markdown_table(answer: str):
-    """Use one complete table already written in the answer, without guessing."""
-    lines = str(answer or "").splitlines()
-    for index in range(len(lines) - 2):
-        if "|" not in lines[index] or not re.fullmatch(r"[\s|:\-]+", lines[index + 1]):
-            continue
-        columns = [c.strip() for c in lines[index].strip().strip("|").split("|")]
-        rows = []
-        for line in lines[index + 2:]:
-            if "|" not in line or not line.strip():
-                break
-            row = [c.strip() for c in line.strip().strip("|").split("|")]
-            if len(row) != len(columns):
-                return None
-            rows.append(row)
-        if rows and all(columns) and len(set(columns)) == len(columns):
-            return columns, rows
-    return None
-
-
-def literature_rows(messages):
-    rows = []
-    seen = set()
-    for message in messages or ():
-        if not isinstance(message, ToolMessage) or message.name != "search_literature":
-            continue
-        data = getattr(message, "artifact", None) or {}
-        if "candidates" not in data:
-            try:
-                data = json.loads(str(message.content))
-            except (ValueError, TypeError):
-                continue
-        if not isinstance(data, dict):
-            continue
-        for row in data.get("candidates", []):
-            if not isinstance(row, dict):
-                continue
-            key = str(row.get("doi") or row.get("url") or row.get("title") or "")
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            rows.append({**row, "citation": row.get("title") or key,
-                         "evidence": "检索候选；尚未核验科学结论支持关系。"})
-    return rows
-
-
-def forced_export_plan(requirement: dict[str, list[str]], query: str, answer: str,
-                       messages, tool_by_name: dict) -> tuple[str, dict[str, Any], str]:
-    """Use the active delivery entrypoint while retaining old renderer adapters."""
-    name, args, reason = _renderer_export_plan(requirement, query, answer, messages, tool_by_name)
-    if name in {"audit_uploaded_data", "verify_uploaded_references"}:
-        args = {**args, "publish": True}
-    if "deliver_research_artifact" in tool_by_name:
-        from src.research.delivery_tools import legacy_delivery_call
-        try:
-            name, args = legacy_delivery_call(name, args)
-        except (ValueError, TypeError):
-            return "", {}, "invalid_delivery_content"
-    return name, args, reason
-
-
-def _renderer_export_plan(requirement: dict[str, list[str]], query: str, answer: str,
-                          messages, tool_by_name: dict) -> tuple[str, dict[str, Any], str]:
-    """Choose a renderer only when the requested format is supported."""
-    kinds = set(requirement.get("kinds") or ())
-    formats = set(requirement.get("formats") or ())
-    label = str(requirement.get("label") or query)
-    title = forced_export_title(label, limit=60)
-    if "report_json" in kinds or (not kinds and formats == {"json"}):
-        # Structured evidence comes from its producer, not from wrapping model
-        # prose in JSON or guessing source file IDs. An existing verified JSON
-        # artifact satisfies the contract through the normal matching path.
-        return "", {}, "structured_report_source_required"
-    if "report_docx" in kinds and (not formats or formats == {"docx"}):
-        return "", {}, "incremental_word_required"
-    if "table_file" in kinds or (not kinds and formats & {"csv", "tsv", "xlsx"}):
-        table = markdown_table(answer)
-        if not table:
-            return "", {}, "missing_tabular_data"
-        fmt = next((f for f in ("csv", "tsv", "xlsx") if f in formats), "xlsx")
-        return "export_table", {"title": title, "columns_json": table[0], "rows_json": table[1], "output_format": fmt}, ""
-    if not kinds and not formats:
-        return "export_paper_analysis", {"title": title, "analysis_markdown": answer}, ""
-    if kinds == {"generic_output"}:
-        return "export_paper_analysis", {"title": title, "analysis_markdown": answer}, ""
-    if "report_html" in kinds and (not formats or "html" in formats):
-        if re.search(r"实验设计|实验方案|experiment design", label, re.I):
-            return "export_experiment_design", {"title": title, "design_markdown": answer}, ""
-        return "export_paper_analysis", {"title": title, "analysis_markdown": answer}, ""
-    if "annotation_table" in kinds and (not formats or formats & {"xlsx"}):
-        return "audit_uploaded_data", {}, ""
-    if "verification_sheet" in kinds and (not formats or formats & {"xlsx"}):
-        return "verify_uploaded_references", {"file_index": 0}, ""
-    if "bibliography" in kinds and (not formats or formats & {"xlsx", "ris", "bibtex", "json"}):
-        fmt = next((f for f in ("xlsx", "ris", "bibtex", "json") if f in formats), "xlsx")
-        verification = [m for m in messages or () if isinstance(m, ToolMessage)
-                        and m.name == "verify_uploaded_references"]
-        if verification:
-            # Never guess which audit (or which last batch) the user intended.
-            return "", {}, "explicit_reference_audit_required"
-        rows = literature_rows(messages)
-        if not rows:
-            return "", {}, "missing_bibliography_evidence"
-        return "export_literature_evidence", {"title": title, "evidence_rows_json": rows, "output_format": fmt}, ""
-    if kinds & {"supplement_archive", "supplement_report"}:
-        supported = {"tar.gz"} if "supplement_archive" in kinds else {"xlsx"}
-        if formats and not (formats & supported):
-            return "", {}, "unsupported_format"
-        dois = list(dict.fromkeys(
-            match.group(0).rstrip(".,;:)")
-            for match in _DOI_RE.finditer(f"{query} {answer}")))
-        if not dois:
-            return "", {}, "missing_doi"
-        return "fetch_and_audit_open_supplements", {"doi": dois[0]}, ""
-    if "gap_csv" in kinds and (not formats or formats & {"csv"}):
-        rows = observed_gap_rows(query, messages)
-        if not rows:
-            return "", {}, "no_observed_gap_evidence"
-        return "export_corpus_gap_report", {
-            "title": title, "gaps_json": json.dumps(rows, ensure_ascii=False),
-        }, ""
-    if "figure" in kinds and (not formats or formats & {"svg"}):
-        svg = svg_from_answer(answer)
-        if not svg:
-            return "", {}, "no_svg_source_in_answer"
-        return "draw_svg", {"svg": svg, "alt_text": str(query or "requested figure")[:240]}, ""
-    return "", {}, "unsupported_or_ambiguous_contract"
-
-
-def forced_export_title(query: str, limit: int = 18) -> str:
-    text = re.sub(r"\s+", " ", str(query or "")).strip()
-    text = re.sub(r"^(请|帮我|麻烦|请你|能否|能不能)+", "", text)
-    text = text[:limit].strip(" ,.:;")
-    return (text or "research-output") + "_report"

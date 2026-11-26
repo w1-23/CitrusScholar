@@ -49,11 +49,13 @@ jobs:
             01_src/src/core/chat_turn_queue_test.py \
             01_src/src/core/task_recovery_generation_test.py \
             01_src/src/core/public_delivery_test.py \
+            01_src/src/agent/context_middleware_parity_test.py \
             01_src/src/agent/context_projection_regression_test.py \
             01_src/src/agent/context_schema_budget_test.py \
             01_src/src/agent/host_runtime_contract_test.py \
             01_src/src/agent/research_routes_test.py \
             01_src/src/agent/native_runtime_test.py \
+            01_src/src/agent/native_retry_parity_test.py \
             01_src/src/agent/native_send_budget_test.py \
             01_src/src/agent/checkpoint_store_compat_test.py \
             01_src/src/agent/plan_tools_test.py \

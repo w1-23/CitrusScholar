@@ -34,6 +34,7 @@ from src.session import manager as sessions
 
 READER = "read_tool_result"
 EVIDENCE = "read_context_evidence"
+TABLE = "inspect_uploaded_table"
 PROVIDER = "deepseek-fixture"
 BASE = "https://api.deepseek.com/v1"
 OLD_TEXT = {f"old-{i}": f"evidence {i} " + "Z" * 30_300 for i in range(16)}
@@ -75,6 +76,8 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.catalog = CapabilityCatalog()
         self.catalog.register(CapabilityDefinition(EVIDENCE, "Synthetic archival evidence",
             {"type": "object", "properties": {}}, lambda: None))
+        self.catalog.register(CapabilityDefinition(TABLE, "Synthetic long table",
+            {"type": "object", "properties": {}}, lambda: None))
         self.catalog.register(CapabilityDefinition(READER, read_tool_result.description,
             read_tool_result.get_input_schema().model_json_schema(), lambda: read_tool_result))
 
@@ -87,16 +90,17 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
         progress_bus.set_turn_scope(self.sid, claim.job["client_request_id"])
         return identity
 
-    async def run_turn(self, model, identity, human_content, evidence, *, model_budget=None, **kwargs):
-        host = HostTools(identity, {}, allowed_names={EVIDENCE, READER})
+    async def run_turn(self, model, identity, human_content, evidence, *, model_budget=None, edit_history=True, **kwargs):
+        host = HostTools(identity, {}, allowed_names={EVIDENCE, TABLE, READER})
         driver = ModelDriver(self.catalog, max_output_tokens=16_384, budget=model_budget)
         human = HumanMessage(content=human_content, additional_kwargs=identity.message_metadata("user"))
 
         async def metered(request, handler, active, host_tools):
-            allowed = {EVIDENCE}
+            allowed = {EVIDENCE, TABLE}
             if host.has_result_readback():
                 allowed.add(READER)
-            return await driver(request, handler, active, allowed=allowed, host_tools=host_tools, historical_readback=host)
+            return await driver(request, handler, active, allowed=allowed, host_tools=host_tools,
+                                historical_readback=host, edit_history=edit_history)
 
         async def execute(call, active):
             if call["name"] == READER:
@@ -104,7 +108,9 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(host._prepare_result_readback(args, call["id"]))
                 content = read_tool_result.invoke(args)
                 row = tool_results.fetch_for_current_request(args["tool_call_id"], strict=True)
-                self.assertEqual(json.loads(content)["result_text"], evidence[row["provider_call_id"]][:24])
+                decoded = json.loads(content)
+                page = decoded["page"]
+                self.assertEqual(decoded["result_text"], evidence[row["provider_call_id"]][page["start_char"]:page["end_char"]])
             else:
                 content = evidence[call["id"]]
             message = ToolMessage(content=content, name=call["name"], tool_call_id=call["id"],
@@ -115,7 +121,7 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
             return FinalCheck()
 
         runtime = HarnessRuntime(model, execute, lambda *_: None, check_final, RunLimits(8, float("inf")),
-            self.catalog.schemas({EVIDENCE, READER}), model_call=metered, **kwargs)
+            self.catalog.schemas({EVIDENCE, TABLE, READER}), model_call=metered, **kwargs)
         async with open_framework_checkpoint(self.root, identity, self.provider) as saver:
             result = await runtime.run(identity, [human], saver=saver,
                 checkpoint_config=framework_checkpoint_scope(identity, self.provider),
@@ -228,6 +234,124 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({m.tool_call_id: m.content for m in canonical if isinstance(m, ToolMessage)
                           and m.tool_call_id in OLD_TEXT}, OLD_TEXT)
         self.assertNotIn("working_context", checkpoint.values)
+
+    async def test_continuation_reoffers_verified_table_metadata_without_compacting(self):
+        first = self.job(1)
+        raw = json.dumps({"rows": 7, "columns": 115, "fields": [
+            {"name": f"field_{i}", "min": "-1.0000000000001", "samples": ["汉字" * 60]}
+            for i in range(115)], "raw_preview": "original table" * 400})
+        evidence = {"old-table": raw}
+        wire = []
+        key = tool_results.execution_receipt_key(first, "old-table")
+
+        def transport(request):
+            payload = json.loads(request.content)
+            wire.append(payload)
+            if len(wire) == 1:
+                return _chat_stream([("old-table", TABLE, {})])
+            if len(wire) == 3:
+                old = next(message for message in payload["messages"] if message.get("tool_call_id") == "old-table")
+                table = json.loads(old["content"])
+                self.assertEqual(table["delivery"], "stored_table_overview")
+                self.assertEqual(table["table_overview"]["columns"], 115)
+                self.assertEqual(table["tool_result_ref"]["full_sha256"], hashlib.sha256(raw.encode()).hexdigest())
+                self.assertEqual(table["tool_result_ref"]["tool_call_id"], key)
+                self.assertIn(READER, {item["function"]["name"] for item in payload["tools"]})
+                self.assertLess(request_context.estimate_request(payload)["estimated_input_tokens"], 128_000)
+                return _chat_stream([("read-old-table", READER, {"tool_call_id": key, "max_chars": 24})])
+            return _chat_stream()
+
+        async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(transport)), trust_env=False) as client:
+            model = ChatOpenAI(use_responses_api=False, model=PROVIDER, api_key="fixture", base_url=BASE,
+                max_retries=0, max_tokens=4096, stream_usage=True, http_async_client=client)
+            result1, _ = await self.run_turn(model, first, "inspect", evidence)
+            self.assertEqual(result1.status, "complete", result1.reason)
+            self.assertTrue(jobs.update_job(first.run_id, status="completed"))
+            store = sessions.session_manager
+            self.assertTrue(await store.save_messages(self.sid, result1.messages))
+            restored, row_ids = await store.get_messages_with_ids(self.sid)
+            from src.core.context_manager import ContextManager, assemble_supervisor_messages
+            view, _ = await ContextManager()._build_send_view(self.sid, restored, row_ids, "follow-up", checkpoint={})
+            messages, _ = assemble_supervisor_messages("system", {"messages": view}, HumanMessage("follow-up"))
+            legacy = next(message for message in messages if isinstance(message, ToolMessage))
+            self.assertNotIn("host_publication", legacy.additional_kwargs)
+            self.assertNotIn("context_projection", legacy.additional_kwargs)
+            self.assertEqual(legacy.content, next(message for message in result1.messages
+                if isinstance(message, ToolMessage)).content)
+            second = self.job(2)
+            result2, host = await self.run_turn(model, second, "read prior table", evidence, edit_history=False)
+            self.assertEqual(result2.status, "complete", result2.reason)
+            self.assertEqual(host.historical_result_offers, {key})
+            self.assertEqual(len(wire), 4)
+            self.assertEqual(host.historical_result_reference(legacy, existing_delivery=True)["tool_call_id"], key)
+            changed = json.loads(legacy.content)
+            changed["tool_result_ref"]["full_sha256"] = "0" * 64
+            self.assertIsNone(host.historical_result_reference(legacy.model_copy(update={
+                "content": json.dumps(changed)}), existing_delivery=True))
+            tracing.set_user_id(9)
+            try:
+                self.assertIsNone(host.historical_result_reference(legacy, existing_delivery=True))
+            finally:
+                tracing.set_user_id(7)
+
+    async def test_duplicate_older_readback_changes_only_final_wire_copy(self):
+        raw = json.dumps({"rows": 7, "columns": 115, "fields": [{"name": f"col_{i}"} for i in range(115)],
+                          "raw_preview": "原始表格带有非 ASCII 数据" * 650}, ensure_ascii=False)
+        evidence = {"table": raw}
+        first = self.job(1)
+        target = tool_results.execution_receipt_key(first, "table")
+        args = {"tool_call_id": target, "start_char": 1200, "max_chars": 5000}
+        wire = []
+
+        def transport(request):
+            wire.append((request.content, json.loads(request.content)))
+            return {
+                1: lambda: _chat_stream([("table", TABLE, {})]),
+                2: lambda: _chat_stream([("old-page", READER, args)]),
+                4: lambda: _chat_stream([("current-page", READER, args)]),
+            }.get(len(wire), _chat_stream)()
+
+        async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(transport)), trust_env=False) as client:
+            model = ChatOpenAI(use_responses_api=False, model=PROVIDER, api_key="fixture", base_url=BASE,
+                max_retries=0, max_tokens=4096, stream_usage=True, http_async_client=client)
+            first_result, _ = await self.run_turn(model, first, "inspect and read", evidence)
+            self.assertEqual((first_result.status, len(wire)), ("complete", 3))
+            self.assertTrue(jobs.update_job(first.run_id, status="completed"))
+            second = self.job(2)
+            second_result, host = await self.run_turn(model, second, "check exact range again", evidence)
+            self.assertEqual((second_result.status, len(wire)), ("complete", 5))
+            self.assertEqual(host.historical_result_offers, {target})
+            self.assertEqual([record["tool_call_id"] for record in host.records], ["current-page"])
+
+        def by_id(payload):
+            return {item["tool_call_id"]: item for item in payload["messages"] if item["role"] == "tool"}
+
+        old = by_id(wire[2][1])["old-page"]
+        self.assertEqual(by_id(wire[3][1])["old-page"], old)
+        final = by_id(wire[4][1])
+        current_page = final["current-page"]
+        self.assertEqual(current_page["content"], old["content"])
+        pointer = json.loads(final["old-page"]["content"])
+        self.assertEqual(pointer["delivery"], "older_verified_readback_page_omitted")
+        self.assertEqual(pointer["duplicate_of_tool_call_id"], "current-page")
+        self.assertEqual(pointer["tool_result_ref"], {"tool_call_id": target,
+            "full_sha256": hashlib.sha256(raw.encode()).hexdigest()})
+        self.assertEqual(set(final), {"table", "old-page", "current-page"})
+        self.assertNotIn("result_text", pointer)
+        self.assertGreater(len(old["content"].encode()) - len(final["old-page"]["content"].encode()), 5000)
+        self.assertEqual(tool_results.fetch_for_current_request(target, strict=True)["result_text"], raw)
+        for identity, cid in ((first, "old-page"), (second, "current-page")):
+            saved = tool_results.fetch_for_current_request(tool_results.execution_receipt_key(identity, cid), strict=True)
+            self.assertEqual(saved["result_text"], old["content"])
+            self.assertTrue(tool_results.storage_integrity(saved)["complete"])
+        async with open_framework_checkpoint(self.root, second, self.provider, read_only=True) as saver:
+            checkpoint = await _checkpoint_reader(saver).aget_state(
+                {"configurable": framework_checkpoint_scope(second, self.provider)})
+        saved_pages = {msg.tool_call_id: msg for msg in checkpoint.values["messages"]
+                       if isinstance(msg, ToolMessage) and msg.name == READER}
+        self.assertEqual(set(saved_pages), {"old-page", "current-page"})
+        self.assertTrue(all(msg.content == old["content"] for msg in saved_pages.values()))
+        self.assertTrue(all(not msg.response_metadata.get("context_editing") for msg in saved_pages.values()))
 
     async def test_official_stream_produces_one_charged_attempt_with_packet_and_usage(self):
         identity = self.job(1)

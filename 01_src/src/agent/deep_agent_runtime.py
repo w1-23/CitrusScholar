@@ -23,6 +23,8 @@ def configure_profile():
     register_harness_profile(GRAPH_PROFILE_KEY, HarnessProfile(
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
         excluded_tools=frozenset({"write_file", "edit_file", "delete", "execute", "task"}),
+        # A missing tool observation needs reconciliation, not an invented
+        # error. Stock summaries are neither metered nor evidence authority.
         excluded_middleware=frozenset({"PatchToolCallsMiddleware", "SummarizationMiddleware"})))
 
 
@@ -206,6 +208,8 @@ def create_framework_agent(model, tools, middleware, saver, state_schema, *,
     from deepagents.backends import CompositeBackend, StateBackend
     from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
     from langchain.agents.middleware import TodoListMiddleware, ToolErrorMiddleware
+    from langchain.agents.middleware.todo import WRITE_TODOS_TOOL_DESCRIPTION
+    from src.core.public_progress import PUBLIC_TODO_INSTRUCTIONS
 
     configure_profile()
     if skill_root is None:
@@ -233,15 +237,16 @@ def create_framework_agent(model, tools, middleware, saver, state_schema, *,
     # has no per-call profile argument. Scope this alias to graph construction
     # and restore the real provider model at the final model middleware hook.
     profiled_model = model.model_copy(update={"model_name": GRAPH_PROFILE_KEY})
+    todos = TodoListMiddleware(tool_description=f"{WRITE_TODOS_TOOL_DESCRIPTION}\n\n{PUBLIC_TODO_INSTRUCTIONS}")
     return create_deep_agent(model=profiled_model, tools=tools,
-        middleware=[filesystem, TodoListMiddleware(), *middleware, read_errors], system_prompt=system_prompt,
+        middleware=[filesystem, todos, *middleware, read_errors], system_prompt=system_prompt,
         subagents=[], skills=["/skills/"] if skill_root is not None else [], backend=backend,
         permissions=permissions, checkpointer=saver, state_schema=state_schema,
          context_schema=context_schema, name="citrus_framework_loop")
 
 
-def _earlier_tool_pairs(messages, identity):
-    """Find native, complete tool blocks before the authenticated current user."""
+def _tool_pairs(messages, identity, *, active=False):
+    """Find complete native batches on one side of the authenticated user."""
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
     def bound(message, origin, turn, run):
@@ -252,18 +257,25 @@ def _earlier_tool_pairs(messages, identity):
 
     current = next((index for index, message in enumerate(messages)
                     if isinstance(message, HumanMessage)
-                    and bound(message, "user", identity.user_turn_id, identity.run_id)), 0)
-    for index in range(current):
+                    and bound(message, "user", identity.user_turn_id, identity.run_id)), None)
+    if current is None:
+        return
+    start, stop = (current + 1, len(messages)) if active else (0, current)
+    for index in range(start, stop):
         assistant = messages[index]
         if not isinstance(assistant, AIMessage) or not assistant.tool_calls or assistant.invalid_tool_calls:
             continue
         meta = assistant.additional_kwargs
         turn, run = meta.get("context_turn_id"), meta.get("run_id")
-        if (not turn or turn == identity.user_turn_id or not run or run == identity.run_id
-                or not bound(assistant, "assistant", turn, run)):
+        if not turn or not run or not bound(assistant, "assistant", turn, run):
+            continue
+        if active:
+            if turn != identity.user_turn_id or run != identity.run_id:
+                continue
+        elif turn == identity.user_turn_id or run == identity.run_id:
             continue
         end = index + 1 + len(assistant.tool_calls)
-        if end > current or isinstance(messages[end], ToolMessage):
+        if end > stop or (end < len(messages) and isinstance(messages[end], ToolMessage)):
             continue
         calls = {call.get("id"): call["name"] for call in assistant.tool_calls}
         observations = messages[index + 1:end]
@@ -276,11 +288,82 @@ def _earlier_tool_pairs(messages, identity):
         yield from ((index, ordinal) for ordinal in range(index + 1, end))
 
 
-async def edit_context_for_send(model, bound, messages, identity, receipt_for):
-    """Apply stock LangChain clearing to individually proven older observations."""
+async def _clear_proven_tool_pair(model, assistant, observation, placeholder):
+    """Use stock LangChain to replace just the result content on a send copy."""
+    from langchain.agents.middleware import ClearToolUsesEdit, ContextEditingMiddleware, ModelRequest
+
+    async def edited_messages(request):
+        return request.messages
+
+    middleware = ContextEditingMiddleware(edits=[ClearToolUsesEdit(trigger=0, keep=0, placeholder=placeholder)])
+    changed = await middleware.awrap_model_call(ModelRequest(model=model,
+        messages=[assistant, observation]), edited_messages)
+    return changed[1] if changed[1].content == placeholder else observation
+
+
+async def _omit_repeated_readback_pages(model, view, identity, pairs, receipt_for, offered, count_tokens, tokens):
+    """Remove an older raw page only when this send carries an exact current copy."""
     import asyncio
     import json
-    from langchain.agents.middleware import ClearToolUsesEdit, ContextEditingMiddleware, ModelRequest
+    from src.core.model_context import exact_readback_page
+
+    # Comparing the entire wire body also compares ordered selectors, source
+    # digest, cursor, outcome and all exact returned bytes. Do not compare IDs,
+    # lengths, or selected text alone. The source must already be re-offered.
+    current = {}
+    for _, ordinal in _tool_pairs(view, identity, active=True):
+        message = view[ordinal]
+        if message.name == "read_tool_result" and message.status == "success" and isinstance(message.content, str):
+            current.setdefault(message.content, []).append(message)
+    if not current:
+        return view
+    candidates = [(assistant, ordinal) for assistant, ordinal in pairs
+                  if view[ordinal].name == "read_tool_result" and isinstance(view[ordinal].content, str)
+                  and view[ordinal].content in current]
+    if not candidates:
+        return view
+
+    def verify():
+        verified = {}
+        edits = []
+        for assistant, ordinal in candidates:
+            old = view[ordinal]
+            if (page := exact_readback_page(old, offered)) is None:
+                continue
+            if old.content not in verified:
+                verified[old.content] = next((message for message in current[old.content]
+                    if receipt_for(message, current_readback=True) is not None), None)
+            newer = verified[old.content]
+            if newer is None or receipt_for(old) is None:
+                continue
+            source, bounds, fields = page
+            placeholder = json.dumps({"delivery": "older_verified_readback_page_omitted",
+                "duplicate_of_tool_call_id": newer.tool_call_id, "tool_result_ref": source,
+                "page": bounds, "selected_fields": fields,
+                "notice": "The identical current readback is in this request. The older page is retained."},
+                ensure_ascii=False, separators=(",", ":"))
+            if len(placeholder.encode("utf-8")) <= 1024:
+                edits.append((assistant, ordinal, placeholder))
+        return edits
+
+    edits = await asyncio.to_thread(verify)
+    if not edits:
+        return view
+    projected = list(view)
+    for assistant, ordinal, placeholder in edits:
+        projected[ordinal] = await _clear_proven_tool_pair(model, view[assistant], view[ordinal], placeholder)
+    return projected if count_tokens(projected) < tokens else view
+
+
+async def prepare_context_for_send(model, bound, messages, identity, receipt_for, *, edit):
+    """Use native send-only edits and re-offer visible, authenticated receipts.
+
+    ``bound`` includes the reader schema. A view that doesn't fit with that
+    schema is not adopted. The graph and durable result rows remain untouched.
+    """
+    import asyncio
+    import json
+    from src.core.model_context import stored_history_offer
     from src.core.request_context import model_request, text_tokens
     from src.core.task_events import model_input_limit
 
@@ -289,20 +372,31 @@ async def edit_context_for_send(model, bound, messages, identity, receipt_for):
 
     _, estimate = model_request(bound, messages)
     limit = model_input_limit(estimate["output_tokens"])
-    if estimate["estimated_input_tokens"] <= limit:
+    tokens = estimate["estimated_input_tokens"]
+    pairs = list(_tool_pairs(messages, identity))
+    if not pairs:
+        return messages, ()
+    inline = []
+    visible = []
+    for assistant, ordinal in pairs:
+        message = messages[ordinal]
+        if stored_history_offer(message) is not None:
+            visible.append(ordinal)
+        elif edit and tokens > limit and isinstance(message.content, str) and len(message.content) >= 512:
+            inline.append((assistant, ordinal))
+
+    if tokens > limit:
+        editable = {ordinal for _, ordinal in inline}
+        if not editable or count_tokens([m for i, m in enumerate(messages) if i not in editable]) > limit:
+            return messages, ()
+    if not inline and not visible:
         return messages, ()
 
-    pairs = [(assistant, ordinal) for assistant, ordinal in _earlier_tool_pairs(messages, identity)
-             if isinstance(messages[ordinal].content, str) and len(messages[ordinal].content) >= 512]
-    possibly_editable = {ordinal for _, ordinal in pairs}
-    # If even this hypothetical lower bound is too large, verify/admit the raw
-    # request normally. The hypothetical view is never sent to the provider.
-    if not pairs or count_tokens([m for i, m in enumerate(messages) if i not in possibly_editable]) > limit:
-        return messages, ()
-
-    def verified_candidates():
+    def verify():
+        offered = {ref["tool_call_id"]: ref["full_sha256"] for ordinal in visible
+                   if (ref := receipt_for(messages[ordinal], existing_delivery=True)) is not None}
         candidates = []
-        for assistant, ordinal in pairs:
+        for assistant, ordinal in inline:
             message = messages[ordinal]
             reference = receipt_for(message)
             if reference is None:
@@ -313,32 +407,28 @@ async def edit_context_for_send(model, bound, messages, identity, receipt_for):
                 "notice": "Read only needed evidence. This is a historical result, not a new execution."},
                 ensure_ascii=False, separators=(",", ":"))
             if text_tokens(placeholder) < text_tokens(message.content):
-                candidates.append((assistant, ordinal, placeholder, reference["tool_call_id"]))
-        return candidates
+                candidates.append((assistant, ordinal, placeholder, reference))
+        return offered, candidates
 
-    candidates = await asyncio.to_thread(verified_candidates)
-    if not candidates:
+    offered, candidates = await asyncio.to_thread(verify)
+    view = list(messages)
+
+    for assistant, ordinal, placeholder, reference in candidates:
+        if tokens <= limit:
+            break
+        original = view[ordinal]
+        view[ordinal] = await _clear_proven_tool_pair(model, view[assistant], original, placeholder)
+        if view[ordinal] is original:
+            continue
+        edited_tokens = count_tokens(view)
+        if edited_tokens >= tokens:
+            view[ordinal] = original
+            continue
+        tokens = edited_tokens
+        offered[reference["tool_call_id"]] = reference["full_sha256"]
+    if not offered or tokens > limit:
         return messages, ()
-
-    offered = []
-
-    class ProvenToolUsesEdit:
-        def apply(self, view, *, count_tokens):
-            for assistant, ordinal, placeholder, key in candidates:
-                if count_tokens(view) <= limit:
-                    break
-                pair = [view[assistant], view[ordinal]]
-                # The native edit must never see a current/unknown pair or change
-                # the assistant call. The entire send, not this pair, is budgeted.
-                ClearToolUsesEdit(trigger=0, keep=0, placeholder=placeholder).apply(
-                    pair, count_tokens=lambda _: 1)
-                if pair[1] is not view[ordinal]:
-                    view[ordinal] = pair[1]
-                    offered.append(key)
-
-    async def send_view(request):
-        return request.messages
-
-    middleware = ContextEditingMiddleware(edits=[ProvenToolUsesEdit()], token_counter=count_tokens)
-    view = await middleware.awrap_model_call(ModelRequest(model=model, messages=messages), send_view)
-    return (view, tuple(offered)) if offered else (messages, ())
+    if edit:
+        view = await _omit_repeated_readback_pages(model, view, identity, pairs, receipt_for, offered,
+                                                  count_tokens, tokens)
+    return view, tuple(offered)

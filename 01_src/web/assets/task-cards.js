@@ -219,22 +219,14 @@
     }
     function draw() {
       var hostIndex = 0, actionIndex = 0, activeRows = new Set(), operations = new Set(), failed = 0, attempts = 0;
-      var milestones = new Set();
       projection.entries.forEach(function (item) {
-        if (item.kind === 'note' && item.category) {
-          var milestone = item.generation + "/" + item.category;
-          if (milestones.has(milestone)) return;
-          milestones.add(milestone);
-        }
         var row = rows.get(item.id);
         if (!row) { row = node('div', item.kind === 'note' ? 'research-process-note' : 'term-line'); rows.set(item.id, row); }
         activeRows.add(item.id);
         row.removeAttribute('aria-current');
         if (item.kind === 'note') {
           row.textContent = item.text;
-          row.dataset.noteId = item.note_id; row.dataset.phase = item.phase; row.dataset.stepId = item.step_id;
-          row.dataset.modelStep = item.model_step == null ? '' : String(item.model_step);
-          row.dataset.toolCallIds = JSON.stringify(item.tool_call_ids);
+          row.dataset.noteId = item.note_id;
           place(host, row, hostIndex++); return;
         }
         var data = item.data, status = data.status || 'running';
@@ -291,10 +283,9 @@
     return {element: host, projection: projection, activeTool: activeTool,
       begin: function (generation) { if (projection.begin(generation)) draw(); },
       pause: function (value) { if (paused !== value) { paused = value; draw(); } },
-      note: function (text, id, metadata) {
-        var clean = (metadata && metadata.public_note && options.publicNote ? options.publicNote : options.clean)(text);
-        var item = clean ? projection.note(clean, id, metadata) : null;
-        if (item && !(metadata && metadata.status_only)) draw();
+      note: function (data) {
+        var item = projection.note(data);
+        if (item) draw();
         return item;
       },
       plan: function (data) { if (projection.plan(data)) draw(); },

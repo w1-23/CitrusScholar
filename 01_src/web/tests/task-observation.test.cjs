@@ -205,17 +205,19 @@ test('replay consumes but never projects obsolete generation frames', async t =>
     question: {id: 'old', status: 'pending'}}), false);
 });
 
-test('public progress identities deduplicate only within one generation', () => {
+test('native progress identity survives recovery while interrupted tool attempts stay separate', () => {
   const process = CitrusTaskState.createProcess();
-  const metadata = {note_id: 'same', visibility: 'public', origin: 'host', category: 'model_thinking'};
+  const first = {job_id: 'job', note_id: 'todo:' + 'a'.repeat(64), visibility: 'public',
+    origin: 'langgraph', source: 'write_todos', status: 'in_progress', text: 'Initial stage'};
   process.begin('job');
-  assert.ok(process.note('one', null, metadata));
-  assert.equal(process.note('duplicate', null, metadata), null);
+  assert.ok(process.note(first));
+  assert.equal(process.note(first), null);
   process.action({tool_call_id: 'call', status: 'running'});
   process.begin('job/4');
-  assert.ok(process.note('after recovery', null, metadata));
+  assert.equal(process.note(first), null);
+  assert.ok(process.note({...first, note_id: 'todo:' + 'b'.repeat(64), text: 'After recovery'}));
   process.action({tool_call_id: 'call', status: 'running'});
-  assert.deepEqual(process.entries.filter(item => item.kind === 'note').map(item => item.text), ['one', 'after recovery']);
+  assert.deepEqual(process.entries.filter(item => item.kind === 'note').map(item => item.text), ['Initial stage', 'After recovery']);
   assert.deepEqual(process.entries.filter(item => item.kind === 'action').map(item => item.data.status), ['interrupted', 'running']);
 });
 

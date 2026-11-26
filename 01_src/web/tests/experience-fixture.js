@@ -54,7 +54,7 @@
       result.push(frame(result.length + 1, 'tool_call_start', {...tool, status: 'running'}));
       result.push(frame(result.length + 1, 'tool_result', {...tool, status: 'complete'}));
     }
-    result.push(frame(result.length + 1, 'assistant_progress', {text: '公开进度：正在核查列名', visibility: 'public', origin: 'model', note_id: 'public-fixture'}));
+    result.push(frame(result.length + 1, 'assistant_progress', {text: '核查列名', visibility: 'public', origin: 'langgraph', source: 'write_todos', status: 'in_progress', note_id: 'todo:' + 'f'.repeat(64)}));
     result.push(frame(result.length + 1, 'assistant_progress', {text: 'INTERNAL_FIXTURE_MARKER', visibility: 'private', origin: 'model', note_id: 'private-fixture'}));
     result.push(frame(result.length + 1, 'answer_start', {}));
     result.push(frame(result.length + 1, 'text', {content: '  \n', delivery: 'committed'}));

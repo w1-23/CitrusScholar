@@ -426,8 +426,6 @@ def project_public_event(event, data):
         return cursor
     if event in _OLD_PROJECTED:
         from src.core.progress_bus import public_progress_payload
-        if event == "assistant_progress" and row.get("origin") == "model":
-            row = row | {"text": strip_private_text(row.get("text"))}
         return public_progress_payload(event, row) | cursor
     if event == "text":
         text = public_answer_text(row.get("content"))

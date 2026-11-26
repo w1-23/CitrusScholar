@@ -1,0 +1,19 @@
+[Unit]
+Description=CitrusScholar 8043 independent corpus intake
+ConditionPathIsDirectory=/home/WZQ/citrusscholar/runtime/8043-isolated-corpus
+
+[Service]
+Type=exec
+WorkingDirectory=/home/WZQ/citrusscholar/releases/8043-reliability-619180208def
+ExecStart="/usr/bin/apptainer" "exec" "--cleanenv" "--no-home" "--no-mount" "hostfs,cwd,home,bind-paths" "--pwd" "/home/WZQ/citrusscholar/releases/8043-reliability-619180208def/source" "--bind" "/home/WZQ/citrusscholar/releases/8043-reliability-619180208def/source:/home/WZQ/citrusscholar/releases/8043-reliability-619180208def/source:ro" "--bind" "/home/WZQ/citrusscholar/runtime/8043-isolated-corpus:/home/WZQ/citrusscholar/runtime/8043-isolated-corpus:rw" "--env" "PYTHONPATH=/home/WZQ/citrusscholar/releases/8043-reliability-619180208def/source/packages" "--env" "PYTHONDONTWRITEBYTECODE=1" "--env" "HF_HUB_OFFLINE=1" "--env" "OMP_NUM_THREADS=2" "--env" "RAYON_NUM_THREADS=2" "--env" "TOKIO_WORKER_THREADS=2" "/home/WZQ/citrusscholar/releases/8043-reliability-619180208def/images/application.sif" "/usr/local/bin/python" "-B" "-m" "citrus_corpus" "--root" "/home/WZQ/citrusscholar/runtime/8043-isolated-corpus" "worker" "--watch"
+Restart=on-failure
+RestartSec=8s
+KillMode=mixed
+TimeoutStopSec=30s
+LimitCORE=0
+UMask=0077
+Nice=10
+CPUQuota=200%
+
+[Install]
+WantedBy=default.target

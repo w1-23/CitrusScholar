@@ -1,0 +1,9 @@
+[Unit]
+Description=Check for newly completed CitrusScholar 8043 chat turns
+
+[Timer]
+OnCalendar=*-*-* *:*:00/10
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

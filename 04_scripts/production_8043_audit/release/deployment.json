@@ -1,0 +1,141 @@
+{
+  "app_sha256": "6fd05698487de1abf205770dbf5c98bf394de1e585ec240e82ad60f9879e6cc6",
+  "app_sif": "/home/WZQ/citrusscholar/releases/8043-native-a865b07d9f52/images/application.sif",
+  "browse_config": "/home/WZQ/citrusscholar/preflight/browse-8042-review-efeb7ed/browse-bundle/browse.json",
+  "code_staging": "/home/WZQ/citrusscholar/jobs/invite8043",
+  "corpus_root": "/home/WZQ/citrusscholar/runtime/citrusqa/state/data",
+  "cpu_threads": 4,
+  "existing_runtime": true,
+  "external_fusion_required": true,
+  "figure_staging": "/home/WZQ/citrusscholar/preflight/invite-nature-dev.cfV879mN/preview-8043/figure-staging",
+  "gpu_device": 0,
+  "historical_skill_releases": [
+    {
+      "mount_path": "/home/WZQ/citrusscholar/work/five-repos-host/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-agentcore-ef1d4c2/historical-skills/fbb2e2de74448503b4cd5a4c4282260dab4e96b5a0cad8e218dee7ec533d5f8b",
+      "sha256": "fbb2e2de74448503b4cd5a4c4282260dab4e96b5a0cad8e218dee7ec533d5f8b"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-agentcore-ef1d4c2/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-agentcore-ef1d4c2/skills-release",
+      "sha256": "0a162822db375e1e0e1c768000af68ff4aa27474eb9f4057f912326c7ae19c7e"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/work/8043-fusion-release-check.Ys4AM5d3/skills-final-r2",
+      "path": "/home/WZQ/citrusscholar/work/8043-fusion-release-check.Ys4AM5d3/skills-final-r2",
+      "sha256": "5469497fda1c51e5927d438665601842774d8315b90c786009179f58b1e9582c"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-reliability-619180208def/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-reliability-619180208def/skills-release",
+      "sha256": "1261c0a86d327b81bcbdbb53707b5a81be00923596258d1c3659ede3d2c059ed"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-7486cad447f3/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-7486cad447f3/skills-release",
+      "sha256": "1261c0a86d327b81bcbdbb53707b5a81be00923596258d1c3659ede3d2c059ed"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-9bc3d5a6ad6b/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-9bc3d5a6ad6b/skills-release",
+      "sha256": "fa35c40d1be0270eb343a85c912a94b20f5552d9369389b627be69557cfd9021"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-b088cb0dfa68/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-b088cb0dfa68/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-9e096ebfc00b/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-9e096ebfc00b/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-a3a37656d2c2/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-a3a37656d2c2/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-e74085752aa9/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-e74085752aa9/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-fea54bc3adaf/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-fea54bc3adaf/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-4513c3c6658f/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-4513c3c6658f/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-405765f345dc/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-405765f345dc/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-9f5e4f60a417/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-9f5e4f60a417/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-4c62e7094aca/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-4c62e7094aca/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-9c582f028a17/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-9c582f028a17/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-e9984fe47a53/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-e9984fe47a53/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-49c656d35dcf/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-49c656d35dcf/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-e50e7848cf03/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-e50e7848cf03/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-3e708b67a3c6/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-3e708b67a3c6/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    },
+    {
+      "mount_path": "/home/WZQ/citrusscholar/releases/8043-native-aad34c5a9a25/skills-release",
+      "path": "/home/WZQ/citrusscholar/releases/8043-native-aad34c5a9a25/skills-release",
+      "sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3"
+    }
+  ],
+  "host_python": "/usr/bin/python3.12",
+  "isolated_corpus": {
+    "embedding_cache": "/home/WZQ/citrusscholar/runtime/citrusqa/state/.hf_cache/fastembed",
+    "growth": true,
+    "read": true,
+    "root": "/home/WZQ/citrusscholar/runtime/8043-isolated-corpus"
+  },
+  "listen_host": "127.0.0.1",
+  "model_cache_root": "/home/WZQ/citrusscholar/runtime/citrusqa/state/.hf_cache",
+  "model_config_root": "/home/WZQ/citrusscholar/preflight/invite-nature-dev.cfV879mN/preview-8043/model",
+  "model_origin": "/home/WZQ/citrusscholar/runtime/citrusqa/state/state",
+  "namespace_sha256": "66514c13c454488f8f0eb152425417851842aa3099b30642e4e8773f19567e3d",
+  "namespace_sif": "/home/WZQ/citrusscholar/releases/8043-native-a865b07d9f52/images/namespace.sif",
+  "port": 8043,
+  "reuse_web_search_settings": false,
+  "runtime_root": "/home/WZQ/citrusscholar/preflight/invite-nature-dev.cfV879mN/preview-8043/runtime",
+  "sandbox_sha256": "f576f83f98f6c18c972babb866e0065ca5d694cb6c9b5fe47dacd4b78dda8f62",
+  "sandbox_sif": "/home/WZQ/citrusscholar/releases/8043-native-a865b07d9f52/images/sandbox.sif",
+  "skill_release": "/home/WZQ/citrusscholar/releases/8043-native-a865b07d9f52/skills-release",
+  "skill_release_sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3",
+  "source_head": "a865b07d9f525bd121a056bb3cad53293c0030ce",
+  "source_root": "/home/WZQ/citrusscholar/releases/8043-native-a865b07d9f52/source"
+}

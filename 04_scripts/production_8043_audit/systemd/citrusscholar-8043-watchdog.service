@@ -1,0 +1,6 @@
+[Unit]
+Description=CitrusScholar 8043 readiness watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/home/WZQ/.local/bin/citrus-8043-watchdog.sh

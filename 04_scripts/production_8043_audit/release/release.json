@@ -1,0 +1,23 @@
+{
+  "active_skill_sha256": "d99ac87f403c6fc84092117c43412309568ea6a8842675ac1349f7a7341de2f3",
+  "artifacts": {
+    "deployment.json": "e7dec98e3f05bd161953b658765e8293f1aa4b7daa8acff1c7a5bfadc9e0c1fe",
+    "launch.py": "2585f236b7dd8a9a21421131c6254d4fee5b8657f53fa0b723aade184016fee6",
+    "source-sha256.json": "d932731b5244b941eb42a69fe9cf50f5597d6720caa0e87cf54d40efd96c9ff1",
+    "source.tar": "ba99a5933a89ccbbee76a82b0aaa623d251f3c52d89907ade721b38155fc11d5"
+  },
+  "baseline": {
+    "deployment": "/home/WZQ/citrusscholar/releases/8043-native-aad34c5a9a25/deployment.json",
+    "launcher_sha256": "2585f236b7dd8a9a21421131c6254d4fee5b8657f53fa0b723aade184016fee6",
+    "sha256": "3b287ff1653ba109db1a2fb07ff7375b23af76dca4276aec3d3a6c374aadf797",
+    "source_inventory_sha256": "96f12b402568c5bc3bb51af2e829999957d13b263c420dcc37a39a6634ef0292"
+  },
+  "images": {
+    "app": "6fd05698487de1abf205770dbf5c98bf394de1e585ec240e82ad60f9879e6cc6",
+    "namespace": "66514c13c454488f8f0eb152425417851842aa3099b30642e4e8773f19567e3d",
+    "sandbox": "f576f83f98f6c18c972babb866e0065ca5d694cb6c9b5fe47dacd4b78dda8f62"
+  },
+  "schema": "citrusscholar.8043-release/1",
+  "source_commit": "a865b07d9f525bd121a056bb3cad53293c0030ce",
+  "source_tree": "eaf4c70961bb257060309e08d2c46dbf771dbb36"
+}

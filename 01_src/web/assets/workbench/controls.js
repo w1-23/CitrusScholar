@@ -1,4 +1,6 @@
 import { element } from './dom.js';
+import { colorControl } from './color-picker.js?v=1';
+import { styleGrid } from './style-grid.js?v=1';
 
 const labels = {
   text: '文字', label: '名称', color: '系列颜色', facecolor: '填充颜色', edgecolor: '边框颜色',
@@ -61,43 +63,19 @@ function numberInput(range, value, optional = true) {
   return input;
 }
 
-function colorField(parent, name, value) {
-  const input = element('input');
-  input.placeholder = '#RRGGBB';
-  input.maxLength = 7;
-  input.pattern = '#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})';
-  input.value = color(value) ? value : '';
-  field(parent, name, input);
-  const swatches = element('div', undefined, 'swatches');
-  for (const [label, hex] of Object.entries({ 绿色: '#286445', 紫色: '#7a3c96', 蓝色: '#0f4d92', 橙色: '#d97706', 黑色: '#202020' })) {
-    const button = element('button');
-    button.type = 'button';
-    button.title = label;
-    button.setAttribute('aria-label', `${name} ${label}`);
-    button.style.backgroundColor = hex;
-    button.addEventListener('click', () => {
-      input.value = hex;
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-    swatches.append(button);
-  }
-  parent.append(swatches);
-  return input;
-}
-
 function markerFill(parent, value, modes) {
   const box = element('fieldset', undefined, 'fill-options');
   box.append(element('legend', labels.markerfacecolor));
   const current = color(value) ? 'custom' : value;
   const mode = field(box, '填充方式', select(modes, current, { auto: '跟随系列', none: '无填充', custom: '自定义' }));
-  const input = colorField(box, '标记自定义颜色', value);
+  const { root, input, open } = colorControl(box, '标记自定义颜色', value, field);
   const show = () => {
     const custom = mode.value === 'custom';
     input.required = custom;
     input.disabled = !custom;
     if (custom && !input.value) input.value = '#ffffff';
-    input.parentNode.hidden = !custom;
-    input.parentNode.nextElementSibling.hidden = !custom;
+    open.disabled = !custom;
+    root.hidden = !custom;
   };
   mode.addEventListener('change', show);
   show();
@@ -117,8 +95,12 @@ function addControl(form, prop, value, snapshot, group) {
     return { events: [x, y], read: () => [x.valueAsNumber, y.valueAsNumber] };
   }
   if (prop === 'markerfacecolor') return markerFill(form, value, (group.line_marker_fill || group.members?.every((member) => member.line_marker_fill)) ? ['auto', 'none', 'custom'] : snapshot.marker_fill_states);
+  if (prop === 'marker' || prop === 'linestyle') {
+    const options = (snapshot.options[prop] || []).filter((option) => group.kind !== 'errorbar' || option !== 'None');
+    return styleGrid(form, prop, name, options, value, selections[prop]);
+  }
   if (prop.endsWith('color')) {
-    input = colorField(form, name, value);
+    input = colorControl(form, name, value, field).input;
   } else {
     if (['visible', 'frameon', 'transparent'].includes(prop)) {
       input = element('input');
@@ -187,7 +169,7 @@ export function renderInspector(container, snapshot, group, values, update) {
     else apply.disabled = true;
   });
   form.append(apply);
-  container.append(form);
+  container.append(form, ...form.querySelectorAll('dialog'));
 }
 
 export function renderTree(tree, groups, selected, expanded, choose, values) {

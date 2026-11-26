@@ -182,7 +182,11 @@ def test_admin_public_paper_contract_and_private_status(tmp_path, monkeypatch):
         job = admitted.json()["job"]
         status = client.get(base + "intake", headers=admin)
         assert status.status_code == 200 and status.headers["Cache-Control"] == "private, no-store"
-        assert status.json() == {"automatic_enabled": True, "jobs": [{**job, "rights": None, "published": False}]}
+        assert status.json() == {"automatic_enabled": True, "jobs": [{**job,
+            "bibliography_verified": False, "original_sha256": None, "source_rights": None,
+            "rights_obtained": None, "rights": None, "prepared": False, "encoded_generation": None,
+            "indexed_generation": None, "published_generation": None, "active_generation": None,
+            "visible_generation": None, "published": False}]}
         assert "publication title" not in status.text and "account-7" not in status.text
 
 

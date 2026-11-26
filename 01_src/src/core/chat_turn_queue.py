@@ -1052,54 +1052,28 @@ def mark_awaiting_input(*, owner_user_id: int, session_id: str,
         return _reread(conn, owner_user_id, session_id, client_request_id)
 
 
-def resume_continuation(*, owner_user_id: int, session_id: str,
-                        client_request_id: str, generation: int,
-                        active_child_job_id: str, deadline: float) -> dict:
-    """Commit a cleaned-up head's new execution generation and child dispatch together."""
-    _validate_identity(owner_user_id, session_id)
-    _validate_client_request_id(client_request_id)
-    _validate_child_id(active_child_job_id)
-    if not active_child_job_id or not deadline > time.time():
-        raise ValueError("continuation child and execution deadline required")
-    with _transaction() as conn:
-        row = _scoped(conn, owner_user_id, session_id, client_request_id)
-        if row is None:
-            raise TurnNotFound("turn_not_found")
-        head = _head(conn, owner_user_id, session_id)
-        if row["state"] != AWAITING_INPUT or head is None or head["root_job_id"] != row["root_job_id"]:
-            raise TurnNotQueued(row["state"], job_id=row["root_job_id"])
-        _check_generation(row, generation)
-        parent = row["active_child_job_id"] or row["root_job_id"]
-        child = conn.execute(
-            "SELECT 1 FROM task_jobs c JOIN task_questions q ON q.id=c.question_id "
-            "AND q.child_job_id=c.job_id AND q.job_id=c.parent_job_id "
-            "AND q.owner_user_id=c.owner_user_id AND q.session_id=c.session_id "
-            "WHERE c.job_id=? AND c.owner_user_id=? AND c.session_id=? "
-            "AND c.parent_job_id=? AND c.status='queued' AND q.status='answered' AND q.recovery_cursor=?",
-            (active_child_job_id, owner_user_id, session_id, parent, task_events.recovery_cursor(conn, parent)),
-        ).fetchone()
-        if child is None:
-            raise TurnStateConflict("continuation_child_conflict", job_id=row["root_job_id"])
-        now = time.time()
-        cursor = conn.execute(
-            "UPDATE chat_turn_queue SET state=?, generation=generation+1, "
-            "active_child_job_id=?, updated_at=? WHERE owner_user_id=? "
-            "AND session_id=? AND client_request_id=? AND state=? AND generation=?",
-            (RUNNING, active_child_job_id, now, owner_user_id,
-             session_id, client_request_id, AWAITING_INPUT, generation),
-        )
-        if cursor.rowcount != 1:
-            raise TurnQueueNotReady("continuation_lost", job_id=row["root_job_id"])
-        child_update = conn.execute(
-            "UPDATE task_jobs SET status='running',current_step='init',updated_at=? "
-            "WHERE job_id=? AND status='queued'",
-            (datetime.fromtimestamp(now).isoformat(), active_child_job_id),
-        )
-        if child_update.rowcount != 1:
-            raise TurnQueueNotReady("continuation_child_lost", job_id=row["root_job_id"])
-        conn.execute("UPDATE task_budgets SET deadline=? WHERE job_id=?",
-                     (deadline, active_child_job_id))
-        return _reread(conn, owner_user_id, session_id, client_request_id)
+def _resume_question(conn, job, *, account_epoch, fence=None):
+    """Advance the same queue head in the question admission transaction."""
+    row = conn.execute("SELECT * FROM chat_turn_queue WHERE root_job_id=? OR active_child_job_id=?",
+                       (job["job_id"], job["job_id"])).fetchone()
+    if row is None and fence is None:
+        return
+    if (row is None or fence is None or row["state"] != AWAITING_INPUT
+            or row["account_epoch"] != account_epoch
+            or any(row[key] != value for key, value in fence.items())
+            or (row["active_child_job_id"] or row["root_job_id"]) != job["job_id"]):
+        raise TurnStateConflict("question_queue_conflict", job_id=job["job_id"])
+    head = _head(conn, row["owner_user_id"], row["session_id"])
+    if head is None or head["root_job_id"] != row["root_job_id"]:
+        raise TurnStateConflict("question_queue_conflict", job_id=job["job_id"])
+    conn.execute("UPDATE chat_turn_queue SET state=?,generation=generation+1,updated_at=? WHERE root_job_id=?",
+                 (RUNNING, time.time(), row["root_job_id"]))
+
+
+def _repark_question(conn, job_id):
+    conn.execute("UPDATE chat_turn_queue SET state=?,generation=generation+1,updated_at=? "
+                 "WHERE (root_job_id=? OR active_child_job_id=?) AND state=?",
+                 (AWAITING_INPUT, time.time(), job_id, job_id, RUNNING))
 
 
 def _validate_child_id(active_child_job_id) -> None:

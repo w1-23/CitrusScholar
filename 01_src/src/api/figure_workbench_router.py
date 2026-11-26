@@ -32,6 +32,7 @@ class GroupBatch(BaseModel):
     commands: list[GroupCommand] = Field(min_length=1, max_length=200)
     expected_revision: int = Field(ge=0, strict=True)
     draft_revision: int = Field(default=0, ge=0, le=9007199254740991, strict=True)
+    source_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$", strict=True)
 
 
 class ImportSvgRequest(BaseModel):
@@ -99,7 +100,7 @@ async def _edit(figure_id, request, body, *, save):
     with _write_scope(owner) as lease:
         try:
             result = await run_account_thread(lease, service.edit, figure_id, owner, body.expected_revision,
-                [command.model_dump() for command in body.commands], draft_revision=body.draft_revision, save=save)
+                [command.model_dump() for command in body.commands], draft_revision=body.draft_revision, save=save, source_sha256=body.source_sha256)
         except projects.ProjectError as exc:
             return _fail(exc)
     return JSONResponse(result, headers=_HEADERS)

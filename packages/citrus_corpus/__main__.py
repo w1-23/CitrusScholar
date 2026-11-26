@@ -151,7 +151,7 @@ def _run(args):
         while True:
             try:
                 result = intake.process_one(acquire=acquire if network_allowed() else None,
-                                            automatic=automatic if automatic and automatic.enabled() else None)
+                                            automatic=automatic)
             except (sqlite3.Error, OSError, ValueError) as exc:
                 if not args.watch:
                     raise

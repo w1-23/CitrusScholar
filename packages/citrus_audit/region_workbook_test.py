@@ -181,3 +181,21 @@ def test_region_token_and_coverage_counts_agree():
     assert columns["Recorded"]["status"] == "preserved"
     assert columns["Mixed"]["status"] == "partial"
     assert sum(col["tokens"] for col in columns.values()) == len(table.precision_evidence) == 3
+
+
+def test_shared_decimal_tail_coverage_requires_real_overlapping_original_decimal_pairs():
+    from citrus_audit.review import review_sheet
+
+    def review(rows):
+        csv = ('a,b\n' + '\n'.join(','.join(row) for row in rows)).encode()
+        snapshot = review_sheet(csv, 'fixture.csv', requested_checks=['pc_shared_decimal_tail'])
+        result = snapshot.report['tables'][0]['result']['data']
+        assert not [item for item in result['findings'] if item['check'] != 'pc_shared_decimal_tail']
+        return next(item for item in result['checklist'] if item['check'] == 'pc_shared_decimal_tail')
+
+    no_decimal = review([('10', '11')] * 5)
+    disjoint = review([('1.01', '')] * 5 + [('', '2.01')] * 5)
+    checked = review([(f'1.{i:02d}', f'2.{i + 10:02d}') for i in range(5)])
+    assert (no_decimal['state'], no_decimal['tested']) == ('not_applicable', 0)
+    assert (disjoint['state'], disjoint['tested']) == ('not_applicable', 0)
+    assert (checked['state'], checked['tested']) == ('checked_no_findings', 5)

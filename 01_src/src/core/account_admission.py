@@ -118,10 +118,9 @@ class AdmissionStore:
             yield conn
 
     @contextmanager
-    def transaction(self):
-        with closing(sqlite3.connect(str(self.path), timeout=30, isolation_level=None)) as conn:
+    def transaction(self, *, timeout: float = 30):
+        with closing(sqlite3.connect(str(self.path), timeout=timeout, isolation_level=None)) as conn:
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -131,9 +130,12 @@ class AdmissionStore:
                 conn.rollback()
                 raise
 
-    def acquire(self, owner: int, *, expected_epoch: int | None = None) -> LeaseTicket:
+    def acquire(self, owner: int, *, expected_epoch: int | None = None,
+                authorize=None, timeout: float = 30) -> LeaseTicket:
         owner = int(owner)
-        with self.transaction() as conn:
+        with self.transaction(timeout=timeout) as conn:
+            if authorize is not None:
+                authorize(conn)
             row = conn.execute(
                 "SELECT a.epoch FROM users u JOIN account_admission a ON a.owner=u.user_id "
                 "WHERE u.user_id=? AND u.active=1 AND a.deleting=0 AND a.claim_token IS NULL",
@@ -206,9 +208,11 @@ class AdmissionStore:
         with self.transaction() as conn:
             return self._close(conn, int(owner))
 
-    def claim_deletion(self, owner: int) -> DeletionClaim | None:
+    def claim_deletion(self, owner: int, *, authorize=None, timeout: float = 30) -> DeletionClaim | None:
         owner = int(owner)
-        with self.transaction() as conn:
+        with self.transaction(timeout=timeout) as conn:
+            if authorize is not None:
+                authorize(conn)
             user = conn.execute("SELECT role FROM users WHERE user_id=?", (owner,)).fetchone()
             if not user or user[0] == "admin":
                 return None

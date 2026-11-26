@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from citrus_refcheck.providers import normalize_doi
 
+from .intake_progress import project_progress
+from .pointers import read_pointer
 from .prepare import public_text
 
 
@@ -90,37 +92,44 @@ class IntakeQueue:
             daily = conn.execute("SELECT count(*) FROM intake WHERE created>?", (now - 86400,)).fetchone()[0]
             if pending >= MAX_PENDING or daily >= MAX_JOBS_PER_DAY:
                 raise ValueError("corpus_queue_full")
+            archived_sha256 = None
             if persist is not None:
                 persist()
+                archived_sha256 = expected_sha256
             if existing:
-                conn.execute("""UPDATE intake SET actor=?, request=?, identity=?, expected_sha256=?, raw_sha256=NULL,
+                conn.execute("""UPDATE intake SET actor=?, request=?, identity=?, expected_sha256=?, raw_sha256=?,
                              document_id=NULL, version_id=NULL, state=?, created=?, updated=?,
                              not_before=?, attempts=0, lease=NULL, lease_until=NULL, error=NULL WHERE id=?""",
-                             (actor, payload, identity, expected_sha256, pending_state, now, now, now, existing["id"]))
+                             (actor, payload, identity, expected_sha256, archived_sha256, pending_state,
+                              now, now, now, existing["id"]))
                 job_id = existing["id"]
             else:
                 job_id = uuid4().hex
                 conn.execute("""INSERT INTO intake
-                             (id,fingerprint,identity,request,actor,state,expected_sha256,created,updated,not_before)
-                             VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                             (job_id, fingerprint, identity, payload, actor, pending_state, expected_sha256, now, now, now))
+                             (id,fingerprint,identity,request,actor,state,expected_sha256,raw_sha256,created,updated,not_before)
+                             VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                             (job_id, fingerprint, identity, payload, actor, pending_state, expected_sha256,
+                              archived_sha256, now, now, now))
             return self._view(conn.execute("SELECT * FROM intake WHERE id=?", (job_id,)).fetchone())
 
     def claim(self, *, network=False, automatic=False):
         now = self.now()
+        automatic = int(automatic)
         with self.store.write() as conn:
             conn.execute("""UPDATE intake SET state='expired', lease=NULL, lease_until=NULL, updated=?, error='intake_expired'
-                         WHERE created<=? AND (state IN ('queued','automatic_queued') OR (state IN ('leased','automatic_leased') AND lease_until<=?))""",
-                         (now, now - JOB_TTL, now))
+                         WHERE created<=? AND (state='queued' OR (state='leased' AND lease_until<=?)
+                         OR (? AND (state='automatic_queued' OR (state='automatic_leased' AND lease_until<=?))))""",
+                         (now, now - JOB_TTL, now, automatic, now))
             conn.execute("""UPDATE intake SET state='failed', lease=NULL, lease_until=NULL, updated=?, error='lease_exhausted'
-                         WHERE state IN ('leased','automatic_leased') AND lease_until<=? AND attempts>=?""", (now, now, MAX_ATTEMPTS))
+                         WHERE (state='leased' OR (? AND state='automatic_leased')) AND lease_until<=? AND attempts>=?""",
+                         (now, automatic, now, MAX_ATTEMPTS))
             row = conn.execute("""SELECT * FROM intake WHERE ((state IN ('queued','automatic_queued') AND not_before<=?)
                          OR (state IN ('leased','automatic_leased') AND lease_until<=?))
                          AND (? OR json_extract(request, '$.kind') <> 'explicit')
                          AND (? OR state NOT IN ('automatic_queued','automatic_leased'))
                          ORDER BY CASE WHEN json_extract(request, '$.kind')='automatic'
                             AND json_extract(request, '$.path')='foreground' THEN 0 ELSE 1 END,
-                            created,id LIMIT 1""", (now, now, int(network), int(automatic))).fetchone()
+                            created,id LIMIT 1""", (now, now, int(network), automatic)).fetchone()
             if row is None:
                 return None
             token = uuid4().hex
@@ -142,20 +151,17 @@ class IntakeQueue:
                      WHERE id=?""", (identity, json.dumps(request, ensure_ascii=False), digest, digest, job["id"]))
         return {**job, "identity": identity, "request": request, "expected_sha256": digest}
 
-    def recent(self, limit=30):
+    def recent(self, limit=30, *, retrieval_enabled=True, read_generation=None):
         if not 1 <= limit <= 100:
             raise ValueError("limit_out_of_range")
-        from .pointers import read_pointer
-
-        generation = read_pointer(self.store.root)
         with self.store.read() as conn:
+            conn.execute("BEGIN")
+            active = read_pointer(self.store.root)
             rows = conn.execute("""SELECT intake.*,v.rights FROM intake LEFT JOIN versions AS v
                                    USING(document_id,version_id) ORDER BY updated DESC,id LIMIT ?""", (limit,)).fetchall()
-            active = conn.execute("SELECT selection FROM publications WHERE generation=? AND published IS NOT NULL",
-                                  (generation,)).fetchone()
-        visible = {(row["document_id"], row["version_id"]) for row in json.loads(active[0])} if active else set()
-        return [{**self._view(row), "rights": row["rights"], "published": row["rights"] == "granted"
-                 and (row["document_id"], row["version_id"]) in visible} for row in rows]
+            retrieval = (read_generation or active) if retrieval_enabled else None
+            progress = project_progress(conn, rows, active=active, retrieval=retrieval)
+        return [{**self._view(row), **stages} for row, stages in zip(rows, progress, strict=True)]
 
     def remember_original(self, job, digest):
         with self.store.write(timeout=2) as conn:

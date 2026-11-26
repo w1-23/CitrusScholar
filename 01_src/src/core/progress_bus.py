@@ -397,7 +397,7 @@ _PROGRESS_REASONS = frozenset("""
     script_request_replayed service_restart some_material_unreviewed some_records_unverified stop_requested task_plan_updated
     tool_protocol_rejected tool_turn_limit user user_input_required verification_limit workspace_version_conflict
     write_requires_reconciliation browse_action_limit browse_bad_observation browse_bundle_integrity browse_click_timeout
-    browse_download_type_unsupported browse_download_unavailable browse_expected_download_link browse_host_not_allowed
+    browse_download_type_unsupported browse_download_unavailable browse_expected_download_link browse_host_not_allowed browse_dns_denied browse_peer_mismatch browse_method_denied
     browse_last_tab browse_network_error browse_network_timeout browse_not_authorized browse_observed browse_page_action_failed
     browse_page_unavailable browse_publication_digest_mismatch browse_queue_full browse_queue_timeout browse_renderer_disconnected
     browse_renderer_protocol browse_renderer_unready browse_retry_rejected browse_session_expired browse_stale_element
@@ -482,7 +482,11 @@ def public_tool_outcome(data: dict) -> dict:
                          (type(v) is float and math.isfinite(v)))} if isinstance(facts, dict) else {}
     status = public_tool_status(data.get("status"))
     reason_class = data.get("reason_class")
-    result = {"status": status, "reason_code": public_tool_reason(data.get("reason_code")),
+    reason = public_tool_reason(data.get("reason_code"))
+    if reason.startswith("browse_"):
+        from src.browse.relay import browse_reason_class
+        reason_class = browse_reason_class(reason) or reason_class
+    result = {"status": status, "reason_code": reason,
               "reason_class": reason_class if isinstance(reason_class, str) and reason_class in _REASON_CLASSES else "",
               "facts": numeric_facts}
     for key in ("result_refs", "artifacts"):
@@ -498,6 +502,7 @@ def _fields(data: dict, *, tokens=(), numbers=()) -> dict:
 
 PUBLIC_WORK_NOTES = {
     "agent_prepare": "正在准备本轮任务",
+    "agent_resume_prepare": "正在准备恢复本轮任务",
     "agent_model_wait": "已向模型发送请求，正在等待首批响应。",
     "agent_model_connected": "已收到模型的初步响应，仍在等待本次输出完成。",
     "agent_review_evidence": "已收到工具结果，正在结合已有资料继续处理。",
@@ -545,6 +550,9 @@ def public_progress_payload(event: str, data: dict) -> dict:
             return cursor
         category = data.get("category")
         origin = data.get("origin")
+        note_id = _token(data.get("note_id"), r"[A-Za-z0-9_:-]{1,160}")
+        if origin == "host" and category == "agent_prepare" and note_id.endswith(":resume-prepare"):
+            category = "agent_resume_prepare"
         label = PUBLIC_WORK_NOTES.get(category) if origin == "host" and isinstance(category, str) else None
         from src.core.public_progress import sanitize
         text = label or (sanitize(data.get("text")) if origin == "model" else "")
@@ -552,7 +560,7 @@ def public_progress_payload(event: str, data: dict) -> dict:
             return cursor
         public = _fields(data, tokens=("job_id", "note_id", "step_id"), numbers=("model_step",))
         # Note IDs include ':' in both graph and agent producers.
-        if note_id := _token(data.get("note_id"), r"[A-Za-z0-9_:-]{1,160}"):
+        if note_id:
             public["note_id"] = note_id
         call_ids = data.get("tool_call_ids")
         if label:

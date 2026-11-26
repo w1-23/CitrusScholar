@@ -363,6 +363,7 @@ def consume_fusion(identity, *, execution_id, skill_release, skill_id, content_s
                             or any(versions.get(name) != version for name, version in runtime["dependencies"].items())):
                         raise ValueError("fusion_worker_environment_receipt_mismatch")
                 return {**result, "inputs": inputs, "options": payload["options"], "report": report,
+                        "_account_epoch": request.account_epoch,
                         "_source_snapshot": {"identity": request.identity, "workspace_id": request.workspace_id,
                             "refs": tuple(snap for snap in request.inputs if snap.path.startswith(INPUT_ROOT)
                                           and snap.path != OBSERVATIONS)} if historical else None,

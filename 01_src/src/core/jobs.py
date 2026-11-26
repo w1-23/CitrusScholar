@@ -334,6 +334,52 @@ def update_job(job_id: str, *, force: bool = False, **fields) -> bool:
         return False
 
 
+def _session_owned(conn, session_id: str | None, owner: int) -> bool:
+    return bool(session_id and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone()
+        and conn.execute("SELECT 1 FROM sessions WHERE session_id=? AND owner_user_id=?",
+                         (session_id, owner)).fetchone())
+
+
+def list_cancel_candidates(session_id: str, owner: int) -> list[str] | None:
+    """List exact candidates. None represents an absent or foreign session."""
+    with read_transaction() as conn:
+        if not _session_owned(conn, session_id, owner):
+            return None
+        return [row[0] for row in conn.execute(
+            "SELECT job_id FROM task_jobs WHERE session_id=? AND (owner_user_id=? OR owner_user_id IS NULL) "
+            "AND status IN ('running','detached','cancel_requested') ORDER BY created_at DESC LIMIT 20",
+            (session_id, owner))]
+
+
+def request_cancel_owned(job_id: str, owner: int, *, session_id: str | None = None) -> dict | None:
+    """Validate exact ownership and record one stop request in one transaction."""
+    uri = Path(_DB_PATH).resolve().as_uri() + "?mode=rw"
+    with closing(sqlite3.connect(uri, uri=True, timeout=0.15)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        job = read_job(job_id, conn=conn)
+        if not job or (session_id is not None and session_id != job["session_id"]):
+            return None
+        explicit_owner = job["owner_user_id"]
+        if explicit_owner is not None and explicit_owner != owner:
+            return None
+        if (explicit_owner is None or session_id is not None) and not _session_owned(conn, job["session_id"], owner):
+            return None
+        previous = job["status"]
+        accepted = _request_cancel_transition(conn, job_id, "user")
+        return {"previous_status": previous, "accepted": accepted,
+                "status": "cancel_requested" if accepted else previous,
+                "stop_reason": "user" if accepted else str(job["stop_reason"] or "")}
+
+
+def _request_cancel_transition(conn, job_id: str, reason: str) -> bool:
+    now = datetime.now().isoformat()
+    return bool(conn.execute(
+        "UPDATE task_jobs SET status='cancel_requested',cancel_requested_at=?,stop_reason=?,updated_at=? "
+        "WHERE job_id=? AND status IN ('running','detached')", (now, reason, now, job_id)).rowcount)
+
+
 def request_cancel(job_id: str, reason: str = "user") -> bool:
     """标记"已收到停止请求"。只从 running/detached 迁入，绝不写终态。
 
@@ -342,18 +388,9 @@ def request_cancel(job_id: str, reason: str = "user") -> bool:
     """
     if not job_id:
         return False
-    now = datetime.now().isoformat()
     try:
-        with _write_lock:
-            with _connect() as conn:
-                cur = conn.execute(
-                    "UPDATE task_jobs SET status='cancel_requested', "
-                    "cancel_requested_at=?, stop_reason=?, updated_at=? "
-                    "WHERE job_id=? AND status IN ('running','detached')",
-                    (now, reason, now, job_id),
-                )
-                conn.commit()
-                return bool(cur.rowcount)
+        with _write_lock, closing(_connect()) as conn, conn:
+            return _request_cancel_transition(conn, job_id, reason)
     except Exception as e:
         logger.warning(f"[Jobs] request_cancel failed: {e}")
         return False
@@ -595,15 +632,9 @@ def claim_agent_recovery(identity, *, answered: bool = False, account_epoch=None
 
 def get_job(job_id: str) -> Optional[dict]:
     try:
-        with _connect() as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT * FROM task_jobs WHERE job_id=?",
-                               (job_id,)).fetchone()
-            if row is None:
-                return None
-            return dict(row)
-    except Exception as e:
-        logger.warning(f"[Jobs] get_job failed: {e}")
+        return read_job(job_id)
+    except sqlite3.Error as exc:
+        logger.warning("[Jobs] get_job failed: %s", type(exc).__name__)
         return None
 
 
@@ -700,7 +731,7 @@ def sessions_with_jobs(session_ids: list[str], owner_user_id: int, *,
     if not keys:
         return set()
     result = set()
-    with closing(_connect()) as conn:
+    with read_transaction() as conn:
         for start in range(0, len(keys), 500):
             batch = keys[start:start + 500]
             placeholders = ",".join("?" for _ in batch)
@@ -762,8 +793,7 @@ def jobs_for_turns(session_id: str, owner_user_id: int, request_ids: list[str], 
     if not keys:
         return {}
     placeholders = ",".join("?" for _ in keys)
-    with closing(_connect()) as conn:
-        conn.row_factory = sqlite3.Row
+    with read_transaction() as conn:
         rows = [dict(r) for r in conn.execute(
             f"SELECT * FROM task_jobs WHERE session_id=? AND owner_user_id=? AND "
             f"(client_request_id IN ({placeholders}) OR request_id IN ({placeholders}))"

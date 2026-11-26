@@ -498,10 +498,11 @@ def test_awaiting_input_survives_restart_and_child_resolves_to_parent_turn():
     with pytest.raises(turn_queue.TurnStateConflict):
         _awaiting(loaded, child="child-b")
 
-    with pytest.raises(turn_queue.TurnStateConflict, match="continuation_child_conflict"):
-        turn_queue.resume_continuation(owner_user_id=1, session_id="s1", client_request_id="a",
-            generation=loaded["generation"], active_child_job_id="child-a", deadline=float("inf"))
-    assert turn_queue.get_turn(owner_user_id=1, session_id="s1", client_request_id="a")["generation"] == loaded["generation"]
+    with turn_queue._transaction() as conn:
+        job = {"job_id": loaded["job_id"]}
+        fence = {key: loaded[key] for key in ("owner_user_id", "session_id", "client_request_id", "generation")}
+        with pytest.raises(turn_queue.TurnStateConflict, match="question_queue_conflict"):
+            turn_queue._resume_question(conn, job, account_epoch=loaded["account_epoch"], fence=fence)
 
 
 def test_settling_and_terminal_require_generation_history_and_cleanup():

@@ -61,21 +61,6 @@ async def load_session_context(state: AgentState) -> dict:
             log_prefix="GeneralAgent",
             load_evidence=not capability_policy.history_key and capability_policy.allows("local_rag"),
         )
-        # A durable answer carries newer working refs than a possibly interrupted
-        # parent session save. Keep that host-owned state across context loading.
-        if (ctx.history_scope_authorized and state.get("continuation_context")
-                and capability_policy.history_key == (state.get("context_working_state") or {}).get("capability_history", "")):
-            carried = state.get("context_working_state") or {}
-            working = dict(result.get("context_working_state") or {})
-            for key in ("dataset_refs", "source_refs", "script_refs", "run_refs"):
-                merged = list(working.get(key) or [])
-                for ref in carried.get(key) or []:
-                    if ref not in merged:
-                        merged.append(ref)
-                working[key] = merged
-            working.update({key: value for key, value in carried.items()
-                            if key not in {"dataset_refs", "source_refs", "script_refs", "run_refs"}})
-            result["context_working_state"] = working
         if ctx.history_load_reason:
             notices = {
                 "legacy_checkpoint_untrusted": "旧摘要无法验证，本轮使用仍可读取的原始对话。",

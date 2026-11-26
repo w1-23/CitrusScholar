@@ -537,25 +537,22 @@ async def account_auth_guard(request: Request, call_next):
                 and not path.startswith(("/jobs/", "/sessions/")))):
         return await call_next(request)
 
-    from src.auth import user_for_token, user_for_token_readonly, require_admin as is_admin
+    from src.auth import user_for_deletion_retry, user_for_token_readonly, require_admin as is_admin
     token = request.cookies.get("citrus_auth", "")
     turn_read = request.method == "GET" and bool(re.fullmatch(
         r"/(?:api/v2/session/[^/]+/(?:turn-queue|task-by-request/[^/]+)|sessions/[^/]+/jobs)", path))
     task_read = request.method == "GET" and bool(re.fullmatch(
         r"/jobs/[^/]+(?:/events|/operations/[^/]+/result)?", path))
-    protocol_read = request.method == "GET" and bool(re.fullmatch(
-        r"/(?:api/tasks/[^/]+/questions|api/v2/chat/jobs/[^/]+/(?:questions|updates/[^/]+))", path))
-    if task_read or turn_read or protocol_read:
-        try:
-            user = await _bounded_task_read(lambda: user_for_token_readonly(token))
-        except HTTPException as exc:
-            # Exceptions raised by HTTP middleware bypass endpoint handlers.
-            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
-    else:
-        user = await asyncio.to_thread(user_for_token, token)
-    if not user and path == "/api/v2/auth/account" and request.method == "DELETE":
-        from src.auth import user_for_deletion_retry
-        user = await asyncio.to_thread(user_for_deletion_retry, token)
+    deletion_only = path == "/api/v2/auth/account" and request.method == "DELETE"
+
+    def lookup_user():
+        return user_for_token_readonly(token) or (user_for_deletion_retry(token) if deletion_only else None)
+
+    try:
+        user = await _bounded_task_read(lookup_user)
+    except HTTPException as exc:
+        # Middleware exceptions bypass endpoint handlers.
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
     if not user:
         return JSONResponse({"detail": "请先登录。"}, status_code=401)
     request.state.user = user
@@ -595,13 +592,17 @@ async def account_auth_guard(request: Request, call_next):
                 return JSONResponse({"detail": "任务不存在或无权访问。"}, status_code=404)
 
     if request.method not in {"GET", "HEAD", "OPTIONS"} and path != "/api/v2/auth/account":
-        from src.core.account_leases import AccountUnavailable, account_lease
+        from src.core.account_leases import AccountUnavailable, async_account_lease
         try:
-            with account_lease(int(user["user_id"])):
+            async with async_account_lease(int(user["user_id"]), token=token):
                 return await call_next(request)
         except AccountUnavailable:
             return JSONResponse({"code": "account_closed", "detail": "账户已停用或正在删除。"},
                                 status_code=409)
+        except sqlite3.OperationalError:
+            unavailable = _account_store_unavailable()
+            return JSONResponse({"detail": unavailable.detail}, status_code=unavailable.status_code,
+                                headers=unavailable.headers)
     return await call_next(request)
 
 
@@ -618,51 +619,39 @@ _pending_graph_starts: set[str] = set()
 from src.core.chat_capacity import chat_capacity
 
 
-def _cancel_one_job(job_id: str) -> dict:
-    """S1 的核心契约：对单个 job 发停止请求（幂等）。
+def _account_store_unavailable():
+    return HTTPException(status_code=503, detail={"code": "account_store_unavailable"},
+                         headers={"Retry-After": "1", "Cache-Control": "no-store"})
 
-    * 已终态        → accepted=False, status 不变（不把完成任务改成 cancelled）
-    * cancel_requested → accepted=False（重复点击不重复清理），但仍补发信号
-    * running/detached → request_cancel() + 令牌置位 + task.cancel()；
-      若本进程没有该 task，则只停在 cancel_requested，**不伪称已终止**
-    """
+
+async def _cancel_one_job(job_id: str, owner: int, *, session_id: str | None = None) -> dict | None:
+    """Signal the worker only after the owner-bound stop is durably recorded."""
     from src.core import jobs as jobs_mod
 
-    job = jobs_mod.get_job(job_id) or {}
-    previous = str(job.get("status") or "")
-    if not previous:
-        return {"job_id": job_id, "previous_status": "", "status": "",
-                "accepted": False, "target": "none", "stop_reason": "",
-                "note": "not_found"}
-    if previous in jobs_mod.TERMINAL_STATUS:
-        return {"job_id": job_id, "previous_status": previous, "status": previous,
-                "accepted": False, "target": "none",
-                "stop_reason": str(job.get("stop_reason") or ""),
-                "note": "already_finished"}
+    try:
+        receipt = await asyncio.to_thread(jobs_mod.request_cancel_owned, job_id, owner, session_id=session_id)
+    except sqlite3.OperationalError as exc:
+        raise HTTPException(status_code=503, detail={"code": "task_store_unavailable"},
+                            headers={"Retry-After": "1", "Cache-Control": "no-store"}) from exc
+    if receipt is None:
+        return None
+    result = {"job_id": job_id, **receipt, "target": "none", "note": ""}
+    if result["status"] != "cancel_requested":
+        result["note"] = "already_finished" if result["status"] in jobs_mod.TERMINAL_STATUS else "not_cancelable"
+        return result
 
-    already = previous == "cancel_requested"
-    accepted = bool(jobs_mod.request_cancel(job_id, "user")) and not already
-
+    result["target"] = "not_in_this_process"
+    if not result["accepted"]:
+        result["note"] = "already_requested"
     token = _job_tokens.get(job_id)
     if token is not None:
         token.cancel("user")
     task = _running_graph_tasks.get(job_id)
-    target = "not_in_this_process"
     if task is not None and not task.done():
-        target = "in_process"
+        result["target"] = "in_process"
         if job_id not in _pending_graph_starts and not task.cancelling():
             task.cancel()
-
-    current = jobs_mod.get_job(job_id) or {}
-    return {
-        "job_id": job_id,
-        "previous_status": previous,
-        "status": str(current.get("status") or "cancel_requested"),
-        "accepted": accepted,
-        "target": target,
-        "stop_reason": "user",
-        "note": "already_requested" if already else "",
-    }
+    return result
 
 
 def _stop_marker_messages(query: str, stop_text: str, done_steps: list) -> list:
@@ -1099,11 +1088,7 @@ async def recover_account_password(req: RecoverRequest, request: Request):
 
 @app.get("/api/v2/auth/me")
 async def current_account(request: Request):
-    from src.auth import user_for_token
-    user = await asyncio.to_thread(user_for_token, request.cookies.get("citrus_auth", ""))
-    if not user:
-        raise HTTPException(status_code=401, detail="尚未登录。")
-    return {"user": user}
+    return {"user": current_user(request)}
 
 
 @app.get("/api/v2/auth/memory")
@@ -1209,21 +1194,23 @@ async def complete_account_onboarding(request: Request):
 
 @app.delete("/api/v2/auth/account")
 async def delete_account(req: AccountDeleteRequest, request: Request, response: Response):
-    from src.auth import delete_user_account, logout, verify_password, retain_deletion_retry
+    from src.auth import delete_user_account_reauthenticated
+    from src.auth_invites import AccountInviteError
     from src.core.account_leases import AccountDeletionPending
+
     user = current_user(request)
     if user.get("role") == "admin":
         raise HTTPException(status_code=400, detail="管理员账号不能自行删除。")
-    # Inactive identities reach only this route through the deletion-only token
-    # lookup. The original password is still required for every retry.
-    if not await asyncio.to_thread(verify_password, user["user_id"], req.password,
-                                   allow_disabled=True):
-        raise HTTPException(status_code=401, detail="密码不正确。")
-    await asyncio.to_thread(retain_deletion_retry,
-                            request.cookies.get("citrus_auth", ""), user["user_id"])
     try:
-        deleted = await asyncio.to_thread(delete_user_account, user["user_id"],
-                                          raise_if_busy=True)
+        deleted = await asyncio.to_thread(
+            delete_user_account_reauthenticated, user["user_id"], req.password,
+            token=request.cookies.get("citrus_auth", ""), raise_if_busy=True)
+    except AccountInviteError as exc:
+        if exc.code == "reauthentication_required":
+            return JSONResponse({"code": exc.code, "detail": "密码不正确或会话已失效。"}, status_code=401)
+        return _account_error(exc)
+    except sqlite3.OperationalError as exc:
+        raise _account_store_unavailable() from exc
     except AccountDeletionPending:
         return JSONResponse(
             {"status": "deletion_pending", "code": "account_work_in_flight",
@@ -1234,16 +1221,23 @@ async def delete_account(req: AccountDeleteRequest, request: Request, response: 
             {"status": "deletion_failed", "code": "account_cleanup_failed",
              "detail": "账户清理尚未完成，可稍后重试或联系管理员。"},
             status_code=503, headers={"Retry-After": "2"})
-    await asyncio.to_thread(logout, request.cookies.get("citrus_auth", ""))
-    response.delete_cookie("citrus_auth", path="/", httponly=True, samesite="lax")
+    response.delete_cookie("citrus_auth", path="/", httponly=True, samesite="lax",
+                           secure=_auth_cookie_secure(request))
     return {"status": "deleted"}
 
 
 @app.get("/api/v2/admin/users")
 async def admin_list_users(request: Request):
     from src.auth import list_users
-    require_admin(request)
-    return {"users": await asyncio.to_thread(list_users)}
+    from src.auth_invites import AccountInviteError
+
+    admin = require_admin(request)
+    try:
+        users = await _bounded_task_read(lambda: list_users(
+            actor_user_id=int(admin["user_id"]), actor_token=request.cookies.get("citrus_auth", "")))
+    except AccountInviteError as exc:
+        return _account_error(exc)
+    return {"users": users}
 
 
 def _admin_page(request: Request) -> tuple[int, int]:
@@ -1252,7 +1246,7 @@ def _admin_page(request: Request) -> tuple[int, int]:
         offset = int(request.query_params.get("offset", "0"))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="分页参数无效。")
-    if not 1 <= limit <= 100 or offset < 0:
+    if not 1 <= limit <= 100 or not 0 <= offset < 2**63:
         raise HTTPException(status_code=400, detail="分页参数无效。")
     return limit, offset
 
@@ -1260,12 +1254,19 @@ def _admin_page(request: Request) -> tuple[int, int]:
 @app.get("/api/v2/admin/applications")
 async def admin_list_applications(request: Request):
     from src.auth import list_applications
-    require_admin(request)
+    from src.auth_invites import AccountInviteError
+
+    admin = require_admin(request)
     status = str(request.query_params.get("status", "pending") or "pending")
     if status not in {"pending", "approved", "rejected"}:
         raise HTTPException(status_code=400, detail="申请状态无效。")
     limit, offset = _admin_page(request)
-    rows = await asyncio.to_thread(list_applications, status=status, limit=limit, offset=offset)
+    try:
+        rows = await _bounded_task_read(lambda: list_applications(
+            status=status, limit=limit, offset=offset, actor_user_id=int(admin["user_id"]),
+            actor_token=request.cookies.get("citrus_auth", "")))
+    except AccountInviteError as exc:
+        return _account_error(exc)
     return _page_result("applications", rows, limit, offset)
 
 
@@ -1327,9 +1328,16 @@ async def admin_reject_application(application_id: str, request: Request):
 @app.get("/api/v2/admin/invites")
 async def admin_list_invites(request: Request):
     from src.auth import list_invites
-    require_admin(request)
+    from src.auth_invites import AccountInviteError
+
+    admin = require_admin(request)
     limit, offset = _admin_page(request)
-    rows = await asyncio.to_thread(list_invites, limit=limit, offset=offset)
+    try:
+        rows = await _bounded_task_read(lambda: list_invites(
+            limit=limit, offset=offset, actor_user_id=int(admin["user_id"]),
+            actor_token=request.cookies.get("citrus_auth", "")))
+    except AccountInviteError as exc:
+        return _account_error(exc)
     return _page_result("invites", rows, limit, offset)
 
 
@@ -1362,9 +1370,19 @@ async def admin_revoke_invite(invite_id: str, request: Request):
 @app.get("/api/v2/admin/requests")
 async def admin_list_request_audit(request: Request, limit: int = 50, offset: int = 0,
                                    user_id: int | None = None, q: str = ""):
-    require_admin(request)
     from src.admin_audit import list_requests
-    return list_requests(limit=limit, offset=offset, user_id=user_id, query=q)
+    from src.auth_invites import AccountInviteError
+
+    admin = require_admin(request)
+    if user_id is not None and not 0 < user_id < 2**63:
+        raise HTTPException(status_code=400, detail="账号参数无效。")
+    try:
+        payload = await _bounded_task_read(lambda: list_requests(
+            limit=limit, offset=offset, user_id=user_id, query=q,
+            actor_user_id=int(admin["user_id"]), actor_token=request.cookies.get("citrus_auth", "")))
+    except AccountInviteError as exc:
+        return _account_error(exc)
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/v2/admin/queue")
@@ -1440,8 +1458,16 @@ async def admin_set_user_active(user_id: int, req: AccountActiveRequest, request
 @app.put("/api/v2/admin/users/{user_id}/daily-limit")
 async def admin_set_user_limit(user_id: int, req: AccountLimitRequest, request: Request):
     from src.auth import set_user_daily_limit
-    require_admin(request)
-    if not set_user_daily_limit(user_id, req.daily_limit):
+    from src.auth_invites import AccountInviteError
+
+    admin = require_admin(request)
+    try:
+        updated = await asyncio.to_thread(set_user_daily_limit, user_id, req.daily_limit,
+                                          actor_user_id=int(admin["user_id"]),
+                                          actor_token=request.cookies.get("citrus_auth", ""))
+    except AccountInviteError as exc:
+        return _account_error(exc)
+    if not updated:
         raise HTTPException(status_code=404, detail="用户不存在。")
     return {"status": "ok", "daily_limit": req.daily_limit}
 
@@ -2356,6 +2382,7 @@ def _reconcile_startup_wait(job):
     from src.agent.recovery import load_recovery_state
     from src.config import get_deepseek_model
     from src.core.account_leases import acquire_account_lease, run_account_async
+    from src.core import user_questions
     from src.core.task_events import TaskConflict
 
     identity = ExecutionIdentity(job["owner_user_id"], job["session_id"], job["request_id"], job["job_id"])
@@ -2363,15 +2390,26 @@ def _reconcile_startup_wait(job):
     snapshot = segments.snapshot()
     root = PROJECT_ROOT / "state"
     lease = acquire_account_lease(identity.owner_user_id, expected_epoch=snapshot["account_epoch"])
-    async def read_state(wait):
+    async def read_state(wait, question=None):
         return await run_account_async(lease, load_recovery_state(root, identity,
-            (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()),
-            execution_wait=wait, discover_execution_wait=wait is None))
+            (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()), execution_wait=wait,
+            discover_execution_wait=wait is None and question is None, question_resume=question))
 
     try:
         with execution_lock(root / "agent_locks", (identity.owner_user_id, identity.session_id)):
             try:
                 wait_ids = json.loads(snapshot["wait_ids"])
+                if snapshot["checkpoint_ref"] and not wait_ids:
+                    try:
+                        question = user_questions.question_resume(identity, active=True)
+                        asyncio.run(read_state(None, question))
+                    except TaskConflict:
+                        # The turn may have passed the user-input barrier and
+                        # reached a later Worker wait. Recheck the protected head.
+                        pass
+                    else:
+                        segments.classify_restart_wait(snapshot, question_resume=True)
+                        return "awaiting_input"
                 wait = {"checkpoint_ref": snapshot["checkpoint_ref"], "wait_ids": wait_ids} if wait_ids else None
                 state = asyncio.run(read_state(wait))
                 segments.classify_restart_wait(snapshot, execution_wait=wait or state["agent_recovery_execution_wait"])
@@ -2490,7 +2528,7 @@ async def _consume_chat_turns(wake: asyncio.Event, *, health=None):
         if activity is not None:
             activity.leave("J")
         if not worker.cancelled() and (error := worker.exception()) is not None:
-            logger.warning("Turn queue worker failed: %s", type(error).__name__, exc_info=error)
+            logger.warning("Turn queue worker failed: %s", type(error).__name__)
         wake.set()
 
     try:
@@ -2561,7 +2599,7 @@ async def _consume_chat_turns(wake: asyncio.Event, *, health=None):
         await asyncio.gather(*active_workers, return_exceptions=True)
 
 
-async def _advance_question_turn(turn: dict, action: str, child: str):
+async def _advance_question_turn(turn: dict, action: str, resume_job_id: str):
     from src.auth import user_by_id
     from src.core import chat_turn_queue as queue, jobs, user_questions
     from src.core.account_leases import AccountUnavailable
@@ -2581,7 +2619,7 @@ async def _advance_question_turn(turn: dict, action: str, child: str):
                 owner_user_id=owner, session_id=sid)
         except user_questions.QuestionConflict:
             latest = ("unknown", "")
-        action, child = latest
+        action, resume_job_id = latest
         if action in {"pending", "expire"}:
             return
         if action == "dispatch":
@@ -2589,7 +2627,7 @@ async def _advance_question_turn(turn: dict, action: str, child: str):
                 user = user_by_id(owner)
                 if not user or not user.get("active"):
                     raise AccountUnavailable("account_closed")
-                worker = await _dispatch_question_child(child, user, queued_turn=current)
+                worker = await _dispatch_question_resume(resume_job_id, user, queued_turn=current)
             except (OverflowError, TimeoutError, queue.TurnQueueNotReady):
                 return  # No dispatch intent was committed in these paths.
             except (AccountUnavailable, HTTPException, ValueError, user_questions.QuestionConflict):
@@ -2598,7 +2636,7 @@ async def _advance_question_turn(turn: dict, action: str, child: str):
                 if latest and latest["state"] == queue.AWAITING_INPUT:
                     queue.mark_reconcile_required(**_turn_fence(latest), reason="turn_continuation_unavailable")
                 return
-        elif action in {"question_cancelled", "question_expired"}:
+        elif action in {"question_cancelled", "question_expired", "legacy_question_settled"}:
             job = _turn_job(current)
             snapshot = jobs.decode_terminal_snapshot(job) or {}
             if job.get("status") != "awaiting_input" or not snapshot:
@@ -2802,7 +2840,7 @@ def _existing_chat_response(job: dict) -> JSONResponse:
 async def _start_claimed_chat(req: ChatRequest, request_lease,
                               user: dict, sid: str, rid: str, job_id: str,
                               cancel_token, ref_infos: list, queued_attachment_bytes: int,
-                              *, continuation_state: dict | None = None, quota_reserved: bool = True,
+                              *, quota_reserved: bool = True,
                               recovery_state: dict | None = None, recovery_cursor: int = 0,
                               execution_segment_claim=None, observe: bool = True,
                               capacity_acquired: bool = False, skill_release_pin: dict | None = None):
@@ -2813,7 +2851,7 @@ async def _start_claimed_chat(req: ChatRequest, request_lease,
     try:
         return await _prepare_claimed_chat(req, request_lease, user, sid, rid,
             job_id, cancel_token, ref_infos, queued_attachment_bytes,
-            continuation_state=continuation_state, quota_reserved=quota_reserved,
+            quota_reserved=quota_reserved,
             recovery_state=recovery_state, recovery_cursor=recovery_cursor,
             execution_segment_claim=execution_segment_claim, observe=observe,
             capacity_acquired=capacity_acquired, skill_release_pin=skill_release_pin)
@@ -2838,7 +2876,7 @@ async def _start_claimed_chat(req: ChatRequest, request_lease,
 async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                 user: dict, sid: str, rid: str, job_id: str,
                                 cancel_token, ref_infos: list, queued_attachment_bytes: int,
-                                *, continuation_state: dict | None = None, quota_reserved: bool = True,
+                                *, quota_reserved: bool = True,
                                 recovery_state: dict | None = None, recovery_cursor: int = 0,
                                 execution_segment_claim=None, observe: bool = True,
                               capacity_acquired: bool = False, skill_release_pin: dict | None = None):
@@ -2882,7 +2920,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
     # persisting later (after capacity is granted) loses files on refresh or
     # when a queued request is cancelled.
     from src.session import files as session_files
-    queued_root = capacity_acquired and continuation_state is None
+    queued_root = capacity_acquired and recovery_state is None
     if recovery_state is None and not queued_root:
         uploaded_ids = await run_account_thread(
             request_lease, _register_session_files, req.attachments, sid,
@@ -2986,10 +3024,6 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
     # Web tools are always available to the Agent. It decides per question
     # whether searching is useful; legacy web_search_enabled=false is ignored.
     }
-    if continuation_state:
-        initial_state.update({key: value for key, value in continuation_state.items()
-                              if key in {"parent_job_id", "question_answer", "continuation_context",
-                                         "context_working_state", "no_replay"}})
     from src.core.tracing import set_web_search_enabled, set_original_query
     set_web_search_enabled(True)
     # v8.15.3d: 用户原始问题直传联网工具——deepseek_web_search 把原始问题原样交给
@@ -3003,7 +3037,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
     from src.core.task_events import init_budget
     import math
     request_deadline = float(initial_state["request_deadline"])
-    if not continuation_state and recovery_state is None:
+    if recovery_state is None:
         init_budget(job_id, (time.time() + max(0.0, request_deadline - time.monotonic())
                              if math.isfinite(request_deadline) else math.inf),
                     max_calls=int(settings.AGENT_MAX_MODEL_CALLS),
@@ -3021,6 +3055,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
     resume_released = False
     park_prepared = False
     code_cancel_pending = False
+    question_wake_deferred = False
 
     # S1 补（发布准入矩阵「SSE 断线」）：断线**不等于**取消。
     # 只在生成器里 catch CancelledError 是不够的——sse-starlette 3.4 在收到
@@ -3216,7 +3251,8 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                 await asyncio.sleep(0)
 
         async def process_graph():
-            nonlocal park_prepared
+            nonlocal park_prepared, question_wake_deferred
+            from src.agent.recovery import QuestionWakeDeferred
             from src.core.tracing import set_session_id, set_user_id, set_user_role
             set_session_id(sid)
             set_user_id(int(user["user_id"]))
@@ -3297,7 +3333,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                     "gen_time_ms": persisted_generation_ms or int((time.perf_counter() - t0) * 1000),
                                     "history_saved": bool(save_trace.get("history_saved")),
                                 }
-                                if not done_payload["history_saved"]:
+                                if not done_payload["history_saved"] and not waiting_for_input:
                                     done_payload["warning"] = "本轮回答已完成，但历史写入未确认；刷新后可能无法恢复。"
                                 # v8.3.7 M3: 假完成检测元数据（前端可提示"引用未检索支撑"）
                                 cit = agent_output.get("citation_info")
@@ -3484,8 +3520,12 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                              turn_status)
             except asyncio.CancelledError:
                 raise
+            except QuestionWakeDeferred:
+                question_wake_deferred = True
             except Exception as e:
-                logger.error("[SSE v2] graph processing error kind=%s", type(e).__name__)
+                from src.graph.diagnostics import graph_failure
+                logger.error("[SSE v2] graph processing error %s",
+                             graph_failure(e, graph="general_agent", request_id=rid, job_id=job_id))
                 model_unconfigured = not bool(settings.RESOLVED_MAIN_API_KEY)
                 safe_error = ("主模型尚未配置，请联系管理员配置模型后重试。附件仍可在资料库中查看。"
                               if model_unconfigured else "处理请求时发生内部错误，请稍后重试")
@@ -3799,11 +3839,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                 jobs_mod.update_job(job_id, current_step="starting",
                                     progress_summary="已进入处理队列，正在启动本轮请求")
                 check_cancelled()
-                if continuation_state or (recovery_state is not None and initial_state.get("continuation_context")):
-                    from src.core.user_questions import pin_continuation_inputs
-                    await run_account_thread(graph_lease, pin_continuation_inputs, job_id,
-                        owner_user_id=int(user["user_id"]), session_id=sid, lease=graph_lease)
-                elif recovery_state is None and not capacity_acquired:
+                if recovery_state is None and not capacity_acquired:
                     # A new request in the composer replaces unanswered choices;
                     # native question answers take the continuation branch above.
                     from src.core.user_questions import supersede_pending_questions
@@ -3906,12 +3942,15 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                     # A stop can arrive after inner cleanup unregisters the
                     # task. The coordinator must re-read execution settlement.
                     segments.release_cancel(segment_claim)
+                elif question_wake_deferred:
+                    await asyncio.to_thread(segments.repark_question, segment_claim)
+                    return
                 elif (park_prepared and not cancel_token.cancelled()
                         and job.get("status") in {"running", "detached"}
                         and not asyncio.current_task().cancelling()):
                     segments.release_park(segment_claim)
             if queue_turn is not None:
-                _settle_dispatched_turn(queue_turn, job_id)
+                await asyncio.to_thread(_settle_dispatched_turn, queue_turn, job_id)
 
         from src.core.chat_turn_queue import find_turn_by_job
         queue_turn = find_turn_by_job(owner_user_id=identity.owner_user_id, session_id=sid, job_id=job_id)
@@ -4092,76 +4131,82 @@ async def get_operation_result(job_id: str, operation_id: str, request: Request)
 from src.core.user_questions import QuestionAnswer as QuestionAnswerRequest
 
 
-async def _dispatch_question_child(child_job_id: str, user: dict, *, queued_turn=None):
-    """Start a legacy child, or claim a queue child only after old cleanup."""
+async def _dispatch_question_resume(job_id: str, user: dict, *, queued_turn=None):
+    """Admit an original native interrupt only after the old lease has drained."""
+    import math
+    from src.agent.execution_segments import ExecutionSegments
+    from src.agent.harness import execution_lock
+    from src.agent.identity import ExecutionIdentity
+    from src.agent.recovery import load_recovery_state
     from src.core import chat_turn_queue as queue, jobs, user_questions
-    from src.core.account_leases import acquire_account_lease
+    from src.core.account_leases import acquire_account_lease, run_account_async
     from src.core.cancel import CancelToken
     from src.graph.general_agent_graph import request_deadline_from_settings
-    import math
 
     async def defer_if_waiting(*_):
         raise OverflowError("turn_capacity_busy")
 
-    child = jobs.get_job(child_job_id)
-    if not child:
+    job = await asyncio.to_thread(jobs.get_job, job_id)
+    if not job or job["owner_user_id"] != int(user["user_id"]):
         raise HTTPException(status_code=404, detail="Job not found")
-    sid, owner = str(child["session_id"]), int(user["user_id"])
+    sid, owner = job["session_id"], job["owner_user_id"]
+    identity = ExecutionIdentity(owner, sid, job["request_id"], job_id)
     lease = acquire_account_lease(owner, expected_epoch=queued_turn["account_epoch"] if queued_turn else None)
-    claimed = acquired = False
-    fence = None
+    capacity_acquired = False
+    admission = None
     try:
-        if queued_turn is not None:
-            _require_active_turn_session(sid, user)
-        state = user_questions.get_continuation(child_job_id, owner_user_id=owner, session_id=sid)
-        context = state.get("continuation_context") or {}
-        refs = context.get("attachment_refs") or context.get("source_refs") or []
-        file_ids = list(dict.fromkeys(str(ref["file_id"]) for ref in refs
-                                    if isinstance(ref, dict) and ref.get("file_id")))
+        _require_active_turn_session(sid, user)
+        question = await asyncio.to_thread(user_questions.question_resume, identity)
+        transport = settings.model_transport()
+        root = PROJECT_ROOT / "state"
+        state = await run_account_async(lease, load_recovery_state(root, identity,
+            (transport.base_url, transport.model), question_resume=question))
+        refs = state.get("attachment_refs") or []
+        file_ids = [str(ref["file_id"]) for ref in refs]
         ref_infos = _validate_account_file_refs(file_ids, owner)
+        hashes = {ref["file_id"]: ref.get("sha256") for ref in refs}
+        if any(hashes.get(info["file_id"]) != info.get("sha256") for info in ref_infos):
+            raise user_questions.QuestionConflict("recovery_input_changed")
         byte_count = sum(int(info.get("size_bytes") or 0) for info in ref_infos)
-        req = ChatRequest(query=state["query"], session_id=sid,
-                          client_request_id=state["client_request_id"], file_refs=file_ids,
-                          visualization_enabled=state.get("visualization_enabled", False),
-                          browse_requested=state.get("browse_requested") is True,
-                          selected_skills=state.get("selected_skills") or [],
-                          context_compression=state.get("context_compression", True))
-        if queued_turn is not None:
-            await chat_capacity.acquire(on_wait=defer_if_waiting, owner_user_id=owner,
-                                        queued_payload_bytes=byte_count)
-            acquired = True
-            from src.core.account_leases import current_store, AccountUnavailable
-            if not current_store().check_epoch(owner, lease.epoch):
-                raise AccountUnavailable("account_authorization_changed")
+        req = ChatRequest(query=state["query"], session_id=sid, client_request_id=state["client_request_id"],
+            file_refs=file_ids, visualization_enabled=bool(state.get("visualization_enabled")),
+            browse_requested=state.get("browse_requested") is True,
+            selected_skills=state.get("selected_skills") or [],
+            context_compression=state.get("context_compression") is not False)
+        await chat_capacity.acquire(on_wait=defer_if_waiting, owner_user_id=owner, queued_payload_bytes=byte_count)
+        capacity_acquired = True
         deadline = request_deadline_from_settings()
         epoch_deadline = (time.time() + max(0.0, deadline - time.monotonic())
                           if math.isfinite(deadline) else math.inf)
-        if queued_turn is None:
-            claimed = user_questions.claim_child_dispatch(child_job_id, owner_user_id=owner,
-                session_id=sid, deadline=epoch_deadline)
-            if not claimed:
-                return False
-        else:
-            fence = queue.resume_continuation(**_turn_fence(queued_turn),
-                active_child_job_id=child_job_id, deadline=epoch_deadline)
-        token = _job_tokens[child_job_id] = CancelToken()
-        worker = await _start_claimed_chat(req, lease, user, sid,
-            state["request_id"], child_job_id, token, ref_infos, byte_count,
-            continuation_state=state, quota_reserved=False, observe=False, capacity_acquired=acquired)
-        acquired = False  # The retained worker owns the capacity slot now.
-        return worker if queued_turn is not None else True
-    except BaseException:
-        if child_job_id not in _running_graph_tasks:
-            if fence is not None:
-                queue.mark_reconcile_required(**_turn_fence(fence), reason="turn_continuation_dispatch_unconfirmed")
-                _job_tokens.pop(child_job_id, None)
-            elif claimed:
-                user_questions.release_child_dispatch(child_job_id, owner_user_id=owner, session_id=sid)
-                _job_tokens.pop(child_job_id, None)
-        raise
+        state["request_deadline"] = deadline
+        if _turn_execution_busy(job_id):
+            raise queue.TurnQueueNotReady("turn_cleanup_pending", job_id=job_id)
+        def claim_question():
+            with execution_lock(root / "agent_locks", (owner, sid)):
+                return ExecutionSegments(identity).claim_question_resume(account_epoch=lease.epoch,
+                    deadline=epoch_deadline, expected=question,
+                    fence=_turn_fence(queued_turn) if queued_turn else None)
+
+        # Finish the indivisible admission even if the HTTP observer disconnects.
+        claim_task = asyncio.create_task(asyncio.to_thread(claim_question))
+        try:
+            admission = await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            admission = await claim_task
+            await asyncio.to_thread(ExecutionSegments(identity).release_unstarted_resume, admission["claim"])
+            raise
+        token = _job_tokens[job_id] = CancelToken()
+        worker = await _start_claimed_chat(req, lease, user, sid, identity.user_turn_id, job_id,
+            token, ref_infos, byte_count, quota_reserved=False, recovery_state=state, observe=False,
+            recovery_cursor=admission["recovery_cursor"], execution_segment_claim=admission["claim"],
+            capacity_acquired=True)
+        capacity_acquired = False
+        return worker
     finally:
         lease.release()
-        if acquired:
+        if capacity_acquired:
+            if admission is not None and job_id not in _running_graph_tasks:
+                _job_tokens.pop(job_id, None)
             await chat_capacity.release(owner_user_id=owner)
 
 
@@ -4190,28 +4235,26 @@ async def answer_task_question(job_id: str, question_id: str, req: QuestionAnswe
     user = current_user(request)
     from src.core.chat_turn_queue import find_turn_by_job
     from src.core.user_questions import answer_question, QuestionConflict
-    turn = find_turn_by_job(owner_user_id=int(user["user_id"]), session_id=job["session_id"], job_id=job_id)
+    owner, sid = int(user["user_id"]), job["session_id"]
+    if job["owner_user_id"] != owner:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _require_active_turn_session(sid, user)
     try:
-        result = answer_question(job_id, question_id, owner_user_id=int(user["user_id"]),
-            session_id=job["session_id"], **req.model_dump())
+        result = await asyncio.to_thread(answer_question, job_id, question_id, owner_user_id=owner,
+                                         session_id=sid, **req.model_dump())
+        turn = await asyncio.to_thread(find_turn_by_job, owner_user_id=owner, session_id=sid, job_id=job_id)
+        result["dispatch_pending"] = bool(result["dispatch_required"])
         if turn is not None:
             wake = getattr(request.app.state, "turn_queue_wake", None)
             if wake is not None:
                 wake.set()
-            if result.get("dispatch_required"):
-                result["dispatch_pending"] = True
-                result["question"]["child_status"] = "queued"
-        elif result.get("dispatch_required"):
-            try:
-                result["dispatched"] = await _dispatch_question_child(result["child_job_id"], user)
-            except Exception as exc:
-                # The answer is already durable. Preserve it and expose a retry
-                # only while the dispatch fence still proves no execution began.
-                logger.warning("Question child scheduling failed: %s", type(exc).__name__)
-                result["dispatched"] = False
-            from src.core.jobs import get_job
-            child = get_job(result["child_job_id"]) or {}
-            result["question"]["child_status"] = child.get("status", "")
+        elif result["dispatch_required"]:
+            async with _turn_session_lock(sid):
+                try:
+                    await _dispatch_question_resume(job_id, user)
+                    result["dispatch_pending"] = False
+                except Exception as exc:
+                    logger.warning("Question resume scheduling deferred: %s", type(exc).__name__)
         return result
     except QuestionConflict as exc:
         code = str(exc)
@@ -4504,13 +4547,10 @@ async def cancel_chat_job(job_id: str, request: Request):
     与会话级 `/api/v2/chat/cancel` 的区别：同一会话里若有多个任务（例如上一
     轮仍在后台收尾），会话级会把它们一起停掉；这里只动 job_id 指向的那一个。
     """
-    from src.core import jobs as jobs_mod
-    job = jobs_mod.get_job(job_id)
-    if not job:
-        return {"status": "ok", "accepted": False, "job_id": job_id,
-                "note": "not_found", "stop_reason": "user"}
-    _require_owned_job(job, current_user(request))
-    result = _cancel_one_job(job_id)
+    owner = int(current_user(request)["user_id"])
+    result = await _cancel_one_job(job_id, owner)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     logger.info(
         f"[API] cancel job={job_id[:12]} prev={result['previous_status']} "
         f"now={result['status']} target={result['target']} accepted={result['accepted']}"
@@ -4532,19 +4572,17 @@ async def cancel_chat(req: CancelRequest, request: Request):
     `target` 告诉前端信号发到了哪里（本进程 / 不在本进程），前端据此诚实显示
     "已停止" 或 "停止请求已记录，服务端实例已不在，未确认终止"。
     """
-    require_owned_session(req.session_id, current_user(request))
     from src.core import jobs as jobs_mod
-    try:
-        jobs = jobs_mod.list_for_session(req.session_id, limit=20)
-    except Exception as e:
-        logger.warning(f"[API] cancel list jobs failed: {e}")
-        jobs = []
-    targets = [
-        j for j in jobs
-        if (j.get("job_id") or "")
-        and j.get("status") in jobs_mod.OPEN_STATUS
-    ]
-    results = [_cancel_one_job(j["job_id"]) for j in targets]
+
+    owner = int(current_user(request)["user_id"])
+    targets = await _bounded_task_read(lambda: jobs_mod.list_cancel_candidates(req.session_id, owner))
+    if targets is None:
+        raise HTTPException(status_code=404, detail="会话不存在或无权访问。")
+    results = []
+    for job_id in targets:
+        result = await _cancel_one_job(job_id, owner, session_id=req.session_id)
+        if result is not None:
+            results.append(result)
     accepted = [r for r in results if r.get("accepted")]
     for r in results:
         logger.info(
@@ -6156,7 +6194,7 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
     """Join saved turns and rediscover unsaved tasks by durable identities only."""
     from src.core import jobs
     from src.core.task_events import latest_context_snapshot, public_job_terminal, public_working_notes
-    from src.core.user_questions import list_questions, get_continuation
+    from src.core.user_questions import list_questions, question_history_input
     keys = [str(turn.get("turn_request_id") or "") for turn in turns]
     saved = {key for key in (saved_request_ids or []) if key}
     saved.update(key for key in keys if key)
@@ -6203,12 +6241,15 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
                 continue
             if is_saved(child):
                 continue
-            continuation = get_continuation(child_id, owner_user_id=owner, session_id=session_id)
+            reply = question.get("answer") or {}
+            selected = set(reply.get("selected_option_ids") or ())
+            labels = [option["label"] for option in question["options"] if option["id"] in selected]
+            content = "；".join(labels + ([reply["text"]] if reply.get("text") else []))
             key = str(child.get("client_request_id") or "")
             pending = _new_history_turn(key)
             pending.update(job_id=child_id, job_status=child["status"],
                 parent_job_id=job["job_id"], parent_question_id=question["id"],
-                user={"content": continuation["query"], "message_id": 0,
+                user={"content": content, "message_id": 0,
                       "request_id": key, "attachments": []},
                 terminal_snapshot=public_job_terminal(child), replay_cursor=0,
                 context_snapshot=latest_context_snapshot(child_id), history_pending=True)
@@ -6222,6 +6263,10 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
             key = str(job.get("client_request_id") or job.get("request_id") or job["job_id"])
             pending = _new_history_turn(key)
             attach(pending, job)
+            original = question_history_input(job["job_id"], owner_user_id=owner, session_id=session_id)
+            if original:
+                pending["user"] = {"content": original, "message_id": 0,
+                                   "request_id": key, "attachments": []}
             # The request body is not stored in task_jobs. Expose only factual
             # task metadata; a reconnect must never invent a user question.
             pending["history_pending"] = True

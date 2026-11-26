@@ -489,7 +489,7 @@ test('answer UI renders API-marked final chunks, honors reset, and accepts a ter
   assert.doesNotMatch(answer.textContent, /stale|private/);
 });
 
-test('only API-designated citations render as answer bubbles and never as duplicate Markdown links', async () => {
+test('verified citations render in one group and retain ordinary Markdown links', async () => {
   const b = browser();
   const html = readFileSync(join(__dirname, '../index.html'), 'utf8');
   const path = html.match(/<script src="([^"]*marked[^"]*)"/)[1];
@@ -517,7 +517,7 @@ test('only API-designated citations render as answer bubbles and never as duplic
   assert.equal(calls[0][0], local);
   assert.equal(calls[0][1].sessionId, 'session');
   assert.equal(calls[0][1].requestId, JSON.parse(posts(b)[0].opts.body).client_request_id);
-  assert.deepEqual(answer.querySelectorAll('a').map(link => link.getAttribute('href')), ['https://example.org/other']);
+  assert.deepEqual(answer.querySelectorAll('a').map(link => link.getAttribute('href')), ['https://example.org/cited#page', 'https://example.org/other']);
   assert.match(answer.textContent, /文献/);
   assert.equal(bot.querySelector('.cr-turn-sources'), null);
   assert.equal(b.requests.filter(r => r.url.includes('/turn-sources?')).length, 0);
@@ -546,7 +546,7 @@ test('restoring a stored answer projects only its persisted citations without ca
   b.respond('/turn-queue?limit=100', {turns: []});
   await restore;
   const bot = b.chatContainer.querySelector('.bot');
-  assert.equal(bot.querySelector('.turn-answer').textContent, '已核对 历史原文。');
+  assert.match(bot.querySelector('.turn-answer').textContent, /已核对 .*历史原文/);
   assert.equal(bot.querySelector('.turn-citation-bubble').href, source.url);
   assert.equal(bot.querySelectorAll('.turn-citation-bubble').length, 1);
   assert.equal(bot.querySelector('.cr-turn-sources'), null);

@@ -846,14 +846,17 @@ def test_auth_14_register_rate_limit_and_auth_24_deletion_retry_token(auth):
     public, token = auth.login("alice", "longpassword1")
 
     # AUTH-24: the retry token is scoped to deletion only and survives closing.
-    auth.retain_deletion_retry(token, public["user_id"])
-    assert auth.user_for_deletion_retry(token) is None  # still active
-    conn = _connect(auth.DB_PATH)
+    from src.core.account_leases import AccountDeletionPending, current_store
+
+    store = current_store()
+    lease = store.acquire(public["user_id"])
     try:
-        conn.execute("UPDATE users SET active=0 WHERE user_id=?", (public["user_id"],))
-        conn.execute("DELETE FROM browser_sessions WHERE user_id=?", (public["user_id"],))
+        assert auth.user_for_deletion_retry(token) is None
+        with pytest.raises(AccountDeletionPending):
+            auth.delete_user_account_reauthenticated(public["user_id"], "longpassword1",
+                                                    token=token, raise_if_busy=True)
     finally:
-        conn.close()
+        store.release(lease)
     assert auth.user_for_token(token) is None
     retry_user = auth.user_for_deletion_retry(token)
     assert retry_user is not None and retry_user["user_id"] == public["user_id"]

@@ -466,7 +466,7 @@ def create_svg_project(*, owner: Any, session_id: Any, svg: Any,
 
 def apply_svg_project_edits(*, figure_id: Any, owner: Any, edits: Any,
                             expected_revision: Any, session_id: Any = "",
-                            vendor_root: Any = None) -> dict[str, Any]:
+                            vendor_root: Any = None, workbench_edit_binding: dict | None = None) -> dict[str, Any]:
     """Apply supported edits and commit a new revision with product CAS."""
     owner = _valid_owner(owner)
     project = projects.get_for_owner(str(figure_id), owner)
@@ -529,6 +529,8 @@ def apply_svg_project_edits(*, figure_id: Any, owner: Any, edits: Any,
             "current_receipt_id": receipt.get("receipt_id"),
         },
     })
+    if workbench_edit_binding is not None:
+        manifest["workbench_edit_binding"] = workbench_edit_binding
     if isinstance(initial, dict):
         manifest["initial_svg_receipt"] = initial
         manifest["initial_qa_receipt"] = initial

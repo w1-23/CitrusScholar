@@ -15,6 +15,7 @@ class AgentState(TypedDict, total=False):
     image_attachments: list[dict]
     attachment_refs: list[dict]
     agent_resume: bool
+    agent_question_resume: dict
     agent_recovery_answered: bool
     context_compression: bool
     capability_snapshot: dict
@@ -28,12 +29,8 @@ class AgentState(TypedDict, total=False):
     request_started_at: float
     session_id: str
     job_id: str
-    parent_job_id: str
     awaiting_input: bool
     pending_question: dict
-    question_answer: dict
-    continuation_context: dict
-    no_replay: bool
     plot_intent: dict
     script_refs: list
     run_refs: list

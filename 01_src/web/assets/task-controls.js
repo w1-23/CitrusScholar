@@ -154,7 +154,7 @@
       var question = state.question;
       if (!question || !question.id) { host.hidden = true; return; }
       host.hidden = false;
-      var key = JSON.stringify([question.id, question.version, question.status, question.prompt, question.options, question.multi_select, question.allow_text, question.child_status]);
+      var key = JSON.stringify([question.id, question.version, question.status, question.prompt, question.options, question.multi_select, question.allow_text, question.child_status, question.interrupt_id]);
       if (key === signature) return;
       current = question;
       signature = key; busy = false; requestId = '';
@@ -163,11 +163,12 @@
       var prompt = document.createElement('p'); prompt.className = 'task-question-prompt'; prompt.textContent = String(question.prompt || '请选择后继续'); host.appendChild(prompt);
       var form = document.createElement('form'), choices = [], textInput = null;
       var pending = question.status === 'pending';
+      var ready = pending && !!question.interrupt_id;
       var retry = question.status === 'answered' && question.child_status === 'queued' && question.answer;
       (question.options || []).forEach(function (option) {
         var label = document.createElement('label'); label.className = 'task-question-option';
         var input = document.createElement('input'); input.type = question.multi_select ? 'checkbox' : 'radio';
-        input.name = 'question-' + question.id; input.value = String(option.id); input.disabled = !pending;
+        input.name = 'question-' + question.id; input.value = String(option.id); input.disabled = !ready;
         input.checked = (question.selected_option_ids || (question.answer || {}).selected_option_ids || []).indexOf(option.id) >= 0;
         choices.push(input); label.appendChild(input);
         var copy = document.createElement('span'); copy.textContent = String(option.label || option.id);
@@ -177,19 +178,20 @@
       if (question.allow_text) {
         var label = document.createElement('label'); label.className = 'task-question-custom'; label.textContent = '补充或自定义';
         textInput = document.createElement('textarea'); textInput.rows = 2; textInput.maxLength = 4000;
-        textInput.setAttribute('aria-label', '补充或自定义回答'); textInput.disabled = !pending;
+        textInput.setAttribute('aria-label', '补充或自定义回答'); textInput.disabled = !ready;
         textInput.value = question.text || (question.answer || {}).text || ''; label.appendChild(textInput); form.appendChild(label);
       }
       var actions = document.createElement('div'); actions.className = 'task-question-actions';
-      var submit = document.createElement('button'); submit.type = 'submit'; submit.textContent = '确认并继续'; submit.disabled = !pending; actions.appendChild(submit);
-      var cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = '取消'; cancel.disabled = !pending; actions.appendChild(cancel);
+      var submit = document.createElement('button'); submit.type = 'submit'; submit.textContent = '确认并继续'; submit.disabled = !ready; actions.appendChild(submit);
+      var cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = '取消'; cancel.disabled = !ready; actions.appendChild(cancel);
       if (retry) { submit.textContent = '重试继续'; submit.disabled = false; cancel.hidden = true; }
       if (pending || retry) form.appendChild(actions);
       var note = document.createElement('p'); note.className = 'task-question-status'; note.setAttribute('role', 'status');
       var statuses = {pending: '等待你的选择，任务暂未继续。', answered: '已记录你的选择。', cancelled: '已取消本次选择。', expired: '问题已过期，请重新发起请求。'};
-      note.textContent = statuses[question.status] || '问题状态待确认。'; form.appendChild(note); host.appendChild(form);
+      note.textContent = pending && !ready ? '正在确认任务已暂停。' : statuses[question.status] || '问题状态待确认。';
+      form.appendChild(note); host.appendChild(form);
       async function answer(cancelled) {
-        if (!options.owns() || busy || current !== question || (!pending && !retry)) return;
+        if (!options.owns() || busy || current !== question || (!ready && !retry)) return;
         var selected = retry ? question.answer.selected_option_ids : choices.filter(function (input) { return input.checked; }).map(function (input) { return input.value; });
         var text = retry ? question.answer.text : (textInput ? textInput.value.trim() : '');
         if (!cancelled && !selected.length && !text) { note.textContent = '请选择一个选项或填写自定义回答。'; return; }
@@ -201,11 +203,13 @@
         if (answer.payloadKey !== payloadKey) { requestId = 'q-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10); answer.payloadKey = payloadKey; }
         try {
           var result = await options.transport.answer(state.job_id || question.job_id, question.id, {
-            version: question.version, selected_option_ids: cancelled ? [] : selected, text: cancelled ? '' : text,
+            version: question.version, interrupt_id: question.interrupt_id,
+            selected_option_ids: cancelled ? [] : selected, text: cancelled ? '' : text,
             cancelled: cancelled, client_request_id: requestId
           });
-          if (!options.owns() || !result) return;
+          if (!options.owns() || current !== question || !result) return;
           if (result.question) options.store.hydrate({job_id: state.job_id, question: result.question});
+          if (result.resume_job_id && options.onContinue) options.onContinue(result);
           if (result.dispatch_pending || (result.child_job_id && result.question && result.question.child_status === 'queued')) {
             note.textContent = '答复已保存，任务正在排队，稍后会自动继续。';
           } else if (result.child_job_id && options.onContinue) options.onContinue(result);
@@ -216,8 +220,8 @@
           if (error.status === 409) { try { await options.transport.refresh(state.job_id); } catch (_) {} }
         } finally {
           if (options.owns() && current === question) {
-            busy = false; submit.disabled = !(pending || retry); cancel.disabled = !pending;
-            choices.forEach(function (input) { input.disabled = !pending; }); if (textInput) textInput.disabled = !pending;
+            busy = false; submit.disabled = !(ready || retry); cancel.disabled = !ready;
+            choices.forEach(function (input) { input.disabled = !ready; }); if (textInput) textInput.disabled = !ready;
           }
         }
       }

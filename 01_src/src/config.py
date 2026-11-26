@@ -141,6 +141,7 @@ class ModelTransport:
     base_url: str
     api_key: str = field(repr=False)
     headers: dict[str, str] = field(repr=False)
+    configured_context_window: int | None = None
 
 
 @contextmanager
@@ -283,8 +284,11 @@ class Settings(BaseSettings):
     TEMPERATURE_MAIN: float = Field(default_factory=lambda: _yaml_val("chat", "temperature_main", default=0.2))
     TEMPERATURE_FAST: float = Field(default_factory=lambda: _yaml_val("chat", "temperature_fast", default=0.0))
     MAX_TOKENS: int = Field(default_factory=lambda: _yaml_val("chat", "max_tokens", default=4096))
-    # Additional safety ceiling for the main call. The fixed allowance is the
-    # smaller of this and chat.max_tokens, including after recovery.
+    # Provider and model limits are operator-supplied capabilities. Older
+    # deployments without a model entry use chat.max_tokens as the fallback.
+    MAIN_MODEL_BUDGETS: dict[str, dict[str, dict[str, int]]] = Field(default_factory=lambda: _yaml_val(
+        "model", "provider_budgets", default={}))
+    # Application safety ceiling, including after recovery.
     AGENT_MAX_OUTPUT_TOKENS: int = Field(default_factory=lambda: _yaml_val(
         "agent", "max_output_tokens", default=16384), ge=1)
     # Cumulative per-request use is separate from the single-call context window.
@@ -808,7 +812,8 @@ class Settings(BaseSettings):
             if cfg.get("fast_base_url") or not store.get("revision"):
                 key = self.fast_credential_for(base, main_base, key)
         return ModelTransport(provider_id, model, base, key,
-                              self._provider_headers(provider_id, base) if include_headers and key else {})
+                              self._provider_headers(provider_id, base) if include_headers and key else {},
+                              self._configured_context_window(cfg))
 
     def fast_credential_for(self, base: str, main_base: str, main_key: str) -> str:
         origin = model_origin(base)
@@ -832,13 +837,16 @@ class Settings(BaseSettings):
         model = self.model_transport(include_headers=False)
         return model_supports_images(model.provider_id, model.model)
 
-    @property
-    def RESOLVED_CONTEXT_BUDGET_MAX_TOKENS(self) -> int:
-        value = self._current_model_config().get("context_window_tokens")
+    def _configured_context_window(self, cfg: dict) -> int:
+        value = cfg.get("context_window_tokens")
         try:
             return min(max(int(value), 4096), 1_000_000) if value else self.CONTEXT_BUDGET_MAX_TOKENS
         except (TypeError, ValueError):
             return self.CONTEXT_BUDGET_MAX_TOKENS
+
+    @property
+    def RESOLVED_CONTEXT_BUDGET_MAX_TOKENS(self) -> int:
+        return self._configured_context_window(self._current_model_config())
 
     @property
     def RESOLVED_FAST_MODEL(self) -> str:

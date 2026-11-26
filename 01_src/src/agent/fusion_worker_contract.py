@@ -31,7 +31,7 @@ OPTION_KEYS = {
                                      "shared_image_pairs", "tolerance", "gel_lanes"}),
 }
 IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff"})
-EXTENSIONS = {"bibliography": {".pdf", ".bib"}, "workbook": {".xlsx", ".xlsm"},
+EXTENSIONS = {"bibliography": {".pdf", ".bib"}, "workbook": {".xlsx"},
               "table": {".csv"}, "source": {".csv", ".tsv", ".xlsx"},
               "reported": {".csv", ".tsv", ".xlsx"}, "gel": IMAGE_EXTS}
 ROLES = {"literature-verification": {"bibliography"}, "data-audit": {"workbook"},
@@ -99,8 +99,11 @@ def load_bundle(release: Path, skill: str) -> Bundle:
     if (type(manifest) is not dict or set(manifest) != {"schema", "entrypoint", "skills", "files", "dependencies"}
             or manifest["schema"] != "citrus.fusion-bundle/1" or manifest["entrypoint"] != ENTRYPOINT
             or type(manifest["skills"]) is not dict or not set(manifest["skills"]) <= SKILLS
-            or any(version not in ({"0.1.0", "0.1.1"} if name in {"data-audit", "literature-verification"} else {"0.1.0"})
-                   for name, version in manifest["skills"].items())
+            or any(version not in {
+                "data-audit": {"0.1.0", "0.1.1", "0.1.2"},
+                "literature-verification": {"0.1.0", "0.1.1", "0.1.2"},
+                "research-integrity": {"0.1.0"},
+            }[name] for name, version in manifest["skills"].items())
             or skill not in manifest["skills"]):
         raise ValueError("fusion_bundle_schema_mismatch")
     members = manifest["files"]
@@ -191,10 +194,12 @@ def confirmed_workbook_regions(regions, query):
     normalized = workbook_regions(regions)
     text = mask_literal_payload(query)
     clauses = re.split(r"[。！？?;；\n]", text)
+    next_region = re.compile(r"!\s*\$?[A-Z]{1,3}\$?[1-9]\d{0,6}", re.I | re.ASCII)
     for original, region in zip(regions, normalized):
         sheet = original["sheet"]
+        bounds = re.sub(r"([A-Z]+)([0-9]+)", lambda m: rf"\$?{m[1]}\$?{m[2]}", region["bounds"])
         reference = re.compile(r"(?<![\w.'])" + r"(?:'" + re.escape(sheet.replace("'", "''")) + r"'|"
-                               + re.escape(sheet) + r")\s*!\s*(?i:" + re.escape(region["bounds"]) + r")(?![\w:])")
+                               + re.escape(sheet) + r")\s*!\s*(?i:" + bounds + r")(?![\w:$])")
         candidates = [part for part in clauses if reference.search(part)]
         exclusions = (r"不(?:要|检查|审查|使用|选)|排除|剔除|比如|例如|举例|候选|是否|能否|还是|"
                       r"\b(?:not|exclude|except|example|candidate|whether|or)\b")
@@ -203,7 +208,14 @@ def confirmed_workbook_regions(regions, query):
         if region["header_rows"][0] != _region_box(region["bounds"])[1]:
             header = region["header_rows"][0]
             marker = rf"(?:表头(?:行)?\s*(?:[:：=]|是|为|在)?\s*第?\s*{header}\s*行?(?!\d)|\bheader\s+row\s*[:=]?\s*{header}\b)"
-            if not any(len(reference.findall(part)) == 1 and re.search(marker, part, re.I) for part in candidates):
+            confirmed = False
+            for part in candidates:
+                for match in reference.finditer(part):
+                    tail = part[match.end():]
+                    following = next_region.search(tail)
+                    if re.search(marker, tail[:following.start()] if following else tail, re.I):
+                        confirmed = True
+            if not confirmed:
                 raise ValueError("fusion_workbook_header_unconfirmed")
     return normalized
 
@@ -222,9 +234,11 @@ def make_request(skill, refs, options, observations):
               for role, item in sorted(refs.items())]
     if observations is not None:
         if (skill != "literature-verification" or type(observations) is not dict
-                or not observations.keys() <= {"http", "refchecker_candidates"}
+                or not observations.keys() <= {"http", "refchecker_candidates", "reference_batch"}
                 or type(observations.get("http", {})) is not dict
-                or type(observations.get("refchecker_candidates", [])) is not list):
+                or type(observations.get("refchecker_candidates", [])) is not list
+                or ("reference_batch" in observations and (set(observations) != {"reference_batch"}
+                    or type(observations["reference_batch"]) is not dict))):
             raise ValueError("fusion_host_observations_invalid")
         cassette = encode(observations)
         if len(cassette) > MAX_REQUEST:

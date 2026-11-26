@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import sqlite3
 import threading
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -19,6 +20,7 @@ from src.core.account_admission import (
 
 
 _lock = threading.RLock()
+_http_admission_slots = threading.BoundedSemaphore(8)
 # Compatibility for older test fixtures only; never consulted for authorization.
 _states: dict = {}
 _deletion_context = threading.local()
@@ -149,15 +151,55 @@ def account_lease(owner: int) -> Iterator[AccountLease]:
         lease.release()
 
 
+@asynccontextmanager
+async def async_account_lease(owner: int, *, token: str):
+    """Admit a live browser session without running SQLite on the event loop."""
+    from src import auth
+
+    def acquire():
+        try:
+            def authorize(conn):
+                user = auth._session_user(conn, token)
+                if user is None or user["user_id"] != owner:
+                    raise AccountUnavailable("browser session changed before admission")
+
+            store = AdmissionStore(auth.DB_PATH)
+            ticket = store.acquire(owner, authorize=authorize, timeout=0.15)
+            return AccountLease(owner, _group=_LeaseGroup(store, ticket))
+        finally:
+            _http_admission_slots.release()
+
+    if not _http_admission_slots.acquire(blocking=False):
+        raise sqlite3.OperationalError("account admission busy")
+    pending = asyncio.create_task(asyncio.to_thread(acquire))
+    try:
+        lease = await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        # The thread can acquire after the HTTP observer is cancelled.
+        async def release_if_admitted():
+            lease = await asyncio.gather(pending, return_exceptions=True)
+            if isinstance(lease[0], AccountLease):
+                await asyncio.to_thread(lease[0].release)
+
+        cleanup = asyncio.create_task(release_if_admitted())
+        await asyncio.shield(cleanup)
+        raise
+    try:
+        with bound_account_lease(lease):
+            yield lease
+    finally:
+        await asyncio.shield(asyncio.create_task(asyncio.to_thread(lease.release)))
+
+
 @contextmanager
-def deletion_lock(owner: int, *, claim_factory=None):
+def deletion_lock(owner: int, *, claim_factory=None, store: AdmissionStore | None = None):
     """Single persistent cleanup owner, reentrant only in its originating thread.
 
     Normal exit relinquishes the claim but never reopens admission. Process
     death leaves the claim for explicit reconciliation, with no TTL takeover.
     """
     import os
-    store = current_store()
+    store = current_store() if store is None else store
     key = (str(store.path), int(owner), os.getpid())
     claims = getattr(_deletion_context, "claims", None)
     if claims is None:

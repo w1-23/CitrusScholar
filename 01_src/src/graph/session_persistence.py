@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 async def persist_agent_turn(state: dict) -> dict:
     """Save the answer, refresh-safe elapsed time, evidence and selected sources."""
+    if state.get("awaiting_input") and (state.get("pending_question") or {}).get("interrupt_id"):
+        # Awaiting-input views live in the job ledger. Saving this segment as
+        # conversation history would consume the final turn's idempotency key.
+        return {"_trace": {"node": "session_save", "elapsed_ms": 0, "summary": "awaiting input",
+                           "history_saved": False, "generation_ms": 0}}
     query = str(state.get("query") or "")
     answer = str(state.get("answer") or "")
     session_id = str(state.get("session_id") or "default")

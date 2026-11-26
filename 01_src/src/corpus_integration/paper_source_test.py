@@ -4,7 +4,10 @@ from contextlib import contextmanager
 from hashlib import md5, sha256
 from io import BytesIO
 import json
+import os
+from pathlib import Path
 import sqlite3
+from types import ModuleType
 
 import pytest
 from urllib3.exceptions import ProtocolError
@@ -135,9 +138,17 @@ def test_dedicated_foreground_reuses_exact_original_and_checks_article(app_queue
     before, = IntakeQueue(app_queue).recent()
     assert before["state"] == "queued" and before["path"] == "foreground"
     digest = sha256(RAW).hexdigest()
+    assert before["original_sha256"] == digest
+    assert before["source_rights"] == {"basis": "ncbi_pmc_cloud", "license": "cc-by"}
+    assert before["rights_obtained"] is None and not before["prepared"]
+    assert not before["bibliography_verified"] and before["indexed_generation"] is None
     assert originals.read_archive(app_queue.originals, digest) == RAW
     receipt = _consume(app_queue)
     assert receipt["state"] == "prepared" and receipt["raw_sha256"] == digest
+    prepared, = IntakeQueue(app_queue).recent()
+    assert prepared["bibliography_verified"] and prepared["prepared"] and prepared["rights"] == "granted"
+    assert prepared["rights_obtained"] == {"event_id": 1, "basis": "ncbi_pmc_cloud", "license": "cc-by"}
+    assert prepared["indexed_generation"] is None and prepared["published_generation"] is None
     assert calls == [source._NCBI + "esummary.fcgi"]
     assert AutoIntake(app_queue).lookup(doi=DOI)["source_url"] == f"https://doi.org/{DOI}"
 
@@ -172,6 +183,9 @@ def test_no_winner_durably_records_background_even_without_rights(app_queue, mon
     assert queued["state"] == "queued" and queued["path"] == "background"
     receipt = _consume(app_queue)
     assert receipt["state"] == "metadata_only" and receipt["id"] == queued["id"]
+    metadata, = IntakeQueue(app_queue).recent()
+    assert metadata["bibliography_verified"] and not metadata["prepared"]
+    assert metadata["original_sha256"] is None and metadata["rights_obtained"] is None
     assert not any(url.endswith(".txt") for url in calls)
     assert not list(app_queue.originals.iterdir())
     assert AutoIntake(app_queue).lookup(doi=DOI)["title"] == TITLE
@@ -230,25 +244,89 @@ def test_foreground_malformed_proof_cannot_claim_original(mutation):
     assert source.verified_original(*_official(metadata=patch, raw=raw), doi=DOI, pmid=PMID) is None
 
 
-def test_old_worker_cannot_claim_or_expire_protected_rows(app_queue):
+def test_disabled_producer_and_consumer_preserve_automatic_rows(app_queue, monkeypatch):
     receipt = fetch_submit.submit(owner=7, doi=DOI, pmid=PMID)
     queue = IntakeQueue(app_queue)
-    old_where = """((state='queued' AND not_before<=?) OR (state='leased' AND lease_until<=?))
-                   AND json_extract(request, '$.kind') <> 'explicit'"""
-    def old_can_see(now):
-        with app_queue.read() as conn:
-            return conn.execute("SELECT id FROM intake WHERE " + old_where, (now, now)).fetchone()
-    assert old_can_see(queue.now()) is None and queue.claim(network=True) is None
     claimed = queue.claim(automatic=True)
-    assert claimed["id"] == receipt["id"] and queue.status(receipt["id"])["state"] == "leased"
-    assert old_can_see(queue.now() + LEASE_SECONDS + 1) is None
+    assert claimed["id"] == receipt["id"]
     later = queue.now() + JOB_TTL + LEASE_SECONDS + 1
-    with app_queue.write() as conn:
-        expired = conn.execute("""UPDATE intake SET state='expired' WHERE created<=?
-                                AND (state='queued' OR (state='leased' AND lease_until<=?))""",
-                               (later - JOB_TTL, later))
-        assert expired.rowcount == 0
-    assert queue.status(receipt["id"])["state"] == "leased"
+    monkeypatch.setenv("CITRUS_CORPUS_DURABLE_INTAKE", "0")
+    calls = _mock_http(monkeypatch)
+    assert fetch_submit.submit(owner=7, doi="10.1234/disabled") is None
+    worker = automatic_worker.AutomaticWorker(app_queue.root, network_allowed=lambda: True)
+    assert not worker.enabled()
+    paused = IntakeQueue(app_queue, now=lambda: later)
+    assert Intake(app_queue, queue=paused).process_one(automatic=worker) is None
+    assert paused.status(receipt["id"])["state"] == "leased"
+    assert not calls
+    with app_queue.read() as conn:
+        assert conn.execute("SELECT count(*) FROM intake").fetchone()[0] == 1
+    monkeypatch.setenv("CITRUS_CORPUS_DURABLE_INTAKE", "1")
+    assert worker.enabled()
+    assert Intake(app_queue, queue=paused).process_one(automatic=worker) is None
+    assert paused.status(receipt["id"])["state"] == "expired"
+
+
+def test_automatic_timeout_and_interrupted_lease_retry(app_queue, monkeypatch):
+    submitted = fetch_submit.submit(owner=7, doi=DOI, pmid=PMID)
+    now = [IntakeQueue(app_queue).now()]
+    queue = IntakeQueue(app_queue, now=lambda: now[0])
+    intake = Intake(app_queue, queue=queue)
+    worker = automatic_worker.AutomaticWorker(app_queue.root, network_allowed=lambda: True)
+    calls = _mock_http(monkeypatch, original=TimeoutError("fixture timeout"))
+    first = intake.process_one(automatic=worker)
+    assert first["id"] == submitted["id"] and first["state"] == "queued"
+    assert first["attempts"] == 1 and first["error"] == "network_timeout"
+    assert calls.count(source._CLOUD + TEXT) == 1 and not list(app_queue.originals.iterdir())
+    assert intake.process_one(automatic=worker) is None
+    now[0] += 16
+    abandoned = queue.claim(automatic=True)
+    assert abandoned["id"] == submitted["id"] and abandoned["attempts"] == 2
+    now[0] += LEASE_SECONDS + 1
+    calls = _mock_http(monkeypatch)
+    completed = intake.process_one(automatic=worker)
+    assert completed["id"] == submitted["id"] and completed["state"] == "prepared"
+    assert completed["attempts"] == 3 and completed["error"] is None
+    assert calls.count(source._CLOUD + TEXT) == 1
+    assert originals.read_archive(app_queue.originals, completed["raw_sha256"]) == RAW
+    with pytest.raises(ValueError, match="corpus_lease_lost"):
+        queue.fail(abandoned, "worker_interrupted")
+
+
+def test_pinned_legacy_worker_only_processes_legacy_rows(app_queue):
+    path = os.getenv("CITRUS_TEST_OLD_QUEUE")
+    if not path:
+        pytest.skip("supply the sealed 6191802 consumer queue.py via CITRUS_TEST_OLD_QUEUE")
+    source_bytes = Path(path).read_bytes()
+    assert sha256(source_bytes).hexdigest() == "c2d6b1f8b5c73db52e7129a839a47a2d59da2e0e206593f2d4c47acca67ba548"
+    old = ModuleType("citrus_corpus._legacy_queue_fixture")
+    exec(compile(source_bytes, path, "exec"), old.__dict__)
+    current = IntakeQueue(app_queue)
+    clock = [current.now()]
+    previous = old.IntakeQueue(app_queue, now=lambda: clock[0])
+    first = fetch_submit.submit(owner=7, doi=DOI, pmid=PMID)
+    legacy = previous.submit("local:legacy", {"kind": "saved", "path": "legacy.md", "format": "markdown"},
+                             actor="operator", expected_sha256="1" * 64)
+    assert previous.claim(network=True)["id"] == legacy["id"]
+    assert previous.claim(network=True) is None
+    leased = current.claim(automatic=True)
+    assert leased["id"] == first["id"]
+    clock[0] += JOB_TTL + LEASE_SECONDS + 1
+    assert previous.claim(network=True) is None
+    assert current.status(legacy["id"])["state"] == "expired"
+    assert current.status(first["id"])["state"] == "leased"
+
+    record = b"# Legacy source\n\nFixture addition using the old queue.\n"
+    (app_queue.inbox / "new-legacy.md").write_bytes(record)
+    legacy = previous.submit("local:new-legacy", {"kind": "saved", "path": "new-legacy.md", "format": "markdown"},
+                             actor="operator", expected_sha256=sha256(record).hexdigest())
+    next_worker = Intake(app_queue, queue=IntakeQueue(app_queue, now=lambda: clock[0]))
+    result = next_worker.process_one()
+    assert result["id"] == legacy["id"] and result["state"] == "prepared"
+    assert originals.read_archive(app_queue.originals, result["raw_sha256"]) == record
+    assert current.status(first["id"])["state"] == "leased"
+
+
 @pytest.mark.parametrize("patch", [{"pubtype": ["Dataset", "Journal Article"]},
     {"pubtype": ["Published Erratum", "Journal Article"]},
     {"pubtype": ["Retracted Publication", "Journal Article"]},
@@ -304,7 +382,11 @@ def test_standalone_worker_revalidates_principal_and_live_controls(app_queue, mo
     assert receipt and not calls
     if denied == "growth":
         monkeypatch.setenv("CITRUS_CORPUS_DURABLE_INTAKE", "0")
-    elif denied == "account":
+        assert _consume(app_queue) is None
+        assert IntakeQueue(app_queue).status(receipt["id"])["state"] == "queued"
+        assert not calls
+        return
+    if denied == "account":
         with sqlite3.connect(auth.DB_PATH) as conn:
             conn.execute("UPDATE users SET active=0")
     elif denied == "epoch":

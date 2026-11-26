@@ -7,7 +7,8 @@ service, or live database is used.
 from __future__ import annotations
 
 import sqlite3
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, closing
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
@@ -75,6 +76,11 @@ def api(tmp_path, monkeypatch):
         ("/api/v2/diag/loop-watchdog", main.diag_loop_watchdog, ["GET"]),
         ("/api/v2/auth/account", main.delete_account, ["DELETE"]),
         ("/api/v2/admin/users", main.admin_list_users, ["GET"]),
+        ("/api/v2/admin/users/{user_id}/daily-limit", main.admin_set_user_limit, ["PUT"]),
+        ("/api/v2/admin/requests", main.admin_list_request_audit, ["GET"]),
+        ("/api/v2/chat/jobs/{job_id}/cancel", main.cancel_chat_job, ["POST"]),
+        ("/api/v2/chat/cancel", main.cancel_chat, ["POST"]),
+        ("/live", main.liveness_check, ["GET"]),
         ("/api/v2/admin/users/{user_id}/reset-password", main.admin_reset_password, ["POST"]),
         ("/api/v2/admin/users/{user_id}/active", main.admin_set_user_active, ["POST"]),
         ("/api/v2/admin/applications", main.admin_list_applications, ["GET"]),
@@ -242,12 +248,12 @@ def test_auth13_account_lease_failure_maps_to_409(api, monkeypatch):
     _, token = _make_user()
     import src.core.account_leases as leases
 
-    @contextmanager
-    def unavailable(owner):
+    @asynccontextmanager
+    async def unavailable(owner, *, token):
         raise AccountUnavailable("closed")
         yield None
 
-    monkeypatch.setattr(leases, "account_lease", unavailable)
+    monkeypatch.setattr(leases, "async_account_lease", unavailable)
     response = api.client.post("/api/v2/probe", cookies=_cookies(token), headers=_write())
     assert response.status_code == 409
     assert response.json()["code"] == "account_closed"
@@ -391,15 +397,10 @@ def test_auth23_legacy_migration_backfills_approved(tmp_path, monkeypatch):
 
 def test_auth24_deletion_pending_and_retry_token_scope(api, monkeypatch):
     user_id, token = _make_user()
-    auth.retain_deletion_retry(token, user_id)
-    with auth._connect() as conn:
-        conn.execute("UPDATE users SET active=0 WHERE user_id=?", (user_id,))
-    assert auth.user_for_token(token) is None
+    from src.core.account_admission import current_store
 
-    def raise_pending(*args, **kwargs):
-        raise AccountDeletionPending("busy")
-
-    monkeypatch.setattr(auth, "delete_user_account", raise_pending)
+    store = current_store()
+    lease = store.acquire(user_id)
     response = api.client.request("DELETE", "/api/v2/auth/account",
                                   json={"password": USER_PASSWORD},
                                   cookies=_cookies(token), headers=_write())
@@ -409,6 +410,11 @@ def test_auth24_deletion_pending_and_retry_token_scope(api, monkeypatch):
     assert response.headers["retry-after"] == "2"
     # The retry token is scoped to DELETE /account and is not general auth.
     assert api.client.get("/api/v2/auth/me", cookies=_cookies(token)).status_code == 401
+    invalid = api.client.request("DELETE", "/api/v2/auth/account", json={"password": NEW_PASSWORD},
+                                 cookies=_cookies(token), headers=_write())
+    assert invalid.status_code == 401
+    assert auth.user_for_deletion_retry(token)["user_id"] == user_id
+    store.release(lease)
 
 
 # ------------------------------------------------------------- HTTP contracts
@@ -803,3 +809,65 @@ def test_lan_mode_auth_uses_https_origin_cookie_and_verified_client(api, monkeyp
     token_path.chmod(0o644)
     with pytest.raises(RuntimeError, match='Invalid LAN proxy credential file'):
         load_lan_ingress()
+
+
+def test_platform_admin_reads_and_liveness_under_external_writers(api, monkeypatch):
+    from src import admin_audit
+    from src.core import jobs
+
+    admin_id, token = _make_admin()
+    monkeypatch.setattr(admin_audit, "DB_PATH", api.tmp / "state" / "admin_audit.sqlite3")
+    monkeypatch.setattr(jobs, "_DB_PATH", api.tmp / "state" / "jobs.sqlite3")
+    admin_audit.init_store()
+    job = jobs.claim_job("sample-session", "request-one", owner_user_id=admin_id)
+    with closing(sqlite3.connect(auth.DB_PATH)) as auth_lock, closing(sqlite3.connect(admin_audit.DB_PATH)) as audit_lock:
+        auth_lock.execute("BEGIN IMMEDIATE")
+        audit_lock.execute("BEGIN IMMEDIATE")
+        start = monotonic()
+        assert api.client.get("/live").status_code == 200
+        for path in ("/api/v2/auth/me", "/api/v2/admin/users", "/api/v2/admin/requests",
+                     "/api/v2/admin/invites", "/api/v2/admin/applications", f"/jobs/{job.job_id}"):
+            assert api.client.get(path, cookies=_cookies(token)).status_code == 200, path
+        limit = api.client.put(f"/api/v2/admin/users/{admin_id}/daily-limit", cookies=_cookies(token),
+                               headers=_write(), json={"daily_limit": 88})
+        assert limit.status_code == 503
+        response = api.client.post("/api/v2/probe", cookies=_cookies(token), headers=_write())
+        assert response.status_code == 503 and response.headers["Retry-After"] == "1"
+        assert api.client.get("/live").status_code == 200
+        assert monotonic() - start < 2
+    limit = api.client.put(f"/api/v2/admin/users/{admin_id}/daily-limit", cookies=_cookies(token),
+                           headers=_write(), json={"daily_limit": 88})
+    assert limit.status_code == 200 and auth.user_by_id(admin_id)["daily_limit"] == 88
+
+
+def test_exact_cancel_checks_ownership_and_records_before_signal(api, monkeypatch):
+    from src.core import jobs
+
+    owner, token = _make_user()
+    foreign, _ = _make_user("neighbor-user")
+    monkeypatch.setattr(jobs, "_DB_PATH", api.tmp / "state" / "jobs.sqlite3")
+    owned = jobs.claim_job("sample-session", "owned-one", owner_user_id=owner).job_id
+    foreign_job = jobs.claim_job("sample-session", "owned-two", owner_user_id=foreign).job_id
+    calls = []
+
+    def signal(reason):
+        assert jobs.get_job(owned)["status"] == "cancel_requested"
+        calls.append(reason)
+
+    monkeypatch.setitem(main._job_tokens, owned, SimpleNamespace(cancel=signal))
+    base = "/api/v2/chat/jobs/"
+
+    def cancel(job_id):
+        return api.client.post(base + job_id + "/cancel", cookies=_cookies(token), headers=_write())
+
+    with closing(sqlite3.connect(jobs._DB_PATH)) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        response = cancel(owned)
+        assert response.status_code == 503 and calls == []
+        assert api.client.get("/live").status_code == 200
+    assert cancel("missing").json() == cancel(foreign_job).json() == {"detail": "Job not found"}
+    assert jobs.get_job(foreign_job)["status"] == "running"
+    assert cancel(owned).json()["accepted"] is True
+    repeated = cancel(owned).json()["results"][0]
+    assert not repeated["accepted"] and repeated["note"] == "already_requested"
+    assert calls == ["user", "user"]

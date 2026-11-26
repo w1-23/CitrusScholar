@@ -138,7 +138,12 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
     raw = b"# Methods\n\nField plots were sampled for leaf nutrient analysis.\n"
     saved(intake, "first.md", raw)
     initial = intake.process_one()
+    awaiting, = intake.queue.recent()
+    assert awaiting["prepared"] and awaiting["rights"] == "needs_review" and awaiting["rights_obtained"] is None
     grant(intake.catalog, initial)
+    granted, = intake.queue.recent()
+    assert granted["rights"] == "granted" and granted["rights_obtained"]["basis"] == "admin_grant"
+    assert granted["encoded_generation"] is None and granted["indexed_generation"] is None
     assert publisher.publish()["state"] == "waiting_for_idle"
     assert read_pointer(store.root) is None
     idle[0] = True
@@ -179,6 +184,13 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
             publisher.publish()
         generation1 = read_pointer(store.root)
         assert generation1 != generation0
+        stages = {row["version_id"]: row for row in intake.queue.recent()}
+        assert stages[initial["version_id"]]["published_generation"] == generation0
+        assert stages[initial["version_id"]]["visible_generation"] is None
+        assert stages[revised["version_id"]]["visible_generation"] == generation1
+        experiment = intake.queue.recent(read_generation=generation0)
+        assert {job["visible_generation"] for job in experiment} == {None, generation0}
+        assert all(job["visible_generation"] is None for job in intake.queue.recent(retrieval_enabled=False))
         assert pinned.search("leaf")[0]["index_generation"] == generation0
         with Reader(Store(store.root)).pin(**models) as changed:
             assert changed.search("randomized blocks")[0]["version_id"] == revised["version_id"]
@@ -213,6 +225,11 @@ def test_publish_pinned_reads_rights_and_recovery(store, monkeypatch):
         assert restored.search("leaf") == []
     watcher = Publisher(Store(store.root), now=lambda: now[0], **models)
     assert watcher.publish()["state"] == "publication_held"  # No ready generation.
+    stages = {row["version_id"]: row for row in intake.queue.recent()}
+    revoked = stages[initial["version_id"]]
+    assert revoked["rights"] == "revoked" and revoked["rights_obtained"]["basis"] == "admin_grant"
+    assert revoked["published_generation"] == revoked["active_generation"] == generation0
+    assert revoked["visible_generation"] is None
     assert read_pointer(store.root) == generation0
     assert len(intake.catalog.versions()) == 2
     assert resume_publication(Store(store.root))["state"] == "publication_resumed"
@@ -236,12 +253,16 @@ def test_interrupted_rollback_holds_ready_generation_until_explicit_resume(store
     grant(intake.catalog, intake.process_one())
     now[0] += 301
     previous = publisher.publish()["generation"]
-    saved(intake, "third.md", b"# Methods\n\nCitrus sampling in the third trial.")
+    last = saved(intake, "third.md", b"# Methods\n\nCitrus sampling in the third trial.")
     grant(intake.catalog, intake.process_one())
     now[0] += 301
     defer = Publisher(store, now=lambda: now[0], idle=lambda: idle.pop(0) if idle else False, **models)
     staged = defer.publish()
     assert staged["state"] == "waiting_for_idle" and staged["generation"] != previous
+    progress = next(job for job in intake.queue.recent() if job["id"] == last["id"])
+    assert progress["encoded_generation"] == progress["indexed_generation"] == staged["generation"]
+    assert progress["published_generation"] is None and progress["active_generation"] is None
+    assert progress["visible_generation"] is None
 
     def fail_pointer(*args):
         raise OSError("simulated failure before pointer replacement")

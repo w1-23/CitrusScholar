@@ -23,13 +23,13 @@ REPLACED_TOOLS = frozenset({"verify_uploaded_references", "audit_uploaded_data",
                             "fetch_and_audit_open_supplements"})
 
 
-_delivery = ContextVar("fusion_delivery", default=(FusionDelivery(), "", ""))
+_delivery = ContextVar("fusion_delivery", default=(FusionDelivery(), "", "", ""))
 
 
 @contextmanager
-def fusion_delivery_scope(contract, *, query="", previous_query=""):
+def fusion_delivery_scope(contract, *, query="", previous_query="", workbook_confirmation=""):
     """Host scope only. A tool call cannot grant itself a delivery format."""
-    token = _delivery.set((contract, query, previous_query))
+    token = _delivery.set((contract, query, previous_query, workbook_confirmation))
     try:
         yield
     finally:
@@ -55,7 +55,7 @@ _SOURCE_LABEL = re.compile(r"(?<![\w./])([A-Za-z0-9][\w. ()-]{0,79}\.(?:csv|xlsx
 _REPORT_ID = re.compile(r"(?<![a-fA-F0-9])[a-f0-9]{32}(?![a-fA-F0-9])")
 
 
-_NEW_REFERENCE = re.compile(r"\b(?:10\.\d{4,9}/|arxiv\s*[:/]|arxiv\.org/)|(?:新(?:的|增)?|另[一个查]|再(?:查|核验|审查))[^，。！？!?]{0,20}(?:文献|引用|参考|数据|文件|DOI)", re.I)
+_NEW_REFERENCE = re.compile(r"\b(?:10\.\d{4,9}/|arxiv\s*[:/]|arxiv\.org/|pmid\s*[:/]|pubmed\.ncbi\.nlm\.nih\.gov/)|(?:新(?:的|增)?|另[一个查]|再(?:查|核验|审查))[^，。！？!?]{0,20}(?:文献|引用|参考|数据|文件|DOI)", re.I)
 _PRIOR_REPORT_REFERENCE = re.compile(
     r"(?:之前|此前|先前|刚才|上(?:一)?(?:份|次|轮|面)|原(?:来的)?(?:审查|核验|报告)|另存为|"
     r"那[一几\d\s]{0,12}(?:份|处|个|些|次)|已有(?:的)?(?:审查|报告)|"
@@ -221,15 +221,6 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
     from .fusion_worker import schedule_fusion
     from .fusion_worker_contract import confirmed_workbook_regions
 
-    if skill_id == "data-audit":
-        try:
-            regions = (options or {}).get("regions")
-            normalized = confirmed_workbook_regions(regions, _delivery.get()[1])
-            options = {**options, "regions": [{**original, "range": region["bounds"]}
-                                             for original, region in zip(regions, normalized)]}
-        except (TypeError, ValueError):
-            return _response({"error": "请确认真实工作表和有界区域，如 'Sheet 1'!A1:D20。默认区域首行为表头；若不同，请一并确认表头行。"},
-                             "not_run", "external_workbook_regions_unconfirmed")
     try:
         identity, call_id, release = _bound(skill_id)
         refs = {role: ref.model_dump() if isinstance(ref, InputRef) else InputRef.model_validate(ref).model_dump()
@@ -239,6 +230,17 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
             from citrus_audit.readers import open_xlsx_readonly
 
             data, filename = _workbook_source(identity, refs["workbook"])
+            if Path(filename).suffix.lower() != ".xlsx":
+                return _response({"error": "此 Skill 只支持 .xlsx 工作簿。"}, "not_run", "external_workbook_format_unsupported")
+            regions = (options or {}).get("regions")
+            _, query, _, confirmation = _delivery.get()
+            try:
+                normalized = confirmed_workbook_regions(regions, confirmation or query)
+            except (TypeError, ValueError):
+                return _response({"error": "请确认真实工作表和有界区域，如 'Sheet 1'!A1:D20。默认区域首行为表头；若不同，请一并确认表头行。"},
+                                 "not_run", "external_workbook_regions_unconfirmed")
+            options = {**options, "regions": [{**original, "range": region["bounds"]}
+                                             for original, region in zip(regions, normalized)]}
             with closing(open_xlsx_readonly(data, filename, data_only=True)) as workbook:
                 if any(region["sheet"] not in workbook.sheetnames for region in options["regions"]):
                     return _response({"error": "确认的工作表不在源文件中。"}, "not_run", "external_workbook_sheet_missing")
@@ -251,12 +253,16 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
 
 @tool(args_schema=LiteratureArgs, response_format="content_and_artifact")
 def continue_external_literature(execution_id: str):
-    """Advance the host registry coverage of the original extraction execution. Collect the returned Worker execution_id. If coverage can advance, call again with the original extraction execution_id, not the latest child. Report any explicit stop reason and unavailable providers."""
-    from src.research.fusion_observations import RegistryCoverage, advance_observations, observation_payload
+    """Run one bounded registry batch on an exact literature extraction and return its Worker execution ID. Collect that report. Repeat only when the report explicitly permits continuation on the original extraction ID."""
+    from citrus_refcheck.lookup import AuditStopped
+    from src.core.account_admission import AccountDeletionPending, AccountUnavailable
+    from src.core.account_leases import acquire_account_lease
+    from src.research.fusion_observations import RegistryCoverage, advance_observations, batch_observations, observation_payload
     from .code_tools import _deadline
     from .fusion_worker import consume_fusion, find_fusion, schedule_fusion
 
     skill_id = "literature-verification"
+    lease = None
     try:
         identity, _, release = _bound(skill_id)
         value = consume_fusion(identity, execution_id=execution_id, skill_release=release, skill_id=skill_id)
@@ -273,6 +279,12 @@ def continue_external_literature(execution_id: str):
                 return _queued(existing)
             return _deliver(identity, value, execution_id, skill_id)
         digest = value["receipt"]["result"]["sha256"]
+        version = report.get("execution", {}).get("version")
+        epoch = value.get("_account_epoch")
+        if version == "0.1.2":
+            if type(epoch) is not int:
+                raise PermissionError("bibliographic_account_epoch_missing")
+            lease = acquire_account_lease(identity.owner_user_id, expected_epoch=epoch)
         store = RegistryCoverage(identity)
         revision, child_id, state = store.get(execution_id, digest)
         if child_id:
@@ -281,11 +293,15 @@ def continue_external_literature(execution_id: str):
                 return _queued(child)
             if child["status"] != "succeeded":
                 return _consumed(child)
-            if state["stop_reason"] not in {"record_window", "lookup_window", "time_budget"}:
+            if "reference_batch" in state or state["stop_reason"] not in {"record_window", "lookup_window", "time_budget"}:
                 return _deliver(identity, child, child_id, skill_id)
         if not state or child_id:
             deadline = time.monotonic() + max(0, _deadline(identity) - time.time())
-            updated = advance_observations(report, state, identity=identity, deadline=deadline)
+            if version == "0.1.2":
+                updated = batch_observations(report, identity=identity, account_epoch=epoch,
+                                             deadline=deadline, original_report_sha256=digest)
+            else:
+                updated = advance_observations(report, state, identity=identity, deadline=deadline)
             if state and updated["offset"] == state["offset"] and observation_payload(updated) == observation_payload(state):
                 return _response({"execution_id": child_id, "original_execution_id": execution_id,
                                   "considered": updated["offset"], "total": updated["total"],
@@ -300,8 +316,11 @@ def continue_external_literature(execution_id: str):
                 skill_id=skill_id, inputs=value["inputs"], options=value["options"], observations=observation_payload(state))
         store.bind_child(execution_id, digest, revision, receipt["execution_id"], state)
         return _queued(receipt)
-    except (KeyError, LookupError, PermissionError, ValueError, OSError):
+    except (KeyError, LookupError, PermissionError, ValueError, OSError, AuditStopped, AccountDeletionPending, AccountUnavailable):
         return _response({"error": "登记补查不可用。可读取已有结果并标注覆盖缺口。"}, "not_run", "external_registry_unavailable")
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 def _literature_coverage(identity, execution_id, report, *, historical=False, source_identity=None):
@@ -327,7 +346,8 @@ def _literature_coverage(identity, execution_id, report, *, historical=False, so
     return {"considered": considered, "total": len(records), "stop_reason": reason,
             "original_execution_id": child["original_execution_id"] if child else execution_id,
             "can_continue": (not historical and allows("bibliographic_lookup") and web_search_enabled()
-                             and reason in {"record_window", "lookup_window", "time_budget", "observations_not_started"}),
+                             and (reason == "observations_not_started" or (
+                                 not report.get("reference_batch") and reason in {"record_window", "lookup_window", "time_budget"}))),
             "counts": {state: sum(value == state for value in indexed.values()) for state in sorted(set(indexed.values()))}}, indexed
 
 
@@ -335,8 +355,16 @@ def _deliver(identity, value, execution_id, skill_id, *, findings_offset=0, hist
     if value["status"] != "succeeded":
         return _consumed(value)
     report = value["report"]
-    contract, query, previous_query = _delivery.get()
+    contract, query, previous_query, _ = _delivery.get()
     curated = report
+    if skill_id == "data-audit":
+        source = (value.get("inputs") or {}).get("workbook", {})
+        digest = source.get("sha256")
+        file_id = source.get("file_id")
+        if digest and file_id:
+            curated = {**report, "findings": [{**finding, "locations": [
+                {**location, "source_file_id": file_id} if location.get("source_file_hash") == digest else location
+                for location in finding.get("locations", [])]} for finding in report.get("findings", [])]}
     duplicate_request = _DUPLICATE_REQUEST.search(previous_query if historical and _CONTINUE.fullmatch(query) else query)
     if historical and duplicate_request:
         curated = {**report, "findings": [row for row in report.get("findings", [])
@@ -416,7 +444,7 @@ def resolve_external_report(findings_offset: int = 0):
     """Read only the exact accepted external report authorized by a findings-list or report-delivery follow-up. No algorithm is rerun. Continue with findings_page.next_offset; never invent missing findings or positions."""
     from src.core.capability_policy import allows
     from src.graph.intent_text import mask_literal_payload
-    contract, query, previous_query = _delivery.get()
+    contract, query, previous_query, _ = _delivery.get()
     query = mask_literal_payload(query).strip()
     if not fusion_report_followup(query, previous_query=previous_query):
         return _response({"error": "本轮没有明确要求读取先前审查发现。"}, "not_run", "external_report_not_requested")

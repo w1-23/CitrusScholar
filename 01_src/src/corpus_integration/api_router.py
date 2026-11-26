@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from src.auth import require_admin
 
-from .settings import durable_intake_enabled, legacy_enabled
+from .settings import durable_intake_enabled, isolated_search_configured, legacy_enabled
 
 router = APIRouter(prefix="/api/v2/isolated-corpus/admin", tags=["isolated-corpus"])
 _PRIVATE = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
@@ -121,9 +121,12 @@ def submit_public_paper(body: PublicPaperRequest, request: Request):
 
 @router.get("/intake")
 def recent_intake(request: Request):
+    from src.core.capability_policy import allows
+
     _authorized(request)
     try:
-        jobs = _intake().queue.recent()
+        jobs = _intake().queue.recent(retrieval_enabled=isolated_search_configured() and allows("local_rag"),
+                                      read_generation=os.getenv("CITRUS_CORPUS_READ_GENERATION"))
     except (sqlite3.Error, OSError, ValueError) as exc:
         raise HTTPException(503, {"code": "corpus_intake_unavailable"}) from exc
     return JSONResponse({"jobs": jobs, "automatic_enabled": durable_intake_enabled()}, headers=_PRIVATE)

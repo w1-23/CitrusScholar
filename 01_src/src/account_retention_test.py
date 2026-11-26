@@ -1,7 +1,10 @@
 """End-to-end retention with only synthetic, tmp_path-bound account stores."""
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +14,7 @@ import textwrap
 REPO = Path(__file__).resolve().parents[2]
 CLI = REPO / "01_src" / "scripts" / "manage_account.py"
 EXPORT = REPO / "04_scripts" / "export_8043_turns.py"
+PURGE = REPO / "04_scripts" / "purge_8043_history.py"
 PASSWORD = "synthetic-passphrase"
 SUBJECT = "SYNTHETIC_ERASURE_MARKER_701796"
 
@@ -312,7 +316,11 @@ admin_audit.start_request(request_id='neighbor_req', user_id=neighbor, username=
 admin_audit.finish_request(request_id='neighbor_req', answer={SUBJECT!r},
     retrieval_trace={{'query':{SUBJECT!r},'total_ms':9}})
 assert admin_audit.list_requests()['total'] == 2
-assert admin_audit.list_requests(query={SUBJECT!r})['total'] == 1
+assert admin_audit.list_requests(query={SUBJECT!r})['total'] == 0
+assert admin_audit.list_requests(query='legacy_req')['total'] == 1
+assert {SUBJECT!r} not in repr(admin_audit.list_requests())
+with sqlite3.connect(admin_audit.DB_PATH) as db:
+    assert db.execute("SELECT query FROM request_audit WHERE request_id='legacy_req'").fetchone()[0] == {SUBJECT!r}
 assert current_store().close_admission(old)
 assert admin_audit.list_requests(query={SUBJECT!r})['total'] == 0
 page = admin_audit.list_requests(limit=1)
@@ -355,3 +363,109 @@ rows, errors = exporter.correlated_logs(root, {{valid: valid}})
 assert not errors and len(rows[valid]) == 1
 assert '"elapsed_ms": 8' in next(iter(rows[valid]))
 ''')
+
+
+def _legacy_audit_fixture(root):
+    run(root, f'''
+from src import admin_audit
+import sqlite3, time
+admin_audit.init_store()
+with sqlite3.connect(admin_audit.DB_PATH) as db:
+    db.execute('INSERT INTO request_audit(request_id,user_id,username,session_id,query,answer,'
+               'attachment_metadata_json,tool_trace_json,retrieval_trace_json,created_at) '
+               'VALUES (?,?,?,?,?,?,?,?,?,?)', ('legacy', 100, 'fixture', 'session_one', {SUBJECT!r}, {SUBJECT!r},
+               '[{{"name":"{SUBJECT}"}}]', '[{{"name":"{SUBJECT}"}}]', '{{"query":"{SUBJECT}"}}', time.time()))
+    db.execute('INSERT INTO request_audit(request_id,user_id,username,session_id,query,'
+               'tool_trace_json,created_at,metadata_version) VALUES (?,?,?,?,?,?,?,1)',
+               ('new', 200, 'new', 'session_two', '', '[{{"name":"read_file"}}]', time.time()))
+''')
+    return root / "state" / "admin_audit.sqlite3"
+
+
+def _archive_fixture(root, name="legacy.txt"):
+    archive = root / "archives"
+    archive.mkdir()
+    target = archive / name
+    target.write_text(SUBJECT, encoding="utf-8")
+    manifest = root / "scope.json"
+    manifest.write_text(json.dumps([{"path": name, "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}]),
+                        encoding="utf-8")
+    args = ("--runtime", root, "--archive-root", archive, "--manifest", manifest, "--incident", "OPS-8050")
+    return target, args
+
+
+def _inspect(root, args):
+    inspection = python(root, PURGE, *args)
+    assert SUBJECT not in inspection.stdout + inspection.stderr
+    return json.loads(inspection.stdout)
+
+
+def test_history_maintenance_requires_exact_snapshot_and_physically_removes_legacy_content(tmp_path):
+    db = _legacy_audit_fixture(tmp_path)
+    archived, args = _archive_fixture(tmp_path)
+    neighbor = archived.with_name("preserve.txt")
+    neighbor.write_text("preserve", encoding="utf-8")
+    before = db.read_bytes()
+    inspected = _inspect(tmp_path, args)
+    assert inspected["mode"] == "inspect" and inspected["archive_files"] == inspected["body_rows"] == 1
+    assert db.read_bytes() == before and archived.is_file()
+    apply = ("--apply", "--confirmed-writers-stopped", "--snapshot")
+    python(tmp_path, PURGE, *args, "--apply", "--snapshot", inspected["snapshot"], expected=2)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE request_audit SET query=query||' changed' WHERE request_id='legacy'")
+    python(tmp_path, PURGE, *args, *apply, inspected["snapshot"], expected=2)
+    assert archived.is_file()
+    refreshed = _inspect(tmp_path, args)
+    result = python(tmp_path, PURGE, *args, *apply, refreshed["snapshot"])
+    assert SUBJECT not in result.stdout + result.stderr
+    assert not archived.exists() and neighbor.read_text(encoding="utf-8") == "preserve"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT request_id,query,answer,tool_trace_json FROM request_audit ORDER BY request_id").fetchall() == [
+            ("legacy", "", "", "[]"), ("new", "", "", '[{"name":"read_file"}]')]
+        phases = {row[0] for row in conn.execute("SELECT phase FROM historical_audit_maintenance WHERE incident='OPS-8050'")}
+        assert phases == {"sql_scrubbed", "archive_intent", "archive_unlinked", "verified"}
+    assert SUBJECT.encode() not in db.read_bytes()
+    wal = db.with_name(db.name + "-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+    retry = _inspect(tmp_path, args)
+    assert retry["body_rows"] == retry["archive_files"] == 0
+    python(tmp_path, PURGE, *args, *apply, retry["snapshot"])
+
+
+def test_history_maintenance_resumes_after_unlink_and_refuses_substitution(tmp_path):
+    db = _legacy_audit_fixture(tmp_path)
+    archived, args = _archive_fixture(tmp_path)
+    inspected = _inspect(tmp_path, args)
+    retry = ("--apply", "--confirmed-writers-stopped", "--snapshot")
+    run(tmp_path, f'''
+import importlib.util
+from pathlib import Path
+import sys
+spec = importlib.util.spec_from_file_location('offline_archive_purge', {str(PURGE)!r})
+maintenance = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(maintenance)
+receipt = maintenance._receipt
+def interrupt(conn, incident, phase, scope, count):
+    if phase == 'archive_unlinked':
+        raise OSError('synthetic stop after unlink')
+    receipt(conn, incident, phase, scope, count)
+maintenance._receipt = interrupt
+sys.argv = {[str(PURGE), *map(str, args), *retry, inspected['snapshot']]!r}
+try:
+    maintenance.main()
+except SystemExit as exc:
+    assert exc.code == 2
+else:
+    raise AssertionError('maintenance interruption was swallowed')
+''')
+    assert not archived.exists()
+    with sqlite3.connect(db) as conn:
+        phases = {row[0] for row in conn.execute("SELECT phase FROM historical_audit_maintenance")}
+        assert phases == {"sql_scrubbed", "archive_intent"}
+    recovered = _inspect(tmp_path, args)
+    python(tmp_path, PURGE, *args, *retry, recovered["snapshot"])
+    neighbor = archived.with_name("different.txt")
+    neighbor.write_text(SUBJECT, encoding="utf-8")
+    archived.symlink_to(neighbor)
+    python(tmp_path, PURGE, *args, expected=2)
+    assert archived.is_symlink() and neighbor.read_text(encoding="utf-8") == SUBJECT

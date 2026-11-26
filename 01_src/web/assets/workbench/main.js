@@ -1,13 +1,14 @@
 import { byId, element } from './dom.js';
-import { renderInspector, renderTree } from './controls.js?v=3';
-import { CanvasView, imageAsset } from './canvas.js?v=4';
+import { renderInspector, renderTree } from './controls.js?v=4';
+import { CanvasView, imageAsset } from './canvas.js?v=5';
+import { hexDigest } from './sha256.js?v=1';
 import { initializeLibrary } from './library.js?v=4';
 import { legacyEditorUrl, sourceReturnUrl } from './navigation.js?v=1';
 import { categoryValues, displayGroups } from './categories.js?v=1';
 
 const api = '/api/v2/figure-workbench';
 const state = { project: null, groups: [], selected: null, expanded: new Set(), snapshots: [[]], cursor: 0,
-  epoch: 0, draft: 0, timer: null, flight: null, saving: false, previewOk: true };
+  epoch: 0, draft: 0, timer: null, flight: null, saving: false, previewOk: true, conflict: false };
 const starting = new URLSearchParams(location.search);
 const path = (id) => `${api}/projects/${encodeURIComponent(id)}`;
 const revisionUrl = (project, suffix = '') => `${path(project.figure_id)}${suffix}?revision=${project.render_version}`;
@@ -18,14 +19,12 @@ const status = (message, error = false) => {
   byId('status').textContent = message;
   byId('status').dataset.error = String(error);
 };
-const canvas = new CanvasView((id) => { showSideTab('objects'); selectGroup(id, false, true); }, (id, x, y) => {
-  if (state.saving) return;
-  const group = state.groups.find((entry) => entry.id === id);
-  if (!group?.properties.includes('offset_px')) return;
-  const previous = effective(group).offset_px || [0, 0];
-  const bound = (n) => Math.max(-200, Math.min(200, Math.round(n * 10) / 10));
-  applyChanges([{ group_id: id, property: 'offset_px', value: [bound(previous[0] + x), bound(previous[1] + y)] }]);
-});
+const canvas = new CanvasView((id, reveal = true) => { showSideTab('objects'); selectGroup(id, false, reveal); },
+  (id, value) => {
+    const group = state.groups.find((entry) => entry.id === id);
+    if (!group?.properties.includes('offset_px')) return false;
+    return applyChanges([{ group_id: id, property: 'offset_px', value }]);
+  });
 
 async function request(url, init = {}) {
   const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', ...init });
@@ -34,6 +33,7 @@ async function request(url, init = {}) {
   const detail = payload.detail;
   const error = new Error(typeof detail === 'string' ? detail : detail?.message || `请求失败（${response.status}）`);
   error.status = response.status;
+  error.code = payload.code;
   throw error;
 }
 
@@ -123,7 +123,9 @@ function renderToolbar() {
   const { project, saving, previewOk } = state;
   byId('undo').disabled = saving || state.cursor === 0;
   byId('redo').disabled = saving || state.cursor + 1 >= state.snapshots.length;
-  byId('save').disabled = saving || !changed() || !previewOk;
+  byId('save').disabled = saving || !changed() || !previewOk || state.conflict;
+  byId('recoverDraft').hidden = !state.conflict || !changed();
+  byId('recoverDraft').disabled = saving;
   byId('openLibrary').disabled = saving;
   byId('figureTitle').textContent = project?.title || '未打开图件';
   byId('revision').textContent = project ? `版本 ${project.render_version}${changed() ? ' · 草稿' : ''}` : '';
@@ -159,10 +161,13 @@ function renderExports() {
       try {
         const url = revisionUrl(project, `/export/${format}`);
         const response = await request(url, capability.state === 'generatable' ? { method: 'POST' } : {});
-        if (Number(response.headers.get('X-Figure-Revision')) !== revision || !response.headers.get('X-Figure-SHA256')) {
+        const digest = response.headers.get('X-Figure-SHA256');
+        if (Number(response.headers.get('X-Figure-Revision')) !== revision || !/^[a-f0-9]{64}$/.test(digest || '')) {
           throw new Error('导出返回了无法确认的图件版本。');
         }
-        const blobUrl = URL.createObjectURL(await response.blob());
+        const blob = await response.blob();
+        if (await hexDigest(await blob.arrayBuffer()) !== digest) throw new Error('导出内容与保存版本的摘要不一致。');
+        const blobUrl = URL.createObjectURL(blob);
         const link = element('a');
         link.href = blobUrl;
         link.download = `${project.title}-v${revision}.${format}`;
@@ -212,7 +217,13 @@ async function loadAsset(project) {
           response.headers.get('Content-Type')?.split(';')[0].trim() !== mime) {
         throw new Error('无法确认预览所对应的图件版本。');
       }
-      return await imageAsset(response, format);
+      const digest = response.headers.get('X-Figure-SHA256');
+      if (format === 'svg' && project.object_contract?.renderKey && project.object_contract.renderKey !== digest) {
+        throw new Error('预览与对象清单的渲染摘要不一致。');
+      }
+      const asset = await imageAsset(response, format, digest);
+      if (error) asset.warning = `${error.message} 已显示此版本的 ${format.toUpperCase()}。`;
+      return asset;
     } catch (failure) { error = failure; }
   }
   throw error || new Error(project.format_capabilities.svg?.reason || project.read_only_reason || '图件没有可读取的 SVG 或 PNG 预览。');
@@ -231,6 +242,7 @@ function activate(project, asset, { preserveFocus = false } = {}) {
   state.groups = displayGroups(project.groups);
   syncLocation(project);
   state.previewOk = true;
+  state.conflict = false;
   state.snapshots = [[]];
   state.cursor = 0;
   if (!preserveFocus) state.expanded = new Set();
@@ -243,36 +255,45 @@ function activate(project, asset, { preserveFocus = false } = {}) {
   renderProperties();
   renderExports();
   renderToolbar();
-  status(project.read_only_reason || project.presentation_note || '请选择对象或对象组。');
+  status(asset.warning || project.read_only_reason || project.presentation_note || '请选择对象或对象组。', !!asset.warning);
 }
 
 function applyChanges(entries) {
-  if (state.saving) return;
+  if (state.saving) return false;
   const before = new Map(commands().map((entry) => [commandKey(entry), entry]));
   for (const entry of entries) {
     const key = commandKey(entry);
     const initial = state.project.groups.find((group) => group.id === entry.group_id)?.values[entry.property];
-    if (JSON.stringify(entry.value) === JSON.stringify(initial)) before.delete(key);
+    if (JSON.stringify(entry.value) === JSON.stringify(initial ?? (entry.property === 'offset_px' ? [0, 0] : undefined))) before.delete(key);
     else before.set(key, entry);
   }
-  if (before.size > 200) { status('最多可以提交 200 项修改。', true); return; }
-  state.snapshots = [...state.snapshots.slice(0, state.cursor + 1), [...before.values()]];
+  if (before.size > 200) { status('最多可以提交 200 项修改。', true); return false; }
+  const next = [...before.values()];
+  if (JSON.stringify(next) === JSON.stringify(commands())) return false;
+  state.snapshots = [...state.snapshots.slice(0, state.cursor + 1), next];
   state.cursor += 1;
   updateDraft();
+  return true;
 }
 
 function updateDraft() {
+  canvas.finishDrag(null, true);
   state.previewOk = false;
   state.draft += 1;
+  canvas.setOffsets(commands(), state.project);
   renderGroups();
   renderProperties();
   renderToolbar();
   clearPreviewTimer();
+  if (state.conflict) {
+    status('图件已有更新。载入最新版以恢复本页草稿。', true);
+    return;
+  }
   status(changed() ? '正在重绘草稿…' : '正在恢复已保存图件…');
   state.timer = setTimeout(() => {
     state.timer = null;
     preview(state.epoch, state.draft);
-  }, 220);
+  }, 150);
 }
 
 async function preview(epoch, draft) {
@@ -287,20 +308,27 @@ async function preview(epoch, draft) {
       let asset;
       if (batch.length) {
         const response = await request(editUrl(project, 'preview'), post({ expected_revision: project.render_version,
-          draft_revision: draft, commands: batch }));
+          source_sha256: project.source_sha256, draft_revision: draft, commands: batch }));
         result = await response.json();
-        if (result.figure_id !== project.figure_id || result.render_version !== project.render_version || result.draft_revision !== draft) {
+        if (result.figure_id !== project.figure_id || result.render_version !== project.render_version ||
+            result.source_sha256 !== project.source_sha256 || result.draft_revision !== draft ||
+            result.object_contract?.draftRevision !== draft || result.object_contract.revision !== project.render_version ||
+            !/^[a-f0-9]{64}$/.test(result.object_contract.renderKey || '')) {
           throw new Error('草稿预览返回了无法确认的版本。');
         }
-        asset = await imageAsset(new Response(new Blob([result.svg], { type: 'image/svg+xml' })), 'svg');
+        asset = await imageAsset(new Response(new Blob([result.svg], { type: 'image/svg+xml' })), 'svg', result.object_contract.renderKey);
       } else asset = await loadAsset(project);
+      await canvas.idle;
       if (!current()) { URL.revokeObjectURL(asset.url); return; }
       state.previewOk = true;
       canvas.show(asset, result);
       canvas.focus(state.selected);
       status(batch.length ? '草稿预览已更新。' : '已恢复保存的图件。');
     } catch (error) {
-      if (current()) status(`预览失败，草稿仍在本页。${error.message}`, true);
+      if (current()) {
+        state.conflict = error.code === 'revision_conflict' || error.code === 'source_conflict';
+        status(`预览失败，草稿仍在本页。${error.message}`, true);
+      }
     } finally {
       if (current()) renderToolbar();
     }
@@ -311,7 +339,7 @@ async function preview(epoch, draft) {
 }
 
 async function save() {
-  if (state.saving || !state.previewOk || !changed()) return;
+  if (state.saving || state.conflict || !state.previewOk || !changed()) return;
   const project = state.project;
   state.saving = true;
   renderProperties();
@@ -319,9 +347,10 @@ async function save() {
   status('正在保存图件…');
   try {
     const response = await request(editUrl(project, 'save'), post({ expected_revision: project.render_version,
-      commands: commands() }));
+      source_sha256: project.source_sha256, draft_revision: state.draft, commands: commands() }));
     const saved = await response.json();
-    if (saved.figure_id !== project.figure_id || saved.render_version !== project.render_version + 1) {
+    if (saved.figure_id !== project.figure_id || saved.source_sha256 !== project.source_sha256 ||
+        saved.render_version !== project.render_version + 1) {
       throw new Error('保存回执版本无法确认，请从图件库重新打开。');
     }
     try { activate(saved, await loadAsset(saved), { preserveFocus: true }); }
@@ -346,12 +375,42 @@ async function save() {
     status(`已保存版本 ${saved.render_version}。`);
     library.refresh();
   } catch (error) {
+    state.conflict = error.code === 'revision_conflict' || error.code === 'source_conflict';
     status(`保存未确认，草稿仍在本页。${error.message}`, true);
   } finally {
     state.saving = false;
     renderToolbar();
     renderProperties();
   }
+}
+
+async function recoverDraft() {
+  if (!state.conflict || !changed() || state.saving) return;
+  const previous = state.project;
+  const draft = commands();
+  state.saving = true;
+  renderToolbar();
+  renderProperties();
+  try {
+    const current = await (await request(path(previous.figure_id))).json();
+    const groups = new Map(current.groups.map((group) => [group.id, group]));
+    if (current.figure_id !== previous.figure_id || current.render_version <= previous.render_version ||
+        current.source_sha256 !== previous.source_sha256 ||
+        draft.some(({ group_id: id, property }) => !groups.get(id)?.properties.includes(property))) {
+      throw new Error('最新版的来源或对象不再匹配，草稿保留在本页。');
+    }
+    const asset = await loadAsset(current);
+    activate(current, asset, { preserveFocus: true });
+  } catch (error) {
+    status(error.message, true);
+    return;
+  } finally {
+    state.saving = false;
+    renderToolbar();
+    renderProperties();
+  }
+  if (applyChanges(draft)) status('已恢复草稿，请核对在最新版上的修改。');
+  else status('最新版已包含草稿中的修改。');
 }
 
 const dialog = byId('library');
@@ -367,8 +426,9 @@ for (const [id, offset] of [['undo', -1], ['redo', 1]]) {
   });
 }
 byId('save').addEventListener('click', save);
+byId('recoverDraft').addEventListener('click', recoverDraft);
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && !dialog.open) {
+  if (event.key === 'Escape' && !event.defaultPrevented && !dialog.open) {
     openDrawer('left', false);
     openDrawer('right', false);
   }

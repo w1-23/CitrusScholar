@@ -389,6 +389,38 @@ def fetch_for_session(session_id: str, key: str, *, request_id: str = "",
         return None
 
 
+def prior_readback_page(row: dict, page_key: str) -> tuple[str, str] | None:
+    """Find an authenticated same-job exact page without loading duplicate bytes into the model."""
+    from src.core.jobs import get_job
+    from src.core.tracing import get_job_id, get_user_id
+
+    try:
+        sid = _authorized_result_session()
+        job_id = get_job_id()
+        job = get_job(job_id) if job_id else None
+        if (not job or job["session_id"] != sid or row.get("session_id") != sid
+                or job["owner_user_id"] != get_user_id()):
+            return None
+        request_id = job.get("client_request_id") or job["request_id"]
+        with _connect() as conn:
+            conn.row_factory = sqlite3.Row
+            records = conn.execute(
+                "SELECT * FROM tool_results WHERE session_id=? AND request_id=? AND retained=1 "
+                "AND tool_name='read_tool_result' AND status='complete' AND instr(result_text, ?) > 0 "
+                "ORDER BY rowid LIMIT 8", (sid, request_id, f'"readback_page_key": "{page_key}"')).fetchall()
+        for record in records:
+            candidate = dict(record)
+            if not storage_integrity(candidate)["complete"]:
+                continue
+            data = json.loads(candidate["result_text"])
+            if (isinstance(data, dict) and data.get("status") == "ok"
+                    and data.get("readback_page_key") == page_key and isinstance(data.get("result_text"), str)):
+                return candidate["tool_call_id"], candidate["full_sha256"]
+    except (PermissionError, sqlite3.Error, KeyError, TypeError, ValueError, RecursionError):
+        logger.debug("Prior exact readback lookup unavailable", exc_info=True)
+    return None
+
+
 def fetch_workbook_snapshot(snapshot_key: str) -> tuple[str, dict] | None:
     if not isinstance(snapshot_key, str) or re.fullmatch(r"[a-f0-9]{64}", snapshot_key) is None:
         return None

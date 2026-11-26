@@ -145,9 +145,20 @@ def test_unsaved_awaiting_input_restores_question_and_continuation_stays_unique(
         assert view["turns"][0]["question"]["id"] == question["id"]
         assert view["turns"][0]["user"] is None
         await save_turn(rt, sid, "parent-request")
-        answered = user_questions.answer_question(parent, question["id"], owner_user_id=rt.owner,
+        with pytest.raises(user_questions.QuestionConflict, match="question_legacy_dispatch_closed"):
+            user_questions.answer_question(parent, question["id"], owner_user_id=rt.owner,
+                session_id=sid, version=1, text="actual clarification reply", client_request_id="answer-key")
+        child = claim(rt, sid, key="child-request", status="failed")
+        from src.core import task_events
+        with task_events.transaction() as conn:
+            reply = {"text": "actual clarification reply", "selected_option_ids": [], "cancelled": False}
+            conn.execute("UPDATE task_questions SET status='answered',answer=?,answer_hash=?,child_job_id=? WHERE id=?",
+                         (task_events.canonical(reply), task_events.input_hash(reply), child, question["id"]))
+            conn.execute("UPDATE task_jobs SET parent_job_id=?,question_id=? WHERE job_id=?",
+                         (parent, question["id"], child))
+        retry = user_questions.answer_question(parent, question["id"], owner_user_id=rt.owner,
             session_id=sid, version=1, text="actual clarification reply", client_request_id="answer-key")
-        child = answered["child_job_id"]
+        assert retry["question"]["child_job_id"] == child and not retry["dispatch_required"]
         view = get_history(rt, sid)
         assert [t["job_id"] for t in view["turns"]] == [parent, child]
         continuation = view["turns"][1]
@@ -199,7 +210,7 @@ def test_missing_or_zero_detach_grace_does_not_schedule_cancellation(monkeypatch
     scheduled.assert_not_called()
 
 
-def test_clarification_child_reuses_original_server_skill_pin(runtime, tmp_path, monkeypatch):
+def test_native_clarification_keeps_original_server_skill_pin(runtime, tmp_path, monkeypatch):
     import hashlib
     import json
 
@@ -222,15 +233,19 @@ def test_clarification_child_reuses_original_server_skill_pin(runtime, tmp_path,
         context = {"query": "Fixture question", "selected_skills": [entry_id], **pin}
         question = user_questions.create_question(parent, owner_user_id=rt.owner, session_id=sid,
             prompt="Clarify scope", options=[], allow_text=True, context=context)
+        binding = {"question_id": question["id"], "interrupt_id": "skill-interrupt", "checkpoint_ref": "skill-checkpoint"}
         with pytest.raises(user_questions.QuestionConflict, match="question_skill_release_mismatch"):
-            user_questions.save_question_context(parent, dict(context, native_skill_release="/different/release"))
-        user_questions.save_question_context(parent, dict(context))
+            user_questions.save_question_context(parent, dict(context, native_skill_release="/different/release"), **binding)
+        user_questions.save_question_context(parent, dict(context), **binding)
         assert jobs.update_job(parent, status="awaiting_input")
         answered = user_questions.answer_question(parent, question["id"], owner_user_id=rt.owner,
-            session_id=sid, version=1, text="Clarification", client_request_id="skill-answer")
-        child = user_questions.get_continuation(answered["child_job_id"], owner_user_id=rt.owner, session_id=sid)
-        assert child["selected_skills"] == [entry_id]
-        assert task_release({}, resume=False, continuation_pin=stored_release_pin(child["continuation_context"])) == release
+            session_id=sid, version=1, interrupt_id=binding["interrupt_id"], text="Clarification", client_request_id="skill-answer")
+        assert answered["resume_job_id"] == parent
+        from src.core import task_events
+        with task_events.read_transaction() as conn:
+            stored = json.loads(conn.execute("SELECT context FROM task_questions WHERE id=?", (question["id"],)).fetchone()[0])
+        assert stored["selected_skills"] == [entry_id]
+        assert task_release(stored_release_pin(stored), resume=True) == release
         assert str(release) not in json.dumps(get_history(rt, sid))
 
     asyncio.run(scenario())

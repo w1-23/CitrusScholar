@@ -1,6 +1,7 @@
 """Publish scientific figures produced by the isolated script runner."""
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -61,7 +62,7 @@ def _session() -> str:
     return str(get_session_id() or "")
 
 
-def _error(code: str, message: str) -> tuple[str, dict]:
+def _error(code: str, message: str, *, execution_stage: str = "not_run") -> tuple[str, dict]:
     """A failed tool call, in the shape the executor reports.
 
     The reason code is what the execution ledger records, so it names the
@@ -69,6 +70,7 @@ def _error(code: str, message: str) -> tuple[str, dict]:
     """
     result = {
         "error": message,
+        "execution_stage": execution_stage,
         "_tool_outcome": {"status": "failed", "reason_code": code, "artifacts": []},
     }
     return f"[FIGURE_{code}] {message}", result
@@ -86,15 +88,21 @@ def _publish(filename: str, payload: bytes, mime: str,
     from src.research.artifacts import publish_artifact
     from src.core.tracing import get_client_request_id, get_current_tool_name
 
-    return publish_artifact(
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("图件导出为空。")
+    entry = publish_artifact(
         owner=_owner(), session_id=_session(), filename=filename,
         content=payload, mime=mime,
         producer_tool=get_current_tool_name() or "run_research_figure_script",
         request_id=get_client_request_id() or "",
         logical_task_id=logical_task_id)
+    if (not entry.get("file_id") or not entry.get("artifact_url") or entry.get("size") != len(payload)
+            or entry.get("sha256") != hashlib.sha256(payload).hexdigest()):
+        raise ValueError("图件登记未能证明与实际导出字节一致。")
+    return entry
 
 
-def _register_figure(svg_bytes: bytes, alt_text: str) -> str:
+def _register_figure(svg_bytes: bytes, alt_text: str, export: dict, *, workbench_url: str = "") -> str:
     """Register the figure for the chat inline preview.
 
     The existing figure registry turns a rendered SVG into the
@@ -104,7 +112,8 @@ def _register_figure(svg_bytes: bytes, alt_text: str) -> str:
     file are the same drawing.
     """
     from src.core.figures import register
-    index, _instruction = register(svg_bytes.decode("utf-8", "replace"), alt_text)
+    index, _instruction = register(svg_bytes.decode("utf-8"), alt_text,
+        download_url=export.get("download_url") or export["artifact_url"], workbench_url=workbench_url)
     return f"[[FIGURE:{index}]]"
 
 
@@ -171,8 +180,11 @@ def _run_research_figure_script(
     只创建Figure或末尾写fig不算登记；该路径可下载，但没有保真样式编辑凭证。
     emit.report(value)最多调用一次，集中提交结构化观察；过程日志用print，不把报告接口当追加日志。
     emit.table的单元格须为标量（字符串、数值、布尔或空），dict/list应拆列或显式编码为JSON字符串。
+    用户要求图件时声明至少一张图，实际导出并登记后才有交付凭据。
     纯探索/整理可声明空figures，emit.report返回有界观察；中间表不作默认附件，
     下一执行使用返回的dataset_ref；一次执行也可整理并绘图，不机械分步。
+    用户已指定 Python 或图型时直接沿用，只有影响科学含义的未知选择才询问。
+    有匹配的内置模板时优先按引用和参数执行，仅传必要参数。
     修复失败时先读取已保存run_id/tool_call_id的具体审核失败项，并复用真实输入与脚本版本；
     不用演示数据、占位图或降低字号/审核要求替代用户要的图件，不把调试图当正式成果。
     图件parents只引用输入绑定名或命名中间表；未声明时保守依赖全部输入与表。
@@ -258,7 +270,6 @@ def _run_research_figure_script(
         else:
             # Only the runtime can provide these, after resolving an owned run.
             # Validate again at the execution boundary before using its bytes.
-            script_replay_inputs({"input_snapshots": replay_snapshots}, _owner())
             snapshots = replay_snapshots
             data_refs = [{"kind": "input_snapshot", "file_id": item["file_id"],
                           "sha256": item["sha256"], "source_file_id": item["source_file_id"]}
@@ -280,7 +291,8 @@ def _run_research_figure_script(
         from src.research.script_execution import publish_script_outputs
         return publish_script_outputs(runner=runner, text=text, title=title,
             output_name=output_name, contract=contract, source=source,
-            data_refs=data_refs, profile=profile, settings=settings)
+            data_refs=data_refs, profile=profile, settings=settings,
+            replay=(inputs, sources, hashes))
     outputs = {fmt: f"figure.{fmt}" for fmt in formats}
     outputs["manifest"] = "objects.json"
     job = SandboxJob(
@@ -298,7 +310,7 @@ def _run_research_figure_script(
     except SandboxUnavailable as exc:
         return _error("SANDBOX_UNAVAILABLE", str(exc))
     except Exception as exc:  # noqa: BLE001
-        return _error("SANDBOX_ERROR", f"沙箱执行失败：{exc}")
+        return _error("SANDBOX_ERROR", f"沙箱执行失败：{exc}", execution_stage="sandbox_failed")
 
     if not result.ok:
         from src.research.script_reconciliation import observe_failed_worker
@@ -307,7 +319,7 @@ def _run_research_figure_script(
         code = {"timeout": "SCRIPT_TIMEOUT", "oom": "SCRIPT_OOM",
                 "forbidden": "SCRIPT_FORBIDDEN",
                 "output": "SCRIPT_OUTPUT"}.get(result.failure_kind, "SCRIPT_ERROR")
-        content, payload = _error(code, message)
+        content, payload = _error(code, message, execution_stage="sandbox_failed")
         if result.diagnostic:
             payload["diagnostic"] = result.diagnostic
         return content, payload
@@ -326,7 +338,8 @@ def _run_research_figure_script(
         if receipt.get("version") != 1 or receipt.get("profile") != parse_qa_profile(profile):
             raise ValueError("worker did not acknowledge profile QA")
     except (KeyError, TypeError, ValueError):
-        return _error("WORKER_PROTOCOL", "绘图沙箱没有返回完整对象清单，请更新沙箱镜像后重试。")
+        return _error("WORKER_PROTOCOL", "绘图沙箱没有返回完整对象清单，请更新沙箱镜像后重试。",
+                      execution_stage="output_verification_failed")
 
     manifest["data_provenance"] = {"input_snapshots": snapshots,
                                    "snapshot_policy": source["snapshot_policy"], **analysis_meta}
@@ -356,25 +369,32 @@ def _run_research_figure_script(
             continue
         published.append({"format": fmt, **entry})
     if not published:
-        return _error("PUBLISH", "请求格式均未交付。")
-
-    placeholder = ""
-    svg_bytes = result.outputs.get("svg")
-    if svg_bytes and any(item["format"] == "svg" for item in published):
-        try:
-            placeholder = _register_figure(svg_bytes, title or "科研图件")
-        except Exception:
-            placeholder = ""
+        return _error("PUBLISH", "请求格式均未交付。", execution_stage="figure_publication_failed")
 
     project = _record_project(
         title=title or stem, source_kind="script",
         source=source, manifest=manifest, exports=published, data_refs=data_refs)
+    workspace_url = f"/figures?project={project['figure_id']}" if project else ""
     if project:
         published.append({"format": "project", "figure_id": project["figure_id"],
-                          "workspace_url": f"/figures?project={project['figure_id']}"})
+                          "workspace_url": workspace_url})
+
+    placeholder = ""
+    stage_failures = [] if project else [{"reason_code": "project_persistence_failed"}]
+    svg_export = next((item for item in published if item["format"] == "svg"), None)
+    if svg_export:
+        try:
+            placeholder = _register_figure(result.outputs["svg"], title or "科研图件", svg_export,
+                                           workbench_url=workspace_url)
+        except Exception:
+            stage_failures.append({"reason_code": "inline_registration_failed"})
 
     summary = {
         "figure_id": project["figure_id"] if project else "",
+        "execution_stage": "outputs_verified",
+        "deliverable_stage": "figure_published",
+        "project_registered": bool(project),
+        "inline_registered": bool(placeholder),
         "title": title or stem,
         "objects": len(manifest.get("objects", [])),
         "qa_receipt": manifest.get("qa_receipt", {}),
@@ -385,7 +405,7 @@ def _run_research_figure_script(
         "backend": result.backend,
         "duration_ms": result.duration_ms,
         "editable": False,
-        "failures": publish_failures,
+        "failures": publish_failures + stage_failures,
         "note": ("脚本图件已保存，可在「图表工作台」查看和下载（/figures）。"
                  "这份脚本尚未分离分析与渲染；样式编辑需要冻结中间表和独立render_script，避免重算改变数值。"
                  if project else "图件已导出，但未能保存工作台项目；当前只能下载。"),
@@ -393,10 +413,10 @@ def _run_research_figure_script(
     qa_failures = _failed_qa_checks(receipt)
     summary["qa_failures"] = qa_failures
     summary["_tool_outcome"] = {
-        "status": "complete" if project and not publish_failures and not qa_failures else "partial",
+        "status": "partial" if publish_failures or qa_failures or stage_failures else "complete",
         "reason_code": ("format_publication_failed" if publish_failures else
                         "figure_qa_needs_attention" if qa_failures else
-                        "figure_published" if project else "project_persistence_failed"),
+                        stage_failures[0]["reason_code"] if stage_failures else "figure_published"),
         "artifacts": [item["artifact_url"] for item in published
                       if item.get("artifact_url")],
     }

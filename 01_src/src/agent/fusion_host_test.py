@@ -386,3 +386,52 @@ def test_independent_arxiv_observation_uses_one_distinct_registry_receipt(monkey
     assert len(seen) == len(set(seen)) == 3
     assert any("10.48550/arxiv.2401.12345" in url for url in seen)
     assert result["coverage"][0]["status"] == "queried"
+
+
+def test_workbook_xlsm_rejected_and_cas_answer_carries_confirmed_exact_coordinates(monkeypatch, tmp_path):
+    from hashlib import sha256
+    from io import BytesIO
+    from openpyxl import Workbook
+    from src.agent.fusion_worker_contract import input_path
+    from src.graph.task_contract import FusionDelivery
+
+    with pytest.raises(ValueError, match="fusion_input_format_invalid"):
+        input_path("data-audit", "workbook", "macros.XLSM")
+    output = BytesIO()
+    book = Workbook()
+    book.active.title = "Trials"
+    book.save(output)
+    book.close()
+    data = output.getvalue()
+    ref = {"file_id": "a" * 32, "sha256": sha256(data).hexdigest()}
+    inputs = {"workbook": ref}
+    regions = {"regions": [{"id": "experiment", "sheet": "Trials", "range": "B3:D20", "header_row": 4}]}
+    chosen = []
+    name = ["macros.xlsm"]
+    monkeypatch.setattr(fusion_tools, "_bound", lambda _skill: (object(), "fixture-call", tmp_path))
+    monkeypatch.setattr(fusion_tools, "_workbook_source", lambda _identity, exact: (data, name[0]) if exact == ref else pytest.fail("wrong source"))
+    def schedule(_identity, **kwargs):
+        chosen.append(kwargs)
+        return {"execution_id": "b" * 32, "status": "queued"}
+    monkeypatch.setattr(fusion_worker, "schedule_fusion", schedule)
+    run = fusion_tools.run_external_skill.func
+    _, result = run("data-audit", inputs, regions)
+    assert result["_tool_outcome"]["reason_code"] == "external_workbook_format_unsupported"
+    name[0] = "workbook.xlsx"
+    with fusion_tools.fusion_delivery_scope(FusionDelivery(), query="继续", previous_query="审查 Trials!B3:D20，表头为第4行。"):
+        assert run("data-audit", inputs, regions)[1]["_tool_outcome"]["reason_code"] == "external_workbook_regions_unconfirmed"
+    with fusion_tools.fusion_delivery_scope(FusionDelivery(), query="需要审查工作簿",
+            workbook_confirmation="确认 Trials!$B$3:$D$20，表头为第4行。"):
+        assert run("data-audit", inputs, regions)[1].get("execution_id") == "b" * 32
+    assert len(chosen) == 1 and chosen[0]["inputs"] == inputs and chosen[0]["options"] == regions
+
+
+def test_region_confirmation_does_not_borrow_header_from_adjacent_region():
+    from src.agent.fusion_worker_contract import confirmed_workbook_regions
+
+    regions = [{"id": "first", "sheet": "Sheet A", "range": "B3:D20", "header_row": 4},
+               {"id": "second", "sheet": "Sheet B", "range": "C3:H20", "header_row": 5}]
+    correct = "确认 'Sheet A'!B3:D20 表头第4行，'Sheet B'!C3:H20 表头第5行"
+    assert len(confirmed_workbook_regions(regions, correct)) == 2
+    with pytest.raises(ValueError, match="fusion_workbook_header_unconfirmed"):
+        confirmed_workbook_regions(regions, "确认 'Sheet A'!B3:D20，'Sheet B'!C3:H20 表头第4行和第5行")

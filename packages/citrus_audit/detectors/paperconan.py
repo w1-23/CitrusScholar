@@ -23,7 +23,7 @@ from openpyxl.utils import get_column_letter
 
 from ..integrity import _number, _rational
 
-METHOD_VERSION = "paperconan-adapt/2"
+METHOD_VERSION = "paperconan-adapt/3"
 SOURCE = {
     "repository": "https://github.com/zixixr/paperconan",
     "commit": "8d116455b23e858651250d8ed23ba41c1a87ab0d",
@@ -251,17 +251,22 @@ def _shared_tail(table, rows, columns):
             if not token:
                 continue
             mantissa = token.strip().lower().split("e", 1)[0].lstrip("+-")
-            digits = "".join(char for char in mantissa if char.isdigit())
-            if len(digits) < 2:
-                continue
-            grouped[column][row] = digits[-2:]
+            _, _, fraction = mantissa.partition(".")
+            if len(fraction) >= 2 and fraction.isdecimal():
+                grouped[column][row] = fraction[-2:]
     findings = []
+    tested, eligible_pairs, skipped_pairs = 0, 0, 0
     keys = list(grouped)
     for left_index, left in enumerate(keys):
         for right in keys[left_index + 1:]:
             common = sorted(set(grouped[left]) & set(grouped[right]))
+            if len(common) < 5:
+                skipped_pairs += 1
+                continue
+            tested += len(common)
+            eligible_pairs += 1
             same = [row for row in common if grouped[left][row] == grouped[right][row]]
-            if len(common) < 5 or len(same) / len(common) < 0.8:
+            if len(same) / len(common) < 0.8:
                 continue
             left_name = table.columns[table.column_numbers.index(left)]
             right_name = table.columns[table.column_numbers.index(right)]
@@ -272,7 +277,12 @@ def _shared_tail(table, rows, columns):
             findings.append(_finding(table, "pc_shared_decimal_tail",
                                      f"{left_name} 与 {right_name} 在 {len(same)}/{len(common)} 个可比较原始数值中共享末两位；需先确认仪器精度与舍入规则。",
                                      column=right, evidence=evidence))
-    return findings, {"state": "complete", "tested": sum(len(v) for v in grouped.values())}
+    limited = len(table.row_numbers) > _MAX_PAIR_ROWS or len(table.column_numbers) > _MAX_COLUMNS
+    state = "partial" if limited else "complete" if eligible_pairs else "not_applicable"
+    reason = ("table_pairing_budget" if limited else "" if eligible_pairs
+              else "no column pair had five overlapping original decimal values")
+    return findings, {"state": state, "tested": tested, "eligible_pairs": eligible_pairs,
+                      "skipped": skipped_pairs, "reason": reason}
 
 
 def detect_table(table, *, checks=None, field_roles=None):
@@ -284,7 +294,7 @@ def detect_table(table, *, checks=None, field_roles=None):
     findings = []
     receipts = {}
     if "pc_shared_decimal_tail" in selected:
-        found, receipt = _shared_tail(table, rows, columns)
+        found, receipt = _shared_tail(table, rows, tuple(coverage))
         findings.extend(found)
         receipts["pc_shared_decimal_tail"] = receipt
     if selected & _COLUMN_CHECKS:

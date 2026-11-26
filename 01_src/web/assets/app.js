@@ -1990,7 +1990,7 @@ function displayToolName(name) {
     deepseek_fetch_paper: '获取论文全文',
     local_hybrid_search: '本地检索', local_bm25_search: '本地检索',
     local_dense_search: '本地检索', citrus_rag_search: '本地检索',
-    read_account_file: '查阅资料', update_task_plan: '更新工作计划', write_todos: '更新工作计划',
+    read_account_file: '查阅资料', read_tool_result: '读取工具结果', update_task_plan: '更新工作计划', write_todos: '更新工作计划',
     draw_svg: '绘图',
     inspect_uploaded_table: '读取表格', audit_uploaded_table: '数据审查',
     audit_uploaded_data_bundle: '数据审查', audit_uploaded_data: '数据审查',
@@ -1998,7 +1998,7 @@ function displayToolName(name) {
     export_literature_evidence: '导出文献证据', export_paper_analysis: '导出论文解读',
     export_experiment_design: '导出实验方案', save_research_note: '保存课题记录',
     recall_research_notes: '查阅课题记录', export_research_notes: '导出课题记录',
-    export_corpus_gap_report: '导出语料清单'
+    export_corpus_gap_report: '导出语料清单', '读取历史结果': '读取工具结果'
   };
   var value = String(name || '');
   if (names[value]) return names[value];
@@ -2105,18 +2105,14 @@ function citedHrefKey(url) {
   catch (_) { return ''; }
 }
 
-function isCitationLink(href, label, bubbles) {
-  if (/^\/api\/v2\/(?:corpus\/source\b|shared-corpus\/documents\b)/.test(href)) return true;
-  if (/^(?:本地|联网)[：:]\s*\S/.test(label || '')) return true;
-  var key = citedHrefKey(href);
-  return !!key && (bubbles || []).some(function (s) {
-    return s && s.kind === 'web' && s.url && citedHrefKey(s.url) === key;
-  });
+function isPrivateCitationRoute(href) {
+  return /^\/api\/v2\/(?:corpus\/source\b|shared-corpus\/documents\b)/.test(href);
 }
 
 function renderCitationBubbles(container, bubbles, requestId, sid, producerJobId) {
   container.replaceChildren();
   container.classList.add('turn-citation-bubbles');
+  container.setAttribute('role', 'group'); container.setAttribute('aria-label', '本轮引证');
   var seen = new Set(), links = [];
   (Array.isArray(bubbles) ? bubbles : []).forEach(function (source) {
     var title = String(source.title || '来源');
@@ -2156,18 +2152,6 @@ function renderCitationBubbles(container, bubbles, requestId, sid, producerJobId
   container.hidden = !links.length;
 }
 
-function stripCitationMarkdown(text, bubbles) {
-  // Protect literal Markdown examples and inline code from link projection.
-  var parts = String(text || '').split(/(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)/g);
-  return parts.map(function (part, index) {
-    if (index % 2) return part;
-    return part.replace(/\[([^\[\]\n]+)\]\(([^\s()]+)\)/g, function (raw, label, href) {
-      if (!isCitationLink(href, label, bubbles)) return raw;
-      return /^(?:本地|联网)[：:]/.test(label) ? '' : label;
-    });
-  }).join('');
-}
-
 // Markdown is untrusted prose. Only these authenticated preview routes may
 // auto-fetch. Everything else is either a user-activated web link or alt text.
 function isTrustedProductImage(url) {
@@ -2201,10 +2185,10 @@ function renderMarkdownImage(token, title, text) {
   return label;
 }
 
-function renderMarkdownSafe(text, bubbles) {
+function renderMarkdownSafe(text) {
   // Accept bare SVG responses as well as fenced ```svg blocks.
   var svgBlocks = [];
-  var src = stripCitationMarkdown(text, bubbles);
+  var src = String(text || '');
   var svgPrefix = "CITRUS_SAFE_SVG_";
   while (src.includes(svgPrefix)) svgPrefix += "_";
   function svgToken(svg) {
@@ -2239,13 +2223,14 @@ function renderMarkdownSafe(text, bubbles) {
   renderer.link = function(token, title, text) {
     var href = typeof token === 'object' && token ? token.href : token;
     var label = typeof token === 'object' && token ? token.text : text;
-    if (!safeProductUrl(href, false) || isCitationLink(href, label, bubbles)) {
+    if (!safeProductUrl(href, false) || isPrivateCitationRoute(href)) {
       return escapeHtml(label || '');
     }
     return originalLink.apply(this, arguments);
   };
-  // v10.0: 回答不使用删除线——防模型输出 ~~...~~ 被 marked 渲染成"横线划掉"观感
-  src = src.replace(/~~/g, '');
+  renderer.del = function (token) {
+    return typeof token === 'object' ? this.parser.parseInline(token.tokens) : token;
+  };
   var rendered = marked.parse(src, { renderer: renderer, breaks: true });
   svgBlocks.forEach(function(block) {
     rendered = rendered.split('<p>' + block.token + '</p>').join(block.html);
@@ -3383,7 +3368,7 @@ function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
   var settled = false, browsePhase = '', activeMilestone = null;
   var liveMilestones = ['agent_prepare', 'agent_model_wait', 'agent_model_connected',
-    'agent_review_evidence', 'agent_review_answer'];
+    'agent_review_evidence', 'agent_review_answer', 'agent_resume_prepare'];
   var browseStages = {waiting: '等待浏览器', navigating: '正在访问网页', interacting: '正在读取或操作网页',
     downloading: '正在下载资料', verifying: '正在核验附件', organizing: '正在组织回答'};
   var panel = document.createElement('div'); panel.className = 'research-process';
@@ -3396,6 +3381,18 @@ function createResearchProcessPanel(goal) {
   var elapsed = document.createElement('span'); elapsed.className = 'research-task-elapsed'; elapsed.setAttribute('aria-live', 'off');
   line.appendChild(orbit); line.appendChild(label); line.appendChild(elapsed);
   panel.insertBefore(line, body);
+  var observation = document.createElement('div');
+  observation.className = 'research-task-observation'; observation.setAttribute('role', 'status');
+  observation.hidden = true; panel.insertBefore(observation, body);
+  var readFailures = new Set();
+  function readState(source, failed) {
+    if (failed) readFailures.add(source); else readFailures.delete(source);
+    var messages = [];
+    if (readFailures.has('status')) messages.push('暂时无法读取任务状态');
+    if (readFailures.has('replay')) messages.push('暂时无法补读任务事件');
+    observation.hidden = settled || !messages.length;
+    observation.textContent = messages.length ? messages.join('；') + '，正在重试。' : '';
+  }
   var timer = null, lastLabel = '', presentation = null;
   function stopClock() { if (timer !== null) { clearInterval(timer); timer = null; } }
   function timeText(seconds) {
@@ -3462,7 +3459,8 @@ function createResearchProcessPanel(goal) {
     elapsed: function (ms) { return (Math.max(0, Number(ms) || 0) / 1000).toFixed(1) + ' 秒'; }});
   function note(text, id, metadata) {
     if (!metadata || metadata.visibility !== 'public' || (metadata.origin !== 'model' && !(metadata.origin === 'host' && metadata.category)) || metadata.internal === true || metadata.private === true) return;
-    var item = view.note(text, id, Object.assign({}, metadata, {public_note: true}));
+    var preparation = metadata.origin === 'host' && ['agent_prepare', 'agent_resume_prepare'].includes(metadata.category);
+    var item = view.note(text, id, Object.assign({}, metadata, {public_note: true, status_only: preparation}));
     if (item && !settled && metadata.origin === 'host' && liveMilestones.includes(metadata.category) &&
         (!metadata.job_id || !knownJobId || metadata.job_id === knownJobId)) {
       activeMilestone = {text: text, category: metadata.category, step: metadata.step_id};
@@ -3485,7 +3483,7 @@ function createResearchProcessPanel(goal) {
     }
     else if (type === 'agent_recovery' && data.status === 'admitted') {
       view.begin(String(data.job_id || knownJobId) + '/' + String(data.seq || data.recovery_cursor || 'recovery'));
-      settled = false; browsePhase = ''; activeMilestone = null;
+      settled = false; browsePhase = ''; activeMilestone = null; readFailures.clear(); readState('', false);
       view.terminal(false); label.textContent = '正在恢复任务'; panel.classList.remove('has-failure');
     }
     else if (type === 'browse_phase' && !settled && ownsDetails() &&
@@ -3536,7 +3534,7 @@ function createResearchProcessPanel(goal) {
   function terminal(status) {
     var names = {completed: '已完成', partial: '部分完成', cancelled: '已停止', failed: '未完成'};
     if (!Object.prototype.hasOwnProperty.call(names, status)) return false;
-    settled = true; browsePhase = ''; activeMilestone = null;
+    settled = true; browsePhase = ''; activeMilestone = null; readFailures.clear(); readState('', false);
     stopClock(); line.dataset.state = status;
     label.textContent = names[status]; view.terminal();
     panel.classList.toggle('has-failure', status === 'failed');
@@ -3544,7 +3542,7 @@ function createResearchProcessPanel(goal) {
   }
   return {element: panel, label: label, elapsed: elapsed, body: body,
     note: note, receive: receive, terminal: terminal, answerVisible: answerVisible, projection: view.projection,
-    syncTask: syncTask, stopClock: stopClock};
+    syncTask: syncTask, stopClock: stopClock, readState: readState};
 }
 
 
@@ -3586,16 +3584,7 @@ function appendMessageActions(content, role, text) {
   var copy = document.createElement('button');
   copy.type = 'button'; copy.className = 'message-action'; copy.title = '复制内容';
   copy.setAttribute('aria-label', '复制内容'); copy.innerHTML = uiIcon('copy') + '<span>复制</span>';
-  copy.addEventListener('click', function() {
-    var value = String(text || '');
-    if (assistant) {
-      var bubbles = Array.from(content.querySelectorAll('.turn-citation-bubble[href]')).map(function (link) {
-        return {kind: 'web', url: link.getAttribute('href')};
-      });
-      value = stripCitationMarkdown(value, bubbles);
-    }
-    copyMessageText(value, copy);
-  });
+  copy.addEventListener('click', function() { copyMessageText(String(text || ''), copy); });
   actions.appendChild(copy);
   if (role === 'user') {
     var edit = document.createElement('button');
@@ -3656,11 +3645,12 @@ function isPublicTurnFile(file) {
     && ['internal', 'intermediate', 'working'].indexOf(String(file.purpose || file.role || '').toLowerCase()) < 0;
 }
 
-function filesAttributedToTurn(files, sid, rid, artifactIds) {
+function filesAttributedToTurn(files, sid, rid, artifactIds, verifiedFileIds) {
   return (files || []).filter(function(file) {
     if (!isPublicTurnFile(file) || (file.source_session_id && String(file.source_session_id) !== String(sid))) return false;
     if (file.turn_request_id && String(file.turn_request_id) !== String(rid)) return false;
-    if (Array.isArray(artifactIds)) return artifactIds.indexOf(String(file.artifact_id || file.file_id || '')) >= 0;
+    if (Array.isArray(verifiedFileIds) && verifiedFileIds.length) return verifiedFileIds.includes(String(file.file_id || ''));
+    if (Array.isArray(artifactIds)) return artifactIds.includes(String(file.artifact_id || '')) || artifactIds.includes(String(file.file_id || ''));
     return String(file.source_session_id || '') === String(sid) && String(file.turn_request_id || '') === String(rid);
   });
 }
@@ -3679,11 +3669,11 @@ function continuationProducer(entry, observedJobId) {
   return entry && entry.active_child_job_id === observedJobId ? observedJobId : '';
 }
 
-async function fetchTurnGeneratedFiles(sid, requestId, producerJobId, artifactIds) {
+async function fetchTurnGeneratedFiles(sid, requestId, producerJobId, artifactIds, verifiedFileIds) {
   if (!producerJobId) {
     if (!window.loadSessionFiles) return null;
     var library = await window.loadSessionFiles();
-    return library ? {requestId: requestId, files: filesAttributedToTurn(library.generated, sid, requestId, artifactIds)} : null;
+    return library ? {requestId: requestId, files: filesAttributedToTurn(library.generated, sid, requestId, artifactIds, verifiedFileIds)} : null;
   }
   var query = new URLSearchParams({request_id: requestId, producer_job_id: producerJobId});
   var response = await accountFetch('/api/v2/session/' + encodeURIComponent(sid) + '/turn-artifacts?' + query);
@@ -3692,7 +3682,35 @@ async function fetchTurnGeneratedFiles(sid, requestId, producerJobId, artifactId
   if (payload.request_id !== requestId || payload.producer_job_id !== producerJobId ||
       typeof payload.producer_request_id !== 'string' || !payload.producer_request_id || !Array.isArray(payload.files)) return null;
   return {requestId: payload.producer_request_id,
-    files: filesAttributedToTurn(payload.files, sid, payload.producer_request_id, artifactIds)};
+    files: filesAttributedToTurn(payload.files, sid, payload.producer_request_id, artifactIds, verifiedFileIds)};
+}
+
+function restoreTurnGeneratedFiles(content, sid, requestId, producerJobId, data, delivery, owns) {
+  if (!owns()) return;
+  data = data || {};
+  var envelope = data.turn_envelope || data.terminal_snapshot || data;
+  var artifactIds = Array.isArray(data.artifact_ids) ? data.artifact_ids : envelope.artifact_ids;
+  if (Array.isArray(artifactIds)) artifactIds = artifactIds.map(String);
+  var verifiedFileIds = delivery && delivery.verified_file_ids;
+  var key = JSON.stringify([producerJobId, artifactIds, verifiedFileIds]);
+  if (content._turnFileRead === key) return;
+  content._turnFileRead = key;
+  async function load(attempt) {
+    if (!owns() || content._turnFileRead !== key) return;
+    var result;
+    try { result = await fetchTurnGeneratedFiles(sid, requestId, producerJobId, artifactIds, verifiedFileIds); }
+    catch (_) { /* An unavailable read leaves confirmed delivery intact. */ }
+    if (!owns() || content._turnFileRead !== key) return;
+    if (result) {
+      recordTurnFileProducer(content, result.requestId);
+      appendTurnGeneratedFiles(content, result.files);
+    }
+    var expected = verifiedFileIds && verifiedFileIds.length || artifactIds && artifactIds.length || 0;
+    if (expected && (!result || result.files.length < expected) && attempt < 2) {
+      setTimeout(function () { void load(attempt + 1); }, 500 * (attempt + 1));
+    }
+  }
+  void load(0);
 }
 
 function syncHistoryTurnFiles() {
@@ -3969,18 +3987,6 @@ function _refIdSort(items) {
     });
   }
 
-/* v9.2: 引用编号统一重排已收敛到后端（evidence.renumber_refs）——citations 事件
-   附带 remap（旧ref_id → 新ref_id；数字 [n] 连续 1..k、[Wn] 连续 W1..Wm、
-   [Hn] 连续 H1..Hp）。前端只按 remap 通用重写正文与 ref_id，替代 v8.17.3
-   前端 W 专用压缩（_buildCompactRefMap/_rewriteWRefsInText 移除）。 */
-function _rewriteRefsByMap(text, remap) {
-  if (!text || !remap) return text;
-  return text.replace(/\[([WH]?)(\d+)\]/gi, function (full, pre, num) {
-    var key = pre ? String(pre).toUpperCase() + num : num;
-    return '[' + (remap[key] != null ? remap[key] : key) + ']';
-  });
-}
-
 // Hoisted to file scope: renderHistoryMessages() also renders tool status text,
 // and the previous nested declarations were invisible to it (refresh lost all
 // messages after the first tool row with a ReferenceError).
@@ -4024,7 +4030,15 @@ function toolStatusText(status, reason) {
     model_rate_limit: '模型请求频率受限', model_quota: '模型服务额度不足',
     model_auth: '模型服务认证失败', model_unavailable: '模型服务暂不可用',
     range_exhausted: '选择范围已处理完，没有新条目', output_missing: '没有生成所需产物',
-    service_restart: '服务进程中断，已保留已有记录'
+    service_restart: '服务进程中断，已保留已有记录',
+    browse_host_not_allowed: '受限浏览器未获准访问该来源，可使用已获准的来源',
+    browse_url_denied: '该网址超出受限浏览器的访问范围',
+    browse_dns_denied: '该来源不符合受限浏览器的地址访问范围',
+    browse_peer_mismatch: '该来源未通过受限浏览器的地址核验',
+    browse_not_authorized: '本轮没有受限浏览器访问权限',
+    browse_method_denied: '该操作超出受限浏览器的只读访问范围',
+    browse_network_error: '浏览器访问来源时网络失败',
+    browse_network_timeout: '浏览器访问来源超时'
   };
   var reasonText = reason ? ' · ' + (reasons[reason] || publicTaskStage(reason)) : '';
   if (status === 'complete' || status === 'completed') return '已完成';
@@ -4238,7 +4252,7 @@ async function sendMsg(paperVerification, continueFrom) {
   answerDiv.style.display = 'none';
 
   var citationsDiv = document.createElement('div');
-  citationsDiv.style.display = 'none';
+  citationsDiv.hidden = true;
 
   var deliveryDiv = document.createElement('div');
   deliveryDiv.className = 'turn-delivery';
@@ -4249,7 +4263,7 @@ async function sendMsg(paperVerification, continueFrom) {
   botContent.appendChild(deliveryDiv);
   botContent.appendChild(citationsDiv);
 
-  var fullText = '', citedBubbles = [];
+  var fullText = '';
   var isAnswerStarted = false;
   var isFinalAnswerArmed = false;
   var renderPending = false;
@@ -4259,7 +4273,12 @@ async function sendMsg(paperVerification, continueFrom) {
   var taskStore = CitrusTaskState.create({onEvent: handleEvent, request_id: clientRequestId, session_id: requestSessionId});
   var taskTransport = CitrusTaskTransport.create({store: taskStore, fetch: accountFetch, owns: ownsTurn,
     onSnapshot: reconcileTaskSnapshot,
-    onError: function () { if (ownsTurn()) { _turnDisconnected = true; syncWaiting(); } }
+    onReadState: function (source, failed) {
+      if (!ownsTurn()) return;
+      processPanel.readState(source, failed);
+      if (failed && navigator.onLine === false) { _turnDisconnected = true; syncWaiting(); }
+    },
+    onStreamInterrupted: function () { if (ownsTurn()) { _turnDisconnected = true; syncWaiting(); } }
   });
   var taskControls = CitrusTaskControls.create({container: botContent, store: taskStore, transport: taskTransport, owns: ownsTurn,
     readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
@@ -4286,7 +4305,8 @@ async function sendMsg(paperVerification, continueFrom) {
   refreshTaskComposer();
   var questionCard = CitrusTaskControls.createQuestion({container: botContent, store: taskStore, transport: taskTransport, owns: ownsTurn,
     onContinue: function (result) {
-      if (!queueEntry) refreshQuestionContinuation(result, ownsTurn, questionCard.element);
+      if (result.resume_job_id === taskStore.state.job_id) taskTransport.follow(result.resume_job_id);
+      else if (!queueEntry) refreshQuestionContinuation(result, ownsTurn, questionCard.element);
     }});
 
   function reconcileTaskSnapshot(job) {
@@ -4370,15 +4390,11 @@ async function sendMsg(paperVerification, continueFrom) {
   }
 
   function loadTurnGeneratedFiles(data) {
-    var producerJobId = continuationProducer(queueEntry, taskStore.state.job_id);
-    var artifactIds = Array.isArray(data && data.artifact_ids) ? data.artifact_ids.map(String) : null;
-    fetchTurnGeneratedFiles(requestSessionId, clientRequestId, producerJobId, artifactIds).then(function (result) {
-      // A later turn may be active. Only account/session/view changes retire
-      // this completed turn's DOM. Account-library growth is not attribution.
-      if (!result || epoch !== authEpoch || requestSessionId !== sessionId || !chatContainer.contains(botContent)) return;
-      recordTurnFileProducer(botContent, result.requestId);
-      appendTurnGeneratedFiles(botContent, result.files);
-    }).catch(function () {});
+    var jobId = taskStore.state.job_id, recovery = taskStore.state.recovery_cursor;
+    restoreTurnGeneratedFiles(botContent, requestSessionId, clientRequestId,
+      continuationProducer(queueEntry, jobId), data, taskStore.state.artifact_delivery, function () {
+        return ownsTurn() && taskStore.state.job_id === jobId && taskStore.state.recovery_cursor === recovery;
+      });
   }
 
   function renderAnswer() {
@@ -4398,7 +4414,7 @@ async function sendMsg(paperVerification, continueFrom) {
             if (q) qs.push(q);
           }
         }
-        answerDiv.innerHTML = renderMarkdownSafe(main, citedBubbles);
+        answerDiv.innerHTML = renderMarkdownSafe(main);
         if (qs.length > 0) {
           var cc = document.createElement('div'); cc.className = 'follow-up-container';
           var cl = document.createElement('div'); cl.className = 'follow-up-label'; cl.textContent = '深入探索（点击追问）'; cc.appendChild(cl);
@@ -4440,7 +4456,9 @@ async function sendMsg(paperVerification, continueFrom) {
     processPanel.receive(type, data);
     renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     if (type === 'agent_recovery' && data.status === 'admitted') {
-      hasTerminalEvent = false; snapshotOnly = false; fullText = '';
+      isCancelled = false; hasTerminalEvent = false; snapshotOnly = false; fullText = ''; botContent._turnFileRead = null;
+      answerDiv.replaceChildren(); answerDiv.style.display = 'none';
+      renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
       var timing = botContent.querySelector('.turn-timings'); if (timing) timing.remove();
       isFinalAnswerArmed = false; isAnswerStarted = false;
     }
@@ -4464,10 +4482,8 @@ async function sendMsg(paperVerification, continueFrom) {
     }
     if (type === 'citations') {
       if (data.display === 'bubble_only') {
-        citedBubbles = Array.isArray(data.bubbles) ? data.bubbles : [];
-        renderCitationBubbles(citationsDiv, citedBubbles, clientRequestId, requestSessionId,
+        renderCitationBubbles(citationsDiv, data.bubbles, clientRequestId, requestSessionId,
           continuationProducer(queueEntry, taskStore.state.job_id));
-        if (fullText) renderAnswer();
       }
       return;
     }
@@ -4478,7 +4494,7 @@ async function sendMsg(paperVerification, continueFrom) {
       if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
         applyTurnEnvelope(data); hasTerminalEvent = true; clearTimeout(spinnerTimeout); finishStatus();
         if (data.answer) {
-          fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText, citedBubbles);
+          fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText);
           if (String(data.answer).trim()) processPanel.answerVisible();
         }
         loadTurnGeneratedFiles(data);
@@ -4488,7 +4504,7 @@ async function sendMsg(paperVerification, continueFrom) {
     if ((type === 'done' || type === 'error') && !CitrusTaskState.displayStatus(data)) {
       if (data.question || taskStore.state.question && taskStore.state.question.status === 'pending' || data.status === 'awaiting_input' || (data.turn_envelope || {}).display_status === 'awaiting_input') {
         statusLabel.textContent = '等待你的选择'; clearTimeout(spinnerTimeout); setSendDisabled(false);
-        if (data.answer) { fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText, citedBubbles); }
+        if (data.answer) { fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText); }
       } else { appendNoticeRow('任务状态待确认，正在等待执行记录。'); }
       return;
     }
@@ -4573,12 +4589,12 @@ async function sendMsg(paperVerification, continueFrom) {
         break;
       case 'done':
         snapshotOnly = false;
-        hasTerminalEvent = true;
         _turnDisconnected = false;
         clearStageLine();
         // One authoritative reducer: the server TurnEnvelope owns the terminal
         // state. Local tool rows never promote a partial turn to completed.
         var _terminal = applyTurnEnvelope(data);
+        hasTerminalEvent = !!_terminal;
         // The mascot has no "partial" state; only a fully completed turn gets
         // the success animation, everything else stays neutral or fails.
         mascotSay(_terminal === 'completed' ? 'completed'
@@ -4592,7 +4608,7 @@ async function sendMsg(paperVerification, continueFrom) {
         }
         // P0: 本轮已落库——拉一次最新索引，把临时刻度换成真实 ID
         if (window.turnRail && window.turnRail.sync) window.turnRail.sync(clientRequestId, query);
-        clearTimeout(spinnerTimeout); isCancelled=true; answerDiv.style.display=''; finishStatus();
+        clearTimeout(spinnerTimeout); isCancelled = hasTerminalEvent; answerDiv.style.display=''; finishStatus();
         window._activeTurnStatusUpdater = null;
         if (activeTurnCancel === stopCurrentTurn) activeTurnCancel = null;
         // v8.3.7 M3: 引用无检索支撑 → 轻提示（不阻断回答）
@@ -4646,7 +4662,7 @@ async function sendMsg(paperVerification, continueFrom) {
           }
         } catch (_ae) {}
         if (fullText) {
-          answerDiv.innerHTML=renderMarkdownSafe(fullText.replace(/__NEED_COMPLEX__/g,''), citedBubbles);
+          answerDiv.innerHTML=renderMarkdownSafe(fullText.replace(/__NEED_COMPLEX__/g,''));
         }
         if (fullText.indexOf('__NEED_COMPLEX__')>=0) {
           var uc=document.createElement('div');uc.style.cssText='margin-top:12px;text-align:center';
@@ -4794,7 +4810,7 @@ async function sendMsg(paperVerification, continueFrom) {
     if (!observer || queueFollowedJobId === observer) return;
     if (queueFollowedJobId) {
       fullText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
-      citedBubbles = []; renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
+      renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
       hasTerminalEvent = false; snapshotOnly = false;
     }
     queueFollowedJobId = observer;
@@ -5935,7 +5951,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
   var epoch = authEpoch, sid = sessionId, round = currentRoundId, armed = false, streamedAnswer = '', closed = false;
   var binding = null, entry = turn.queueEntry, unwatchQueue = null, observed = '', queueStatus, disconnected = false;
   var hasSavedAnswer = !!String(turn.answer && turn.answer.content || '').trim(), finalAnswerReceived = false;
-  var savedCitations = turn.answer && turn.answer.citation_bubbles || [];
   var citationContainer = content.querySelector('.turn-citation-bubbles');
   function syncWaiting() {
     process.syncTask(store.state, entry, {hasAnswer: hasSavedAnswer || !!streamedAnswer.trim(),
@@ -5982,6 +5997,15 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       if (labels[store.state.status]) process.label.textContent = labels[store.state.status];
     }
     projectContext(); questionLabel(); syncWaiting(); reconcileControls();
+    if (CitrusTaskState.isTerminal(store.state)) loadGeneratedFiles(job);
+  }
+  function loadGeneratedFiles(data) {
+    var jobId = store.state.job_id, recovery = store.state.recovery_cursor;
+    if (!jobId) return;
+    restoreTurnGeneratedFiles(content, sid, turn.turnRequestId, continuationProducer(entry, jobId),
+      data, store.state.artifact_delivery, function () {
+        return owns() && store.state.job_id === jobId && store.state.recovery_cursor === recovery;
+      });
   }
   function dispose() {
     if (closed) return;
@@ -6004,24 +6028,24 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     renderArtifactDelivery(content, store.state.artifact_delivery);
     if (type === 'agent_recovery' && data.status === 'admitted') {
       answer.dataset.displayStatus = '';
-      finalAnswerReceived = false; armed = false; streamedAnswer = '';
+      finalAnswerReceived = false; armed = false; streamedAnswer = ''; content._turnFileRead = null;
+      hasSavedAnswer = false; answer.replaceChildren();
+      if (citationContainer) renderCitationBubbles(citationContainer, [], turn.turnRequestId, sid);
       var timing = content.querySelector('.turn-timings'); if (timing) timing.remove();
     }
     if (type.indexOf('context_') === 0 || data.context_snapshot) projectContext();
     if (type === 'citations' && data.display === 'bubble_only') {
-      savedCitations = Array.isArray(data.bubbles) ? data.bubbles : [];
       if (!citationContainer) {
         citationContainer = document.createElement('div'); content.appendChild(citationContainer);
       }
-      renderCitationBubbles(citationContainer, savedCitations, turn.turnRequestId, sid,
+      renderCitationBubbles(citationContainer, data.bubbles, turn.turnRequestId, sid,
         continuationProducer(entry, store.state.job_id));
-      if (!hasSavedAnswer && streamedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer, savedCitations);
     }
     if (!finalAnswerReceived && isPublicAnswerEvent(data)) {
       if (type === 'answer_start') armed = true;
       if (type === 'text' && armed && data.delivery === 'committed' && typeof data.content === 'string') {
         streamedAnswer += data.content;
-        if (!hasSavedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer, savedCitations);
+        if (!hasSavedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer);
       }
       if (type === 'text_reset') {
         armed = false; streamedAnswer = '';
@@ -6029,7 +6053,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       }
     }
     if ((type === 'done' || type === 'error') && data.answer) {
-      answer.innerHTML = renderMarkdownSafe(data.answer, savedCitations);
+      answer.innerHTML = renderMarkdownSafe(data.answer);
       if (String(data.answer).trim()) process.answerVisible();
     }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
@@ -6040,29 +6064,29 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       }
       process.terminal(CitrusTaskState.displayStatus(data));
       answer.dataset.displayStatus = CitrusTaskState.displayStatus(data);
-      var producerJobId = continuationProducer(entry, store.state.job_id);
-      if (producerJobId || Array.isArray(data.artifact_ids)) {
-        var fileIds = Array.isArray(data.artifact_ids) ? data.artifact_ids.map(String) : null;
-        fetchTurnGeneratedFiles(sid, turn.turnRequestId, producerJobId, fileIds).then(function (result) {
-          if (!owns() || !result) return;
-          recordTurnFileProducer(content, result.requestId);
-          appendTurnGeneratedFiles(content, result.files);
-        }).catch(function () {});
-      }
+      loadGeneratedFiles(data);
     }
     if (type === 'request_user_input' || type === 'question' || type === 'done') questionLabel();
     syncWaiting();
     reconcileControls();
   }});
   var transport = CitrusTaskTransport.create({store: store, fetch: accountFetch, owns: owns, onSnapshot: snapshot,
-    onError: function () { if (owns()) { disconnected = true; syncWaiting(); } }});
+    onReadState: function (source, failed) {
+      if (!owns()) return;
+      process.readState(source, failed);
+      if (failed && navigator.onLine === false) { disconnected = true; syncWaiting(); }
+    },
+    onStreamInterrupted: function () { if (owns()) { disconnected = true; syncWaiting(); } }});
   var controls = CitrusTaskControls.create({container: content, store: store, transport: transport, owns: owns,
     readDraft: readSupplementDraft, onReconcile: reconcileSupplement,
     onChange: function() {
       if (binding) reconcileControls();
     }});
   var questionCard = CitrusTaskControls.createQuestion({container: content, store: store, transport: transport, owns: owns,
-    onContinue: function (result) { if (!entry) refreshQuestionContinuation(result, owns, questionCard.element); }});
+    onContinue: function (result) {
+      if (result.resume_job_id === store.state.job_id) transport.follow(result.resume_job_id);
+      else if (!entry) refreshQuestionContinuation(result, owns, questionCard.element);
+    }});
   store.hydrate({job_id: turn.jobId, status: turn.jobStatus, terminal_snapshot: turn.terminalSnapshot,
     artifact_delivery: turn.artifactDelivery, question: turn.question, context_snapshot: turn.contextSnapshot});
   if (useComposer || entry && entry.state !== 'terminal') {
@@ -6162,7 +6186,7 @@ function bindSettledHistoryDetails(turn, content, answer, process) {
           if ((type === 'done' || type === 'error') && event.seq >= (page.recovery_cursor || 0)) renderTurnTimings(content, data);
           if (recoveryAnswer && event.seq >= (page.recovery_cursor || 0) && (type === 'done' || type === 'error') && typeof data.answer === 'string' &&
               data.answer.trim() && isPublicAnswerEvent(data)) {
-            answer.innerHTML = renderMarkdownSafe(data.answer, data.citation_bubbles);
+            answer.innerHTML = renderMarkdownSafe(data.answer);
             appendMessageActions(content, 'assistant', data.answer);
           }
         });
@@ -6222,7 +6246,7 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     contentEl.dataset.sessionId = sessionId;
     var answerBody = document.createElement('div'); answerBody.className = 'turn-answer';
     answerBody.dataset.displayStatus = turn.displayStatus;
-    answerBody.innerHTML = renderMarkdownSafe(answer.content, answer.citation_bubbles); contentEl.appendChild(answerBody);
+    answerBody.innerHTML = renderMarkdownSafe(answer.content); contentEl.appendChild(answerBody);
     if (answer.citation_bubbles && answer.citation_bubbles.length) {
       var citationRow = document.createElement('div');
       contentEl.appendChild(citationRow);

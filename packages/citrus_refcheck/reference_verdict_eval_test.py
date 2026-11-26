@@ -374,3 +374,30 @@ def test_doi_and_arxiv_are_independent_and_retraction_survives():
     missing = verify_batch(inventory, capabilities=Capabilities(lambda: None, lambda query: None,
         lookup_doi=lookup))["entries"][0]["evidence"]
     assert missing["match_status"] != "matching"
+
+
+def test_batch_deduplicates_normalized_title_and_keeps_linked_preprint_doi_independent():
+    from collections import Counter
+    from citrus_refcheck.verification import Capabilities, Observation, verify_batch
+
+    seen = Counter()
+
+    def observe(query, _deadline):
+        seen[query.kind] += 1
+        published = {'doi': '10.5555/published', 'title': 'Bounded Work', 'source_ref': 'registry'}
+        arxiv = {'arxiv_id': '2401.12345', 'doi': '10.48550/arxiv.2401.12345',
+                 'related_dois': ['10.5555/published'], 'title': 'Bounded Work', 'source_ref': 'preprint'}
+        return Observation('Fixture', 200, (arxiv if query.kind == 'arxiv' else published,))
+
+    citations = [{'doi': '10.5555/published', 'arxiv_id': '2401.12345', 'title': 'Bounded Work'},
+                 {'title': 'Bounded Work'}, {'title': 'BOUNDED, WORK!'}]
+    entries = [{'record_index': index, 'record_id': str(index), 'citation': '', 'claims': claims}
+               for index, claims in enumerate(citations, start=1)]
+    result = verify_batch({'entries': entries}, capabilities=Capabilities(lambda: None, lambda _: None,
+        lookup_doi=observe, lookup_arxiv=observe, search=observe))
+    assert seen == {'doi': 1, 'arxiv': 1, 'search': 1}
+    linked = result['entries'][0]['evidence']
+    assert linked['match_status'] == 'matching' and not linked['differences']
+    assert linked['identifier_checks']['arxiv']['match']['doi'] == '10.48550/arxiv.2401.12345'
+    assert not linked['identifier_checks']['arxiv']['differences']
+    assert all(row['evidence']['match_status'] == 'matching' for row in result['entries'])

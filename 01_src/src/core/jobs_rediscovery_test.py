@@ -50,14 +50,17 @@ def test_task_presence_is_one_owner_scoped_batch_query(monkeypatch):
     add_job(2, session="foreign-only", owner=2)
     add_job(3, session="outside-list")
     queries = []
-    connect = jobs._connect
+    from contextlib import contextmanager
+    read = jobs.read_transaction
 
-    def traced_connect():
-        conn = connect()
-        conn.set_trace_callback(queries.append)
-        return conn
+    @contextmanager
+    def traced_read():
+        with read() as conn:
+            conn.set_trace_callback(queries.append)
+            yield conn
 
-    monkeypatch.setattr(jobs, "_connect", traced_connect)
+    monkeypatch.setattr(jobs, "_connect", lambda: pytest.fail("read opened a writer"))
+    monkeypatch.setattr(jobs, "read_transaction", traced_read)
     assert jobs.sessions_with_jobs(["owned-empty", "foreign-only", "none", "owned-empty"], 1) == {"owned-empty"}
     selects = [q for q in queries if q.startswith("SELECT DISTINCT session_id")]
     assert len(selects) == 1

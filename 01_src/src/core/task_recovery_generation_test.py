@@ -45,6 +45,8 @@ def test_recovered_run_has_one_new_question_and_keeps_old_done_immutable(identit
     second = _question(identity, "A new exact question after recovery")
     assert second["id"] != first["id"] and second["recovery_cursor"] == cursor
     assert _question(identity, second["prompt"])["id"] == second["id"]
+    second = user_questions.save_question_context(run, {}, question_id=second["id"],
+        interrupt_id="second-interrupt", checkpoint_ref="second-checkpoint")
     with pytest.raises(user_questions.QuestionConflict, match="question_already_exists"):
         _question(identity, "Not another question in this generation")
     assert task_events.projection(run)["recovery_cursor"] == cursor
@@ -57,10 +59,11 @@ def test_recovered_run_has_one_new_question_and_keeps_old_done_immutable(identit
     with pytest.raises(user_questions.QuestionConflict, match="question_version_conflict"):
         user_questions.answer_question(run, first["id"], **scope, version=1, text="stale", client_request_id="old")
     assert jobs.update_job(run, status="awaiting_input")
-    answer = user_questions.answer_question(run, second["id"], **scope, version=1, text="fresh", client_request_id="new")
-    assert user_questions.get_continuation(answer["child_job_id"], **scope)["question_answer"]["question"]["id"] == second["id"]
-    action, child = user_questions.queue_wait_state(run, **scope)
-    assert (action, child) == ("dispatch", answer["child_job_id"])
+    answer = user_questions.answer_question(run, second["id"], **scope, version=1,
+        interrupt_id=second["interrupt_id"], text="fresh", client_request_id="new")
+    assert user_questions.question_resume(identity)["value"]["question_id"] == second["id"]
+    assert user_questions.queue_wait_state(run, **scope) == ("dispatch", answer["resume_job_id"])
+    assert answer["resume_job_id"] == run and answer["question"]["child_job_id"] == ""
 
 
 def test_question_read_is_side_effect_free_for_expired_row(identity, monkeypatch):
@@ -92,7 +95,9 @@ def test_old_question_schema_migrates_transactionally_to_initial_generation(tmp_
         old = conn.execute("SELECT id,recovery_cursor,pin_until FROM task_questions").fetchone()
         assert tuple(old) == ("old", 0, 100)
     with task_events.transaction() as conn:
-        conn.execute("INSERT INTO task_questions SELECT 'new',job_id,owner_user_id,session_id,version,status,question,context,"
+        conn.execute("INSERT INTO task_questions(id,job_id,owner_user_id,session_id,version,status,question,context,"
+                     "answer,answer_hash,client_request_id,child_job_id,created_at,expires_at,pin_until,recovery_cursor) "
+                     "SELECT 'new',job_id,owner_user_id,session_id,version,status,question,context,"
                      "answer,answer_hash,client_request_id,child_job_id,created_at,expires_at,pin_until,44 FROM task_questions")
         assert conn.execute("SELECT COUNT(*) FROM task_questions WHERE job_id='job'").fetchone()[0] == 2
 
@@ -142,3 +147,32 @@ def test_safe_resume_rejects_orphan_owner_and_legacy_missing_call(identity):
     with pytest.raises(task_events.TaskConflict, match="unsafe_or_unavailable_resume"):
         task_events.claim_resume(run, orphan, OWNER)
     assert not any(op["resumable"] for op in task_events.projection(run)["operations"])
+
+
+def test_question_manifest_optional_refs_and_strict_field_identity(monkeypatch):
+    from src.agent.preset_catalog import build_preset_catalog
+    from src.core.user_questions import UserQuestionInput, validate_question_refs
+
+    from src.agent.model import ModelDriver
+
+    row, = ModelDriver(build_preset_catalog())._schemas_for({"request_user_input"})
+    parameters = row["function"]["parameters"]
+    option = parameters["properties"]["options"]["items"]
+    definitions = parameters.get("$defs", {})
+    option = definitions[option["$ref"].rsplit("/", 1)[-1]] if "$ref" in option else option
+    assert "refs" in option["properties"] and "refs" not in option["required"]
+    payload = {"prompt": "Specify a field or use a preference", "multi_select": False,
+               "allow_text": True, "options": [{"id": "use", "label": "Use", "description": "Preference"}]}
+    data = UserQuestionInput.model_validate(payload)
+    assert data.options[0].refs == []
+    assert data.options[0].refs is not UserQuestionInput.model_validate(payload).options[0].refs
+    payload["options"][0]["refs"] = [{"kind": "source_field", "dataset_ref": None,
+        "file_id": "offline-file", "sha256": "f" * 64, "sheet": "Data", "column": "Measured"}]
+    options = UserQuestionInput.model_validate(payload).model_dump()["options"]
+    trusted = {"file_id": "offline-file", "sha256": "f" * 64, "sheet": "Data", "columns": ["Measured"]}
+    monkeypatch.setattr("src.session.files.get_account_file", lambda fid, owner, **kwargs: trusted if owner == OWNER else None)
+    validate_question_refs(options, OWNER, {"source_refs": [trusted]})
+    with pytest.raises(ValueError, match="field_not_in_trusted_source_schema"):
+        validate_question_refs(options, OWNER, {"source_refs": [{**trusted, "sheet": "Other"}]})
+    with pytest.raises(ValueError, match="source_version_changed"):
+        validate_question_refs(options, OWNER+1, {"source_refs": [trusted]})

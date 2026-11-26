@@ -8,7 +8,7 @@
   <script src="/assets/citrus-theme.js?v=2"></script>
   <link rel="stylesheet" href="/assets/admin.css?v=5">
   <link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
-  <script src="/assets/admin.js?v=6" defer></script>
+  <script src="/assets/admin.js?v=7" defer></script>
 </head>
 <body data-page="admin">
   <header class="topbar">
@@ -88,7 +88,7 @@
       <div class="audit-pager"><button class="button secondary" type="button" id="invitesNewer">上一页</button><span id="invitesPageLabel"></span><button class="button secondary" type="button" id="invitesOlder">下一页</button></div>
     </section>
     <section class="panel">
-      <div class="panel-heading audit-heading"><div><h2>请求记录</h2><p>问题、回答与工具执行摘要；附件仅显示元信息</p></div><form id="auditSearch"><input id="auditQuery" type="search" placeholder="搜索问题或用户名"><button class="button secondary" type="submit">搜索</button></form></div>
+      <div class="panel-heading audit-heading"><div><h2>请求记录</h2><p>用户名、任务状态、工具与附件元数据</p></div><form id="auditSearch"><input id="auditQuery" type="search" placeholder="搜索用户名、会话或请求 ID"><button class="button secondary" type="submit">搜索</button></form></div>
       <div class="audit-list" id="auditList"><p class="muted">正在加载…</p></div>
       <div class="audit-pager"><button class="button secondary" id="olderButton">更早记录</button><span id="auditPageLabel"></span><button class="button secondary" id="newerButton">更新记录</button></div>
     </section>
@@ -115,9 +115,10 @@
       </div>
     </section>
     <section class="panel" id="isolatedCorpusPanel" hidden>
-      <div class="panel-heading corpus-heading"><div><h2>第六库入库任务</h2><p>查看独立队列的原件准备、授权和发布状态。</p></div>
+      <div class="panel-heading corpus-heading"><div><h2>第六库入库任务</h2><p>查看候选、原件、授权、准备、编码、索引、发布和检索资格。</p></div>
         <button class="button secondary" type="button" id="isolatedCorpusRefresh">刷新</button>
       </div>
+      <p class="muted" id="isolatedCorpusAutomatic"></p>
       <form id="isolatedCorpusForm" hidden>
         <label>公开文献来源
           <select id="isolatedCorpusKind"><option value="doi">DOI</option><option value="pmid">PMID</option>

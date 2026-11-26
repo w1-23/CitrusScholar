@@ -18,7 +18,7 @@ from typing import Annotated, Any
 from deepagents import DeepAgentState
 from langchain.agents.middleware import AgentMiddleware, ModelRefusalMiddleware, hook_config
 from langchain.tools import ToolRuntime
-from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode
@@ -58,6 +58,7 @@ class HarnessState(DeepAgentState):
     # A synchronously committed wake awaiting host acknowledgment. Keep it in
     # the checkpoint until all acknowledgments succeed, including after a crash.
     execution_wake: NotRequired[list[str]]
+    user_input_wake: NotRequired[dict]
     stop_status: NotRequired[str]
     stop_reason: NotRequired[str]
     # Raw rejected responses remain in the encrypted execution checkpoint,
@@ -124,8 +125,13 @@ class HarnessRuntime:
     not_run: Any = None
     check_terminal_orphan: Any = None
     restore_tool_observation: Any = None
-    authorized_question_parent: str = ""
+    user_input: dict | None = None
+    bind_user_input: Any = None
+    accept_user_input: Any = None
+    acknowledge_user_input: Any = None
+    check_retired_question: Any = None
     model_call: Any = None
+    diagnostic_checkpoint: str = ""
 
     async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None,
                   agent_options=None, pinned_skills=()):
@@ -218,7 +224,7 @@ class HarnessRuntime:
                     if isinstance(message, AIMessage)
                     and message.additional_kwargs.get("context_turn_id") == identity.user_turn_id
                     for call in message.tool_calls}
-                if ids and (any(not isinstance(cid, str) or not cid.strip() or cid != cid.strip()
+                if not invalid.startswith("model_") and ids and (any(not isinstance(cid, str) or not cid.strip() or cid != cid.strip()
                                 or any(ord(char) < 32 for char in cid) for cid in ids)
                             or len(set(ids)) != len(ids) or previous.intersection(ids)):
                     invalid = "invalid_or_reused_tool_call_id"
@@ -386,20 +392,35 @@ class HarnessRuntime:
             state_schema = HarnessState
 
             async def abefore_model(self, state, runtime):
-                publish_native_plan(state, identity, published_todos)
                 signals = list((state.get("operation_signals") or {}).values())
                 if any(item.get("uncertain") for item in signals):
                     return None
-                asking = any(item.get("pending_question") for item in signals)
+                questions = [item["pending_question"] for item in signals if item.get("pending_question")]
                 waits = tuple(dict.fromkeys(wait for item in signals for wait in item.get("execution_waits", ())))
-                if not asking and not waits:
+                if not questions and not waits:
+                    publish_native_plan(state, identity, published_todos)
                     return None
                 from .runtime import validate_execution_waits, _pending_calls
                 validate_execution_waits(waits)
-                if _pending_calls(state["messages"]) or (asking and waits):
+                if _pending_calls(state["messages"]) or (questions and waits) or len(questions) > 1:
                     raise ValueError("execution_suspension_requires_paired_messages")
-                wake = interrupt({"kind": "user_input" if asking else "execution_wait", "wait_ids": list(waits)})
-                if asking or not isinstance(wake, dict) or set(wake) != {"completion_notes"}:
+                if questions:
+                    from src.core.user_questions import QuestionResume
+                    question = questions[0]
+                    wake = QuestionResume.model_validate(interrupt({"kind": "user_input", **question},
+                        response_schema=QuestionResume.model_json_schema()))
+                    if (wake.question_id, wake.version) != (question["question_id"], question["version"]):
+                        raise ValueError("user_input_resume_identity_mismatch")
+                    if adapter.accept_user_input:
+                        adapter.accept_user_input(wake)
+                    reply = HumanMessage(content="本轮澄清答复：" +
+                        wake.model_dump_json(include={"selected_option_ids", "selected_labels", "text"}),
+                        additional_kwargs={**identity.message_metadata("internal_control"), "clarification_reply": True})
+                    return {"messages": [reply],
+                        "operation_signals": None, "batch_status": "", "user_input_wake": wake.model_dump(),
+                        "host_state": host_snapshot()}
+                wake = interrupt({"kind": "execution_wait", "wait_ids": list(waits)})
+                if not isinstance(wake, dict) or set(wake) != {"completion_notes"}:
                     raise ValueError("invalid_execution_resume")
                 notes = tuple(wake["completion_notes"])
                 if not notes or any(type(note) is not str for note in notes) or sum(map(len, notes)) > 65536:
@@ -442,6 +463,7 @@ class HarnessRuntime:
         config = {"configurable": checkpoint_config or {"thread_id": identity.run_id},
                   "recursion_limit": max(64, self.limits.max_model_steps * 6 + 20)}
         snapshot = await graph.aget_state(config)
+        self.diagnostic_checkpoint = (snapshot.config or {}).get("configurable", {}).get("checkpoint_id", "")
         topology = graph.get_graph()
         tool_nodes = tuple(name for name, node in topology.nodes.items() if isinstance(node.data, ToolNode))
         # The native before-model chain can include conditional middleware
@@ -462,7 +484,19 @@ class HarnessRuntime:
             result = self._result(state)
             if result.status == "suspended" and adapter.validate_parked_snapshot:
                 adapter.validate_parked_snapshot(await graph.aget_state(config), result)
+            elif result.status == "waiting" and adapter.bind_user_input:
+                parked = await graph.aget_state(config)
+                pause = parked.interrupts[0]
+                await adapter.bind_user_input(pause.value, pause.id,
+                    parked.config["configurable"]["checkpoint_id"])
             return result
+
+        async def acknowledge_user_input(committed):
+            value = committed.values.get("user_input_wake")
+            if value != adapter.user_input["value"]:
+                raise ValueError("user_input_wake_commit_required")
+            if adapter.acknowledge_user_input:
+                await adapter.acknowledge_user_input(value, committed.config["configurable"]["checkpoint_id"])
 
         async def acknowledge_wake(state):
             waits = validate_execution_waits(tuple(state["execution_wake"]))
@@ -506,13 +540,14 @@ class HarnessRuntime:
             orphan = await adapter.check_terminal_orphan(prior) if adapter.check_terminal_orphan else False
             quarantined = orphan == "quarantined"
             orphan_closed = bool(before_model and orphan)
-            answered_question = (adapter.authorized_question_parent == prior.get("active_run_id")
-                                 and len(snapshot.interrupts) == 1 and snapshot.interrupts[0].value == {
-                                     "kind": "user_input", "wait_ids": []})
+            retired = (adapter.check_retired_question and len(snapshot.interrupts) == 1
+                       and isinstance(snapshot.interrupts[0].value, dict)
+                       and snapshot.interrupts[0].value.get("kind") == "user_input"
+                       and await adapter.check_retired_question(prior.get("active_run_id"))
+                       and not has_unsettled_work(prior, ignore_question=True))
+            quarantined = quarantined or retired
             if (prior.get("executor_id") != EXECUTOR_ID or (not quarantined and (
-                    not (closed or orphan_closed or answered_question)
-                    or has_unsettled_work(prior, ignore_question=answered_question)
-                    or (snapshot.interrupts and not answered_question)))):
+                    not (closed or orphan_closed) or has_unsettled_work(prior) or snapshot.interrupts))):
                 raise AdmissionStopped("native_thread_requires_reconciliation")
         initial = None
         if prior and not continuing_thread:
@@ -582,13 +617,22 @@ class HarnessRuntime:
             if snapshot.interrupts:
                 waiting = _interruption(snapshot)
                 await observed(waiting)
-                if waiting["stop_status"] != "suspended" or not adapter.resolve_execution_waits:
-                    return await result_for(waiting)
-                waits = tuple(waiting["execution_waits"])
-                notes = await adapter.resolve_execution_waits(identity, waits)
-                if notes is None:
-                    return await result_for(waiting)
-                initial = Command(resume={snapshot.interrupts[0].id: {"completion_notes": list(notes)}})
+                if waiting["stop_status"] == "waiting":
+                    if adapter.user_input is None:
+                        return await result_for(waiting)
+                    from .recovery import verify_question_interrupt
+                    verify_question_interrupt(snapshot, adapter.user_input)
+                    initial = Command(resume={snapshot.interrupts[0].id: adapter.user_input["value"]})
+                else:
+                    if not adapter.resolve_execution_waits:
+                        return await result_for(waiting)
+                    waits = tuple(waiting["execution_waits"])
+                    notes = await adapter.resolve_execution_waits(identity, waits)
+                    if notes is None:
+                        return await result_for(waiting)
+                    initial = Command(resume={snapshot.interrupts[0].id: {"completion_notes": list(notes)}})
+            elif adapter.user_input is not None:
+                await acknowledge_user_input(snapshot)
             elif prior.get("execution_wake"):
                 settled = await acknowledge_wake(prior)
                 if settled is None:
@@ -630,7 +674,7 @@ class HarnessRuntime:
             initial = {"messages": additions, "model_steps": 0, "host_state": host_snapshot(),
                 "executor_id": EXECUTOR_ID, "active_run_id": identity.run_id, "pinned_skills": list(pinned_skills),
                 "skills_metadata": None, "delivery_followup_used": False, "operation_signals": None,
-                "unknown_operations": [], "execution_waits": [], "execution_wake": [], "batch_status": "",
+                "unknown_operations": [], "execution_waits": [], "execution_wake": [], "user_input_wake": {}, "batch_status": "",
                 "stop_status": "", "stop_reason": "", "rejected_responses": []}
         await event("run_started", latest)
         if isinstance(initial, Command):
@@ -642,17 +686,22 @@ class HarnessRuntime:
                 raise AdmissionStopped("recovery_requires_reconciliation")
             await graph.ainvoke(initial, config, durability="sync", context=run_context,
                                 interrupt_after=match)
-            committed = (await graph.aget_state(config)).values
-            if not committed.get("execution_wake"):
-                raise ValueError("execution_wake_commit_required")
-            settled = await acknowledge_wake(committed)
-            if settled is None:
-                return await deferred_wake(committed)
-            if settled.get("stop_status"):
-                await observed(settled, "stopped")
-                await event("run_finished", settled)
-                return self._result(settled)
-            await observed(settled)
+            committed_snapshot = await graph.aget_state(config)
+            committed = committed_snapshot.values
+            if adapter.user_input is not None:
+                await acknowledge_user_input(committed_snapshot)
+                await observed(committed)
+            else:
+                if not committed.get("execution_wake"):
+                    raise ValueError("execution_wake_commit_required")
+                settled = await acknowledge_wake(committed)
+                if settled is None:
+                    return await deferred_wake(committed)
+                if settled.get("stop_status"):
+                    await observed(settled, "stopped")
+                    await event("run_finished", settled)
+                    return self._result(settled)
+                await observed(settled)
             initial = None
         timer = asyncio.timeout(max(0, self.limits.deadline-time.monotonic())
                                 if self.limits.deadline != float("inf") else None)
@@ -697,14 +746,16 @@ def _interruption(snapshot):
     if len(snapshot.interrupts) != 1 or _pending_calls(state["messages"]):
         raise ValueError("invalid_framework_interrupt")
     value = snapshot.interrupts[0].value
-    if type(value) is not dict or set(value) != {"kind", "wait_ids"}:
+    if type(value) is not dict:
         raise ValueError("invalid_framework_interrupt")
-    waits = validate_execution_waits(tuple(value["wait_ids"]))
-    if value["kind"] == "execution_wait" and waits:
-        return {**state, "stop_status": "suspended", "stop_reason": "execution_pending",
-                "execution_waits": list(waits)}
-    if value["kind"] == "user_input" and not waits:
+    if value.get("kind") == "user_input" and (set(value) == {"kind", "question_id", "version"}
+            or value == {"kind": "user_input", "wait_ids": []}):
         return {**state, "stop_status": "waiting", "stop_reason": "user_input_required"}
+    if value.get("kind") == "execution_wait" and set(value) == {"kind", "wait_ids"}:
+        waits = validate_execution_waits(tuple(value["wait_ids"]))
+        if waits:
+            return {**state, "stop_status": "suspended", "stop_reason": "execution_pending",
+                    "execution_waits": list(waits)}
     raise ValueError("invalid_framework_interrupt")
 
 

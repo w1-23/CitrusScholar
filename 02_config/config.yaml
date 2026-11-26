@@ -42,6 +42,9 @@ web_search:
   timeout_sec: 90
 
 model:
+  # 主模型可按 {provider_id: {model_id: {max_output_tokens: 整数, context_window_tokens: 整数}}} 配置。
+  # 填写已核验的服务商和模型能力。缺少条目时使用 chat.max_tokens 作为输出配置。
+  # provider_budgets: {}
   main: "deepseek-flash"   # v9.5.1: 官方现行模型名 deepseek-flash（服务 DeepSeek-V4.1-Flash）；旧名 deepseek-v4-flash 已下线但可调用并路由到 V4.1
   fast: "deepseek-flash"
   embedding: "intfloat/multilingual-e5-large"

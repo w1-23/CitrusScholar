@@ -1,7 +1,7 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {browser, flush, reply, framesPage} = require("./frontend-harness.cjs");
+const {browser, flush, reply, framesPage, question} = require("./frontend-harness.cjs");
 function render(b, turns) { b.context.renderHistoryMessages([], b.context.normalizeHistoryTurns(turns)); }
 const active = (id = 'job', status = 'detached') => ({turn_request_id: id + '-request', job_id: id, job_status: status});
 const events = (b, job) => b.requests.findLast(r => r.url.includes('/jobs/' + job + '/events?'));
@@ -121,4 +121,38 @@ test('old file-turn action cannot jump in a resumed session after A → B → A'
   finish(true);
   assert.equal(await paused,false);
   assert.equal(jumps,0);
+});
+
+
+test('clarification attaches to the original job and does not submit an unbound answer', async () => {
+  const b = browser();
+  render(b, [{...active('job', 'awaiting_input'), question: question()}]);
+  const original = b.get('chat-container').querySelector('.bot');
+  const card = original.querySelector('.task-question');
+  assert.equal(card.querySelector('button').disabled, true);
+  const bound = question({interrupt_id: 'protected-interrupt'});
+  reply(events(b, 'job'), framesPage('job', [[1, 'request_user_input', {question: bound}]], {status: 'awaiting_input'}));
+  await flush();
+  assert.equal(card.querySelector('button').disabled, false);
+  card.querySelector('input').checked = true;
+  const [submit] = card.querySelector('form').fire('submit', {preventDefault() {}});
+  await flush();
+  const post = b.requests.find(r => r.url === '/api/tasks/job/questions/q1/answer');
+  assert.equal(JSON.parse(post.opts.body).interrupt_id, 'protected-interrupt');
+  assert.deepEqual(JSON.parse(post.opts.body).selected_option_ids, ['a']);
+  const status = b.requests.findLast(r => r.url === '/jobs/job');
+  reply(status, {job_id: 'job', status: 'awaiting_input', event_cursor: 1, question: question()});
+  await flush();
+  assert.equal(card.querySelector('button').disabled, true, 'stale status leaves the submitted form in flight');
+  reply(post, {job_id: 'job', resume_job_id: 'job', question: {...bound, status: 'answered', version: 2}});
+  await submit;
+  await flush();
+  const resumed = events(b, 'job');
+  assert.match(resumed.url, /after=1/);
+  reply(resumed, framesPage('job', [[2, 'agent_recovery', {status: 'admitted'}],
+    [3, 'done', {answer: '同轮恢复完成', turn_envelope: {display_status: 'completed'}}]], {recovery_cursor: 2}));
+  await flush();
+  assert.equal(b.get('chat-container').querySelectorAll('.bot').length, 1);
+  assert.match(original.querySelector('.turn-answer').innerHTML, /同轮恢复完成/);
+  assert.equal(b.requests.filter(r => r.opts?.method === 'POST').length, 1);
 });

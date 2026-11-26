@@ -29,15 +29,15 @@ _REQUEST_FIELDS = frozenset({
     "query", "request_id", "client_request_id", "session_id", "user_id", "job_id",
     "idempotency_key", "visualization_enabled", "context_compression", "selected_skills", "attachment_refs", "attachment_context",
     "browse_requested", "image_attachments", "has_paper_attachment", "request_tables", "mode",
-    "parent_job_id", "question_answer", "continuation_context",
-    "no_replay", "script_budget_scope", "context_working_state", "history_summary",
+    "script_budget_scope", "context_working_state", "history_summary",
     "long_term_memory", "resident_cards", "user_preferences", "account_files",
     "history_evidence_block", "history_load_status", "history_load_reason", "history_load_error", "search_suggestions", "format_hint",
     "candidate_pool", "candidate_pool_notice", "request_plan", "task_contract",
     "native_skill_release", "skill_release_inventory_sha256", "capability_snapshot", "capability_runtime",
 })
 # Accepted only to decode original requests from older authenticated checkpoints.
-_RETIRED_REQUEST_FIELDS = frozenset({"agent_no_prefetch_hints"})
+_RETIRED_REQUEST_FIELDS = frozenset({"agent_no_prefetch_hints", "parent_job_id", "question_answer",
+                                     "continuation_context", "no_replay"})
 
 
 def capture_original_request_state(state: dict) -> dict:
@@ -106,7 +106,7 @@ async def is_terminal_orphan(identity, values, *, answered_question=False):
     return await asyncio.to_thread(read_job)
 
 
-async def validate_legacy_native_head(root, identity, provider_scope, *, context_scope="", authorized_question_parent=""):
+async def validate_legacy_native_head(root, identity, provider_scope, *, context_scope=""):
     """Admit only a settled predecessor. Never invoke or change the legacy graph."""
     from .deep_agent_runtime import LEGACY_NATIVE_EXECUTOR_ID
     from .harness import has_unsettled_work
@@ -129,9 +129,10 @@ async def validate_legacy_native_head(root, identity, provider_scope, *, context
             pending_tool = any(k.startswith("branch:to:") and "tool" in k for k in channels)
             pending_tool |= any(isinstance(v, Send) and "tool" in v.node for _, _, v in pending)
             pending_tool |= any(channel == INTERRUPT for _, channel, _ in pending)
-            answered_question = (authorized_question_parent == values.get("active_run_id")
-                                 and values.get("stop_status") == "waiting"
-                                 and values.get("stop_reason") == "user_input_required")
+            from src.core.user_questions import retired_question
+            answered_question = (values.get("stop_status") == "waiting"
+                                 and values.get("stop_reason") == "user_input_required"
+                                 and await asyncio.to_thread(retired_question, identity, values.get("active_run_id")))
             if (values.get("executor_id") != LEGACY_NATIVE_EXECUTOR_ID or not values.get("messages")
                     or has_unsettled_work(values, ignore_question=answered_question) or pending_tool
                     or not await is_terminal_orphan(identity, values, answered_question=answered_question)):
@@ -200,9 +201,27 @@ def _checkpoint_reconciliation():
         raise
 
 
+class QuestionWakeDeferred(RuntimeError):
+    """The answer was committed by the graph and its durable ACK can retry."""
+
+
+def verify_question_interrupt(snapshot, question_resume):
+    _verify_question_interrupt(snapshot.interrupts,
+        (snapshot.config or {}).get("configurable", {}).get("checkpoint_id"), question_resume)
+
+
+def _verify_question_interrupt(interrupts, checkpoint_id, question_resume):
+    from src.core.user_questions import QuestionResume
+    value = QuestionResume.model_validate(question_resume["value"])
+    expected = {"kind": "user_input", "question_id": value.question_id, "version": value.version}
+    if (checkpoint_id != question_resume["checkpoint_ref"] or len(interrupts) != 1
+            or interrupts[0].id != value.interrupt_id or interrupts[0].value != expected):
+        raise TaskConflict("question_resume_checkpoint_conflict")
+
+
 async def load_recovery_state(root: Path, identity: ExecutionIdentity,
-                              provider_scope: tuple[str, str], *,
-                              execution_wait: dict | None = None, discover_execution_wait=False) -> dict:
+                              provider_scope: tuple[str, str], *, execution_wait: dict | None = None,
+                              discover_execution_wait=False, question_resume=None) -> dict:
     """Read the exact committed framework state. Legacy executors are never resumed."""
     from src.core.jobs import get_job
     from .deep_agent_runtime import EXECUTOR_ID
@@ -213,6 +232,8 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
     if job and (job["owner_user_id"], job["session_id"], job["request_id"]) != (
             identity.owner_user_id, identity.session_id, identity.user_turn_id):
         raise TaskConflict("recovery_identity_mismatch")
+    if job and job.get("question_id"):
+        raise TaskConflict("legacy_question_execution_closed")
     options = {"context_scope": (job or {}).get("native_context_scope", "")}
     if not framework_checkpoint_path(root, identity, provider_scope, **options).is_file():
         if (checkpoint_path(root, identity, provider_scope).is_file()
@@ -238,9 +259,9 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
     answered = status == "complete" and values.get("stop_reason") == "answered"
     signals = list((values.get("operation_signals") or {}).values())
     has_pending = bool(_pending_calls(values["messages"]))
-    unsettled = (values.get("unknown_operations")
-                 or any(item.get("uncertain") or item.get("pending_question") for item in signals))
-    if unsettled or (values.get("host_state") or {}).get("pending_question"):
+    unsettled = values.get("unknown_operations") or any(item.get("uncertain") for item in signals)
+    pending_question = (values.get("host_state") or {}).get("pending_question")
+    if unsettled or (question_resume is None and (pending_question or any(item.get("pending_question") for item in signals))):
         raise TaskConflict("recovery_requires_reconciliation")
     if discover_execution_wait:
         discovered = list(dict.fromkeys(wait for item in signals for wait in item.get("execution_waits", ())))
@@ -252,7 +273,19 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
         if status or execution_wait is not None or pending_interrupts or values.get("execution_waits"):
             raise TaskConflict("recovery_requires_reconciliation")
         await committed_tool_receipts(identity, values["messages"])
-    if execution_wait is not None:
+    if question_resume is not None:
+        from dataclasses import asdict
+        if (execution_wait is not None or discover_execution_wait or has_pending or status
+                or (values.get("host_state") or {}).get("identity") != asdict(identity)
+                or values.get("execution_wake") or any(item.get("execution_waits") for item in signals)):
+            raise TaskConflict("question_resume_checkpoint_conflict")
+        if pending_interrupts:
+            _verify_question_interrupt([pause for group in pending_interrupts for pause in group],
+                                       saved.checkpoint["id"], question_resume)
+        elif (pending_question or values.get("user_input_wake") != question_resume["value"]
+              or (saved.parent_config or {}).get("configurable", {}).get("checkpoint_id") != question_resume["checkpoint_ref"]):
+            raise TaskConflict("question_resume_checkpoint_conflict")
+    elif execution_wait is not None:
         from dataclasses import asdict
         from .execution_outcome import validate_execution_suspension
         try:
@@ -287,7 +320,10 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
     # Candidate bytes were process-local and are not present in the protected
     # snapshot. Never pretend those search handles survived a restart.
     pool_id = (state.get("candidate_pool") or {}).get("pool_id")
-    if pool_id and not answered:
+    if pool_id and question_resume is not None:
+        state.pop("candidate_pool", None)
+        state.pop("candidate_pool_notice", None)
+    elif pool_id and not answered:
         from src.retrieval.candidate_pool import get_pool, prune_expired
         # The stored reference names the original pool, not whichever search
         # most recently published a pool in this run. Prune before the id lookup
@@ -297,6 +333,8 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
         if (pool is None or pool.owner_user_id != identity.owner_user_id
                 or pool.session_id != identity.session_id or pool.turn_id != identity.run_id):
             raise TaskConflict("recovery_candidate_pool_unavailable")
+    if question_resume is not None:
+        state["agent_question_resume"] = question_resume
     if discover_execution_wait:
         state["agent_recovery_execution_wait"] = execution_wait
     state["agent_recovery_wake_committed"] = bool(execution_wait and values.get("execution_wake"))

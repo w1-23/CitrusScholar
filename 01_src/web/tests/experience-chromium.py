@@ -134,7 +134,7 @@ def until(check, description, timeout=12):
     raise AssertionError(description)
 
 
-def run(browser, origin, output):
+def run(browser, origin, output, *, observation_only=False):
     script = Path(__file__).with_name('experience-fixture.js').read_text(encoding='utf-8')
     browser.call('Runtime.enable')
     browser.call('Page.enable')
@@ -213,12 +213,52 @@ def run(browser, origin, output):
         phase('tool')
         check('Running tool replaces dot phase', "document.querySelector('[data-state=tool]') && document.querySelector('.is-running') && document.querySelector('.research-task-status').textContent.includes('正在执行 ·')")
         capture('tool')
+        evaluate("experienceReadFailure('status')")
+        check('Online status 503 leaves task running',
+              "document.querySelector('[data-state=tool]') && document.querySelector('.research-task-observation:not([hidden])')?.textContent.includes('暂时无法读取任务状态') && navigator.onLine")
+        evaluate("experienceReadFailure('replay')")
+        check('Online replay 503 reports its own read source',
+              "document.querySelector('[data-state=tool]') && document.querySelector('.research-task-observation:not([hidden])')?.textContent.includes('暂时无法补读任务事件') && navigator.onLine")
+        evaluate("experienceReadFailure('')")
+        check('Distinct read failures clear after successful reads',
+              "document.querySelector('[data-state=tool]') && document.querySelector('.research-task-observation').hidden")
         offline(True)
         check('Disconnect stops the running display', "document.querySelector('[data-state=disconnected]') && !document.querySelector('.is-running')")
         capture('disconnected')
-        offline(False)
-        check('Reconnection restores the tool display', "document.querySelector('[data-state=tool]') && document.querySelector('.is-running')")
         phase('zero')
+        offline(False)
+        check('Reconnection resumes the prior cursor and displays the missed result',
+              "document.querySelector('[data-state=waiting]') && !document.querySelector('.is-running') "
+              "&& experienceRequests().replayCursors.includes(3) && experienceRequests().replayCursors.includes(5) "
+              "&& experienceRequests().cancels.length === 0 && experienceRequests().posts.length === 0")
+        check('Chromium ReadableStream interruption consumes one durable terminal tail', '''
+              (async () => {
+                const store = CitrusTaskState.create();
+                const observations = [], paths = [];
+                const started = {job_id: 'synthetic-sse', status: 'running', seq: 18};
+                const tail = {seq: 19, event: 'done', data: {turn_envelope: {display_status: 'completed'}}};
+                const status = {job_id: 'synthetic-sse', status: 'completed', event_cursor: 19,
+                  terminal_snapshot: {display_status: 'completed'}};
+                const transport = CitrusTaskTransport.create({store, owns: () => true,
+                  onStreamInterrupted: () => observations.push('interruption'),
+                  fetch: async path => {
+                    paths.push(path);
+                    return new Response(JSON.stringify(path.includes('/events?') ? {...status,
+                      protocol: 'citrus-task/1', next_cursor: 19, has_more: false,
+                      events: [{seq: 18, event: 'job', data: started}, tail]} : status));
+                  }});
+                let calls = 0;
+                const stream = new ReadableStream({pull(controller) {
+                  if (calls++ === 0) {
+                    controller.enqueue(new TextEncoder().encode('event: job\\ndata: {"job_id":"synthetic-sse","status":"running"}\\n\\n'));
+                  } else controller.error(new TypeError('synthetic connection loss'));
+                }});
+                try {
+                  await transport.stream(new Response(stream), new AbortController().signal);
+                  return store.state.cursor === 19 && store.state.status === 'completed' &&
+                    observations.length === 1 && paths[0].includes('after=0');
+                } finally { transport.stop(); }
+              })()''')
         browser.click('#ctxCircleBtn')
         check('Provider reporting does not overwrite context occupancy',
               f"({text('#ctxUsed')}) === '9.2K / 86K' && !({text('#ctxUsageRows')}).includes('缓存覆盖率')")
@@ -239,10 +279,12 @@ def run(browser, origin, output):
         capture('answer')
         check('Only explicitly public progress is rendered',
               "document.querySelector('.research-process').textContent.includes('公开进度：正在核查列名') && !document.querySelector('#chat-container').textContent.includes('INTERNAL_FIXTURE_MARKER')")
-        check('Only cited sources appear in the answer bubble and duplicate Markdown links are removed',
+        check('One visible group shows verified titles and preserves literal citation examples',
               "Array.from(document.querySelectorAll('.message.bot .turn-citation-bubbles .turn-citation-bubble'), el => el.textContent).join('|') === '联网：公开表格说明|本地：本地表格字典' "
               "&& document.querySelector('.turn-citation-bubbles a')?.href === 'https://example.org/cited-table' "
               "&& Array.from(document.querySelectorAll('.turn-answer a'), el => el.href).join('|') === 'https://example.org/ordinary' "
+              "&& document.querySelectorAll('.turn-citation-bubbles[aria-label=本轮引证]').length === 1 "
+              "&& document.querySelector('.turn-answer code').textContent === '【w1，w2】' "
               "&& !document.querySelector('.cr-turn-sources') && experienceRequests().sourceReads.length === 0")
         check('The only composer action is Stop while the original task is executing',
               "document.querySelectorAll('.input-box textarea, .task-controls textarea').length === 1 "
@@ -297,7 +339,20 @@ def run(browser, origin, output):
               "&& document.querySelector('#user-input').value === '第二条独立消息'")
         check('Server timings distinguish admission, provider packet, and visible answer',
               "document.querySelector('.turn-timings')?.textContent.includes('提交到首段可见答复 12.1 秒') && document.querySelector('.turn-timings')?.textContent.includes('模型调用到服务商首包 0.9 秒') && document.querySelector('.turn-timings')?.textContent.includes('队列等待 3.0 秒')")
+        check('Verified file card is restored once from the terminal artifact tail',
+              "document.querySelectorAll('.turn-file-card').length === 1 "
+              "&& document.querySelector('.turn-file-name')?.textContent === '核验结果.csv' "
+              "&& document.querySelector('.turn-delivery')?.dataset.verifiedCount === '1'")
         capture('completed')
+        if observation_only:
+            before = evaluate("document.querySelector('.turn-answer[data-display-status=completed]').innerHTML")
+            browser.call('Page.reload', ignoreCache=True)
+            check('Reopening history retains the same answer, citation group and file card',
+                  f"document.querySelector('.turn-answer[data-display-status=completed]')?.innerHTML === {json.dumps(before)} "
+                  "&& document.querySelectorAll('.turn-citation-bubbles .turn-citation-bubble').length === 2 "
+                  "&& document.querySelectorAll('.turn-file-card').length === 1")
+            capture('history-reopened')
+            return
         browser.click('.turn-explicit-continuation')
         check('Selecting a completed turn makes attachment inheritance explicit', "!document.querySelector('#composer-continuation').hidden")
         browser.click('#clear-composer-continuation')
@@ -419,6 +474,7 @@ def main():
     parser.add_argument('--chrome', required=True)
     parser.add_argument('--origin', default='http://citrus-experience.test')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--task-observation-only', action='store_true', help='Stop after chat observation and terminal history recovery.')
     args = parser.parse_args()
     origin = args.origin.rstrip('/')
     assert origin == 'http://citrus-experience.test', 'Only use the isolated virtual fixture origin'
@@ -436,7 +492,7 @@ def main():
                 target = next(item for item in json.load(response) if item['type'] == 'page')
             ws = websocket.create_connection(target['webSocketDebuggerUrl'], timeout=15, suppress_origin=True, http_no_proxy=['127.0.0.1'])
             try:
-                run(Browser(ws), origin, args.output)
+                run(Browser(ws), origin, args.output, observation_only=args.task_observation_only)
             finally:
                 ws.close()
         finally:

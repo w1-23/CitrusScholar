@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 from langchain_core.tools import tool
 
-from src.browse.relay import BrowseError
+from src.browse.relay import BrowseError, browse_reason_class
 from src.browse.service import enabled, release, renderer_for
 from src.core import tracing
 from src.core.cancel import raise_if_cancelled
@@ -66,6 +66,10 @@ def _output(fields: dict, *, error: str = '', error_status: str = 'failed', urls
         'status': error_status if error else 'complete',
         'reason_code': error or 'browse_observed', 'artifacts': list(urls),
     }}
+    if reason_class := browse_reason_class(error):
+        data['_tool_outcome']['reason_class'] = reason_class
+    if reason_class == 'scope_limited':
+        data['source_guidance'] = '如仍需该事实，请使用本轮已获准的其他来源。'
     return json.dumps(data, ensure_ascii=False), data
 
 
@@ -180,7 +184,9 @@ async def browse_web(action: Literal['open', 'observe', 'scroll', 'click', 'down
     except BrowseError as exc:
         reason = str(exc)
         # Before publication, a failed transfer cannot have registered a file.
-        not_run = reason == 'browse_retry_rejected' or (action == 'download' and not publication_started)
+        not_run = (reason in {'browse_retry_rejected', 'browse_not_authorized'}
+                   or action in NAVIGATION_ACTIONS and browse_reason_class(reason) == 'scope_limited'
+                   or action == 'download' and not publication_started)
         return _output({'action': action, 'error': reason}, error=reason,
                        error_status='not_run' if not_run else 'failed')
     except TimeoutError:

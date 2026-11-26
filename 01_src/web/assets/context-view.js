@@ -30,6 +30,13 @@
     return {input, output, read, uncached, write, coverage};
   }
 
+  function taskBudget(value) {
+    if (!value || typeof value !== 'object') return null;
+    const budget = {calls: count(value.calls), maxCalls: count(value.max_calls),
+      tokens: count(value.tokens), maxTokens: count(value.max_tokens)};
+    return Object.values(budget).some(part => part == null) ? null : budget;
+  }
+
   function project(snapshot) {
     const data = snapshot || {};
     const used = count(data.estimated_input_tokens ?? data.estimated_tokens);
@@ -57,7 +64,10 @@
     return {used, full, capacity, inputLimit, ringLimit, ringRatio, modelWindow, limitKind, ratio, state, rows, breakdown, free,
       chartTotal: full && used != null && breakdown !== 'inconsistent' ? Math.max(used, capacity ?? 0) : 0,
       historical: !full && used != null, estimateMethod: data.estimate_method, model: full ? data.model : '',
-      outputReserve: full ? count(data.output_tokens) : null, usage: full ? providerUsage(data) : null,
+      outputReserve: full ? count(data.output_tokens) : null,
+      actualOutputLimit: full && data.attempt_id ? count(data.actual_output_tokens) : null,
+      attemptElapsed: full && data.attempt_id ? count(data.attempt_elapsed_ms) : null,
+      budget: full ? taskBudget(data.task_budget) : null, usage: full ? providerUsage(data) : null,
       scope: data.view_scope, history: full ? HISTORY_LABEL[data.history_load_status] : '',
       session: data.session_id || '', request: data.request_id || ''};
   }
@@ -239,10 +249,14 @@
       if (ratio > 1) notes.push('估算输入超过显示上限，图示按估算输入构成填满。');
       el('ctxChartNote').textContent = notes.join(' ');
       el('ctxChartNote').hidden = !notes.length;
+      const budget = current.budget;
       const extra = [current.model, current.scope === 'previous' ? '上一调用' : current.scope === 'active' ? '当前调用' : '',
         current.history, current.estimateMethod === 'character_heuristic' ? '字符估算' : '',
-        limitKind === 'input' ? '模型窗口未知' : modelWindow != null && inputLimit != null ? '应用单次输入上限 ' + short(inputLimit) : '',
-        current.outputReserve != null ? '输出预留 ' + short(current.outputReserve) : ''].filter(Boolean);
+        limitKind === 'input' ? '模型窗口未知' : modelWindow != null && inputLimit != null ? '应用单次输入上限 ' + inputLimit.toLocaleString() : '',
+        current.outputReserve != null ? '输出预留 ' + current.outputReserve.toLocaleString() : '',
+        current.actualOutputLimit != null ? '实际发包输出上限 ' + current.actualOutputLimit.toLocaleString() : '',
+        current.attemptElapsed != null ? '本次调用用时 ' + (current.attemptElapsed / 1000).toFixed(2) + ' 秒' : '',
+        budget ? `本轮预算已计入 ${budget.tokens.toLocaleString()} / ${budget.maxTokens.toLocaleString()} 令牌，${budget.calls} / ${budget.maxCalls} 次调用` : ''].filter(Boolean);
       metadata.textContent = extra.join(' · ');
       metadata.hidden = !extra.length;
       trigger.setAttribute('aria-label', used == null ? '上下文用量' : `估算输入 ${short(used)}${ringRatio == null ? '，应用上限比例未知' : `，占应用单次输入上限 ${percent(ringRatio)}`}`);

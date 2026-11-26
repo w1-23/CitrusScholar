@@ -71,17 +71,6 @@ def completion_digest(value: Any) -> str:
         separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
-def parse_completion(text: str) -> CompletionEnvelope:
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate_completion_key")
-            result[key] = value
-        return result
-    return CompletionEnvelope.model_validate(json.loads(text, object_pairs_hook=unique))
-
-
 def repairable_proposal_reason(reason: str) -> bool:
     """Admission failures only; the host must separately prove zero dispatch.
 
@@ -160,6 +149,28 @@ def artifact_goal_evidence(requirements, rows, verified_links):
                          "subject": {"label": label, "formats": requirement.get("formats") or []},
                          "detail": f"尚未核验交付件：{label}"})
     return goals, gaps
+
+
+def verified_delivery_after_length(requirements, records, verified_links):
+    """Summarize figure delivery from the journal and refreshed artifact checks."""
+    from src.core.task_result import effective_tool_records
+    from src.graph.agent_operations import _append_verified_artifact_links
+    from src.graph.task_contract import FIGURE_KINDS
+
+    if not any(FIGURE_KINDS.intersection(item.get("kinds") or ()) for item in requirements):
+        return None
+    rows = effective_tool_records(records)
+    goals, gaps = artifact_goal_evidence(requirements, rows, set(verified_links))
+    links = {link for goal in goals for link in goal.artifact_links}
+    evidence = [{**row, "artifact_validations": [item for item in row.get("artifact_validations", ())
+                 if item.get("valid") and item.get("request_matches") is True and item.get("link") in links]}
+                for row in rows if row.get("status") in {"complete", "partial"}]
+    answer = "模型报告输出长度截断。"
+    if links:
+        answer = _append_verified_artifact_links(answer + "以下文件已重新核验。", evidence)
+    if gaps:
+        answer += "\n\n" + "\n".join(gap["detail"] for gap in gaps)
+    return answer, tuple(gaps)
 
 
 def completion_errors(statement: CompletionEnvelope, records, missing=(), *, verified_repairs=(), superseded_proposals=()) -> tuple[str, ...]:

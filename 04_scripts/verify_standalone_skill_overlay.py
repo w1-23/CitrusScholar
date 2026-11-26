@@ -10,6 +10,10 @@ from pathlib import Path
 # Every sanctioned divergence pins both the upstream and the host bytes.
 # Keep this allowlist exact. A package-wide exception would hide source drift.
 OVERLAYS = {
+    Path('citrus_audit/detectors/paperconan.py'): (
+        '336915b080a3d0a56a3c1698d3c5411e250379fdc71a8305168146d2f256b6ec',
+        '4931694f683ab7e5487e8881c0c6bdd7348f424f4a1159f8777fb6c7459d94fa',
+    ),
     Path('citrus_audit/methods.py'): (
         'dcf9f8a85156e966a372461ace584d79c0c0de649dcc1054d6d68dfe188f2879',
         '562c029ee148de052a8609dba37f2ee4375e1b69d46be25635993ef84396005d',
@@ -20,7 +24,7 @@ OVERLAYS = {
     ),
     Path('citrus_audit/review.py'): (
         'ab3ed719876b70d1f402d3eade97b1f9ed5178b5751a7eec4e792c78c9f26546',
-        'bb6c06d3d586f04336037de5255521e7a0a33830cb704f9f564ea526feb0c397',
+        'e3b74ed4d080f9a42858b5239ba4fb9acea71b9c3d2917a067d0e3aec58248a1',
     ),
     Path('citrus_audit/workbook.py'): (
         '93aa851610d0ce557917eaec298374bd98cedc311c5b7b456ab824144c093070',
@@ -32,7 +36,7 @@ OVERLAYS = {
     ),
     Path('citrus_refcheck/providers.py'): (
         'a82130c2575e9ce82563ff8ca38eb26e05234d59622e4f588a9d13ce8ee74962',
-        '93ee32e55be95ef30b2ae618e46bab3bb815dae5bb1c30f6db83862ab82507ff',
+        '6800495f303f15eacaaf260bceb2fc0dcaf4836f77161f958560da06491e300f',
     ),
     Path('citrus_refcheck/verdict.py'): (
         '8803c6fb88bbeabdcffd78b34ba73a64cdf8426a81956e45f4f26d19a62880b8',
@@ -40,7 +44,7 @@ OVERLAYS = {
     ),
     Path('citrus_refcheck/verification.py'): (
         '4bc3ec4e6a3888c2b352f61d1a973a604460b53a8684fd0f9c299dd7fd5aade7',
-        '673fbdb789ae7bd912ead81d46f14e250c93410364aace0f9305f9a8b1c73812',
+        '6a6dc5a3d3a3bd4fcaf1f17e473b09ec90e8b64af84dc3f2c2b1f6939b95c418',
     ),
 }
 LEGACY_FIXTURES = {

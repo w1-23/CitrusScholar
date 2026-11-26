@@ -218,3 +218,84 @@ test('public progress identities deduplicate only within one generation', () => 
   assert.deepEqual(process.entries.filter(item => item.kind === 'note').map(item => item.text), ['one', 'after recovery']);
   assert.deepEqual(process.entries.filter(item => item.kind === 'action').map(item => item.data.status), ['interrupted', 'running']);
 });
+
+
+test('first durable legacy cursor can catch a newer SSE frame without skipping an interior gap', async t => {
+  const store = CitrusTaskState.create({request_id: 'original-client'});
+  const calls = [];
+  const first = {seq: 21, event: 'job', data: {job_id: job.job_id}};
+  const note = {seq: 22, event: 'assistant_progress', data: {request_id: 'original-server'}};
+  store.receive('done', {...terminal.data, seq: 23});
+  const transport = CitrusTaskTransport.create({store, owns: () => true, fetch: async url => {
+    calls.push(url);
+    return calls.length === 1 ? page([first], 21, {has_more: true}) : page([note], 22);
+  }});
+  t.after(() => transport.stop());
+  await transport.replay(job.job_id);
+  assert.equal(store.state.cursor, 23);
+  assert.equal(CitrusTaskState.isTerminal(store.state), true);
+  assert.deepEqual(calls.map(url => new URL(url, 'https://example.test').searchParams.get('after')), ['0', '21']);
+});
+
+test('online transient status and replay reads have separate recovery signals', async t => {
+  const responses = [page([running], 1), reply({}, 503), reply({}, 503),
+    page([output, terminal], 3, {status: 'completed', terminal_snapshot: envelope}), reply(job)];
+  const store = CitrusTaskState.create();
+  const reads = [];
+  const transport = CitrusTaskTransport.create({store, owns: () => true, fetch: async () => responses.shift(),
+    onReadState: (source, failed) => { if (failed) reads.push(source); }, onStreamInterrupted: assert.fail});
+  t.after(() => transport.stop());
+  await transport.follow(job.job_id);
+  assert.equal(store.state.status, 'running');
+  await transport.follow(job.job_id);
+  assert.equal(store.state.status, 'running');
+  await transport.follow(job.job_id);
+  assert.equal(store.state.status, 'completed');
+  assert.deepEqual(reads, ['status', 'replay']);
+});
+
+test('one bounded session lane reaches the 33rd watch behind the first window', async t => {
+  const batches = [], adopted = [];
+  const observer = CitrusTaskTransport.createSessionObserver({sessionId: 'session', owns: () => true,
+    url: '/queue', fetch: async url => {
+      const query = new URL(url, 'https://example.test').searchParams;
+      const watch = query.getAll('watch');
+      batches.push([query.get('after_seq'), watch]);
+      return reply({turns: watch.map(id => ({client_request_id: id, session_id: 'session',
+        state: id === 'old-33' ? 'terminal' : 'running', generation: 1})), next_after_seq: 500});
+    }});
+  t.after(() => observer.stop());
+  for (let i = 1; i <= 33; i++) observer.watch('old-' + i, row => adopted.push(row));
+  await observer.snapshot();
+  await observer.snapshot();
+  assert.equal(batches[0][0], null);
+  assert.equal(batches[0][1].length, 32);
+  assert.deepEqual(batches[1], ['500', ['old-33']]);
+  assert.equal(adopted.filter(row => row.state === 'terminal')[0].client_request_id, 'old-33');
+});
+
+test('SSE end discards an incomplete tail for durable replay', () => {
+  const frames = [];
+  const parse = CitrusTaskTransport.parser((event, data) => frames.push([event, data]));
+  parse.push('event: text\r\ndata: {"content":"已"}\r\n\r\nevent: done\ndata: {"answer":"unfinished"}', false);
+  parse.push('', true);
+  assert.deepEqual(frames, [['text', {content: '已'}]]);
+});
+
+
+test('first sequenced SSE job binds its exact replay before a legacy gap is filled', async t => {
+  const frames = [], requests = [];
+  const store = CitrusTaskState.create({request_id: 'my-client', onEvent: event => frames.push(event)});
+  const transport = CitrusTaskTransport.create({store, owns: () => true, fetch: async url => {
+    requests.push(url);
+    return page([{...running, seq: 21}, {...terminal, seq: 22}], 22, {status: 'completed'});
+  }});
+  t.after(() => transport.stop());
+  const sseFrame = (client, target) => 'id: 21\nevent: job\ndata: ' +
+    JSON.stringify({client_request_id: client, job_id: target, status: 'running', seq: 21}) + '\n\n';
+  const response = new Response(sseFrame('foreign', 'another-job') + sseFrame('my-client', job.job_id));
+  await transport.stream(response, new AbortController().signal);
+  assert.deepEqual(requests, ['/jobs/job-1/events?after=0&limit=200']);
+  assert.deepEqual(frames, ['job', 'done']);
+  assert.equal(store.state.cursor, 22);
+});

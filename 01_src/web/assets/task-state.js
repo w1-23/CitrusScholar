@@ -62,7 +62,8 @@
         note_id: metadata.note_id || '', phase: metadata.phase || '', step_id: metadata.step_id || '',
         category: metadata.origin === 'host' ? metadata.category : '',
         model_step: metadata.model_step, tool_call_ids: list(metadata.tool_call_ids).map(String)};
-      entries.push(item); return item;
+      if (!metadata.status_only) entries.push(item);
+      return item;
     }
     function plan(data) {
       if (!data || !data.plan_id || !Array.isArray(data.steps)) return false;
@@ -130,9 +131,9 @@
       result.start = Number(start) || 0;
       result.finish = Number(jobMatches && state.finished_at || entry && entry.finished_at) || 0;
     } else if (ui.stopping || jobMatches && status === 'cancel_requested') result.kind = 'stopping';
-    else if (ui.disconnected) result.kind = 'disconnected';
     else if (phase === 'awaiting_input' || jobMatches && (status === 'awaiting_input' || state.question && state.question.status === 'pending' || list(state.approvals).some(function (item) { return item.status === 'pending'; }))) result.kind = 'awaiting_input';
     else if (phase === 'settling' || jobMatches && status === 'settling') result.kind = 'settling';
+    else if (ui.disconnected) result.kind = 'disconnected';
     else if (execution && !ui.hasAnswer) {
       result.kind = ui.activeTool ? 'tool' : 'waiting';
       result.start = Number(start) || 0;
@@ -143,7 +144,8 @@
     if (!incoming || !incoming.id) return previous;
     if (previous && previous.id === incoming.id) {
       if (Number(incoming.version || 0) < Number(previous.version || 0)) return previous;
-      if (Number(incoming.version || 0) === Number(previous.version || 0) && previous.status && previous.status !== 'pending' && incoming.status === 'pending') return previous;
+      if (Number(incoming.version || 0) === Number(previous.version || 0) && incoming.status === 'pending' &&
+          (previous.status && previous.status !== 'pending' || previous.interrupt_id && !incoming.interrupt_id)) return previous;
     }
     return Object.assign({}, incoming);
   }
@@ -418,6 +420,13 @@
       reduce(frame.event, frame.data);
       if (options.onEvent) options.onEvent(frame.event, frame.data);
     }
+    function beginReplay(firstSeq) {
+      // Only a durable first page can establish a historic sequence base.
+      // A later missing event must be filled before the cursor advances.
+      if (state.cursor || !Number.isSafeInteger(firstSeq) || firstSeq <= 1) return;
+      state.cursor = firstSeq - 1;
+      pending.forEach(function (_, seq) { if (seq < firstSeq) pending.delete(seq); });
+    }
     function receive(type, data, eventId) {
       data = data && typeof data === 'object' ? data : {};
       if (foreignRequest(type, data)) return false;
@@ -441,7 +450,7 @@
         display_status: '', terminal_snapshot: null, question: null, approvals: [], operations: [], pending_updates: [], not_applied_updates: [],
         artifact_delivery: null, recovery_cursor: 0});
     }
-    return {state: state, receive: receive, hydrate: hydrate,
+    return {state: state, receive: receive, hydrate: hydrate, beginReplay: beginReplay,
       setRecoveryFloor: function (cursor) {
         if (Number.isSafeInteger(cursor) && cursor > recoveryFloor) recoveryFloor = cursor;
       },

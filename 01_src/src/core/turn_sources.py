@@ -552,13 +552,21 @@ def references_data(answer: str, main_results, web_results) -> dict[str, Any]:
     }
 
 
+_REFERENCE = r"[LWHC][0-9]{1,3}"
+_REFERENCE_GROUP = rf"{_REFERENCE}(?:[^\S\n]*[,，、;；][^\S\n]*{_REFERENCE})*"
+_INLINE_REFERENCE = re.compile(
+    rf"\[[^\S\n]*({_REFERENCE_GROUP})[^\S\n]*\]|【[^\S\n]*({_REFERENCE_GROUP})[^\S\n]*】", re.I)
+_MARKER = re.compile(_REFERENCE, re.I)
+_LINK_LABEL = r"(?:\\.|[^\[\]\\\n]|\[[^\]\n]*\])*"
 _LITERAL_MARKDOWN = re.compile(
-    r"^[ \t]{0,3}(?:`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^[ \t]{0,3}(?:`{3,}|~{3,})[^\n]*(?:\n|$)|\Z)"
-    r"|^[ \t]*>[^\n]*|(`+)[^\n]*?\1|\\\[[^\]\n]*\]"
-    r"|!?\[[^\]\n]+\]\([^\n]*?\)|!?\[(?![LWHClwhc]\d{1,3}\])[^\]\n]+\][ \t]*\[[^\]\n]*\]"
-    r'|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』|"[^"\n]*"', re.M)
-_INLINE_REFERENCE = re.compile(r"\[([LWHC]\d{1,3})\]", re.I)
-_CITATION_LINK = re.compile(r"\[([^]\n]+)\]\(\s*<?(https?://[^>\s)]+)>?(?:\s+[^)\n]+)?\)", re.I)
+    rf"^[ \t]{{0,3}}(?P<ticks>`{{3,}})[^\n]*\n[\s\S]*?(?:^[ \t]{{0,3}}(?P=ticks)`*[ \t]*(?:\n|$)|\Z)"
+    rf"|^[ \t]{{0,3}}(?P<tildes>~{{3,}})[^\n]*\n[\s\S]*?(?:^[ \t]{{0,3}}(?P=tildes)~*[ \t]*(?:\n|$)|\Z)"
+    r"|^[ \t]*>[^\n]*|(?<!`)(?P<inline>`+)(?!`)[^\n]*?(?<!`)(?P=inline)(?!`)"
+    r"|\\(?:\[[^\]\n]*\]|【[^】\n]*】)"
+    rf"|^[ \t]{{0,3}}\[{_LINK_LABEL}\]:[^\n]*"
+    rf"|!?\[{_LINK_LABEL}\]\([^\n]*?\)"
+    rf"|!?\[(?![^\S\n]*{_REFERENCE_GROUP}[^\S\n]*\]){_LINK_LABEL}\][ \t]*\[{_LINK_LABEL}\]"
+    r'|“[^”\n]*”|「[^」\n]*」|『[^』\n]*』|"[^"\n]*"', re.M | re.I)
 
 
 def _visible_shared_reference(ref, user):
@@ -600,14 +608,14 @@ def answer_citations(answer, *, session_id, request_id, user):
     markers = []
 
     def redact(match):
-        markers.append(match[1].upper())
+        markers.extend(marker.upper() for marker in _MARKER.findall(match[1] or match[2]))
         return ""
 
-    parts, start = [], 0
+    body, start = [], 0
     for literal in _LITERAL_MARKDOWN.finditer(answer):
-        parts.extend(((False, _INLINE_REFERENCE.sub(redact, answer[start:literal.start()])), (True, literal[0])))
+        body.extend((_INLINE_REFERENCE.sub(redact, answer[start:literal.start()]), literal[0]))
         start = literal.end()
-    parts.append((False, _INLINE_REFERENCE.sub(redact, answer[start:])))
+    body.append(_INLINE_REFERENCE.sub(redact, answer[start:]))
     cited, dropped = [], []
     stored = None
     seen = set()
@@ -646,14 +654,6 @@ def answer_citations(answer, *, session_id, request_id, user):
                 item["reader_id"] = reader_id
             cited.append(item)
             seen.add(key)
-    cited_urls = {item["url"] for item in cited if item["kind"] == "web"}
-    body = []
-    for literal, text in parts:
-        link = _CITATION_LINK.fullmatch(text) if literal and cited_urls else None
-        if link and turn_source_ledger.safe_http_url(link[2]) in cited_urls:
-            # A link to the already-verified citation belongs on its citation bubble.
-            text = "" if _INLINE_REFERENCE.fullmatch(f"[{link[1]}]") else link[1]
-        body.append(text)
     return "".join(body), {"display": "bubble_only", "bubbles": cited, "dropped": dropped}
 
 

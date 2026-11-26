@@ -112,7 +112,7 @@ class CandidatePreparation(unittest.TestCase):
         self.assertEqual(inventory, {p.relative_to(release).as_posix(): _sha(p.read_bytes())
                                     for p in release.rglob("*") if p.is_file() and p.name != "inventory.json"})
         bundle = payload("fusion/bundle.json")
-        self.assertEqual(bundle["skills"], dict.fromkeys(FUSION_IDS, "0.1.0") | {"data-audit": "0.1.1", "literature-verification": "0.1.1"})
+        self.assertEqual(bundle["skills"], dict.fromkeys(FUSION_IDS, "0.1.0") | {"data-audit": "0.1.2", "literature-verification": "0.1.2"})
         self.assertLessEqual(len(bundle["files"]), 94)
         for name, digest in bundle["files"].items():
             self.assertEqual(logical_path("/input/fusion/" + name), "/input/fusion/" + name)

@@ -40,6 +40,12 @@ def normalize_arxiv_id(value: Any) -> str:
     return match[1].casefold() if match else ""
 
 
+def normalize_pmid(value: Any) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(?:(?:https://pubmed\.ncbi\.nlm\.nih\.gov/)|pmid:\s*)?([1-9][0-9]{0,9})/?", text, re.I)
+    return match[1] if match else ""
+
+
 def norm_title(value: Any) -> str:
     text = re.sub(r"<[^>]+>", " ", str(value or ""))
     text = unicodedata.normalize('NFKC', html.unescape(text)).casefold()
@@ -156,7 +162,7 @@ def _datacite_work(doi: str) -> tuple[int | str, list[dict], str]:
     titles = attributes.get("titles") or [{}]
     container = attributes.get("container") or {}
     types = attributes.get("types") or {}
-    return 200, [_rec("DataCite",
+    record = _rec("DataCite",
                       title=(titles[0] or {}).get("title", ""),
                       authors="; ".join(str(c.get("name") or "") for c in (attributes.get("creators") or [])),
                       year=attributes.get("publicationYear", ""),
@@ -165,7 +171,12 @@ def _datacite_work(doi: str) -> tuple[int | str, list[dict], str]:
                       kind=str(types.get("resourceTypeGeneral") or "dataset"),
                       url=str(attributes.get("url") or ""),
                       volume=container.get('volume', ''), issue=container.get('issue', ''),
-                      pages='-'.join(str(container[k]) for k in ('firstPage', 'lastPage') if container.get(k)))], ""
+                      pages='-'.join(str(container[k]) for k in ('firstPage', 'lastPage') if container.get(k)))
+    record['related_dois'] = [normalize_doi(item.get('relatedIdentifier'))
+        for item in (attributes.get('relatedIdentifiers') or [])[:24] if isinstance(item, dict)
+        and item.get('relatedIdentifierType') == 'DOI'
+        and item.get('relationType') in {'IsVersionOf', 'HasVersion', 'IsIdenticalTo', 'IsPreprintOf', 'HasPreprint'}]
+    return 200, [record], ""
 
 
 def _datacite_arxiv(arxiv_id: str) -> tuple[int | str, list[dict], str]:
@@ -238,7 +249,7 @@ def _epmc_records(payload: dict) -> list[dict]:
         pmid = str(item.get("pmid") or "")
         url = f"https://europepmc.org/article/MED/{pmid}" if pmid else (f"https://doi.org/{item.get('doi')}" if item.get("doi") else "")
         kind = "preprint" if str(item.get("source") or "").upper() in {"PPR", "PREPRINT"} else "journal-article"
-        records.append(_rec("Europe PMC",
+        record = _rec("Europe PMC",
                             title=item.get("title", ""),
                             authors=item.get("authorString", ""),
                             year=item.get("pubYear", ""),
@@ -249,7 +260,10 @@ def _epmc_records(payload: dict) -> list[dict]:
                             extra=f"pmid:{pmid}" if pmid else "",
                             volume=(item.get('journalInfo') or {}).get('volume', ''),
                             issue=(item.get('journalInfo') or {}).get('issue', ''),
-                            pages=item.get('pageInfo', '')))
+                            pages=item.get('pageInfo', ''))
+        if pmid:
+            record['pmid'] = pmid
+        records.append(record)
     return records
 
 

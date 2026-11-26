@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -431,53 +431,53 @@ def _session_user(conn: sqlite3.Connection, token: str) -> sqlite3.Row | None:
         "AND u.approval_status='approved' AND a.deleting=0", (digest, _stamp())).fetchone()
 
 
+@contextmanager
+def read_transaction():
+    """Read current identity from the initialized account DB without a writer."""
+    uri = DB_PATH.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=0.15)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
+        yield conn
+
+
 def user_for_token(token: str) -> dict[str, Any] | None:
-    if not token:
-        return None
-    with _connect() as conn:
-        row = _session_user(conn, token)
-    return _public_user(row) if row else None
+    return user_for_token_readonly(token)
 
 
 def user_for_token_readonly(token: str) -> dict[str, Any] | None:
-    """Check the same session and account guards without opening a writer."""
     if not token:
         return None
-    uri = DB_PATH.resolve().as_uri() + "?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
-        conn.row_factory = sqlite3.Row
+    with read_transaction() as conn:
         row = _session_user(conn, token)
     return _public_user(row) if row else None
 
 
-def retain_deletion_retry(token: str, user_id: int) -> None:
-    """Keep this verified browser token valid only for retrying account deletion."""
-    if not token:
-        return
+def _deletion_identity(conn: sqlite3.Connection, token: str) -> sqlite3.Row | None:
     digest = hashlib.sha256(token.encode()).hexdigest()
-    with _connect() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO account_deletion_retries(token_hash,user_id,expires_at) "
-            "SELECT token_hash,user_id,expires_at FROM browser_sessions "
-            "WHERE token_hash=? AND user_id=? AND expires_at>?",
-            (digest, int(user_id), _stamp()))
+    stamp = _stamp()
+    return conn.execute(
+        "SELECT u.*, a.epoch, a.deleting, COALESCE(s.expires_at,d.expires_at) AS token_expiry "
+        "FROM users u JOIN account_admission a ON a.owner=u.user_id "
+        "LEFT JOIN browser_sessions s ON s.user_id=u.user_id AND s.token_hash=? AND s.expires_at>? "
+        "LEFT JOIN account_deletion_retries d ON d.user_id=u.user_id AND d.token_hash=? AND d.expires_at>? "
+        "WHERE u.approval_status='approved' AND u.role!='admin' AND "
+        "((u.active=1 AND a.deleting=0 AND s.token_hash IS NOT NULL) OR "
+        "(u.active=0 AND a.deleting=1 AND d.token_hash IS NOT NULL))",
+        (digest, stamp, digest, stamp)).fetchone()
 
 
 def user_for_deletion_retry(token: str) -> dict[str, Any] | None:
     """Never use this lookup for general authentication or resource access."""
     if not token:
         return None
-    digest = hashlib.sha256(token.encode()).hexdigest()
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT u.* FROM users u JOIN account_deletion_retries d ON d.user_id=u.user_id "
-            "WHERE d.token_hash=? AND d.expires_at>? AND u.active=0 AND u.role!='admin'",
-            (digest, _stamp())).fetchone()
-    return _public_user(row) if row else None
+    with read_transaction() as conn:
+        row = _deletion_identity(conn, token)
+    return _public_user(row) if row and row["deleting"] else None
 
 
 def user_by_id(user_id: int) -> dict[str, Any] | None:
-    with _connect() as conn:
+    with read_transaction() as conn:
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (int(user_id),)).fetchone()
     return _public_user(row) if row else None
 
@@ -541,9 +541,11 @@ def release_chat_request(user: dict[str, Any]) -> None:
         conn.commit()
 
 
-def list_users() -> list[dict[str, Any]]:
+def list_users(*, actor_user_id: int | None = None, actor_token: str = "") -> list[dict[str, Any]]:
     day = _now().date().isoformat()
-    with _connect() as conn:
+    with read_transaction() as conn:
+        if actor_user_id is not None:
+            _require_admin_actor(conn, actor_user_id, actor_token)
         rows = conn.execute(
             "SELECT u.*,COALESCE(d.request_count,0) AS requests_today FROM users u "
             "LEFT JOIN daily_usage d ON d.user_id=u.user_id AND d.day=? ORDER BY u.user_id", (day,)).fetchall()
@@ -583,13 +585,19 @@ def issue_invite(*, actor_user_id: int, expires_in_days: int = 7, actor_token: s
                                         fixed_code=fixed_code)
 
 
-def list_invites(*, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-    with _connect() as conn:
+def list_invites(*, limit: int = 50, offset: int = 0, actor_user_id: int | None = None,
+                 actor_token: str = "") -> list[dict[str, Any]]:
+    with read_transaction() as conn:
+        if actor_user_id is not None:
+            _require_admin_actor(conn, actor_user_id, actor_token)
         return auth_invites.list_invites(conn, limit=limit, offset=offset)
 
 
-def list_applications(*, status: str, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-    with _connect() as conn:
+def list_applications(*, status: str, limit: int = 50, offset: int = 0,
+                      actor_user_id: int | None = None, actor_token: str = "") -> list[dict[str, Any]]:
+    with read_transaction() as conn:
+        if actor_user_id is not None:
+            _require_admin_actor(conn, actor_user_id, actor_token)
         return auth_invites.list_applications(conn, status=status, limit=limit, offset=offset)
 
 
@@ -640,8 +648,13 @@ def set_user_status(user_id: int, active: bool, *, actor_user_id: int | None = N
     return True
 
 
-def set_user_daily_limit(user_id: int, limit: int) -> bool:
-    with _connect() as conn:
+def set_user_daily_limit(user_id: int, limit: int, *, actor_user_id: int | None = None,
+                         actor_token: str = "") -> bool:
+    from src.core.account_admission import AdmissionStore
+
+    with AdmissionStore(DB_PATH).transaction(timeout=0.15) as conn:
+        if actor_user_id is not None:
+            _require_admin_actor(conn, actor_user_id, actor_token)
         cur = conn.execute("UPDATE users SET daily_limit=? WHERE user_id=?", (int(limit), int(user_id)))
     return cur.rowcount > 0
 
@@ -876,6 +889,42 @@ def _purge_owned_session_rows(conn: sqlite3.Connection, user_id: int, session_id
             if table in tables:
                 conn.execute(f"DELETE FROM {table} WHERE session_id=?", (sid,))
         conn.execute("DELETE FROM sessions WHERE session_id=? AND owner_user_id=?", (sid, user_id))
+
+
+def delete_user_account_reauthenticated(user_id: int, password: str, *, token: str,
+                                        raise_if_busy: bool = False) -> bool:
+    """Verify outside the writer and bind the exact identity to the deletion claim."""
+    from src.core.account_admission import AdmissionStore
+    from src.core.account_leases import deletion_lock
+
+    with read_transaction() as conn:
+        original = _deletion_identity(conn, token)
+    if original is None or original["user_id"] != int(user_id):
+        raise AccountInviteError("reauthentication_required")
+    _verify_reauthentication(original, password)
+
+    def authorize(conn):
+        current = _deletion_identity(conn, token)
+        fence = ("user_id", "epoch", "salt", "password_hash", "role", "active", "deleting", "token_expiry")
+        if current is None or any(current[key] != original[key] for key in fence):
+            raise AccountInviteError("reauthentication_required")
+        if not current["deleting"]:
+            conn.execute("INSERT OR IGNORE INTO account_deletion_retries(token_hash,user_id,expires_at) "
+                         "VALUES(?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), int(user_id),
+                                            current["token_expiry"]))
+
+    def claim_verified(store):
+        return store.claim_deletion(user_id, authorize=authorize, timeout=0.15)
+
+    try:
+        with deletion_lock(user_id, claim_factory=claim_verified, store=AdmissionStore(DB_PATH)) as claim:
+            if claim is None:
+                return False
+            return _delete_user_account(user_id, raise_if_busy=raise_if_busy, claim=claim)
+    except AccountDeletionPending:
+        if raise_if_busy:
+            raise
+        return False
 
 
 def delete_user_account(user_id: int, *, raise_if_busy: bool = False) -> bool:

@@ -2,7 +2,7 @@
   "data-audit/manifest.json": [
     [
       "\"version\": \"0.1.0\"",
-      "\"version\": \"0.1.1\""
+      "\"version\": \"0.1.2\""
     ]
   ],
   "data-audit/scripts/adapter.py": [
@@ -65,12 +65,36 @@
     [
       "    workbook = load_workbook(path, keep_links=False)\n    formula_cache = load_workbook(path, keep_links=False, data_only=True)\n    for region in regions:\n        audit_region(path, workbook[region[\"sheet\"]], region, formula_cache[region[\"sheet\"]], output)\n    try:\n        inspect_formulas(path, output, workbook, regions)\n    except (RuntimeError, subprocess.TimeoutExpired) as exc:\n        output[\"status\"] = \"partial\"\n        output[\"coverage\"].append(dict(check=\"formula_structure\", status=\"failed\"))\n        output[\"limitations\"].append(str(exc))\n    return output",
       "    from contextlib import closing\n\n    locate = partial(workbook_location, digest(path))\n    output[\"limitations\"].append(\"formula structure analyzer reads the whole workbook; only findings within confirmed regions are reported\")\n    with closing(load_workbook(path, keep_links=False)) as workbook, closing(\n            load_workbook(path, keep_links=False, data_only=True)) as formula_cache:\n        for region in regions:\n            try:\n                audit_region(locate, workbook[region[\"sheet\"]], region, formula_cache[region[\"sheet\"]], output)\n            except (KeyError, TypeError, ValueError):\n                output[\"status\"] = \"partial\"\n                output[\"coverage\"].append(dict(check=\"region_data\", region_id=region[\"id\"],\n                    status=\"invalid_input\", reason=\"invalid_region_data_or_options\", applied=0))\n        try:\n            inspect_formulas(path, locate, output, workbook, regions)\n        except (RuntimeError, ValueError, subprocess.TimeoutExpired):\n            output[\"status\"] = \"partial\"\n            output[\"coverage\"].append(dict(check=\"formula_structure\", status=\"failed\", scope=\"whole_workbook\",\n                                           findings_scope=\"confirmed_regions\"))\n            output[\"limitations\"].append(\"formula structure analyzer did not complete\")\n    output[\"findings_total\"] = len(output[\"findings\"]) + output[\"findings\"].omitted\n    output[\"findings_omitted\"] = output[\"findings\"].omitted\n    if output[\"findings_omitted\"]:\n        output[\"status\"] = \"partial\"\n        output[\"limitations\"].append(\"finding retention limit reached; unretained findings cannot be listed\")\n    return output"
+    ],
+    [
+      "MAX_LOCATIONS = 32",
+      "MAX_LOCATIONS = 32\nMETHOD_VERSION = \"fusion-data-audit/0.1.2\""
+    ],
+    [
+      "        try:\n            pa.SeriesSchema(checks=[check], nullable=True).validate(frame[column], lazy=True)",
+      "        values = frame[column]\n        unavailable = [row for row in values.index if sheet.cell(row, ci).data_type == \"f\"\n                       and formula_cache.cell(row, ci).value is None]\n        if unavailable:\n            values = values.drop(unavailable)\n        if kind != \"required\":\n            values = values.dropna()\n        prerequisite = \"selected column has original values or available formula cache\"\n        minimum = 2 if kind == \"unique\" else 1\n        if len(values) < minimum:\n            response[\"status\"] = \"partial\"\n            response[\"coverage\"].append(dict(check=kind, region_id=region_id, column=column,\n                status=\"not_applicable\", applied=0, n_rows=len(frame), reason=prerequisite,\n                minimum=minimum, method_version=METHOD_VERSION, scope=\"confirmed_region\"))\n            continue\n        hits = 0\n        try:\n            pa.SeriesSchema(checks=[check], nullable=True).validate(values, lazy=True)"
+    ],
+    [
+      "                raise ValueError(f\"rule evaluation failed for {column}: {rule['kind']}\") from exc",
+      "                response[\"status\"] = \"partial\"\n                response[\"coverage\"].append(dict(check=kind, region_id=region_id, column=column,\n                    status=\"failed\", reason=\"selected rule evaluation failed\", applied=0,\n                    method_version=METHOD_VERSION, scope=\"confirmed_region\"))\n                continue"
+    ],
+    [
+      "                if cell.data_type == \"f\" and formula_cache.cell(row, ci).value is None:\n                    continue\n                if len(response[\"findings\"])",
+      "                if cell.data_type == \"f\" and formula_cache.cell(row, ci).value is None:\n                    continue\n                hits += 1\n                if len(response[\"findings\"])"
+    ],
+    [
+      "                    severity=\"error\"))\n        response[\"coverage\"].append(dict(check=rule[\"kind\"], region_id=region_id,\n                                         column=column, status=\"checked\"))",
+      "                    evidence={\"reason\": \"verify source entry and experimental context before correction\",\n                              \"method_version\": METHOD_VERSION, \"prerequisite\": prerequisite},\n                    severity=\"error\"))\n        response[\"coverage\"].append(dict(check=kind, region_id=region_id, column=column,\n            status=\"partial\" if unavailable else \"checked_with_findings\" if hits else \"checked_no_findings\",\n            applied=len(values), n_rows=len(frame), reason=prerequisite, missing_cache_count=len(unavailable),\n            method_version=METHOD_VERSION, scope=\"confirmed_region\"))"
+    ],
+    [
+      "    output[\"findings_total\"] = len(output[\"findings\"]) + output[\"findings\"].omitted",
+      "    for row in output[\"coverage\"]:\n        row.setdefault(\"scope\", \"confirmed_region\")\n        row.setdefault(\"method_version\", METHOD_VERSION)\n    for item in output[\"findings\"]:\n        item[\"evidence\"].setdefault(\"method_version\", METHOD_VERSION)\n        item[\"evidence\"].setdefault(\"reason\", \"review source evidence and scope before correction\")\n    output[\"findings_total\"] = len(output[\"findings\"]) + output[\"findings\"].omitted"
     ]
   ],
   "literature-verification/manifest.json": [
     [
       "\"version\": \"0.1.0\"",
-      "\"version\": \"0.1.1\""
+      "\"version\": \"0.1.2\""
     ]
   ],
   "literature-verification/scripts/adapter.py": [
@@ -105,6 +129,14 @@
     [
       "status == \"verified\" else \"candidate\" if normalized else \"none\"",
       "status in {\"verified\", \"retracted\"} else \"candidate\" if normalized else \"none\""
+    ],
+    [
+      "def analyze(inputs, options):",
+      "BATCH_SCHEMA = \"citrus.fusion-reference-batch/1\"\nBATCH_STATUSES = {\"verified\", \"metadata_conflict\", \"retracted\", \"unconfirmed\", \"not_found\",\n                  \"source_unavailable\", \"not_processed\"}\n\n\ndef batch_report(response, rows, batch):\n    if batch is None:\n        if rows:\n            response[\"status\"] = \"partial\"\n            response[\"limitations\"].append(\"reference extraction only; no registry was queried\")\n        response[\"records\"] = [dict(record_index=index, submitted=entry, status=\"not_processed\", attempts=[])\n                               for index, entry in enumerate(rows, start=1)]\n        return response\n    records = batch.get(\"records\")\n    if (batch.get(\"schema\") != BATCH_SCHEMA or not isinstance(records, list) or len(records) != len(rows)\n            or not re.fullmatch(r\"[a-f0-9]{64}\", batch.get(\"original_report_sha256\", \"\"))):\n        raise ValueError(\"invalid_binding_for_reference_batch\")\n    counts = dict.fromkeys(sorted(BATCH_STATUSES), 0)\n    response[\"records\"] = []\n    from hashlib import sha256\n\n    for index, (entry, record) in enumerate(zip(rows, records), start=1):\n        checked = record.get(\"status\")\n        submitted = json.dumps(entry, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()\n        if (record.get(\"record_index\") != index or checked not in BATCH_STATUSES\n                or record.get(\"submitted_sha256\") != sha256(submitted).hexdigest()):\n            raise ValueError(\"invalid_reference_batch_record\")\n        counts[checked] += 1\n        response[\"records\"].append({**record, \"submitted\": entry, \"evidence_ids\": [\n            item[\"record_id\"] for item in record[\"attempts\"]], \"evidence_grade\": (\n                \"registry_match\" if checked in {\"verified\", \"retracted\"} else \"candidate\" if record[\"registered\"] else \"none\")})\n        response[\"coverage\"].append(dict(check=\"identity\", scope=\"metadata in observed registries\",\n            record_index=index, status=checked, reason=record.get(\"reason\")))\n    response[\"reference_batch\"] = {key: batch[key] for key in (\"schema\", \"original_report_sha256\", \"stop_reason\",\n        \"coverage\", \"distinct_queries\", \"provider_requests\", \"elapsed_ms\")}\n    response[\"reference_batch\"][\"status_counts\"] = counts\n    response[\"limitations\"].append(\"Registry metadata and observed retraction signals only; no source full text was fetched.\")\n    if any(counts[key] for key in (\"unconfirmed\", \"source_unavailable\", \"not_processed\")) or batch.get(\"stop_reason\"):\n        response[\"status\"] = \"partial\"\n    return response\n\n\ndef analyze(inputs, options):"
+    ],
+    [
+      "    observed = json.loads(inputs[\"observations\"].read_bytes()) if \"observations\" in inputs else {}\n    cassette = observed.get(\"http\", {})",
+      "    if \"observations\" not in inputs:\n        return batch_report(response, rows, None)\n    observed = json.loads(inputs[\"observations\"].read_bytes())\n    if \"reference_batch\" in observed:\n        return batch_report(response, rows, observed[\"reference_batch\"])\n    cassette = observed.get(\"http\", {})"
     ]
   ]
 }

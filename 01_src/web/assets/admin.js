@@ -153,16 +153,15 @@
     var host = el('auditList');
     if (!items.length) { host.innerHTML = '<p class="muted">没有匹配的请求记录</p>'; return; }
     host.innerHTML = items.map(function (item) {
-      var tools = (item.tools || []).map(function (tool) { return tool.name || tool.tool || ''; }).filter(Boolean).join('、') || '无';
+      var missing = item.metadata_recorded ? '无' : '未记录';
+      var tools = (item.tools || []).map(function (tool) { return tool.name || tool.tool || ''; }).filter(Boolean).join('、') || missing;
       var attachments = (item.attachments || []).map(function (file) {
-        var kb = Math.max(1, Math.round((file.approx_bytes || 0) / 1024));
-        return esc(file.name) + '（' + kb + ' KB）';
-      }).join('、') || '无';
+        var kb = Math.round((file.approx_bytes || 0) / 1024);
+        return kb + ' KB';
+      }).join('、') || missing;
       var when = item.created_at ? new Date(item.created_at).toLocaleString() : '时间未知';
-      return '<details class="audit-item"><summary><span class="audit-user">' + esc(item.username) + '</span><span class="audit-status">' + esc(item.status) + '</span><time>' + esc(when) + '</time><span class="audit-question">' + esc(item.query) + '</span></summary>' +
-        '<div class="audit-content"><p><b>问题</b><span>' + esc(item.query) + '</span></p>' +
-        '<p><b>回答</b><span>' + esc(item.answer || '尚未完成') + '</span></p>' +
-        '<p><b>工具</b><span>' + esc(tools) + '</span></p>' +
+      return '<details class="audit-item"><summary><span class="audit-user">' + esc(item.username) + '</span><span class="audit-status">' + esc(item.status) + '</span><time>' + esc(when) + '</time><span class="audit-question">' + esc(item.request_id) + '</span></summary>' +
+        '<div class="audit-content"><p><b>工具</b><span>' + esc(tools) + '</span></p>' +
         '<p><b>附件</b><span>' + attachments + '</span></p>' +
         '<p><b>会话与耗时</b><span>' + esc(item.session_id) + ' · ' + esc(item.elapsed_ms == null ? '—' : item.elapsed_ms + ' ms') + '</span></p></div></details>';
     }).join('');
@@ -412,17 +411,33 @@
       el('isolatedCorpusPanel').hidden = !data;
       if (!data) return;
       el('isolatedCorpusForm').hidden = !data.automatic_enabled;
-      var labels = {queued: '等待处理', leased: '正在处理', metadata_only: '仅书目信息（未验证全文或授权）',
-        failed: '未入库', expired: '任务过期', prepared: '全文已准备'};
+      el('isolatedCorpusAutomatic').textContent = data.automatic_enabled ? '公开文献自动提交已开启' : '公开文献自动提交已关闭';
+      var labels = {queued: '等待处理', leased: '正在处理', metadata_only: '仅已验证书目',
+        failed: '处理未完成', expired: '任务过期', prepared: '全文已准备'};
       var paths = {foreground: '复用本轮原件', background: '后台补齐', saved: '预存原件',
         explicit: '指定来源', observed: '历史原件观察'};
+      var rights = {granted: '已授权', needs_review: '待审核', revoked: '已撤销'};
       el('isolatedCorpusJobs').innerHTML = data.jobs.length ? data.jobs.map(function (job) {
-        var state = job.rights === 'revoked' ? '授权已撤销' : job.published ? '已发布' :
-          job.state === 'prepared' && job.rights === 'granted' ? '已授权，未发布' :
-          job.state === 'prepared' && job.rights === 'needs_review' ? '等待授权' : labels[job.state];
-        return '<article class="corpus-item"><div class="corpus-main"><strong>' + esc(state || job.state) +
-          '</strong><small>' + esc(paths[job.path] || '') + ' · <code>' + esc(job.id) + '</code>' +
-          (job.error ? ' · ' + esc(job.error) : '') + '</small></div></article>';
+        var proof = job.source_rights;
+        var grant = job.rights_obtained;
+        var stages = [
+          '书目核验：' + (job.bibliography_verified ? '已核验' : '—'),
+          '原件 SHA-256：' + (job.original_sha256 || '—'),
+          '原件权利依据：' + (proof ? proof.basis + ' / ' + proof.license : '—'),
+          '取得发布授权：' + (grant ? '记录 #' + grant.event_id + ' / ' + grant.basis + (grant.license ? ' / ' + grant.license : '') : '—'),
+          '当前发布权利：' + (rights[job.rights] || '—'),
+          '全文准备：' + (job.prepared ? '已准备' : '—'),
+          '编码：' + (job.encoded_generation ? '已完成' : '—'),
+          '索引代次：' + (job.indexed_generation || '—'),
+          '发布代次：' + (job.published_generation || '—'),
+          '活动代次：' + (job.active_generation || '—'),
+          '检索资格：' + (job.visible_generation || '—')
+        ];
+        var reference = job.document_id && job.version_id ? ' · ' + job.document_id + ' / ' + job.version_id : '';
+        return '<article class="corpus-item"><div class="corpus-main"><strong>候选 · ' + esc(labels[job.state] || job.state) +
+          '</strong><small>' + esc(paths[job.path] || '') + ' · <code>' + esc(job.id) + '</code>' + esc(reference) +
+          (job.error ? ' · 原因 ' + esc(job.error) : '') + '</small><small>' + stages.map(esc).join('<br>') +
+          '</small></div></article>';
       }).join('') : '<p class="muted">暂无任务</p>';
     });
   }

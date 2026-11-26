@@ -15,18 +15,18 @@ import re
 from urllib.parse import urlsplit
 
 
-LOCATIONS = ("source_file_hash", "sheet_name", "region_id", "cell_range", "row_index", "column_index",
+LOCATIONS = ("source_file_id", "source_file_hash", "sheet_name", "region_id", "cell_range", "row_index", "column_index",
              "end_row_index", "end_column_index", "scope", "group", "field", "filename", "pixel_box",
              "hidden_row", "hidden_column", "merged_placeholder")
 EVIDENCE = ("detector", "reason", "message", "notes", "formula", "statistics", "interpretation", "byte_match",
             "group", "rows", "distinct_biological_units", "rows_without_unit", "technical_replicate_column",
             "batch_column", "provider", "status", "record_id", "evidence_id", "title", "doi", "url",
-            "queried_at", "source_file_hash", "source_id", "source", "sources", "method", "grade", "length", "where")
+            "queried_at", "source_file_hash", "source_id", "source", "sources", "method", "grade", "length", "where", "method_version", "prerequisite")
 COVERAGE = ("check", "status", "scope", "record_index", "region_id", "reason", "column", "n", "n_rows",
             "n_images", "method", "detector", "limits", "recalculation", "missing_cache_count", "findings_scope", "applied", "group",
-            "rows", "distinct_biological_units", "rows_without_unit", "source_file_hashes")
+            "rows", "distinct_biological_units", "rows_without_unit", "source_file_hashes", "method_version", "minimum")
 RECORD = ("record_index", "status", "evidence_ids", "evidence_grade", "problems", "reason", "flags", "fields_checked",
-          "identifier_checks", "retraction_status")
+          "identifier_checks", "retraction_status", "registered", "differences", "candidates", "method", "details_omitted")
 ATTEMPT = ("provider", "status", "queried_at", "url", "reason", "http_status", "record_id")
 _PRIVATE_KEYS = re.compile(r"(?:^|_)(?:path|paths|body|raw|logs?|headers|secret|token|credentials?|options|password)(?:$|_)", re.I)
 _SAFE_FIELD = re.compile(r"[\w .-]{1,64}", re.UNICODE)
@@ -80,14 +80,21 @@ def project_finding(finding, *, location_limit=None):
 
 def _project_record(record, *, attempt_limit=12):
     result = _project(record, RECORD)
-    result["submitted"] = _project(record.get("submitted"), ("doi", "arxiv_id", "title", "year", "author", "authors", "journal", "raw_reference"))
+    result["submitted"] = _project(record.get("submitted"), ("doi", "arxiv_id", "pmid", "title", "year", "author", "authors", "journal", "venue", "raw_reference"))
     result["attempts"] = [_project(a, ATTEMPT) for a in (record.get("attempts") or [])[:attempt_limit]]
+    if record.get("method") == "citrus_refcheck/reference-verification/1":
+        fields = ("status", "reason", "registered", "differences", "candidates")
+        result["identifier_checks"] = {key: _project(check, fields) for key, check in record.get("identifier_checks", {}).items()
+                                       if key in {"doi", "arxiv", "pmid"}}
     return result
 
 
 def summary(report, *, findings_offset=0, findings_limit=36):
     result = {"status": report["status"], "limitations": _bounded(report.get("limitations") or [], text=300),
               "execution": _project(report.get("execution"), ("skill", "version", "python"))}
+    if report.get("reference_batch"):
+        result["reference_batch"] = _project(report["reference_batch"], ("schema", "original_report_sha256", "stop_reason",
+            "coverage", "distinct_queries", "provider_requests", "elapsed_ms", "status_counts"))
     if type(report.get("findings_omitted")) is int and report["findings_omitted"] > 0:
         result["findings_omitted"] = report["findings_omitted"]
     for key, build in (("findings", lambda f: project_finding(f, location_limit=16)),
@@ -119,7 +126,8 @@ def summary(report, *, findings_offset=0, findings_limit=36):
 def annotate_record_coverage(record, by_index):
     status = by_index.get(record["record_index"], "not_queried")
     record["host_coverage"] = status
-    if status not in {"queried", "previously_observed"} and record.get("status") == "not_found":
+    if (not record.get("method") and status not in {"queried", "previously_observed"}
+            and record.get("status") == "not_found"):
         record["worker_status"] = "not_found"
         record["status"] = "unavailable" if status == "provider_unavailable" else "not_checked"
 
@@ -255,6 +263,8 @@ def publish_report(report, *, execution_id, skill_id, fmt, receipt, host_coverag
                "coverage": [_project(x, COVERAGE) for x in report.get("coverage", [])],
                "findings": findings, "evidence": [_project(x, EVIDENCE) for x in report.get("evidence", [])],
                "records": records}
+    if report.get("reference_batch"):
+        payload["reference_batch"] = summary(report, findings_limit=0)["reference_batch"]
     body = _render(payload, fmt, literature=literature)
     if len(body) > 16 << 20:
         raise ValueError("external_report_export_size_limit")

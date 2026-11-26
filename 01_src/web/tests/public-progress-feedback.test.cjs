@@ -95,3 +95,28 @@ test('one collapsed disclosure preserves 30 attempts and stable milestone IDs li
     assert.deepEqual(notes.map(note => note.textContent), [waiting.text, review.text]);
   }
 });
+
+
+test('preparation is shown only in the status and replay cannot replace the next milestone', t => {
+  const {panel} = mount();
+  t.after(panel.stopClock);
+  const started = {job_id: 'job', status: 'running', started_at: Math.floor(Date.now() / 1000)};
+  panel.syncTask(started, null, {});
+  panel.receive('job', started);
+  const prepare = {job_id: 'job', note_id: 'job:prepare', origin: 'host', visibility: 'public',
+    category: 'agent_prepare', text: '正在准备本轮任务'};
+  panel.receive('assistant_progress', prepare);
+  assert.equal(panel.label.textContent, prepare.text);
+  assert.doesNotMatch(panel.body.textContent, /正在准备本轮任务/);
+  panel.receive('assistant_progress', waiting);
+  panel.receive('assistant_progress', prepare);
+  assert.equal(panel.label.textContent, waiting.text);
+  panel.receive('agent_recovery', {job_id: 'job', status: 'admitted', seq: 10});
+  const resumed = {...prepare, note_id: 'job:resume-prepare', category: 'agent_resume_prepare', text: '正在准备恢复本轮任务'};
+  panel.receive('assistant_progress', resumed);
+  assert.equal(panel.label.textContent, resumed.text);
+  assert.doesNotMatch(panel.body.textContent, /正在准备恢复本轮任务/);
+  panel.terminal('completed');
+  panel.receive('assistant_progress', resumed);
+  assert.equal(panel.label.textContent, '已完成');
+});

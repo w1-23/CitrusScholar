@@ -116,6 +116,76 @@ class ExecutionSegments:
                 raise task_events.TaskConflict('execution_segment_missing')
             return dict(row)
 
+    def claim_question_resume(self, *, account_epoch, deadline, expected, fence=None):
+        """Reopen the same job, budget and queue head after an accepted answer."""
+        import time
+        from src.core import chat_turn_queue, user_questions
+
+        if not deadline > time.time():
+            raise ValueError("question_execution_deadline_required")
+        with task_events.transaction() as conn:
+            job = self._job(conn, active=False)
+            segment = self._row(conn, active=False)
+            terminal = task_events.current_terminal_event(conn, self.identity.run_id)
+            question = user_questions.resume_question_row(conn, self.identity.run_id)
+            value = expected["value"]
+            if (job["status"] != "awaiting_input" or job["cancel_requested_at"] or terminal is None
+                    or segment["phase"] != "terminal" or segment["account_epoch"] != account_epoch
+                    or question is None or question["expires_at"] <= time.time()
+                    or (question["id"], question["version"], question["interrupt_id"], question["checkpoint_ref"])
+                       != (value["question_id"], value["version"], value["interrupt_id"], expected["checkpoint_ref"])):
+                raise task_events.TaskConflict("question_resume_claim_conflict")
+            self._settled(conn, self.identity.run_id)
+            chat_turn_queue._resume_question(conn, job, account_epoch=account_epoch, fence=fence)
+            run_id = self.identity.run_id
+            if conn.execute("UPDATE task_budgets SET deadline=? WHERE job_id=?", (deadline, run_id)).rowcount != 1:
+                raise task_events.TaskConflict("execution_segment_budget_missing")
+            event = task_events._append(conn, run_id, "agent_recovery", {"job_id": run_id,
+                "request_id": self.identity.user_turn_id, "status": "admitted", "previous_terminal_seq": terminal[0]})
+            conn.execute("UPDATE task_questions SET resume_cursor=? WHERE id=?", (event["seq"], question["id"]))
+            conn.execute("UPDATE task_jobs SET status='running',current_step='resuming_user_input',error='',"
+                         "finished_at='',terminal_snapshot='',updated_at=? WHERE job_id=?",
+                         (datetime.now().isoformat(), run_id))
+            conn.execute("UPDATE agent_execution_segments SET phase='resuming',generation=generation+1,"
+                         "token=?,checkpoint_ref=?,wait_ids='[]' WHERE job_id=?",
+                         (uuid.uuid4().hex, expected["checkpoint_ref"], run_id))
+            return {"claim": self._claim(self._row(conn)), "recovery_cursor": event["seq"]}
+
+    def _repark_question(self, conn, row):
+        from src.core import chat_turn_queue, user_questions
+
+        run_id = self.identity.run_id
+        question = user_questions.resume_question_row(conn, run_id, active=True)
+        if question is None or row["checkpoint_ref"] != question["checkpoint_ref"] or row["wait_ids"] != "[]":
+            return False
+        cursor = task_events.recovery_cursor(conn, run_id)
+        previous = conn.execute("SELECT data FROM task_events WHERE job_id=? AND event='done' AND seq<? "
+                                "ORDER BY seq DESC LIMIT 1", (run_id, cursor)).fetchone()
+        if previous is None or task_events.current_terminal_event(conn, run_id) is not None:
+            raise task_events.TaskConflict("question_resume_previous_terminal_missing")
+        payload = json.loads(previous[0])
+        if (payload.get("turn_envelope") or {}).get("job_status") != "awaiting_input":
+            raise task_events.TaskConflict("question_resume_previous_terminal_mismatch")
+        self._settled(conn, run_id)
+        conn.execute("UPDATE task_questions SET recovery_cursor=?,resume_cursor=0 WHERE id=?", (cursor, question["id"]))
+        question = user_questions._view(conn.execute("SELECT * FROM task_questions WHERE id=?", (question["id"],)).fetchone())
+        payload.update(question=question, pending_question=question)
+        conn.execute("UPDATE task_jobs SET status='awaiting_input',current_step='awaiting_input',finished_at=?,updated_at=? "
+                     "WHERE job_id=?", (datetime.now().isoformat(), datetime.now().isoformat(), run_id))
+        conn.execute("UPDATE agent_execution_segments SET phase='terminal',generation=generation+1,token=? WHERE job_id=?",
+                     (uuid.uuid4().hex, run_id))
+        chat_turn_queue._repark_question(conn, run_id)
+        task_events._append(conn, run_id, "done", payload)
+        return True
+
+    def repark_question(self, claim):
+        """Requeue only a proven question wake before any model may run."""
+        with self._admit(), task_events.transaction() as conn:
+            row = self._row(conn)
+            self._owned(row, claim)
+            if row["phase"] not in {"resuming", "active"} or not self._repark_question(conn, row):
+                raise task_events.TaskConflict("question_resume_repark_conflict")
+
     def release_unstarted_resume(self, claim):
         """Return an unactivated admission; invalidate its token before reuse."""
         with self._admit(), task_events.transaction() as conn:
@@ -136,19 +206,25 @@ class ExecutionSegments:
                 return 'interrupted'
             if row['phase'] != 'resuming':
                 raise task_events.TaskConflict('execution_segment_phase_conflict')
+            if self._repark_question(conn, row):
+                return 'awaiting_input'
             self._settled(conn, self.identity.run_id)
             conn.execute("UPDATE agent_execution_segments SET phase='parked',generation=generation+1,token=? WHERE job_id=?",
                          (uuid.uuid4().hex, self.identity.run_id))
             self._step(conn, 'waiting_code', 'parked')
             return 'parked'
 
-    def classify_restart_wait(self, snapshot, *, execution_wait=None):
+    def classify_restart_wait(self, snapshot, *, execution_wait=None, question_resume=False):
         """Fenced startup classification after reading the old protected graph."""
         with self._admit(), task_events.transaction() as conn:
             row = self._row(conn)
             if (row['phase'] != 'restart_wait' or row['generation'] != snapshot['generation']
                     or row['token'] != snapshot['token']):
                 raise task_events.TaskConflict('execution_segment_claim_lost')
+            if question_resume:
+                if not self._repark_question(conn, row):
+                    raise task_events.TaskConflict("question_resume_repark_conflict")
+                return
             if execution_wait:
                 checkpoint_ref, waits = execution_wait["checkpoint_ref"], tuple(execution_wait["wait_ids"])
                 self._reference(checkpoint_ref)

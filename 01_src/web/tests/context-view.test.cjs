@@ -81,6 +81,23 @@ test('shows cache coverage only if directly reported counters cover reported inp
 });
 
 
+test('keeps the sent cap, provider usage, elapsed time, and cumulative task budget distinct', () => {
+  const data = project({...snapshot, output_tokens:6144, actual_output_tokens:6144, attempt_elapsed_ms:39610,
+    model_window:20000, input_limit:13728, task_budget:{calls:2, max_calls:8, tokens:8530, max_tokens:30000},
+    provider_usage:{...usageIdentity, output_tokens:1210}});
+  assert.equal(data.outputReserve, 6144);
+  assert.equal(data.actualOutputLimit, 6144);
+  assert.equal(data.attemptElapsed, 39610);
+  assert.deepEqual(data.budget, {calls:2, maxCalls:8, tokens:8530, maxTokens:30000});
+  assert.equal(data.usage.output, 1210);
+  assert.equal(data.inputLimit, 13728);
+  assert.equal(data.modelWindow, 20000);
+  assert.equal(project(snapshot).actualOutputLimit, null);
+  assert.equal(project({...snapshot, attempt_id:'', actual_output_tokens:6144}).actualOutputLimit, null);
+  assert.equal(project({...snapshot, task_budget:{calls:0}}).budget, null);
+});
+
+
 test('the header ring measures the application cap independently of the model drawer', () => {
   const view = project({estimate_scope: 'full_request_estimate', estimated_input_tokens: 7000,
     application_input_limit: 8000, input_limit: 8500, model_window: 100000});

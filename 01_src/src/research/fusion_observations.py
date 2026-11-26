@@ -225,7 +225,60 @@ class RegistryCoverage:
 
 
 def observation_payload(state):
+    if "reference_batch" in state:
+        return {"reference_batch": state["reference_batch"]}
     return {"http": state["http"], "refchecker_candidates": state["refchecker_candidates"]}
+
+
+def batch_observations(report, *, identity, account_epoch, deadline, original_report_sha256):
+    """Run the reference kernel once using the accepted extraction and live policy."""
+    from citrus_refcheck.audit import BudgetExceeded
+    from citrus_refcheck.lookup import AuditStopped
+    from src.core.account_admission import AccountDeletionPending, AccountUnavailable
+    from src.core.account_leases import acquire_account_lease
+    from src.research.fusion_reference_batch import run_reference_batch
+
+    if type(account_epoch) is not int or account_epoch < 0:
+        raise PermissionError("bibliographic_account_epoch_missing")
+
+    def check():
+        try:
+            _policy_check()
+            if not allows("skill:literature-verification"):
+                raise PermissionError("skill_restricted")
+        except PermissionError as exc:
+            raise AuditStopped("network_disabled") from exc
+
+    durable = RegistryReceipts(identity)
+
+    def send(key, operation):
+        try:
+            lease = acquire_account_lease(identity.owner_user_id, expected_epoch=account_epoch)
+        except (AccountDeletionPending, AccountUnavailable) as exc:
+            raise AuditStopped("lease_lost") from exc
+        try:
+            return durable.send(key, operation)
+        except LookupError as exc:
+            if str(exc) != "registry_job_lookup_limit":
+                raise
+            raise BudgetExceeded("request_budget_exhausted") from exc
+        finally:
+            lease.release()
+
+    check()
+    strict = (report.get("execution", {}).get("options") or {}).get("strict") is True
+    batch = run_reference_batch(report["records"], check=check, send=send, deadline=deadline, strict=strict)
+    batch["original_report_sha256"] = original_report_sha256
+    coverage = []
+    for row in batch["records"]:
+        attempts = row["attempts"]
+        status = ("not_queried" if not attempts else "dispatch_unknown" if any(
+            attempt.get("reason") == "dispatch_unknown" for attempt in attempts) else "provider_unavailable" if any(
+            attempt["http_status"] not in {200, 404} for attempt in attempts) else "queried")
+        coverage.append({"record_index": row["record_index"], "status": status})
+    return {"offset": sum(row["status"] != "not_queried" for row in coverage), "total": len(coverage),
+            "stop_reason": batch["stop_reason"] or "batch_completed", "coverage": coverage,
+            "reference_batch": batch}
 
 
 def advance_observations(report, previous=None, *, identity=None, deadline=None):

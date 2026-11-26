@@ -19,7 +19,7 @@ from src.code_execution.egress_policy import normalize_host
 from src.core.cancel import raise_if_cancelled
 from src.figures.apptainer import _CGROUP_GUARD, _host_env
 from .integrity import Bundle, IntegrityError, load_bundle, trusted_source_file, verify_bundle, verify_host_python
-from .relay import BrowseError, Relay
+from .relay import BrowseError, Relay, browse_reason_class
 
 
 _LOG = logging.getLogger(__name__)
@@ -148,6 +148,7 @@ class Renderer:
                 raise BrowseError('browse_action_limit')
             self.actions += 1
             navigations = {}
+            navigation_denials = {}
             await self.send(command)
             while True:
                 raise_if_cancelled('browse')
@@ -157,6 +158,12 @@ class Renderer:
                     result.pop('_navigation_response', None)
                     result['_action_sequence'] = self.actions
                     tab_id = result.get('tab_id')
+                    if result.get('error'):
+                        target = result.get('retry_target') or tab_id
+                        if isinstance(target, str) and target in navigation_denials:
+                            raise BrowseError(navigation_denials[target])
+                        if command.get('action') == 'new_tab' and len(navigation_denials) == 1:
+                            raise BrowseError(next(iter(navigation_denials.values())))
                     observed_url = result.get('url')
                     document = navigations.get(tab_id) if isinstance(tab_id, str) else None
                     if document and isinstance(observed_url, str):
@@ -172,9 +179,12 @@ class Renderer:
                 navigation = isinstance(navigation_tab, str) and re.fullmatch(r't-[a-f0-9]{12}', navigation_tab)
                 if navigation:
                     navigations.pop(navigation_tab, None)
+                    navigation_denials.pop(navigation_tab, None)
                 try:
                     response = await self.relay.fetch(result.get('url'), result.get('method'))
-                except BrowseError:
+                except BrowseError as exc:
+                    if navigation and browse_reason_class(str(exc)) == 'scope_limited':
+                        navigation_denials[navigation_tab] = str(exc)
                     raise_if_cancelled('browse')
                     if self.closing:
                         raise BrowseError('browse_session_expired')

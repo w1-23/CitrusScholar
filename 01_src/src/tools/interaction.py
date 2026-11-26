@@ -23,8 +23,8 @@ def request_user_input(prompt: str, options: list, multi_select: bool, allow_tex
     """Ask one necessary clarification and end this execution segment.
 
     Use native structured tool calls only, in a separate batch from all other
-    tools. options have id, label, description, refs; purpose/preferences may
-    have empty refs. Field options MUST cite real schema identities. Never infer
+    tools. Options have id, label, description and optional refs. Field options
+    MUST cite real schema identities. Never infer
     scientific field roles. Set allow_text for a custom answer; user may cancel.
     IDs, owner, session and version are generated/validated by the host.
     """
@@ -37,10 +37,3 @@ def request_user_input(prompt: str, options: list, multi_select: bool, allow_tex
         "user_question": question,
         "_tool_outcome": {"status": "complete", "reason_code": "awaiting_input",
                           "summary": "等待用户答复", "artifacts": []}}
-
-
-def provider_tools(tools):
-    """Keep existing executor objects; bind only interaction with strict schema."""
-    from langchain_core.utils.function_calling import convert_to_openai_tool
-    return [convert_to_openai_tool(t, strict=True) if t.name == "request_user_input" else t
-            for t in tools]

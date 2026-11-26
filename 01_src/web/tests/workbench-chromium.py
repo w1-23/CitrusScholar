@@ -124,7 +124,7 @@ def run(browser, origin, output):
     expect(group(page, "数据系列")).to_have_attribute("aria-expanded", "false")
     group(page, "数据系列").locator(":scope > .tree-row > .tree-name").click()
     expect(page.get_by_text("批量属性 · 3 个对象")).to_be_visible()
-    page.get_by_label("标记形状", exact=True).select_option("D")
+    page.get_by_role("radio", name="菱形", exact=True).press("Space")
     batch = apply(page, "应用到类别")
     assert {item["label"] for item in batch["groups"] if item["kind"] == "series" and item["values"].get("marker") == "D"} == {"CK", "BL", "WL"}
     page.get_by_role("button", name="撤销", exact=True).click()
@@ -142,8 +142,8 @@ def run(browser, origin, output):
     expect(page.get_by_role("heading", name="WL", exact=True)).to_be_visible()
     original = page.locator("#preview").get_attribute("src")
     page.get_by_label("系列颜色", exact=True).fill("#7a3c96")
-    page.get_by_label("线型", exact=True).select_option("--")
-    page.get_by_label("标记形状", exact=True).select_option("^")
+    page.get_by_role("radio", name="虚线", exact=True).press("Space")
+    page.get_by_role("radio", name="向上三角", exact=True).press("Space")
     page.get_by_label("填充方式", exact=True).select_option("none")
     draft = apply(page)
     assert page.locator("#preview").get_attribute("src") != original
@@ -151,7 +151,7 @@ def run(browser, origin, output):
     assert svg.count('stroke="#7a3c96"') >= 2 and 'stroke-dasharray=' in svg
     page.get_by_role("button", name="撤销", exact=True).click()
     expect(page.locator("#status")).to_have_text("已恢复保存的图件。", timeout=20000)
-    expect(page.get_by_label("线型", exact=True)).to_have_value("-")
+    expect(page.get_by_role("radio", name="实线", exact=True)).to_be_checked()
     expect(page.get_by_label("填充方式", exact=True)).to_have_value("auto")
     page.get_by_role("button", name="重做", exact=True).click()
     expect(page.locator("#status")).to_have_text("草稿预览已更新。", timeout=20000)

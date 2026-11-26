@@ -24,7 +24,7 @@
       while ((offset = buffer.indexOf('\n')) >= 0) {
         line(buffer.slice(0, offset).replace(/\r$/, '')); buffer = buffer.slice(offset + 1);
       }
-      if (final) { if (buffer) line(buffer.replace(/\r$/, '')); buffer = ''; line(''); }
+      if (final) { buffer = ''; type = 'message'; id = ''; lines = []; }
     }};
   }
   function create(options) {
@@ -44,12 +44,26 @@
       }
       return data;
     }
+    async function observeRead(source, read) {
+      var scope = reads;
+      try {
+        var result = await read();
+        if (owns() && scope === reads && options.onReadState) options.onReadState(source, false);
+        return result;
+      } catch (error) {
+        if (owns() && scope === reads && options.onReadState) options.onReadState(source, true);
+        throw error;
+      }
+    }
     function snapshot(data) {
       if (!owns() || !data) return;
       if (!store.hydrate(data)) return;
       if (options.onSnapshot) options.onSnapshot(data);
     }
-    async function replay(jobId) {
+    function replay(jobId) {
+      return observeRead('replay', function () { return readEvents(jobId); });
+    }
+    async function readEvents(jobId) {
       if (!jobId || !owns()) return;
       if (replaying) return replaying;
       var scope = reads;
@@ -60,18 +74,26 @@
           var before = store.state.cursor;
           var page = await json('/jobs/' + encodeURIComponent(jobId) + '/events?after=' + before + '&limit=200');
           if (!owns() || !page) return;
-          if (page.protocol !== 'citrus-task/1' || page.job_id && page.job_id !== jobId) throw new Error('任务事件格式不匹配。');
+          if (page.protocol !== 'citrus-task/1' || page.job_id !== jobId || !Array.isArray(page.events)) {
+            throw new Error('任务事件格式不匹配。');
+          }
+          if (page.events.some(function (frame) {
+            return !frame || typeof frame.event !== 'string' || !Number.isSafeInteger(frame.seq) || frame.seq < 1 ||
+              frame.data && frame.data.job_id && frame.data.job_id !== jobId;
+          })) throw new Error('任务事件格式不匹配。');
+          var last = page.events[page.events.length - 1];
+          if (!Number.isSafeInteger(page.next_cursor) || page.next_cursor < before ||
+              page.next_cursor !== (last ? last.seq : before)) throw new Error('任务事件游标无效。');
           if (store.setRecoveryFloor) store.setRecoveryFloor(page.recovery_cursor);
-          (page.events || []).forEach(function (frame) {
-            if (owns()) store.receive(frame.event, Object.assign({}, frame.data, {seq: frame.seq}), String(frame.seq));
+          var first = page.events[0];
+          if (!before && first) store.beginReplay(first.seq);
+          page.events.forEach(function (frame) {
+            if (owns() && scope === reads) store.receive(frame.event, Object.assign({job_id: jobId}, frame.data, {seq: frame.seq}), String(frame.seq));
           });
           // A cursor is a watermark: a page may repeat consumed events, never
           // move it backwards. The terminal snapshot is hydrated only after the
           // page (including the artifact-delivery tail before ``done``) is applied.
-          if (Number.isSafeInteger(page.next_cursor) && page.next_cursor < store.state.cursor) {
-            throw new Error('任务事件游标回退。');
-          }
-          if (store.hasGap() || Number.isSafeInteger(page.next_cursor) && store.state.cursor < page.next_cursor) {
+          if (store.state.cursor < page.next_cursor || !page.has_more && store.hasGap()) {
             throw new Error('任务状态暂未同步，正在补读事件。');
           }
           more = !!page.has_more;
@@ -82,9 +104,12 @@
       try { return await flight; } finally { if (replaying === flight) replaying = null; }
     }
     async function refresh(jobId, withEvents) {
-      var job = await json('/jobs/' + encodeURIComponent(jobId));
+      var job = await observeRead('status', async function () {
+        var data = await json('/jobs/' + encodeURIComponent(jobId));
+        if (data && data.job_id !== jobId) throw new Error('任务状态标识不匹配。');
+        return data;
+      });
       if (!job || !owns()) return null;
-      if (job.job_id !== jobId) throw new Error('任务状态标识不匹配。');
       var taskState = root.CitrusTaskState;
       // A late status response must not move the consumed watermark backwards.
       if (Number.isSafeInteger(job.event_cursor) && job.event_cursor < store.state.cursor) return job;
@@ -92,7 +117,9 @@
       if ((withEvents !== false || taskState.snapshotStatus(job) || taskState.isTerminal(store.state)) &&
           job.event_cursor > store.state.cursor) {
         await replay(jobId);
-        if (owns() && job.event_cursor > store.state.cursor) throw new Error('任务状态暂未同步，正在补读事件。');
+        if (owns() && job.event_cursor > store.state.cursor) {
+          return observeRead('replay', function () { throw new Error('任务状态暂未同步，正在补读事件。'); });
+        }
       }
       if (owns()) snapshot(job);
       return owns() ? job : null;
@@ -149,26 +176,40 @@
       return lookup();
     }
     async function stream(response, signal) {
+      var scope = reads;
       var reader = response.body.getReader(), decoder = new TextDecoder();
+      var watching = function () { return owns() && scope === reads && !signal.aborted; };
       var frames = [];
       var input = parser(function (type, data, id) { frames.push([type, data, id]); });
       async function flush() {
-        while (frames.length && owns() && !signal.aborted) {
+        while (frames.length && watching()) {
           var frame = frames.shift();
-          store.receive(frame[0], frame[1], frame[2]);
-          if (store.hasGap() && store.state.job_id) await replay(store.state.job_id);
+          var accepted = store.receive(frame[0], frame[1], frame[2]);
+          if (accepted && !store.state.job_id && frame[0] === 'job' && typeof frame[1].job_id === 'string' && frame[1].job_id) {
+            store.hydrate({job_id: frame[1].job_id});
+          }
+          if (store.hasGap() && store.state.job_id) {
+            try { await replay(store.state.job_id); } catch (_) { /* Keep reading the SSE stream. */ }
+          }
         }
       }
       try {
-        while (owns() && !signal.aborted) {
-          var chunk = await reader.read();
-          if (!owns() || signal.aborted) return;
+        while (watching()) {
+          var chunk;
+          try { chunk = await reader.read(); } catch (_) { break; }
+          if (!watching()) return;
           input.push(chunk.done ? decoder.decode() : decoder.decode(chunk.value, {stream: true}), !!chunk.done);
           await flush();
-          if (chunk.done) return;
+          if (chunk.done) break;
         }
       } finally {
-        if (!owns() || signal.aborted) await reader.cancel().catch(function () {});
+        if (!watching()) await reader.cancel().catch(function () {});
+        reader.releaseLock();
+      }
+      if (watching() && !root.CitrusTaskState.isTerminal(store.state)) {
+        var waiting = store.state.status === 'awaiting_input';
+        if (!waiting && options.onStreamInterrupted) options.onStreamInterrupted();
+        if (store.state.job_id) return follow(store.state.job_id);
       }
     }
     return {stream: stream, replay: replay, refresh: refresh, follow: follow, followContinuation: followContinuation, followRequest: followRequest,
@@ -195,7 +236,7 @@
   // turns observe their own job events. A watched terminal need not be within
   // the page that advanced after_seq. Missing/failed reads never erase a row.
   function createSessionObserver(options) {
-    var observers = new Map(), known = new Map(), cursor = null, timer, flight, stopped = false;
+    var observers = new Map(), known = new Map(), cursor = null, watchOffset = 0, timer, flight, stopped = false;
     var reads = new AbortController();
     var owns = function () { return !stopped && options.owns(); };
     function schedule() {
@@ -206,7 +247,10 @@
       if (!owns()) return Promise.resolve(null);
       if (flight) return flight;
       if (timer != null) { clearTimeout(timer); timer = null; }
-      var watches = Array.from(observers.keys()).slice(0, 32);
+      var ids = Array.from(observers.keys());
+      watchOffset = ids.length > 32 ? watchOffset % ids.length : 0;
+      var watches = ids.slice(watchOffset, watchOffset + 32);
+      if (ids.length > 32) watchOffset += watches.length;
       // The unqualified first window returns the latest history. A numeric
       // zero would instead page from the beginning of an old session.
       var url = options.url + '?limit=100' + (cursor == null ? '' : '&after_seq=' + cursor)
@@ -232,7 +276,7 @@
             if (pair[1].state === 'terminal' && !observers.has(pair[0])) known.delete(pair[0]);
           }
         }
-        if (options.onAvailability) options.onAvailability(watches.every(function (id) { return returned.has(id); }));
+        if (options.onAvailability) options.onAvailability(watches.every(function (id) { return !observers.has(id) || returned.has(id); }));
         returned.forEach(function (entry, id) {
           var listeners = observers.get(id);
           if (listeners && owns()) Array.from(listeners).forEach(function (adopt) { adopt(entry); });

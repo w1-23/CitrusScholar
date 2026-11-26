@@ -94,7 +94,7 @@ class HostTools:
                 "original_chars": len(message.content), "execution_status": row["status"]}
 
     def result_readbacks(self):
-        """Collect the last committed page for each selection of a clipped result."""
+        """Index issued continuation cursors for authorized result offers."""
         from src.core.tool_results import observation_receipt_key
 
         eligible = {key: {} for key in self.historical_result_offers}
@@ -110,30 +110,30 @@ class HostTools:
             if not isinstance(observation, dict) or observation.get("status") != "ok":
                 continue
             target = observation.get("tool_call_id")
-            fields = observation.get("selected_fields")
+            fields, page = observation.get("selected_fields"), observation.get("page")
+            cursor = page.get("next_cursor") if isinstance(page, dict) else None
             if (isinstance(target, str) and target in eligible and isinstance(fields, list)
-                    and all(isinstance(field, str) for field in fields)
-                    and isinstance(observation.get("page"), dict)):
-                eligible[target][tuple(sorted(set(fields)))] = observation
+                    and all(isinstance(field, str) for field in fields) and isinstance(cursor, str)
+                    and type(page.get("next_start_char")) is int):
+                eligible[target][cursor] = observation
         return eligible
 
     def has_result_readback(self):
-        return any(() not in selections or selections[()]["page"].get("next_cursor")
-                   for selections in self.result_readbacks().values())
+        return bool(self.result_readbacks())
 
     def _prepare_result_readback(self, args, call_id):
         target, token = args.get("tool_call_id"), args.get("cursor", "")
-        if not isinstance(target, str) or args.get("start_char", 0) != 0:
+        start = args.get("start_char", 0)
+        if not isinstance(target, str) or type(start) is not int or start < 0:
             return False
         selections = self.result_readbacks().get(target)
         if selections is None or target in self.pending_result_reads:
             return False
         if token:
-            if args.get("fields") is not None:
+            if not isinstance(token, str) or args.get("fields") is not None or start:
                 return False
-            previous = next((entry for entry in selections.values()
-                             if entry["page"].get("next_cursor") == token), None)
-            if previous is None or (() in selections and previous is not selections[()]):
+            previous = selections.get(token)
+            if previous is None:
                 return False
             args["start_char"] = previous["page"]["next_start_char"]
             args["fields"] = previous["selected_fields"] or None
@@ -141,11 +141,6 @@ class HostTools:
             fields = args.get("fields")
             if fields is not None and (not isinstance(fields, list)
                     or any(not isinstance(field, str) for field in fields)):
-                return False
-            requested = set(fields or [])
-            if () in selections or (selections and not requested):
-                return False
-            if any(requested.intersection(selection) for selection in selections):
                 return False
         self.pending_result_reads[target] = call_id
         return True
@@ -466,7 +461,11 @@ class HostTools:
             emit_encoded("context_degraded", {"stage": "tool_delivery", "status": "degraded",
                 "reason_code": "batch_observation_not_stored", "tool_call_id": call['id'],
                 "message": "部分工具观察无法编码，已登记的成果仍可查看。"})
-        if delivered.name == "draw_svg" and execution.operation_id and not execution.uncertain:
+        artifact = delivered.artifact if isinstance(delivered.artifact, dict) else {}
+        has_inline_figure = (delivered.name == "draw_svg" or
+            delivered.name == "run_research_figure_script" and (
+                artifact.get("inline_registered") is True or bool(artifact.get("figure_placeholders"))))
+        if has_inline_figure and execution.operation_id and not execution.uncertain:
             from src.core.figures import export_recovery
             retained = delivered.model_copy(update={"additional_kwargs": {
                 **delivered.additional_kwargs, "host_figure_recovery": export_recovery(identity)}})
@@ -477,7 +476,7 @@ class HostTools:
                 # A too-large outbox copy must not undo a published drawing.
                 # A missing early receipt prevents recovery from rerunning it.
                 import logging
-                logging.getLogger(__name__).warning("draw_observation_recovery_state_too_large")
+                logging.getLogger(__name__).warning("figure_observation_recovery_state_too_large")
         else:
             retain_observation(identity, execution, delivered, call)
         self.records.append(record)

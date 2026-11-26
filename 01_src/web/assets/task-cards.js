@@ -294,7 +294,7 @@
       note: function (text, id, metadata) {
         var clean = (metadata && metadata.public_note && options.publicNote ? options.publicNote : options.clean)(text);
         var item = clean ? projection.note(clean, id, metadata) : null;
-        if (item) draw();
+        if (item && !(metadata && metadata.status_only)) draw();
         return item;
       },
       plan: function (data) { if (projection.plan(data)) draw(); },

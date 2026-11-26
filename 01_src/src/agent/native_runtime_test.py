@@ -87,11 +87,15 @@ def test_workspace_uses_installed_skill_inventory_and_live_policy(tmp_path, monk
 
 
 async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
+    from hashlib import sha256
+    import json
+
     skill_root = tmp_path / "skills"
     demo = skill_root / "demo"
     demo.mkdir(parents=True)
-    (demo / "SKILL.md").write_text("---\nname: demo\ndescription: Demo\n---\nRead-only demo",
-                                 encoding="utf-8")
+    entry = demo / "SKILL.md"
+    entry.write_text("---\nname: demo\ndescription: Demo\n---\nRead-only demo", encoding="utf-8")
+    (tmp_path / "inventory.json").write_text(json.dumps({"skills/demo/SKILL.md": sha256(entry.read_bytes()).hexdigest()}))
     histories = []
     admissions = []
     events = []
@@ -178,6 +182,7 @@ def test_native_thread_accepts_new_turn_after_cancelling_model(tmp_path):
 
         skill_root = tmp_path / "skills"
         skill_root.mkdir()
+        (tmp_path / "inventory.json").write_text("{}")
         options = {"skill_root": skill_root, "system_prompt": "fixture prompt"}
         calls = []
 
@@ -227,6 +232,7 @@ def test_native_experiment_scope_discards_prior_context_and_summary(tmp_path, mo
     async def scenario():
         skill_root = tmp_path / "skills"
         skill_root.mkdir()
+        (tmp_path / "inventory.json").write_text("{}")
         provider = ("https://example.test", "example-model")
         root = tmp_path / "state"
         histories = []
@@ -330,12 +336,13 @@ def test_retired_skills_do_not_leak_into_current_method_interfaces(tmp_path, mon
         validate_scenario_selection([legacy])
     monkeypatch.setattr(workspace_tools, '_identity', lambda: (1, 'skill-test-session'))
     call = workspace_tools.research_workspace.func
-    assert call(operation="skills")[1]["skills"] == []
-    assert call(operation="read_skill", skill_id=new_id)[1]["error"] == "skill_resource_unavailable"
-    assert not list(resources("/skills/" + new_id))
+    assert [row["id"] for row in call(operation="skills")[1]["skills"]] == [new_id]
+    assert call(operation="read_skill", skill_id=new_id)[1]["entrypoint"]["text"] == content.decode()
+    assert list(resources("/skills/" + new_id))
     policy = CapabilityPolicy()
     sdk = ScopedSkillBackend(tmp_path / "skills", policy)
-    assert sdk.read("/" + entry.removeprefix("skills/")).error
+    assert sdk.read("/" + entry.removeprefix("skills/")).error is None
+    assert sdk.read("/" + new_id + "/unlisted.md").error
     selected = validate_scenario_selection([{key: scenario_catalog()[0][key]
         for key in ("id", "version", "sha256")}])
     with pytest.raises(ValueError, match="selected_skill_identity_mismatch"):
@@ -354,9 +361,8 @@ def test_retired_skills_do_not_leak_into_current_method_interfaces(tmp_path, mon
         sdk = ScopedSkillBackend(tmp_path / "skills", policy, view)
         assert sdk.read("/" + entry.removeprefix("skills/")).error is None
     with bind_turn_skills(TurnSkills(tmp_path)):
-        with pytest.raises(PermissionError, match="skill_disabled"):
-            read(key, descriptor)
-        assert not list(resources("/skills/" + new_id))
+        assert read(key, descriptor)[0] == content.decode()
+        assert list(resources("/skills/" + new_id))
     revoked = CapabilityPolicy(revoked=("skill:" + new_id,))
     with bind_policy(revoked), bind_turn_skills(view):
         assert not list(resources("/skills/" + new_id))
@@ -533,43 +539,88 @@ def test_unknown_operation_never_executes_sibling_or_next_turn():
     asyncio.run(scenario())
 
 
-def test_only_authenticated_answered_question_child_can_start_new_turn():
+@pytest.mark.parametrize("crash_ack", (False, True))
+def test_question_resume_continues_original_interrupt_without_replaying_tools(tmp_path, monkeypatch, crash_ack):
+    from dataclasses import asdict
     from langchain_core.messages import ToolMessage
-    from langgraph.checkpoint.memory import InMemorySaver
+    from src.agent.recovery import QuestionWakeDeferred, load_recovery_state
+    from src.core import jobs
     from src.agent.runtime import AdmissionStopped
-    import pytest
+    from src.core.task_events import TaskConflict
+
+    monkeypatch.setattr(jobs, "_DB_PATH", tmp_path / "jobs.sqlite3")
 
     async def run():
-        parent = ExecutionIdentity(1, "s", "t1", "parent")
-        child = ExecutionIdentity(1, "s", "t2", "child")
-        calls = []
+        job = jobs.claim_job("session-fixture", "turn-fixture", owner_user_id=1,
+                             client_request_id="client", payload={})
+        identity = ExecutionIdentity(1, "session-fixture", "turn-fixture", job.job_id)
+        provider = ("https://example.test", "fixture")
+        original = {"user_id": 1, "session_id": identity.session_id,
+                    "request_id": identity.user_turn_id, "job_id": identity.run_id,
+                    "query": "request", "client_request_id": "client", "idempotency_key": "key"}
+        next_turn = ExecutionIdentity(1, "session-fixture", "other-turn", "other-run")
+        calls, model_calls, bindings, acks = [], [], [], []
         question = {"name": "request_user_input", "id": "ask", "args": {}}
 
-        async def model(history, identity, **kwargs):
-            if identity == parent:
+        async def model(history, active, **kwargs):
+            assert active == identity
+            model_calls.append(active)
+            if len(model_calls) == 1:
                 return AIMessage("", tool_calls=[question])
-            assert any(m.content == "my answer" for m in history)
+            assert sum(isinstance(message, HumanMessage) and message.content == "request" for message in history) == 1
+            assert sum(isinstance(message, HumanMessage) and "fixture answer" in str(message.content)
+                       for message in history) == 1
             return AIMessage("final")
 
         async def execute(call, _):
             calls.append(call["id"])
-            return ToolMessage("question recorded", name=call["name"], tool_call_id=call["id"]), {"pending_question": True}
+            return ToolMessage("question recorded", name=call["name"], tool_call_id=call["id"]), {
+                "pending_question": {"question_id": "first-question", "version": 1}}
 
-        async def accept(*args):
+        async def final(*args):
             return FinalCheck()
+
+        async def bind(value, interrupt_id, checkpoint):
+            bindings.append((value, interrupt_id, checkpoint))
+
+        async def ack(value, checkpoint):
+            acks.append((value, checkpoint))
+            if crash_ack and len(acks) == 1:
+                raise QuestionWakeDeferred("simulated loss before ledger ACK")
 
         schemas = [{"function": {"name": question["name"], "description": "Fixture question",
                                  "parameters": {"type": "object"}}}]
-        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(), schemas)
-        saver = InMemorySaver()
-        config = {"thread_id": "same-session"}
-        assert (await runtime.run(parent, [HumanMessage("request")], saver=saver,
-                                  checkpoint_config=config)).status == "waiting"
-        with pytest.raises(AdmissionStopped, match="native_thread_requires_reconciliation"):
-            await runtime.run(child, [HumanMessage("arbitrary user input")], saver=saver, checkpoint_config=config)
-        runtime.authorized_question_parent = parent.run_id
-        result = await runtime.run(child, [HumanMessage("my answer")], saver=saver, checkpoint_config=config)
+        runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, final, RunLimits(), schemas,
+                                 bind_user_input=bind, acknowledge_user_input=ack,
+                                 export_host=lambda: {"identity": asdict(identity), "original_request_state": original})
+        config = framework_checkpoint_scope(identity, provider)
+        async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
+            parked = await runtime.run(identity, [HumanMessage("request")], saver=saver, checkpoint_config=config)
+            assert parked.status == "waiting"
+            with pytest.raises(AdmissionStopped, match="native_thread_requires_reconciliation"):
+                await runtime.run(next_turn, [HumanMessage("arbitrary user input")], saver=saver, checkpoint_config=config)
+        payload, interrupt_id, ref = bindings[0]
+        assert payload == {"kind": "user_input", "question_id": "first-question", "version": 1}
+        answer = {**payload, "interrupt_id": interrupt_id, "selected_option_ids": [], "selected_labels": [],
+                  "text": "fixture answer"}
+        runtime.user_input = {"value": {**answer, "interrupt_id": "wrong"}, "checkpoint_ref": ref}
+        with pytest.raises(TaskConflict, match="question_resume_checkpoint_conflict"):
+            await load_recovery_state(tmp_path, identity, provider, question_resume=runtime.user_input)
+        runtime.user_input = {"value": answer, "checkpoint_ref": ref}
+        resumed = await load_recovery_state(tmp_path, identity, provider, question_resume=runtime.user_input)
+        assert resumed["agent_question_resume"] == runtime.user_input and resumed["messages"] == []
+        if crash_ack:
+            async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
+                with pytest.raises(QuestionWakeDeferred):
+                    await runtime.run(identity, [], saver=saver, checkpoint_config=config, resume=True)
+            assert len(model_calls) == 1
+            resumed = await load_recovery_state(tmp_path, identity, provider, question_resume=runtime.user_input)
+            assert resumed["agent_question_resume"] == runtime.user_input
+        async with open_framework_checkpoint(tmp_path, identity, provider) as saver:
+            result = await runtime.run(identity, [], saver=saver, checkpoint_config=config, resume=True)
         assert result.status == "complete" and calls == ["ask"]
+        assert len(model_calls) == 2 and len(set(checkpoint for _, checkpoint in acks)) == 1
+        assert len(acks) == (2 if crash_ack else 1)
 
     asyncio.run(run())
 
@@ -774,7 +825,7 @@ def test_rqa_method_projection_retains_tool_pairing_and_nonmethod_evidence(tmp_p
     assert not _shared_result_accessible(pointer, outer, fetch, allow_rqa=False)
 
 
-def test_selected_sdk_method_is_available_but_does_not_carry_to_fresh_turn(tmp_path):
+def test_sdk_discovers_unselected_method_without_carrying_prior_method_bytes(tmp_path):
     import hashlib
     import json
     from langchain_core.messages import ToolMessage
@@ -815,7 +866,9 @@ def test_selected_sdk_method_is_available_but_does_not_carry_to_fresh_turn(tmp_p
                 leaked = [(type(message).__name__, getattr(message, "name", ""), message.content,
                            message.additional_kwargs) for message in outgoing if "Scope specimen 9651." in str(message.content)]
                 assert not leaked
-                assert all("Exact method specimen" not in str(message.content) for message in outgoing)
+                assert any("Exact method specimen" in str(message.content) for message in outgoing)
+                assert all(message.additional_kwargs.get("skill", {}).get("name") != RQA_ID
+                           for message in outgoing if isinstance(message, HumanMessage))
                 assert any(message.tool_call_id == "rqa-native" for message in observations)
             return AIMessage("ordinary answer")
 

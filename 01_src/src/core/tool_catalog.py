@@ -58,7 +58,7 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "read_account_file": ToolMetadata(
         "读取账户文件", capabilities=frozenset()),
     "read_tool_result": ToolMetadata(
-        "读取历史结果", capabilities=frozenset()),
+        "读取工具结果", capabilities=frozenset()),
     "research_workspace": ToolMetadata(
         "科研工作区", capabilities=frozenset({RESEARCH})),
 

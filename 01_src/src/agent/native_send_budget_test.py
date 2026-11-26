@@ -6,7 +6,8 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import PropertyMock, patch
 
 import httpx
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -38,11 +39,11 @@ BASE = "https://api.deepseek.com/v1"
 OLD_TEXT = {f"old-{i}": f"evidence {i} " + "Z" * 30_300 for i in range(16)}
 
 
-def _chat_stream(calls=(), *, answer="accepted", finish=None):
+def _chat_stream(calls=(), *, answer="accepted", finish=None, raw_args=None, completion_tokens=10):
     if calls:
         delta = {"role": "assistant", "reasoning_content": "private tool reasoning",
                  "tool_calls": [{"index": i, "id": cid, "type": "function",
-                     "function": {"name": name, "arguments": json.dumps(args)}}
+                     "function": {"name": name, "arguments": json.dumps(args) if raw_args is None else raw_args}}
                      for i, (cid, name, args) in enumerate(calls)]}
     else:
         delta = {"role": "assistant", "content": answer}
@@ -50,7 +51,8 @@ def _chat_stream(calls=(), *, answer="accepted", finish=None):
     rows = [{**chunk, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
             {**chunk, "choices": [{"index": 0, "delta": {},
                                   "finish_reason": finish or ("tool_calls" if calls else "stop")}]},
-            {**chunk, "choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}}]
+            {**chunk, "choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": completion_tokens,
+                                                "total_tokens": 100 + completion_tokens}}]
     return httpx.Response(200, text="".join(f"data: {json.dumps(row)}\n\n" for row in rows) + "data: [DONE]\n\n",
                           headers={"Content-Type": "text/event-stream"})
 
@@ -85,9 +87,9 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
         progress_bus.set_turn_scope(self.sid, claim.job["client_request_id"])
         return identity
 
-    async def run_turn(self, model, identity, human_content, evidence, **kwargs):
+    async def run_turn(self, model, identity, human_content, evidence, *, model_budget=None, **kwargs):
         host = HostTools(identity, {}, allowed_names={EVIDENCE, READER})
-        driver = ModelDriver(self.catalog, max_output_tokens=16_384)
+        driver = ModelDriver(self.catalog, max_output_tokens=16_384, budget=model_budget)
         human = HumanMessage(content=human_content, additional_kwargs=identity.message_metadata("user"))
 
         async def metered(request, handler, active, host_tools):
@@ -290,6 +292,53 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request_context.estimate_request(payload)["output_tokens"] for payload in wire], [4096])
         self.assertFalse(host.records)
         self.assertFalse(result.pending_tool_calls)
+
+    async def test_malformed_tool_stream_length_requires_measured_cap_usage(self):
+        self.addCleanup(progress_bus.clear_request_queue)
+        for index, (finish, used, expected) in enumerate((
+            ('length', 6144, 'exhausted'), ('length', 21, 'unconfirmed'), ('content_filter', 6144, None)), 1):
+            identity = self.job(index)
+            task_events.init_budget(identity.run_id, time.time() + 60, max_calls=1, max_tokens=30_000)
+            progress_bus.set_request_queue(task_events.DurableEventQueue(identity.run_id))
+            wire = []
+            base_url = BASE
+            registry = {'opencode_go': {PROVIDER: {'max_output_tokens': 6144, 'context_window_tokens': 20000}}}
+            transport = SimpleNamespace(provider_id='opencode_go', model=PROVIDER, configured_context_window=30000)
+            with patch.object(settings, 'MAIN_MODEL_BUDGETS', registry):
+                budget = request_context.resolve_main_model_budget(transport, settings)
+            def receive(request):
+                wire.append(json.loads(request.content))
+                return _chat_stream([('truncated', EVIDENCE, {})], finish=finish, raw_args='{',
+                                    completion_tokens=used)
+            with (patch.object(type(settings), 'RESOLVED_PROVIDER_ID', new_callable=PropertyMock, return_value='opencode_go'),
+                  patch.object(type(settings), 'RESOLVED_MAIN_BASE_URL', new_callable=PropertyMock, return_value=base_url)):
+                client_transport = AsyncDeepSeekTransport(base_url, httpx.MockTransport(receive))
+                async with httpx.AsyncClient(transport=client_transport, trust_env=False) as client:
+                    model = ChatOpenAI(use_responses_api=False, model=PROVIDER, api_key='fixture', base_url=base_url,
+                        max_retries=0, max_tokens=4096, stream_usage=True, http_async_client=client)
+                    result, host = await self.run_turn(model, identity, 'fixture', {}, model_budget=budget, recover_output=True)
+            self.assertEqual((result.status, result.reason), ('incomplete', 'model_' + finish))
+            self.assertFalse(host.records)
+            self.assertFalse(result.pending_tool_calls)
+            self.assertEqual(len(wire), 1)
+            self.assertEqual(wire[0]['max_tokens'] if 'max_tokens' in wire[0] else wire[0]['max_completion_tokens'], 6144)
+            with task_events.transaction() as conn:
+                row = conn.execute('SELECT observation,usage FROM task_model_attempts WHERE job_id=?',
+                                   (identity.run_id,)).fetchone()
+            obs = json.loads(row['observation'])
+            self.assertEqual((obs['provider'], obs['finish_reason'], obs['finish_reason_status'], obs['output_limit_status']),
+                             ('opencode_go', finish, 'reported', expected))
+            self.assertEqual((obs['max_output_tokens'], obs['prepared_output_tokens'], obs['model_window'], obs['input_limit']),
+                             (6144, 6144, 20000, budget.input_limit()))
+            self.assertEqual(json.loads(row['usage'])['output_tokens'], used)
+            self.assertIsInstance(obs['provider_first_packet_ms'], int)
+            self.assertIsInstance(obs['attempt_elapsed_ms'], int)
+            snapshot = task_events.latest_context_snapshot(identity.run_id)
+            self.assertEqual(snapshot['actual_output_tokens'], 6144)
+            self.assertEqual(snapshot['input_limit'], budget.input_limit())
+            self.assertEqual(snapshot['attempt_elapsed_ms'], obs['attempt_elapsed_ms'])
+            self.assertEqual(snapshot['task_budget'], {'calls': 1, 'max_calls': 1,
+                                                       'tokens': 100 + used, 'max_tokens': 30_000})
 
     async def test_legacy_derived_checkpoint_is_ignored_without_rewriting_canonical_tape(self):
         class LegacyState(HarnessState):

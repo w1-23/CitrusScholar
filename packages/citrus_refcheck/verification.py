@@ -2,6 +2,7 @@
 from concurrent.futures import Executor, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from dataclasses import dataclass, replace
+from itertools import combinations
 import math
 import re
 from threading import Event, Lock
@@ -12,7 +13,7 @@ from .audit import BudgetExceeded
 from .compare import _value, compare_fields
 from .inventory import MAX_RECORDS, digest
 from .lookup import AuditStopped
-from .providers import norm_title, normalize_arxiv_id, normalize_doi
+from .providers import norm_title, normalize_arxiv_id, normalize_doi, normalize_pmid
 from .verdict import _abbreviated_authors
 
 _MAX_WORKERS = 4
@@ -22,7 +23,7 @@ _BATCH_STOPS = frozenset({'cancelled', 'canceled', 'deadline', 'request_budget_e
 _ITEM_STOPS = frozenset({'item_deadline', 'rate_limit_cooldown'})
 _EXACT_DOI = re.compile(r'10\.\d{4,9}/\S+')
 _ERROR_CODE = re.compile(r'[A-Za-z][A-Za-z0-9_.:-]{0,127}')
-_TEXT_FIELDS = ('title', 'authors', 'year', 'doi', 'arxiv_id', 'journal', 'venue', 'volume', 'issue', 'pages',
+_TEXT_FIELDS = ('title', 'authors', 'year', 'doi', 'arxiv_id', 'pmid', 'journal', 'venue', 'volume', 'issue', 'pages',
                 'article_number', 'type', 'source', 'url')
 
 
@@ -54,6 +55,7 @@ class Capabilities:
     search: Lookup | None = None
     lookup_arxiv: Lookup | None = None
     executor: Executor | None = None
+    lookup_pmid: Lookup | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,8 @@ def _queries(entry):
         identifiers.append(Query('doi', doi if _EXACT_DOI.fullmatch(doi) else ''))
     if supplied := _value(claims, 'arxiv_id'):
         identifiers.append(Query('arxiv', normalize_arxiv_id(supplied)))
+    if supplied := _value(claims, 'pmid'):
+        identifiers.append(Query('pmid', normalize_pmid(supplied)))
     if identifiers:
         return tuple(identifiers)
     title = _value(claims, 'title')
@@ -251,9 +255,10 @@ def _match(entry, query, observation):
     if not records:
         return None, 'unconfirmed', 'insufficient_metadata'
     title = _value(claims, 'title')
-    if query.kind in {'doi', 'arxiv'}:
-        field = 'doi' if query.kind == 'doi' else 'arxiv_id'
-        normalize = normalize_doi if field == 'doi' else normalize_arxiv_id
+    exact_fields = {'doi': ('doi', normalize_doi), 'arxiv': ('arxiv_id', normalize_arxiv_id),
+                    'pmid': ('pmid', normalize_pmid)}
+    if query.kind in exact_fields:
+        field, normalize = exact_fields[query.kind]
         direct = [row for row in records if normalize(row.get(field)) == query.value]
         if not direct:
             return None, 'unconfirmed', 'identifier_not_returned'
@@ -309,23 +314,38 @@ def _row_result(entry, query, observations, stop):
         if record:
             fields = compare_fields(entry['claims'], record, uncertain_fields=entry.get('uncertain_fields', ()))
             differences = [dict(value, field=field) for field, value in fields.items()
-                           if value['status'] in {'conflicting', 'uncertain'}]
+                           if value['status'] in {'conflicting', 'uncertain'}
+                           and (field != 'doi' or query.kind != 'arxiv')]
     result = {'processing_status': 'processed' if observations else 'unprocessed', 'match_status': status,
               'reason': reason, 'match': record, 'sources': receipts, 'differences': differences}
-    if record and record.get('retracted') is True:
+    if (record and record.get('retracted') is True) or (query and query.kind == 'doi' and any(
+            normalize_doi(row.get('doi')) == query.value and row.get('retracted') is True
+            for observation in observations for row in observation.records)):
         result['retraction_status'] = 'retracted'
+    if reason == 'source_title_conflict' and observations:
+        result['candidates'] = [row for row in observations[-1].records if row.get('title')]
     return result
 
 
+def _linked_identifiers(left_query, left, right_query, right):
+    left_doi, right_doi = normalize_doi(left.get('doi')), normalize_doi(right.get('doi'))
+    if left_doi and right_doi and (left_doi == right_doi or left_doi in right.get('related_dois', ())
+                                 or right_doi in left.get('related_dois', ())):
+        return True
+    aliases = {'doi': ('doi', normalize_doi), 'arxiv': ('arxiv_id', normalize_arxiv_id),
+               'pmid': ('pmid', normalize_pmid)}
+    left_field, left_normalize = aliases[left_query.kind]
+    right_field, right_normalize = aliases[right_query.kind]
+    return (left_normalize(right.get(left_field)) == left_query.value
+            or right_normalize(left.get(right_field)) == right_query.value)
+
+
 def _combined_identifiers(queries, results):
-    doi, arxiv = results['doi'], results['arxiv']
     both_processed = all(result['processing_status'] == 'processed' for result in results.values())
     states = {result['match_status'] for result in results.values()}
-    left, right = doi['match'] or {}, arxiv['match'] or {}
-    linked = (normalize_doi(right.get('doi')) == queries[0].value
-              or normalize_arxiv_id(left.get('arxiv_id')) == queries[1].value
-              or queries[0].value in right.get('related_dois', ())
-              or normalize_doi(right.get('doi')) in left.get('related_dois', ()))
+    matches = {kind: result['match'] or {} for kind, result in results.items()}
+    linked = all(_linked_identifiers(a, matches[a.kind], b, matches[b.kind])
+                 for a, b in combinations(queries, 2))
     if 'conflict' in states:
         status, reason = 'conflict', 'submitted_identifier_conflict'
     elif not both_processed:
@@ -337,8 +357,10 @@ def _combined_identifiers(queries, results):
     else:
         status, reason = 'matching', 'identifier_match'
     result = {'processing_status': 'processed' if both_processed else 'unprocessed', 'match_status': status,
-              'reason': reason, 'match': left or right or None, 'sources': doi['sources'] + arxiv['sources'],
-              'differences': doi['differences'], 'identifier_checks': results}
+              'reason': reason, 'match': next((matches[q.kind] for q in queries if matches[q.kind]), None),
+              'sources': [source for item in results.values() for source in item['sources']],
+              'differences': results[queries[0].kind]['differences'],
+              'identifier_checks': results}
     if any(item.get('retraction_status') == 'retracted' for item in results.values()):
         result['retraction_status'] = 'retracted'
     return result
@@ -355,17 +377,19 @@ def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits(),
         raise ValueError('invalid_inventory')
     if len({entry['record_id'] for entry in entries}) != len(entries):
         raise ValueError('duplicate_record_id')
-    lookups = {'doi': capabilities.lookup_doi, 'arxiv': capabilities.lookup_arxiv, 'search': capabilities.search}
+    lookups = {'doi': capabilities.lookup_doi, 'arxiv': capabilities.lookup_arxiv,
+               'pmid': capabilities.lookup_pmid, 'search': capabilities.search}
     if not callable(capabilities.check) or not callable(capabilities.debit):
         raise TypeError('check_and_debit_callbacks_required')
     rows = [dict(entry, evidence=None) for entry in entries]
     groups = {}
+    primary_queries = {}
     queries_by_row, results_by_row = [_queries(entry) for entry in entries], [{} for _ in entries]
 
     def finish_row(index):
         queries, results = queries_by_row[index], results_by_row[index]
         if rows[index]['evidence'] is None and len(results) == len(queries):
-            rows[index]['evidence'] = (_combined_identifiers(queries, results) if len(queries) == 2
+            rows[index]['evidence'] = (_combined_identifiers(queries, results) if len(queries) > 1
                 else next(iter(results.values())) if results
                 else _row_result(entries[index], None, (), 'invalid_input'))
             if on_row is not None:
@@ -374,6 +398,9 @@ def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits(),
     for index, queries in enumerate(queries_by_row):
         for query in queries:
             if query.value and lookups[query.kind]:
+                if query.kind == 'search':
+                    key = norm_title(query.value), norm_title(query.authors)
+                    query = primary_queries.setdefault(key, query)
                 groups.setdefault(query, []).append(index)
             else:
                 reason = 'capability_unavailable' if query.value else 'invalid_input'

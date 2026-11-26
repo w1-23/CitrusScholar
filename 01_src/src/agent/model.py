@@ -12,6 +12,8 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.messages.tool import invalid_tool_call
 from langchain_core.utils.function_calling import convert_to_openai_function, convert_to_openai_tool
 
+from src.core.request_context import MainModelBudget, _main_model_budget
+
 from .capabilities import CapabilityCatalog
 from .identity import ExecutionIdentity
 from .runtime import AdmissionStopped
@@ -133,13 +135,26 @@ class _StreamEvidence(BaseCallbackHandler):
 
     def check(self, response, *, allow_tool_stop, output_limit):
         metadata = dict(response.response_metadata)
-        metadata.pop("citrus_stream_terminal_unconfirmed", None)
+        for key in ("citrus_stream_terminal_unconfirmed", "citrus_output_limit",
+                    "citrus_output_limit_exhausted", "citrus_output_limit_status"):
+            metadata.pop(key, None)
         if self.terminal_conflict or self.terminal is None:
             metadata.pop("finish_reason", None)
         else:
             metadata["finish_reason"] = self.terminal
         if output_limit is not None:
-            metadata.update(citrus_output_limit=output_limit, citrus_output_limit_exhausted=True)
+            metadata["citrus_output_limit"] = output_limit
+        # Some compatible gateways use "length" for several conditions.
+        # Attribute an output cap only when terminal metadata and usage agree.
+        if metadata.get("finish_reason") in _LENGTH_TERMINALS:
+            from src.core.cache_metrics import extract_usage
+
+            usage = extract_usage(response) or {}
+            used = usage.get("output_tokens")
+            exhausted = output_limit is not None and type(used) is int and used >= output_limit
+            metadata["citrus_output_limit_status"] = "exhausted" if exhausted else "unconfirmed"
+            if exhausted:
+                metadata["citrus_output_limit_exhausted"] = True
         update = {"response_metadata": metadata, "additional_kwargs": {
             key: value for key, value in response.additional_kwargs.items() if key != "reasoning_content"}}
         if self.tool_chunks:
@@ -166,9 +181,14 @@ class _StreamEvidence(BaseCallbackHandler):
             update.update(tool_calls=calls, invalid_tool_calls=invalid)
         elif response.tool_calls:
             metadata.pop("finish_reason", None)  # No raw evidence for a proposed tool batch.
-        response = response.model_copy(update=update)
+        if update.get("invalid_tool_calls"):
+            # Pydantic validation normalizes invalid-call members to the same
+            # native shape that LangGraph reconstructs from its checkpoint.
+            response = type(response).model_validate({**response.__dict__, **update})
+        else:
+            response = response.model_copy(update=update)
         if not stream_terminal_confirmed(response, allow_tool_stop=allow_tool_stop):
-            metadata["citrus_stream_terminal_unconfirmed"] = True
+            response.response_metadata["citrus_stream_terminal_unconfirmed"] = True
         return response
 
 
@@ -177,15 +197,27 @@ class ModelDriver:
     catalog: CapabilityCatalog
     max_output_tokens: int | None = None
     allow_tool_stop: bool = False
+    budget: MainModelBudget | None = None
 
     def _schemas_for(self, names):
-        # Discovery does not import or resolve an optional implementation.
+        # Provider strict mode requires every object field. Clarification refs
+        # are optional on the wire and still validated by the host at dispatch.
         return [{"type": "function", "function": convert_to_openai_function(schema["function"], strict=True)}
-                   if self.catalog.execution_mode(schema["function"]["name"]) == "interaction"
-                   else schema for schema in self.catalog.schemas(names)]
+                if (schema["function"]["name"] != "request_user_input"
+                    and self.catalog.execution_mode(schema["function"]["name"]) == "interaction")
+                else schema for schema in self.catalog.schemas(names)]
 
     async def __call__(self, request, handler, identity: ExecutionIdentity, *, allowed, host_tools,
                        on_delta=None, historical_readback=None):
+        token = _main_model_budget.set(self.budget)
+        try:
+            return await self._invoke(request, handler, identity, allowed=allowed, host_tools=host_tools,
+                                      on_delta=on_delta, historical_readback=historical_readback)
+        finally:
+            _main_model_budget.reset(token)
+
+    async def _invoke(self, request, handler, identity: ExecutionIdentity, *, allowed, host_tools,
+                      on_delta, historical_readback):
         from src.core.provider_transport import async_deepseek_attempt
         from src.core.request_context import model_request
         from src.core.task_events import TaskConflict, model_input_limit, run_model_attempt
@@ -203,10 +235,14 @@ class ModelDriver:
                 native_schemas.append(convert_to_openai_tool(tool))
         allowed = set(allowed) & available
         model = request.model
-        limit = int(getattr(model, "max_tokens", 0) or 4096)
-        if self.max_output_tokens is not None:
-            limit = min(limit, self.max_output_tokens)
+        if self.budget is not None:
+            limit = self.budget.max_output_tokens
+        else:
+            limit = int(getattr(model, "max_tokens", 0) or 4096)
+            if self.max_output_tokens is not None:
+                limit = min(limit, self.max_output_tokens)
         options = {**request.model_settings, "stream": True, "max_tokens": limit}
+        options.pop("max_completion_tokens", None)
         if request.tool_choice is not None:
             raise RuntimeError("unexpected_main_model_tool_choice")
         schemas = [*self._schemas_for(allowed), *native_schemas]
@@ -257,7 +293,7 @@ class ModelDriver:
             if private is not None and private.terminal_conflict:
                 evidence.terminal_conflict = True
             checked = evidence.check(model_response.result[0], allow_tool_stop=self.allow_tool_stop,
-                                     output_limit=limit if self.max_output_tokens is not None else None)
+                                     output_limit=scope.get("actual_output_tokens") if scope else None)
             if private is not None and stream_terminal_confirmed(checked, allow_tool_stop=self.allow_tool_stop):
                 return private.protect(checked)
             return checked

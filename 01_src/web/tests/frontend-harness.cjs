@@ -151,7 +151,7 @@ function reply(request, data, status = 200) {
   request.resolve({ok: status < 400, status, json: async () => data});
 }
 const framesPage = (job, events, extra = {}) => ({protocol: 'citrus-task/1', job_id: job,
-  events: events.map(([seq, event, data]) => ({seq, event, data})), has_more: false, ...extra});
+  events: events.map(([seq, event, data]) => ({seq, event, data})), next_cursor: events.at(-1)?.[0] ?? 0, has_more: false, ...extra});
 const question = (extra = {}) => ({id: 'q1', version: 1, status: 'pending', job_id: 'job',
   prompt: '请选择处理范围', multi_select: false, allow_text: true,
   options: [{id: 'a', label: '全部资料', description: '使用已选资料', refs: [{private: 'do not show refs'}]}, {id: 'b', label: '仅摘要'}], ...extra});

@@ -1,13 +1,19 @@
 import { byId } from './dom.js';
+import { SvgScene } from './scene.js?v=1';
+import { hexDigest } from './sha256.js?v=1';
 
 const MANUAL_MIN = .5, MANUAL_MAX = 2;
 const MOVABLE = new Set(['title', 'xlabel', 'ylabel', 'legend', 'annot', 'colorbar']);
 
-export async function imageAsset(response, format) {
+export async function imageAsset(response, format, expectedDigest) {
   const blob = await response.blob();
   const asset = { url: URL.createObjectURL(blob), svg: '', width: 0, height: 0 };
   try {
-    if (format === 'svg') asset.svg = await blob.text();
+    if (expectedDigest) {
+      const bytes = await blob.arrayBuffer();
+      if (await hexDigest(bytes) !== expectedDigest) throw new Error('预览内容与已登记的摘要不一致。');
+      if (format === 'svg') asset.svg = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    }
     const image = new Image();
     image.src = asset.url;
     await image.decode();
@@ -24,7 +30,7 @@ export async function imageAsset(response, format) {
 export class CanvasView {
   constructor(selectGroup, moveGroup) {
     this.asset = null;
-    this.geometry = null;
+    this.scene = null;
     this.project = null;
     this.selected = null;
     this.zoom = null;
@@ -36,11 +42,20 @@ export class CanvasView {
     this.suppressClick = false;
     this.canvas = byId('canvas');
     this.image = byId('preview');
+    this.mount = byId('inkScene');
+    this.idle = Promise.resolve();
+    this.offsets = new Map();
     this.image.addEventListener('click', (event) => this.pickObject(event));
     this.image.addEventListener('pointerdown', (event) => this.startDrag(event));
     this.image.addEventListener('pointermove', (event) => this.updateDrag(event));
     this.image.addEventListener('pointerup', (event) => this.finishDrag(event));
     this.image.addEventListener('pointercancel', (event) => this.finishDrag(event, true));
+    this.image.addEventListener('lostpointercapture', (event) => this.finishDrag(event, true));
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || !this.drag) return;
+      event.preventDefault();
+      this.finishDrag(null, true);
+    });
     byId('zoomOut').addEventListener('click', () => this.resize(1 / 1.3));
     byId('zoomIn').addEventListener('click', () => this.resize(1.3));
     byId('fit').addEventListener('click', () => this.setZoom(null));
@@ -62,18 +77,21 @@ export class CanvasView {
   show(asset, project, reset = false) {
     if (this.asset) URL.revokeObjectURL(this.asset.url);
     if (reset) this.zoom = null;
-    this.drag = null;
-    byId('outline').style.transform = '';
+    this.finishDrag(null, true);
+    this.scene?.reset();
+    this.scene = null;
+    this.offsets.clear();
     this.asset = asset;
     this.project = project;
     this.image.src = asset.url;
     this.image.alt = project.title;
-    this.geometry = null;
     this.pickCycle = null;
-    this.groupByGid = new Map();
-    for (const group of project.groups) {
-      for (const gid of group.pick_ids || []) this.groupByGid.set(gid, group.id);
+    const contract = project.object_contract;
+    if (asset.svg && contract?.renderKey && Object.keys(contract.objects).length) {
+      try { this.scene = new SvgScene(this.mount, asset.svg, contract.objects); }
+      catch { this.mount.shadowRoot?.replaceChildren(); }
     }
+    this.image.classList.toggle('interactive-preview', !!this.scene?.enabled);
     byId('canvasEmpty').hidden = true;
     byId('canvasSheet').hidden = false;
     for (const id of ['fit', 'actualSize', 'canvasZoom', 'setCanvasZoom']) byId(id).disabled = false;
@@ -83,11 +101,13 @@ export class CanvasView {
   }
 
   renderStatus() {
-    const enabled = !!(this.asset?.svg && this.groupByGid.size && window.FigureHitScene);
+    const enabled = !!this.scene?.enabled;
     byId('picking').disabled = !enabled;
     byId('picking').setAttribute('aria-pressed', String(enabled && this.picking));
     this.canvas.dataset.picking = String(enabled && this.picking);
-    byId('canvasStatus').textContent = !enabled || !this.picking ? '可从对象组选取。' : '点击选取对象，Alt + 点击切换重叠对象。可拖动标题、图例和标签。';
+    byId('canvasStatus').textContent = enabled ?
+      this.picking ? '点击选取对象，Alt + 点击切换重叠对象。支持移动的对象可直接拖动。' : '画布选取已关闭，可从对象组选择。' :
+      '无法从此画布精确选取。';
   }
 
   resize(factor) {
@@ -125,68 +145,31 @@ export class CanvasView {
     byId('fit').setAttribute('aria-pressed', String(this.zoom === null));
     byId('actualSize').setAttribute('aria-pressed', String(this.zoom === 1));
     byId('zoomLevel').textContent = `${Math.round(scale * 100)}%`;
-    this.outline();
   }
 
   focus(groupId) {
     this.selected = groupId;
-    this.outline();
-  }
-
-  spatialIndex() {
-    if (!this.geometry) {
-      const svg = new DOMParser().parseFromString(this.asset.svg, 'image/svg+xml');
-      this.geometry = new window.FigureHitScene(svg, this.project.hit_manifest, true);
-    }
-    return this.geometry;
-  }
-
-  selectionBounds(group) {
-    const ids = new Set(group.pick_ids);
-    const boxes = (this.project.hit_manifest?.objects || []).filter((row) => ids.has(row.gid) && row.bbox).map((row) => row.bbox);
-    if (boxes.length && this.project.figure_size?.length) return { boxes, viewport: [0, 0, ...this.project.figure_size] };
-    if (!ids.size || !this.asset?.svg || !window.FigureHitScene) return null;
-    try {
-      const index = this.spatialIndex();
-      for (const item of index.primitives) {
-        if (!item.bounds || !item.owners.some((id) => ids.has(id))) continue;
-        const [x0, y0, x1, y1] = item.bounds;
-        const points = [[x0,y0],[x1,y0],[x0,y1],[x1,y1]].map(([x, y]) => item.matrix.transformPoint({x, y}));
-        boxes.push({ x0: Math.min(...points.map((p) => p.x)), y0: Math.min(...points.map((p) => p.y)),
-          x1: Math.max(...points.map((p) => p.x)), y1: Math.max(...points.map((p) => p.y)) });
-      }
-      return { boxes, viewport: index.viewBox };
-    } catch { return null; }
-  }
-
-  outline() {
-    const outline = byId('outline');
-    outline.hidden = true;
-    const group = this.project?.groups.find((entry) => entry.id === this.selected);
-    const region = group && this.selectionBounds(group);
-    if (!region?.boxes.length) return;
-    const { boxes, viewport: [x, y, width, height] } = region;
-    const left = Math.max(x, Math.min(...boxes.map((box) => box.x0)));
-    const top = Math.max(y, Math.min(...boxes.map((box) => box.y0)));
-    const right = Math.min(x + width, Math.max(...boxes.map((box) => box.x1)));
-    const bottom = Math.min(y + height, Math.max(...boxes.map((box) => box.y1)));
-    if (right < left || bottom < top) return;
-    outline.style.left = `${(left - x) / width * 100}%`;
-    outline.style.top = `${(top - y) / height * 100}%`;
-    outline.style.width = `${(right - left) / width * 100}%`;
-    outline.style.height = `${(bottom - top) / height * 100}%`;
-    outline.hidden = false;
+    this.scene?.focus(groupId);
   }
 
   hits(event) {
-    if (byId('picking').disabled || !this.picking || !this.asset?.svg) return [];
-    try {
-      const index = this.spatialIndex();
-      const point = index.point(event.clientX, event.clientY, this.image.getBoundingClientRect());
-      return [...new Set(index.hits(point, false).map((gid) => this.groupByGid.get(gid)).filter(Boolean))];
-    } catch {
-      byId('canvasStatus').textContent = '此图暂不可从画布精确选取，可从对象组选取。';
-      return [];
+    return this.picking && this.scene?.enabled ? this.scene.ownersAt(event.clientX, event.clientY) : [];
+  }
+
+  setOffsets(commands, savedProject) {
+    if (!this.scene) return;
+    this.offsets.clear();
+    this.scene.restorePositions();
+    const draft = new Map(commands.filter((entry) => entry.property === 'offset_px').map((entry) => [entry.group_id, entry.value]));
+    const saved = new Map(savedProject.groups.map((group) => [group.id, group.values.offset_px]));
+    for (const group of this.project.groups) {
+      if (!group.properties.includes('offset_px')) continue;
+      const value = draft.get(group.id) || saved.get(group.id) || [0, 0];
+      const original = group.values.offset_px || [0, 0];
+      const delta = [value[0] - original[0], value[1] - original[1]];
+      if (delta.every((component) => component === 0)) continue;
+      this.offsets.set(group.id, delta);
+      this.scene.position(group.id, ...delta);
     }
   }
 
@@ -204,39 +187,59 @@ export class CanvasView {
 
   startDrag(event) {
     this.suppressClick = false;
-    if (event.button !== 0 || event.pointerType !== 'mouse' || event.altKey) return;
+    if (event.button !== 0 || event.altKey || !event.isPrimary || this.drag) return;
     const hit = this.hits(event)[0];
     const group = this.project?.groups.find((entry) => entry.id === hit);
     if (!group || !MOVABLE.has(group.kind) || !group.properties.includes('offset_px')) return;
-    const rect = this.image.getBoundingClientRect();
-    this.drag = { id: event.pointerId, x: event.clientX, y: event.clientY, target: group.id, rect, started: false };
+    const start = this.scene.point(event.clientX, event.clientY);
+    if (!start) return;
+    this.drag = { id: event.pointerId, x: event.clientX, y: event.clientY,
+      start, target: group.id, started: false, frame: null };
+    this.idle = new Promise((resolve) => { this.drag.done = resolve; });
     this.image.setPointerCapture(event.pointerId);
   }
 
   updateDrag(event) {
     const drag = this.drag;
     if (!drag || drag.id !== event.pointerId) return;
-    const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
-    if (!drag.started && Math.hypot(dx, dy) < 4) return;
+    if (!drag.started && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 4) return;
     if (!drag.started) {
       drag.started = true;
-      this.focus(drag.target);
+      this.selectGroup(drag.target, false);
     }
-    // Pointer deltas are viewport CSS pixels. The overlay transform uses local layout pixels.
-    const viewportToLayout = this.image.offsetWidth / drag.rect.width;
-    byId('outline').style.transform = `translate(${dx * viewportToLayout}px, ${dy * viewportToLayout}px)`;
+    drag.event = event;
+    if (drag.frame !== null) return;
+    drag.frame = requestAnimationFrame(() => {
+      drag.frame = null;
+      const delta = this.displacement(drag, drag.event);
+      if (delta) this.scene.position(drag.target, ...delta.total);
+    });
+  }
+
+  displacement(drag, event) {
+    const point = this.scene.point(event.clientX, event.clientY);
+    if (!point) return null;
+    const delta = [point.x - drag.start.x, point.y - drag.start.y];
+    const former = this.offsets.get(drag.target) || [0, 0];
+    const base = this.project.groups.find((entry) => entry.id === drag.target).values.offset_px || [0, 0];
+    const limit = (n) => Math.max(-200, Math.min(200, Math.round(n * 10) / 10));
+    const value = delta.map((component, index) => limit(base[index] + former[index] + component));
+    return { value, total: value.map((component, index) => component - base[index]) };
   }
 
   finishDrag(event, cancel = false) {
     const drag = this.drag;
-    if (!drag || drag.id !== event.pointerId) return;
+    if (!drag || (event && drag.id !== event.pointerId)) return;
     this.drag = null;
-    byId('outline').style.transform = '';
-    if (!drag.started || cancel) return;
-    this.suppressClick = true;
-    const [, , width, height] = this.geometry.viewBox;
-    this.selectGroup(drag.target);
-    this.moveGroup(drag.target, (event.clientX - drag.x) * width / drag.rect.width,
-      (event.clientY - drag.y) * height / drag.rect.height);
+    if (drag.frame !== null) cancelAnimationFrame(drag.frame);
+    if (this.image.hasPointerCapture(drag.id)) this.image.releasePointerCapture(drag.id);
+    if (drag.started) {
+      this.suppressClick = true;
+      const delta = cancel ? null : this.displacement(drag, event);
+      if (!delta || !this.moveGroup(drag.target, delta.value)) {
+        this.scene.position(drag.target, ...(this.offsets.get(drag.target) || [0, 0]));
+      }
+    }
+    drag.done();
   }
 }

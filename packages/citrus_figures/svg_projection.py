@@ -106,6 +106,11 @@ def projection_manifest(rendered, bbox):
                                                       "mark_gids": [mark.get_gid() for mark in link["marks"]]}]
             except Exception:
                 metadata[gid].pop("legend_links", None)
+    for gid, entry in rendered.locators.items():
+        if entry.get("role") == "errorbar":
+            parent_ids = set(metadata.get(entry.get("parent_gid"), {}).get("svg_nodes", ()))
+            member_ids = [member.get_gid() for member in entry.get("members", ())]
+            metadata[gid]["svg_hit_nodes"] = [ident for ident in member_ids if ident in parent_ids]
     return metadata
 
 

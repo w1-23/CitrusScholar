@@ -5,11 +5,11 @@ from functools import cache
 
 from deepagents import (GeneralPurposeSubagentProfile, HarnessProfile,
                         create_deep_agent, register_harness_profile)
+from deepagents.backends import FilesystemBackend
 from deepagents.backends.protocol import BackendProtocol
 
 SDK_VERSION = "0.7.38"
 EXECUTOR_ID = "citrus-deepagents-0.7.38-framework-v2"
-LEGACY_HOST_EXECUTOR_ID = "citrus-deepagents-0.7.38-host-v1"
 LEGACY_NATIVE_EXECUTOR_ID = "citrus-deepagents-0.7.38-native-v1"
 GRAPH_PROFILE_KEY = "citrus_metered_framework:main"
 NATIVE_READ_TOOLS = frozenset({"ls", "glob", "grep", "read_file"})
@@ -63,32 +63,121 @@ class EmptySkillBackend(HostOnlyBackend):
         return [FileDownloadResponse(path, error="file_not_found") for path in paths]
 
 
+class InventorySkillBackend(FilesystemBackend):
+    """Expose the SDK filesystem operations over an installed release manifest."""
+
+    def __init__(self, root, entries):
+        super().__init__(root_dir=root, virtual_mode=True)
+        self.skill_root = root
+        self.entries = entries
+        self.directories = {prefix for name in entries for prefix in self._parents(name)}
+
+    @staticmethod
+    def _parents(name):
+        from pathlib import PurePosixPath
+        return (str(part) for part in PurePosixPath(name).parents if str(part) != ".")
+
+    def _verified(self, path):
+        import hashlib
+        from .research_skill_catalog import _bytes, _path, _MAX_RESOURCE_BYTES
+        name = path.removeprefix("/")
+        expected = self.entries.get(name)
+        if expected is None:
+            raise PermissionError("skill_resource_unavailable")
+        try:
+            raw = _bytes(_path(self.skill_root, name), _MAX_RESOURCE_BYTES)
+        except (OSError, ValueError) as exc:
+            raise PermissionError("skill_resource_unavailable") from exc
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise PermissionError("skill_changed_during_read")
+        return raw
+
+    def download_files(self, paths):
+        from deepagents.backends.protocol import FileDownloadResponse
+        results = []
+        for path in paths:
+            try:
+                results.append(FileDownloadResponse(path, content=self._verified(path)))
+            except PermissionError:
+                results.append(FileDownloadResponse(path, error="permission_denied"))
+        return results
+
+    def read(self, file_path, offset=0, limit=2000):
+        from deepagents.backends.protocol import ReadResult
+        try:
+            self._verified(file_path)
+        except PermissionError:
+            return ReadResult(error="skill_resource_unavailable")
+        return super().read(file_path, offset, limit)
+
+    def _listed(self, item):
+        name = item["path"].strip("/")
+        return name in (self.directories if item.get("is_dir") else self.entries)
+
+    def ls(self, path):
+        from dataclasses import replace
+        result = super().ls(path)
+        return replace(result, entries=[item for item in result.entries or () if self._listed(item)])
+
+    def glob(self, pattern, path=None):
+        from dataclasses import replace
+        result = super().glob(pattern, path)
+        return replace(result, matches=[item for item in result.matches or () if self._listed(item)])
+
+    def grep(self, pattern, path=None, glob=None, *, max_count=None, context_lines=0):
+        from deepagents.backends.protocol import GrepResult
+        base = (path or "/").strip("/")
+        matches = []
+        for name in self.entries:
+            if base and name != base and not name.startswith(base + "/"):
+                continue
+            try:
+                self._verified(name)
+            except PermissionError:
+                continue
+            limit = None if max_count is None else max_count - len(matches)
+            if limit == 0:
+                return GrepResult(matches=matches, truncated=True)
+            result = super().grep(pattern, "/" + name, glob, max_count=limit, context_lines=context_lines)
+            matches.extend(result.matches or ())
+            if result.truncated or result.error:
+                return GrepResult(error=result.error, matches=matches, truncated=result.truncated)
+        return GrepResult(matches=matches)
+
+
 class ScopedSkillBackend(HostOnlyBackend):
     def __init__(self, root, policy, turn_skills=None):
-        from deepagents.backends import FilesystemBackend
+        import json
         from pathlib import Path
-        from .installed_skills import RQA_ID
+        from .research_skill_catalog import _bytes, _path, _MAX_RESOURCE_BYTES
 
         root = Path(root)
-        rqa_selected = (turn_skills is not None and turn_skills.release == root.parent
-                        and any(row["id"] == RQA_ID for row in turn_skills.rows()))
+        inventory = json.loads(_bytes(_path(root.parent, "inventory.json"), _MAX_RESOURCE_BYTES))
+        if not isinstance(inventory, dict):
+            raise ValueError("invalid_skill_inventory")
 
         self.policy = policy
         self.routes = {}
         self.required_capability = {}
-        for entrypoint in sorted(Path(root).glob("*/SKILL.md")):
+
+        def mount(directory, capability):
+            prefix = "skills/" + directory.name + "/"
+            entries = {key.removeprefix(prefix): digest for key, digest in inventory.items()
+                       if key.startswith(prefix)}
+            if entries:
+                self.routes[directory.name] = InventorySkillBackend(directory, entries)
+                self.required_capability[directory.name] = capability
+
+        for entrypoint in sorted(root.glob("*/SKILL.md")):
             directory = entrypoint.parent
             if (not directory.is_symlink() and not entrypoint.is_symlink()
-                    and (directory.name != RQA_ID or rqa_selected)):
-                self.routes[directory.name] = FilesystemBackend(root_dir=directory, virtual_mode=True)
-                self.required_capability[directory.name] = "skill:" + directory.name
-        # Upstream text is preserved byte for byte and refers to this sibling.
-        # The sibling provides files only, never a discoverable Skill entry.
-        shared = Path(root) / "nature-shared"
+                    and f"skills/{directory.name}/SKILL.md" in inventory):
+                mount(directory, "skill:" + directory.name)
+        # Upstream text refers to this sibling, which has no discoverable entry.
+        shared = root / "nature-shared"
         if ("nature-figure" in self.routes and shared.is_dir() and not shared.is_symlink()
                 and not (shared / "SKILL.md").exists()):
-            self.routes["nature-shared"] = FilesystemBackend(root_dir=shared, virtual_mode=True)
-            self.required_capability["nature-shared"] = "skill:nature-figure"
+            mount(shared, "skill:nature-figure")
 
     def _backend(self):
         from deepagents.backends import CompositeBackend

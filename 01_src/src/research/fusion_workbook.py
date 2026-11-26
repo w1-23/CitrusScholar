@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import csv
-from io import BytesIO, StringIO
+from io import BytesIO, TextIOWrapper
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -179,11 +179,35 @@ def _project_findings(report, digest, targets, bounds):
 
 _CSV_SHEET = "CSV 原始记录"
 _MAX_CSV_CELLS = 250_000
+_MAX_CSV_RECORDS = 5001
+_MAX_CSV_RECORD_CHARS = 1 << 20
+
+
+def _csv_records(data):
+    """Cap physical reads and logical records before csv.reader allocates their fields."""
+    with TextIOWrapper(BytesIO(data), encoding="utf-8-sig", newline="") as stream:
+        remaining = _MAX_CSV_RECORD_CHARS
+
+        def lines():
+            nonlocal remaining
+            while line := stream.readline(remaining + 1):
+                remaining -= len(line)
+                if remaining < 0:
+                    raise ValueError("CSV logical record exceeds publication budget")
+                yield line
+
+        try:
+            for row in csv.reader(lines(), strict=True):
+                remaining = _MAX_CSV_RECORD_CHARS
+                yield row
+        except (UnicodeDecodeError, csv.Error) as exc:
+            raise ValueError("CSV record positions could not be reproduced") from exc
 
 
 def _csv_workbook(report, data, digest):
     """Mirror UTF-8 CSV record positions, never literal text into formulas."""
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
 
     execution = report.get("execution") or {}
     options = execution.get("options") or {}
@@ -192,23 +216,30 @@ def _csv_workbook(report, data, digest):
     if (execution.get("skill") != "research-integrity" or len(matches) != 1
             or matches[0].get("sha256") != digest or "numeric" not in options.get("checks", [])):
         raise ValueError("Fusion report does not identify the authorized CSV numeric review")
-    try:
-        rows = list(csv.reader(StringIO(data.decode("utf-8-sig"), newline="")))
-    except (UnicodeDecodeError, csv.Error) as exc:
-        raise ValueError("CSV record positions could not be reproduced") from exc
-    if not rows or not rows[0] or len(rows) > 5001:
+    header, widths, width = [], [], 0
+    for height, row in enumerate(_csv_records(data), 1):
+        if height == 1:
+            header = row
+        if not header or height > _MAX_CSV_RECORDS:
+            raise ValueError("CSV record count exceeds publication budget")
+        width = max(width, len(row))
+        if width > 16384 or height * width > _MAX_CSV_CELLS:
+            raise ValueError("CSV cell count exceeds publication budget")
+        if any(len(value) > 32767 or ILLEGAL_CHARACTERS_RE.search(value) for value in row):
+            raise ValueError("CSV contains text that cannot be copied faithfully to Excel")
+        widths.append(len(row))
+    if not widths:
         raise ValueError("CSV record count exceeds publication budget")
-    height, width = len(rows), max(map(len, rows))
-    if width > 16384 or height * width > _MAX_CSV_CELLS:
-        raise ValueError("CSV cell count exceeds publication budget")
-    wb = Workbook()
-    sheet = wb.active
-    sheet.title = _CSV_SHEET
-    for row_number, row in enumerate(rows, 1):
-        for column_number, value in enumerate(row, 1):
-            if len(value) > 32767 or ILLEGAL_CHARACTERS_RE.search(value):
-                raise ValueError("CSV contains text that cannot be copied faithfully to Excel")
-            sheet.cell(row_number, column_number, value).data_type = "s"
+    height = len(widths)
+    wb = Workbook(write_only=True)
+    sheet = wb.create_sheet(_CSV_SHEET)
+    for row in _csv_records(data):
+        cells = []
+        for value in row:
+            cell = WriteOnlyCell(sheet, value=value)
+            cell.data_type = "s"
+            cells.append(cell)
+        sheet.append(cells)
     # Openpyxl drops empty strings on reopen, but they remain distinct from a
     # missing CSV field in the retained original. The file labels record indexing.
     workbook = BytesIO()
@@ -230,15 +261,15 @@ def _csv_workbook(report, data, digest):
             scope = location.get("scope")
             row, last, col = (location.get(key) for key in ("row_index", "end_row_index", "column_index"))
             if (scope == "csv_range" and all(type(i) is int for i in (row, last, col))
-                    and 2 <= row <= last <= height and 1 <= col <= len(rows[0])
-                    and all(col <= len(rows[n - 1]) for n in range(row, last + 1))):
+                    and 2 <= row <= last <= height and 1 <= col <= len(header)
+                    and all(col <= widths[n - 1] for n in range(row, last + 1))):
                 address = _address((col, row, col, last))
                 label.add(f"{_CSV_SHEET}!{address}")
                 links.add((_CSV_SHEET, address))
                 if severity != "coverage":
                     positions.update((n, col) for n in range(row, last + 1))
-            elif scope == "column" and type(col) is int and 1 <= col <= len(rows[0]):
-                label.add(f"CSV 第 {col} 列（{_text(rows[0][col - 1], 100)}，非单元格发现）")
+            elif scope == "column" and type(col) is int and 1 <= col <= len(header):
+                label.add(f"CSV 第 {col} 列（{_text(header[col - 1], 100)}，非单元格发现）")
             else:
                 label.add("未能绑定 CSV 精确记录（未标注）")
         item = {"check": rule, "severity": severity, "detail": _finding_detail(finding)}

@@ -301,6 +301,10 @@ class Inventory:
                         or self.declarative and not self.declarative.confirmation(before, after)
                         or not self._confirms_svg(after, expected, values, actual, svg_targets)):
                     raise invalid("group_members_changed", "重绘时所选组的 SVG 对象或所属子图无法确认。", 409)
+            else:
+                ids = tuple(node.get("id") for node in self.svg_targets.drawn_nodes(before))
+                if ids and not self._confirms_drawn_nodes(after, ids, values, svg_targets):
+                    raise invalid("group_members_changed", "重绘时所选对象的 SVG 标识无法确认。", 409)
             if prop not in (set(actual[gid].get("editable", [])) | workbench_properties(actual[gid])):
                 raise invalid("group_property_unavailable", "重绘未确认所选组的样式。", 409)
             if prop not in _OBSERVED_STYLES:
@@ -316,6 +320,14 @@ class Inventory:
             if not matches:
                 raise invalid("group_edit_unconfirmed", "重绘结果与提交的组样式不一致，修改未保存。", 409)
 
+    @staticmethod
+    def _confirms_drawn_nodes(row, before_ids, values, svg_targets):
+        after_ids = tuple(node.get("id") for node in svg_targets.drawn_nodes(row))
+        if before_ids == after_ids:
+            return True
+        gid = row["gid"]
+        removed = values.get((gid, "visible")) is False or values.get((gid, "text")) == ""
+        return removed and not after_ids and not any(svg_targets.nodes[ident] for ident in before_ids)
 
     def _confirms_svg(self, row, expected, values, actual, svg_targets):
         visibility = (row["gid"], "visible")

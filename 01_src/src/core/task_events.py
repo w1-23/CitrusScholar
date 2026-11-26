@@ -682,6 +682,10 @@ class DurableEventQueue(asyncio.Queue):
 
 def model_input_limit(output_tokens):
     """Configured request input limit, shared by preflight and final admission."""
+    from src.core.request_context import current_main_model_budget
+    budget = current_main_model_budget()
+    if budget is not None:
+        return budget.input_limit(output_tokens)
     from src.config import settings
     return max(0, min(int(settings.CONTEXT_ACTIVE_MAX_INPUT_TOKENS),
         int(settings.RESOLVED_CONTEXT_BUDGET_MAX_TOKENS) - int(output_tokens)
@@ -733,7 +737,10 @@ def _attempt_response(scope, response, error):
     return {"provider_first_packet_ms": scope.get("provider_first_packet_ms"),
             "attempt_elapsed_ms": scope.get("attempt_elapsed_ms"),
             "provider": scope["provider"], "estimated_input_tokens": estimate["estimated_input_tokens"],
-            "max_output_tokens": estimate["output_tokens"], "streaming": streaming,
+            "max_output_tokens": scope.get("actual_output_tokens"),
+            "prepared_output_tokens": estimate["output_tokens"], "model_window": estimate.get("model_window"),
+            "input_limit": model_input_limit(estimate["output_tokens"]),
+            "output_limit_status": meta.get("citrus_output_limit_status"), "streaming": streaming,
             "stream_state": terminal if streaming else "not_streaming",
             "finish_reason": finish if known else None,
             "finish_reason_status": "reported" if known else "missing" if finish is None else "unrecognized",
@@ -768,6 +775,9 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
             history_load_reason=scope["history_load_reason"], input_limit=limit,
             usage=usage, status=status, error=error)
         snapshot["parent_purpose"] = scope["parent_purpose"]
+        for key in ("actual_output_tokens", "attempt_elapsed_ms", "task_budget"):
+            if scope.get(key) is not None:
+                snapshot[key] = scope[key]
         scope["context_snapshot"] = snapshot
         emit_context_snapshot(snapshot)
 
@@ -807,8 +817,10 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
         usage = extract_usage(response) or {}
         denied = scope.get("pre_transport_denial", "")
         error = denied or error
-        finish_attempt(attempt_id, usage, error=error, observation=_attempt_response(
+        counters = finish_attempt(attempt_id, usage, error=error, observation=_attempt_response(
             scope, response, error), unsent=bool(denied))
+        if isinstance(counters, dict):
+            scope["task_budget"] = counters
         if response is not None:
             emit_usage_from_response(usage_session_id or get_session_id(), purpose, response,
                 attempt_id=scope["attempt_id"], logical_call_id=scope["logical_call_id"],
@@ -906,6 +918,11 @@ def adjust_model_reservation(attempt_id, tokens):
         conn.execute("UPDATE task_model_attempts SET reserved_tokens=? WHERE attempt_id=?", (tokens, attempt_id))
 
 
+def _budget_counters(conn, job_id):
+    row = conn.execute("SELECT calls,max_calls,tokens,max_tokens FROM task_budgets WHERE job_id=?", (job_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def finish_attempt(attempt_id, usage=None, error="", *, observation=None, unsent=False):
     if not attempt_id:
         return
@@ -928,7 +945,7 @@ def finish_attempt(attempt_id, usage=None, error="", *, observation=None, unsent
             _append(conn, row["job_id"], "model_attempt", {"attempt_id": attempt_id,
                 "purpose": row["purpose"], "status": "not_sent", "usage_status": "not_sent",
                 "charged_tokens": 0, "error": error, "observation": observation or {}})
-            return
+            return _budget_counters(conn, row["job_id"])
         if reported and row["budget_scope"] == "execution":
             conn.execute("UPDATE task_budgets SET tokens=tokens+? WHERE job_id=?", (measured-row["reserved_tokens"], row["job_id"]))
         observation = observation or {}
@@ -939,6 +956,7 @@ def finish_attempt(attempt_id, usage=None, error="", *, observation=None, unsent
             "usage": usage, "usage_status": "reported" if reported else "unknown_reserved",
             "charged_tokens": measured if reported else row["reserved_tokens"], "error": error,
             "observation": observation})
+        return _budget_counters(conn, row["job_id"])
 
 
 def _usage_totals(conn, job_id):

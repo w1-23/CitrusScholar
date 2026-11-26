@@ -310,6 +310,49 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fields["reason"], "result_retention_truncated")
         self.assertNotIn("selected_values", fields)
 
+    async def test_exact_readback_retries_reuse_the_authenticated_same_turn_page(self):
+        self.enterContext(patch.object(jobs, "_DB_PATH", Path(self.session_store.db_path)))
+        self.addCleanup(tracing.set_job_id, tracing.get_job_id())
+        self.addCleanup(progress_bus.clear_turn_scope)
+        claim = jobs.claim_job(self.sid, "request", owner_user_id=7, client_request_id="request", payload={})
+        tracing.set_job_id(claim.job_id)
+        progress_bus.set_turn_scope(self.sid, "request")
+        identity = ExecutionIdentity(7, self.sid, "request", claim.job_id)
+        host = HostTools(identity, {}, allowed_names={"read_tool_result"})
+        raw = json.dumps({"field": "éλ字" * 3000}, ensure_ascii=False)
+        host.messages["source"] = self.delivery("source", raw)
+
+        async def page(call_id, **selection):
+            args = {"tool_call_id": "source", "max_chars": 50, **selection}
+            self.assertTrue(host._prepare_result_readback(args, call_id))
+            call = {"id": call_id, "name": "read_tool_result", "args": args}
+            message = ToolMessage(content=read_tool_result.invoke(args), name=call["name"], tool_call_id=call_id)
+            delivered = await host.publish(call, ToolExecution(message), identity)
+            return json.loads(delivered.content), delivered.additional_kwargs["result_reference"]
+
+        original, reference = await page("first", start_char=25)
+        self.assertEqual(original["result_text"], raw[25:75])
+        cursor = original["page"]["next_cursor"]
+        second, _ = await page("second", cursor=cursor)
+        self.assertEqual(second["result_text"], raw[75:125])
+        repeated, _ = await page("repeat", start_char=25)
+        self.assertEqual(repeated["status"], "reused")
+        self.assertNotIn("result_text", repeated)
+        self.assertEqual(repeated["reused_readback"], {
+            "tool_call_id": reference["tool_call_id"], "full_sha256": reference["full_sha256"],
+            "original_page_bytes": len(raw[25:75].encode())})
+        self.assertEqual(repeated["page"], original["page"])
+        retried_cursor, _ = await page("cursor-retry", cursor=cursor)
+        self.assertEqual((retried_cursor["status"], retried_cursor["page"]), ("reused", second["page"]))
+        self.assertFalse(host._prepare_result_readback({"tool_call_id": "source", "cursor": "forged"}, "forged"))
+        next_job = jobs.claim_job(self.sid, "next", owner_user_id=7, client_request_id="different", payload={})
+        tracing.set_job_id(next_job.job_id)
+        fresh = json.loads(read_tool_result.invoke({"tool_call_id": "source", "start_char": 25, "max_chars": 50}))
+        self.assertEqual(fresh["result_text"], raw[25:75])
+        tracing.set_user_id(8)
+        forbidden = json.loads(read_tool_result.invoke({"tool_call_id": "source"}))
+        self.assertEqual(forbidden["reason"], "result_access_denied")
+
     async def test_published_pages_survive_soft_budget_and_have_hard_limit_resume_range(self):
         from src.agent.host import _finish
         from src.agent.runtime import RunResult

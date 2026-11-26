@@ -41,6 +41,9 @@ jobs:
           export CITRUSQA_PROJECT_ROOT="$(mktemp -d "$RUNNER_TEMP/citrus-regression.XXXXXXXX")"
           python -m pytest -q -p pytest_socket --disable-socket --allow-unix-socket \
             01_src/src/api/invite_auth_http_test.py \
+            01_src/src/auth_session_fence_test.py \
+            01_src/src/auth_invites_test.py \
+            01_src/src/core/jobs_rediscovery_test.py \
             01_src/src/api/chat_turn_queue_admission_test.py \
             01_src/src/api/chat_turn_queue_http_test.py \
             01_src/src/core/chat_turn_queue_test.py \
@@ -70,6 +73,7 @@ jobs:
             01_src/src/core/tool_result_delivery_test.py \
             01_src/src/guardrails/turn_checkpoint_deterministic_test.py \
             01_src/src/api/task_observation_regression_test.py \
+            01_src/src/browse/observer_classification_test.py \
             01_src/src/api/citation_identity_regression_test.py \
             01_src/src/api/citation_roles_refresh_test.py \
             01_src/src/api/reference_views_test.py \
@@ -80,6 +84,9 @@ jobs:
             01_src/src/agent/file_baseline_autonomy_test.py \
             01_src/src/api/reference_fusion_cutover_test.py \
             01_src/src/research/fusion_workbook_test.py \
+            01_src/src/research/fusion_reference_batch_test.py \
+            01_src/src/research/script_runtime_preflight_test.py \
+            01_src/src/research/script_delivery_acceptance_test.py \
             01_src/src/research/nature_skill_contract_test.py \
             01_src/src/figures/workbench/nature_vectors_test.py \
             01_src/src/core/citation_stable_refs_test.py \
@@ -112,6 +119,7 @@ jobs:
             01_src/src/figures/publication_reliability_test.py \
             01_src/src/figures/svg_projects_test.py \
             01_src/src/figures/workbench/workbench_test.py \
+            01_src/src/figures/workbench/d_audit_test.py \
             01_src/src/research/standalone_audit_workbook_format_test.py \
             01_src/src/retrieval/generation_boundary_test.py \
             01_src/src/session/workspace_retention_test.py

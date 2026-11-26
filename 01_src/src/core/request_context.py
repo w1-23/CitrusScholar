@@ -12,6 +12,49 @@ from dataclasses import dataclass
 _observation = contextvars.ContextVar("model_request_observation", default=None)
 _epoch = contextvars.ContextVar("model_context_epoch", default=None)
 _logical_call = contextvars.ContextVar("model_logical_call", default="")
+_main_model_budget = contextvars.ContextVar("main_model_budget", default=None)
+
+
+@dataclass(frozen=True)
+class MainModelBudget:
+    max_output_tokens: int
+    model_window: int | None
+    output_limit_source: str
+    active_input_cap: int
+    application_window: int
+    safety_margin: int
+
+    def input_limit(self, output_tokens=None) -> int:
+        window = min(self.application_window, self.model_window or self.application_window)
+        reserve = self.max_output_tokens if output_tokens is None else output_tokens
+        return max(0, min(self.active_input_cap, window - reserve - self.safety_margin))
+
+
+def current_main_model_budget() -> MainModelBudget | None:
+    return _main_model_budget.get()
+
+
+def resolve_main_model_budget(transport, settings) -> MainModelBudget:
+    """Resolve the selected provider/model's caps once for a main turn."""
+    models = settings.MAIN_MODEL_BUDGETS.get(transport.provider_id, {})
+    capability = models.get(transport.model, {})
+    provider_output = capability.get("max_output_tokens")
+    model_window = capability.get("context_window_tokens")
+    if type(provider_output) is not int or provider_output < 1:
+        provider_output = None
+    if type(model_window) is not int or model_window < 1:
+        model_window = None
+    application_window = int(transport.configured_context_window or settings.RESOLVED_CONTEXT_BUDGET_MAX_TOKENS)
+    safety_margin = int(settings.CONTEXT_SAFETY_MARGIN_TOKENS)
+    configured = provider_output or int(settings.MAX_TOKENS)
+    ceiling = int(settings.AGENT_MAX_OUTPUT_TOKENS)
+    context_output = min(application_window, model_window or application_window) - safety_margin - 1
+    output = max(1, min(configured, ceiling, context_output))
+    source = ("context_window" if context_output < min(configured, ceiling)
+              else "agent_ceiling" if ceiling < configured
+              else "provider_model_configuration" if provider_output else "legacy_configuration")
+    return MainModelBudget(output, model_window, source, int(settings.CONTEXT_ACTIVE_MAX_INPUT_TOKENS),
+                           application_window, safety_margin)
 
 
 def _json(value):
@@ -117,7 +160,9 @@ def model_request(model, messages, output_tokens=None):
                "model": str(getattr(base, "model_name", ""))}
     replay = current_tool_reasoning(messages, model_deepseek_scope(model, kwargs))
     attach_current_tool_reasoning(rows, replay)
-    return payload, estimate_request(payload, output_tokens=output)
+    budget = current_main_model_budget()
+    return payload, estimate_request(payload, output_tokens=output,
+                                     model_window=budget.model_window if budget is not None else None)
 
 
 @dataclass(frozen=True)
@@ -156,11 +201,11 @@ def observe_provider_request(request):
         prepared = estimate_request(payload, model_window=scope["estimate"].get("model_window"))
     except (TypeError, ValueError):
         blocked("model_request_body_unavailable")
+    if (scope["purpose"] == "main_loop"
+            and prepared["output_tokens"] != scope["estimate"]["output_tokens"]):
+        blocked("model_output_budget_mismatch")
     if prepared["estimated_input_tokens"] > model_input_limit(prepared["output_tokens"]):
         blocked("context_budget_exhausted")
-    if (scope["purpose"] == "main_loop"
-            and not 0 < prepared["output_tokens"] <= scope["estimate"]["output_tokens"]):
-        blocked("model_output_budget_mismatch")
     if prepared["estimated_total_tokens"] > scope["estimate"]["estimated_total_tokens"]:
         try:
             adjust_model_reservation(scope.get("reservation_id"), prepared["estimated_total_tokens"])
@@ -175,6 +220,7 @@ def observe_provider_request(request):
     scope["model"] = str(payload.get("model", scope.get("model", "")))
     if changed and scope.get("publish_context"):
         scope["publish_context"]()
+    scope["actual_output_tokens"] = prepared["output_tokens"] or None
     scope["provider_request_admitted"] = True
     # The main-loop driver may observe this verified send boundary. Observation
     # cannot authorize, alter or prevent transport.

@@ -10,6 +10,7 @@ from src.figures.document import SCHEMA, _digest
 from src.figures.workbench import artifacts, nature_vectors
 from src.figures.workbench.frozen_script_identity import FrozenScriptIdentity
 from src.figures.workbench.groups import Inventory, invalid
+from src.figures.workbench.object_contract import contract
 from src.figures.workbench.svg_targets import SvgTargets
 
 _OPTIONS = {"fontfamily": "font_families", "fontweight": "font_weights", "fontstyle": "font_styles",
@@ -162,10 +163,30 @@ def _inventory(project, owner, *, check_preview=True, preview_svg=None):
                                             disabled="图件的已保存对象清单无法验证。")
 
 
-def _present(project, manifest, inventory, *, formats):
+def _present(project, manifest, inventory, *, formats, draft_revision=None):
+    groups = inventory.public() if manifest["objects"] else []
+    targets = inventory.svg_targets
+    geometry = {}
+    if targets is not None:
+        # Errorbar members are part of a series replay address. The painted
+        # instances belong to the more specific errorbar object on the canvas.
+        stable = {group.id: [node for row in group.rows for node in targets.drawn_nodes(row)]
+                  for group in inventory.groups.values() if group.hits}
+        error_nodes = {node for group in inventory.groups.values() if group.kind == "errorbar"
+                       for node in stable.get(group.id, ())}
+        for group in inventory.groups.values():
+            nodes = [node for node in stable.get(group.id, ()) if group.kind != "series" or node not in error_nodes]
+            role = group.kind
+            if role == "series" and group.rows:
+                artist = group.rows[0].get("artist")
+                role = {"Line2D": "line", "PathCollection": "scatter", "Rectangle": "patch"}.get(artist, role)
+            geometry[group.id] = (role, *targets.projection(nodes))
     return {"figure_id": project["figure_id"], "title": project.get("title") or "未命名图件",
             "render_version": project["render_version"], "read_only_reason": inventory.disabled,
-            "groups": inventory.public(), "format_capabilities": formats,
+            "groups": groups, "format_capabilities": formats,
+            **contract(groups, project["render_version"], svg=targets.svg if targets else None,
+                       draft_revision=draft_revision, source_sha256=(project.get("document_json") or {}).get("source_sha256"),
+                       geometry=geometry),
             "hit_manifest": {"objects": manifest["objects"]}, "figure_size": manifest.get("figure_size_px"),
             "options": {**{prop: manifest.get(key, []) for prop, key in _OPTIONS.items()}, "cmap": list(COLORMAPS)},
             "marker_fill_states": (["auto", "none", "custom"] if project.get("source_kind") == "spec" else ["custom"])}
@@ -183,14 +204,20 @@ def detail(figure_id, owner, revision):
     editor_url = _ordinary_svg_editor(project, owner)
     if editor_url:
         result.update(editor_url=editor_url, read_only_reason="此 SVG 的对象编辑在独立 SVG 编辑器中。")
+    if capabilities["svg"]["state"] != "ready" and capabilities["png"]["state"] == "ready":
+        result["read_only_reason"] = "PNG 位图可查看和导出。图中没有可编辑的原生对象。"
     projects._assert_current(project, owner)
     return result
 
 
-def edit(figure_id, owner, revision, commands, *, draft_revision=0, save=False):
+def edit(figure_id, owner, revision, commands, *, draft_revision=0, save=False, source_sha256=None):
     project = projects._load_revision(figure_id, owner, revision)
     if nature_vectors.is_plot(project):
-        return nature_vectors.edit(project, owner, commands, draft_revision=draft_revision, save=save)
+        return nature_vectors.edit(project, owner, commands, draft_revision=draft_revision, save=save,
+                                   source_sha256=source_sha256)
+    frozen_sha = (project.get("document_json") or {}).get("source_sha256")
+    if source_sha256 is not None and source_sha256 != frozen_sha:
+        raise invalid("source_conflict", "草稿绑定的冻结图件来源已变化。", 409)
     _, inventory = _inventory(project, owner)
     submitted, expected = inventory.translate(commands)
 
@@ -206,6 +233,9 @@ def edit(figure_id, owner, revision, commands, *, draft_revision=0, save=False):
         if not {gid for gid, _ in expected} <= set(changed):
             raise invalid("group_edit_unconfirmed", "渲染器未应用全部组样式。", 409)
         inventory.confirm(expected, manifest, accepted, SvgTargets(svg, manifest))
+        if save:
+            manifest["workbench_edit_binding"] = {"source_sha256": frozen_sha, "expected_revision": revision,
+                                                   "draft_revision": draft_revision}
 
     if not save:
         result = projects.preview_overrides(figure_id, owner, submitted, expected_revision=revision,
@@ -213,7 +243,7 @@ def edit(figure_id, owner, revision, commands, *, draft_revision=0, save=False):
         preview_project = {**project, "manifest_json": result["manifest"], "overrides_json": result["overrides"]}
         manifest, projected = _inventory(preview_project, owner, check_preview=False,
                                          preview_svg=result["svg"].encode("utf-8"))
-        return {**_present(project, manifest, projected, formats={}),
+        return {**_present(project, manifest, projected, formats={}, draft_revision=draft_revision),
                 "svg": result["svg"], "draft_revision": result["draft_revision"]}
     result = projects.save_overrides(figure_id, owner, submitted, expected_revision=revision,
                                      confirm_targets=confirm)

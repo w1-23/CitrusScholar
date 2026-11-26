@@ -242,8 +242,8 @@ def _detector_checklist(selected, paper_receipt, geng_receipt, paper_findings, g
                 state = "not_applicable"
             else:
                 state = "checked_with_findings" if counts.get(check) else "checked_no_findings"
-            rows.append(_checklist_row(check, state, tested=tested, reason=reason,
-                                       method_version=PAPERCONAN_METHOD_VERSION))
+            rows.append(_checklist_row(check, state, tested=tested, skipped=receipt.get("skipped", 0),
+                                       reason=reason, method_version=PAPERCONAN_METHOD_VERSION))
         elif check in geng_receipt and isinstance(geng_receipt[check], dict):
             receipt = geng_receipt[check]
             states = []

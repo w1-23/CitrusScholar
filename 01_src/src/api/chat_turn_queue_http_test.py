@@ -36,6 +36,7 @@ def runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "chat_capacity", ChatCapacity())
     sessions = manager.SessionManager()
     monkeypatch.setattr(main, "session_manager", sessions)
+    monkeypatch.setattr(manager, "session_manager", sessions)
     auth.init_store()
     files.init_store()
     password = "Fixture-only-8043!"
@@ -48,7 +49,19 @@ def runtime(monkeypatch, tmp_path):
     started = []
     released = {"legacy", "last"}
     asking, hold_cleanup, held = set(), set(), {}
-    graph_errors = set()
+    ask_rounds, checkpoints, graph_errors = {}, {}, set()
+
+    async def read_fixture_checkpoint(root, identity, provider_scope, *, question_resume=None, **kwargs):
+        if question_resume is None:
+            raise task_events.TaskConflict("fixture_checkpoint_missing")
+        ref = question_resume["checkpoint_ref"]
+        saved = checkpoints.get(ref)
+        if not saved or saved["job_id"] != identity.run_id:
+            raise task_events.TaskConflict("question_resume_checkpoint_conflict")
+        return {**saved, "agent_resume": True, "agent_question_resume": question_resume}
+
+    from src.agent.recovery import load_recovery_state
+    monkeypatch.setattr("src.agent.recovery.load_recovery_state", read_fixture_checkpoint)
 
     class ControlledGraph:
         async def astream(self, state, **_):
@@ -60,20 +73,39 @@ def runtime(monkeypatch, tmp_path):
                     raise TimeoutError("fixture release missing")
                 await asyncio.sleep(0.01)
             if cid in graph_errors:
-                raise RuntimeError("fixture private provider detail")
+                from langgraph.graph import START, END, StateGraph
+                def failing_node(_):
+                    try:
+                        raise ValueError("fixture confidential arguments")
+                    except ValueError as exc:
+                        raise AttributeError("fixture private provider detail") from exc
+                builder = StateGraph(dict)
+                builder.add_node("capability_admission", failing_node)
+                builder.add_edge(START, "capability_admission")
+                builder.add_edge("capability_admission", END)
+                await builder.compile().ainvoke({})
             answer = "answer to " + state["query"]
             output = {"answer": answer, "turn_outcome": {"status": "completed"}}
-            if cid in asking:
-                question = user_questions.create_question(get_job_id(), owner_user_id=owner, session_id=sid,
-                    prompt="Which option?", options=[], allow_text=True, context={"query": state["query"]})
+            ordinal = started.count(cid)
+            if ordinal <= ask_rounds.get(cid, int(cid in asking)):
+                job_id = get_job_id()
+                context = {"query": state["query"], "selected_skills": state.get("selected_skills") or []}
+                question = user_questions.create_question(job_id, owner_user_id=owner, session_id=sid,
+                    prompt="Which option?", options=[], allow_text=True, context=context)
+                reference = f"checkpoint-{question['id']}"
+                checkpoints[reference] = {**state, "job_id": job_id, "request_id": jobs.get_job(job_id)["request_id"]}
+                question = user_questions.save_question_context(job_id, context, question_id=question["id"],
+                    interrupt_id=f"interrupt-{question['id']}", checkpoint_ref=reference)
                 output.update(awaiting_input=True, pending_question=question)
-                if cid in hold_cleanup:
+                if cid in hold_cleanup and ordinal == 1:
                     held[cid] = current_account_lease().retain()
             yield {"supervisor": output}
-            await sessions.save_messages(state["session_id"],
-                [HumanMessage(content=state["query"]), AIMessage(content=answer)],
-                idempotency_key=state["idempotency_key"])
-            yield {"session_save": {"_trace": {"history_saved": True}}}
+            history_saved = not output.get("awaiting_input")
+            if history_saved:
+                await sessions.save_messages(state["session_id"],
+                    [HumanMessage(content=state["query"]), AIMessage(content=answer)],
+                    idempotency_key=state["idempotency_key"])
+            yield {"session_save": {"_trace": {"history_saved": history_saved}}}
 
     monkeypatch.setattr(graph, "build_graph", lambda _: ControlledGraph())
 
@@ -117,7 +149,7 @@ def runtime(monkeypatch, tmp_path):
             yield SimpleNamespace(client=client, sid=sid, started=started, released=released,
                                   owner=owner, path=f"/api/v2/session/{sid}/turn-queue",
                                   other_owner=other_owner, asking=asking, held=held, hold_cleanup=hold_cleanup,
-                                  graph_errors=graph_errors,
+                                  graph_errors=graph_errors, ask_rounds=ask_rounds, real_checkpoint_loader=load_recovery_state,
                                   other=auth.login("queue-other", password)[1])
         finally:
             for lease in held.values():
@@ -192,52 +224,116 @@ def test_legacy_stream_observes_one_persistent_job(runtime):
 
 
 
-def answer_question(runtime, job_id, *, cancelled=False):
+def answer_question(runtime, job_id, *, cancelled=False, question=None, **overrides):
     url = f"/api/v2/chat/jobs/{job_id}/questions"
-    questions = runtime.client.get(url).json()["questions"]
-    assert len(questions) == 1
-    question = questions[0]
+    if question is None:
+        questions = runtime.client.get(url).json()["questions"]
+        assert len(questions) == 1
+        question = questions[0]
     response = runtime.client.post(f'{url}/{question["id"]}/answer', json={
-        "version": question["version"], "client_request_id": "fixture-answer",
-        "text": "a clarification" if not cancelled else "", "cancelled": cancelled,
+        "version": question["version"], "interrupt_id": question["interrupt_id"],
+        "client_request_id": "fixture-answer", "text": "a clarification" if not cancelled else "",
+        "cancelled": cancelled, **overrides,
     })
     assert response.status_code == 200, response.text
     return response.json()
 
 
 def test_two_questions_preserve_original_queue_position_through_cleanup(runtime):
-    runtime.asking.add("first")
+    runtime.ask_rounds["first"] = 2
     runtime.hold_cleanup.add("first")
     root = send(runtime, "first", "question task")
     follower = send(runtime, "last", "independent task")
+    run = root["job_id"]
     runtime.released.add("first")
-    wait_for(lambda: jobs.get_job(root["job_id"])["status"] == "awaiting_input")
+    wait_for(lambda: jobs.get_job(run)["status"] == "awaiting_input")
     assert state(runtime, "first") == "running"
-    answer = answer_question(runtime, root["job_id"])
-    assert answer["dispatch_pending"] is True
-    assert answer_question(runtime, root["job_id"])["child_job_id"] == answer["child_job_id"]
-    child = answer["child_job_id"]
-    child_cid = jobs.get_job(child)["client_request_id"]
-    runtime.asking.add(child_cid)
-    assert jobs.get_job(child)["status"] == "queued"
+    first = answer_question(runtime, run)
+    assert first["dispatch_pending"] and first["resume_job_id"] == run
+    assert answer_question(runtime, run)["resume_job_id"] == run
     assert runtime.started == ["first"]
     runtime.held.pop("first").release()
-    wait_for(lambda: runtime.started == ["first", child_cid])
+    wait_for(lambda: runtime.started == ["first", "first"] and state(runtime, "first") == "awaiting_input")
     assert state(runtime, "last") == "queued"
-    runtime.released.add(child_cid)
-    wait_for(lambda: state(runtime, "first") == "awaiting_input")
-    reply = answer_question(runtime, child)
-    grandchild = reply["child_job_id"]
-    grandchild_cid = jobs.get_job(grandchild)["client_request_id"]
-    runtime.released.add(grandchild_cid)
+    second = answer_question(runtime, run)
+    assert second["resume_job_id"] == run and second["question"]["id"] != first["question"]["id"]
     wait_for(lambda: state(runtime, "last") == "terminal")
-    assert runtime.started == ["first", child_cid, grandchild_cid, "last"]
+    assert runtime.started == ["first", "first", "first", "last"]
+    assert answer_question(runtime, run, question=first["question"])["dispatch_required"] is False
     turns = {t["job_id"]: t for t in runtime.client.get(runtime.path).json()["turns"]}
-    assert turns[root["job_id"]]["state"] == turns[follower["job_id"]]["state"] == "terminal"
-    assert turns[root["job_id"]]["active_child_job_id"] == grandchild
-    events = runtime.client.get(f"/jobs/{grandchild}/events").json()["events"]
-    terminal = [row for row in events if row["event"] == "done"]
-    assert len(terminal) == 1 and terminal[0]["data"]["history_saved"] is True
+    assert turns[run]["state"] == turns[follower["job_id"]]["state"] == "terminal"
+    assert turns[run]["active_child_job_id"] == ""
+    events = runtime.client.get(f"/jobs/{run}/events").json()["events"]
+    assert [row["data"]["history_saved"] for row in events if row["event"] == "done"] == [False, False, True]
+    assert sum(row["event"] == "agent_recovery" for row in events) == 2
+
+
+def test_native_question_complete_http_and_protected_graph(runtime, monkeypatch, tmp_path):
+    import json
+    import httpx
+    from langchain_openai import ChatOpenAI
+    from src.agent.native_send_budget_test import BASE, PROVIDER, _chat_stream
+    from src.config import ModelTransport, settings
+    from src.core.provider_transport import AsyncDeepSeekTransport
+    from src.graph.general_agent_graph import build_general_agent_graph
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.config.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(type(settings), "model_transport",
+        lambda *_args, **_kwargs: ModelTransport("deepseek", PROVIDER, BASE, "fixture", {}))
+    monkeypatch.setattr("src.agent.recovery.load_recovery_state", runtime.real_checkpoint_loader)
+    monkeypatch.setattr(graph, "build_graph", lambda _: build_general_agent_graph())
+    wire = []
+    original = "Please make a simple choice with me."
+    answer = "The choice is recorded."
+
+    def receive(request):
+        body = json.loads(request.content)
+        wire.append(body)
+        assert len(wire) <= 2
+        question = next(tool["function"] for tool in body["tools"] if tool["function"]["name"] == "request_user_input")
+        params = question["parameters"]
+        shape = params["properties"]["options"]["items"]
+        if "$ref" in shape:
+            shape = params["$defs"][shape["$ref"].rsplit("/", 1)[-1]]
+        assert "refs" in shape["properties"] and "refs" not in shape["required"]
+        if len(wire) == 1:
+            return _chat_stream([("fixture-question", "request_user_input", {"prompt": "Which choice?",
+                "options": [{"id": "pick", "label": "Use this", "description": "A plain preference"}],
+                "multi_select": False, "allow_text": True})])
+        assert sum(original in str(message.get("content")) for message in body["messages"]
+                   if message["role"] == "user") == 1
+        assert sum("a clarification" in str(message.get("content")) for message in body["messages"]
+                   if message["role"] == "user") == 1
+        assert [message.get("tool_call_id") for message in body["messages"] if message["role"] == "tool"] == ["fixture-question"]
+        return _chat_stream(answer=answer)
+
+    client = httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(receive)), trust_env=False)
+    monkeypatch.setattr("src.core.llm_pool.get_llm", lambda **kwargs: ChatOpenAI(use_responses_api=False,
+        model=PROVIDER, api_key="fixture", base_url=BASE, max_retries=0,
+        max_tokens=kwargs["max_tokens"], stream_usage=True, http_async_client=client))
+    try:
+        turn = send(runtime, "native-http", original)
+        run = turn["job_id"]
+        wait_for(lambda: state(runtime, "native-http") in {"terminal", "awaiting_input"})
+        assert state(runtime, "native-http") == "awaiting_input"
+        first = runtime.client.get(f"/jobs/{run}/events").json()["events"]
+        parked, = [item["data"]["question"] for item in first if item["event"] == "request_user_input"]
+        assert parked["options"][0]["refs"] == [] and parked["interrupt_id"]
+        assert answer_question(runtime, run)["resume_job_id"] == run
+        wait_for(lambda: state(runtime, "native-http") == "terminal")
+        assert jobs.get_job(run)["status"] == "completed"
+        with task_events.read_transaction() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM task_jobs WHERE parent_job_id=?", (run,)).fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM task_operations WHERE job_id=? AND tool_name='request_user_input'", (run,)).fetchone()[0] == 1
+            assert conn.execute("SELECT calls FROM task_budgets WHERE job_id=?", (run,)).fetchone()[0] == 2
+        events = runtime.client.get(f"/jobs/{run}/events").json()["events"]
+        assert [item["data"]["history_saved"] for item in events if item["event"] == "done"] == [False, True]
+        history = runtime.client.get(runtime.path.replace("turn-queue", "messages")).json()["turns"]
+        assert len(history) == 1 and history[0]["job_id"] == run
+        assert history[0]["answer"]["content"] == answer
+    finally:
+        runtime.client.portal.call(client.aclose)
 
 
 def test_cancel_question_releases_head_without_creating_child(runtime):
@@ -246,17 +342,29 @@ def test_cancel_question_releases_head_without_creating_child(runtime):
     send(runtime, "last", "independent task")
     runtime.released.add("first")
     wait_for(lambda: state(runtime, "first") == "awaiting_input")
-    assert not answer_question(runtime, root["job_id"], cancelled=True)["child_job_id"]
+    assert not answer_question(runtime, root["job_id"], cancelled=True)["resume_job_id"]
     wait_for(lambda: state(runtime, "last") == "terminal")
     assert runtime.started == ["first", "last"]
     settled = queue.get_turn(owner_user_id=runtime.owner, session_id=runtime.sid, client_request_id="first")
     assert settled["state"] == "terminal" and settled["clear_reason"] == "question_cancelled"
 
 
-@pytest.mark.parametrize("claim_before_restart", [False, True])
-def test_startup_recovers_durable_answer_or_fences_unknown_dispatch(runtime, monkeypatch, claim_before_restart):
+def claim_waiting_question(runtime, run):
     from time import time
+    from src.agent.execution_segments import ExecutionSegments
+    from src.agent.identity import ExecutionIdentity
 
+    job = jobs.get_job(run)
+    identity = ExecutionIdentity(runtime.owner, runtime.sid, job["request_id"], run)
+    turn = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=run)
+    segment = ExecutionSegments(identity)
+    claim = segment.claim_question_resume(account_epoch=turn["account_epoch"], deadline=time() + 60,
+        expected=user_questions.question_resume(identity), fence=main._turn_fence(turn))
+    return segment, claim
+
+
+@pytest.mark.parametrize("claim_before_restart", [False, True])
+def test_startup_recovers_durable_question_answer(runtime, monkeypatch, claim_before_restart):
     advance = main._advance_question_turn
 
     async def pause_dispatch(*_):
@@ -265,62 +373,50 @@ def test_startup_recovers_durable_answer_or_fences_unknown_dispatch(runtime, mon
     monkeypatch.setattr(main, "_advance_question_turn", pause_dispatch)
     runtime.asking.add("first")
     root = send(runtime, "first", "question task")
+    run = root["job_id"]
     runtime.released.add("first")
     wait_for(lambda: state(runtime, "first") == "awaiting_input")
     send(runtime, "last", "after restart")
-    child = answer_question(runtime, root["job_id"])["child_job_id"]
-    child_cid = jobs.get_job(child)["client_request_id"]
-    runtime.released.add(child_cid)
-    assert jobs.get_job(child)["status"] == "queued"
+    assert answer_question(runtime, run)["resume_job_id"] == run
     if claim_before_restart:
-        waiting = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=root["job_id"])
-        queue.resume_continuation(**main._turn_fence(waiting), active_child_job_id=child, deadline=time() + 60)
+        claim_waiting_question(runtime, run)
         jobs.mark_interrupted_jobs()
     runtime.client.portal.call(main._reconcile_turn_queue_startup)
     monkeypatch.setattr(main, "_advance_question_turn", advance)
-    if claim_before_restart:
-        assert state(runtime, "first") == "reconcile_required"
-        assert state(runtime, "last") == "queued"
-        assert runtime.started == ["first"]
-    else:
-        wait_for(lambda: state(runtime, "last") == "terminal")
-        assert runtime.started == ["first", child_cid, "last"]
+    wait_for(lambda: state(runtime, "last") == "terminal")
+    assert runtime.started == ["first", "first", "last"]
 
 
-def test_startup_settles_completed_child(runtime, monkeypatch):
-    settled_child = []
+def test_startup_settles_completed_native_resume(runtime, monkeypatch):
+    settled = []
     settle = main._settle_dispatched_turn
 
     def interrupt_settlement(turn, job_id):
-        if turn["active_child_job_id"] == job_id:
-            settled_child.append(job_id)
+        if turn["client_request_id"] == "first" and jobs.get_job(job_id)["status"] == "completed":
+            settled.append(job_id)
         else:
             settle(turn, job_id)
 
     monkeypatch.setattr(main, "_settle_dispatched_turn", interrupt_settlement)
     runtime.asking.add("first")
     root = send(runtime, "first", "question task")
+    run = root["job_id"]
     runtime.released.add("first")
     wait_for(lambda: state(runtime, "first") == "awaiting_input")
-    follower = send(runtime, "last", "after restart")
-    child = answer_question(runtime, root["job_id"])["child_job_id"]
-    child_cid = jobs.get_job(child)["client_request_id"]
-    runtime.released.add(child_cid)
-    wait_for(lambda: settled_child == [child])
+    send(runtime, "last", "after restart")
+    assert answer_question(runtime, run)["resume_job_id"] == run
+    wait_for(lambda: settled == [run])
     assert state(runtime, "first") == "running"
     assert state(runtime, "last") == "queued"
-    assert jobs.decode_terminal_snapshot(jobs.get_job(child))["history_saved"] is True
+    assert jobs.decode_terminal_snapshot(jobs.get_job(run))["history_saved"] is True
     monkeypatch.setattr(main, "_settle_dispatched_turn", settle)
     runtime.client.portal.call(main._reconcile_turn_queue_startup)
     wait_for(lambda: state(runtime, "last") == "terminal")
     assert state(runtime, "first") == "terminal"
-    assert runtime.started == ["first", child_cid, "last"]
-    for job_id in (child, follower["job_id"]):
-        events = runtime.client.get(f"/jobs/{job_id}/events").json()["events"]
-        assert sum(row["event"] == "done" for row in events) == 1
+    assert runtime.started == ["first", "first", "last"]
 
 
-def test_graph_exception_commits_one_failed_terminal_and_advances_queue(runtime):
+def test_graph_exception_commits_one_failed_terminal_and_advances_queue(runtime, caplog):
     runtime.graph_errors.add("provider-error")
     runtime.released.update({"provider-error", "after-error"})
     failed = send(runtime, "provider-error", "failing question")
@@ -330,8 +426,14 @@ def test_graph_exception_commits_one_failed_terminal_and_advances_queue(runtime)
 
     failed_job = jobs.get_job(failed["job_id"])
     assert failed_job["status"] == "failed"
-    assert failed_job["error"] == "RuntimeError"
+    assert failed_job["error"] == "AttributeError"
     assert jobs.get_job(following["job_id"])["status"] == "completed"
+    with task_events.read_transaction() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_model_attempts WHERE job_id=?", (failed["job_id"],)).fetchone()[0] == 0
+    row = next(record.message for record in caplog.records if "graph processing error" in record.message)
+    assert "capability_admission" in row and "failing_node" in row and "langgraph" in row
+    assert "AttributeError" in row and "ValueError" in row and failed["job_id"] in row
+    assert "fixture private provider detail" not in row and "fixture confidential arguments" not in row
     response = runtime.client.get(f"/jobs/{failed['job_id']}/events")
     assert response.status_code == 200
     assert "fixture private provider detail" not in response.text
@@ -430,12 +532,7 @@ def test_original_reviewed_answer_reopens_same_expired_segment(runtime, monkeypa
         assert task_events.current_terminal_event(conn, identity.run_id)["event"] == "done"
 
 
-def test_interactive_reconciliation_closes_active_child_and_retains_unknown_ledger(runtime, monkeypatch, tmp_path):
-    import time
-    from src.agent.execution_segments import ExecutionSegments
-    from src.agent.identity import ExecutionIdentity
-    from src.core import task_events
-
+def test_interactive_reconciliation_closes_original_run_and_retains_unknown_ledger(runtime, monkeypatch, tmp_path):
     async def pause(*_):
         return
 
@@ -445,23 +542,20 @@ def test_interactive_reconciliation_closes_active_child_and_retains_unknown_ledg
     root = send(runtime, "first", "needs a question")
     runtime.released.add("first")
     wait_for(lambda: state(runtime, "first") == "awaiting_input")
-    child = answer_question(runtime, root["job_id"])["child_job_id"]
-    row = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=root["job_id"])
-    queue.resume_continuation(**main._turn_fence(row), active_child_job_id=child, deadline=time.time()+60)
-    child_job = jobs.get_job(child)
-    segments = ExecutionSegments(ExecutionIdentity(runtime.owner, runtime.sid, child_job["request_id"], child))
-    segments.start()
-    operation, _ = task_events.start_operation(child, runtime.owner, "fixture_write", {})
+    run = root["job_id"]
+    assert answer_question(runtime, run)["resume_job_id"] == run
+    segments, admission = claim_waiting_question(runtime, run)
+    segments.activate(admission["claim"])
+    operation, _ = task_events.start_operation(run, runtime.owner, "fixture_write", {})
     jobs.mark_interrupted_jobs()
     runtime.client.portal.call(main._reconcile_turn_queue_startup)
     assert state(runtime, "first") == "reconcile_required"
-    row = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=child)
+    row = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=run)
     response = runtime.client.post(runtime.path + "/first/reconcile")
     assert response.status_code == 200, response.text
-    assert response.json()["state"] == "terminal" and response.json()["active_child_job_id"] == child
-    assert jobs.get_job(root["job_id"])["status"] == "awaiting_input"
-    assert jobs.get_job(child)["current_step"] == "reconciled" and segments.snapshot()["phase"] == "quarantined"
-    current = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=child)
+    assert response.json()["state"] == "terminal" and response.json()["active_child_job_id"] == ""
+    assert jobs.get_job(run)["current_step"] == "reconciled" and segments.snapshot()["phase"] == "quarantined"
+    current = queue.find_turn_by_job(owner_user_id=runtime.owner, session_id=runtime.sid, job_id=run)
     assert current["generation"] > row["generation"] and not queue.can_release_inputs(**main._turn_fence(current))
     with task_events.transaction() as conn:
         assert conn.execute("SELECT status FROM task_operations WHERE operation_id=?", (operation,)).fetchone()[0] == "interrupted"

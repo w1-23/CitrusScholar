@@ -31,6 +31,22 @@ _WORKER_ENTRY = ('import sys; sys.path.insert(0, sys.argv[1]); '
 _SOURCE_ROOT = str(Path(__file__).resolve().parents[2])
 
 
+_SCOPE_DENIALS = frozenset({
+    'browse_not_authorized', 'browse_host_not_allowed', 'browse_url_denied',
+    'browse_dns_denied', 'browse_peer_mismatch', 'browse_method_denied',
+})
+
+
+def browse_reason_class(reason: str) -> str:
+    if reason in _SCOPE_DENIALS:
+        return 'scope_limited'
+    if reason == 'browse_network_error':
+        return 'source_unavailable'
+    if reason in {'browse_network_timeout', 'browse_timed_out'}:
+        return 'transient'
+    return ''
+
+
 class BrowseError(RuntimeError):
     """A bounded, model-visible browse reason without upstream error text."""
 

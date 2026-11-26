@@ -47,7 +47,8 @@ class Intake:
 
     def process_one(self, *, acquire=None, automatic=None):
         with self.store.writer():
-            job = self.queue.claim(network=acquire is not None, automatic=automatic is not None)
+            job = self.queue.claim(network=acquire is not None,
+                                   automatic=automatic is not None and automatic.enabled())
             if job is None:
                 return None
             try:

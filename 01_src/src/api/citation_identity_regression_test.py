@@ -6,11 +6,11 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from src import config
 from src.api import main
-from src.core import jobs, progress_bus, tool_results, tracing, turn_source_ledger
+from src.core import jobs, progress_bus, task_events, tool_results, tracing, turn_source_ledger
 from src.graph.agent_operations import _emit_completed_tool_step
 from src.research.result_tools import read_tool_result
 from src.retrieval import corpus_registry, evidence_adapter
@@ -44,6 +44,8 @@ def citation_session(tmp_path, monkeypatch):
     app.add_api_route('/corpus/source', main.corpus_source_endpoint)
     app.add_api_route('/sessions/{session_id}/turn-sources', main.session_turn_sources)
     app.add_api_route('/sessions/{session_id}/citations', main.session_citations)
+    app.add_api_route('/sessions/{session_id}/messages', main.session_messages)
+    app.add_api_route('/jobs/{job_id}/events', main.get_job_events)
     try:
         with TestClient(app) as client:
             yield SimpleNamespace(client=client, sid=sid, user=user, job=job_id, root=tmp_path)
@@ -266,3 +268,40 @@ def test_fetched_paper_can_be_cited_without_showing_internal_id(citation_session
     assert answer == 'From the paper.'
     assert projection['bubbles'] == [
         {'kind': 'web', 'url': url, 'title': 'A verified paper', 'ref_id': 'W2'}]
+
+
+
+def test_grouped_citations_keep_markdown_and_match_replay_and_history(citation_session):
+    from src.core.turn_sources import answer_citations
+
+    run = citation_session
+    sources = [('W1', 'First source', 'https://example.org/first'),
+               ('W2', 'Second source', 'https://example.org/second')]
+    for marker, title, url in sources:
+        record_tool('deepseek_search', f'group-{marker}', f'[{marker}] {title}\nEvidence',
+                    {'web_results': [{'url': url, 'title': title, 'citation_ref': marker, 'summary': 'Evidence'}]})
+    literal = ('`【w1，w2】` and ``x ` 【w1，w2】``; “【w1，w2】”; '
+               r'\【w1，w2】' + '\n\n[read [W1]](https://example.org/first) '
+               '[ordinary](https://example.org/first#section) and [【w1，w2】](https://example.org/second)\n\n'
+               '```text\n【w1，w2】\n~~~\n[W1, W2]\n  ```\n\n'
+               '~~~text\n【w1，w2】\n ```\n[W1, W2]\n~~~\n\n')
+    literal += 'Source names are grouped below.'
+    chunks = ['First【w', '1，w', '2】 then [W2, ', 'W1] unknown【W7、H3】.\n\n', literal]
+    body, projection = answer_citations(''.join(chunks), session_id=run.sid, request_id='client-request', user=run.user)
+    assert body == 'First then  unknown.\n\n' + literal
+    assert projection['dropped'] == ['W7', 'H3']
+    assert [(item['ref_id'], item['title'], item['url']) for item in projection['bubbles']] == sources
+    task_events.append_event(run.job, 'answer_start', {})
+    task_events.append_event(run.job, 'text', {'delivery': 'committed', 'content': body[:11]})
+    task_events.append_event(run.job, 'text', {'delivery': 'committed', 'content': body[11:]})
+    task_events.append_event(run.job, 'citations', projection)
+    task_events.append_event(run.job, 'done', {'answer': body, 'turn_envelope': {'display_status': 'completed'}})
+    jobs.update_job(run.job, status='completed')
+    asyncio.run(manager.session_manager.save_messages(run.sid, [HumanMessage('Synthetic question'),
+        AIMessage(body, response_metadata={'citrus_citation_bubbles': projection['bubbles']})],
+        idempotency_key='crid:client-request'))
+
+    replay = run.client.get(f'/jobs/{run.job}/events').json()['events']
+    saved = run.client.get(f'/sessions/{run.sid}/messages').json()['turns'][0]['answer']
+    assert ''.join(row['data']['content'] for row in replay if row['event'] == 'text') == saved['content'] == body
+    assert next(row['data']['bubbles'] for row in replay if row['event'] == 'citations') == saved['citation_bubbles']

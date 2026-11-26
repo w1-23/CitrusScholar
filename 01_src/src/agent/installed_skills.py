@@ -75,23 +75,21 @@ class TurnSkills:
     """One authorized method view for the SDK, File and research workspace."""
 
     release: Path | None
-    rqa_identity: tuple[str, ...] = ()
 
     @classmethod
     def from_selection(cls, release, selected):
-        pinned = next((row for row in selected if row["id"] == RQA_ID), None)
-        return cls(release, tuple(pinned[key] for key in _IDENTITY_FIELDS) if pinned else ())
+        # Explicit selections are validated and surfaced independently by the host.
+        return cls(release)
 
     def allows(self, skill_id: str) -> bool:
         from src.core.capability_policy import allows
 
-        return ((skill_id != RQA_ID or bool(self.rqa_identity)) and allows("skill:" + skill_id))
+        return self.release is not None and allows("skill:" + skill_id)
 
     def rows(self) -> list[dict]:
         if self.release is None:
             return []
-        return [row for row in list_installed(self.release) if self.allows(row["id"])
-                and (row["id"] != RQA_ID or tuple(row[key] for key in _IDENTITY_FIELDS) == self.rqa_identity)]
+        return [row for row in list_installed(self.release) if self.allows(row["id"])]
 
 
 @contextmanager

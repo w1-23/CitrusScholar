@@ -162,8 +162,13 @@ def test_only_validated_descendant_producer_can_read_its_own_answer_and_artifact
         q = user_questions.create_question(parent, owner_user_id=owner, session_id=sid,
             prompt="Choose the offline fixture", options=[], context={"query": "Synthetic root question"})
         jobs.update_job(parent, status="awaiting_input")
-        return user_questions.answer_question(parent, q["id"], owner_user_id=owner, session_id=sid,
-            version=1, text=reply, client_request_id=reply)["child_job_id"]
+        child = claim(sid, reply)
+        with task_events.transaction() as conn:
+            answer = {"text": reply, "cancelled": False, "selected_option_ids": []}
+            conn.execute("UPDATE task_questions SET status='answered',answer=?,answer_hash=?,child_job_id=? WHERE id=?",
+                         (task_events.canonical(answer), task_events.input_hash(answer), child, q["id"]))
+            conn.execute("UPDATE task_jobs SET parent_job_id=?,question_id=? WHERE job_id=?", (parent, q["id"], child))
+        return child
 
     root = claim(sid, "shown-root")
     child = continue_from(root, "choice-one")

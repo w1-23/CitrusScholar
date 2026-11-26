@@ -294,7 +294,7 @@ def _question_option(value):
 
 def project_public_question(value):
     row = _object(value)
-    result = project_fields(row, ids="id job_id status child_job_id", texts="prompt", numbers="version expires_at recovery_cursor",
+    result = project_fields(row, ids="id job_id status child_job_id interrupt_id", texts="prompt", numbers="version expires_at recovery_cursor",
                             bools="multi_select allow_text", nullable="answer")
     _set_array(result, row, "options", lambda rows: _array(rows, _question_option))
     def answer(item):
@@ -310,7 +310,7 @@ _BUDGET_NUMBERS = "snapshot_version epoch estimated_input_tokens estimated_token
 _BUDGET_IDS = "scope estimate_scope estimate_method model_window_status image_estimate_status change_reason"
 _CONTEXT_IDS = "source model session_id request_id logical_call_id attempt_id parent_purpose status history_load_status history_load_reason"
 _COMPONENTS = "system messages tool_arguments tool_schemas images protocol"
-_OBSERVATION_FIELDS = "estimated_input_tokens max_output_tokens"
+_OBSERVATION_FIELDS = "estimated_input_tokens max_output_tokens prepared_output_tokens model_window input_limit"
 _OLD_PROJECTED = frozenset("""
     tool_call_start tool_executing tool_progress tool_result operation assistant_progress
     task_update agent_recovery permission_request permission_decision status task_state
@@ -341,8 +341,8 @@ def _usage(value):
 
 def model_attempt_observation(value):
     row = _object(value)
-    result = project_fields(row, ids="provider stream_state finish_reason finish_reason_status response_type",
-                            numbers=_OBSERVATION_FIELDS, bools="streaming", nullable="finish_reason")
+    result = project_fields(row, ids="provider stream_state finish_reason finish_reason_status response_type output_limit_status",
+                            numbers=_OBSERVATION_FIELDS, bools="streaming", nullable="finish_reason max_output_tokens")
     for key in ("provider_first_packet_ms", "attempt_elapsed_ms"):
         if key in row:
             result[key] = duration_ms(row[key])
@@ -359,6 +359,12 @@ def _context(event, row):
                                 numbers=_BUDGET_NUMBERS, nullable=_BUDGET_NUMBERS, bools="fits tool_results_shortened")
         _set_object(result, row, "components", lambda item: project_fields(item, numbers=_COMPONENTS, nullable=_COMPONENTS))
         _set_object(result, row, "provider_usage", _usage)
+        if "actual_output_tokens" in row:
+            result.update(project_fields(row, numbers="actual_output_tokens", nullable="actual_output_tokens"))
+        if "attempt_elapsed_ms" in row:
+            result["attempt_elapsed_ms"] = duration_ms(row["attempt_elapsed_ms"])
+        _set_object(result, row, "task_budget",
+                    lambda item: project_fields(item, numbers="calls max_calls tokens max_tokens"))
     elif event == "context_status":
         result = project_fields(row, ids="history_load_status history_load_reason estimate_scope memory_status format_hint",
                                 numbers="history_msgs history_chars ltm_chars estimated_tokens max_tokens soft_threshold hard_threshold compression_len",

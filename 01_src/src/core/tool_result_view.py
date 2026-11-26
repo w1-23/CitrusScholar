@@ -21,6 +21,8 @@ _CONTROL_PRIORITY = (
     "audit_id", "review_id", "_tool_outcome", "dataset_ref", "analysis_result_ref",
     "findings_page", "findings_total", "registry_coverage", "execution_id", "saved_report", "report_file_error",
     "audit_status", "continuation", "counts", "coverage", "export_requests", "review", "files", "exports",
+    "execution_stage", "deliverable_stage", "figure_placeholders", "figure_placeholder", "figure_id",
+    "project_registered", "inline_registered", "failures",
 )
 
 
@@ -115,6 +117,43 @@ def _failure(message, code: str, *, verified: bool = False):
                                       "additional_kwargs": metadata})
 
 
+def _table_overview(value):
+    rows, columns, fields = (value.get(key) for key in ("rows", "columns", "fields"))
+    if (not all(isinstance(count, str) and count.isascii() and count.isdecimal() and len(count) < 12
+                for count in (rows, columns)) or not isinstance(fields, list)):
+        return None
+    descriptors = []
+    for field in fields[:10]:
+        if not isinstance(field, dict) or not isinstance(field.get("name"), str):
+            continue
+        descriptors.append({key: field[key][:100] for key in (
+            "name", "inferred_type", "missing_count", "unique_count", "numeric_count", "min", "median", "max")
+            if isinstance(field.get(key), str)})
+        if isinstance(field.get("samples"), list):
+            descriptors[-1]["samples"] = [sample[:60] for sample in field["samples"][:2] if isinstance(sample, str)]
+    source_ref = value.get("source_ref")
+    source = ({key: source_ref[key] for key in ("file_id", "sha256", "filename", "sheet", "sheet_name")
+               if isinstance(source_ref.get(key), str) and len(source_ref[key]) <= 180}
+              if isinstance(source_ref, dict) else {})
+    summary = {"rows": int(rows), "columns": int(columns), "reported_fields": len(fields),
+               "fields": descriptors, "source_ref": source}
+    digest = value.get("source_sha256")
+    if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+        summary["source_sha256"] = digest
+    if isinstance(value.get("inputs_binding"), dict) and source.get("file_id"):
+        summary["inputs_binding"] = {"data": {"file_id": source["file_id"]}}
+    for key in ("source_rows", "source_columns", "source_rows_exact", "truncated", "truncation_reasons",
+                "scan_complete", "header_rows", "sheet"):
+        info = value.get(key)
+        if isinstance(info, (bool, str, list)) and content_wire_bytes(info) <= 160:
+            summary[key] = info
+    # Keep identities, dimensions and field counts before optional samples.
+    while descriptors and content_wire_bytes(_json(summary)) > 1500:
+        descriptors.pop()
+    summary["fields_omitted"] = max(0, len(fields) - len(descriptors))
+    return summary
+
+
 def first_delivery(message, *, call: dict, reader_available: bool):
     text = message.content
     is_reader = message.name in _READERS or (
@@ -143,11 +182,14 @@ def first_delivery(message, *, call: dict, reader_available: bool):
     index = []
     control = {}
     total_controls = 0
+    table_overview = None
     try:
         # Keep the original spelling of numbers; the reference, not this view,
         # is authoritative evidence for scientific quantities and units.
         value = json.loads(text, parse_float=str, parse_int=str, parse_constant=str)
         if isinstance(value, dict):
+            if message.name == "inspect_uploaded_table":
+                table_overview = _table_overview(value)
             index = [{"pointer": "/" + key.replace("~", "~0").replace("/", "~1"),
                       "type": "object" if isinstance(item, dict) else "array" if isinstance(item, list) else "scalar"}
                      for key, item in list(value.items())[:12] if len(key) <= 80]
@@ -187,12 +229,17 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         "notice": "原文已完整保存。缺少关键结果时只读必要字段；如需续读，使用返回的 next_cursor。",
     }
 
+    if table_overview is not None:
+        payload["delivery"] = "stored_table_overview"
+        payload["table_overview"] = table_overview
+        payload.pop("previews")
+
     def render():
         payload["control_fields_omitted"] = total_controls - len(control)
         return _json(payload)
 
     rendered = render()
-    if content_wire_bytes(rendered) > FIRST_DELIVERY_BYTES:
+    if content_wire_bytes(rendered) > FIRST_DELIVERY_BYTES and "previews" in payload:
         payload["delivery"] = "stored_result_reference"
         payload.pop("previews")
         rendered = render()

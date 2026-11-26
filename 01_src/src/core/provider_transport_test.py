@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+import pytest
 from openai import APIError, BadRequestError, DefaultAsyncHttpxClient, DefaultHttpxClient
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage, ToolMessage, messages_to_dict
@@ -270,6 +271,7 @@ class ProviderWireTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(isinstance(item, APIError) for item in cb.records))
             self.assert_public([cb.records, str(caught.exception), caught.exception.body])
 
+    @pytest.mark.allow_hosts(["127.0.0.1"])
     async def test_default_route_honors_proxy_and_no_proxy_without_live_network(self):
         connects = []
 

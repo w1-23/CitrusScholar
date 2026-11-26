@@ -7,8 +7,9 @@
     },
     "source_bundle": {
       "base_commit": "484b598cfbb2b041ec199abe8ae2ebf818db59e5",
+      "fetch_commit": "f62b87b1e72cc11e9e04f8b6aaaa727979d83e07",
       "file": "research-question-answering.bundle",
-      "sha256": "e2ffac3176928999bdbf009781007d6a0879999bfd587983c3c7b6704570e363",
+      "sha256": "a082e006c7da968b5097802309ce74b825b51b885e840324e3a78ba8fa6f7458",
       "ref": "refs/heads/fix/8043-skill-convergence"
     }
   },

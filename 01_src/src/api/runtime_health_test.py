@@ -34,6 +34,7 @@ def _get(port, path):
         connection.close()
 
 
+@pytest.mark.allow_hosts(["127.0.0.1"])
 def test_uvicorn_serves_live_while_core_model_and_worker_are_blocked(monkeypatch):
     core_started, queue_started, warm_started, worker_started = (Event() for _ in range(4))
     core_release, queue_release, optional_release = (Event() for _ in range(3))

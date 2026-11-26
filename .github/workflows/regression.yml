@@ -200,7 +200,8 @@ jobs:
               git = ["git", "-C", str(target)]
               overlay = entry.get("source_bundle")
               base = overlay["base_commit"] if overlay else entry["commit"]
-              subprocess.run([*git, "fetch", "--depth", "1", "origin", base], check=True)
+              fetch_commit = overlay.get("fetch_commit", base) if overlay else base
+              subprocess.run([*git, "fetch", "--depth", "1", "origin", fetch_commit], check=True)
               if overlay:
                   if overlay["file"] != f"{name}.bundle" or not overlay["ref"].startswith("refs/heads/"):
                       raise ValueError(f"Invalid Skill bundle reference for {name}")

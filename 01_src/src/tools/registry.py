@@ -453,8 +453,8 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
     if token is not None and token.cancelled():
         return _cancelled_result(tool_call.get("name", tool.name), tool_call["id"], "before_checkpoint")
     job = jobs.get_job(job_id) if job_id and owner else None
-    if not job:
-        if require_durable:
+    if not job or job.get("owner_user_id") != owner:
+        if require_durable or job_id:
             raise task_events.TaskConflict("durable_operation_context_required")
         return await _execute_single_tool(tool, tool_call, on_dispatch=on_dispatch)
     name, args = tool_call.get("name", tool.name), tool_call.get("args", {})
@@ -488,7 +488,7 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
         elif name in ZERO_WRITE_TOOL_NAMES:
             reconciliation_scope = capture_zero_write(owner, job["session_id"], job_id, name, tool_call["id"])
         with reconciliation_scope as reconciliation:
-            message = await _execute_single_tool(tool, tool_call, lease_seconds=600, on_dispatch=on_dispatch)
+            message = await _execute_single_tool(tool, tool_call, lease_seconds=task_events.OPERATION_LEASE_SECONDS, on_dispatch=on_dispatch)
         message.additional_kwargs["operation_id"] = operation_id
         # Only this runner can attest first-party evidence bound to the invocation.
         message.additional_kwargs.pop("host_preflight_reconciled", None)
@@ -543,6 +543,10 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
 async def resume_safe_operation(job_id, operation_id, owner):
     """Resume one verified safe step; the original turn stays interrupted."""
     from src.core import task_events
+    from src.core.account_leases import current_account_lease
+    account_lease = current_account_lease()
+    if account_lease is None or account_lease.owner != owner:
+        raise task_events.TaskConflict("durable_operation_context_required")
     row = task_events.claim_resume(job_id, operation_id, owner)
     try:
         spec = get_tool_spec(row["tool_name"])
@@ -556,16 +560,18 @@ async def resume_safe_operation(job_id, operation_id, owner):
             raise task_events.TaskConflict("checkpoint_input_hash_mismatch")
         if refs:
             from src.core.resource_refs import pin_inputs
-            from src.core.account_leases import current_account_lease
-            account_lease = current_account_lease()
-            if account_lease is not None:
-                pin_inputs(owner, "task_input", operation_id,
-                           [r["file_id"] for r in refs], lease=account_lease)
+            pin_inputs(owner, "task_input", operation_id,
+                       [r["file_id"] for r in refs], lease=account_lease)
+        from time import time
+        remaining = row["lease_until"] - time()
+        if remaining <= 0:
+            raise task_events.TaskConflict("operation_lease_lost")
         message = await _execute_single_tool(spec.func, {
-            "id": operation_id, "name": row["tool_name"], "args": args}, recovering=True, lease_seconds=600)
+            "id": row["tool_call_id"], "name": row["tool_name"], "args": args},
+            recovering=True, lease_seconds=min(remaining, task_events.OPERATION_LEASE_SECONDS))
         if _recovery_inputs(row["tool_name"], args, owner) != (mode, refs):
             raise task_events.TaskConflict("checkpoint_input_changed")
-        outcome = task_events.finish_operation(operation_id, row["lease"], message)
+        outcome = task_events.finish_operation(operation_id, row["lease"], message, attempt=row["attempts"])
         return {"job_id": job_id, "operation_id": operation_id,
                 "recovery": "safe_step", "operation_status": outcome["status"],
                 "outcome": outcome, "result": str(message.content or "")}

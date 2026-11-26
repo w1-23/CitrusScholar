@@ -40,24 +40,27 @@ import hashlib
 import json
 import logging
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 from fastapi import HTTPException
 
 from src.core import chat_turn_queue
 from src.session import files as session_files
+from src.session import turn_input_staging as staging
 
 logger = logging.getLogger(__name__)
 
 # One deterministic resource id per accepted-or-staged turn input set. The
 # account library pins the complete ordered attachment set under this id so a
 # queued turn protects its bytes from TTL/cleanup while it waits.
-RESOURCE_KIND = "chat_turn_input"
+RESOURCE_KIND = staging.RESOURCE_KIND
 PAYLOAD_SCHEMA = 1
 
 MAX_FILES = 8
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-MAX_LIBRARY_REF_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+# Standalone library upload/list retain the existing boundary and field names.
+MAX_UPLOAD_BYTES = MAX_LIBRARY_REF_BYTES = MAX_ATTACHMENT_BYTES
 MAX_QUERY_CHARS = 20000
 MAX_NAME_CHARS = 180
 MAX_REQUEST_ID_CHARS = 128
@@ -76,7 +79,7 @@ _ALLOWED_UPLOAD_SUFFIXES = frozenset({
 })
 
 _PUBLIC_TURN_KEYS = (
-    "session_id", "client_request_id", "queue_seq", "state",
+    "session_id", "client_request_id", "queue_seq", "state", "generation",
     "active_child_job_id", "accepted_at", "dispatch_at", "started_at",
     "finished_at", "updated_at", "history_saved", "clear_reason", "blocked_by",
 )
@@ -238,6 +241,11 @@ def _validate_request(*, request, owner_user_id, session_id,
     if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY_CHARS:
         raise _http(400, "问题内容为空或过长。")
 
+    baseline = request.get("continue_from")
+    if baseline is not None and (not isinstance(baseline, str) or not _CLIENT_REQUEST_RE.fullmatch(baseline)
+                                 or baseline == client_request_id):
+        raise _http(400, "续问来源无效。")
+
     options = {
         "light_mode": _optional_bool(request.get("light_mode"), "light_mode"),
         "web_search_enabled": _optional_bool(
@@ -272,10 +280,11 @@ def _validate_request(*, request, owner_user_id, session_id,
         "selected_skills": selected_skills,
         "attachments": attachments,
         "file_refs": [str(item or "") for item in file_refs],
+        "continue_from": baseline,
     }
 
 
-def _decode_upload(item: dict) -> tuple[str, str, bytes, str]:
+def _decode_upload(item: dict, *, remaining: int) -> tuple[str, str, bytes, str]:
     """Validate one in-memory upload without persisting anything yet."""
     name = str(item.get("name") or "attachment")[:MAX_NAME_CHARS]
     suffix = name.lower().rsplit(".", 1)[-1] if "." in name else ""
@@ -284,10 +293,14 @@ def _decode_upload(item: dict) -> tuple[str, str, bytes, str]:
     raw = str(item.get("data") or "")
     if raw.startswith("data:") and "," in raw:
         raw = raw.split(",", 1)[1]
+    if len(raw) > 4 * ((remaining + 2) // 3):
+        raise _http(413, "本轮附件总大小不能超过 20 MiB。")
     try:
         content = base64.b64decode(raw, validate=True)
     except Exception as exc:  # noqa: BLE001 - normalize decoder failures
         raise _http(400, f"附件内容无法读取：{name}") from exc
+    if len(content) > remaining:
+        raise _http(413, "本轮附件总大小不能超过 20 MiB。")
     mime = str(item.get("type") or "")
     return name, mime, content, _sha256_bytes(content)
 
@@ -299,6 +312,10 @@ def _resolve_library_refs(file_ids: list[str], owner_user_id: int) -> list[dict]
         info = session_files.get_account_file(file_id, owner_user_id)
         if not info:
             raise _http(404, "引用的资料不存在、已过期或不属于当前账号。")
+        try:
+            info["size_bytes"] = Path(info["path"]).stat().st_size
+        except OSError as exc:
+            raise _http(404, "引用的资料不存在、已过期或不属于当前账号。") from exc
         resolved.append(info)
     return resolved
 
@@ -321,7 +338,7 @@ def _input_metadata(info: dict, *, source: str) -> dict:
 
 def _request_fingerprint(*, session_id: str, query: str, options: dict,
                          selected_skills: list[dict], uploads: list[tuple],
-                         file_refs: list[str]) -> str:
+                         file_refs: list[str], continue_from: str | None) -> str:
     """Pre-registration identity of the *client's* request.
 
     Uploads are identified by requested name/type plus immutable byte SHA-256,
@@ -342,6 +359,9 @@ def _request_fingerprint(*, session_id: str, query: str, options: dict,
         ],
         "file_refs": file_refs,
     }
+    # Ordinary request fingerprints remain compatible with existing receipts.
+    if continue_from is not None:
+        material["continue_from"] = continue_from
     try:
         return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
     except (TypeError, ValueError) as exc:
@@ -393,20 +413,20 @@ def _stored_fingerprint_matches(payload: dict, *, session_id: str,
 
 def _register_upload(*, session_id: str, owner_user_id: int, name: str,
                      mime: str, content: bytes,
-                     client_request_id: str) -> dict:
+                     client_request_id: str, stage_turn_input: bool = False) -> dict:
     try:
         return session_files.register_file(
             session_id=session_id, owner_user_id=owner_user_id,
             filename=name, content=content, mime=mime,
             origin=session_files.ORIGIN_UPLOADED,
-            client_request_id=client_request_id,
+            client_request_id=client_request_id, stage_turn_input=stage_turn_input,
         )
     except session_files.StorageQuotaExceeded as exc:
         raise _http(413, "账号资料库容量不足，附件未能保存。") from exc
     except ValueError as exc:
         raise _http(400, f"附件无法保存：{name}") from exc
     except Exception as exc:  # noqa: BLE001 - host storage outage
-        logger.exception("turn queue upload registration failed")
+        logger.warning("turn queue upload registration failed: %s", type(exc).__name__)
         raise _http(503, "附件未能保存到账号资料库，请稍后重试。") from exc
 
 
@@ -427,78 +447,73 @@ def _replay_existing(turn: dict, *, session_id: str, fingerprint: str) -> dict:
     return {**turn, "created": False}
 
 
-def _ensure_turn_links(owner_user_id: int, session_id: str,
-                       client_request_id: str, inputs) -> None:
-    file_ids = [str(item.get("file_id"))
-                for item in inputs or [] if isinstance(item, dict)]
-    if file_ids:
-        session_files.link_turn_files(
-            session_id, owner_user_id, client_request_id, file_ids)
+class _AdmissionBusy(RuntimeError):
+    pass
 
 
-def _cleanup_failed_admission(*, owner_user_id: int, session_id: str,
-                              client_request_id: str,
-                              staged_file_ids: list[str]) -> None:
-    """Compensate a failed (never-202) admission without touching accepted data.
-
-    If an accepted turn appeared for this owner-level id in the meantime, the
-    admission is no longer ours to clean: leave both pins and bytes alone.
-    Otherwise release our deterministic pin and delete only the uploads this
-    attempt staged (matching session and turn id); the library's own pin check
-    still refuses to delete anything another resource protects.
-    """
+@contextmanager
+def _admission_lock(owner, request):
+    # Bounded lockfile set. The owner-level id is unique across sessions and
+    # the OS releases the scope lock after a stopped or killed process.
+    from src.agent.harness import execution_lock
+    stripe = hashlib.sha256(f"{owner}:{request}".encode()).hexdigest()[:3]
     try:
-        if _existing_turn(owner_user_id=owner_user_id, session_id=session_id,
-                          client_request_id=client_request_id) is not None:
-            return
-    except Exception:  # noqa: BLE001 - never mask the original failure
-        logger.exception("turn queue cleanup could not confirm admission")
-        return
-    try:
-        session_files.release_resource_references(
-            owner_user_id, RESOURCE_KIND,
-            turn_input_resource_id(session_id, client_request_id))
-    except Exception:  # noqa: BLE001
-        logger.exception("turn queue cleanup could not release input pin")
-    for file_id in dict.fromkeys(staged_file_ids):
-        try:
-            info = session_files.get_account_file(file_id, owner_user_id)
-            if not info:
-                continue
-            if str(info.get("session_id") or "") != session_id:
-                continue
-            if str(info.get("turn_request_id") or "") != client_request_id:
-                continue
-            session_files.delete_account_file(file_id, owner_user_id)
-        except Exception:  # noqa: BLE001
-            logger.warning("turn queue cleanup skipped staged file",
-                           exc_info=True)
+        with execution_lock(session_files.DB_PATH.parent / "turn-input-locks", stripe):
+            yield
+    except RuntimeError as exc:
+        if str(exc) != "agent_run_already_active":
+            raise
+        raise _AdmissionBusy from exc
 
 
-def _inherited_inputs(owner_user_id: int, session_id: str) -> list[dict]:
-    turns = chat_turn_queue.list_turns(owner_user_id=owner_user_id, session_id=session_id, limit=1)
-    if not turns:
-        return []
-    previous = turns[-1]
+def _resolve_stage(scope):
+    owner, session, request = scope
+    accepted = _existing_turn(owner_user_id=owner, session_id=session, client_request_id=request)
+    staging.resolve(scope, turn_input_resource_id(session, request), accepted=accepted is not None)
+
+
+def reconcile_staged_turn_inputs():
+    """Startup/periodic repair. Never compensate against an uncertain queue read."""
+    cursor = 0
+    while rows := staging.pending(after=cursor):
+        for cursor, owner, session, request in rows:
+            try:
+                with _admission_lock(owner, request):
+                    _resolve_stage((owner, session, request))
+            except _AdmissionBusy:
+                continue
+            except Exception as exc:
+                logger.warning("staged turn input reconciliation deferred: %s", type(exc).__name__)
+
+
+def _continued_inputs(owner_user_id: int, session_id: str, baseline: str) -> list[dict]:
     try:
-        payload = _load_payload(previous)
-    except (chat_turn_queue.TurnNotFound, chat_turn_queue.TurnReconcileRequired):
-        return []
+        previous = chat_turn_queue.continuation_baseline(owner_user_id=owner_user_id, session_id=session_id,
+                                                        client_request_id=baseline)
+    except chat_turn_queue.TurnStateConflict as exc:
+        raise _http(409, "指定的续问来源尚未形成可验证的历史记录。", code="turn_baseline_not_ready") from exc
+    if previous is None:
+        raise _http(404, "找不到指定的续问来源。", code="turn_baseline_not_found")
+    payload = _load_payload(previous)
+    items = payload.get("inputs")
+    if not isinstance(items, list):
+        raise _http(409, "续问来源的附件无法验证。", code="turn_baseline_unavailable")
     inherited = []
-    total = 0
-    for item in (payload.get("inputs") or [])[:MAX_FILES]:
+    for item in items:
+        unavailable = _http(409, "续问来源的附件已失效或变更。", code="turn_baseline_unavailable")
         if not isinstance(item, dict):
-            continue
+            raise unavailable
         file_id, expected = str(item.get("file_id") or ""), str(item.get("sha256") or "")
         if not _FILE_ID_RE.fullmatch(file_id) or not _SHA256_RE.fullmatch(expected):
-            continue
+            raise unavailable
         info = session_files.get_account_file(file_id, owner_user_id)
         if not info or info.get("sha256") != expected or not info.get("path"):
-            continue
-        size = int(info.get("size_bytes") or 0)
-        if total + size > MAX_LIBRARY_REF_BYTES or _sha256_path(Path(info["path"])) != expected:
-            continue
-        total += size
+            raise unavailable
+        try:
+            info["size_bytes"] = Path(info["path"]).stat().st_size
+        except OSError as exc:
+            raise unavailable from exc
+        # The transactional pin verifies actual bytes against this exact hash.
         inherited.append(_input_metadata(info, source="previous_turn"))
     return inherited
 
@@ -526,92 +541,97 @@ def admit_turn(*, request: dict, owner_user_id: int, session_id: str,
         raise _http(400, "服务端请求标识无效。")
     client_request_id = req["client_request_id"]
 
-    uploads = [_decode_upload(item) for item in req["attachments"]]
-    upload_bytes = sum(len(content) for _name, _mime, content, _sha in uploads)
-    if upload_bytes > MAX_UPLOAD_BYTES:
-        raise _http(413, "本轮附件总大小不能超过 20 MB")
-    # Preserve schema-1 identity: the previous implementation hashed only the
-    # resolved opaque ids, in their first-seen order, never the library metadata.
+    uploads = []
+    upload_bytes = 0
+    for item in req["attachments"]:
+        upload = _decode_upload(item, remaining=MAX_ATTACHMENT_BYTES - upload_bytes)
+        upload_bytes += len(upload[2])
+        uploads.append(upload)
     file_refs = list(dict.fromkeys(req["file_refs"]))
+    baseline = req["continue_from"]
     fingerprint = _request_fingerprint(
         session_id=session_id, query=req["query"], options=req["options"],
-        selected_skills=req["selected_skills"], uploads=uploads, file_refs=file_refs)
+        selected_skills=req["selected_skills"], uploads=uploads, file_refs=file_refs, continue_from=baseline)
+
+    scope = (owner_user_id, session_id, client_request_id)
+    def existing():
+        return chat_turn_queue.admission_receipt(owner_user_id=owner_user_id, session_id=session_id,
+                                                 client_request_id=client_request_id)
 
     # A receipt proves historical acceptance, not current file authorization.
-    # Look up the scoped receipt before reading any current library entry.
-    existing = _existing_turn(
-        owner_user_id=owner_user_id, session_id=session_id,
-        client_request_id=client_request_id)
-    if existing is not None:
-        return _replay_existing(existing, session_id=session_id, fingerprint=fingerprint)
+    if prior := existing():
+        return _replay_existing(prior, session_id=session_id, fingerprint=fingerprint)
+    try:
+        with _admission_lock(owner_user_id, client_request_id):
+            if prior := existing():
+                return _replay_existing(prior, session_id=session_id, fingerprint=fingerprint)
+            return _admit_new_turn(scope, req, baseline=baseline, uploads=uploads, upload_bytes=upload_bytes,
+                                   file_refs=file_refs, fingerprint=fingerprint, request_id=request_id,
+                                   account_epoch=account_epoch, limits=limits, enforce_rate=enforce_rate)
+    except _AdmissionBusy as exc:
+        raise _http(503, "消息正等待受理，请使用相同请求标识重试。", code="turn_admission_busy") from exc
 
+
+def _admit_new_turn(scope, req, *, baseline, uploads, upload_bytes, file_refs, fingerprint,
+                    request_id, account_epoch, limits, enforce_rate):
+    owner_user_id, session_id, client_request_id = scope
+    resource_id = turn_input_resource_id(session_id, client_request_id)
+    # Retry any unaccepted attempt first, even if the new request has no files.
+    staging.resolve(scope, resource_id, accepted=False)
+    inherited = _continued_inputs(owner_user_id, session_id, baseline) if baseline is not None else []
+    inherited_ids = {item["file_id"] for item in inherited}
+    refs = _resolve_library_refs([file_id for file_id in file_refs if file_id not in inherited_ids], owner_user_id)
+    inputs = inherited + [_input_metadata(info, source="library") for info in refs]
+    if len(uploads) + len(inputs) > MAX_FILES:
+        raise _http(413, "每轮最多上传或引用 8 个文件。")
+    attachment_bytes = upload_bytes + sum(item["size_bytes"] for item in inputs)
+    if attachment_bytes > MAX_ATTACHMENT_BYTES:
+        raise _http(413, "本轮附件总大小不能超过 20 MiB。")
     skill_pin = _pin_selected_skill_release(req["selected_skills"])
-    ref_infos = _resolve_library_refs(file_refs, owner_user_id)
-    ref_bytes = sum(int(info.get("size_bytes") or 0) for info in ref_infos)
-    if ref_bytes > MAX_LIBRARY_REF_BYTES:
-        raise _http(413, "引用资料总大小不能超过 20 MB。")
-
     if enforce_rate:
         _enforce_rate_limit(owner_user_id)
 
-    # Narrow the race before mutating pins: if another attempt admitted this
-    # owner-level id between the first lookup and here, replay it instead.
-    existing = _existing_turn(
-        owner_user_id=owner_user_id, session_id=session_id,
-        client_request_id=client_request_id)
-    if existing is not None:
-        return _replay_existing(existing, session_id=session_id, fingerprint=fingerprint)
-
-    staged_file_ids: list[str] = []
+    has_files = bool(uploads or inputs)
+    if has_files:
+        staging.begin(scope)
     try:
-        inputs: list[dict] = []
+        upload_inputs = []
         for name, mime, content, _sha in uploads:
-            info = _register_upload(
-                session_id=session_id, owner_user_id=owner_user_id,
-                name=name, mime=mime, content=content,
-                client_request_id=client_request_id)
-            staged_file_ids.append(str(info["file_id"]))
-            inputs.append(_input_metadata(info, source="upload"))
-        for info in ref_infos:
-            inputs.append(_input_metadata(info, source="library"))
-
-        if not inputs:
-            inputs = _inherited_inputs(owner_user_id, session_id)
-            ref_bytes = sum(item["size_bytes"] for item in inputs)
+            info = _register_upload(session_id=session_id, owner_user_id=owner_user_id,
+                name=name, mime=mime, content=content, client_request_id=client_request_id,
+                stage_turn_input=True)
+            upload_inputs.append(_input_metadata(info, source="upload"))
+        inputs = inherited + upload_inputs + inputs[len(inherited):]
         bounded_payload = {
-            "schema": PAYLOAD_SCHEMA,
-            "request_fingerprint": fingerprint,
-            "query": req["query"],
-            "options": req["options"],
-            "selected_skills": req["selected_skills"],
-            **skill_pin,
-            "inputs": inputs,
-            "attachment_bytes": upload_bytes + ref_bytes,
+            "schema": PAYLOAD_SCHEMA, "request_fingerprint": fingerprint, "query": req["query"],
+            "options": req["options"], "selected_skills": req["selected_skills"], **skill_pin,
+            "inputs": inputs, "attachment_bytes": attachment_bytes,
         }
-        resource_id = turn_input_resource_id(session_id, client_request_id)
-        all_file_ids = [item["file_id"] for item in inputs]
-        if all_file_ids:
-            # Pin BEFORE the queue row can be observed: a 202 therefore proves
-            # the ordered input set is readable and protected.
-            session_files.replace_resource_references(
-                owner_user_id, RESOURCE_KIND, resource_id, all_file_ids)
-
-        turn = chat_turn_queue.enqueue_turn(
-            owner_user_id=owner_user_id, session_id=session_id,
-            client_request_id=client_request_id,
-            bounded_payload=bounded_payload, request_id=request_id,
-            attachment_bytes=upload_bytes + ref_bytes,
-            account_epoch=account_epoch, limits=limits)
-        _ensure_turn_links(
-            owner_user_id, session_id, client_request_id, inputs)
-        turn["created"] = bool(turn.get("created"))
-        return turn
-    except BaseException:
-        _cleanup_failed_admission(
-            owner_user_id=owner_user_id, session_id=session_id,
-            client_request_id=client_request_id,
-            staged_file_ids=staged_file_ids)
+        if baseline is not None:
+            bounded_payload["continue_from"] = baseline
+        if has_files:
+            try:
+                staging.pin(scope, resource_id, inputs)
+            except ValueError as exc:
+                raise _http(409, "附件已失效或变更。", code="turn_input_unavailable") from exc
+        turn = chat_turn_queue.enqueue_turn(owner_user_id=owner_user_id, session_id=session_id,
+            client_request_id=client_request_id, bounded_payload=bounded_payload, request_id=request_id,
+            attachment_bytes=attachment_bytes, account_epoch=account_epoch, limits=limits)
+    except Exception:
+        if has_files:
+            try:
+                _resolve_stage(scope)
+            except Exception as exc:
+                logger.warning("staged turn input compensation deferred: %s", type(exc).__name__)
         raise
+    if has_files:
+        try:
+            staging.resolve(scope, resource_id, accepted=True)
+        except Exception as exc:
+            # Committed receipt and pins are already complete. Restart repair
+            # forgets the stage without ever unpinning this accepted turn.
+            logger.warning("staged turn input handoff deferred: %s", type(exc).__name__)
+    return turn
 
 
 def _enforce_rate_limit(owner_user_id: int) -> None:
@@ -700,9 +720,9 @@ def load_dispatch_input(turn: dict) -> tuple[dict, list[dict]]:
         file_id = str(item.get("file_id") or "")
         expected = str(item.get("sha256") or "")
         info = session_files.get_account_file(file_id, owner_user_id)
-        inherited = item.get("source") == "previous_turn"
+        legacy_implicit = item.get("source") == "previous_turn" and "continue_from" not in payload
         if not info:
-            if inherited:
+            if legacy_implicit:
                 continue
             raise chat_turn_queue.TurnReconcileRequired(
                 "dispatch_input_missing", job_id=turn.get("job_id"))
@@ -710,7 +730,7 @@ def load_dispatch_input(turn: dict) -> tuple[dict, list[dict]]:
         actual = _sha256_path(Path(path)) if path else None
         if (actual is None or actual != expected
                 or str(info.get("sha256")) != expected):
-            if inherited:
+            if legacy_implicit:
                 continue
             raise chat_turn_queue.TurnReconcileRequired(
                 "dispatch_input_checksum_changed", job_id=turn.get("job_id"))

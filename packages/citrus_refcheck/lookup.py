@@ -31,7 +31,7 @@ def evidence_cache_key(claims, limits):
     """Key actual provider queries, rather than unrelated submitted claims."""
     doi = p.normalize_doi(claims.get('doi'))
     title = str(claims.get('title') or claims.get('query') or '').strip()
-    arxiv = str(claims.get('arxiv_id') or '')
+    arxiv = p.normalize_arxiv_id(claims.get('arxiv_id'))
     queries = []
     for name in limits.providers:
         if name == 'arXiv':
@@ -41,10 +41,13 @@ def evidence_cache_key(claims, limits):
         else:
             query = ['doi', doi] if doi else ['title', title]
         queries.append([name, query])
+        if name == 'DataCite' and arxiv and doi != p.normalize_doi(f'10.48550/arxiv.{arxiv}'):
+            if doi:
+                queries.append(['DataCite:arxiv', ['arxiv', arxiv]])
     transport = limits.transport
     identity = [type(transport).__module__, type(transport).__qualname__,
                 getattr(transport, 'cache_namespace', ''), limits.cache_namespace]
-    return hashlib.sha256(json.dumps(['evidence/2', queries, identity, limits.authorized],
+    return hashlib.sha256(json.dumps(['evidence/3', queries, identity, limits.authorized],
                                     sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -178,7 +181,7 @@ def lookup_evidence(claims, limits: LookupLimits):
         raise TypeError('Explicit LookupLimits required')
     doi=p.normalize_doi(claims.get('doi'))
     title=str(claims.get('title') or claims.get('query') or '').strip()
-    arxiv=str(claims.get('arxiv_id') or '')
+    arxiv=p.normalize_arxiv_id(claims.get('arxiv_id'))
     routes={
         'Crossref':lambda:p._crossref_work(doi) if doi else p._crossref_search(title),
         'DataCite':lambda:p._datacite_work(doi) if doi else p._datacite_arxiv(arxiv),
@@ -189,11 +192,16 @@ def lookup_evidence(claims, limits: LookupLimits):
         'Semantic Scholar':lambda:p._s2_doi(doi) if doi else p._s2_search(title),
     }
     records,states,errors,evidence=[],{},{},[]
+    applicable = {name: (doi or title) for name in routes}
+    applicable.update({'DataCite': doi or arxiv, 'arXiv': arxiv or title})
+    names = list(limits.providers)
+    if 'DataCite' in names and arxiv and doi and doi != p.normalize_doi(f'10.48550/arxiv.{arxiv}'):
+        routes['DataCite:arxiv'] = lambda: p._datacite_arxiv(arxiv)
+        applicable['DataCite:arxiv'] = True
+        names.insert(names.index('DataCite') + 1, 'DataCite:arxiv')
     with p.using_transport(_ControlledTransport(limits,evidence)):
-        for name in limits.providers:
-            applicable = ((doi or arxiv) if name == 'DataCite' else
-                          (arxiv or title) if name == 'arXiv' else (doi or title))
-            if name not in routes or not applicable:
+        for name in names:
+            if name not in routes or not applicable[name]:
                 states[name]='skipped'
                 continue
             if not getattr(limits.transport,'offline',False) and not limits.authorized:

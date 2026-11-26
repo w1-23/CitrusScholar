@@ -1,12 +1,11 @@
 """Operator TXT turn logs: real 12-char root ids, turn scoping, never fatal."""
 import asyncio
-import time
 import uuid
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src import config, logger as citrus_logger
+from src import auth, config, logger as citrus_logger
 from src.core import chat_turn_queue as queue
 from src.core import jobs
 from src.core import turn_logs
@@ -28,6 +27,11 @@ def log_env(tmp_path, monkeypatch):
     sessions = manager.SessionManager()
     monkeypatch.setattr(manager, "session_manager", sessions)
     queue.ensure_schema()
+    monkeypatch.setattr(auth, "DB_PATH", state / "accounts.sqlite3")
+    auth.init_store()
+    with auth._connect() as conn:
+        conn.execute("INSERT INTO users(user_id,username,salt,password_hash,created_at) "
+                     "VALUES(7,'fixture',X'00',X'00','fixture')")
     return {"root": tmp_path, "logs": logs, "sessions": sessions}
 
 
@@ -84,35 +88,38 @@ def test_12_char_root_job_writes_one_log(log_env):
     files = list((log_env["logs"] / "turns").rglob(f"{job_id}.txt"))
     assert len(files) == 1
     body = files[0].read_text(encoding="utf-8")
-    assert "十二位日志" in body
-    assert "本轮对话" in body
+    assert "十二位日志" not in body and "回答" not in body
+    assert "metadata only" in body and job_id in body
 
 
-def test_log_contains_only_this_turn(log_env):
+def test_backfill_writes_missing_terminal_only_idempotently(log_env):
     sid = "s-scope"
-    a = queue.enqueue_turn(owner_user_id=7, session_id=sid,
-                           client_request_id="req-a", bounded_payload={"query": "A问题"})
-    b = queue.enqueue_turn(owner_user_id=7, session_id=sid,
-                           client_request_id="req-b", bounded_payload={"query": "B问题"})
-    _save_turn(log_env, sid, "req-a", "A问题唯一正文", "A回答唯一正文")
-    _save_turn(log_env, sid, "req-b", "B问题唯一正文", "B回答唯一正文")
-    turn_logs.write_turn_log({
-        "owner_user_id": 7, "session_id": sid, "root_job_id": a["root_job_id"],
-        "client_request_id": "req-a", "finished_at": time.time(),
-        "history_saved": True, "clear_reason": "done",
-    })
-    files = list((log_env["logs"] / "turns").rglob(f"{a['root_job_id']}.txt"))
-    assert len(files) == 1
-    body = files[0].read_text(encoding="utf-8")
-    assert "A问题唯一正文" in body and "A回答唯一正文" in body
-    assert "B问题唯一正文" not in body and "B回答唯一正文" not in body
+    a = _drive_terminal(sid=sid)
+    b = queue.enqueue_turn(owner_user_id=7, session_id=sid, client_request_id="req-b",
+                           bounded_payload={"query": "private B"})
+    _save_turn(log_env, sid, a["client_request_id"], "private A question", "private A answer")
+    target = next((log_env["logs"] / "turns").rglob(f"{a['root_job_id']}.txt"))
+    target.unlink()
+    assert turn_logs.backfill_terminal_turn_logs(limit=1) == 1
+    assert turn_logs.backfill_terminal_turn_logs(limit=1) == 0
+    assert turn_logs.backfill_terminal_turn_logs(limit=1) == 0
+    existing = target.read_bytes()
+    assert b"private A" not in existing
+    assert not list((log_env["logs"] / "turns").rglob(f"{b['root_job_id']}.txt"))
+    assert not turn_logs.write_turn_log(a)
+    assert target.read_bytes() == existing
+    from src.core.account_admission import current_store
+    assert current_store().close_admission(7)
+    target.unlink()
+    assert not turn_logs.write_turn_log(a)
+    assert not target.exists()
 
 
 def test_log_rejects_traversal_and_bad_ids(log_env):
     for bad in ("../../escape", "ABCDEF123456", "short"):
         turn_logs.write_turn_log({
             "owner_user_id": 7, "session_id": "s", "root_job_id": bad,
-            "client_request_id": "req", "finished_at": time.time(),
+            "client_request_id": "req", "finished_at": 1,
             "history_saved": True, "clear_reason": "done",
         })
     assert list((log_env["logs"] / "turns").rglob("*.txt")) == []

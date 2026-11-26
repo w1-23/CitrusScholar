@@ -1,4 +1,13 @@
 {
+  "adapter_revisions": {
+    "patch_sha256": "b244afdb7074831e84db371fce4b1475aac45acbca32c2b4ec98a61a82c455ae",
+    "staged_sha256": {
+      "data-audit/manifest.json": "0184427e92dfa06a3da5d925499b2a0ca34da7aa301415cab24223e03367fe17",
+      "data-audit/scripts/adapter.py": "c6deb65d0eb12665c0596b30a828a26895a58b34f9bc02ac8e50a369b1805924",
+      "literature-verification/manifest.json": "90f197916e5598510f19187e0a353964d17d62e74a1e70e4702c7ffbf6294e16",
+      "literature-verification/scripts/adapter.py": "f7f8cdb08aad220d3ed22b0cca36e244651b57ec58c5a6807a055927489a70b3"
+    }
+  },
   "eda_license": {
     "path": "LICENSE.md",
     "sha256": "09b02a3c9df3053c55531d503357a9c7cde275970e6c3ceaa1ddf5f0e90b40c1",

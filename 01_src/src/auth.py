@@ -439,6 +439,17 @@ def user_for_token(token: str) -> dict[str, Any] | None:
     return _public_user(row) if row else None
 
 
+def user_for_token_readonly(token: str) -> dict[str, Any] | None:
+    """Check the same session and account guards without opening a writer."""
+    if not token:
+        return None
+    uri = DB_PATH.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = _session_user(conn, token)
+    return _public_user(row) if row else None
+
+
 def retain_deletion_retry(token: str, user_id: int) -> None:
     """Keep this verified browser token valid only for retrying account deletion."""
     if not token:
@@ -950,6 +961,13 @@ def _delete_user_account(user_id: int, *, raise_if_busy: bool, claim) -> bool:
                 if "sessions" in _tables(conn):
                     session_ids = [str(row[0]) for row in conn.execute(
                         "SELECT session_id FROM sessions WHERE owner_user_id=?", (int(user_id),))]
+
+        # Retain the exact owner/root/date evidence until diagnostics cleanup
+        # succeeds. Every hook is idempotent under closed admission.
+        from src.admin_audit import purge_owner as purge_request_audit
+        from src.core.turn_logs import purge_owner as purge_turn_logs
+        purge_request_audit(int(user_id), claim=claim)
+        purge_turn_logs(int(user_id), claim=claim, sessions_db=sessions_db)
 
         from src.code_execution.logs import purge_owner as purge_execution_logs
         purge_execution_logs(int(user_id), claim=claim)

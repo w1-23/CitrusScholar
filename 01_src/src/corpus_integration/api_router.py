@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from src.auth import require_admin
 
-from .settings import legacy_enabled
+from .settings import durable_intake_enabled, legacy_enabled
 
 router = APIRouter(prefix="/api/v2/isolated-corpus/admin", tags=["isolated-corpus"])
 _PRIVATE = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
@@ -77,3 +77,53 @@ def job_status(job_id: str, request: Request):
     except (sqlite3.Error, OSError) as exc:
         raise HTTPException(503, {"code": "corpus_intake_unavailable"}) from exc
     return JSONResponse(job, headers=_PRIVATE)
+
+
+class PublicPaperRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    doi: str = Field(default="", max_length=512)
+    pmid: str = Field(default="", max_length=16)
+    pmcid: str = Field(default="", max_length=19)
+    public_title: str = Field(default="", max_length=512)
+    title_is_public: bool = Field(default=False, strict=True)
+
+
+@router.post("/public-paper")
+def submit_public_paper(body: PublicPaperRequest, request: Request):
+    from citrus_corpus.auto_intake import AutoIntake
+    from src.core.capability_policy import allows
+    from .automatic_worker import account_epoch
+    from .paper_source import public_identifiers
+
+    actor = _authorized(request)
+    if not durable_intake_enabled():
+        raise HTTPException(409, {"code": "corpus_automatic_disabled"})
+    if not (allows("web_fetch") and allows("bibliographic_lookup")):
+        raise HTTPException(403, "联网入库未获授权。")
+    owner = int(actor[8:])
+    epoch = account_epoch(owner, admin=True)
+    if epoch is None:
+        raise HTTPException(403, "管理员权限不足。")
+    try:
+        doi, pmid, pmcid = public_identifiers(body.doi, body.pmid, body.pmcid)
+        if bool(body.public_title) != body.title_is_public or (body.public_title and (doi or pmid or pmcid)):
+            raise ValueError("publication_title_attestation_required")
+        job = AutoIntake(_intake().store).submit(owner=owner, epoch=epoch, producer="admin", doi=doi, pmid=pmid,
+                                                pmcid=pmcid, title=body.public_title)
+    except (sqlite3.Error, OSError) as exc:
+        raise HTTPException(503, {"code": "corpus_intake_unavailable"}) from exc
+    except ValueError as exc:
+        code = str(exc)
+        raise HTTPException(409 if code == "corpus_queue_full" else 422,
+                            {"code": code if code.isidentifier() else "corpus_intake_invalid"}) from exc
+    return JSONResponse({"accepted": True, "job": job}, status_code=202, headers=_PRIVATE)
+
+
+@router.get("/intake")
+def recent_intake(request: Request):
+    _authorized(request)
+    try:
+        jobs = _intake().queue.recent()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        raise HTTPException(503, {"code": "corpus_intake_unavailable"}) from exc
+    return JSONResponse({"jobs": jobs, "automatic_enabled": durable_intake_enabled()}, headers=_PRIVATE)

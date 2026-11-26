@@ -1,9 +1,11 @@
 """
 Structured retrieval logger for traceability and manual review.
-Writes query + reranked chunks to timestamped log files.
+Writes allowlisted retrieval metrics to timestamped log files.
 """
 import logging
 import os
+import re
+import unicodedata
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from datetime import datetime
@@ -34,16 +36,30 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
-class MaskingFormatter(logging.Formatter):
-    """v8.4.6 B6: 日志脱敏（PII 正则过滤）——输出到文件/控制台前统一掩码。"""
+_SECRET = re.compile(
+    r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"
+    r"|\b(?:bearer|basic)\s+[\w./+=~-]+|\b(?:sk-|ghp_|github_pat_)[\w-]{8,}"
+    r"|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|cookie|authorization|token)"
+    r"[\"']?\s*[=:]\s*(?:(?:bearer|basic)\s+[^\s,;]+|\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"|[\w.+-]+://[^\s/@:]+:[^\s/@]+@"
+)
 
+
+def redact_log_text(text: str, *, single_line: bool = True) -> str:
+    """Remove credentials and neutralize control characters in a log sink."""
+    from src.core.pii_mask import mask_sensitive
+
+    # Obfuscating format controls must not defeat credential recognition.
+    safe = "".join(ch for ch in text if unicodedata.category(ch) not in {"Cf", "Cs"})
+    safe = mask_sensitive(_SECRET.sub("[REDACTED]", safe))
+    keep = "" if single_line else "\n\t"
+    return "".join(" " if ch not in keep and unicodedata.category(ch) in {"Cc", "Zl", "Zp"}
+                   else ch for ch in safe)
+
+
+class MaskingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        s = super().format(record)
-        try:
-            from src.core.pii_mask import mask_sensitive
-            return mask_sensitive(s)
-        except Exception:
-            return s
+        return redact_log_text(super().format(record))
 
 
 def setup_logging():
@@ -69,7 +85,7 @@ def setup_logging():
     # Console handler: WARNING+ only
     console = logging.StreamHandler()
     console.setLevel(logging.WARNING)
-    console.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+    console.setFormatter(MaskingFormatter("%(levelname)s | %(message)s"))
 
     rid_filter = RequestIdFilter()
     file_handler.addFilter(rid_filter)
@@ -88,83 +104,38 @@ def setup_logging():
 
 
 class RetrievalLogger:
-    """检索日志（v8.7 合并重构）——统一记录检索过滤全过程。
+    """Record sizes and numeric settings, never query or retrieved content."""
 
-    原 retrieval/（只记通过结果）与 debug_filter/（过滤明细但 filtered 恒空）
-    两个文件功能重叠且都不完整，合并为单个 logs/retrieval/retrieval_YYYY-MM-DD.log：
-    query / 模式 / 候选数 / 动态阈值 / 通过·被过滤明细 / 耗时 / 预算·去重拦截。
-    日志目录跟随 CITRUS_LOG_DIR 覆盖（测试独立 sink）。
-    """
+    _METRICS = {"candidate_budget", "chunk_budget", "token_budget", "dedup_dropped",
+                "dense_candidates", "bm25_candidates", "rrf_candidates", "translation_used",
+                "reranker_fallback", "fetch_elapsed_ms"}
 
     def __init__(self):
         self._log_dir = _log_dir() / "retrieval"
-        self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    def _log_path(self) -> Path:
-        return self._log_dir / f"retrieval_{datetime.now().strftime('%Y-%m-%d')}.log"
-
-    def log_retrieval(
-        self,
-        query: str,
-        reranked: List[Dict],
-        threshold: float,
-        passed: List[Dict],
-        filtered: List[Dict],
-        elapsed: Optional[float] = None,
-        extra: Optional[Dict] = None,
-    ):
-        """Append a complete retrieval-filter record to today's log file.
-
-        reranked: 重排序候选全集；passed: 过阈值保留；filtered: 被动态阈值拦截。
-        """
+    def log_retrieval(self, query: str, reranked: List[Dict], threshold: float,
+                      passed: List[Dict], filtered: List[Dict],
+                      elapsed: Optional[float] = None, extra: Optional[Dict] = None):
         now = datetime.now()
-        lines = []
-        lines.append(f"[{now.isoformat()}] QUERY: {query}")
-        head = (f"  candidates={len(reranked)} | threshold={threshold:.4f} "
-                f"| passed={len(passed)} | filtered={len(filtered)}")
+        fields = [f"[{now.isoformat()}] retrieval", f"query_chars={len(query)}",
+                  f"candidates={len(reranked)}", f"threshold={threshold:.4f}",
+                  f"passed={len(passed)}", f"filtered={len(filtered)}"]
         if elapsed is not None:
-            head += f" | elapsed={elapsed:.2f}s"
-        for k, v in (extra or {}).items():
-            head += f" | {k}={v}"
-        lines.append(head)
-        lines.append(f"  {'─' * 80}")
-
-        if passed:
-            lines.append("  ✅ PASSED:")
-            for i, r in enumerate(passed, 1):
-                lines.append(self._fmt_chunk(i, r))
-        if filtered:
-            lines.append("  ❌ FILTERED (dynamic threshold):")
-            for i, r in enumerate(filtered, 1):
-                lines.append(self._fmt_chunk(i, r))
-        if not passed and not filtered:
-            lines.append("  (no candidates)")
-        lines.append("")
-
-        with open(self._log_path(), "a", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-
-    @staticmethod
-    def _fmt_chunk(i: int, r: dict) -> str:
-        paper_id = r.get("paper_id", "N/A")
-        doi = r.get("doi", "N/A")
-        section = r.get("section_name", "N/A")
-        batch = r.get("_batch", "N/A")
-        score = r.get("rerank_score", 0)
-        text = str(r.get("text", "") or "").replace("\n", " ").strip()
-        head = f"    [{i:2d}] CE={score:.4f} | {paper_id} | {section} | batch={batch} | DOI: {doi}"
-        if text:
-            head += f"\n        Text: {text[:160]}{'...' if len(text) > 160 else ''}"
-        return head
-
-
-_search_logger = RetrievalLogger()
+            fields.append(f"elapsed={elapsed:.2f}s")
+        for key, value in (extra or {}).items():
+            if key in self._METRICS and type(value) in {int, float, bool} and -2**53 < value < 2**53:
+                fields.append(f"{key}={value}")
+        path = self._log_dir / f"retrieval_{now:%Y-%m-%d}.log"
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                               0o600), "a", encoding="utf-8") as handle:
+            handle.write(" | ".join(fields) + "\n")
 
 
 def log_retrieval(query: str, reranked: List[Dict], threshold: float,
                   passed: List[Dict], filtered: List[Dict],
-                  elapsed: Optional[float] = None,
-                  extra: Optional[Dict] = None):
-    """Module-level convenience function (v8.7 统一检索过滤日志入口)."""
-    _search_logger.log_retrieval(query, reranked, threshold, passed, filtered,
-                                 elapsed=elapsed, extra=extra)
+                  elapsed: Optional[float] = None, extra: Optional[Dict] = None):
+    try:
+        RetrievalLogger().log_retrieval(query, reranked, threshold, passed, filtered, elapsed, extra)
+    except (OSError, ValueError, TypeError) as error:
+        logger.warning("retrieval_log_failed kind=%s", type(error).__name__)

@@ -120,14 +120,40 @@ def _adapt_worker_sandbox(raw: bytes, pin: dict) -> bytes:
     return _checked(raw.replace(original, replacement), pin["staged_sha256"], "staged sandbox.py")
 
 
-def _stage_analysis_sources(handoff: Path, upstreams: Path, lock: dict, bundle: Path) -> dict:
+_ADAPTER_PATCH = "02_config/skill-fusion-adapters.patch.json"
+_ADAPTER_PATCH_MEMBERS = frozenset(f"{name}/{item}" for name in ("data-audit", "literature-verification")
+                                 for item in ("scripts/adapter.py", "manifest.json"))
+
+
+def _adapter_revisions(repo: Path, handoff: Path, lock: dict) -> dict[str, bytes]:
+    """Stage only the reviewed derivation from the exact verified handoff."""
+    pin = lock["adapter_revisions"]
+    patch = json.loads(_checked(_read_member(repo, _ADAPTER_PATCH, 65_536),
+                                pin["patch_sha256"], _ADAPTER_PATCH))
+    if patch.keys() != _ADAPTER_PATCH_MEMBERS or pin["staged_sha256"].keys() != _ADAPTER_PATCH_MEMBERS:
+        raise ValueError("invalid_fusion_adapter_patch_members")
+    updated = {}
+    for path, hunks in patch.items():
+        source = _checked(_read_member(handoff, path), lock["handoff_files"][path], path).decode()
+        for old, new in hunks:
+            if not old or source.count(old) != 1:
+                raise ValueError(f"fusion_adapter_patch_context_mismatch: {path}")
+            source = source.replace(old, new, 1)
+        updated[path] = _checked(source.encode(), pin["staged_sha256"][path], f"staged {path}")
+    return updated
+
+
+def _stage_analysis_sources(repo: Path, handoff: Path, upstreams: Path, lock: dict, bundle: Path) -> dict:
     members = {}
     sandbox_pin = lock["sandbox_compatibility"]
+    revisions = _adapter_revisions(repo, handoff, lock)
     for name, digest in lock["handoff_files"].items():
         dest = f"03_skill_fusion/{name}"
         if name == sandbox_pin["path"]:
             original = _checked(_read_member(handoff, name), digest, name)
             members[dest] = _write(bundle, dest, _adapt_worker_sandbox(original, sandbox_pin))
+        elif name in revisions:
+            members[dest] = _write(bundle, dest, revisions[name])
         else:
             members[dest] = _locked_copy(handoff, name, digest, bundle, dest)
     metadata = "03_skill_fusion/sandbox-compatibility.json"
@@ -159,7 +185,7 @@ def _stage_analysis_sources(handoff: Path, upstreams: Path, lock: dict, bundle: 
 def _stage_analysis(repo: Path, handoff: Path, upstreams: Path, release: Path,
                     names: set[str], lock: dict, selected: dict, approvals: dict) -> None:
     bundle = release / "fusion"
-    files = _stage_analysis_sources(handoff, upstreams, lock, bundle)
+    files = _stage_analysis_sources(repo, handoff, upstreams, lock, bundle)
     versions = {}
     for name in sorted(names):
         manifest = json.loads(_read_member(bundle, f"03_skill_fusion/{name}/manifest.json"))

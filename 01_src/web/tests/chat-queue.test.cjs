@@ -469,19 +469,20 @@ test('answer UI renders API-marked final chunks, honors reset, and accepts a ter
   await b.runTimers();
   assert.equal(answer.textContent, '');
   store.receive('answer_start', {});
-  store.receive('text', {content: 'private', visibility: 'internal'});
-  store.receive('text', {content: 'First '});
+  store.receive('text', {content: 'private', visibility: 'internal', delivery: 'committed'});
+  store.receive('text', {content: 'uncommitted draft'});
+  store.receive('text', {content: 'First ', delivery: 'committed'});
   await b.runTimers();
   assert.equal(answer.textContent, 'First ');
-  store.receive('text', {content: 'second'});
+  store.receive('text', {content: 'second', delivery: 'committed'});
   await b.runTimers();
   assert.equal(answer.textContent, 'First second');
   store.receive('text_reset', {});
   assert.equal(answer.textContent, '');
-  store.receive('text', {content: 'stale chunk'});
+  store.receive('text', {content: 'stale chunk', delivery: 'committed'});
   store.receive('done', {answer: 'Server final', turn_envelope: {display_status: 'completed'}});
   store.receive('answer_start', {});
-  store.receive('text', {content: 'late chunk'});
+  store.receive('text', {content: 'late chunk', delivery: 'committed'});
   await b.runTimers();
   assert.equal(answer.style.display, '');
   assert.equal(answer.textContent, 'Server final');
@@ -501,7 +502,7 @@ test('only API-designated citations render as answer bubbles and never as duplic
   store.receive('citations', {candidates: [{...web, title: '候选不展示'}]});
   assert.equal(bot.querySelector('.turn-citation-bubbles'), null);
   store.receive('answer_start', {});
-  store.receive('text', {content: '引用 [文献](https://example.org/cited#page) [本地：原文](/api/v2/corpus/source/paper-1) 以及 [其他链接](https://example.org/other)。'});
+  store.receive('text', {content: '引用 [文献](https://example.org/cited#page) [本地：原文](/api/v2/corpus/source/paper-1) 以及 [其他链接](https://example.org/other)。', delivery: 'committed'});
   await b.runTimers();
   store.receive('citations', {display: 'bubble_only', bubbles: [web, local, {...web, url: web.url + '#page'}, local,
     {kind: 'web', url: 'javascript:alert(1)', title: '无效链接'}]});

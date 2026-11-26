@@ -1,20 +1,22 @@
 """Automatic admission is a private consequence of exact first-party evidence."""
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from contextlib import contextmanager
 from hashlib import md5, sha256
 from io import BytesIO
 import json
-from queue import Queue
-import threading
+import sqlite3
 
 import pytest
 from urllib3.exceptions import ProtocolError
 
+from citrus_corpus import originals
 from citrus_corpus.auto_intake import AutoIntake
+from citrus_corpus.intake import Intake
+from citrus_corpus.queue import IntakeQueue, JOB_TTL, LEASE_SECONDS
 from citrus_corpus.store import Store
 from src import auth
 from src.core import capability_policy as policy, tracing, web_failure_ledger
-from src.corpus_integration import fetch_submit, paper_source as source
+from src.corpus_integration import automatic_worker, fetch_submit, paper_source as source
 from src.tools import deepseek_search_fetch as fetch
 
 DOI = "10.1371/journal.pone.0154431"
@@ -71,12 +73,17 @@ def _mock_http(monkeypatch, *, article=None, license_patch=None, original=RAW, d
 @pytest.fixture
 def app_queue(tmp_path, monkeypatch):
     store = Store.initialize(tmp_path / "isolated")
+    db = tmp_path / "accounts.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE users(user_id INTEGER, active INTEGER, approval_status TEXT, role TEXT)")
+        conn.execute("INSERT INTO users VALUES(7,1,'approved','regular')")
+        from src.core.account_admission import init_schema
+        init_schema(conn)
+    monkeypatch.setattr(auth, "DB_PATH", db)
     monkeypatch.setenv("CITRUS_CORPUS_MODE", "isolated")
     monkeypatch.setenv("CITRUS_CORPUS_FETCH_GROWTH", "1")
+    monkeypatch.setenv("CITRUS_CORPUS_DURABLE_INTAKE", "1")
     monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_ROOT", str(store.root))
-    monkeypatch.setattr(fetch_submit, "_ensure_consumer", lambda: True)
-    monkeypatch.setattr(fetch_submit, "_pending", Queue(maxsize=1))
-    monkeypatch.setattr(auth, "user_by_id", lambda uid: {"user_id": uid, "active": True, "approval_status": "approved"})
     monkeypatch.setattr(fetch, "_public_http_url_error", lambda url: None)
     monkeypatch.setattr(fetch, "_web_citation_ref", lambda: "W1")
     monkeypatch.setattr(web_failure_ledger, "record_fetch_failures", lambda *args, **kwargs: None)
@@ -91,58 +98,157 @@ def app_queue(tmp_path, monkeypatch):
         tracing._user_id.reset(user_token)
 
 
-def _worker_receipt():
-    queued = fetch_submit._pending.get_nowait()
-    context, *job = queued
-    assert threading.current_thread() is threading.main_thread()
-    with ThreadPoolExecutor(max_workers=1) as worker:
-        return worker.submit(context.run, fetch_submit._persist, *job).result(timeout=5)
+def _consume(store):
+    # A fresh consumer has no request owner or request-level opt-in. Its
+    # persisted principal and current system policy are what matter.
+    token = tracing._user_id.set(None)
+    web_token = tracing._web_search_enabled.set(False)
+    try:
+        reopened = Store(store.root)
+        return Intake(reopened).process_one(
+            automatic=automatic_worker.AutomaticWorker(reopened.root, network_allowed=lambda: True))
+    finally:
+        tracing._web_search_enabled.reset(web_token)
+        tracing._user_id.reset(token)
 
 
-def _winner(*args):
-    row = {"ok": True, "url": "https://publisher.example/paper", "content": "An unrelated body.",
-           "license": "CC0", "title": "Untrusted model title", "format": "publisher_html", "validity": "valid"}
-    args[-1].append(row)
-    return row
+def _official(*, metadata=LICENSE, raw=RAW):
+    return ({"url": source._CLOUD + TEXT, "raw_bytes": raw, "metadata_raw": json.dumps(metadata).encode()},
+            "cc-by", source._CLOUD + "/metadata/" + MEMBER + ".json")
 
 
-def test_dedicated_fetch_paper_registers_only_exact_original(app_queue, monkeypatch):
+def test_dedicated_foreground_reuses_exact_original_and_checks_article(app_queue, monkeypatch):
     calls = _mock_http(monkeypatch)
-    monkeypatch.setattr(fetch, "_race_candidates", _winner)
-    rendered, result = fetch.deepseek_fetch_paper.func(doi=DOI, pmid=PMID, title="Wrong title")
+
+    async def winner(*args):
+        official = _official()
+        row = {"ok": True, "url": source._CLOUD + TEXT, "content": RAW.decode(), "title": TITLE,
+               "format": "pmc_cloud_text", "validity": "valid"}
+        args[-1].append(row)
+        return row, official
+
+    monkeypatch.setattr(fetch, "_race_candidates", winner)
+    rendered, result = asyncio.run(fetch.deepseek_fetch_paper.coroutine(doi=DOI, pmid=PMID))
     assert result["fetch_status"] == "full_text" and result["review_candidate"] is None
-    assert "An unrelated body." in rendered and "Literature review candidate" not in rendered
-    assert not calls and not list(app_queue.originals.iterdir())
-    receipt = _worker_receipt()
+    assert "Original UTF-8 text" in rendered and "raw_bytes" not in str(result)
+    assert calls == []
+    before, = IntakeQueue(app_queue).recent()
+    assert before["state"] == "queued" and before["path"] == "foreground"
     digest = sha256(RAW).hexdigest()
-    assert receipt["state"] == "queued"
-    with app_queue.read() as conn:
-        assert conn.execute("SELECT expected_sha256 FROM intake WHERE id=?", (receipt["id"],)).fetchone()[0] == digest
-    assert len(calls) == 4 and receipt["title"] == TITLE
-    from citrus_corpus import originals
     assert originals.read_archive(app_queue.originals, digest) == RAW
+    receipt = _consume(app_queue)
+    assert receipt["state"] == "prepared" and receipt["raw_sha256"] == digest
+    assert calls == [source._NCBI + "esummary.fcgi"]
     assert AutoIntake(app_queue).lookup(doi=DOI)["source_url"] == f"https://doi.org/{DOI}"
 
+    # A disconnected background request still finds current metadata, but the
+    # same official version/hash does not redownload, re-extract or regrant.
+    calls.clear()
+    background = fetch_submit.submit(owner=7, doi=DOI, pmid=PMID)
+    assert background["path"] == "background"
+    monkeypatch.setattr("citrus_corpus.intake.extract_markdown",
+                        lambda *args: pytest.fail("duplicate must not be extracted"))
+    duplicate = _consume(app_queue)
+    assert duplicate["version_id"] == receipt["version_id"]
+    assert not any(url.endswith(".txt") for url in calls)
+    with app_queue.read() as conn:
+        assert conn.execute("SELECT count(*) FROM versions").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM rights_events").fetchone()[0] == 1
 
-def test_no_winner_can_register_exact_link_without_trusting_provider(app_queue, monkeypatch):
+
+def test_no_winner_durably_records_background_even_without_rights(app_queue, monkeypatch):
     calls = _mock_http(monkeypatch, license_patch={"license_code": "https://evil.example/cc-by"})
 
-    def failed(*args):
+    async def failed(*args):
         args[-1].append({"ok": True, "format": "identifier_metadata", "url": "https://provider.example",
                          "content": '{"resultList":{"result":[{"doi":"invented"}]}}'})
+        return None, None
 
     monkeypatch.setattr(fetch, "_race_candidates", failed)
-    rendered, result = fetch.deepseek_fetch_paper.func(doi=DOI, pmid=PMID)
+    rendered, result = asyncio.run(fetch.deepseek_fetch_paper.coroutine(doi=DOI, pmid=PMID))
     assert result["fetch_status"] == "failed" and result["review_candidate"] is None
-    assert "Literature review candidate" not in rendered and not calls
-    receipt = _worker_receipt()
-    assert receipt["state"] == "metadata_only" and receipt["title"] == TITLE
+    assert "Literature review candidate" not in rendered and calls == []
+    queued, = IntakeQueue(app_queue).recent()
+    assert queued["state"] == "queued" and queued["path"] == "background"
+    receipt = _consume(app_queue)
+    assert receipt["state"] == "metadata_only" and receipt["id"] == queued["id"]
     assert not any(url.endswith(".txt") for url in calls)
     assert not list(app_queue.originals.iterdir())
-    with app_queue.read() as conn:
-        assert conn.execute("SELECT count(*) FROM intake").fetchone()[0] == 0
+    assert AutoIntake(app_queue).lookup(doi=DOI)["title"] == TITLE
 
 
+def test_background_fills_original_without_chat_or_foreground_proof(app_queue, monkeypatch):
+    calls = _mock_http(monkeypatch)
+    before = fetch_submit.submit(owner=7, doi=DOI, pmid=PMID, proof={"content": "generated"})
+    assert before["path"] == "background" and not calls
+    completed = _consume(app_queue)
+    assert completed["state"] == "prepared" and completed["id"] == before["id"]
+    assert calls.count(source._CLOUD + TEXT) == 1
+    assert originals.read_archive(app_queue.originals, sha256(RAW).hexdigest()) == RAW
+
+
+def test_background_then_foreground_never_reencodes_or_republishes(app_queue, monkeypatch):
+    from citrus_corpus.models import FusedRank
+    from citrus_corpus.publication import Publisher
+    from citrus_corpus.tests.corpus_test import FixtureEmbedder
+
+    calls = _mock_http(monkeypatch)
+    fetch_submit.submit(owner=7, doi=DOI, pmid=PMID)
+    background = _consume(app_queue)
+    publisher = Publisher(app_queue, embedder=FixtureEmbedder(), reranker=FusedRank())
+    active = publisher.publish()["generation"]
+    assert IntakeQueue(app_queue).recent()[0]["published"]
+    monkeypatch.setattr(publisher, "_build", lambda *_: pytest.fail("duplicate generation rebuild"))
+    proof = source.verified_original(*_official(), doi=DOI, pmid=PMID)
+    admitted = fetch_submit.submit(owner=7, doi=DOI, pmid=PMID, proof=proof)
+    assert admitted["path"] == "foreground"
+    foreground = _consume(app_queue)
+    assert foreground["version_id"] == background["version_id"]
+    assert publisher.publish() == {"state": "active", "generation": active}
+    assert calls.count(source._CLOUD + TEXT) == 1
+    assert all(job["published"] for job in IntakeQueue(app_queue).recent())
+    Intake(app_queue).catalog.decide(background["document_id"], background["version_id"], decision="revoked",
+                                   actor="operator", reason="fixture revocation")
+    assert all(job["rights"] == "revoked" and not job["published"] for job in IntakeQueue(app_queue).recent())
+
+
+@pytest.mark.parametrize("mutation", ["body", "version", "rights", "identity", "html", "short"])
+def test_foreground_malformed_proof_cannot_claim_original(mutation):
+    patch = dict(LICENSE)
+    raw = RAW
+    if mutation == "body":
+        raw += b"changed"
+    elif mutation == "version":
+        patch["version"] = 2
+    elif mutation == "rights":
+        patch["license_code"] = "CC BY-NC"
+    elif mutation == "identity":
+        patch["doi"] = "10.1234/other"
+    elif mutation in {"html", "short"}:
+        raw = b"<article>" + RAW if mutation == "html" else b"Short abstract"
+        patch["text_url"] = f"s3://pmc-oa-opendata{TEXT}?md5={md5(raw, usedforsecurity=False).hexdigest()}"
+    assert source.verified_original(*_official(metadata=patch, raw=raw), doi=DOI, pmid=PMID) is None
+
+
+def test_old_worker_cannot_claim_or_expire_protected_rows(app_queue):
+    receipt = fetch_submit.submit(owner=7, doi=DOI, pmid=PMID)
+    queue = IntakeQueue(app_queue)
+    old_where = """((state='queued' AND not_before<=?) OR (state='leased' AND lease_until<=?))
+                   AND json_extract(request, '$.kind') <> 'explicit'"""
+    def old_can_see(now):
+        with app_queue.read() as conn:
+            return conn.execute("SELECT id FROM intake WHERE " + old_where, (now, now)).fetchone()
+    assert old_can_see(queue.now()) is None and queue.claim(network=True) is None
+    claimed = queue.claim(automatic=True)
+    assert claimed["id"] == receipt["id"] and queue.status(receipt["id"])["state"] == "leased"
+    assert old_can_see(queue.now() + LEASE_SECONDS + 1) is None
+    later = queue.now() + JOB_TTL + LEASE_SECONDS + 1
+    with app_queue.write() as conn:
+        expired = conn.execute("""UPDATE intake SET state='expired' WHERE created<=?
+                                AND (state='queued' OR (state='leased' AND lease_until<=?))""",
+                               (later - JOB_TTL, later))
+        assert expired.rowcount == 0
+    assert queue.status(receipt["id"])["state"] == "leased"
 @pytest.mark.parametrize("patch", [{"pubtype": ["Dataset", "Journal Article"]},
     {"pubtype": ["Published Erratum", "Journal Article"]},
     {"pubtype": ["Retracted Publication", "Journal Article"]},
@@ -186,26 +292,76 @@ def test_pmc_retraction_blocks_metadata_but_integrity_failure_keeps_link(monkeyp
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("denied", ["account", "after_network", "revocation", "root", "web_optin", "growth"])
-def test_worker_revalidates_captured_principal_and_live_controls(app_queue, monkeypatch, denied):
+@pytest.mark.parametrize("denied", ["account", "epoch", "revocation", "after_network", "web_optin", "growth"])
+def test_standalone_worker_revalidates_principal_and_live_controls(app_queue, monkeypatch, denied):
     calls = _mock_http(monkeypatch)
     if denied == "web_optin":
         tracing.set_web_search_enabled(False)
-    fetch_submit.submit(owner=7, doi=DOI, pmid=PMID)
-    if denied == "account":
-        monkeypatch.setattr(auth, "user_by_id", lambda uid: {"user_id": uid, "active": True, "approval_status": "pending"})
-    elif denied == "after_network":
-        users = iter(({"user_id": 7, "active": True, "approval_status": "approved"}, None))
-        monkeypatch.setattr(auth, "user_by_id", lambda uid: next(users))
+        assert fetch_submit.submit(owner=7, doi=DOI, pmid=PMID) is None
+        assert _consume(app_queue) is None
+        return
+    receipt = fetch_submit.submit(owner=7, doi=DOI, pmid=PMID)
+    assert receipt and not calls
+    if denied == "growth":
+        monkeypatch.setenv("CITRUS_CORPUS_DURABLE_INTAKE", "0")
+    elif denied == "account":
+        with sqlite3.connect(auth.DB_PATH) as conn:
+            conn.execute("UPDATE users SET active=0")
+    elif denied == "epoch":
+        with sqlite3.connect(auth.DB_PATH) as conn:
+            conn.execute("UPDATE users SET active=0")
+            conn.execute("UPDATE users SET active=1")
     elif denied == "revocation":
         monkeypatch.setattr(policy, "_revocations", lambda: frozenset({"bibliographic_lookup"}))
-    elif denied == "root":
-        monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_ROOT", str(app_queue.root.parent))
-    elif denied == "growth":
-        monkeypatch.setenv("CITRUS_CORPUS_FETCH_GROWTH", "0")
-    assert _worker_receipt() is None
+    else:
+        get = source.requests.get
+
+        @contextmanager
+        def get_then_revoke(url, **options):
+            with get(url, **options) as response:
+                yield response
+            if url == source._CLOUD + TEXT:
+                with sqlite3.connect(auth.DB_PATH) as conn:
+                    conn.execute("UPDATE users SET active=0")
+
+        monkeypatch.setattr(source.requests, "get", get_then_revoke)
+    result = _consume(app_queue)
+    assert result["state"] == "failed" and result["error"] == "network_scope_denied"
     assert len(calls) == (4 if denied == "after_network" else 0)
     assert not list(app_queue.originals.iterdir())
+
+
+@pytest.mark.parametrize("selector", ["pmcid", "title"])
+@pytest.mark.parametrize("match", ["exact", "ambiguous", "wrong"])
+def test_standalone_title_and_pmcid_prove_exact_unique_record(app_queue, monkeypatch, selector, match):
+    original_calls = _mock_http(monkeypatch)
+    get = source.requests.get
+    authority_calls = []
+
+    @contextmanager
+    def authoritative(url, **options):
+        if url != source._EUROPE_PMC:
+            with get(url, **options) as response:
+                yield response
+            return
+        term = options["params"]["query"]
+        assert term == (f'PMCID:{PMC} AND SRC:MED' if selector == "pmcid" else f'TITLE:"{TITLE}" AND SRC:MED')
+        authority_calls.append(term)
+        row = {"source": "MED", "id": PMID, "doi": DOI, "pmid": PMID, "pmcid": PMC, "title": TITLE,
+               "pubTypeList": {"pubType": ["journal article"]}, "journalInfo": {"journal": {"title": "PLoS One"}}}
+        if match == "wrong":
+            row["pmcid" if selector == "pmcid" else "title"] = "PMC999999" if selector == "pmcid" else "Similar title"
+        rows = [row, row] if match == "ambiguous" else [row]
+        raw = json.dumps({"hitCount": len(rows), "resultList": {"result": rows}}).encode()
+        yield type("Response", (), {"raw": BytesIO(raw), "status_code": 200, "headers": {"Content-Length": str(len(raw))}})
+
+    monkeypatch.setattr(source.requests, "get", authoritative)
+    adapter = AutoIntake(app_queue)
+    before = adapter.submit(owner=7, epoch=1, producer="literature", **{selector: PMC if selector == "pmcid" else TITLE})
+    assert before["path"] == "background" and not authority_calls
+    after = _consume(app_queue)
+    assert after["state"] == ("prepared" if match == "exact" else "failed")
+    assert len(authority_calls) == 1 and len(original_calls) == (3 if match == "exact" else 0)
 
 
 def test_stable_identifiers_do_not_repair_or_extract_dirty_input():

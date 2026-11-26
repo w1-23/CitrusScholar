@@ -92,13 +92,16 @@ def isolated_corpus(config, binds):
     options = config.get('isolated_corpus')
     if options is None:
         return [], []
-    allowed = {'root', 'growth', 'read', 'embedding_cache', 'read_generation'}
+    allowed = {'root', 'growth', 'read', 'embedding_cache', 'read_generation', 'durable_intake'}
     if (not isinstance(options, dict) or not options.keys() <= allowed
             or config.get('shared_literature_single_web')):
         raise ValueError('Invalid or conflicting isolated corpus deployment')
     growth, read = options.get('growth', False), options.get('read', False)
-    if type(growth) is not bool or type(read) is not bool:
+    durable = options.get('durable_intake', False)
+    if any(type(switch) is not bool for switch in (growth, read, durable)):
         raise ValueError('Isolated corpus switches must be boolean')
+    if durable and not growth:
+        raise ValueError('Durable intake requires isolated corpus growth')
     root = Path(absolute(options.get('root')))
     if root.resolve(strict=True) != root or not root.is_dir():
         raise ValueError('Isolated corpus needs a real, dedicated directory')
@@ -107,7 +110,8 @@ def isolated_corpus(config, binds):
         raise ValueError('Isolated corpus root overlaps a deployment bind')
     mounts = [(str(root), 'rw')]
     variables = ['CITRUS_CORPUS_MODE=isolated', 'CITRUS_ISOLATED_CORPUS_ROOT=' + str(root),
-                 'CITRUS_CORPUS_FETCH_GROWTH=' + str(int(growth)), 'CITRUS_CORPUS_READ=' + str(int(read))]
+                 'CITRUS_CORPUS_FETCH_GROWTH=' + str(int(growth)), 'CITRUS_CORPUS_READ=' + str(int(read)),
+                 'CITRUS_CORPUS_DURABLE_INTAKE=' + str(int(durable))]
     cache = options.get('embedding_cache')
     if read or cache is not None:
         cache = Path(absolute(cache))

@@ -161,3 +161,23 @@ class RegionWorkbookTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+
+def test_region_token_and_coverage_counts_agree():
+    from io import BytesIO
+    from openpyxl import Workbook
+    from citrus_audit.readers import read_region
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Recorded", "Mixed"])
+    sheet.append(["1.00", "3.50"])
+    sheet.append(["2.00", 4.5])
+    stream = BytesIO()
+    workbook.save(stream)
+    table = read_region(stream.getvalue(), "sample.xlsx", bounds="A1:B3", header_rows=[1])
+    columns = table.lexical_coverage["columns"]
+    assert columns["Recorded"]["status"] == "preserved"
+    assert columns["Mixed"]["status"] == "partial"
+    assert sum(col["tokens"] for col in columns.values()) == len(table.precision_evidence) == 3

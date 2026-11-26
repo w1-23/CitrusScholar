@@ -44,6 +44,7 @@ jobs:
             01_src/src/api/chat_turn_queue_admission_test.py \
             01_src/src/api/chat_turn_queue_http_test.py \
             01_src/src/core/chat_turn_queue_test.py \
+            01_src/src/core/task_recovery_generation_test.py \
             01_src/src/core/public_delivery_test.py \
             01_src/src/agent/context_projection_regression_test.py \
             01_src/src/agent/context_schema_budget_test.py \
@@ -84,6 +85,7 @@ jobs:
             01_src/src/core/citation_stable_refs_test.py \
             01_src/src/research/render_script_contract_test.py \
             01_src/src/research/reference_kernel_test.py \
+            packages/citrus_refcheck/reference_verdict_eval_test.py \
             01_src/src/research/audit_release_test.py \
             01_src/src/research/audit_projection_test.py \
             01_src/src/research/standalone_audit_integration_test.py \
@@ -99,6 +101,7 @@ jobs:
             01_src/src/figures/nature_current_qa_test.py \
             01_src/scripts/manage_account_test.py \
             01_src/src/account_retention_test.py \
+            01_src/src/core/turn_logs_test.py \
             01_src/src/agent/receipt_policy_test.py \
             01_src/src/api/admin_runtime_activation_test.py \
             01_src/src/api/library_preview_boundary_test.py \
@@ -129,6 +132,8 @@ jobs:
             --repository "$GITHUB_WORKSPACE" --commit "$GITHUB_SHA"
           python -B 04_scripts/stage_8043_release_test.py
           python -B 04_scripts/stage_fusion_release_test.py
+          python -B 04_scripts/verify_standalone_skill_overlay_test.py
+          python -B 04_scripts/cutover_8043_record_test.py
   skills-lock:
     name: Standalone Skill lock drift
     runs-on: ubuntu-24.04
@@ -147,6 +152,7 @@ jobs:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           python - <<'PY'
+          import hashlib
           import json
           import os
           import subprocess
@@ -158,10 +164,23 @@ jobs:
               subprocess.run(["git", "init", "-q", str(target)], check=True)
               subprocess.run(["git", "-C", str(target), "remote", "add", "origin",
                               entry["repository"]], check=True)
-              subprocess.run(["git", "-C", str(target), "fetch", "--depth", "1",
-                              "origin", entry["commit"]], check=True)
-              subprocess.run(["git", "-C", str(target), "checkout", "-q", "FETCH_HEAD"],
-                             check=True)
+              git = ["git", "-C", str(target)]
+              overlay = entry.get("source_bundle")
+              base = overlay["base_commit"] if overlay else entry["commit"]
+              subprocess.run([*git, "fetch", "--depth", "1", "origin", base], check=True)
+              if overlay:
+                  if overlay["file"] != f"{name}.bundle" or not overlay["ref"].startswith("refs/heads/"):
+                      raise ValueError(f"Invalid Skill bundle reference for {name}")
+                  bundle = Path("02_config/skill-source-bundles", overlay["file"]).resolve()
+                  if hashlib.sha256(bundle.read_bytes()).hexdigest() != overlay["sha256"]:
+                      raise ValueError(f"Skill bundle checksum mismatch for {name}")
+                  subprocess.run([*git, "bundle", "verify", str(bundle)], check=True)
+                  subprocess.run([*git, "fetch", "--no-tags", str(bundle), overlay["ref"]], check=True)
+                  if subprocess.check_output([*git, "rev-parse", "FETCH_HEAD^"], text=True).strip() != base:
+                      raise ValueError(f"Skill bundle prerequisite mismatch for {name}")
+              if subprocess.check_output([*git, "rev-parse", "FETCH_HEAD"], text=True).strip() != entry["commit"]:
+                  raise ValueError(f"Skill source pin mismatch for {name}")
+              subprocess.run([*git, "checkout", "-q", "FETCH_HEAD"], check=True)
           PY
       - name: Stage locked runtime packages
         env:

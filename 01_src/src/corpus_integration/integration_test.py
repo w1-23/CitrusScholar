@@ -1,47 +1,46 @@
 from hashlib import sha256
 import json
-from queue import Queue
 import sqlite3
 
 import pytest
 
 from citrus_corpus.intake import Intake
 from citrus_corpus.store import Store
-from src.corpus_integration import fetch_submit
 from src.corpus_integration.legacy_read import LegacyReader
 from src.corpus_integration.migration import dry_run
 from src.shared_corpus import catalog, journal, prepare
 
 
-def test_fetch_paper_handoff_never_archives_or_fetches_inline(tmp_path, monkeypatch):
-    from src.core import tracing
+def test_fetch_paper_handoff_persists_only_public_identity_inline(tmp_path, monkeypatch):
+    from src.core import capability_policy, tracing
+    from src.corpus_integration import automatic_worker, paper_source
     from src.tools import deepseek_search_fetch as fetch
 
     root = Store.initialize(tmp_path / "isolated")
     monkeypatch.setenv("CITRUS_CORPUS_MODE", "isolated")
     monkeypatch.setenv("CITRUS_CORPUS_FETCH_GROWTH", "1")
+    monkeypatch.setenv("CITRUS_CORPUS_DURABLE_INTAKE", "1")
     monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_ROOT", str(root.root))
     monkeypatch.setattr(tracing, "get_user_id", lambda: 7)
-    monkeypatch.setattr(fetch, "_enabled", lambda name: name in {"web_fetch", "bibliographic_lookup"})
-    monkeypatch.setattr(fetch_submit, "_ensure_consumer", lambda: True)
-    monkeypatch.setattr(fetch_submit, "_pending", Queue(maxsize=1))
+    monkeypatch.setattr(capability_policy, "allows", lambda name: name in {"web_fetch", "bibliographic_lookup"})
+    monkeypatch.setattr(automatic_worker, "account_epoch", lambda owner: 1 if owner == 7 else None)
+    monkeypatch.setattr(paper_source.requests, "get", lambda *a, **k: pytest.fail("inline provider access"))
 
     winner = {"url": "https://a.example/study", "content": "untrusted bytes", "validity": "valid"}
     before = winner.copy()
     assert fetch._retain_paper(winner, doi="10.1234/work") is None
-    assert fetch_submit._pending.empty()
     fetch._queue_paper_registration("10.1234/work", "", winner)
     fetch._queue_paper_registration("10.1234/another", "", winner)
     assert winner == before and list(root.originals.iterdir()) == []
     with root.read() as conn:
-        assert conn.execute("SELECT count(*) FROM intake").fetchone()[0] == 0
-    assert fetch_submit._pending.get_nowait()[1:] == (7, str(root.root), "10.1234/work", "")
-    assert fetch_submit._pending.empty()
+        rows = conn.execute("SELECT state,expected_sha256,request FROM intake ORDER BY identity").fetchall()
+    assert [json.loads(r[2])["doi"] for r in rows] == ["10.1234/another", "10.1234/work"]
+    assert all(r[0] == "automatic_queued" and r[1] is None and "untrusted" not in r[2] for r in rows)
     assert fetch._retain_missing_paper(doi="", pmid="", title="", url="https://a.example") is None
 
-    monkeypatch.setattr(fetch, "_enabled", lambda name: name == "web_fetch")
-    fetch._queue_paper_registration("10.1234/work", "", winner)
-    assert fetch_submit._pending.empty()
+    monkeypatch.setattr(capability_policy, "allows", lambda name: name == "web_fetch")
+    fetch._queue_paper_registration("10.1234/denied", "", winner)
+    assert len(Intake(root).queue.recent()) == 2
 
 
 def test_legacy_citation_and_consistent_migration_dry_run(tmp_path):
@@ -145,6 +144,102 @@ def test_admin_explicit_intake_returns_durable_receipt(tmp_path, monkeypatch):
         assert Intake(store).process_one()["state"] == "prepared"
         assert client.get(path + "/" + job_id, headers=admin).json()["raw_sha256"] == sha256(original).hexdigest()
 
+
+
+def test_admin_public_paper_contract_and_private_status(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from src.core import capability_policy
+    from src.corpus_integration import api_router, automatic_worker
+
+    store = Store.initialize(tmp_path / "isolated")
+    monkeypatch.setenv("CITRUS_CORPUS_MODE", "isolated")
+    monkeypatch.setenv("CITRUS_CORPUS_FETCH_GROWTH", "1")
+    monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_ROOT", str(store.root))
+    monkeypatch.setattr(capability_policy, "allows", lambda name: True)
+    monkeypatch.setattr(automatic_worker, "account_epoch", lambda owner, admin: 1 if owner == 7 and admin else None)
+    app = FastAPI()
+    app.include_router(api_router.router)
+
+    @app.middleware("http")
+    async def identify(request, call_next):
+        request.state.user = {"active": True, "approval_status": "approved", "user_id": 7,
+                              "role": request.headers.get("x-test-role", "regular")}
+        return await call_next(request)
+
+    with TestClient(app) as client:
+        base = "/api/v2/isolated-corpus/admin/"
+        admin = {"x-test-role": "admin"}
+        assert client.get(base + "intake").status_code == 403
+        assert client.post(base + "public-paper", headers=admin, json={"pmcid": "PMC123"}).status_code == 409
+        monkeypatch.setenv("CITRUS_CORPUS_DURABLE_INTAKE", "1")
+        for bad in ({"public_title": "A publication title"}, {"doi": "10.1234/paper", "body": "private"},
+                    {"public_title": "A publication title", "title_is_public": "true"}):
+            assert client.post(base + "public-paper", headers=admin, json=bad).status_code == 422
+        admitted = client.post(base + "public-paper", headers=admin,
+                               json={"public_title": "A publication title", "title_is_public": True})
+        assert admitted.status_code == 202
+        job = admitted.json()["job"]
+        status = client.get(base + "intake", headers=admin)
+        assert status.status_code == 200 and status.headers["Cache-Control"] == "private, no-store"
+        assert status.json() == {"automatic_enabled": True, "jobs": [{**job, "rights": None, "published": False}]}
+        assert "publication title" not in status.text and "account-7" not in status.text
+
+
+def test_standalone_worker_cli_can_start_on_fixture_without_web(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    store = Store.initialize(tmp_path / "isolated")
+    monkeypatch.setenv("CITRUS_CORPUS_MODE", "isolated")
+    monkeypatch.setenv("CITRUS_CORPUS_FETCH_GROWTH", "1")
+    monkeypatch.setenv("CITRUS_CORPUS_DURABLE_INTAKE", "1")
+    monkeypatch.setenv("CITRUS_ISOLATED_CORPUS_ROOT", str(store.root))
+    marker = tmp_path / "disabled-marker"
+    command = [sys.executable, "-m", "citrus_corpus", "--root", str(store.root), "worker", "--allow-automatic"]
+    denied = subprocess.run(command, text=True, capture_output=True, timeout=10)
+    assert denied.returncode == 1 and "corpus_automatic_network_required" in denied.stderr
+    result = subprocess.run([*command, "--allow-network", "--network-marker", str(marker)],
+                            text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0 and json.loads(result.stdout) == {"state": "idle"}
+    marker.touch()
+    ready = subprocess.run([*command, "--allow-network", "--network-marker", str(marker)],
+                           text=True, capture_output=True, timeout=10)
+    assert ready.returncode == 0 and json.loads(ready.stdout) == {"state": "idle"}
+
+
+def test_launcher_durable_intake_boolean_is_independent_and_default_off(tmp_path):
+    from pathlib import Path
+    from runpy import run_path
+
+    launch = run_path(str(Path(__file__).resolve().parents[2] / "scripts" / "apptainer_launch.py"))
+    isolated = launch["isolated_corpus"]
+    options = {"root": str(tmp_path), "growth": True}
+    def env(**overrides):
+        return isolated({"isolated_corpus": {**options, **overrides}}, [])[1]
+    assert "CITRUS_CORPUS_DURABLE_INTAKE=0" in env()
+    assert "CITRUS_CORPUS_DURABLE_INTAKE=1" in env(durable_intake=True)
+    with pytest.raises(ValueError, match="boolean"):
+        env(durable_intake="true")
+    with pytest.raises(ValueError, match="requires"):
+        env(growth=False, durable_intake=True)
+
+
+def test_literature_handoff_keeps_private_query_out_of_payload(monkeypatch):
+    from src.corpus_integration import fetch_submit, settings
+    from src.research import literature
+
+    monkeypatch.setattr(settings, "durable_intake_enabled", lambda: True)
+    writes = []
+    monkeypatch.setattr(fetch_submit, "_submit", lambda owner, **payload: writes.append(payload))
+    row = {"title": "A study of grove nutrients", "source": "PubMed", "identifier_match": False,
+           "field_conflicts": [], "pmid": "123"}
+    literature._submit_public_match([row], query="private lab notes", doi="", arxiv_id="", claimed_title="")
+    assert not writes
+    literature._submit_public_match([row, dict(row)], query=row["title"], doi="", arxiv_id="", claimed_title="")
+    assert not writes
+    literature._submit_public_match([row], query=row["title"], doi="", arxiv_id="", claimed_title="")
+    assert writes == [{"producer": "literature", "doi": "", "pmid": "123", "pmcid": "", "title": ""}]
 
 
 def test_public_family_and_citation_dispatch_follow_runtime_mode(tmp_path, monkeypatch):

@@ -350,3 +350,27 @@ def _run_all_tests():
 
 if __name__ == "__main__":
     raise SystemExit(_run_all_tests())
+
+
+
+def test_doi_and_arxiv_are_independent_and_retraction_survives():
+    from citrus_refcheck.verification import Capabilities, Observation, verify_batch
+
+    claims = {"doi": "10.5555/example", "arxiv_id": "2401.12345v2", "title": "Example"}
+    inventory = {"entries": [{"record_id": "one", "record_index": 1, "citation": "Example", "claims": claims}]}
+    seen = []
+    def lookup(query, _deadline):
+        seen.append(query.kind)
+        if query.kind == "doi":
+            return Observation("Crossref", 200, ({"title": "Example", "doi": claims["doi"],
+                "source_ref": "fixture:doi", "retracted": True},))
+        return Observation("arXiv", 200, ({"title": "Example", "doi": claims["doi"],
+            "arxiv_id": "2401.12345", "source_ref": "fixture:arxiv"},))
+    capabilities = Capabilities(lambda: None, lambda query: None, lookup_doi=lookup, lookup_arxiv=lookup)
+    result = verify_batch(inventory, capabilities=capabilities)["entries"][0]["evidence"]
+    assert sorted(seen) == ["arxiv", "doi"]
+    assert result["match_status"] == "matching"
+    assert result["retraction_status"] == "retracted"
+    missing = verify_batch(inventory, capabilities=Capabilities(lambda: None, lambda query: None,
+        lookup_doi=lookup))["entries"][0]["evidence"]
+    assert missing["match_status"] != "matching"

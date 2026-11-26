@@ -14,6 +14,10 @@ def growth_enabled():
     return isolated_enabled() and os.getenv("CITRUS_CORPUS_FETCH_GROWTH") == "1"
 
 
+def durable_intake_enabled():
+    return growth_enabled() and os.getenv("CITRUS_CORPUS_DURABLE_INTAKE") == "1"
+
+
 def reader_root():
     if os.getenv("CITRUS_CORPUS_READ") == "1":
         return os.getenv("CITRUS_ISOLATED_CORPUS_ROOT")

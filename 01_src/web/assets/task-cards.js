@@ -222,8 +222,9 @@
       var milestones = new Set();
       projection.entries.forEach(function (item) {
         if (item.kind === 'note' && item.category) {
-          if (milestones.has(item.category)) return;
-          milestones.add(item.category);
+          var milestone = item.generation + "/" + item.category;
+          if (milestones.has(milestone)) return;
+          milestones.add(milestone);
         }
         var row = rows.get(item.id);
         if (!row) { row = node('div', item.kind === 'note' ? 'research-process-note' : 'term-line'); rows.set(item.id, row); }
@@ -246,7 +247,7 @@
         row.dataset.resolvedBy = resolution ? resolution.resolved_by_tool_call_id : '';
         row.className = 'term-line ' + (['running', 'resuming'].indexOf(status) >= 0 ? 'is-running'
           : ['complete', 'completed', 'no_results'].indexOf(status) >= 0 ? 'is-complete'
-          : status === 'partial' ? 'is-partial' : ['skipped', 'cancelled', 'not_run'].indexOf(status) >= 0 ? 'is-skipped' : 'is-failed');
+          : status === 'partial' ? 'is-partial' : ['skipped', 'cancelled', 'not_run', 'interrupted'].indexOf(status) >= 0 ? 'is-skipped' : 'is-failed');
         var running = ['running', 'resuming'].indexOf(status) >= 0;
         if (resolution) row.className = 'term-line is-resolved';
         if ((settled || paused) && running) row.className = 'term-line is-unconfirmed';
@@ -288,6 +289,7 @@
       });
     }
     return {element: host, projection: projection, activeTool: activeTool,
+      begin: function (generation) { if (projection.begin(generation)) draw(); },
       pause: function (value) { if (paused !== value) { paused = value; draw(); } },
       note: function (text, id, metadata) {
         var clean = (metadata && metadata.public_note && options.publicNote ? options.publicNote : options.clean)(text);

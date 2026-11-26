@@ -11,10 +11,12 @@ import hashlib
 import json
 import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 
 PROTOCOL = "citrus-task/1"
 LIVE_QUEUE_SIZE = 128
+OPERATION_LEASE_SECONDS = 600
+SAFE_RECOVERY_MODES = frozenset({"local_read", "pure_computation"})
 
 
 class TaskConflict(ValueError):
@@ -69,6 +71,11 @@ def transaction():
         conn.row_factory = __import__('sqlite3').Row
         conn.execute("BEGIN IMMEDIATE")
         yield conn
+
+
+def read_transaction(conn=None):
+    from src.core.jobs import read_transaction as read_jobs
+    return read_jobs() if conn is None else nullcontext(conn)
 
 
 def canonical(value):
@@ -128,6 +135,8 @@ def _append(conn, job_id, event, data):
     now = time.time()
     if event == "done":
         data["turn_timings"] = _terminal_timings(conn, job_id, data, now)
+        if isinstance(data.get("turn_envelope"), dict):
+            data["turn_envelope"]["turn_timings"] = data["turn_timings"]
     frame = stamp_sse_event(_encode_event(event, data), seq)
     payload = json.loads(frame["data"])
     conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", (job_id, seq, event, canonical(payload), now))
@@ -161,7 +170,7 @@ def _terminal_timings(conn, job_id, payload, now):
 
 def public_working_notes(job_id):
     from src.core.public_delivery import project_public_event
-    with transaction() as conn:
+    with read_transaction() as conn:
         rows = conn.execute("SELECT seq,data FROM task_events WHERE job_id=? AND event='assistant_progress' "
                             "ORDER BY seq DESC LIMIT ?", (job_id, LIVE_QUEUE_SIZE)).fetchall()
     notes = []
@@ -187,14 +196,14 @@ def _latest_context_snapshot(conn, job_id):
 
 def latest_context_snapshot(job_id):
     """Read the same identified event consumed by live SSE and replay."""
-    with transaction() as conn:
+    with read_transaction() as conn:
         _job(conn, job_id)
         return _latest_context_snapshot(conn, job_id)
 
 
-def replay(job_id, after=0, limit=200):
+def replay(job_id, after=0, limit=200, *, conn=None):
     after, limit = max(0, int(after)), min(500, max(1, int(limit)))
-    with transaction() as conn:
+    with read_transaction(conn) as conn:
         job = dict(_job(conn, job_id))
         rows = conn.execute("SELECT * FROM task_events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?", (job_id, after, limit + 1)).fetchall()
         events = [dict(row) | {"data": json.loads(row["data"])} for row in rows[:limit]]
@@ -218,12 +227,14 @@ def replay(job_id, after=0, limit=200):
 
 def _public_terminal(envelope):
     from src.core.progress_bus import public_tool_reason, public_tool_resolutions
-    from src.core.public_delivery import private_record, project_artifact_delivery, project_fields
+    from src.core.public_delivery import private_record, project_artifact_delivery, project_fields, timing_fields
     if not isinstance(envelope, dict) or private_record(envelope):
         return {}
     visible = project_fields(envelope,
         ids="display_status execution_status acceptance_status acceptance_reason job_status stop_reason",
         numbers="schema_version verified_artifacts terminal_seq", bools="history_saved")
+    if isinstance(envelope.get("turn_timings"), dict):
+        visible["turn_timings"] = timing_fields(envelope["turn_timings"])
     if isinstance(envelope.get("artifact_ids"), (list, tuple)):
         visible["artifact_ids"] = [item for item in envelope["artifact_ids"]
                                   if project_fields({"id": item}, ids="id").get("id")]
@@ -281,15 +292,16 @@ def public_job_record(job):
                       "stop_reason": public_tool_reason(job.get("stop_reason"))}
 
 
-def projection(job_id, *, include_job=False):
+def projection(job_id, *, include_job=False, conn=None):
     from src.core.progress_bus import public_progress_payload, public_result_refs, public_tool_outcome
-    with transaction() as conn:
+    with read_transaction(conn) as conn:
         job = _job(conn, job_id)
         status = public_job_record(job) if include_job else {}
         updates = [dict(r) for r in conn.execute(
             "SELECT job_id,version,status,created_at,applied_at FROM task_updates WHERE job_id=? ORDER BY version", (job_id,))]
         operations = []
-        for row in conn.execute("SELECT * FROM task_operations WHERE job_id=? ORDER BY updated_at", (job_id,)):
+        for row in conn.execute("SELECT * FROM task_operations WHERE job_id=? AND owner_user_id=? "
+                                "AND owner_user_id>0 ORDER BY updated_at", (job_id, job["owner_user_id"])):
             item = public_progress_payload("operation", dict(row))
             item.update({key: row[key] for key in ("job_id", "recovery_mode", "attempts", "updated_at")})
             item["status"] = row["status"]
@@ -300,7 +312,9 @@ def projection(job_id, *, include_job=False):
             item["outcome"] = public_tool_outcome(outcome) if outcome else {}
             item["resumable"] = (job["current_step"] == "interrupted"
                                  and job["status"] == "failed"
-                                 and item["recovery_mode"] != "never" and item["status"] == "interrupted")
+                                 and job["owner_user_id"] is not None
+                                 and item["recovery_mode"] in SAFE_RECOVERY_MODES
+                                 and bool(row["tool_call_id"]) and item["status"] == "interrupted")
             operations.append(item)
         budget_row = conn.execute("SELECT * FROM task_budgets WHERE job_id=?", (job_id,)).fetchone()
         budget = dict(budget_row) if budget_row else {}
@@ -309,6 +323,7 @@ def projection(job_id, *, include_job=False):
         if budget and not __import__('math').isfinite(budget["deadline"]):
             budget["deadline"] = None
         return {**status,
+                "recovery_cursor": recovery_cursor(conn, job_id),
                 "event_cursor": conn.execute("SELECT COALESCE(MAX(seq),0) FROM task_events WHERE job_id=?", (job_id,)).fetchone()[0],
                 "task_version": updates[-1]["version"] if updates else 0,
                 "applied_version": max((u["version"] for u in updates if u["status"] == "applied"), default=0),
@@ -327,8 +342,8 @@ def _update_request(conn, job_id, request_id):
                         (job_id, request_id)).fetchone()
 
 
-def update_request_status(job_id, request_id):
-    with transaction() as conn:
+def update_request_status(job_id, request_id, *, conn=None):
+    with read_transaction(conn) as conn:
         _job(conn, job_id)
         existing = _update_request(conn, job_id, request_id)
         return ({"job_id": job_id, "version": existing["version"], "status": existing["status"]}
@@ -448,13 +463,13 @@ def approval_status(approval_id):
 
 
 def start_operation(job_id, owner, tool_name, args, *, recovery_mode="never", input_refs=None,
-                    lease_seconds=600, tool_call_id="", attempt=1, retry_of=None, logical_key=""):
+                    lease_seconds=OPERATION_LEASE_SECONDS, tool_call_id="", attempt=1, retry_of=None, logical_key=""):
     refs = input_refs or []
     operation_id, lease = uuid.uuid4().hex, uuid.uuid4().hex
     digest = input_hash({"tool": tool_name, "args": args, "refs": refs})
     with transaction() as conn:
         job = _job(conn, job_id)
-        if job["owner_user_id"] != owner or job["status"] not in {"running", "detached"}:
+        if type(owner) is not int or owner <= 0 or job["owner_user_id"] != owner or job["status"] not in {"running", "detached"}:
             raise TaskConflict("operation_owner_or_state_conflict")
         if retry_of is not None:
             parent = conn.execute(
@@ -510,9 +525,11 @@ def finish_operation(operation_id, lease, message, *, attempt=1):
         row = conn.execute("SELECT * FROM task_operations WHERE operation_id=?", (operation_id,)).fetchone()
         if row is None or row["lease"] != lease or row["status"] != "running" or row["lease_until"] < time.time():
             raise TaskConflict("operation_lease_lost")
-        if row["logical_key"] and row["tool_call_id"] != message.tool_call_id:
+        if row["tool_call_id"] and row["tool_call_id"] != message.tool_call_id:
             raise TaskConflict("operation_call_identity_conflict")
         job = _job(conn, row["job_id"])
+        if job["owner_user_id"] != row["owner_user_id"] or row["owner_user_id"] <= 0:
+            raise TaskConflict("operation_owner_or_state_conflict")
         # Resume commits are independent of the original interrupted terminal view.
         resuming = (job["status"] == "failed" and job["current_step"] == "interrupted"
                     and row["attempts"] > 1 and row["recovery_mode"] != "never")
@@ -559,10 +576,12 @@ def abandon_operation(operation_id, lease):
         conn.execute("UPDATE task_operations SET status='interrupted',lease_until=0,updated_at=? WHERE operation_id=? AND lease=? AND status='running'", (time.time(), operation_id, lease))
 
 
-def operation_result(job_id, operation_id, *, include_retry=False):
-    with transaction() as conn:
-        _job(conn, job_id)
-        row = conn.execute("SELECT result,outcome,input_hash,result_refs,retry_of FROM task_operations WHERE job_id=? AND operation_id=?", (job_id, operation_id)).fetchone()
+def operation_result(job_id, operation_id, *, include_retry=False, conn=None):
+    with read_transaction(conn) as conn:
+        job = _job(conn, job_id)
+        row = conn.execute("SELECT result,outcome,input_hash,result_refs,retry_of FROM task_operations "
+                           "WHERE job_id=? AND operation_id=? AND owner_user_id=? AND owner_user_id>0",
+                           (job_id, operation_id, job["owner_user_id"])).fetchone()
         if row is None or not row["result"]:
             raise TaskConflict("operation_result_unavailable")
         return {"job_id": job_id, "operation_id": operation_id,
@@ -575,13 +594,20 @@ def claim_resume(job_id, operation_id, owner):
     with transaction() as conn:
         job = _job(conn, job_id)
         row = conn.execute("SELECT * FROM task_operations WHERE operation_id=? AND job_id=? AND owner_user_id=?", (operation_id, job_id, owner)).fetchone()
-        if (row is None or job["owner_user_id"] != owner or job["current_step"] != "interrupted"
-                or row["recovery_mode"] == "never" or row["status"] != "interrupted"):
+        if (type(owner) is not int or owner <= 0 or row is None or job["owner_user_id"] != owner
+                or job["status"] != "failed" or job["current_step"] != "interrupted"
+                or row["recovery_mode"] not in SAFE_RECOVERY_MODES or row["status"] != "interrupted"
+                or not row["tool_call_id"] or row["lease_until"] > time.time()):
             raise TaskConflict("unsafe_or_unavailable_resume")
-        lease = uuid.uuid4().hex
-        conn.execute("UPDATE task_operations SET status='running',lease=?,lease_until=?,attempts=attempts+1,updated_at=? WHERE operation_id=?", (lease, time.time()+600, time.time(), operation_id))
-        _append(conn, job_id, "operation", {"operation_id": operation_id, "status": "resuming", "recovery": "safe_step"})
-        return dict(row) | {"lease": lease, "inputs": json.loads(row["inputs"]), "input_refs": json.loads(row["input_refs"])}
+        lease, now = uuid.uuid4().hex, time.time()
+        lease_until = now + OPERATION_LEASE_SECONDS
+        attempt = row["attempts"] + 1
+        conn.execute("UPDATE task_operations SET status='running',lease=?,lease_until=?,attempts=?,updated_at=? WHERE operation_id=?",
+                     (lease, lease_until, attempt, now, operation_id))
+        _append(conn, job_id, "operation", {"operation_id": operation_id, "tool_name": row["tool_name"],
+            "status": "resuming", "recovery": "safe_step", "tool_call_id": row["tool_call_id"], "attempt": attempt})
+        return dict(row) | {"lease": lease, "lease_until": lease_until, "attempts": attempt,
+                           "inputs": json.loads(row["inputs"]), "input_refs": json.loads(row["input_refs"])}
 
 
 def recover_interrupted(conn):

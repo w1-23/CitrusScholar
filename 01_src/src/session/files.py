@@ -169,6 +169,13 @@ def init_store() -> None:
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_resource_refs_file "
                      "ON session_file_resource_refs(file_id, owner_user_id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS chat_turn_input_stages (
+            owner_user_id INTEGER NOT NULL, session_id TEXT NOT NULL, client_request_id TEXT NOT NULL,
+            PRIMARY KEY(owner_user_id,session_id,client_request_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS chat_turn_staged_uploads (
+            owner_user_id INTEGER NOT NULL, session_id TEXT NOT NULL, client_request_id TEXT NOT NULL,
+            file_id TEXT NOT NULL, storage_path TEXT NOT NULL,
+            PRIMARY KEY(owner_user_id,session_id,client_request_id,file_id))""")
         conn.execute("""CREATE TABLE IF NOT EXISTS workspace_file_versions (
             owner INTEGER NOT NULL, session TEXT NOT NULL, path TEXT NOT NULL,
             version INTEGER NOT NULL, file_id TEXT NOT NULL, sha256 TEXT NOT NULL,
@@ -636,7 +643,7 @@ def register_file(*, session_id: str, owner_user_id: int, filename: str,
                   mime: str = "", origin: str = ORIGIN_UPLOADED,
                   artifact_id: str = "", client_request_id: str = "",
                   producer_tool: str = "", dedupe_key: str = "",
-                  visibility: str = "public") -> dict[str, Any]:
+                  visibility: str = "public", stage_turn_input: bool = False) -> dict[str, Any]:
     """Register a file in the session index.
 
     Either ``content`` is supplied (we write it into the controlled directory)
@@ -673,6 +680,18 @@ def register_file(*, session_id: str, owner_user_id: int, filename: str,
         path = (root / f"{file_id}_{safe}").resolve()
         if not path.is_relative_to(root):
             raise ValueError("unsafe storage path")
+        if stage_turn_input:
+            # Persist the exact allocated path before bytes can exist. A hard
+            # process stop between upload write and index commit is recoverable.
+            scope = (owner_user_id, session_id, client_request_id)
+            if owner_user_id <= 0 or not client_request_id or origin != ORIGIN_UPLOADED:
+                raise ValueError("an upload stage requires a scoped turn")
+            with _connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if not conn.execute("SELECT 1 FROM chat_turn_input_stages WHERE owner_user_id=? "
+                                    "AND session_id=? AND client_request_id=?", scope).fetchone():
+                    raise ValueError("turn input stage is missing")
+                conn.execute("INSERT INTO chat_turn_staged_uploads VALUES(?,?,?,?,?)", (*scope, file_id, str(path)))
         path.write_bytes(content)
         if os.name != "nt":
             try:
@@ -742,9 +761,10 @@ def register_file(*, session_id: str, owner_user_id: int, filename: str,
                     mime=mime, dedupe_key=dedupe_key, now=now)
                 # 重发也属于"本轮产出了这份文件"：链接必须补上，否则新一轮的
                 # "本轮成果"判定看不到它。
-                _link_turn(conn, session_id=session_id, owner_user_id=owner_user_id,
-                           client_request_id=client_request_id,
-                           file_id=str(refreshed["file_id"]), now=now)
+                if not stage_turn_input:
+                    _link_turn(conn, session_id=session_id, owner_user_id=owner_user_id,
+                               client_request_id=client_request_id,
+                               file_id=str(refreshed["file_id"]), now=now)
                 return _row_to_public(refreshed)
             _check_storage_quota(conn, owner_user_id, size)
             conn.execute(
@@ -759,8 +779,9 @@ def register_file(*, session_id: str, owner_user_id: int, filename: str,
                  str(producer_tool or "")[:64], dedupe_key, visibility, upload_identity))
             # 生成物在登记时就绑定本轮，不等轮末补链接：否则"本轮产出了什么"
             # 在轮内不可判定，只能靠扩展名猜。
-            _link_turn(conn, session_id=session_id, owner_user_id=owner_user_id,
-                       client_request_id=client_request_id, file_id=file_id, now=now)
+            if not stage_turn_input:
+                _link_turn(conn, session_id=session_id, owner_user_id=owner_user_id,
+                           client_request_id=client_request_id, file_id=file_id, now=now)
             row = conn.execute("SELECT * FROM session_files WHERE file_id=?",
                                (file_id,)).fetchone()
     except Exception:
@@ -1474,6 +1495,8 @@ def purge_account_files(owner_user_id: int, session_ids: Iterable[str] = ()) -> 
                             (owner_user_id, owner_user_id)).fetchone():
                 raise ValueError("account file index has conflicting ownership")
             # Includes a turn pin whose source file or session row is already gone.
+            conn.execute(f"DELETE FROM {table} WHERE owner_user_id=?", (owner_user_id,))
+        for table in ("chat_turn_input_stages", "chat_turn_staged_uploads"):
             conn.execute(f"DELETE FROM {table} WHERE owner_user_id=?", (owner_user_id,))
         for session_id in known:
             _purge_session_locked(conn, session_id, strict=True, owner_user_id=owner_user_id)

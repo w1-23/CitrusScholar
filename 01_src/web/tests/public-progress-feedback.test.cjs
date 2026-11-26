@@ -43,7 +43,11 @@ test('live status prefers verified milestones or current tool family, and never 
   assert.equal([...panel.element.querySelectorAll('.research-process-note')]
     .filter(note => note.textContent === waiting.text).length, 1, 'repeated fixed host label stays one milestone');
   assert.equal(panel.element.textContent.includes('private fixture'), false);
-  assert.match(b.ctx.createElapsedBadge(2500).textContent, /^开始执行到首段答复 2\.5 秒$/);
+  b.ctx.renderTurnTimings(panel.element, {turn_timings: {visible_answer_first_ms: 2500, provider_first_packet_ms: 350}});
+  assert.equal(panel.element.querySelector('.turn-timings').textContent,
+    '提交到首段可见答复 2.5 秒 · 模型调用到服务商首包 0.3 秒');
+  b.ctx.renderTurnTimings(panel.element, {terminal_snapshot: {turn_timings: {queue_wait_ms: 100}}});
+  assert.equal(panel.element.querySelectorAll('.turn-timings').length, 1);
   panel.terminal('completed');
   panel.syncTask({...state, display_status: 'completed', finished_at: start + 45}, null, {});
   assert.equal(panel.label.textContent, '已完成');

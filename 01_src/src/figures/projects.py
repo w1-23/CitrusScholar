@@ -1011,7 +1011,7 @@ def preview_overrides(figure_id: str, owner: int, raw_overrides: Any,
     result = render_preview(project, owner, raw_overrides, validate=validate,
                             render=render, is_script=_is_script(project))
     if confirm_targets is not None:
-        confirm_targets(result["manifest"], result["overrides"], result.get("changed", []))
+        confirm_targets(result["manifest"], result["overrides"], result.get("changed", []), result["svg"].encode("utf-8"))
     return {**{key: value for key, value in result.items() if key != "changed"}, "draft_revision": draft_revision}
 
 
@@ -1035,7 +1035,7 @@ def save_overrides(figure_id: str, owner: int, raw_overrides: Any,
         project, owner, entries, formats=formats)
     _confirm_edit_targets(new_manifest, targets)
     if confirm_targets is not None:
-        confirm_targets(new_manifest, merged, changed)
+        confirm_targets(new_manifest, merged, changed, blobs.get("svg"))
 
     stem = project.get("title") or "figure"
     with stage_rendered(owner, session_id or project.get("session_id", ""), stem, blobs) as (published, publication):

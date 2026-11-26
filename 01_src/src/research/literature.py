@@ -591,6 +591,7 @@ def search_literature(query: str = "", doi: str = "", arxiv_id: str = "",
                                   SOURCE_PRIORITY.index(r["source"]) if r["source"] in SOURCE_PRIORITY else 99))
     if query and not annotated and not errors:
         notes.append("登记库没有返回候选；未查到不等于文献不存在。")
+    _submit_public_match(annotated, query=query, doi=doi, arxiv_id=arxiv_id, claimed_title=claimed_title)
     return {
         "query_used": search_query,
         "original_query": query,
@@ -600,6 +601,22 @@ def search_literature(query: str = "", doi: str = "", arxiv_id: str = "",
         "notes": notes,
         "elapsed_ms": int((time.time() - started) * 1000),
     }
+
+
+def _submit_public_match(records, *, query, doi, arxiv_id, claimed_title):
+    """Hand off only a positive registry match, never the user's query or claim."""
+    from src.corpus_integration.settings import durable_intake_enabled
+
+    if not durable_intake_enabled() or arxiv_id or _LOOKUP_CONTEXT.get() is not None:
+        return
+    supplied = norm_title(claimed_title or query)
+    matches = [record for record in records if not record["field_conflicts"] and
+               ((doi and record["identifier_match"])
+                or (not doi and supplied and norm_title(record["title"]) == supplied))]
+    if len(matches) == 1:
+        from src.corpus_integration.fetch_submit import submit_literature
+
+        submit_literature(matches[0])
 
 
 def lookup_doi(doi: str) -> tuple[str, dict | None, str]:

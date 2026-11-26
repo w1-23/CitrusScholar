@@ -12,7 +12,7 @@ from .audit import BudgetExceeded
 from .compare import _value, compare_fields
 from .inventory import MAX_RECORDS, digest
 from .lookup import AuditStopped
-from .providers import norm_title, normalize_doi
+from .providers import norm_title, normalize_arxiv_id, normalize_doi
 from .verdict import _abbreviated_authors
 
 _MAX_WORKERS = 4
@@ -75,19 +75,21 @@ class BatchLimits:
                 raise ValueError('invalid_batch_deadline')
 
 
-def _query(entry):
+def _queries(entry):
     if entry.get('parse_status') == 'invalid_row':
-        return None
+        return ()
     claims = entry['claims']
-    doi = normalize_doi(claims.get('doi'))
-    if doi:
-        return Query('doi', doi) if _EXACT_DOI.fullmatch(doi) else None
-    arxiv = _value(claims, 'arxiv_id')
-    if arxiv:
-        return Query('arxiv', arxiv)
+    identifiers = []
+    if supplied := _value(claims, 'doi'):
+        doi = normalize_doi(supplied)
+        identifiers.append(Query('doi', doi if _EXACT_DOI.fullmatch(doi) else ''))
+    if supplied := _value(claims, 'arxiv_id'):
+        identifiers.append(Query('arxiv', normalize_arxiv_id(supplied)))
+    if identifiers:
+        return tuple(identifiers)
     title = _value(claims, 'title')
     authors = '' if 'authors' in entry.get('uncertain_fields', ()) else _value(claims, 'authors')
-    return Query('search', title, authors) if title else None
+    return (Query('search', title, authors),) if title else ()
 
 
 def _stop_code(error):
@@ -115,6 +117,11 @@ def _metadata(record):
            or type(value.get('year')) not in (str, int) for value in years):
         raise ValueError('invalid_year_metadata')
     fields['years'] = [{'kind': value['kind'], 'year': str(value['year'])} for value in years]
+    if type(record.get('retracted')) is bool:
+        fields['retracted'] = record['retracted']
+    related = record.get('related_dois')
+    if isinstance(related, (list, tuple)):
+        fields['related_dois'] = [normalize_doi(value) for value in related[:20] if isinstance(value, str)]
     return fields
 
 
@@ -228,10 +235,10 @@ class _BatchRequests:
 
 
 def _candidate_identity(record):
-    for field in ('doi', 'arxiv_id', 'url'):
+    for field, normalize in (('doi', normalize_doi), ('arxiv_id', normalize_arxiv_id), ('url', str)):
         value = record.get(field)
         if value:
-            return field, normalize_doi(value) if field == 'doi' else value
+            return field, normalize(value)
     return 'source_ref', digest(record['source_ref']) if record.get('source_ref') else None
 
 
@@ -246,8 +253,8 @@ def _match(entry, query, observation):
     title = _value(claims, 'title')
     if query.kind in {'doi', 'arxiv'}:
         field = 'doi' if query.kind == 'doi' else 'arxiv_id'
-        direct = [row for row in records if (normalize_doi(row.get(field)) if field == 'doi'
-                                             else row.get(field)) == query.value]
+        normalize = normalize_doi if field == 'doi' else normalize_arxiv_id
+        direct = [row for row in records if normalize(row.get(field)) == query.value]
         if not direct:
             return None, 'unconfirmed', 'identifier_not_returned'
         titles = {norm_title(row['title']) for row in direct}
@@ -303,8 +310,38 @@ def _row_result(entry, query, observations, stop):
             fields = compare_fields(entry['claims'], record, uncertain_fields=entry.get('uncertain_fields', ()))
             differences = [dict(value, field=field) for field, value in fields.items()
                            if value['status'] in {'conflicting', 'uncertain'}]
-    return {'processing_status': 'processed' if observations else 'unprocessed', 'match_status': status,
-            'reason': reason, 'match': record, 'sources': receipts, 'differences': differences}
+    result = {'processing_status': 'processed' if observations else 'unprocessed', 'match_status': status,
+              'reason': reason, 'match': record, 'sources': receipts, 'differences': differences}
+    if record and record.get('retracted') is True:
+        result['retraction_status'] = 'retracted'
+    return result
+
+
+def _combined_identifiers(queries, results):
+    doi, arxiv = results['doi'], results['arxiv']
+    both_processed = all(result['processing_status'] == 'processed' for result in results.values())
+    states = {result['match_status'] for result in results.values()}
+    left, right = doi['match'] or {}, arxiv['match'] or {}
+    linked = (normalize_doi(right.get('doi')) == queries[0].value
+              or normalize_arxiv_id(left.get('arxiv_id')) == queries[1].value
+              or queries[0].value in right.get('related_dois', ())
+              or normalize_doi(right.get('doi')) in left.get('related_dois', ()))
+    if 'conflict' in states:
+        status, reason = 'conflict', 'submitted_identifier_conflict'
+    elif not both_processed:
+        status, reason = 'unprocessed', 'identifier_not_processed'
+    elif states != {'matching'}:
+        status, reason = 'unconfirmed', 'submitted_identifier_unconfirmed'
+    elif not linked:
+        status, reason = 'unconfirmed', 'identifier_relationship_unconfirmed'
+    else:
+        status, reason = 'matching', 'identifier_match'
+    result = {'processing_status': 'processed' if both_processed else 'unprocessed', 'match_status': status,
+              'reason': reason, 'match': left or right or None, 'sources': doi['sources'] + arxiv['sources'],
+              'differences': doi['differences'], 'identifier_checks': results}
+    if any(item.get('retraction_status') == 'retracted' for item in results.values()):
+        result['retraction_status'] = 'retracted'
+    return result
 
 
 def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits(), on_row=None):
@@ -323,14 +360,25 @@ def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits(),
         raise TypeError('check_and_debit_callbacks_required')
     rows = [dict(entry, evidence=None) for entry in entries]
     groups = {}
-    for index, entry in enumerate(entries):
-        query = _query(entry)
-        if query and lookups[query.kind]:
-            groups.setdefault(query, []).append(index)
-        else:
-            rows[index]['evidence'] = _row_result(entry, query, (), 'capability_unavailable' if query else 'invalid_input')
+    queries_by_row, results_by_row = [_queries(entry) for entry in entries], [{} for _ in entries]
+
+    def finish_row(index):
+        queries, results = queries_by_row[index], results_by_row[index]
+        if rows[index]['evidence'] is None and len(results) == len(queries):
+            rows[index]['evidence'] = (_combined_identifiers(queries, results) if len(queries) == 2
+                else next(iter(results.values())) if results
+                else _row_result(entries[index], None, (), 'invalid_input'))
             if on_row is not None:
                 on_row(dict(rows[index]))
+
+    for index, queries in enumerate(queries_by_row):
+        for query in queries:
+            if query.value and lookups[query.kind]:
+                groups.setdefault(query, []).append(index)
+            else:
+                reason = 'capability_unavailable' if query.value else 'invalid_input'
+                results_by_row[index][query.kind] = _row_result(entries[index], query, (), reason)
+        finish_row(index)
 
     executor = capabilities.executor or _WORKERS
     pending = iter(groups)
@@ -346,9 +394,8 @@ def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits(),
     def collect(future, query):
         observations, reason = future.result()
         for index in groups[query]:
-            rows[index]['evidence'] = _row_result(entries[index], query, observations, reason)
-            if on_row is not None:
-                on_row(dict(rows[index]))
+            results_by_row[index][query.kind] = _row_result(entries[index], query, observations, reason)
+            finish_row(index)
         return reason
 
     try:
@@ -401,7 +448,9 @@ def verify_batch(inventory, *, capabilities: Capabilities, limits=BatchLimits(),
             wait(tuple(workers), timeout=grace)
     for index, row in enumerate(rows):
         if row['evidence'] is None:
-            row['evidence'] = _row_result(entries[index], None, (), stop or 'not_started')
+            for query in queries_by_row[index]:
+                results_by_row[index].setdefault(query.kind, _row_result(entries[index], query, (), stop or 'not_started'))
+            finish_row(index)
     processed = sum(row['evidence']['processing_status'] == 'processed' for row in rows)
     gap = len(rows) - processed
     status = 'cancelled' if stop in {'cancelled', 'canceled'} else 'partial' if gap else 'complete'

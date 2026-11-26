@@ -403,9 +403,11 @@ def test_legacy_known_address_migrates_while_conflicting_or_absent_address_stays
     missing["gid"] = "not_a_registered_artist"
     fid = library.project(source, rendered.manifest, rendered.blobs["svg"])
     opened = service.detail(fid, OWNER, 1)
-    by_gid = {row["pick_ids"][0]: row for row in opened["groups"] if row["kind"] == "series"}
+    by_gid = {row["pick_ids"][0]: row for row in opened["groups"] if row["kind"] == "series" and row["pick_ids"]}
     assert "color" in by_gid[left["gid"]]["properties"]
-    for rejected in (by_gid[right["gid"]], by_gid[missing["gid"]]):
+    unverified = [row for row in opened["groups"] if row["kind"] == "series" and not row["pick_ids"]]
+    assert sorted(row["label"] for row in unverified) == sorted([right["label"], missing["label"]])
+    for rejected in unverified:
         assert not rejected["properties"] and rejected["reason"]
         with pytest.raises(projects.ProjectError) as error:
             service.edit(fid, OWNER, 1, [command(rejected, "color", "#123456")], save=True)
@@ -542,6 +544,152 @@ def test_frozen_script_rejects_unverified_geometry_and_ambiguous_targets(library
         assert error.value.code == "group_property_unavailable"
         assert store.get_project(fid, OWNER) == before
         assert service.download(fid, OWNER, 1, "svg").body == original
+
+
+def corrupt_series(svg, manifest, variant, *, label="WL"):
+    from copy import deepcopy
+    manifest = deepcopy(manifest)
+    root = ET.fromstring(svg)
+    series = next(row for row in manifest["objects"] if row.get("label") == label and row["role"] == "series")
+    gid = series["gid"]
+    left, right = [root.find(f".//s:g[@id='{panel}']", SVG_NS) for panel in ("panel_p_left", "panel_p_right")]
+    node = left.find(f"s:g[@id='{gid}']", SVG_NS)
+    assert node is not None
+    if variant == "duplicate":
+        right.append(deepcopy(node))
+    elif variant == "cross_axis":
+        left.remove(node)
+        right.append(node)
+    else:
+        left.remove(node)
+    result = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    manifest["render_receipt"]["checks"]["svg"].update(size_bytes=len(result), sha256=hashlib.sha256(result).hexdigest())
+    return result, manifest
+
+
+@pytest.mark.parametrize("variant", ["duplicate", "cross_axis", "missing"])
+def test_saved_svg_fails_closed_without_unique_owned_target(library, variant):
+    spec = parse_spec({"panels": [leaf(panel="p_left"), leaf(panel="p_right")]})
+    resolved, provenance = resolve_spec(spec, owner_user_id=OWNER)
+    rendered = render_resolved(resolved, formats=("svg",), dpi=90)
+    svg, manifest = corrupt_series(rendered.blobs["svg"], rendered.manifest, variant)
+    fid = library.project(prepare_source(spec, resolved, provenance), manifest, svg)
+    initial = store.get_project(fid, OWNER)
+    left, right = [row for row in service.detail(fid, OWNER, 1)["groups"] if row["kind"] == "series" and row["label"] == "WL"]
+    assert not left["pick_ids"] and not left["properties"] and "color" in right["properties"]
+    with pytest.raises(projects.ProjectError, match="不支持该属性"):
+        service.edit(fid, OWNER, 1, [command(left, "color", "#123456")], save=True)
+    assert store.get_project(fid, OWNER) == initial
+
+
+@pytest.mark.parametrize("variant", ["duplicate", "cross_axis", "missing"])
+def test_replay_svg_fails_closed_before_publication_cas(library, monkeypatch, variant):
+    fid = library.spec({"panels": [leaf(panel="p_left"), leaf(panel="p_right")]})
+    initial = store.get_project(fid, OWNER)
+    published = list(library.published)
+    target = group(service.detail(fid, OWNER, 1), "WL", "series")
+    render = projects._render_edits
+
+    def corrupt(*args, **kwargs):
+        merged, changed, manifest, blobs = render(*args, **kwargs)
+        svg, manifest = corrupt_series(blobs["svg"], manifest, variant)
+        return merged, changed, manifest, {**blobs, "svg": svg}
+
+    monkeypatch.setattr(projects, "_render_edits", corrupt)
+    for save in (False, True):
+        with pytest.raises(projects.ProjectError) as error:
+            service.edit(fid, OWNER, 1, [command(target, "color", "#123456")], save=save)
+        assert error.value.code == "group_members_changed"
+    assert store.get_project(fid, OWNER) == initial and library.published == published
+
+
+def test_repeat_edit_preserves_source_key_and_exact_artifact_sha(library):
+    fid = library.spec({"panels": [leaf(panel="p_left"), leaf(panel="p_right")]})
+    before = store.get_project(fid, OWNER)
+    target = group(service.detail(fid, OWNER, 1), "WL", "series")
+    svg_file = library.get(before["exports_json"]["svg"]["file_id"], OWNER)["path"]
+    original_sha = hashlib.sha256(svg_file.read_bytes()).hexdigest()
+    edits = [command(target, "color", "#123456")]
+    first = service.edit(fid, OWNER, 1, edits, save=True)
+    first_svg = service.download(fid, OWNER, 2, "svg")
+    second = service.edit(fid, OWNER, 2, edits, save=True)
+    second_svg = service.download(fid, OWNER, 3, "svg")
+    after = store.get_project(fid, OWNER)
+    assert first["render_version"] == 2 and second["render_version"] == 3
+    assert group(second, "WL", "series")["id"] == target["id"]
+    assert second_svg.digest == first_svg.digest == after["exports_json"]["svg"]["sha256"]
+    assert hashlib.sha256(svg_file.read_bytes()).hexdigest() == original_sha
+    assert before["document_json"]["source_sha256"] == after["document_json"]["source_sha256"]
+    keys = lambda row: {obj["gid"]: obj["presentation_key"] for obj in row["manifest_json"]["objects"]
+                        if obj["role"] in {"series", "axes"}}
+    assert keys(before) == keys(after) and len(set(keys(after).values())) == 8
+
+
+def test_deliberate_hide_is_tree_only_and_restore_requires_exact_node(library, monkeypatch):
+    fid = library.spec({"panels": [leaf(panel="p_left"), leaf(panel="p_right")]})
+    target = group(service.detail(fid, OWNER, 1), "WL", "series")
+    gid = target["pick_ids"][0]
+    changes = [command(target, "visible", False)]
+    render = projects._render_edits
+
+    def hide_visible_sibling(*args, **kwargs):
+        edits, changed, manifest, blobs = render(*args, **kwargs)
+        svg, manifest = corrupt_series(blobs["svg"], manifest, "missing", label="CK")
+        next(row for row in manifest["objects"] if row.get("label") == "CK")["visible"] = False
+        return edits, changed, manifest, {**blobs, "svg": svg}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(projects, "_render_edits", hide_visible_sibling)
+        with pytest.raises(projects.ProjectError) as error:
+            service.edit(fid, OWNER, 1, changes, save=True)
+        assert error.value.code == "group_members_changed"
+        assert store.get_project(fid, OWNER)["render_version"] == 1
+    preview = service.edit(fid, OWNER, 1, changes)
+    assert group(preview, "WL", "series")["properties"] == ["visible"]
+    assert not group(preview, "WL", "series")["pick_ids"]
+    assert not any(node.get("id") == gid for node in ET.fromstring(preview["svg"]).iter())
+    service.edit(fid, OWNER, 1, changes, save=True)
+    hidden = group(service.detail(fid, OWNER, 2), "WL", "series")
+    assert hidden["id"] == target["id"] and not hidden["pick_ids"] and hidden["values"]["visible"] is False
+
+    def corrupt(*args, **kwargs):
+        edits, changed, manifest, blobs = render(*args, **kwargs)
+        svg, manifest = corrupt_series(blobs["svg"], manifest, "missing")
+        return edits, changed, manifest, {**blobs, "svg": svg}
+
+    restore = [command(hidden, "visible", True)]
+    with monkeypatch.context() as patch:
+        patch.setattr(projects, "_render_edits", corrupt)
+        with pytest.raises(projects.ProjectError) as error:
+            service.edit(fid, OWNER, 2, restore, save=True)
+        assert error.value.code == "group_members_changed"
+        assert store.get_project(fid, OWNER)["render_version"] == 2
+    reopened = group(service.edit(fid, OWNER, 2, restore, save=True), "WL", "series")
+    assert reopened["id"] == hidden["id"] and reopened["pick_ids"] == target["pick_ids"]
+    assert reopened["values"]["visible"] is True
+
+
+def test_legacy_native_replay_rejects_actual_svg_axes_geometry_change(library, monkeypatch):
+    source, manifest, svg, refs = native_multipanel(library, monkeypatch)
+    fid = library.project(source, manifest, svg, kind="script", refs=refs)
+    target = group(service.detail(fid, OWNER, 1), "Trend A", "series")
+    render = projects._render_edits
+
+    def moved_patch(*args, **kwargs):
+        edits, changed, manifest, blobs = render(*args, **kwargs)
+        root = ET.fromstring(blobs["svg"])
+        group = root.find(".//s:g[@id='axes_0']", SVG_NS)
+        assert group is not None
+        group[0].set("transform", "translate(1 0)")
+        svg = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        manifest["render_receipt"]["checks"]["svg"].update(size_bytes=len(svg), sha256=hashlib.sha256(svg).hexdigest())
+        return edits, changed, manifest, {**blobs, "svg": svg}
+
+    monkeypatch.setattr(projects, "_render_edits", moved_patch)
+    with pytest.raises(projects.ProjectError) as error:
+        service.edit(fid, OWNER, 1, [command(target, "color", "#123456")], save=True)
+    assert error.value.code == "group_members_changed"
+    assert store.get_project(fid, OWNER)["render_version"] == 1
 
 
 def serve_fixture(path, port):

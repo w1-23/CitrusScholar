@@ -224,11 +224,18 @@ def test_auth11_session_ownership(api, monkeypatch):
 
 
 def test_auth12_job_ownership(api, monkeypatch):
-    _, token = _make_user()
+    owner, token = _make_user()
+    other, _ = _make_user("different-owner")
     from src.core import jobs as jobs_mod
-    monkeypatch.setattr(jobs_mod, "get_job", lambda job_id: None)
-    response = api.client.get("/jobs/foreign-job", cookies=_cookies(token))
-    assert response.status_code == 404
+    monkeypatch.setattr(jobs_mod, "_DB_PATH", api.tmp / "state" / "sessions.sqlite3")
+    foreign = jobs_mod.claim_job("other-session", "other-request", owner_user_id=other)
+    owned = jobs_mod.claim_job("own-session", "own-request", owner_user_id=owner)
+    original = jobs_mod._connect
+    monkeypatch.setattr(jobs_mod, "_connect", lambda: pytest.fail("GET opened a writer"))
+    assert api.client.get(f"/jobs/{foreign.job_id}", cookies=_cookies(token)).status_code == 404
+    assert api.client.get("/jobs/missing-job", cookies=_cookies(token)).status_code == 404
+    assert api.client.get(f"/jobs/{owned.job_id}", cookies=_cookies(token)).status_code == 200
+    monkeypatch.setattr(jobs_mod, "_connect", original)
 
 
 def test_auth13_account_lease_failure_maps_to_409(api, monkeypatch):

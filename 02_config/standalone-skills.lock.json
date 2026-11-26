@@ -1,9 +1,15 @@
 {
   "research-question-answering": {
     "repository": "https://github.com/w1-23/research-question-answering.git",
-    "commit": "484b598cfbb2b041ec199abe8ae2ebf818db59e5",
+    "commit": "4cfe9e8ed2e2883e7b8f02db8c59bbc3df61d67f",
     "dependencies": {
       "requirements.lock": "e6c1144611ffee2a14e6f3bcf8417975e596ea80bd500967b0fe31d3dd1bfc5c"
+    },
+    "source_bundle": {
+      "base_commit": "484b598cfbb2b041ec199abe8ae2ebf818db59e5",
+      "file": "research-question-answering.bundle",
+      "sha256": "e2ffac3176928999bdbf009781007d6a0879999bfd587983c3c7b6704570e363",
+      "ref": "refs/heads/fix/8043-skill-convergence"
     }
   },
   "reference-verification": {

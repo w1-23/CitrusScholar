@@ -12,7 +12,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, model_validator
 
-from src.core.task_events import TaskConflict, _append, _job, canonical, input_hash, transaction
+from src.core.task_events import TaskConflict, _append, _job, canonical, current_terminal_event, input_hash, read_transaction, recovery_cursor, transaction
 
 
 class QuestionConflict(TaskConflict):
@@ -87,14 +87,28 @@ class QuestionAnswer(BaseModel):
 
 
 def init_schema(conn):
-    conn.execute("""CREATE TABLE IF NOT EXISTS task_questions (
-        id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, owner_user_id INTEGER NOT NULL,
-        session_id TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL,
-        question TEXT NOT NULL, context TEXT NOT NULL, answer TEXT NOT NULL DEFAULT '',
-        answer_hash TEXT NOT NULL DEFAULT '', client_request_id TEXT NOT NULL DEFAULT '',
-        child_job_id TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
-        expires_at REAL NOT NULL, pin_until REAL NOT NULL DEFAULT 0)""")
+    def create():
+        conn.execute("""CREATE TABLE IF NOT EXISTS task_questions (
+            id TEXT PRIMARY KEY, job_id TEXT NOT NULL, owner_user_id INTEGER NOT NULL,
+            session_id TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL,
+            question TEXT NOT NULL, context TEXT NOT NULL, answer TEXT NOT NULL DEFAULT '',
+            answer_hash TEXT NOT NULL DEFAULT '', client_request_id TEXT NOT NULL DEFAULT '',
+            child_job_id TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+            expires_at REAL NOT NULL, pin_until REAL NOT NULL DEFAULT 0,
+            recovery_cursor INTEGER NOT NULL DEFAULT 0, UNIQUE(job_id,recovery_cursor))""")
+
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(task_questions)")]
+    if columns and "recovery_cursor" not in columns:
+        # Before this schema a job could only ask before its first done event.
+        conn.execute("ALTER TABLE task_questions RENAME TO task_questions_before_generations")
+        create()
+        fields = ",".join(columns)
+        conn.execute(f"INSERT INTO task_questions({fields}) SELECT {fields} FROM task_questions_before_generations")
+        conn.execute("DROP TABLE task_questions_before_generations")
+    elif not columns:
+        create()
     conn.execute("CREATE INDEX IF NOT EXISTS idx_task_questions_expiry ON task_questions(status,expires_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_questions_child ON task_questions(child_job_id) WHERE child_job_id<>''")
 
 
 def _authorized(conn, job_id, owner_user_id, session_id):
@@ -107,6 +121,7 @@ def _authorized(conn, job_id, owner_user_id, session_id):
 def _view(row):
     return json.loads(row["question"]) | {"id": row["id"], "job_id": row["job_id"],
         "version": row["version"], "status": row["status"], "expires_at": row["expires_at"],
+        "recovery_cursor": row["recovery_cursor"],
         "child_job_id": row["child_job_id"],
         "answer": json.loads(row["answer"]) if row["answer"] else None}
 
@@ -279,16 +294,18 @@ def create_question(job_id, *, owner_user_id, session_id, prompt, options,
     try:
         with transaction() as conn:
             job = _authorized(conn, job_id, owner_user_id, session_id)
-            existing = conn.execute("SELECT * FROM task_questions WHERE job_id=?", (job_id,)).fetchone()
+            cursor = recovery_cursor(conn, job_id)
+            existing = conn.execute("SELECT * FROM task_questions WHERE job_id=? AND recovery_cursor=?",
+                                    (job_id, cursor)).fetchone()
             if existing:
                 if json.loads(existing["question"]) != data:
                     raise QuestionConflict("question_already_exists")
                 return _view(existing)
-            if job["status"] not in {"running", "detached"} or conn.execute(
-                    "SELECT 1 FROM task_events WHERE job_id=? AND event='done'", (job_id,)).fetchone():
+            if job["status"] not in {"running", "detached"} or current_terminal_event(conn, job_id) is not None:
                 raise QuestionConflict("task_not_running")
-            conn.execute("INSERT INTO task_questions(id,job_id,owner_user_id,session_id,version,status,question,context,created_at,expires_at,pin_until) VALUES (?,?,?,?,1,'pending',?,?,?,?,?)",
-                (identity, job_id, owner_user_id, session_id, canonical(data), canonical(context), now, now+ttl_seconds, now+ttl_seconds))
+            conn.execute("INSERT INTO task_questions(id,job_id,owner_user_id,session_id,version,status,question,context,created_at,expires_at,pin_until,recovery_cursor) VALUES (?,?,?,?,1,'pending',?,?,?,?,?,?)",
+                (identity, job_id, owner_user_id, session_id, canonical(data), canonical(context), now,
+                 now+ttl_seconds, now+ttl_seconds, cursor))
             row = conn.execute("SELECT * FROM task_questions WHERE id=?", (identity,)).fetchone()
             question = _view(row)
             pin_attempted = _has_inputs(context)
@@ -310,7 +327,8 @@ def create_question(job_id, *, owner_user_id, session_id, prompt, options,
 def save_question_context(job_id, context):
     """Called at the graph pause boundary, after all paired tool receipts exist."""
     with transaction() as conn:
-        row = conn.execute("SELECT * FROM task_questions WHERE job_id=? AND status='pending'", (job_id,)).fetchone()
+        row = conn.execute("SELECT * FROM task_questions WHERE job_id=? AND recovery_cursor=? AND status='pending'",
+                           (job_id, recovery_cursor(conn, job_id))).fetchone()
         if row is None:
             raise QuestionConflict("pending_question_not_found")
         previous = json.loads(row["context"])
@@ -335,19 +353,25 @@ def save_question_context(job_id, context):
         encoded_context = canonical(context)
         _pin_scripts(row["id"], row["owner_user_id"], row["session_id"], context,
                      previous_refs=previous_scripts)
-        conn.execute("UPDATE task_questions SET context=? WHERE job_id=? AND status='pending'",
-                     (encoded_context, job_id))
+        conn.execute("UPDATE task_questions SET context=? WHERE id=? AND status='pending'",
+                     (encoded_context, row["id"]))
 
 
-def list_questions(job_id, *, owner_user_id, session_id):
-    expire_questions()
-    with transaction() as conn:
+def list_questions(job_id, *, owner_user_id, session_id, conn=None):
+    with read_transaction(conn) as conn:
         _authorized(conn, job_id, owner_user_id, session_id)
         result = []
-        for row in conn.execute("SELECT * FROM task_questions WHERE job_id=?", (job_id,)):
+        for row in conn.execute("SELECT * FROM task_questions WHERE job_id=? AND recovery_cursor=?",
+                                (job_id, recovery_cursor(conn, job_id))):
             view = _view(row)
+            # An observation can report time expiry without releasing a pin,
+            # cancelling a job or waiting for the lifecycle sweep to write.
+            if view["status"] == "pending" and row["expires_at"] <= time.time():
+                view["status"] = "expired"
             if row["child_job_id"]:
-                child = conn.execute("SELECT status FROM task_jobs WHERE job_id=?", (row["child_job_id"],)).fetchone()
+                child = conn.execute("SELECT status FROM task_jobs WHERE job_id=? AND question_id=? AND "
+                    "parent_job_id=? AND owner_user_id=? AND session_id=?",
+                    (row["child_job_id"], row["id"], job_id, owner_user_id, session_id)).fetchone()
                 view["child_status"] = child[0] if child else ""
             result.append(view)
         return result
@@ -355,15 +379,15 @@ def list_questions(job_id, *, owner_user_id, session_id):
 
 def queue_wait_state(job_id, *, owner_user_id, session_id):
     """Publish only the scheduler's dispatch or settlement evidence."""
-    with transaction() as conn:
+    with read_transaction() as conn:
         _authorized(conn, job_id, owner_user_id, session_id)
         rows = conn.execute("""SELECT q.status, q.child_job_id, q.expires_at, q.pin_until,
                                       c.status AS child_status, c.error AS child_error
             FROM task_questions q LEFT JOIN task_jobs c ON c.job_id=q.child_job_id
                   AND c.question_id=q.id AND c.parent_job_id=q.job_id
                   AND c.owner_user_id=q.owner_user_id AND c.session_id=q.session_id
-            WHERE q.job_id=? AND q.owner_user_id=? AND q.session_id=? LIMIT 2""",
-            (job_id, owner_user_id, session_id)).fetchall()
+            WHERE q.job_id=? AND q.owner_user_id=? AND q.session_id=? AND q.recovery_cursor=? LIMIT 2""",
+            (job_id, owner_user_id, session_id, recovery_cursor(conn, job_id))).fetchall()
         if len(rows) != 1:
             return "unknown", ""
         row = rows[0]
@@ -399,7 +423,7 @@ def answer_question(job_id, question_id, *, owner_user_id, session_id, version,
         if row is None:
             raise QuestionConflict("question_not_found")
         # Version identifies the prompt; answering never silently changes it.
-        if row["version"] != version:
+        if row["recovery_cursor"] != recovery_cursor(conn, job_id) or row["version"] != version:
             raise QuestionConflict("question_version_conflict")
         if row["status"] in {"answered", "cancelled"}:
             if row["answer_hash"] != digest:
@@ -451,9 +475,12 @@ def answer_question(job_id, question_id, *, owner_user_id, session_id, version,
 
 def get_continuation(child_job_id, *, owner_user_id, session_id):
     """Fresh graph input, never a replay/checkpoint or old tool call execution."""
-    with transaction() as conn:
+    with read_transaction() as conn:
         child = _authorized(conn, child_job_id, owner_user_id, session_id)
-        row = conn.execute("SELECT * FROM task_questions WHERE child_job_id=? AND status='answered'", (child_job_id,)).fetchone()
+        row = conn.execute("SELECT * FROM task_questions WHERE child_job_id=? AND id=? AND job_id=? "
+                           "AND owner_user_id=? AND session_id=? AND recovery_cursor=? AND status='answered'",
+                           (child_job_id, child["question_id"], child["parent_job_id"], owner_user_id,
+                            session_id, recovery_cursor(conn, child["parent_job_id"]))).fetchone()
         if row is None:
             raise QuestionConflict("continuation_not_found")
         context, answer, question = json.loads(row["context"]), json.loads(row["answer"]), _view(row)
@@ -528,7 +555,7 @@ def supersede_pending_questions(new_job_id, *, owner_user_id, session_id):
 
 
 def expire_questions(now=None):
-    """Host may call periodically; reads/answers also sweep. Bounded DB pins end here."""
+    """Host calls periodically; answer and queue lifecycle may also sweep. Bounded DB pins end here."""
     now = time.time() if now is None else now
     with transaction() as conn:
         expired = conn.execute("SELECT * FROM task_questions WHERE pin_until>0 AND pin_until<=?", (now,)).fetchall()

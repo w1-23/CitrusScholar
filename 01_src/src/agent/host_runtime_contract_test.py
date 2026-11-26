@@ -95,7 +95,7 @@ class DeliveryDispatchTests(unittest.IsolatedAsyncioTestCase):
 
                 with (patch.object(tracing, "get_user_id", return_value=7),
                       patch.object(tracing, "get_job_id", return_value="fixture-run"),
-                      patch.object(jobs, "get_job", return_value={"session_id": "fixture-session"}),
+                      patch.object(jobs, "get_job", return_value={"session_id": "fixture-session", "owner_user_id": 7}),
                       patch.object(task_events, "start_operation", return_value=("operation-one", "lease")),
                       patch.object(task_events, "finish_operation") as finish,
                       patch.object(task_events, "remaining_seconds", return_value=10),
@@ -125,7 +125,7 @@ class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(tracing, "get_user_id", return_value=IDENTITY.owner_user_id))
         self.enterContext(patch.object(tracing, "get_session_id", return_value=IDENTITY.session_id))
         self.enterContext(patch.object(tracing, "get_job_id", return_value=IDENTITY.run_id))
-        self.enterContext(patch.object(jobs, "get_job", return_value={"session_id": IDENTITY.session_id}))
+        self.enterContext(patch.object(jobs, "get_job", return_value={"session_id": IDENTITY.session_id, "owner_user_id": IDENTITY.owner_user_id}))
         self.enterContext(patch.object(task_events, "start_operation", return_value=("operation-one", "lease")))
         self.finish = self.enterContext(patch.object(task_events, "finish_operation"))
         self.enterContext(patch("src.core.account_leases.account_lease", return_value=nullcontext()))

@@ -23,9 +23,10 @@ EVIDENCE = ("detector", "reason", "message", "notes", "formula", "statistics", "
             "batch_column", "provider", "status", "record_id", "evidence_id", "title", "doi", "url",
             "queried_at", "source_file_hash", "source_id", "source", "sources", "method", "grade", "length", "where")
 COVERAGE = ("check", "status", "scope", "record_index", "region_id", "reason", "column", "n", "n_rows",
-            "n_images", "method", "detector", "limits", "recalculation", "missing_cache_count", "group",
+            "n_images", "method", "detector", "limits", "recalculation", "missing_cache_count", "findings_scope", "applied", "group",
             "rows", "distinct_biological_units", "rows_without_unit", "source_file_hashes")
-RECORD = ("record_index", "status", "evidence_ids", "evidence_grade", "problems", "reason", "flags", "fields_checked")
+RECORD = ("record_index", "status", "evidence_ids", "evidence_grade", "problems", "reason", "flags", "fields_checked",
+          "identifier_checks", "retraction_status")
 ATTEMPT = ("provider", "status", "queried_at", "url", "reason", "http_status", "record_id")
 _PRIVATE_KEYS = re.compile(r"(?:^|_)(?:path|paths|body|raw|logs?|headers|secret|token|credentials?|options|password)(?:$|_)", re.I)
 _SAFE_FIELD = re.compile(r"[\w .-]{1,64}", re.UNICODE)
@@ -69,14 +70,17 @@ def project_finding(finding, *, location_limit=None):
     row["evidence"] = _project(finding.get("evidence"), EVIDENCE)
     locations = finding.get("locations") or []
     row["locations"] = [_project(location, LOCATIONS) for location in locations[:location_limit]]
-    if location_limit is not None and len(locations) > location_limit:
-        row["locations_total"] = len(locations)
+    total = finding.get("locations_total")
+    if type(total) is not int or total < len(locations):
+        total = len(locations)
+    if total > len(row["locations"]):
+        row["locations_total"] = total
     return row
 
 
 def _project_record(record, *, attempt_limit=12):
     result = _project(record, RECORD)
-    result["submitted"] = _project(record.get("submitted"), ("doi", "title", "year", "author", "authors", "journal", "raw_reference"))
+    result["submitted"] = _project(record.get("submitted"), ("doi", "arxiv_id", "title", "year", "author", "authors", "journal", "raw_reference"))
     result["attempts"] = [_project(a, ATTEMPT) for a in (record.get("attempts") or [])[:attempt_limit]]
     return result
 
@@ -84,6 +88,8 @@ def _project_record(record, *, attempt_limit=12):
 def summary(report, *, findings_offset=0, findings_limit=36):
     result = {"status": report["status"], "limitations": _bounded(report.get("limitations") or [], text=300),
               "execution": _project(report.get("execution"), ("skill", "version", "python"))}
+    if type(report.get("findings_omitted")) is int and report["findings_omitted"] > 0:
+        result["findings_omitted"] = report["findings_omitted"]
     for key, build in (("findings", lambda f: project_finding(f, location_limit=16)),
                        ("coverage", lambda row: _project(row, COVERAGE)),
                        ("evidence", lambda row: _project(row, EVIDENCE)), ("records", _project_record)):
@@ -140,7 +146,7 @@ def _render(payload, fmt, *, literature):
             fields = (*RECORD, "submitted", "attempts", "host_coverage", "worker_status")
             rows = payload["records"]
         else:
-            fields = ("finding_id", "rule_id", "severity", "observed_value", "expected_value", "locations", "evidence")
+            fields = ("finding_id", "rule_id", "severity", "observed_value", "expected_value", "locations", "locations_total", "evidence")
             rows = payload["findings"]
         return _write_csv(rows, fields, fmt)
     if fmt == "xlsx" and literature:
@@ -245,6 +251,7 @@ def publish_report(report, *, execution_id, skill_id, fmt, receipt, host_coverag
             annotate_record_coverage(record, host_coverage)
     payload = {"execution_id": execution_id, "skill_id": skill_id, "report_sha256": source["sha256"],
                "status": report["status"], "limitations": _bounded(report.get("limitations") or [], items=100),
+               "findings_omitted": report.get("findings_omitted", 0),
                "coverage": [_project(x, COVERAGE) for x in report.get("coverage", [])],
                "findings": findings, "evidence": [_project(x, EVIDENCE) for x in report.get("evidence", [])],
                "records": records}

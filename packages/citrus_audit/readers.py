@@ -698,9 +698,10 @@ def _read_region(data, name, *, bounds, header_rows, sheet_name='', region_id=''
             match = re.fullmatch(r'[+-]?(?:[0-9]+(?:\.([0-9]*))?|\.([0-9]+))(?:[eE]([+-]?[0-9]+))?',
                                  value.strip())
             if match and _number(value)[0] is not None:
-                evidence.append({'row': row, 'column': column, 'raw': value,
-                                 'places': len(match[1] or match[2] or ''),
-                                 'exp': int(match[3] or 0)})
+                item = {'row': row, 'column': column, 'raw': value,
+                        'places': len(match[1] or match[2] or ''), 'exp': int(match[3] or 0)}
+                evidence.append(item)
+                evidence_by_column[column].append(item)
     by_column = {}
     for offset, (column, label) in enumerate(zip(column_numbers, header)):
         actual = sum(_number(row[offset])[0] is not None for row in values)

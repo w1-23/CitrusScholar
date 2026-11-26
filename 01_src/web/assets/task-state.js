@@ -31,7 +31,7 @@
   // Event arrival is ordered separately from the public process projection.
   // All aliases identify one logical operation; attempts remain separate facts.
   function createProcess() {
-    var entries = [], actions = [], seen = new Set(), nextId = 0, currentPlan = null, resolutions = new Map();
+    var entries = [], actions = [], seen = new Set(), nextId = 0, currentPlan = null, resolutions = new Map(), generation = "";
     function resolution(data) {
       var changed = false;
       list(data && data.resolutions).forEach(function (value) {
@@ -44,7 +44,7 @@
         var record = {tool_call_id: value.tool_call_id, resolved_by_tool_call_id: value.resolved_by_tool_call_id,
           resolution: value.resolution, seq: data.seq};
         resolutions.set(value.tool_call_id, record);
-        actions.forEach(function (item) { if (item.data.tool_call_id === record.tool_call_id) item.resolution = record; });
+        actions.forEach(function (item) { if (item.generation === generation && item.data.tool_call_id === record.tool_call_id) item.resolution = record; });
         changed = true;
       });
       return changed;
@@ -52,12 +52,13 @@
     function note(text, id, metadata) {
       metadata = metadata || {};
       if (typeof text !== 'string' || metadata.visibility !== 'public' || (metadata.origin !== 'model' && !(metadata.origin === 'host' && metadata.category)) || metadata.internal === true || metadata.private === true) return null;
-      var identity = metadata.note_id ? 'note:' + metadata.note_id : id;
+      var key = metadata.note_id ? 'note:' + metadata.note_id : id;
+      var identity = key && generation + '/' + key;
       if (!text || identity && seen.has(identity)) return null;
       if (identity) seen.add(identity);
       var last = entries[entries.length - 1];
-      if (!identity && last && last.kind === 'note' && last.text === text) return last;
-      var item = {kind: 'note', id: ++nextId, text: text,
+      if (!identity && last && last.kind === 'note' && last.generation === generation && last.text === text) return last;
+      var item = {kind: 'note', id: ++nextId, text: text, generation: generation,
         note_id: metadata.note_id || '', phase: metadata.phase || '', step_id: metadata.step_id || '',
         category: metadata.origin === 'host' ? metadata.category : '',
         model_step: metadata.model_step, tool_call_ids: list(metadata.tool_call_ids).map(String)};
@@ -83,10 +84,10 @@
     function action(data) {
       var keys = [data.logical_key, data.operation_id, data.tool_call_id].concat(list(data.aliases)).filter(Boolean).map(String);
       var attempt = String(data.attempt || data.attempts || 1);
-      var matches = actions.filter(function (item) { return item.attempt === attempt && keys.some(function (key) { return item.aliases.indexOf(key) >= 0; }); });
+      var matches = actions.filter(function (item) { return item.generation === generation && item.attempt === attempt && keys.some(function (key) { return item.aliases.indexOf(key) >= 0; }); });
       var item = matches[0];
       if (!item) {
-        item = {kind: 'action', id: ++nextId, attempt: attempt, aliases: [], data: {}};
+        item = {kind: 'action', id: ++nextId, generation: generation, attempt: attempt, aliases: [], data: {}};
         entries.push(item); actions.push(item);
       }
       // A later event can bridge a tool_call_id and operation_id already seen.
@@ -103,7 +104,15 @@
       item.resolution = resolutions.get(item.data.tool_call_id) || null;
       return item;
     }
-    return {entries: entries, note: note, action: action, plan: plan, resolution: resolution, currentPlan: function () { return currentPlan; }};
+    function begin(key) {
+      if (!key || key === generation) return false;
+      generation = key; currentPlan = null; resolutions.clear();
+      actions.forEach(function (item) {
+        if (['running', 'resuming'].indexOf(item.data.status) >= 0) item.data.status = 'interrupted';
+      });
+      return true;
+    }
+    return {begin: begin, entries: entries, note: note, action: action, plan: plan, resolution: resolution, currentPlan: function () { return currentPlan; }};
   }
   // Presentation only: queue and job state remain authoritative. Time starts at
   // the durable execution stamp, never at submission or observer attachment.
@@ -112,7 +121,7 @@
     var terminalStatus = state.display_status || (terminal.indexOf(status) >= 0 ? status : '');
     var jobMatches = !entry || state.job_id === (entry.active_child_job_id || entry.job_id);
     if (entry && !jobMatches) terminalStatus = '';
-    var start = jobMatches && state.started_at || (entry && !entry.active_child_job_id ? entry.started_at : 0);
+    var start = jobMatches && state.started_at || (entry && !entry.active_child_job_id && !state.recovery_cursor ? entry.started_at : 0);
     var execution = jobMatches && (status === 'running' || status === 'detached') || phase === 'running' && Number(start) > 0;
     var result = {kind: '', start: 0, finish: 0};
     if (phase === 'queued' || phase === 'claimed' || phase === 'reconcile_required') return result;
@@ -253,8 +262,8 @@
     options = options || {};
     var state = {job_id: '', cursor: 0, task_version: 0, applied_version: 0, status: '', started_at: 0, finished_at: 0,
       display_status: '', terminal_snapshot: null, question: null, pending_updates: [], not_applied_updates: [], operations: [], approvals: [],
-      artifact_delivery: null};
-    var pending = new Map(), subscribers = [], context = createContext(options);
+      artifact_delivery: null, recovery_cursor: 0};
+    var pending = new Map(), subscribers = [], recoveryFloor = 0, context = createContext(options);
     state.context_snapshot = null;
     function notify() { subscribers.slice().forEach(function (fn) { fn(state); }); }
     // Ordered events own the newest delivery. A snapshot without a sequence
@@ -300,6 +309,7 @@
       // request scoping applies to events (foreignRequest), not snapshots.
       if (Number.isSafeInteger(job.event_cursor) && job.event_cursor < state.cursor) return false;
       if (Number.isSafeInteger(job.task_version) && job.task_version < state.task_version) return false;
+      if (Number.isSafeInteger(job.recovery_cursor) && job.recovery_cursor < state.recovery_cursor) return false;
       if (job.job_id) state.job_id = String(job.job_id);
       recordTimes(job);
       ['task_version', 'applied_version'].forEach(function (key) {
@@ -350,7 +360,11 @@
       });
       if (type === 'job') state.status = String(data.status || 'running');
       if (type === 'agent_recovery' && data.status === 'admitted' && Number.isSafeInteger(data.seq)) {
+        state.recovery_cursor = data.seq;
         state.status = 'running'; state.display_status = ''; state.terminal_snapshot = null;
+        state.question = null; state.approvals = []; state.operations = []; state.artifact_delivery = null;
+        state.started_at = 0; state.finished_at = 0; recordTimes(data);
+        context = createContext(options); state.context_snapshot = null;
         var reopened = Array.isArray(data.reactivated_updates) ? data.reactivated_updates.filter(function (item) {
           return Number.isSafeInteger(item.version) && item.version > state.applied_version;
         }) : [];
@@ -400,6 +414,7 @@
       }
     }
     function dispatch(frame) {
+      if (Number.isSafeInteger(frame.data.seq) && frame.data.seq < recoveryFloor) return;
       reduce(frame.event, frame.data);
       if (options.onEvent) options.onEvent(frame.event, frame.data);
     }
@@ -421,12 +436,15 @@
       notify(); return true;
     }
     function reset(jobId) {
-      pending.clear(); context = createContext(options); state.context_snapshot = null;
+      pending.clear(); recoveryFloor = 0; context = createContext(options); state.context_snapshot = null;
       Object.assign(state, {job_id: jobId, cursor: 0, task_version: 0, applied_version: 0, status: '', started_at: 0, finished_at: 0,
         display_status: '', terminal_snapshot: null, question: null, approvals: [], operations: [], pending_updates: [], not_applied_updates: [],
-        artifact_delivery: null});
+        artifact_delivery: null, recovery_cursor: 0});
     }
     return {state: state, receive: receive, hydrate: hydrate,
+      setRecoveryFloor: function (cursor) {
+        if (Number.isSafeInteger(cursor) && cursor > recoveryFloor) recoveryFloor = cursor;
+      },
       hasGap: function () { return pending.size > 0; },
       subscribe: function (fn) { subscribers.push(fn); return function () { subscribers = subscribers.filter(function (item) { return item !== fn; }); }; },
       resetJob: function (jobId) { reset(jobId); notify(); },

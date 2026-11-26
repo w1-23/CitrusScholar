@@ -294,7 +294,7 @@ def _question_option(value):
 
 def project_public_question(value):
     row = _object(value)
-    result = project_fields(row, ids="id job_id status child_job_id", texts="prompt", numbers="version expires_at",
+    result = project_fields(row, ids="id job_id status child_job_id", texts="prompt", numbers="version expires_at recovery_cursor",
                             bools="multi_select allow_text", nullable="answer")
     _set_array(result, row, "options", lambda rows: _array(rows, _question_option))
     def answer(item):

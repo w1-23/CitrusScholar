@@ -102,7 +102,7 @@ class ScriptRuntimeRegistryProofTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(tracing, "get_session_id", return_value=SESSION))
         self.enterContext(patch.object(tracing, "get_job_id", return_value=JOB))
         self.enterContext(patch.object(tracing, "get_client_request_id", return_value="request"))
-        self.enterContext(patch.object(jobs, "get_job", return_value={"session_id": SESSION}))
+        self.enterContext(patch.object(jobs, "get_job", return_value={"session_id": SESSION, "owner_user_id": OWNER}))
         self.enterContext(patch.object(task_events, "start_operation",
                                        return_value=("operation-one", "lease")))
         self.enterContext(patch.object(task_events, "finish_operation"))

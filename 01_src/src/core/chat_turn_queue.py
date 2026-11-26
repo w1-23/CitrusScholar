@@ -26,11 +26,11 @@ import logging
 import sqlite3
 import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 
-from src.core import jobs
+from src.core import jobs, task_events
 
 logger = logging.getLogger(__name__)
 
@@ -452,6 +452,7 @@ def _legacy_blocker(conn, owner_user_id: int, session_id: str):
         "AND c.question_id=q.id AND c.parent_job_id=q.job_id "
         "AND c.owner_user_id=q.owner_user_id AND c.session_id=q.session_id "
         "WHERE q.job_id=j.job_id AND q.owner_user_id=j.owner_user_id AND q.session_id=j.session_id "
+                        "AND q.recovery_cursor=COALESCE((SELECT MAX(e.seq) FROM task_events e WHERE e.job_id=q.job_id AND e.event='agent_recovery'),0) "
         "AND ((q.status IN ('cancelled','expired') AND q.child_job_id='') "
         "OR (q.status='answered' AND c.job_id IS NOT NULL)))))) "
         "ORDER BY j.created_at LIMIT 1",
@@ -465,8 +466,9 @@ def _legacy_blocker(conn, owner_user_id: int, session_id: str):
             "current_step": row["current_step"],
         }
     question = conn.execute(
-        "SELECT id,job_id FROM task_questions WHERE owner_user_id=? "
-        "AND session_id=? AND status='pending' AND expires_at>? LIMIT 1",
+        "SELECT id,job_id FROM task_questions q WHERE owner_user_id=? "
+        "AND session_id=? AND status='pending' AND expires_at>? "
+        "AND q.recovery_cursor=COALESCE((SELECT MAX(e.seq) FROM task_events e WHERE e.job_id=q.job_id AND e.event='agent_recovery'),0) LIMIT 1",
         (owner_user_id, session_id, time.time()),
     ).fetchone()
     if question is not None:
@@ -634,20 +636,56 @@ def get_turn(*, owner_user_id: int, session_id: str,
              client_request_id: str) -> dict | None:
     _validate_identity(owner_user_id, session_id)
     _validate_client_request_id(client_request_id)
-    with _transaction() as conn:
+    with jobs.read_transaction() as conn:
         row = _scoped(conn, owner_user_id, session_id, client_request_id)
         if row is None:
             return None
         return _with_position(conn, _decode(row, include_payload=True))
 
 
+def admission_receipt(*, owner_user_id: int, session_id: str, client_request_id: str) -> dict | None:
+    """Check the owner-level id before staging any bytes, links or pins."""
+    with jobs.read_transaction() as conn:
+        row = conn.execute("SELECT * FROM chat_turn_queue WHERE owner_user_id=? AND client_request_id=?",
+                           (owner_user_id, client_request_id)).fetchone()
+        if row is not None:
+            if row["session_id"] != session_id:
+                raise TurnPayloadConflict("turn_payload_conflict")
+            _require_root_job(conn, row)
+            return _with_position(conn, _decode(row, include_payload=True))
+        if conn.execute("SELECT 1 FROM task_jobs WHERE owner_user_id=? AND client_request_id=?",
+                        (owner_user_id, client_request_id)).fetchone():
+            raise TurnPayloadConflict("turn_payload_conflict")
+        return None
+
+
+def continuation_baseline(*, owner_user_id: int, session_id: str, client_request_id: str) -> dict | None:
+    """Accept only the exact executed turn in the current visible generation."""
+    with jobs.read_transaction() as conn:
+        row = _scoped(conn, owner_user_id, session_id, client_request_id)
+        if row is None:
+            return None
+        if _require_root_job(conn, row)["history_hidden"]:
+            return None
+        if row["state"] != TERMINAL or row["started_at"] <= 0 or not row["history_saved"]:
+            raise TurnStateConflict("turn_baseline_not_ready")
+        job = _execution_job(conn, row)
+        terminal = jobs.durable_terminal(conn, job)
+        if job["history_hidden"] or not terminal or not terminal["history_saved"]:
+            raise TurnStateConflict("turn_baseline_not_ready")
+        return _decode(row, include_payload=True)
+
+
 def find_turn_by_job(*, owner_user_id: int, session_id: str,
-                     job_id: str) -> dict | None:
+                     job_id: str, conn=None, include_payload: bool = False) -> dict | None:
     """Resolve a root job or an active continuation child to the same turn."""
     _validate_identity(owner_user_id, session_id)
     if not isinstance(job_id, str) or not job_id:
         return None
-    with _transaction() as conn:
+    with (jobs.read_transaction() if conn is None else nullcontext(conn)) as conn:
+        # A legitimate legacy job store may predate the queue entirely.
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_turn_queue'").fetchone():
+            return None
         row = conn.execute(
             "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
             "AND session_id=? AND root_job_id=?",
@@ -662,61 +700,64 @@ def find_turn_by_job(*, owner_user_id: int, session_id: str,
             ).fetchone()
         if row is None:
             return None
-        return _with_position(conn, _decode(row))
+        return _with_position(conn, _decode(row, include_payload=include_payload))
 
 
 def list_turns(*, owner_user_id: int, session_id: str, limit: int = 50,
                include_terminal: bool = True, include_active: bool = True,
                after_seq: int | None = None, visible_only: bool = False) -> list[dict]:
-    """Authoritative session view; active turns can never be hidden by a limit.
+    """Active turns and one bounded terminal window, in queue order."""
+    turns, _ = observe_turns(owner_user_id=owner_user_id, session_id=session_id,
+        limit=limit, include_terminal=include_terminal, include_active=include_active,
+        after_seq=after_seq, visible_only=visible_only)
+    return turns
 
-    Every non-terminal turn is always returned when ``include_active`` is true,
-    regardless of ``limit``. Terminal turns are a bounded window:
 
-    * ``after_seq is None`` -- the most recent ``limit`` terminal turns (the
-      restore-queue bubble view).
-    * ``after_seq is not None`` -- a forward cursor: terminal turns with
-      ``queue_seq > after_seq`` in ascending order. The stable next cursor is
-      the ``queue_seq`` of the last returned terminal turn.
-
-    Admission limits bound the active set, so this stays a bounded read.
-    """
+def observe_turns(*, owner_user_id: int, session_id: str, limit: int = 50,
+                  include_terminal: bool = True, include_active: bool = True,
+                  after_seq: int | None = None, visible_only: bool = False,
+                  watch: tuple[str, ...] = (), include_payload: bool = False, conn=None):
+    """Keep exact watched transitions separate from the terminal page cursor."""
     _validate_identity(owner_user_id, session_id)
     if type(limit) is not int or limit < 0:
         raise ValueError("limit must be a non-negative integer")
     if after_seq is not None and (type(after_seq) is not int or after_seq < 0):
         raise ValueError("after_seq must be a non-negative integer or None")
+    if len(watch) > 32:
+        raise ValueError("too many watched turns")
+    for key in watch:
+        _validate_client_request_id(key)
     limit = min(limit, MAX_LIST_LIMIT)
-    with _transaction() as conn:
-        turns = []
+    scope = (owner_user_id, session_id)
+    where = "SELECT * FROM chat_turn_queue WHERE owner_user_id=? AND session_id=?"
+    visible = (" AND EXISTS (SELECT 1 FROM task_jobs j WHERE j.job_id=root_job_id "
+               "AND j.owner_user_id=chat_turn_queue.owner_user_id "
+               "AND j.session_id=chat_turn_queue.session_id AND j.history_hidden=0)"
+               if visible_only else "")
+    with (jobs.read_transaction() if conn is None else nullcontext(conn)) as conn:
+        rows = {}
         if include_active:
-            turns.extend(
-                _with_position(conn, _decode(row))
-                for row in conn.execute(
-                    "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
-                    "AND session_id=? AND state IN ("
-                    + _NONTERMINAL_PLACEHOLDERS + ") ORDER BY queue_seq ASC",
-                    (owner_user_id, session_id, *_NONTERMINAL_SQL_STATES))
-            )
+            active = conn.execute(where + " AND state IN (" + _NONTERMINAL_PLACEHOLDERS + ")" + visible,
+                                  (*scope, *_NONTERMINAL_SQL_STATES))
+            rows.update((row["queue_seq"], row) for row in active)
+        next_cursor = after_seq
         if include_terminal and limit:
-            visible = (" AND EXISTS (SELECT 1 FROM task_jobs j WHERE j.job_id=root_job_id "
-                       "AND j.owner_user_id=chat_turn_queue.owner_user_id "
-                       "AND j.session_id=chat_turn_queue.session_id AND j.history_hidden=0)"
-                       if visible_only else "")
             if after_seq is None:
-                rows = list(conn.execute(
-                    "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
-                    "AND session_id=? AND state=?" + visible + " ORDER BY queue_seq DESC LIMIT ?",
-                    (owner_user_id, session_id, TERMINAL, limit)))
-                rows.reverse()
+                terminal = conn.execute(where + " AND state=?" + visible + " ORDER BY queue_seq DESC LIMIT ?",
+                                        (*scope, TERMINAL, limit))
             else:
-                rows = list(conn.execute(
-                    "SELECT * FROM chat_turn_queue WHERE owner_user_id=? "
-                    "AND session_id=? AND state=? AND queue_seq>?" + visible + " ORDER BY queue_seq ASC LIMIT ?",
-                    (owner_user_id, session_id, TERMINAL, after_seq, limit)))
-            turns.extend(_with_position(conn, _decode(row)) for row in rows)
-        turns.sort(key=lambda turn: turn["queue_seq"])
-        return turns
+                terminal = conn.execute(where + " AND state=? AND queue_seq>?" + visible + " ORDER BY queue_seq LIMIT ?",
+                                        (*scope, TERMINAL, after_seq, limit))
+            for row in terminal:
+                rows[row["queue_seq"]] = row
+                next_cursor = max(next_cursor or 0, row["queue_seq"])
+        if watch:
+            placeholders = ",".join("?" for _ in watch)
+            watched = conn.execute(where + " AND client_request_id IN (" + placeholders + ")" + visible,
+                                   (*scope, *watch))
+            rows.update((row["queue_seq"], row) for row in watched)
+        return [_with_position(conn, _decode(rows[key], include_payload=include_payload))
+                for key in sorted(rows)], next_cursor
 
 
 def scan_open_turns(*, limit: int = 100,
@@ -1034,8 +1075,8 @@ def resume_continuation(*, owner_user_id: int, session_id: str,
             "AND q.child_job_id=c.job_id AND q.job_id=c.parent_job_id "
             "AND q.owner_user_id=c.owner_user_id AND q.session_id=c.session_id "
             "WHERE c.job_id=? AND c.owner_user_id=? AND c.session_id=? "
-            "AND c.parent_job_id=? AND c.status='queued' AND q.status='answered'",
-            (active_child_job_id, owner_user_id, session_id, parent),
+            "AND c.parent_job_id=? AND c.status='queued' AND q.status='answered' AND q.recovery_cursor=?",
+            (active_child_job_id, owner_user_id, session_id, parent, task_events.recovery_cursor(conn, parent)),
         ).fetchone()
         if child is None:
             raise TurnStateConflict("continuation_child_conflict", job_id=row["root_job_id"])
@@ -1305,8 +1346,9 @@ def _settle_durable(conn, row, job):
                 or row["history_saved"] != int(terminal["history_saved"])):
             return False
     if job["status"] == "awaiting_input" and snapshot_only:
-        if not conn.execute("SELECT 1 FROM task_questions WHERE job_id=? AND owner_user_id=? AND session_id=?",
-                            (job["job_id"], row["owner_user_id"], row["session_id"])).fetchone():
+        if not conn.execute("SELECT 1 FROM task_questions WHERE job_id=? AND owner_user_id=? AND session_id=? "
+                            "AND recovery_cursor=?", (job["job_id"], row["owner_user_id"], row["session_id"],
+                                                       task_events.recovery_cursor(conn, job["job_id"]))).fetchone():
             return False
         if row["state"] != AWAITING_INPUT:
             conn.execute("UPDATE chat_turn_queue SET state=?, generation=generation+1, updated_at=? WHERE root_job_id=?",

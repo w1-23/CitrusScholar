@@ -541,7 +541,8 @@ def audit_frame(frame, mapping=None, groups=None, values=None, row_offset=2,
                     'tested':0,'skipped':0,'reasons':{'not_selected':1},'scopes':[],
                     'scopes_omitted':0,'findings_returned':0}
         receipt['requested'] = sorted(chosen)
-        receipt['actual'] = sorted(k for k,r in receipts.items() if r['tested'])
+        receipt['actual'] = sorted(k for k,r in receipts.items() if r['tested']
+                                   and r['status'] not in {'invalid_input', 'failed'})
         receipt['gap'] = sorted(k for k in chosen if receipts[k]['status'] != 'executed')
         receipt['findings_omitted'] = sum(r.get('findings_omitted', 0) for r in receipts.values())
         receipt['rules'] = dict(receipts)

@@ -323,3 +323,66 @@ def test_prior_report_lineage_requires_same_owned_admitted_turn(monkeypatch):
     assert fusion_worker._prior_report_jobs(current) == {
         ExecutionIdentity(2, "same", "one", "old"), ExecutionIdentity(2, "same", "one-child", "child")}
     db.close()
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("请审查 'Sheet 1'!B3:D20，表头行 4", True),
+    ("请审查 'Sheet 1'!B3:D20", False),
+    ("请审查 'Sheet 1'!B3:D21，表头行 4", False),
+    ("请审查工作簿，无需问我", False),
+    ("不要审查 'Sheet 1'!B3:D20，表头行 4", False),
+    ("例如 'Sheet 1'!B3:D20，表头行 4", False),
+])
+def test_data_audit_requires_exact_user_confirmed_range_and_header(text, expected):
+    from src.agent.fusion_worker_contract import confirmed_workbook_regions
+
+    regions = [{"id": "region-one", "sheet": "Sheet 1", "range": "B3:D20", "header_row": 4}]
+    if expected:
+        assert confirmed_workbook_regions(regions, text)[0]["bounds"] == "B3:D20"
+    else:
+        with pytest.raises(ValueError):
+            confirmed_workbook_regions(regions, text)
+
+
+def test_report_preflight_requires_verified_output_and_never_routes_a_new_doi(monkeypatch):
+    from contextlib import nullcontext
+    from src.agent import code_tools
+    from src.core import capability_policy
+    from src.graph.task_contract import FusionDelivery
+
+    monkeypatch.setattr(capability_policy, "allows", lambda name: True)
+    monkeypatch.setattr(code_tools, "code_execution_context", lambda *_a, **_kw: nullcontext())
+    settled = []
+    monkeypatch.setattr(fusion_worker, "historical_report_candidates", lambda *_a, **_kw: settled)
+    monkeypatch.setattr(fusion_worker, "consume_fusion", lambda *_a, **_kw: {"status": "succeeded", "report": {}})
+    query = "帮我列出之前的审查发现"
+    assert not fusion_tools.verified_report_route(object(), object(), FusionDelivery(), query, "")
+    settled.append(("a" * 32, "research-integrity", object()))
+    assert fusion_tools.verified_report_route(object(), object(), FusionDelivery(), query, "")
+    assert not fusion_tools.verified_report_route(object(), object(), FusionDelivery(),
+        "请审查这个领域并列出发现", "")
+    assert not fusion_tools.verified_report_route(object(), object(), FusionDelivery(),
+        query + "，同时核验 10.5555/new-work", "")
+    def refused(*_a, **_kw):
+        raise LookupError("no_accepted_worker_artifact")
+    monkeypatch.setattr(fusion_worker, "consume_fusion", refused)
+    assert not fusion_tools.verified_report_route(object(), object(), FusionDelivery(), query, "")
+
+
+def test_independent_arxiv_observation_uses_one_distinct_registry_receipt(monkeypatch):
+    monkeypatch.setattr(fusion_observations, "_policy_check", lambda: None)
+    seen = []
+    def provider(url, *, source):
+        seen.append(url)
+        if source == "datacite":
+            return 200, {"data": {"attributes": {"doi": "10.48550/arxiv.2401.12345"}}}, ""
+        if source == "openalex":
+            return 200, {"is_retracted": False}, ""
+        return 200, {"message": {"DOI": "10.5555/example", "title": ["Example"]}}, ""
+    monkeypatch.setattr(fusion_observations.literature, "_get", provider)
+    data = {"records": [{"record_index": 1, "status": "unavailable",
+                        "submitted": {"doi": "10.5555/example", "arxiv_id": "2401.12345v2"}}]}
+    result = fusion_observations.advance_observations(data)
+    assert len(seen) == len(set(seen)) == 3
+    assert any("10.48550/arxiv.2401.12345" in url for url in seen)
+    assert result["coverage"][0]["status"] == "queried"

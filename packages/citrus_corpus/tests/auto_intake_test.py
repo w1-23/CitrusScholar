@@ -227,3 +227,40 @@ def test_worker_then_hot_publication_preserves_pinned_readers(store):
         assert pinned.search("phosphate") == []
         with pytest.raises(LookupError):
             reader.reference(old["read_ref"])
+
+
+@pytest.mark.parametrize("filename, source_format, article", [
+    ("public-article.xml", "xml", b"""<?xml version="1.0" encoding="UTF-8"?>
+<article article-type="research-article"><front><article-meta><article-id pub-id-type="doi">10.1234/greengrove</article-id>
+<title-group><article-title>A grove nutrient study</article-title></title-group>
+<permissions><license license-type="open-access"><license-p>CC BY 4.0</license-p></license></permissions>
+<abstract><p>Full-text research article fixture.</p></abstract></article-meta></front>
+<body><sec sec-type="methods"><title>Methods</title><p>We harvested the irrigated trees.</p></sec>
+<sec sec-type="results"><title>Results</title><p>The fruit contained more phosphate.</p></sec></body></article>"""),
+    ("public-article.html", "html", b"""<!doctype html><html><head><title>A grove nutrient study</title></head>
+<body><article><h1>A grove nutrient study</h1><h2>Methods</h2><p>We harvested the irrigated trees.</p>
+<h2>Results</h2><p>The fruit contained more phosphate.</p></article></body></html>"""),
+])
+def test_operator_reviewed_structured_original_preserves_exact_digest_and_rights(store, filename, source_format, article):
+    from citrus_corpus import originals
+
+    worker = Intake(store)
+    (store.inbox / filename).write_bytes(article)
+    wrong = worker.submit_local(filename, expected_sha256="0" * 64, actor="operator", doi=DOI, title=TITLE)
+    assert worker.process_one()["error"] == "original_hash_mismatch"
+    assert worker.queue.status(wrong["id"])["state"] == "failed"
+    digest = sha256(article).hexdigest()
+    worker.submit_local(filename, expected_sha256=digest, actor="operator", doi=DOI, title=TITLE)
+    result = worker.process_one()
+    doc, version = result["document_id"], result["version_id"]
+    assert result["raw_sha256"] == digest and originals.read_archive(store.originals, digest) == article
+    assert worker.catalog.versions()[0]["source_format"] == source_format
+    assert not worker.catalog.visible(doc, version)  # An embedded label alone grants nothing.
+    worker.catalog.decide(doc, version, decision="granted", actor="operator", reason="Verified exact source rights",
+                          evidence="fixture:authoritative-license-record", license_id="cc-by")
+    metadata, markdown = worker.catalog.document(doc, version)
+    assert metadata["source_sha256"] == digest
+    assert "## Methods" in markdown and "## Results" in markdown and "more phosphate" in markdown
+    assert events(store)[0]["raw_sha256"] == digest
+    worker.catalog.decide(doc, version, decision="revoked", actor="operator", reason="Withdraw test version")
+    assert not worker.catalog.visible(doc, version)

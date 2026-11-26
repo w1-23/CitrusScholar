@@ -114,6 +114,22 @@
         <button class="button secondary" id="corpusOlder" type="button">更早记录</button>
       </div>
     </section>
+    <section class="panel" id="isolatedCorpusPanel" hidden>
+      <div class="panel-heading corpus-heading"><div><h2>第六库入库任务</h2><p>查看独立队列的原件准备、授权和发布状态。</p></div>
+        <button class="button secondary" type="button" id="isolatedCorpusRefresh">刷新</button>
+      </div>
+      <form id="isolatedCorpusForm" hidden>
+        <label>公开文献来源
+          <select id="isolatedCorpusKind"><option value="doi">DOI</option><option value="pmid">PMID</option>
+            <option value="pmcid">PMCID</option><option value="public_title">公开发表的标题</option></select>
+        </label>
+        <input id="isolatedCorpusValue" type="text" aria-label="公开文献标识或标题" maxlength="512" autocomplete="off" required>
+        <label id="isolatedCorpusAttestationLabel" hidden><input id="isolatedCorpusAttestation" type="checkbox">确认这是已公开发表的标题</label>
+        <button class="button secondary" type="submit" id="isolatedCorpusSubmit">后台补齐</button>
+      </form>
+      <p class="muted" id="isolatedCorpusStatus" role="status"></p>
+      <div class="audit-list" id="isolatedCorpusJobs"></div>
+    </section>
     <p class="footnote">管理页面只对已登录管理员开放。审计记录按服务配置保留；临时密码和邀请码只在生成后显示一次，请通过安全渠道交付。</p>
   </main>
   <div class="admin-modal" id="adminResetDialog" hidden role="dialog" aria-modal="true" aria-labelledby="adminResetTitle">

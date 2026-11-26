@@ -61,6 +61,7 @@
           var page = await json('/jobs/' + encodeURIComponent(jobId) + '/events?after=' + before + '&limit=200');
           if (!owns() || !page) return;
           if (page.protocol !== 'citrus-task/1' || page.job_id && page.job_id !== jobId) throw new Error('任务事件格式不匹配。');
+          if (store.setRecoveryFloor) store.setRecoveryFloor(page.recovery_cursor);
           (page.events || []).forEach(function (frame) {
             if (owns()) store.receive(frame.event, Object.assign({}, frame.data, {seq: frame.seq}), String(frame.seq));
           });
@@ -182,5 +183,83 @@
       },
       stop: function () { stopped = true; reads.abort(); if (timer) clearTimeout(timer); timer = null; }};
   }
-  root.CitrusTaskTransport = {parser: parser, create: create};
+  function currentQueueEntry(previous, entry) {
+    if (!entry || !entry.client_request_id) return false;
+    if (!previous) return true;
+    var generation = Number.isSafeInteger(entry.generation) ? entry.generation : 0;
+    var last = Number.isSafeInteger(previous.generation) ? previous.generation : 0;
+    return generation >= last && (generation > last || previous.state !== 'terminal' || entry.state === 'terminal');
+  }
+
+  // One fetch lane and timer for the mounted session, independent of how many
+  // turns observe their own job events. A watched terminal need not be within
+  // the page that advanced after_seq. Missing/failed reads never erase a row.
+  function createSessionObserver(options) {
+    var observers = new Map(), known = new Map(), cursor = null, timer, flight, stopped = false;
+    var reads = new AbortController();
+    var owns = function () { return !stopped && options.owns(); };
+    function schedule() {
+      if (timer != null || !owns() || !observers.size) return;
+      timer = setTimeout(function () { timer = null; if (observers.size) void read(); }, options.interval || 2000);
+    }
+    function read() {
+      if (!owns()) return Promise.resolve(null);
+      if (flight) return flight;
+      if (timer != null) { clearTimeout(timer); timer = null; }
+      var watches = Array.from(observers.keys()).slice(0, 32);
+      // The unqualified first window returns the latest history. A numeric
+      // zero would instead page from the beginning of an old session.
+      var url = options.url + '?limit=100' + (cursor == null ? '' : '&after_seq=' + cursor)
+        + watches.map(function (id) { return '&watch=' + encodeURIComponent(id); }).join('');
+      flight = Promise.resolve().then(async function () {
+        if (!owns()) return null;
+        var response = await options.fetch(url, {signal: reads.signal, cache: 'no-store'});
+        if (!response.ok) throw new Error('queue_unavailable');
+        var page = await response.json();
+        if (!owns()) return null;
+        if (!Array.isArray(page.turns) || (page.next_after_seq != null &&
+            (!Number.isSafeInteger(page.next_after_seq) || page.next_after_seq < (cursor ?? 0)))) throw new Error('queue_protocol');
+        var returned = new Map();
+        page.turns.forEach(function (entry) {
+          if (!entry || (entry.session_id && entry.session_id !== options.sessionId)) return;
+          var id = entry.client_request_id;
+          if (currentQueueEntry(known.get(id), entry)) { known.set(id, entry); returned.set(id, entry); }
+        });
+        if (page.next_after_seq != null) cursor = page.next_after_seq;
+        if (known.size > 132) {
+          for (var pair of known) {
+            if (known.size <= 132) break;
+            if (pair[1].state === 'terminal' && !observers.has(pair[0])) known.delete(pair[0]);
+          }
+        }
+        if (options.onAvailability) options.onAvailability(watches.every(function (id) { return returned.has(id); }));
+        returned.forEach(function (entry, id) {
+          var listeners = observers.get(id);
+          if (listeners && owns()) Array.from(listeners).forEach(function (adopt) { adopt(entry); });
+        });
+        return Array.from(known.values());
+      }).catch(function () {
+        if (owns() && options.onAvailability) options.onAvailability(false);
+        return null;
+      }).finally(function () { flight = null; schedule(); });
+      return flight;
+    }
+    return {snapshot: read, watch: function (id, adopt) {
+      if (!owns()) return function () {};
+      var listeners = observers.get(id);
+      if (!listeners) observers.set(id, listeners = new Set());
+      listeners.add(adopt); schedule();
+      return function () {
+        listeners.delete(adopt);
+        if (!listeners.size) observers.delete(id);
+        if (!observers.size && timer != null) { clearTimeout(timer); timer = null; }
+      };
+    }, stop: function () {
+      stopped = true; reads.abort(); observers.clear(); known.clear();
+      if (timer != null) clearTimeout(timer);
+      timer = null;
+    }};
+  }
+  root.CitrusTaskTransport = {parser: parser, create: create, createSessionObserver: createSessionObserver,
+    currentQueueEntry: currentQueueEntry};
 }(typeof window !== 'undefined' ? window : globalThis));

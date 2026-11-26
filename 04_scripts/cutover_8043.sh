@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Operator-owned Linux activation. The gate receipt is created only after isolated acceptance.
+# Operator tool. No new release is started by prepare or check.
+# Usage: cutover_8043.sh {prepare|check|apply|rollback} NEW RECORD BASELINE_JSON BASELINE_SHA256
+# Baseline schema 1 pins units (cwd, source_head, release_manifest_sha256,
+# config_sha256, active_state), watch_state, and helper (path, sha256).
 set -Eeuo pipefail
 umask 077
 root=/home/WZQ/citrusscholar
-old="$root/releases/8043-external-skills-2234d15"
 py=/usr/bin/python3.12
-previous_tools="$root/rollbacks/8043-before-external-skills-1125"
+scripts=$(dirname -- "$(realpath -e -- "$0")")
 unitdir="$HOME/.config/systemd/user"
 web=citrusscholar-8043-merged-web.service
 worker=citrusscholar-8043-merged-worker.service
@@ -14,185 +16,243 @@ publisher=citrusscholar-8043-corpus-publisher.service
 watch=citrusscholar-8043-watchdog.timer
 watchjob=citrusscholar-8043-watchdog.service
 units=("$web" "$worker" "$intake" "$publisher")
-mode=${1:-}; new=${2:-}; record=${3:-}
-test $# = 3
-[[ "$mode" == prepare || "$mode" == apply || "$mode" == rollback ]]
-[[ "$new" =~ ^/home/WZQ/citrusscholar/releases/8043-reliability-[a-f0-9]{7,40}$ ]]
-[[ "$record" =~ ^/home/WZQ/citrusscholar/rollbacks/8043-before-reliability-[a-f0-9]{7,40}$ ]]
-test "$(realpath -e -- "$new")" = "$new"
-test "$(realpath -e -- "$old")" = "$old"
-source "$previous_tools/helper.sh"
-runtime=$($py -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime_root"])' "$old/deployment.json")
-index="$root/runtime/8043-isolated-corpus/active_index.json"
-exec 9>"$root/rollbacks/8043-before-auto-corpus-1125/operation.lock"
-flock -n 9
+lock="$root/rollbacks/8043-before-auto-corpus-1125/operation.lock"
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+[[ $# == 5 ]] || fail "Usage: $0 {prepare|check|apply|rollback} NEW RECORD BASELINE_JSON BASELINE_SHA256"
+mode=$1 new=$2 record=$3 baseline=$4 baseline_pin=$5
+[[ "$mode" == prepare || "$mode" == check || "$mode" == apply || "$mode" == rollback ]] || fail 'Invalid mode'
+[[ "$new" =~ ^$root/releases/8043-(reliability|native)-[a-f0-9]{7,40}$ ]] || fail 'Invalid candidate release path'
+[[ "$record" =~ ^$root/rollbacks/8043-before-(reliability|native)-[a-f0-9]{7,40}(\.[A-Za-z0-9_-]+)?$ ]] || fail 'Invalid rollback record path'
+[[ "$baseline_pin" =~ ^[a-f0-9]{64}$ ]] || fail 'Invalid baseline digest'
+[[ $(realpath -e -- "${record%/*}") == "${record%/*}" ]] || fail 'Noncanonical record parent'
+[[ $(realpath -e -- "${lock%/*}") == "${lock%/*}" && ! -L "$lock" ]] || fail 'Noncanonical shared operation lock'
+if [[ "$mode" == check ]]; then
+  if [[ -f "$lock" ]]; then exec 9<"$lock"; flock -ns 9; fi
+else
+  exec 9<>"$lock"
+  flock -n 9
+fi
+
 path_for() {
-  case "$1" in "$web"|"$worker") printf '%s/%s.d/8043-worktree.conf' "$unitdir" "$1";; *) printf '%s/%s' "$unitdir" "$1";; esac
+  case "$1" in
+    "$web"|"$worker") printf '%s/%s.d/8043-worktree.conf' "$unitdir" "$1" ;;
+    *) printf '%s/%s' "$unitdir" "$1" ;;
+  esac
 }
-check_units() {
-  local release=$1 u
+
+# Validate file pins without executing anything from the selected release or
+# copying currently installed files into an implicitly trusted baseline.
+record_data() {
+  "$py" -BI "$scripts/cutover_8043_record.py" "$1" "$root" "$new" "$record" "$baseline" "$baseline_pin" "$unitdir" "${units[@]}"
+}
+
+context=$(record_data context)
+mapfile -t fields <<< "$context"
+old=${fields[0]} runtime=${fields[1]} index=${fields[2]} helper=${fields[3]} old_watch=${fields[4]}
+declare -A old_cwd old_state
+for i in "${!units[@]}"; do
+  old_cwd[${units[i]}]=${fields[5+2*i]}
+  old_state[${units[i]}]=${fields[6+2*i]}
+done
+property() { systemctl --user show "$1" -p "$2" --value; }
+real_config() {
+  [[ -f "$1" && ! -L "$1" && $(realpath -e -- "$1") == "$1" ]]
+}
+check_running() {
+  local mode=$1 u expected
   for u in "${units[@]}"; do
-    systemctl --user is-active --quiet "$u" || return
-    test "$(systemctl --user show "$u" -p WorkingDirectory --value)" = "$release" || return
+    expected=$new
+    [[ "$mode" != old ]] || expected=${old_cwd[$u]}
+    [[ $(property "$u" WorkingDirectory) == "$expected" && $(property "$u" ActiveState) == "${old_state[$u]}" ]] || return 1
   done
 }
+scan_phase() {
+  local u p disk live state cwd phase=old have_old=0 have_new=0
+  for u in "${units[@]}"; do
+    p=$(path_for "$u")
+    real_config "$p" || fail "Missing or linked unit config: $u"
+    if cmp -s -- "$p" "$record/$u.conf"; then disk=old
+    elif cmp -s -- "$p" "$record/staged/$u.conf"; then disk=new
+    else fail "Unit config drift is not a recognized cutover phase: $u"; fi
+    cwd=$(property "$u" WorkingDirectory)
+    case "$cwd" in
+      "${old_cwd[$u]}") live=old ;;
+      "$new") live=new ;;
+      *) fail "Effective WorkingDirectory drift: $u" ;;
+    esac
+    state=$(property "$u" ActiveState)
+    case "$state" in
+      active|inactive|failed) ;;
+      *) fail "Unstable unit state: $u ($state)" ;;
+    esac
+    if [[ "$disk" == old || "$live" == old ]]; then have_old=1; fi
+    if [[ "$disk" == new || "$live" == new ]]; then have_new=1; fi
+    printf '%s disk=%s effective=%s service=%s\n' "$u" "$disk" "$live" "$state" >&2
+  done
+  if (( have_new && have_old )); then phase=mixed
+  elif (( have_new )); then phase=new; fi
+  printf '%s\n' "$phase"
+}
+
+if [[ "$mode" == prepare ]]; then
+  [[ ! -e "$record" && ! -L "$record" ]] || fail 'Record already exists'
+  check_running old || fail 'Effective units differ from the pinned baseline'
+  [[ $(property "$watch" ActiveState) == "$old_watch" ]] || fail 'Watchdog state differs from the pinned baseline'
+  target_record=$record
+  record=$(mktemp -d -- "$record.preparing.XXXXXXXX")
+  trap 'printf "Incomplete preparation remains private at %s\n" "$record" >&2' EXIT
+  record_data capture
+  check_running old || fail 'Effective units changed during preparation'
+  [[ $(property "$watch" ActiveState) == "$old_watch" ]] || fail 'Watchdog changed during preparation'
+  mv -Tn -- "$record" "$target_record"
+  [[ ! -e "$record" ]] || fail 'Record appeared during preparation'
+  trap - EXIT
+  printf 'prepared\n'
+  exit
+fi
+
+record_data verify
+[[ -f "$record/state" && ! -L "$record/state" ]] || fail 'Missing or linked phase state'
+state=$(<"$record/state")
+case "$state" in
+  prepared|stopping|switching|active|rolled-back|rollback-needs-attention) ;;
+  *) fail 'Unrecognized recorded activation state' ;;
+esac
+observed_phase=$(scan_phase)
+if [[ "$mode" == check ]]; then
+  printf 'record=%s unit_phase=%s\n' "$state" "$observed_phase"
+  if cmp -s -- "$index" "$record/active_index.before.json"; then printf 'index=unchanged\n'
+  else printf 'index=changed (preserved by rollback)\n'; fi
+  if [[ "$observed_phase" == mixed ]]; then printf 'mixed phase is rollback-only\n'; fi
+  exit
+fi
+
+# The helper byte hash and canonical path were checked before sourcing. It
+# provides read-only admission/queue checks, readiness and invocation evidence.
+source "$helper"
+write_state() {
+  local pending
+  pending=$(mktemp -- "$record/.state.XXXXXXXX") || return
+  printf '%s\n' "$1" > "$pending" || return
+  mv -Tf -- "$pending" "$record/state"
+}
 put_configs() {
-  local from=$1 u p
+  local from=$1 u p tmp
   for u in "${units[@]}"; do
     p=$(path_for "$u") || return
-    install -m 0600 "$from/$u.conf" "$p.next" || return
-    mv -Tf -- "$p.next" "$p" || return
+    real_config "$p" || return
+    tmp=$(mktemp -- "$p.next.XXXXXXXX") || return
+    install -m 0600 -- "$from/$u.conf" "$tmp" || return
+    mv -Tf -- "$tmp" "$p" || return
   done
   systemctl --user daemon-reload
 }
-check_config() {
-  local from=$1 u
-  for u in "${units[@]}"; do cmp -s -- "$(path_for "$u")" "$from/$u.conf" || return; done
+resume_watch() {
+  [[ "$old_watch" != active ]] || systemctl --user start "$watch"
 }
-resume_watch() { if [[ "$(cat "$record/watch.state")" == active ]]; then systemctl --user start "$watch"; fi; }
 start_services() {
-  local release=$1 require_unchanged=${2:-true}
+  local phase=$1 release=$2 u
   systemctl --user reset-failed "${units[@]}" || true
   systemctl --user start "$worker" || return
   heartbeat "$release" || return
   systemctl --user start "$web" || return
   ready || return
-  if [[ "$require_unchanged" == true ]]; then cmp -s "$index" "$record/active_index.before.json" || return; fi
-  systemctl --user start "$intake" "$publisher" || return
-  check_units "$release" || return
-  if [[ "$require_unchanged" == true ]]; then cmp -s "$index" "$record/active_index.before.json" || return; fi
+  if [[ "$phase" == new ]]; then cmp -s -- "$index" "$record/active_index.before.json" || return; fi
+  for u in "$intake" "$publisher"; do
+    if [[ "${old_state[$u]}" == active ]]; then systemctl --user start "$u" || return; fi
+  done
+  check_running "$phase" || return
+  if [[ "$phase" == new ]]; then cmp -s -- "$index" "$record/active_index.before.json" || return; fi
 }
 restore() {
-  systemctl --user stop "$watch" "$watchjob" || true
+  systemctl --user stop "$watch" "$watchjob" || return
   systemctl --user stop "${units[@]}" || return
   put_configs "$record" || return
-  start_services "$old" false || return
-  if ! cmp -s "$index" "$record/active_index.before.json"; then
-    printf 'Corpus pointer differs from the pre-cutover observation; no index bytes were changed by rollback.\n' >&2
+  start_services old "$old" || return
+  if ! cmp -s -- "$index" "$record/active_index.before.json"; then
+    printf 'Corpus pointer changed. Rollback did not modify the index.\n' >&2
   fi
   resume_watch || return
-  printf 'rolled-back\n' > "$record/state"
+  write_state rolled-back
 }
-if [[ "$mode" == prepare ]]; then
-  "$py" - "$old/deployment.json" "$new/deployment.json" <<'PY'
-import json,re,sys
-from pathlib import Path
-old,new=(json.loads(Path(p).read_bytes()) for p in sys.argv[1:]); assert new['port']==old['port']==8043
-assert new['listen_host']==old['listen_host']=='127.0.0.1' and new['external_fusion_required'] is True
-for key in ('runtime_root','corpus_root','code_staging','figure_staging','isolated_corpus','gpu_device','model_origin','model_config_root'):
-    assert new[key]==old[key],key
-for item in old['historical_skill_releases']:
-    assert item in new['historical_skill_releases']
-assert any(i['mount_path']==old['skill_release'] and i['sha256']==old['skill_release_sha256'] for i in new['historical_skill_releases'])
-PY
-  check_units "$old"
-  mkdir -- "$record"
-  mkdir -- "$record/staged"
-  cp -- "$index" "$record/active_index.before.json"
-  systemctl --user show "$watch" -p ActiveState --value > "$record/watch.state"
-  for u in "${units[@]}"; do
-    p=$(path_for "$u")
-    test -f "$p" && test ! -L "$p"
-    install -m 0600 "$p" "$record/$u.conf"
-    "$py" - "$record/$u.conf" "$record/staged/$u.conf" "$old" "$new" "$u" <<'PY'
-from pathlib import Path
-import json,sys
-original,out,old,new,unit=sys.argv[1:]; source=Path(original).read_text()
-assert f'WorkingDirectory={old}' in source and f'{old}/' in source
-result=source.replace(old,new)
-if unit.endswith(('corpus-intake.service','corpus-publisher.service')):
-    before=json.loads((Path(old)/'deployment.json').read_bytes())['app_sif']
-    after=json.loads((Path(new)/'deployment.json').read_bytes())['app_sif']
-    assert source.count(before)==1
-    result=result.replace(before,after)
-Path(out).write_text(result)
-PY
-  done
-  "$py" - "$record" "$old" "$new" <<'PY'
-import json,sys
-from pathlib import Path
-record,old,new=map(Path,sys.argv[1:]); commit=json.loads((new/'deployment.json').read_bytes())['source_head']
-(record/'identity.json').write_text(json.dumps({'old':str(old),'new':str(new),'source_head':commit},sort_keys=True)+'\n')
-PY
-  (cd -- "$record" && sha256sum identity.json active_index.before.json watch.state ./*.conf staged/*.conf > SHA256SUMS)
-  printf 'prepared\n' > "$record/state"
-  exit
-fi
-test "$(realpath -e -- "$record")" = "$record"
-(cd -- "$record" && sha256sum -c SHA256SUMS)
-"$py" - "$record" "$old" "$new" <<'PY'
-import json,sys
-from pathlib import Path
-record,old,new=map(Path,sys.argv[1:]); config=json.loads((new/'deployment.json').read_bytes())
-assert json.loads((record/'identity.json').read_bytes())=={'old':str(old),'new':str(new),'source_head':config['source_head']}
-for p in (record/'staged').glob('*.conf'):
-    text=p.read_text();assert f'WorkingDirectory={new}\n' in text and str(old) not in text
-PY
-if [[ "$mode" == rollback ]]; then
-  check_config "$record/staged"
-  precheck
-  web_before=$(systemctl --user show "$web" -p ActiveState --value)
-  systemctl --user stop "$web"
-  if ! precheck; then
+
+reconcile_to_old() {
+  local web_before watchdog_before
+  precheck || return
+  watchdog_before=$(property "$watch" ActiveState) || return
+  web_before=$(property "$web" ActiveState) || return
+  systemctl --user stop "$watch" "$watchjob" || return
+  if ! systemctl --user stop "$web" || ! precheck; then
     if [[ "$web_before" == active ]]; then systemctl --user start "$web" || true; fi
-    exit 1
+    if [[ "$watchdog_before" == active ]]; then systemctl --user start "$watch" || true; fi
+    return 1
   fi
   restore
+}
+
+if [[ "$mode" == rollback ]]; then
+  if [[ "$observed_phase" == old && ( "$state" == prepared || "$state" == rolled-back ) ]] \
+      && check_running old && [[ $(property "$watch" ActiveState) == "$old_watch" ]]; then
+    printf 'baseline already running\n'
+    exit
+  fi
+  "$py" -BI "$old/launch.py" worker --preflight
+  "$py" -BI "$old/launch.py" web --preflight
+  if ! reconcile_to_old; then write_state rollback-needs-attention; exit 1; fi
   exit
 fi
-check_units "$old"
-check_config "$record"
-cmp -s "$index" "$record/active_index.before.json"
-manifest_pin=$("$py" - "$record/isolated-gate.json" "$new/deployment.json" <<'PY'
-from pathlib import Path
-from hashlib import sha256
-import json,re,sys
-r=json.loads(Path(sys.argv[1]).read_bytes()); p=Path(sys.argv[2]); d=p.read_bytes(); c=json.loads(d)
-assert r['deployment_sha256']==sha256(d).hexdigest() and r['source_head']==c['source_head']
-sha=r['manifest_sha256']; assert re.fullmatch('[0-9a-f]{64}',sha)
-assert r['isolated_port'] not in {8043,8145} and r['isolated_runtime_root']!=c['runtime_root']
-for key in ('app_sha256','sandbox_sha256','namespace_sha256','skill_release_sha256'):
-    assert r[key]==c[key],key
-assert all(r['passed'][k] is True for k in ('pinned_worker','app_readiness','browser','audit_delivery','r_artifacts','full_regression','source_architecture'))
-print(sha)
-PY
-)
-"$py" -BI "$new/source/04_scripts/stage_8043_release.py" verify --release "$new" --manifest-sha256 "$manifest_pin"
+
+[[ "$observed_phase" == old && "$state" == prepared ]] || fail 'Apply requires pristine prepared state and old units'
+check_running old || fail 'Effective units differ from the pinned baseline'
+[[ $(property "$watch" ActiveState) == "$old_watch" ]] || fail 'Watchdog state differs from the pinned baseline'
+cmp -s -- "$index" "$record/active_index.before.json" || fail 'Corpus pointer changed after prepare'
+manifest_pin=$(record_data candidate)
+"$py" -BI "$scripts/stage_8043_release.py" verify --release "$new" --manifest-sha256 "$manifest_pin"
 "$py" -BI "$new/launch.py" worker --preflight
 "$py" -BI "$new/launch.py" web --preflight
 precheck
-phase=stopping-before-swap
+phase=before-drain
+web_was_stopped=false
 on_exit() {
   local rc=$?
+  trap - EXIT
   case "$phase" in
-    swapped) restore || printf 'rollback-needs-attention\n' > "$record/state" ;;
-    stopping-before-swap) start_services "$old" false || true; resume_watch || true ;;
+    before-drain)
+      if [[ "$web_was_stopped" == true ]]; then
+        systemctl --user start "$web" || { write_state rollback-needs-attention; exit "$rc"; }
+      fi
+      if resume_watch && check_running old; then write_state prepared
+      else write_state rollback-needs-attention; fi ;;
+    drained) restore || write_state rollback-needs-attention ;;
+    activating) reconcile_to_old || write_state rollback-needs-attention ;;
   esac
   exit "$rc"
 }
 trap on_exit EXIT
 trap 'exit 130' INT TERM
+write_state stopping
 systemctl --user stop "$watch" "$watchjob"
 precheck
-# Removing loopback admission first closes the race between checking and draining.
+web_was_stopped=true
 systemctl --user stop "$web"
 precheck
+phase=drained
 systemctl --user stop "$worker" "$intake" "$publisher"
-cmp -s "$index" "$record/active_index.before.json"
-phase=swapped
-printf 'switching\n' > "$record/state"
+cmp -s -- "$index" "$record/active_index.before.json"
+write_state switching
 put_configs "$record/staged"
-start_services "$new"
-"$py" - "$new/deployment.json" <<'PY'
-import json,sys
+phase=activating
+start_services new "$new"
+"$py" -BI - <<'PY'
 from urllib.request import urlopen
-from pathlib import Path
-path=Path(sys.argv[1]); c=json.loads(path.read_bytes()); base='http://127.0.0.1:'+str(c['port'])
-for endpoint, marker in (('/','ctxViewGrid'),('/assets/context-view.js','CitrusContextView'),('/assets/citrus-theme.js','CitrusTheme')):
-    with urlopen(base+endpoint,timeout=5) as r:
-        assert r.status==200 and marker.encode() in r.read(),endpoint
+base = 'http://127.0.0.1:8043'
+for endpoint, marker in (('/', 'ctxViewGrid'), ('/assets/context-view.js', 'CitrusContextView'),
+                         ('/assets/citrus-theme.js', 'CitrusTheme')):
+    with urlopen(base + endpoint, timeout=5) as response:
+        if response.status != 200 or marker.encode() not in response.read():
+            raise SystemExit(f'Browser smoke marker missing: {endpoint}')
 PY
 resume_watch
-cmp -s "$index" "$record/active_index.before.json"
-printf 'active\n' > "$record/state"
+cmp -s -- "$index" "$record/active_index.before.json"
+write_state active
 phase=active

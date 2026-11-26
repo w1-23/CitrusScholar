@@ -11,8 +11,8 @@
   const file = (id, filename) => ({file_id: id, filename, kind: 'table', origin: 'uploaded', size_bytes: 128,
     download_url: '/api/v2/files/' + id + '/download', last_accessed_at: 1700000000});
   const dataFiles = [file('fixture-file-0', 'Measurements.csv'), file('workbook', 'Measurements.xlsx')];
-  const svgId = 'imported-project';
-  window.experienceRequests = () => ({posts: state().posts || [], imports: state().imports || [], saves: state().saves || [],
+  const svgId = 'a'.repeat(32);
+  window.experienceRequests = () => ({previews: state().previews || [], posts: state().posts || [], imports: state().imports || [], saves: state().saves || [],
     updates: state().updates || [], cancels: state().cancels || [], queueDeletes: state().queueDeletes || [],
     sourceReads: state().sourceReads || []});
   window.experienceActiveJob = job;
@@ -53,12 +53,12 @@
     result.push(frame(result.length + 1, 'assistant_progress', {text: '公开进度：正在核查列名', visibility: 'public', origin: 'model', note_id: 'public-fixture'}));
     result.push(frame(result.length + 1, 'assistant_progress', {text: 'INTERNAL_FIXTURE_MARKER', visibility: 'private', origin: 'model', note_id: 'private-fixture'}));
     result.push(frame(result.length + 1, 'answer_start', {}));
-    result.push(frame(result.length + 1, 'text', {content: '  \n'}));
+    result.push(frame(result.length + 1, 'text', {content: '  \n', delivery: 'committed'}));
     if (has('whitespace')) return result;
     result.push(frame(result.length + 1, 'citations', {candidates: [{kind: 'web', title: '未引用的候选', url: 'https://example.org/candidate'}]}),
       frame(result.length + 2, 'citations', {display: 'bubble_only', bubbles: citations}),
-      frame(result.length + 3, 'text', {content: answer}));
-    if (has('done')) result.push(frame(result.length + 1, 'done', {turn_envelope: envelope(), answer}));
+      frame(result.length + 3, 'text', {content: answer, delivery: 'committed'}));
+    if (has('done')) result.push(frame(result.length + 1, 'done', {turn_envelope: envelope(), answer, turn_timings: {visible_answer_first_ms: 12100, provider_first_packet_ms: 900, queue_wait_ms: 3000}}));
     return result;
   }
   function queue() {
@@ -73,14 +73,19 @@
     if (url.origin !== location.origin || !p.startsWith('/api/') && !p.startsWith('/jobs/')) return nativeFetch(input, settings);
     if (settings?.signal?.aborted || !navigator.onLine) throw new TypeError('Fixture transport offline');
     let body = {}, status = 200;
-    const figureBase = '/api/v2/figures/projects/' + svgId;
-    if (p === figureBase + '/export/svg') return nativeFetch(input, settings);
-    const figure = (overrides = [], version = 1) => ({figure_id: svgId, title: '隔离夹具新建图件', editable: true,
-      render_version: version, exports: {svg: {size_bytes: 200}}, overrides,
-      manifest: {figure_size_px: [360, 180], objects: [{gid: 'fixture-title', role: 'title', label: '示例标题', text: '示例标题', editable: ['text']}]}});
-    const rendering = () => figure(state().saves?.at(-1)?.overrides || [], 1 + (state().saves || []).length);
-    const asSvg = () => '<svg xmlns="http://www.w3.org/2000/svg" width="360" height="180" viewBox="0 0 360 180"><text id="fixture-title" x="20" y="40">示例标题</text></svg>';
+    const figureBase = '/api/v2/figure-workbench/projects/' + svgId;
+    if (p.startsWith(figureBase + '/export/') || p.startsWith(figureBase + '/preview/')) return nativeFetch(input, settings);
+    const original = '示例标题', title = '隔离夹具图件';
+    const asSvg = value => '<svg xmlns="http://www.w3.org/2000/svg" width="360" height="180" viewBox="0 0 360 180"><text id="fixture-title" x="20" y="40">' + value + '</text></svg>';
+    const rendered = (value, revision) => ({figure_id: svgId, title, render_version: revision, options: {},
+      format_capabilities: {svg: {state: 'ready'}}, figure_size: [360, 180],
+      hit_manifest: {objects: [{gid: 'fixture-title', role: 'title', bbox: {x0: 20, y0: 18, x1: 105, y1: 42}}]},
+      groups: [{id: 'fixture-title-group', kind: 'title', parent: null, label: original,
+        pick_ids: ['fixture-title'], properties: ['text'], values: {text: value}}]});
+    const saves = () => state().saves || [];
+    const rendering = () => rendered(saves().at(-1)?.commands[0].value || original, 1 + saves().length);
     if (p === '/api/v2/auth/me') body = {user: {user_id: 'browser-fixture-user', username: '本地验收', role: 'user'}};
+    else if (p === '/api/v2/config') body = {context: {max_tokens: 80000}};
     else if (p === '/api/v2/sessions') body = {sessions: [
       {session_id: sid, title: '表格核对', msg_count: 1, updated_at: new Date().toISOString()},
       {session_id: otherSid, title: '另一个会话', msg_count: 1, updated_at: new Date().toISOString()}]};
@@ -92,26 +97,20 @@
       const workbook = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(samples), 'Measurements');
       return new Response(XLSX.write(workbook, {type: 'array', bookType: 'xlsx'}));
-    } else if (p === '/api/v2/figures/data-files') body = {files: dataFiles};
-    else if (p.startsWith('/api/v2/figures/data-files/') && p.endsWith('/schema')) {
-      const selected = dataFiles.find(entry => p.endsWith('/' + entry.file_id + '/schema'));
-      body = {file_id: selected.file_id, filename: selected.filename, rows: 2, sheet: selected.filename.endsWith('.xlsx') ? 'Measurements' : '',
-        columns: samples[0].map(name => ({name, numeric: name !== 'Notes'}))};
-    } else if (p === '/api/v2/figures/projects' && settings?.method === 'POST') {
-      save({imports: [...(state().imports || []), JSON.parse(settings.body)]});
-      body = {figure_id: svgId};
-    } else if (p === '/api/v2/figures/projects') {
-      const projects = Array.from({length: 122}, (_, i) => ({figure_id: 'old-project-' + i, title: '历史图件 ' + i, editable: false}));
-      const offset = +(url.searchParams.get('offset') || 0), limit = +(url.searchParams.get('limit') || 31);
-      body = {projects: projects.slice(offset, offset + limit)};
+    } else if (p === '/api/v2/figure-workbench/projects') {
+      const projects = [{figure_id: svgId, render_version: rendering().render_version, title},
+        ...Array.from({length: 25}, (_, i) => ({figure_id: (i + 1).toString(16).padStart(32, '0'), render_version: 1, title: '历史图件 ' + i}))];
+      const offset = +(url.searchParams.get('offset') || 0), limit = +(url.searchParams.get('limit') || 12);
+      body = {projects: projects.slice(offset, offset + limit), has_more: offset + limit < projects.length};
     } else if (p === figureBase) {
       body = rendering();
-    } else if (p === figureBase + '/overrides' && settings?.method === 'POST') {
-      save({saves: [...(state().saves || []), JSON.parse(settings.body)]});
+    } else if (p === figureBase + '/preview' && settings?.method === 'POST') {
+      const edit = JSON.parse(settings.body);
+      save({previews: [...(state().previews || []), edit]});
+      body = {...rendered(edit.commands[0].value, edit.expected_revision), draft_revision: edit.draft_revision, svg: asSvg(edit.commands[0].value)};
+    } else if (p === figureBase + '/save' && settings?.method === 'POST') {
+      save({saves: [...saves(), JSON.parse(settings.body)]});
       body = rendering();
-    } else if (p === figureBase + '/preview.svg') {
-      const svg = asSvg();
-      return new Response(svg, {headers: {'Content-Type': 'image/svg+xml', 'Content-Disposition': 'attachment; filename=fixture.svg', 'Content-Length': String(new TextEncoder().encode(svg).length)}});
     } else if (p.endsWith('/messages')) body = {messages: [], turns: Array.from({length: state().turns || 0}, (_, i) => ({turn_request_id: 'saved-' + i, user: {content: '历史问题 ' + i}, answer: {content: '历史回答 ' + i}, display_status: 'completed'})), has_more: false};
     else if (p.startsWith('/api/v2/session/' + otherSid + '/')) body = {turns: []};
     else if (p === '/api/v2/chat/jobs/' + job + '/cancel' && settings?.method === 'POST') {
@@ -136,7 +135,7 @@
       }
       const entries = admissions.map((entry, i) => ({...entry, session_id: sid, job_id: 'new-job-' + i, queue_seq: i + 10,
         queue_position: i + 1, state: 'queued', accepted_at: Date.now() / 1000}));
-      body = settings?.method === 'POST' ? entries.at(-1) : {turns: [queue(), ...entries]};
+      body = settings?.method === 'POST' ? entries.at(-1) : {turns: [queue(), ...entries], next_after_seq: has('done') ? 9 : null};
     }
     else if (p === '/jobs/' + job || p === '/jobs/' + job + '/events') {
       const events = frames(), after = +(url.searchParams.get('after') || 0);

@@ -1,5 +1,4 @@
 """Public delivery, private snapshot, and first-packet regression contracts."""
-from contextlib import contextmanager
 import importlib.util
 import json
 from pathlib import Path
@@ -117,13 +116,10 @@ class PublicDeliveryTests(unittest.TestCase):
         task_events._append(conn, "job", "context_maintenance", {
             "status": "compacted", "elapsed_ms": 55, "draft": "hidden fixture"})
 
-        @contextmanager
-        def transaction():
-            yield conn
-        with patch.object(task_events, "transaction", transaction), patch.object(task_events, "public_job_terminal", return_value={}):
-            page = task_events.replay("job", limit=1)
+        with patch.object(task_events, "public_job_terminal", return_value={}):
+            page = task_events.replay("job", limit=1, conn=conn)
             self.assertEqual(page["events"][0]["data"], {"seq": 1})
-            exported = task_events.replay("job")
+            exported = task_events.replay("job", conn=conn)
         self.assertIn("storage fixture", conn.execute("SELECT data FROM task_events WHERE event='task_state'").fetchone()[0])
         public = json.dumps(exported)
         self.assertNotIn("storage fixture", public)

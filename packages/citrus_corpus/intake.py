@@ -2,6 +2,7 @@
 from hashlib import sha256
 
 from . import originals
+from .auto_intake import AutoIntake
 from .catalog import Catalog
 from .extract import extract_markdown, source_format
 from .prepare import MAX_SOURCE_BYTES, PreparationError, public_text
@@ -44,13 +45,16 @@ class Intake:
                                  actor=actor, expected_sha256=digest,
                                  persist=lambda: originals.archive(self.store.originals, raw))
 
-    def process_one(self, *, acquire=None):
+    def process_one(self, *, acquire=None, automatic=None):
         with self.store.writer():
-            job = self.queue.claim(network=acquire is not None)
+            job = self.queue.claim(network=acquire is not None, automatic=automatic is not None)
             if job is None:
                 return None
             try:
-                self._prepare(job, acquire)
+                if job["request"]["kind"] == "automatic":
+                    self._prepare_automatic(job, automatic)
+                else:
+                    self._prepare(job, acquire)
             except PreparationError as exc:
                 self.queue.fail(job, exc.code)
             except (FileNotFoundError, NotADirectoryError):
@@ -62,14 +66,26 @@ class Intake:
                     self.queue.fail(job, "source_invalid")
             return self.queue.status(job["id"])
 
-    def _prepare(self, job, acquire):
+    def _prepare_automatic(self, job, automatic):
+        adapter = AutoIntake(self.store)
+        allowed = lambda: automatic.allowed(job)
+        if not allowed():
+            raise PreparationError("network_scope_denied")
+        expected = job["expected_sha256"]
+        raw = originals.read_archive(self.store.originals, expected) if expected else None
+        record = automatic.resolve(job, raw=raw, reuse=adapter.proven_original, allowed=allowed)
+        resolved = adapter.resolve_job(self.queue, job, record, allowed=allowed)
+        if resolved is not None:
+            self._prepare(resolved, None, allowed=allowed)
+
+    def _prepare(self, job, acquire, *, allowed=lambda: True):
         request = job["request"]
         expected = job["expected_sha256"]
-        if expected and self.catalog.complete_duplicate(self.queue, job, expected):
+        if expected and self.catalog.complete_duplicate(self.queue, job, expected, allowed=allowed):
             return
         if request["kind"] == "explicit":
             raw, fmt = originals.capture(self.store.originals, job["id"], lambda: acquire(request))
-        elif request["kind"] == "observed":
+        elif request["kind"] in {"observed", "automatic"}:
             raw, fmt = originals.read_archive(self.store.originals, expected), request["format"]
         else:
             archived = self.store.originals / expected
@@ -79,9 +95,10 @@ class Intake:
         digest = sha256(raw).hexdigest()
         if expected and digest != expected:
             raise PreparationError("original_hash_mismatch")
-        originals.archive(self.store.originals, raw)
-        self.queue.remember_original(job, digest)
-        if self.catalog.complete_duplicate(self.queue, job, digest):
-            return
+        if request["kind"] != "automatic":
+            originals.archive(self.store.originals, raw)
+            self.queue.remember_original(job, digest)
+            if not expected and self.catalog.complete_duplicate(self.queue, job, digest, allowed=allowed):
+                return
         markdown = extract_markdown(raw, fmt)
-        self.catalog.record(self.queue, job, digest, fmt, markdown)
+        self.catalog.record(self.queue, job, digest, fmt, markdown, allowed=allowed)

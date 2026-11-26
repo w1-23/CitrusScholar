@@ -1,0 +1,110 @@
+{
+  "data-audit/manifest.json": [
+    [
+      "\"version\": \"0.1.0\"",
+      "\"version\": \"0.1.1\""
+    ]
+  ],
+  "data-audit/scripts/adapter.py": [
+    [
+      "from pathlib import Path\n\nfrom contract import UPSTREAM, finding, location, result",
+      "from functools import partial\nfrom pathlib import Path\n\nfrom contract import UPSTREAM, digest, finding, result\n\nMAX_FINDINGS = 1000\nMAX_LOCATIONS = 32\n\n\nclass BoundedFindings(list):\n    omitted = 0\n\n    def append(self, row):\n        if len(self) < MAX_FINDINGS:\n            super().append(row)\n        else:\n            self.omitted += 1\n\n\ndef workbook_location(source_hash, sheet, region, cells=None, row=None, column=None, **extra):\n    return dict(source_file_hash=source_hash, sheet_name=sheet, region_id=region,\n                cell_range=cells, row_index=row, column_index=column, **extra)"
+    ],
+    [
+      "def cell_location(path, sheet, region, cell):",
+      "def cell_location(locate, sheet, region, cell):"
+    ],
+    [
+      "    return location(path, sheet.title, region, cell.coordinate, cell.row, cell.column,",
+      "    return locate(sheet.title, region, cell.coordinate, cell.row, cell.column,"
+    ],
+    [
+      "def describe_design(path, sheet, region_id, frame, design, response):",
+      "def describe_design(locate, sheet, region_id, frame, design, response):"
+    ],
+    [
+      "            scope = location(path, sheet.title, region_id, scope=\"group\", group=str(name))",
+      "            scope = locate(sheet.title, region_id, scope=\"group\", group=str(name))"
+    ],
+    [
+      "def audit_region(path, sheet, region, formula_cache, response):",
+      "def audit_region(locate, sheet, region, formula_cache, response):"
+    ],
+    [
+      "    describe_design(path, sheet, region_id, frame, region.get(\"experimental_design\", response[\"experimental_design\"]), response)",
+      "    describe_design(locate, sheet, region_id, frame, region.get(\"experimental_design\", response[\"experimental_design\"]), response)"
+    ],
+    [
+      "        column = rule[\"column\"]\n        ci = c1 + names.index(column)\n        check = make_check(pa, rule)\n",
+      "        column = rule.get(\"column\") if isinstance(rule, dict) else None\n        kind = rule.get(\"kind\") if isinstance(rule, dict) else None\n        try:\n            ci = c1 + names.index(column)\n            check = make_check(pa, rule)\n        except (KeyError, TypeError, ValueError):\n            response[\"status\"] = \"partial\"\n            response[\"coverage\"].append(dict(check=kind if isinstance(kind, str) else \"data_rule\",\n                region_id=region_id, status=\"invalid_input\", reason=\"invalid_rule_or_missing_region_column\", applied=0))\n            continue\n"
+    ],
+    [
+      "                if cell.data_type == \"f\" and formula_cache.cell(row, ci).value is None:\n                    continue\n                response[\"findings\"].append(finding(rule[\"kind\"], [cell_location(path, sheet, region_id, cell)],\n                    observed=str(formula_cache.cell(row, ci).value), expected=rule, severity=\"error\"))",
+      "                if cell.data_type == \"f\" and formula_cache.cell(row, ci).value is None:\n                    continue\n                if len(response[\"findings\"]) >= MAX_FINDINGS:\n                    response[\"findings\"].omitted += 1\n                    continue\n                response[\"findings\"].append(finding(rule[\"kind\"], [cell_location(locate, sheet, region_id, cell)],\n                    observed=str(formula_cache.cell(row, ci).value)[:500],\n                    expected={key: rule[key] for key in (\"kind\", \"column\", \"minimum\", \"maximum\") if key in rule},\n                    severity=\"error\"))"
+    ],
+    [
+      "    uncached = [cell_location(path, sheet, region_id, sheet.cell(r, c))\n                for r in range(header + 1, r2 + 1) for c in range(c1, c2 + 1)\n                if sheet.cell(r, c).data_type == \"f\" and formula_cache.cell(r, c).value is None]\n    if uncached:\n        response[\"status\"] = \"partial\"\n        response[\"findings\"].append(finding(\"formula_cache_unavailable\", uncached, severity=\"coverage\"))\n    response[\"coverage\"].append(dict(check=\"formula_values\", region_id=region_id,\n        status=\"partial\" if uncached else \"checked\", method=\"cached values; no recalculation\",\n        missing_cache_count=len(uncached)))",
+      "    missing_cache_count, uncached = 0, []\n    for row in range(header + 1, r2 + 1):\n        for column in range(c1, c2 + 1):\n            cell = sheet.cell(row, column)\n            if cell.data_type == \"f\" and formula_cache.cell(row, column).value is None:\n                missing_cache_count += 1\n                if len(uncached) < MAX_LOCATIONS:\n                    uncached.append(cell_location(locate, sheet, region_id, cell))\n    if missing_cache_count:\n        response[\"status\"] = \"partial\"\n        item = finding(\"formula_cache_unavailable\", uncached, severity=\"coverage\")\n        item[\"locations_total\"] = missing_cache_count\n        response[\"findings\"].append(item)\n    response[\"coverage\"].append(dict(check=\"formula_values\", region_id=region_id,\n        status=\"partial\" if missing_cache_count else \"checked\", method=\"cached values; no recalculation\",\n        missing_cache_count=missing_cache_count))"
+    ],
+    [
+      "def inspect_formulas(path, response, workbook, specs):",
+      "def inspect_formulas(path, locate, response, workbook, specs):"
+    ],
+    [
+      "        for spec in specs:\n            c1, r1, c2, r2 = range_boundaries(spec[\"range\"])\n            if spec[\"sheet\"] == sheet and c1 <= c <= stop_c <= c2 and r1 <= r <= stop_r <= r2:\n                response[\"findings\"].append(finding(rule, [location(path, sheet, spec[\"id\"], address,",
+      "        if None in (c, r, stop_c, stop_r):\n            continue\n        for spec in specs:\n            c1, r1, c2, r2 = range_boundaries(spec[\"range\"])\n            if spec[\"sheet\"] == sheet and c1 <= c <= stop_c <= c2 and r1 <= r <= stop_r <= r2:\n                if len(response[\"findings\"]) >= MAX_FINDINGS:\n                    response[\"findings\"].omitted += 1\n                    continue\n                response[\"findings\"].append(finding(rule, [locate(sheet, spec[\"id\"], address,"
+    ],
+    [
+      "    response[\"coverage\"].append(dict(check=\"formula_structure\", status=\"checked\" if complete else \"partial\",\n        detector=\"spreadsheet-auditor\", limits=coverage.get(\"limitations\", []),",
+      "    response[\"coverage\"].append(dict(check=\"formula_structure\", status=\"checked\" if complete else \"partial\",\n        detector=\"spreadsheet-auditor\", scope=\"whole_workbook\", findings_scope=\"confirmed_regions\",\n        limits=coverage.get(\"limitations\", []),"
+    ],
+    [
+      "    output = result()\n    if not path",
+      "    output = result()\n    output[\"findings\"] = BoundedFindings()\n    if not path"
+    ],
+    [
+      "    workbook = load_workbook(path, keep_links=False)\n    formula_cache = load_workbook(path, keep_links=False, data_only=True)\n    for region in regions:\n        audit_region(path, workbook[region[\"sheet\"]], region, formula_cache[region[\"sheet\"]], output)\n    try:\n        inspect_formulas(path, output, workbook, regions)\n    except (RuntimeError, subprocess.TimeoutExpired) as exc:\n        output[\"status\"] = \"partial\"\n        output[\"coverage\"].append(dict(check=\"formula_structure\", status=\"failed\"))\n        output[\"limitations\"].append(str(exc))\n    return output",
+      "    from contextlib import closing\n\n    locate = partial(workbook_location, digest(path))\n    output[\"limitations\"].append(\"formula structure analyzer reads the whole workbook; only findings within confirmed regions are reported\")\n    with closing(load_workbook(path, keep_links=False)) as workbook, closing(\n            load_workbook(path, keep_links=False, data_only=True)) as formula_cache:\n        for region in regions:\n            try:\n                audit_region(locate, workbook[region[\"sheet\"]], region, formula_cache[region[\"sheet\"]], output)\n            except (KeyError, TypeError, ValueError):\n                output[\"status\"] = \"partial\"\n                output[\"coverage\"].append(dict(check=\"region_data\", region_id=region[\"id\"],\n                    status=\"invalid_input\", reason=\"invalid_region_data_or_options\", applied=0))\n        try:\n            inspect_formulas(path, locate, output, workbook, regions)\n        except (RuntimeError, ValueError, subprocess.TimeoutExpired):\n            output[\"status\"] = \"partial\"\n            output[\"coverage\"].append(dict(check=\"formula_structure\", status=\"failed\", scope=\"whole_workbook\",\n                                           findings_scope=\"confirmed_regions\"))\n            output[\"limitations\"].append(\"formula structure analyzer did not complete\")\n    output[\"findings_total\"] = len(output[\"findings\"]) + output[\"findings\"].omitted\n    output[\"findings_omitted\"] = output[\"findings\"].omitted\n    if output[\"findings_omitted\"]:\n        output[\"status\"] = \"partial\"\n        output[\"limitations\"].append(\"finding retention limit reached; unretained findings cannot be listed\")\n    return output"
+    ]
+  ],
+  "literature-verification/manifest.json": [
+    [
+      "\"version\": \"0.1.0\"",
+      "\"version\": \"0.1.1\""
+    ]
+  ],
+  "literature-verification/scripts/adapter.py": [
+    [
+      "from urllib.parse import urlsplit",
+      "from urllib.parse import quote, urlsplit"
+    ],
+    [
+      "def pdf_entries(path):",
+      "def normalized_arxiv(value):\n    match = re.fullmatch(r\"(?:(?:https?://(?:export\\.)?arxiv\\.org/abs/)|arxiv:\\s*)?\"\n                         r\"(\\d{4}\\.\\d{4,5}|[a-z-]+(?:\\.[a-z]{2})?/\\d{7})(?:v\\d+)?\", str(value or \"\").strip(), re.I)\n    return match[1].casefold() if match else \"\"\n\n\ndef arxiv_observation(arxiv, cassette, attempts):\n    exact = \"10.48550/arxiv.\" + arxiv\n    url = \"https://api.datacite.org/dois/\" + quote(exact, safe=\"/\")\n    receipt = cassette.get(url, {})\n    attempts.append(dict(provider=\"DataCite (arXiv DOI)\", url=url,\n                         status=receipt.get(\"status\") or \"unavailable\", queried_at=receipt.get(\"queried_at\")))\n    attributes = ((receipt.get(\"body\") or {}).get(\"data\") or {}).get(\"attributes\") or {}\n    if receipt.get(\"status\") == 404:\n        return \"not_found\", {}, set()\n    if receipt.get(\"status\") != 200 or normalize_doi(attributes.get(\"doi\")) != exact:\n        return \"unavailable\", {}, set()\n    titles = attributes.get(\"titles\") or []\n    title = titles[0].get(\"title\") if titles and isinstance(titles[0], dict) else None\n    relations = {normalize_doi(row.get(\"relatedIdentifier\")) for row in (attributes.get(\"relatedIdentifiers\") or [])[:24]\n                 if isinstance(row, dict) and row.get(\"relatedIdentifierType\") == \"DOI\"\n                 and row.get(\"relationType\") in {\"IsVersionOf\", \"HasVersion\", \"IsIdenticalTo\", \"IsPreprintOf\", \"HasPreprint\"}}\n    return \"matched\", dict(doi=exact, title=title, provider=\"DataCite (arXiv DOI)\", record_id=arxiv,\n                           url=\"https://arxiv.org/abs/\" + arxiv, queried_at=receipt.get(\"queried_at\")), relations\n\n\ndef crossref_related_preprint(doi, arxiv, cassette):\n    receipt = cassette.get(\"https://api.crossref.org/works/\" + quote(doi, safe=\"/\"), {})\n    msg = (receipt.get(\"body\") or {}).get(\"message\") or {}\n    if normalize_doi(msg.get(\"DOI\")) != doi:\n        return False\n    relation = msg.get(\"relation\") or {}\n    if not isinstance(relation, dict):\n        return False\n    ids = [row.get(\"id\") for key, rows in relation.items()\n           if key in {\"has-preprint\", \"is-preprint-of\", \"is-version-of\", \"has-version\"} and isinstance(rows, list)\n           for row in rows[:24] if isinstance(row, dict)]\n    return any(normalized_arxiv(value) == arxiv or normalize_doi(value) == \"10.48550/arxiv.\" + arxiv for value in ids)\n\n\ndef pdf_entries(path):"
+    ],
+    [
+      "        entry[\"doi\"] = normalize_doi(entry.get(\"doi\"))\n        entry[\"year\"]",
+      "        entry[\"doi\"] = normalize_doi(entry.get(\"doi\"))\n        submitted_arxiv = entry.get(\"arxiv_id\") or entry.get(\"eprint\") or entry.get(\"arxiv\")\n        arxiv = normalized_arxiv(submitted_arxiv)\n        if submitted_arxiv:\n            entry[\"arxiv_id\"] = arxiv or str(submitted_arxiv)[:100]\n        entry[\"year\"]"
+    ],
+    [
+      "            raw = upstream.check_entry(entry)",
+      "            raw = upstream.check_entry(entry) if entry[\"doi\"] or not submitted_arxiv else {\"status\": \"unavailable\"}"
+    ],
+    [
+      "\"found-add-doi\": \"verified\", \"retracted\": \"verified\",",
+      "\"found-add-doi\": \"verified\", \"retracted\": \"retracted\","
+    ],
+    [
+      "        normalized = candidate_evidence(matched)\n        if status == \"verified\" and not normalized:",
+      "        checks = {}\n        if entry[\"doi\"]:\n            checks[\"doi\"] = status\n        if submitted_arxiv:\n            arxiv_status, candidate, links = arxiv_observation(arxiv, cassette, attempts) if arxiv else (\"invalid_input\", {}, set())\n            if candidate and entry.get(\"title\"):\n                score = module(\"refchecker\", \"src/refchecker/utils/text_utils.py\", \"rc_text\").calculate_title_similarity(\n                    entry[\"title\"], candidate.get(\"title\") or \"\")\n                if score < .90:\n                    arxiv_status = \"mismatch\" if candidate.get(\"title\") else \"unavailable\"\n            if candidate:\n                matched.append(candidate)\n            checks[\"arxiv\"] = arxiv_status\n            doi = entry[\"doi\"]\n            if doi:\n                linked = (candidate and (doi == candidate[\"doi\"] or doi in links\n                                         or crossref_related_preprint(doi, arxiv, cassette)))\n                checks[\"relationship\"] = \"matched\" if linked else \"unconfirmed\"\n                if status == \"verified\" and (arxiv_status != \"matched\" or not linked):\n                    status = \"mismatch\" if arxiv_status == \"mismatch\" else \"inconclusive\"\n            else:\n                status = {\"matched\": \"verified\", \"mismatch\": \"mismatch\", \"not_found\": \"not_found\"}.get(arxiv_status, \"unavailable\")\n        normalized = candidate_evidence(matched)\n        if status == \"verified\" and not normalized:"
+    ],
+    [
+      "            problems=raw.get(\"problems\", [])))",
+      "            problems=raw.get(\"problems\", []), identifier_checks=checks,\n            retraction_status=\"retracted\" if status == \"retracted\" else \"not_established\"))"
+    ],
+    [
+      "status == \"verified\" else \"candidate\" if normalized else \"none\"",
+      "status in {\"verified\", \"retracted\"} else \"candidate\" if normalized else \"none\""
+    ]
+  ]
+}

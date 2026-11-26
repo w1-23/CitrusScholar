@@ -1,87 +1,67 @@
-"""Bounded, best-effort backend handoff from the dedicated Fetch Paper tool."""
-from contextvars import copy_context
+"""Durable public-paper handoff. The request never resolves or downloads here."""
 import logging
 import os
-from queue import Full, Queue
-from threading import Lock, Thread
+import sqlite3
 
-from .settings import growth_enabled
+from .settings import durable_intake_enabled
 
 logger = logging.getLogger(__name__)
-_pending = Queue(maxsize=8)
-_start_lock = Lock()
-_consumer = None
 
 
-def submit(*, owner: int | None, doi: str, pmid: str, winner_url: str = "") -> None:
-    from .paper_source import identifiers
+def submit(*, owner: int | None, doi="", pmid="", pmcid="", winner_url="", proof=None):
+    """Dedicated Fetch only. Never accept snippets, raw provider text or titles."""
+    from .paper_source import VerifiedOriginal, public_identifiers
 
-    if not growth_enabled() or type(owner) is not int or owner <= 0:
-        return
-    root = os.getenv("CITRUS_ISOLATED_CORPUS_ROOT")
-    if not root:
-        return
-    doi, pmid = identifiers(doi, pmid, winner_url)
-    if not (doi or pmid) or not _ensure_consumer():
-        return
-    # Nothing from the search tool's body, headers, title or license enters the
-    # queue. Items are not durable until the worker verifies and registers them.
     try:
-        _pending.put_nowait((copy_context(), owner, root, doi, pmid))
-    except Full:
-        logger.debug("Isolated Fetch Paper handoff unavailable: queue_full")
+        doi, pmid, pmcid = public_identifiers(doi, pmid, pmcid, winner_url)
+    except ValueError:
+        return None
+    if (type(proof) is not VerifiedOriginal or (doi and proof.doi != doi)
+            or (pmid and proof.pmid != pmid) or (pmcid and proof.pmcid != pmcid)):
+        proof = None
+    if not (doi or pmid or pmcid or proof):
+        return None
+    return _submit(owner, producer="fetch", doi=doi, pmid=pmid, pmcid=pmcid, proof=proof)
 
 
-def _ensure_consumer():
-    global _consumer
-    if _consumer is not None and _consumer.is_alive():
-        return True
-    if not _start_lock.acquire(blocking=False):
-        return False
+def submit_literature(record):
+    """Accept only the scholarly producer's returned, public registry record."""
+    from src.core.tracing import get_user_id
+    from .paper_source import public_identifiers
+
+    if record.get("source") not in {"Crossref", "Europe PMC", "PubMed"}:
+        return None
     try:
-        if _consumer is None or not _consumer.is_alive():
-            _consumer = Thread(target=_drain, name="isolated-corpus-submission", daemon=True)
-            _consumer.start()
-        return True
-    finally:
-        _start_lock.release()
+        doi, pmid, pmcid = public_identifiers(record.get("doi") or "", record.get("pmid") or "",
+                                             record.get("pmcid") or "")
+    except ValueError:
+        return None
+    title = "" if (doi or pmid or pmcid) else record.get("title") or ""
+    if not (doi or pmid or pmcid or title):
+        return None
+    return _submit(get_user_id(), producer="literature", doi=doi, pmid=pmid, pmcid=pmcid, title=title)
 
 
-def _drain():
-    while True:
-        context, *receipt = _pending.get()
-        try:
-            context.run(_persist, *receipt)
-        except Exception as exc:
-            logger.warning("Isolated Fetch Paper handoff unavailable: %s", type(exc).__name__)
-        finally:
-            _pending.task_done()
-
-
-def _persist(owner: int, root: str, doi: str, pmid: str):
-    from src.auth import user_by_id
+def _submit(owner, *, producer, **payload):
+    from src.core.account_leases import current_account_lease
     from src.core.capability_policy import allows
     from src.core.tracing import get_user_id
+    from .automatic_worker import account_epoch
 
-    from .paper_source import resolve
-
-    def allowed():
-        # Network capabilities also require external_data_network and the
-        # captured request's web opt-in, and consult live revocations.
-        return (growth_enabled() and root == os.getenv("CITRUS_ISOLATED_CORPUS_ROOT")
-                and get_user_id() == owner and allows("web_fetch") and allows("bibliographic_lookup"))
-
-    def approved():
-        user = user_by_id(owner) or {}
-        return (user.get("user_id") == owner and user.get("active") is True
-                and user.get("approval_status") == "approved")
-
-    if not allowed() or not approved():
-        return
-    record = resolve(doi, pmid, allowed=allowed)
-    if record is None or not allowed() or not approved():
-        return
+    if not durable_intake_enabled() or type(owner) is not int or owner <= 0 or get_user_id() != owner:
+        return None
+    root = os.getenv("CITRUS_ISOLATED_CORPUS_ROOT")
+    if not root or not allows("web_fetch") or not allows("bibliographic_lookup"):
+        return None
+    lease = current_account_lease()
+    epoch = account_epoch(owner)
+    if epoch is None or (lease is not None and (lease.owner != owner or lease.epoch != epoch)):
+        return None
     from citrus_corpus.auto_intake import AutoIntake
     from citrus_corpus.store import Store
 
-    return AutoIntake(Store(root)).register(**record)
+    try:
+        return AutoIntake(Store(root)).submit(owner=owner, epoch=epoch, producer=producer, **payload)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        logger.debug("Public-paper intake unavailable: %s", type(exc).__name__)
+        return None

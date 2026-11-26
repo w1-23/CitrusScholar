@@ -503,7 +503,7 @@ def _build_resolved_figure(resolved: ResolvedFigure, *, rendered=None, ax=None,
         rendered.axes.append(ax)
     else:
         fig = rendered.figure
-    from citrus_figures.presentation_ids import series_address
+    from citrus_figures.presentation_ids import presentation_key, series_address
 
     def series_gid(index):
         series = resolved.series[index] if resolved.series else None
@@ -512,6 +512,8 @@ def _build_resolved_figure(resolved: ResolvedFigure, *, rendered=None, ax=None,
     _register(rendered, "figure_1", fig, "figure", {"scope": "figure", "role": "figure"})
     # The subplot itself is addressable: a whole axes block can be moved.
     _register(rendered, prefix, ax, "axes", {"axes_index": axes_index, "role": "axes"})
+
+    ax._citrus_presentation_key = presentation_key(resolved.panel_id, "axes")
 
     chart = resolved.chart
     y_values = _numeric(resolved.y_values)
@@ -615,6 +617,14 @@ def _build_resolved_figure(resolved: ResolvedFigure, *, rendered=None, ax=None,
             ax.set_xticks(np.arange(len(domain)))
             ax.set_xticklabels(_labels(domain))
         _set_axis_labels(ax, resolved)
+
+    if chart in {"histogram", "bar", "line", "scatter", "errorbar"}:
+        items = (resolved.series[:1] or (None,)) if chart == "histogram" else resolved.series or (None,)
+        for index, series in enumerate(items):
+            artist = rendered.locators[series_gid(index)]["artist"]
+            artist._citrus_presentation_key = presentation_key(
+                resolved.panel_id, "series", series_key=series.key if series else None,
+                source_group=series.name if series else "")
 
     # Register only whole-series identity. Patches, points, ticks and errorbar
     # children have no domain row keys in this contract and remain render-scoped.

@@ -1262,6 +1262,7 @@ function rememberComposerSession() {
 }
 
 function restoreComposerSession(preserve) {
+  composerContinuation = null;
   var key = composerDraftKey();
   var saved = composerSelections.get(key);
   _composerNotice = '';
@@ -2554,6 +2555,7 @@ function applyAppVersion() {
   if (badge) badge.textContent = 'v' + v;
   var w = document.getElementById('welcomeVersion');
   if (w) w.textContent = 'CitrusScholar v' + v;
+  if (_ctxData) renderContextPanel(_ctxData);
 }
 
 /* ─── v8.4.3/8.4.12: 权限审批卡片（授权动作不写入对话历史）───
@@ -2619,7 +2621,24 @@ var historyRequest = null, historyPageRequest = null;
 var turnQueueBindings = [];
 var turnAdmissionChains = new Map();
 var TURN_POST_DEADLINE_MS = 15000;
-var turnQueueReads = [];
+var turnQueueReads = [], turnQueueObserver = null, composerContinuation = null;
+
+function sessionQueueObserver(sid) {
+  var observer = turnQueueObserver;
+  if (observer && observer.sid === sid) return observer;
+  if (observer) observer.stop();
+  var epoch = authEpoch;
+  observer = CitrusTaskTransport.createSessionObserver({url: turnQueueURL(sid), fetch: accountFetch, sessionId: sid,
+    owns: function () { return turnQueueObserver === observer && epoch === authEpoch && sid === sessionId; },
+    onAvailability: function (available) { queueSyncUnavailable = !available; refreshTaskComposer(); }});
+  observer.sid = sid;
+  turnQueueObserver = observer;
+  return observer;
+}
+
+function watchTurnQueue(sid, requestId, adopt) {
+  return sessionQueueObserver(sid).watch(requestId, adopt);
+}
 
 function abortHistoryRequests() {
   if (historyRequest) historyRequest.abort();
@@ -2672,8 +2691,7 @@ function readTurnQueue(sid, callback, requestId) {
     var index = turnQueueReads.indexOf(controller);
     if (index >= 0) turnQueueReads.splice(index, 1);
   }
-  var url = requestId ? '/api/v2/session/' + encodeURIComponent(sid) + '/task-by-request/' + encodeURIComponent(requestId)
-    : turnQueueURL(sid) + '?limit=100';
+  var url = '/api/v2/session/' + encodeURIComponent(sid) + '/task-by-request/' + encodeURIComponent(requestId);
   accountFetch(url, {signal: controller.signal, cache: 'no-store'})
     .then(function (response) {
       return response.json().then(function (body) {
@@ -2690,19 +2708,12 @@ function readTurnQueue(sid, callback, requestId) {
   return controller;
 }
 
-function findTurnQueueEntry(turns, requestId) {
-  for (var i = 0; i < (turns || []).length; i++) {
-    var turn = turns[i];
-    if (turn && String(turn.client_request_id || '') === String(requestId)) return turn;
-  }
-  return null;
-}
-
 // Retire observers and view controls only. Navigation never sends cancellation.
-function disposeTaskView() {
+function disposeTaskView(preserveQueue) {
   historyRestoreVersion += 1;
   abortHistoryRequests();
   abortTurnQueueReads();
+  if (!preserveQueue && turnQueueObserver) { turnQueueObserver.stop(); turnQueueObserver = null; }
   if (activeTurnCancel) activeTurnCancel('switch');
   else if (activeTurnComposer) activeTurnComposer.cancel('switch');
   turnQueueBindings.slice().forEach(function (binding) {
@@ -2804,6 +2815,8 @@ function refreshTaskComposer() {
     var icon = button.querySelector('use');
     if (icon) icon.setAttribute('href', executing ? '/assets/citrus-icons.svg#ui-stop' : '/assets/citrus-icons.svg#ui-send');
   }
+  var continuation = document.getElementById('composer-continuation');
+  if (continuation) continuation.hidden = !(composerContinuation && composerContinuation.session === sessionId);
   var hint = document.getElementById('composer-task-status');
   if (hint) {
     hint.textContent = queueSyncUnavailable ? '消息状态待同步，可刷新重试。'
@@ -2814,6 +2827,13 @@ function refreshTaskComposer() {
     hint.title = hint.textContent;
   }
 }
+
+function setComposerContinuation(requestId) {
+  composerContinuation = requestId ? {session: sessionId, requestId: requestId} : null;
+  refreshTaskComposer();
+}
+var clearContinuation = document.getElementById('clear-composer-continuation');
+if (clearContinuation) clearContinuation.addEventListener('click', function () { setComposerContinuation(null); });
 
 function activateComposer() {
   var binding = activeTurnComposer;
@@ -3340,7 +3360,8 @@ function contextView() {
 function toggleCtxDrawer() { contextView().toggle(); }
 function renderContextPanel(data) {
   _ctxData = data || null;
-  if (typeof CitrusContextView !== 'undefined') contextView().update(_ctxData);
+  var limit = _runtimeConfig && _runtimeConfig.context && _runtimeConfig.context.max_tokens;
+  if (typeof CitrusContextView !== 'undefined') contextView().update(_ctxData && Object.assign({}, _ctxData, {application_input_limit: limit}));
 }
 
 function publicTaskStage(value) {
@@ -3456,13 +3477,14 @@ function createResearchProcessPanel(goal) {
     if (Array.isArray(savedResolutions)) view.resolution({resolutions: savedResolutions});
     if (type === 'job') {
       var nextJobId = String(data.job_id || knownJobId);
-      if (knownJobId && nextJobId !== knownJobId) { activeMilestone = null; browsePhase = ''; }
+      if (nextJobId && nextJobId !== knownJobId) { activeMilestone = null; browsePhase = ''; view.begin(nextJobId); }
       knownJobId = nextJobId;
     }
     else if (type === 'task_plan' || type === 'status' && data.stage === 'task_plan') {
       if (!knownJobId || String(data.plan_id) === knownJobId) view.plan(data);
     }
     else if (type === 'agent_recovery' && data.status === 'admitted') {
+      view.begin(String(data.job_id || knownJobId) + '/' + String(data.seq || data.recovery_cursor || 'recovery'));
       settled = false; browsePhase = ''; activeMilestone = null;
       view.terminal(false); label.textContent = '正在恢复任务'; panel.classList.remove('has-failure');
     }
@@ -3584,12 +3606,25 @@ function appendMessageActions(content, role, text) {
     edit.textContent = '✎ 编辑';
     edit.addEventListener('click', function() {
       userInput.value = String(text || '');
+      setComposerContinuation(null);
       userInput.focus();
       refreshTaskComposer();
       userInput.setSelectionRange(userInput.value.length, userInput.value.length);
       userInput.scrollIntoView({behavior:'smooth', block:'nearest'});
     });
     actions.appendChild(edit);
+  }
+  if (assistant && content.dataset.requestId && content.dataset.sessionId === sessionId && (text || '').trim()) {
+    var prior = content.dataset.requestId, sid = sessionId;
+    var next = document.createElement('button');
+    next.type = 'button'; next.className = 'message-action turn-explicit-continuation';
+    next.textContent = '继续此轮';
+    next.title = '明确继承此轮保存的附件';
+    next.addEventListener('click', function () {
+      if (sid !== sessionId || !chatContainer.contains(content)) return;
+      setComposerContinuation(prior); userInput.focus();
+    });
+    actions.appendChild(next);
   }
   actionHost.appendChild(actions);
   if (assistant) appendFeedback(actions);
@@ -4001,12 +4036,13 @@ function toolStatusText(status, reason) {
   if (status === 'no_results') return '已完成，未找到结果';
   if (status === 'unavailable') return '执行记录不可用';
   if (status === 'cancelled') return '已停止';
+  if (status === 'interrupted') return '上次执行未记录结束状态';
   if (status === 'skipped') return '已跳过' + reasonText;
   if (status === 'not_run') return '未执行' + reasonText;
   return '未完成' + reasonText;
 }
 
-async function sendMsg(paperVerification) {
+async function sendMsg(paperVerification, continueFrom) {
   if (!currentAccount || !sessionId || accountDocumentRetired || historyRequest) return false;
   var epoch = authEpoch, requestSessionId = sessionId;
   function ownsTurn() { return epoch === authEpoch && requestSessionId === sessionId && (!botContent || chatContainer.contains(botContent)); }
@@ -4025,9 +4061,12 @@ async function sendMsg(paperVerification) {
     }
     return;
   }
-  if (!paperVerification) _composerNotice = '';
+  if (!paperVerification) {
+    _composerNotice = '';
+    if (!continueFrom && composerContinuation && composerContinuation.session === requestSessionId) continueFrom = composerContinuation.requestId;
+    setComposerContinuation(null);
+  }
   mascotSay('planning');
-  var _firstTokenElapsedMs = null;
   var visualizeForRequest = !paperVerification && visualizationEnabled;
   var draftKey = composerDraftKey();
   // The PDF action sends one original File in its own turn, without consuming
@@ -4254,6 +4293,7 @@ async function sendMsg(paperVerification) {
     if (!ownsTurn()) return;
     _turnDisconnected = false;
     processPanel.receive('snapshot', job);
+    renderTurnTimings(botContent, job);
     renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     syncWaiting();
     if (taskStore.state.question && taskStore.state.question.status === 'pending' && !CitrusTaskState.displayStatus(job)) {
@@ -4374,7 +4414,7 @@ async function sendMsg(paperVerification) {
 
   function handleSendFollowUp(q) {
     userInput.value = q;
-    sendMsg();
+    sendMsg(null, clientRequestId);
   }
 
   function showBanner(msg) {
@@ -4401,6 +4441,7 @@ async function sendMsg(paperVerification) {
     renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     if (type === 'agent_recovery' && data.status === 'admitted') {
       hasTerminalEvent = false; snapshotOnly = false; fullText = '';
+      var timing = botContent.querySelector('.turn-timings'); if (timing) timing.remove();
       isFinalAnswerArmed = false; isAnswerStarted = false;
     }
     if (type === 'answer_start' || type === 'text' || type === 'text_reset') {
@@ -4410,11 +4451,9 @@ async function sendMsg(paperVerification) {
         isFinalAnswerArmed = false; isAnswerStarted = false; fullText = '';
         answerDiv.replaceChildren(); answerDiv.style.display = 'none';
       }
-      if (type === 'text' && isFinalAnswerArmed && typeof data.content === 'string') {
+      if (type === 'text' && isFinalAnswerArmed && data.delivery === 'committed' && typeof data.content === 'string') {
         if (!isAnswerStarted && data.content.trim()) {
           isAnswerStarted = true; clearTimeout(spinnerTimeout);
-          var executionStart = queueEntry && !queueEntry.active_child_job_id && Number(queueEntry.started_at);
-          _firstTokenElapsedMs = executionStart > 0 ? Math.max(0, Date.now() - executionStart * 1000) : null;
           if (ownsControls()) mascotSay('generating');
           answerDiv.style.display = '';
         }
@@ -4432,6 +4471,7 @@ async function sendMsg(paperVerification) {
       }
       return;
     }
+    if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) renderTurnTimings(botContent, data);
     // Retired rounds may finish replaying into their own DOM. They cannot
     // release the composer, alter context usage, permissions or the sidebar.
     if (!ownsControls()) {
@@ -4614,7 +4654,6 @@ async function sendMsg(paperVerification) {
           ub.onclick=function(){handleSendFollowUp(query)};
           uc.appendChild(ub);botContent.appendChild(uc);
         }
-        if (_firstTokenElapsedMs != null) botContent.appendChild(createElapsedBadge(_firstTokenElapsedMs));
         if (data.session_id) sessionId=data.session_id;if(sessionId)localStorage.setItem(sessionStorageKey(),sessionId);
         window.dispatchEvent(new Event('citrus:turn-finished'));
         if (CitrusTaskState.isTerminal({display_status: _terminal})) {
@@ -4698,7 +4737,7 @@ async function sendMsg(paperVerification) {
     userInput.focus();
   }
 
-  var queueEntry = null, queuePollTimer = null, queueFollowedJobId = '', queueStatusEl = null;
+  var queueEntry = null, unwatchQueue = null, queueFollowedJobId = '', queueStatusEl = null;
   var queueUncertainAttempts = 0;
 
   function queueStatusNode() {
@@ -4743,24 +4782,11 @@ async function sendMsg(paperVerification) {
     }
   }
 
-  function clearQueuePoll() { if (queuePollTimer) { clearTimeout(queuePollTimer); queuePollTimer = null; } }
+  function clearQueuePoll() { if (unwatchQueue) { unwatchQueue(); unwatchQueue = null; } }
 
   function scheduleQueuePoll() {
-    if (queuePollTimer || !ownsTurn()) return;
-    if (!queueEntry || queueEntry.state === 'terminal') return;
-    queuePollTimer = setTimeout(function () {
-      queuePollTimer = null;
-      if (!ownsTurn() || !queueEntry || queueEntry.state === 'terminal') return;
-      readTurnQueue(requestSessionId, function (error, result) {
-        if (!ownsTurn()) return;
-        var entries = !error && result && result.ok && result.body && result.body.turns;
-        var found = Array.isArray(entries) && findTurnQueueEntry(entries, clientRequestId);
-        queueSyncUnavailable = !found;
-        if (found) { adoptTurnEntry(found, true); return; }
-        refreshTaskComposer();
-        scheduleQueuePoll();
-      });
-    }, 2000);
+    if (unwatchQueue || !ownsTurn() || !queueEntry || queueEntry.state === 'terminal') return;
+    unwatchQueue = watchTurnQueue(requestSessionId, clientRequestId, function (entry) { adoptTurnEntry(entry, true); });
   }
 
   function maybeFollowObserver() {
@@ -4810,7 +4836,7 @@ async function sendMsg(paperVerification) {
 
   function adoptTurnEntry(entry, silent) {
     if (!ownsTurn() || !entry || entry.client_request_id !== clientRequestId) return false;
-    if (queueEntry && queueEntry.state === 'terminal' && entry.state !== 'terminal') return false;
+    if (!CitrusTaskTransport.currentQueueEntry(queueEntry, entry)) return false;
     queueEntry = entry;
     queueSyncUnavailable = false;
     myBinding.queueEntry = entry;
@@ -4980,6 +5006,7 @@ async function sendMsg(paperVerification) {
           selected_skills: skillsForRequest, attachments: attachments,
           file_refs: fileRefsForRequest.map(function (file) { return file.file_id; })
         };
+        if (!paperVerification && typeof continueFrom === 'string' && continueFrom) payload.continue_from = continueFrom;
         requestSubmitted = true;
         admission.state = 'posting'; setComposerAdmission(draftKey, clientRequestId, admission, false);
         var outcome = await submitTurnBeforeDeadline(turnQueueURL(requestSessionId), payload, streamAbortController);
@@ -5833,12 +5860,8 @@ function observeQueuedJob(turn) {
 }
 
 function loadQueueTurns(sid) {
-  return new Promise(function (resolve) {
-    readTurnQueue(sid, function (error, result) {
-      var entries = !error && result && result.ok && result.body && result.body.turns;
-      resolve(Array.isArray(entries) ? entries : null);
-    });
-  });
+  if (!sid || sid !== sessionId) return Promise.resolve(null);
+  return sessionQueueObserver(sid).snapshot();
 }
 
 function mergeQueuedHistory(history, entries) {
@@ -5910,7 +5933,7 @@ function isPublicAnswerEvent(data) {
 
 function bindHistoryTask(turn, content, answer, process, ownsContext, useComposer, userContent) {
   var epoch = authEpoch, sid = sessionId, round = currentRoundId, armed = false, streamedAnswer = '', closed = false;
-  var binding = null, entry = turn.queueEntry, queuePoll = null, observed = '', queueStatus, disconnected = false;
+  var binding = null, entry = turn.queueEntry, unwatchQueue = null, observed = '', queueStatus, disconnected = false;
   var hasSavedAnswer = !!String(turn.answer && turn.answer.content || '').trim(), finalAnswerReceived = false;
   var savedCitations = turn.answer && turn.answer.citation_bubbles || [];
   var citationContainer = content.querySelector('.turn-citation-bubbles');
@@ -5951,6 +5974,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (!owns()) return;
     disconnected = false;
     process.receive('snapshot', job);
+    renderTurnTimings(content, job);
     renderArtifactDelivery(content, store.state.artifact_delivery);
     answer.dataset.displayStatus = store.state.display_status;
     if (!process.terminal(store.state.display_status)) {
@@ -5961,7 +5985,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
   }
   function dispose() {
     if (closed) return;
-    closed = true; process.stopClock(); clearTimeout(queuePoll); transport.stop(); controls.dispose(); questionCard.dispose(); store.clear();
+    closed = true; process.stopClock(); if (unwatchQueue) unwatchQueue(); transport.stop(); controls.dispose(); questionCard.dispose(); store.clear();
     composerRunning = false;
     unregisterTurnBinding(binding);
   }
@@ -5981,6 +6005,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (type === 'agent_recovery' && data.status === 'admitted') {
       answer.dataset.displayStatus = '';
       finalAnswerReceived = false; armed = false; streamedAnswer = '';
+      var timing = content.querySelector('.turn-timings'); if (timing) timing.remove();
     }
     if (type.indexOf('context_') === 0 || data.context_snapshot) projectContext();
     if (type === 'citations' && data.display === 'bubble_only') {
@@ -5994,7 +6019,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     }
     if (!finalAnswerReceived && isPublicAnswerEvent(data)) {
       if (type === 'answer_start') armed = true;
-      if (type === 'text' && armed && typeof data.content === 'string') {
+      if (type === 'text' && armed && data.delivery === 'committed' && typeof data.content === 'string') {
         streamedAnswer += data.content;
         if (!hasSavedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer, savedCitations);
       }
@@ -6008,6 +6033,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       if (String(data.answer).trim()) process.answerVisible();
     }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
+      renderTurnTimings(content, data);
       finalAnswerReceived = true;
       if (CitrusTaskState.isTerminal(store.state)) {
         appendMessageActions(content, 'assistant', data.answer || streamedAnswer || (turn.answer && turn.answer.content));
@@ -6050,7 +6076,8 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
   historyTaskDisposers.push(dispose);
 
   function adopt(entryNow) {
-    if (!owns() || entry.state === 'terminal' && entryNow.state !== 'terminal') return;
+    if (!owns() || !CitrusTaskTransport.currentQueueEntry(entry, entryNow)) return;
+    if (entryNow.state === 'terminal' && unwatchQueue) { unwatchQueue(); unwatchQueue = null; }
     entry = entryNow;
     if (binding) binding.queueEntry = entry;
     markQueuedBubble(userContent, content, entry);
@@ -6064,7 +6091,8 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       answer.dataset.displayStatus = cancelled ? 'cancelled' : 'failed';
       answer.textContent = cancelled ? '已取消，这条消息不会执行。' : '这条消息未能开始执行，请重新发送。';
     }
-    var job = observeQueuedJob(entry);    if (entry.state === 'reconcile_required') {
+    var job = observeQueuedJob(entry);
+    if (entry.state === 'reconcile_required') {
       var settle = document.createElement('button');
       settle.type = 'button'; settle.className = 'turn-queue-cancel turn-queue-reconcile';
       settle.textContent = '确认并继续';
@@ -6092,21 +6120,12 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     syncWaiting();
     selectActiveTurn();
   }
-  async function pollQueue() {
-    if (!owns() || entry.state === 'terminal') return;
-    var next = findTurnQueueEntry(await loadQueueTurns(sid), entry.client_request_id);
-    if (!owns()) return;
-    queueSyncUnavailable = !next;
-    if (next) adopt(next);
-    else refreshTaskComposer();
-    if (entry.state !== 'terminal') queuePoll = setTimeout(pollQueue, 2000);
-  }
   if (entry) {
     queueStatus = document.createElement('div'); queueStatus.className = 'turn-queue-state';
     queueStatus.setAttribute('role', 'status');
     content.appendChild(queueStatus);
     adopt(entry);
-    if (entry.state !== 'terminal') queuePoll = setTimeout(pollQueue, 2000);
+    if (entry.state !== 'terminal') unwatchQueue = watchTurnQueue(sid, entry.client_request_id, adopt);
   } else if (turn.jobId) transport.follow(turn.jobId);
 }
 
@@ -6140,7 +6159,8 @@ function bindSettledHistoryDetails(turn, content, answer, process) {
           cursor = event.seq;
           var type = event.event, data = Object.assign({}, event.data || {}, {seq: event.seq});
           process.receive(type, data);
-          if (recoveryAnswer && (type === 'done' || type === 'error') && typeof data.answer === 'string' &&
+          if ((type === 'done' || type === 'error') && event.seq >= (page.recovery_cursor || 0)) renderTurnTimings(content, data);
+          if (recoveryAnswer && event.seq >= (page.recovery_cursor || 0) && (type === 'done' || type === 'error') && typeof data.answer === 'string' &&
               data.answer.trim() && isPublicAnswerEvent(data)) {
             answer.innerHTML = renderMarkdownSafe(data.answer, data.citation_bubbles);
             appendMessageActions(content, 'assistant', data.answer);
@@ -6163,7 +6183,7 @@ function bindSettledHistoryDetails(turn, content, answer, process) {
 
 function renderHistoryMessages(msgs, serverTurns, placement) {
   if (!placement) {
-    disposeTaskView();
+    disposeTaskView(true);
     clearSentAttachmentPreviewUrls();
     chatContainer.innerHTML = '';
   }
@@ -6209,6 +6229,7 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
       renderCitationBubbles(citationRow, answer.citation_bubbles, turn.turnRequestId, sessionId, turn.answerProducerJobId);
     }
     if (turn.artifactDelivery) renderArtifactDelivery(contentEl, turn.artifactDelivery);
+    renderTurnTimings(contentEl, turn.terminalSnapshot);
     var process = createResearchProcessPanel(turn.intentSummary || (turn.user && turn.user.content));
     contentEl.insertBefore(process.element, contentEl.firstChild);
     process.receive('snapshot', {terminal_snapshot: turn.terminalSnapshot});
@@ -6249,11 +6270,23 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
 
 /* v8.10: 无会话时自动创建默认会话（主流行为）——打开即有一个会话，历史回答有处可存，
    不再依赖用户手动点 ＋ 新建 */
-function createElapsedBadge(milliseconds) {
-  var badge = document.createElement('div');
-  badge.style.cssText = 'margin-top:8px;font-size:11px;color:var(--text-muted);font-family:var(--font-mono)';
-  badge.textContent = '开始执行到首段答复 ' + (Math.max(0, Number(milliseconds) || 0) / 1000).toFixed(1) + ' 秒';
-  return badge;
+function renderTurnTimings(container, source) {
+  var envelope = source && (source.turn_envelope || source.terminal_snapshot);
+  var timing = source && (source.turn_timings || envelope && envelope.turn_timings);
+  if (!timing) return;
+  var labels = {visible_answer_first_ms: '提交到首段可见答复', provider_first_packet_ms: '模型调用到服务商首包',
+    queue_wait_ms: '队列等待', tool_elapsed_ms: '工具累计用时', context_maintenance_ms: '上下文维护用时'};
+  var rows = Object.keys(labels).filter(function (key) { return Number.isFinite(timing[key]) && timing[key] >= 0; })
+    .map(function (key) { return labels[key] + ' ' + (timing[key] / 1000).toFixed(1) + ' 秒'; });
+  if (!rows.length) return;
+  var badge = container.querySelector('.turn-timings');
+  if (!badge) {
+    badge = document.createElement('div'); badge.className = 'turn-timings';
+    badge.style.cssText = 'margin-top:8px;font-size:11px;color:var(--text-muted)';
+    badge.title = '服务端记录的各阶段用时，统计起点不同，不应直接相加。';
+    container.appendChild(badge);
+  }
+  badge.textContent = rows.join(' · ');
 }
 
 var _sessionCreation = null;

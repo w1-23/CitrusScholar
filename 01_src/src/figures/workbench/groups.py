@@ -82,7 +82,7 @@ class Group:
 class Inventory:
     """One revision's groups and the closed translation into renderer overrides."""
 
-    def __init__(self, project, manifest, *, disabled="", frozen=None, native=None):
+    def __init__(self, project, manifest, *, disabled="", frozen=None, native=None, svg_targets=None):
         self.figure_id = project["figure_id"]
         self.source_kind = project.get("source_kind")
         self.groups = {}
@@ -91,6 +91,7 @@ class Inventory:
         self.saved = {}
         self.declarative = DeclarativeIdentity(frozen) if self.source_kind == "spec" else None
         self.native = native
+        self.svg_targets = svg_targets
         self._build(manifest, project.get("overrides_json") or [])
 
     def _add(self, key, kind, label, parent=None, rows=()):
@@ -143,6 +144,8 @@ class Inventory:
         root = self._add(("figure",), "figure", "整张图", rows=figure_rows)
         root.hits.clear()
         panel_ids = self.native.panels if self.native else verified_panels(axes, self.declarative)
+        panel_ids = {index: key for index, key in panel_ids.items()
+                     if self.svg_targets and self.svg_targets.verifies(axes[index])}
         panel_keys = {index: ("verified", panel_ids[index]) if index in panel_ids else ("unverified", index)
                       for index in axes}
         panels = {}
@@ -194,16 +197,22 @@ class Inventory:
                 group.reason = "此子图没有唯一的已保存标识。"
             if role == "series":
                 series_by_gid[row["gid"]] = group
-                if not source_key:
+                deliberate_hide = (source_key and self.svg_targets and self.saved.get((row["gid"], "visible")) is False
+                                   and self.svg_targets.verifies_absence(row))
+                if deliberate_hide:
+                    group.props.intersection_update({"visible"})
+                    group.hits.clear()
+                elif not source_key or not self.svg_targets or not self.svg_targets.verifies(row):
                     group.props.clear()
-                    group.reason = group.reason or "此系列没有可验证的来源标识。"
+                    group.hits.clear()
+                    group.reason = group.reason or "此系列没有可验证的来源标识或 SVG 对象。"
                 if not group.props and not group.reason:
                     group.reason = "渲染器未声明此系列可用的样式属性。"
             elif role in {"title", "xlabel", "ylabel"} and not row.get("text") and not row.get("bbox"):
                 group.hits.clear()
         for row in rows:
             parent = series_by_gid.get(row.get("parent_gid"))
-            if row["role"] in {"bar", "point"} and parent:
+            if row["role"] in {"bar", "point"} and parent and parent.hits:
                 parent.hits.append(row["gid"])
                 blocked = {prop for gid, prop in self.saved if gid == row["gid"]}
                 if blocked:
@@ -272,8 +281,8 @@ class Inventory:
             raise invalid("group_batch_too_large", "这批修改超出 200 项成员样式上限。", 422)
         return raw, expected
 
-    def confirm(self, expected, manifest, accepted):
-        if self.native and not self.native.confirms(manifest):
+    def confirm(self, expected, manifest, accepted, svg_targets):
+        if self.native and not self.native.confirms(manifest, svg_targets.svg):
             raise invalid("group_members_changed", "重绘时所选组成员发生变化。", 409)
         actual = {row.get("gid"): row for row in manifest.get("objects", []) if isinstance(row, dict)}
         if len(actual) != len(manifest.get("objects", [])):
@@ -286,6 +295,12 @@ class Inventory:
             if after is None or (_identity(before) != _identity(after) and not (
                     self.declarative and self.declarative.confirmation(before, after))):
                 raise invalid("group_members_changed", "重绘时所选组成员发生变化。", 409)
+            if after["role"] in {"axes", "series"}:
+                same_axes = self.svg_targets.axes_gid(before) == svg_targets.axes_gid(after)
+                if (before.get("svg_nodes") != after.get("svg_nodes") or not same_axes
+                        or self.declarative and not self.declarative.confirmation(before, after)
+                        or not self._confirms_svg(after, expected, values, actual, svg_targets)):
+                    raise invalid("group_members_changed", "重绘时所选组的 SVG 对象或所属子图无法确认。", 409)
             if prop not in (set(actual[gid].get("editable", [])) | workbench_properties(actual[gid])):
                 raise invalid("group_property_unavailable", "重绘未确认所选组的样式。", 409)
             if prop not in _OBSERVED_STYLES:
@@ -300,3 +315,27 @@ class Inventory:
                 matches = observed == wanted
             if not matches:
                 raise invalid("group_edit_unconfirmed", "重绘结果与提交的组样式不一致，修改未保存。", 409)
+
+
+    def _confirms_svg(self, row, expected, values, actual, svg_targets):
+        visibility = (row["gid"], "visible")
+        if visibility not in expected or values[visibility] is not False:
+            return svg_targets.verifies(row)
+        # Matplotlib omits hidden artists. This exception requires an explicit
+        # submitted visibility change, exact locator, declared hidden state,
+        # no instances anywhere, and a genuine node for every visible sibling.
+        index = row["locator"]["axes_index"]
+        if not svg_targets.verifies_absence(row):
+            return False
+        for before in self.rows.values():
+            key = (before["gid"], "visible")
+            if (before["role"] != "series" or before["locator"].get("axes_index") != index
+                    or before.get("visible") is False or key in expected and values[key] is False):
+                continue
+            sibling = actual.get(before["gid"])
+            if (sibling is None or sibling.get("visible") is False
+                    or sibling.get("svg_nodes") != before.get("svg_nodes")
+                    or self.svg_targets.axes_gid(before) != svg_targets.axes_gid(sibling)
+                    or not svg_targets.verifies(sibling)):
+                return False
+        return True

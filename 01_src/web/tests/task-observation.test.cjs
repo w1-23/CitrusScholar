@@ -150,3 +150,71 @@ test('continuation starts at cursor zero and ignores the retired job response', 
   assert.equal(store.state.cursor, 1);
   assert.deepEqual(received.filter(data => data.answer).map(data => data.answer), ['Child answer']);
 });
+
+
+test('one session read multiplexes watched requests and retains backfilled terminal status', async t => {
+  const replies = [], calls = [], seen = [], available = [];
+  let release;
+  const turn = (id, state, generation = 1) => ({client_request_id: id, session_id: 's', state, generation});
+  const observer = CitrusTaskTransport.createSessionObserver({url: '/queue', sessionId: 's', owns: () => true,
+    onAvailability: value => available.push(value), fetch: (url, {signal}) => {
+      calls.push({url, signal});
+      if (replies.length) return replies.shift();
+      return new Promise(resolve => { release = resolve; });
+    }});
+  t.after(() => observer.stop());
+  observer.watch('request a', entry => seen.push(entry));
+  observer.watch('request/b', entry => seen.push(entry));
+  const first = observer.snapshot();
+  assert.equal(first, observer.snapshot());
+  await Promise.resolve();
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\?limit=100&watch=request%20a&watch=request%2Fb$/);
+  release(reply({turns: [turn('request a', 'running'), turn('request/b', 'queued')], next_after_seq: 99}));
+  assert.equal((await first).length, 2);
+  replies.push(reply({turns: [turn('request a', 'terminal', 2), turn('request/b', 'running')], next_after_seq: 99}));
+  assert.equal((await observer.snapshot())[0].state, 'terminal');
+  assert.match(calls[1].url, /after_seq=99&watch=request%20a&watch=request%2Fb$/);
+  replies.push(reply({turns: [turn('request a', 'running', 1), turn('request/b', 'terminal')], next_after_seq: 100}));
+  assert.equal((await observer.snapshot())[0].state, 'terminal');
+  assert.deepEqual(available, [true, true, false]);
+  assert.deepEqual(seen.map(item => item.state), ['running', 'queued', 'terminal', 'running', 'terminal']);
+  const last = observer.snapshot();
+  await Promise.resolve();
+  observer.stop();
+  assert.equal(calls.at(-1).signal.aborted, true);
+  release(reply({turns: [turn('request a', 'running', 3)], next_after_seq: 101}));
+  assert.equal(await last, null);
+  assert.equal(seen.length, 5);
+});
+
+test('replay consumes but never projects obsolete generation frames', async t => {
+  const recovery = {seq: 3, event: 'agent_recovery', data: {job_id: job.job_id, status: 'admitted'}};
+  const oldQuestion = {seq: 2, event: 'question', data: {question: {id: 'old', status: 'pending'}}};
+  const newQuestion = {seq: 4, event: 'question', data: {question: {id: 'current', status: 'pending'}}};
+  const {transport, store, frames} = observation([
+    page([running, oldQuestion, recovery, newQuestion], 4, {status: 'awaiting_input', recovery_cursor: 3})
+  ]);
+  t.after(() => transport.stop());
+  await transport.replay(job.job_id);
+  assert.equal(store.state.cursor, 4);
+  assert.equal(store.state.recovery_cursor, 3);
+  assert.equal(store.state.question.id, 'current');
+  assert.deepEqual(frames.map(frame => frame.type), ['agent_recovery', 'question']);
+  assert.equal(store.hydrate({job_id: job.job_id, event_cursor: 4, recovery_cursor: 0,
+    question: {id: 'old', status: 'pending'}}), false);
+});
+
+test('public progress identities deduplicate only within one generation', () => {
+  const process = CitrusTaskState.createProcess();
+  const metadata = {note_id: 'same', visibility: 'public', origin: 'host', category: 'model_thinking'};
+  process.begin('job');
+  assert.ok(process.note('one', null, metadata));
+  assert.equal(process.note('duplicate', null, metadata), null);
+  process.action({tool_call_id: 'call', status: 'running'});
+  process.begin('job/4');
+  assert.ok(process.note('after recovery', null, metadata));
+  process.action({tool_call_id: 'call', status: 'running'});
+  assert.deepEqual(process.entries.filter(item => item.kind === 'note').map(item => item.text), ['one', 'after recovery']);
+  assert.deepEqual(process.entries.filter(item => item.kind === 'action').map(item => item.data.status), ['interrupted', 'running']);
+});

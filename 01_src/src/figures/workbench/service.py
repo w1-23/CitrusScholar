@@ -10,6 +10,7 @@ from src.figures.document import SCHEMA, _digest
 from src.figures.workbench import artifacts, nature_vectors
 from src.figures.workbench.frozen_script_identity import FrozenScriptIdentity
 from src.figures.workbench.groups import Inventory, invalid
+from src.figures.workbench.svg_targets import SvgTargets
 
 _OPTIONS = {"fontfamily": "font_families", "fontweight": "font_weights", "fontstyle": "font_styles",
             "horizontalalignment": "horizontalalignment_options", "loc": "legend_loc_options",
@@ -154,7 +155,8 @@ def _inventory(project, owner, *, check_preview=True, preview_svg=None):
             reason = exc.message
     try:
         native = None if reason else FrozenScriptIdentity.create(project, manifest, svg)
-        return manifest, Inventory(project, manifest, disabled=reason, frozen=frozen, native=native)
+        return manifest, Inventory(project, manifest, disabled=reason, frozen=frozen, native=native,
+                                   svg_targets=SvgTargets(svg, manifest) if not reason else None)
     except (projects.ProjectError, TypeError, AttributeError):
         return {"objects": []}, Inventory({**project, "overrides_json": []}, {"objects": []},
                                             disabled="图件的已保存对象清单无法验证。")
@@ -192,7 +194,7 @@ def edit(figure_id, owner, revision, commands, *, draft_revision=0, save=False):
     _, inventory = _inventory(project, owner)
     submitted, expected = inventory.translate(commands)
 
-    def confirm(manifest, accepted, changed):
+    def confirm(manifest, accepted, changed, svg):
         try:
             # Use the same normalized value acknowledgement as script replay.
             # A child process reporting the right ids but dropping or changing
@@ -203,7 +205,7 @@ def edit(figure_id, owner, revision, commands, *, draft_revision=0, save=False):
             raise invalid("group_edit_unconfirmed", "渲染器未确认提交的组样式。", 409) from exc
         if not {gid for gid, _ in expected} <= set(changed):
             raise invalid("group_edit_unconfirmed", "渲染器未应用全部组样式。", 409)
-        inventory.confirm(expected, manifest, accepted)
+        inventory.confirm(expected, manifest, accepted, SvgTargets(svg, manifest))
 
     if not save:
         result = projects.preview_overrides(figure_id, owner, submitted, expected_revision=revision,

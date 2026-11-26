@@ -238,13 +238,14 @@
       <div id="selected-skills" class="selected-skills" aria-live="polite" hidden></div>
       <div id="composer-admission-recovery" class="composer-admission-recovery" aria-live="polite" hidden></div>
       <!-- 输入区：自然语言请求、附件与发送控件 -->
+      <div id="composer-continuation" class="composer-task-status" hidden>继续所选轮次并继承其附件 · <button type="button" id="clear-composer-continuation" class="history-retry">取消继承</button></div>
       <div class="composer-meta">
         <p id="composer-task-status" class="composer-task-status" role="status" aria-live="polite" hidden></p>
 
       </div>
       <div class="input-box">
         <div id="attachment-list" class="attachment-list" aria-live="polite"></div>
-        <textarea id="user-input" rows="2" aria-label="消息" aria-describedby="composer-task-status" placeholder="向 CitrusScholar 提问，或上传文件进行分析…"></textarea>
+        <textarea id="user-input" rows="2" aria-label="消息" aria-describedby="composer-task-status composer-continuation" placeholder="向 CitrusScholar 提问，或上传文件进行分析…"></textarea>
         <div class="input-bottom">
           <div class="input-actions">
             <input id="attachment-input" type="file" accept=".pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb" multiple hidden onchange="handleAttachmentSelection(this.files, this)">
@@ -537,13 +538,13 @@
   </div>
 </template>
 <script src="/assets/guide.js?v=5"></script>
-<script src="/assets/task-state.js?v=11"></script>
-<script src="/assets/context-view.js?v=3"></script>
-<script src="/assets/task-transport.js?v=6"></script>
-<script src="/assets/task-cards.js?v=10"></script>
+<script src="/assets/task-state.js?v=12"></script>
+<script src="/assets/context-view.js?v=4"></script>
+<script src="/assets/task-transport.js?v=7"></script>
+<script src="/assets/task-cards.js?v=11"></script>
 <script src="/assets/task-controls.js?v=5"></script>
 <script src="/assets/skill-picker.js?v=11"></script>
-<script src="/assets/app.js?v=74"></script>
+<script src="/assets/app.js?v=75"></script>
 <script src="/assets/turn_rail.js?v=2"></script>
 <script src="/assets/corpus_reader.js?v=12"></script>
 <script src="/assets/xlsx.full.min.js?v=1"></script>

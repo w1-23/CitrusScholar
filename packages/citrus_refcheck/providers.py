@@ -33,6 +33,13 @@ def normalize_doi(value: Any) -> str:
     return doi.rstrip(".,;:，。；）)]}")
 
 
+def normalize_arxiv_id(value: Any) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(?:(?:https?://(?:export\.)?arxiv\.org/abs/)|arxiv:\s*)?"
+                         r"(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?", text, re.I)
+    return match[1].casefold() if match else ""
+
+
 def norm_title(value: Any) -> str:
     text = re.sub(r"<[^>]+>", " ", str(value or ""))
     text = unicodedata.normalize('NFKC', html.unescape(text)).casefold()
@@ -118,6 +125,12 @@ def _crossref_record(item: dict, source: str = "Crossref") -> dict:
             for kind, refs in relations.items() if kind in {'is-preprint-of', 'has-preprint', 'is-version-of', 'has-version'}
             and isinstance(refs, list) for ref in refs[:12]
             if isinstance(ref, dict) and ref.get('id-type') == 'doi' and ref.get('id')]
+    updates = item.get('updated-by') or []
+    explicit = item.get('is_retracted') is True or any(
+        isinstance(update, dict) and str(update.get('type', '')).casefold() in {'retraction', 'withdrawal'}
+        for update in updates[:20]) if isinstance(updates, list) else item.get('is_retracted') is True
+    if explicit:
+        record['retracted'] = True
     return record
 
 
@@ -163,7 +176,9 @@ def _datacite_arxiv(arxiv_id: str) -> tuple[int | str, list[dict], str]:
     same identifier. The record is backfilled with ``arxiv_id`` so that callers
     still see an identifier match.
     """
-    status, records, error = _datacite_work(f"10.48550/arXiv.{arxiv_id}")
+    exact = normalize_doi(f"10.48550/arXiv.{arxiv_id}")
+    status, records, error = _datacite_work(exact)
+    records = [record for record in records if normalize_doi(record.get("doi")) == exact]
     for record in records:
         record["arxiv_id"] = arxiv_id
         record["source"] = "DataCite (arXiv DOI)"
@@ -178,7 +193,7 @@ def _openalex_record(item: dict) -> dict:
     location = item.get("primary_location") or {}
     venue = str((location.get("source") or {}).get("display_name") or "")
     kind = str(item.get("type") or "journal-article")
-    return _rec("OpenAlex",
+    record = _rec("OpenAlex",
                 title=item.get("title") or item.get("display_name") or "",
                 authors=authors,
                 year=item.get("publication_year", ""),
@@ -190,6 +205,9 @@ def _openalex_record(item: dict) -> dict:
                 issue=(item.get('biblio') or {}).get('issue', ''),
                 pages='-'.join(str((item.get('biblio') or {})[k]) for k in ('first_page', 'last_page')
                                if (item.get('biblio') or {}).get(k)))
+    if type(item.get('is_retracted')) is bool:
+        record['retracted'] = item['is_retracted']
+    return record
 
 
 def _openalex_work(doi: str) -> tuple[int | str, list[dict], str]:

@@ -1,5 +1,8 @@
 """Queue HTTP and execution lifecycle with temporary stores and a controlled graph."""
 import asyncio
+import base64
+import sqlite3
+from contextlib import closing
 from contextlib import asynccontextmanager
 from time import monotonic, sleep
 from types import SimpleNamespace
@@ -11,7 +14,7 @@ import pytest
 
 from src import auth
 from src.api import main
-from src.core import chat_turn_queue as queue, jobs, user_questions
+from src.core import chat_turn_queue as queue, jobs, task_events, user_questions
 from src.core.account_leases import current_account_lease
 from src.core.tracing import get_job_id
 from src.core.chat_capacity import ChatCapacity
@@ -100,8 +103,10 @@ def runtime(monkeypatch, tmp_path):
         (root + "/turn-queue/{client_request_id}", main.cancel_chat_turn, "DELETE"),
         (root + "/task-by-request/{client_request_id}", main.discover_chat_job, "GET"),
         ("/api/v2/chat", main.chat_v2, "POST"),
+        ("/jobs/{job_id}", main.get_job_status, "GET"),
         ("/jobs/{job_id}/events", main.get_job_events, "GET"),
         ("/api/v2/chat/jobs/{job_id}/questions", main.get_task_questions, "GET"),
+        ("/api/v2/chat/jobs/{job_id}/updates/{update_request_id}", main.chat_task_update_status, "GET"),
         ("/api/v2/chat/jobs/{job_id}/questions/{question_id}/answer", main.answer_task_question, "POST"),
     ):
         app.add_api_route(path, handler, methods=[method])
@@ -624,3 +629,110 @@ def test_reconcile_parked_checkpoint_conflict_requires_terminal_worker(runtime, 
     assert second.status_code == 200, second.text
     assert state(runtime, "first") == "terminal" and segments.snapshot()["phase"] == "quarantined"
     assert seen == [identity, identity] and runtime.started == []
+
+
+def test_only_explicit_visible_executed_baseline_contributes_attachments(runtime):
+    data = {"query": "source query", "client_request_id": "baseline", "attachments": [
+        {"name": "only-source.txt", "type": "text/plain", "data": base64.b64encode(b"immutable").decode()}]}
+    accepted = runtime.client.post(runtime.path, json=data)
+    assert accepted.status_code == 202, accepted.text
+    source_file, = accepted.json()["attachments"]
+
+    def continue_from(cid, baseline="baseline"):
+        return runtime.client.post(runtime.path, json={"query": "follow up", "client_request_id": cid,
+                                                     "continue_from": baseline})
+
+    assert continue_from("too-early").status_code == 409
+    assert continue_from("missing", "not-a-turn").status_code == 404
+    runtime.released.add("baseline")
+    wait_for(lambda: state(runtime, "baseline") == "terminal")
+    new_file_data = dict(data, query="unrelated upload", client_request_id="newer-input",
+                         attachments=[{"name": "different.txt", "type": "text/plain", "data": "ZGlmZmVyZW50"}])
+    runtime.released.add("newer-input")
+    assert runtime.client.post(runtime.path, json=new_file_data).status_code == 202
+    wait_for(lambda: state(runtime, "newer-input") == "terminal")
+    assert send(runtime, "ordinary", "unrelated turn")["attachments"] == []
+    response = continue_from("explicit")
+    assert response.status_code == 202, response.text
+    inherited, = response.json()["attachments"]
+    assert inherited["file_id"] == source_file["file_id"]
+    assert inherited["sha256"] == source_file["sha256"]
+    assert inherited["source"] == "previous_turn"
+    runtime.released.update({"ordinary", "explicit"})
+    wait_for(lambda: state(runtime, "explicit") == "terminal")
+    clear = runtime.client.post(f"/api/v1/session/{runtime.sid}/clear")
+    assert clear.status_code == 200, clear.text
+    assert continue_from("hidden").status_code == 404
+
+
+def test_queue_watch_recovers_terminal_transition_behind_cursor(runtime):
+    first = send(runtime, "held", "first stays running")
+    wait_for(lambda: state(runtime, "held") == "running")
+    second = send(runtime, "later", "cancel at higher sequence")
+    assert runtime.client.delete(runtime.path + "/later").status_code == 200
+    initial = runtime.client.get(runtime.path).json()
+    assert initial["next_after_seq"] == second["queue_seq"]
+    runtime.released.add("held")
+    wait_for(lambda: state(runtime, "held") == "terminal")
+    reply = runtime.client.get(runtime.path, params=[("after_seq", second["queue_seq"]), ("watch", "held")]).json()
+    latest, = reply["turns"]
+    assert (latest["client_request_id"], latest["state"]) == ("held", "terminal")
+    assert latest["generation"] > first["generation"]
+    assert reply["next_after_seq"] == second["queue_seq"]
+
+
+def test_observation_reads_do_not_wait_for_independent_wal_writer(runtime):
+    first = send(runtime, "last", "fully settle first")
+    wait_for(lambda: state(runtime, "last") == "terminal")
+    job_path = f'/jobs/{first["job_id"]}'
+    with closing(sqlite3.connect(jobs._DB_PATH, timeout=0.5)) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE task_jobs SET status='failed' WHERE job_id=?", (first["job_id"],))
+        start = monotonic()
+        status = runtime.client.get(job_path)
+        replay = runtime.client.get(job_path + "/events")
+        observed = runtime.client.get(runtime.path)
+        q = runtime.client.get(f'/api/v2/chat/jobs/{first["job_id"]}/questions')
+        assert monotonic() - start < 2.0
+        assert [status.status_code, replay.status_code, observed.status_code, q.status_code] == [200] * 4
+        assert status.json()["status"] == replay.json()["status"] == "completed"
+        assert status.json()["recovery_cursor"] == replay.json()["recovery_cursor"] == 0
+        listed = runtime.client.get(f'/sessions/{runtime.sid}/jobs')
+        assert listed.status_code == 200 and listed.json()["jobs"][0]["status"] == "completed"
+    with jobs.read_transaction() as reader:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("UPDATE task_jobs SET status='failed'")
+
+
+def test_status_and_replay_return_503_for_real_locked_sqlite(runtime, monkeypatch, tmp_path):
+    first = send(runtime, "last", "fully settle first")
+    wait_for(lambda: state(runtime, "last") == "terminal")
+    locked_path = tmp_path / "exclusive.sqlite3"
+    with closing(sqlite3.connect(str(locked_path))) as db:
+        db.execute("CREATE TABLE task_jobs (job_id TEXT)")
+        db.commit()
+        db.execute("BEGIN EXCLUSIVE")
+        job_path = f'/jobs/{first["job_id"]}'
+        with monkeypatch.context() as isolated:
+            isolated.setattr(jobs, "_DB_PATH", locked_path)
+            start = monotonic()
+            for path in (job_path, job_path + "/events", f'/api/v2/chat/jobs/{first["job_id"]}/updates/u'):
+                response = runtime.client.get(path)
+                assert response.status_code == 503, response.text
+                assert response.json()["detail"]["code"] == "task_store_unavailable"
+                assert response.headers["Retry-After"] == "1"
+            assert monotonic() - start < 2.0
+
+
+def test_update_status_observes_exact_committed_receipt_under_writer(runtime):
+    # Seed a real open receipt without having the controlled graph itself try
+    # a competing write on the server event loop while this test holds WAL.
+    job_id = jobs.claim_job(runtime.sid, "offline-update-fixture", owner_user_id=runtime.owner).job_id
+    base = f"/api/v2/chat/jobs/{job_id}/updates/"
+    update = task_events.submit_update(job_id, 0, "a user update", request_id="version-one")
+    with closing(sqlite3.connect(jobs._DB_PATH, timeout=0.5)) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE task_updates SET status='applied' WHERE job_id=?", (job_id,))
+        reply = runtime.client.get(base + "version-one")
+        assert reply.status_code == 200 and reply.json() == update
+        assert runtime.client.get(base + "unknown").status_code == 404

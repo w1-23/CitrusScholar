@@ -12,6 +12,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import asyncio
+import sqlite3
+import threading
 from contextvars import ContextVar
 import base64
 import hashlib
@@ -23,11 +25,11 @@ import uuid
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 from xml.etree import ElementTree
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -322,6 +324,17 @@ async def lifespan(app: FastAPI):
                 await asyncio.to_thread(expire_questions)
             except Exception as exc:
                 logger.warning("[Lifespan] pending input cleanup failed: %s", type(exc).__name__)
+            try:
+                from src.core.turn_logs import backfill_terminal_turn_logs
+                await asyncio.to_thread(backfill_terminal_turn_logs, limit=100)
+            except Exception as exc:
+                logger.warning("[Lifespan] terminal turn log backfill failed: %s", type(exc).__name__)
+            try:
+                from src.api.turn_envelope import reconcile_staged_turn_inputs
+                await asyncio.to_thread(reconcile_staged_turn_inputs)
+                await asyncio.to_thread(_retry_terminal_turn_inputs)
+            except Exception as exc:
+                logger.warning("[Lifespan] turn input reconciliation failed: %s", type(exc).__name__)
             # Library files expire per file, not per session: a file viewed from
             # any conversation is kept, and the session activity map is only
             # passed for caller compatibility (cleanup_idle_sessions ignores it).
@@ -524,9 +537,22 @@ async def account_auth_guard(request: Request, call_next):
                 and not path.startswith(("/jobs/", "/sessions/")))):
         return await call_next(request)
 
-    from src.auth import user_for_token, require_admin as is_admin
+    from src.auth import user_for_token, user_for_token_readonly, require_admin as is_admin
     token = request.cookies.get("citrus_auth", "")
-    user = await asyncio.to_thread(user_for_token, token)
+    turn_read = request.method == "GET" and bool(re.fullmatch(
+        r"/(?:api/v2/session/[^/]+/(?:turn-queue|task-by-request/[^/]+)|sessions/[^/]+/jobs)", path))
+    task_read = request.method == "GET" and bool(re.fullmatch(
+        r"/jobs/[^/]+(?:/events|/operations/[^/]+/result)?", path))
+    protocol_read = request.method == "GET" and bool(re.fullmatch(
+        r"/(?:api/tasks/[^/]+/questions|api/v2/chat/jobs/[^/]+/(?:questions|updates/[^/]+))", path))
+    if task_read or turn_read or protocol_read:
+        try:
+            user = await _bounded_task_read(lambda: user_for_token_readonly(token))
+        except HTTPException as exc:
+            # Exceptions raised by HTTP middleware bypass endpoint handlers.
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+    else:
+        user = await asyncio.to_thread(user_for_token, token)
     if not user and path == "/api/v2/auth/account" and request.method == "DELETE":
         from src.auth import user_for_deletion_retry
         user = await asyncio.to_thread(user_for_deletion_retry, token)
@@ -544,19 +570,29 @@ async def account_auth_guard(request: Request, call_next):
     # Session ids in path are checked centrally so every route added under the
     # session namespace inherits ownership enforcement.
     match = re.search(r"/(?:session|sessions)/([^/]+)(?:/|$)", path)
-    if match and match.group(1) not in {"new", "auth"}:
+    if match and match.group(1) not in {"new", "auth"} and not turn_read:
         if not session_manager.session_belongs_to(match.group(1), int(user["user_id"])):
             return JSONResponse({"detail": "会话不存在或无权访问。"}, status_code=404)
     if path.startswith("/jobs/"):
         job_id = path.split("/")[2]
-        try:
-            from src.core import jobs as jobs_mod
-            job = jobs_mod.get_job(job_id)
-            if not job:
+        from src.core import jobs as jobs_mod
+        if task_read:
+            def check_job_owner():
+                with jobs_mod.read_transaction() as conn:
+                    _read_owned_job(conn, job_id, int(user["user_id"]))
+
+            try:
+                await _bounded_task_read(check_job_owner)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+        else:
+            try:
+                job = jobs_mod.get_job(job_id)
+                if not job:
+                    return JSONResponse({"detail": "任务不存在或无权访问。"}, status_code=404)
+                _require_owned_job(job, user)
+            except HTTPException:
                 return JSONResponse({"detail": "任务不存在或无权访问。"}, status_code=404)
-            _require_owned_job(job, user)
-        except Exception:
-            return JSONResponse({"detail": "任务不存在或无权访问。"}, status_code=404)
 
     if request.method not in {"GET", "HEAD", "OPTIONS"} and path != "/api/v2/auth/account":
         from src.core.account_leases import AccountUnavailable, account_lease
@@ -731,6 +767,7 @@ class ChatRequest(BaseModel):
     # v8.3.7: 长度上限（防单条超长文本打爆预算/日志）+ 客户端幂等 ID（重试复用）
     query: str = Field(..., min_length=1, max_length=20000)
     client_request_id: Optional[str] = Field(default=None, max_length=64)
+    continue_from: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_.:-]{1,64}$")
     # Deprecated request fields retained for older clients; unified Agent mode
     # and always-available web tools are now server-controlled.
     light_mode: Optional[bool] = None
@@ -2117,26 +2154,71 @@ async def enqueue_chat_turn(session_id: str, req: ChatRequest, request: Request)
                         headers={"Cache-Control": "no-store"})
 
 
+_task_read_slots = threading.BoundedSemaphore(8)
+
+
+async def _bounded_task_read(read):
+    """Bound both HTTP latency and outstanding threads, including timed-out reads."""
+    unavailable = HTTPException(status_code=503, detail={"code": "task_store_unavailable"},
+                                headers={"Retry-After": "1", "Cache-Control": "no-store"})
+    if not _task_read_slots.acquire(blocking=False):
+        raise unavailable
+    work = asyncio.create_task(asyncio.to_thread(read))
+
+    def release_slot(task):
+        _task_read_slots.release()
+        if not task.cancelled():
+            task.exception()  # timed-out/disconnected callers no longer observe it
+
+    work.add_done_callback(release_slot)
+    try:
+        return await asyncio.wait_for(asyncio.shield(work), timeout=0.75)
+    except (TimeoutError, sqlite3.OperationalError) as exc:
+        raise unavailable from exc
+
+
+def _read_session_owner(conn, session_id, owner, *, active=False):
+    if not session_id or conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id=? AND owner_user_id=?" +
+            (" AND COALESCE(deleted_at,'')=''" if active else ""),
+            (session_id, owner)).fetchone() is None:
+        raise HTTPException(status_code=404, detail="会话不存在或无权访问。")
+
+
+def _read_owned_job(conn, job_id, owner):
+    from src.core.jobs import read_job
+    job = read_job(job_id, conn=conn)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("owner_user_id") is None:
+        _read_session_owner(conn, job.get("session_id"), owner)
+    elif job["owner_user_id"] != owner:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
 @app.get("/api/v2/session/{session_id}/turn-queue")
 async def list_chat_turns(session_id: str, request: Request, limit: int = 20,
-                          after_seq: int | None = None):
+                          after_seq: int | None = None,
+                          watch: Annotated[list[str] | None, Query()] = None):
     from src.api.turn_envelope import present_turn
-    from src.core import chat_turn_queue as queue
-    user = current_user(request)
-    _require_active_turn_session(session_id, user)
-    if not 1 <= limit <= 100 or (after_seq is not None and after_seq < 0):
+    from src.core import chat_turn_queue as queue, jobs
+    owner = int(current_user(request)["user_id"])
+    watched = tuple(dict.fromkeys(watch or ()))
+    if (not 1 <= limit <= 100 or (after_seq is not None and not 0 <= after_seq < 2**63)
+            or len(watch or ()) > 32 or any(not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", key) for key in watched)):
         raise HTTPException(status_code=400, detail="排队记录游标无效。")
-    owner = int(user["user_id"])
 
     def read_turns():
-        rows = queue.list_turns(owner_user_id=owner, session_id=session_id,
-                                limit=limit, after_seq=after_seq, visible_only=True)
-        return [present_turn(row, include_content=True) for row in rows]
+        with jobs.read_transaction() as conn:
+            _read_session_owner(conn, session_id, owner, active=True)
+            rows, cursor = queue.observe_turns(owner_user_id=owner, session_id=session_id,
+                limit=limit, after_seq=after_seq, visible_only=True, watch=watched,
+                include_payload=True, conn=conn)
+            return {"turns": [present_turn(row, include_content=True) for row in rows],
+                    "next_after_seq": cursor}
 
-    turns = await asyncio.to_thread(read_turns)
-    terminal_seqs = [turn["queue_seq"] for turn in turns if turn["state"] == "terminal"]
-    return JSONResponse({"turns": turns, "next_after_seq": max(terminal_seqs, default=after_seq)},
-                        headers={"Cache-Control": "no-store"})
+    return JSONResponse(await _bounded_task_read(read_turns), headers={"Cache-Control": "no-store"})
 
 
 @app.delete("/api/v2/session/{session_id}/turn-queue/{client_request_id}")
@@ -2367,6 +2449,8 @@ async def _reconcile_turn_queue_startup():
         if not page["has_more"]:
             break
         cursor = page["next_cursor"]
+    from src.api.turn_envelope import reconcile_staged_turn_inputs
+    await asyncio.to_thread(reconcile_staged_turn_inputs)
     await asyncio.to_thread(_retry_terminal_turn_inputs)
 
 
@@ -2644,11 +2728,13 @@ async def chat_v2(req: ChatRequest, request: Request):
     from src.core.progress_bus import _encode_event
     owner = int(current_user(request)["user_id"])
     req.client_request_id = req.client_request_id or uuid.uuid4().hex
+    if req.continue_from and not req.session_id:
+        raise HTTPException(status_code=400, detail="续问必须指定来源会话。")
     # Older clients can omit a session. Their stable request ID then locates
     # the same newly created session even if the first response was lost.
     sid = req.session_id or uuid.uuid5(uuid.NAMESPACE_URL,
         f"citrusscholar:chat:{owner}:{req.client_request_id}").hex
-    turn = await _accept_chat_turn(req, request, sid, create_session=True)
+    turn = await _accept_chat_turn(req, request, sid, create_session=not req.continue_from)
     job_id = turn["root_job_id"]
     if not turn.get("created", True):
         return _existing_chat_response(jobs.get_job(job_id))
@@ -3693,7 +3779,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                         message = str(exc)
                         status = "attachment_timeout"
                     else:
-                        logger.exception("chat attachment preparation failed")
+                        logger.warning("chat attachment preparation failed: %s", type(exc).__name__)
                         message = "附件处理失败，请检查文件格式后重试。"
                         status = "attachment_failed"
                     await commit_failed_terminal(
@@ -3921,74 +4007,86 @@ def _require_owned_job(job: dict, user: dict) -> None:
             raise HTTPException(status_code=404, detail="Job not found")
     elif job.get("session_id"):
         require_owned_session(str(job["session_id"]), user)
+    else:
+        raise HTTPException(status_code=404, detail="Job not found")
 
 
 @app.get("/api/v2/session/{session_id}/task-by-request/{client_request_id}")
 async def discover_chat_job(session_id: str, client_request_id: str, request: Request):
-    from src.core.jobs import find_chat_job_id
-    user = current_user(request)
-    job_id = find_chat_job_id(session_id, int(user["user_id"]), client_request_id)
-    headers = {"Cache-Control": "no-store"}
-    if not job_id:
-        return JSONResponse({"detail": "Job not found"}, status_code=404, headers=headers)
     from src.api.turn_envelope import present_turn
+    from src.core import jobs
     from src.core.chat_turn_queue import find_turn_by_job
-    turn = find_turn_by_job(owner_user_id=int(user["user_id"]), session_id=session_id, job_id=job_id)
-    payload = {"job_id": job_id}
-    if turn is not None:
-        _require_active_turn_session(session_id, user)
-        payload.update(present_turn(turn, include_content=True))
+    owner = int(current_user(request)["user_id"])
+    headers = {"Cache-Control": "no-store"}
+
+    def read_claim():
+        with jobs.read_transaction() as conn:
+            job_id = jobs.find_chat_job_id(session_id, owner, client_request_id, conn=conn, visible_only=True)
+            if job_id is None:
+                return None
+            turn = find_turn_by_job(owner_user_id=owner, session_id=session_id, job_id=job_id,
+                                   conn=conn, include_payload=True)
+            if turn is None:
+                return {"job_id": job_id}
+            _read_session_owner(conn, session_id, owner, active=True)
+            return {"job_id": job_id, **present_turn(turn, include_content=True)}
+
+    payload = await _bounded_task_read(read_claim)
+    if payload is None:
+        return JSONResponse({"detail": "Job not found"}, status_code=404, headers=headers)
     return JSONResponse(payload, headers=headers)
 
 
 @app.get("/jobs/{job_id}")
 async def get_job_status(job_id: str, request: Request):
-    """v8.3.7 M2: 任务状态查询（断连保活后可查 running/completed/failed）。
+    from src.core import jobs, task_events
+    from src.core.public_delivery import project_public_question
+    from src.core.user_questions import list_questions
+    owner = int(current_user(request)["user_id"])
 
-    S1 补：任务属于某个会话，必须按会话归属校验；否则只要知道 job_id
-    就能读到别人的任务状态与停止原因。
-    """
-    from src.core import jobs as jobs_mod
-    job = jobs_mod.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-    user = current_user(request)
-    _require_owned_job(job, user)
-    from src.core.task_events import projection
-    payload = projection(job_id, include_job=True)
-    # Legacy jobs are authorized through their session above. They have no
-    # durable account identity and cannot own the newer question protocol.
-    # Do not feed them into its stricter owner-bound authorization check.
-    if job.get("owner_user_id") is not None:
-        from src.core.user_questions import list_questions
-        questions = list_questions(job_id, owner_user_id=int(user["user_id"]),
-                                   session_id=job["session_id"])
-        if questions:
-            from src.core.public_delivery import project_public_question
-            payload["question"] = project_public_question(questions[0])
-    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+    def read_status():
+        with jobs.read_transaction() as conn:
+            job = _read_owned_job(conn, job_id, owner)
+            payload = task_events.projection(job_id, include_job=True, conn=conn)
+            if job.get("owner_user_id") is not None:
+                questions = list_questions(job_id, owner_user_id=owner,
+                                           session_id=job["session_id"], conn=conn)
+                if questions:
+                    payload["question"] = project_public_question(questions[0])
+            return payload
+
+    return JSONResponse(await _bounded_task_read(read_status), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/jobs/{job_id}/events")
 async def get_job_events(job_id: str, request: Request, after: int = 0, limit: int = 200):
     from src.core import jobs, task_events
-    job = jobs.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    _require_owned_job(job, current_user(request))
-    if after < 0 or not 1 <= limit <= 500:
+    owner = int(current_user(request)["user_id"])
+    if not 0 <= after < 2**63 or not 1 <= limit <= 500:
         raise HTTPException(status_code=400, detail="invalid event cursor or limit")
-    return JSONResponse(task_events.replay(job_id, after, limit), headers={"Cache-Control": "no-store"})
+
+    def read_events():
+        with jobs.read_transaction() as conn:
+            _read_owned_job(conn, job_id, owner)
+            return task_events.replay(job_id, after, limit, conn=conn)
+
+    return JSONResponse(await _bounded_task_read(read_events), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/jobs/{job_id}/operations/{operation_id}/result")
 async def get_operation_result(job_id: str, operation_id: str, request: Request):
-    _owned_protocol_job(job_id, request)
-    from src.core import task_events
-    try:
-        return JSONResponse(task_events.operation_result(job_id, operation_id), headers={"Cache-Control": "no-store"})
-    except task_events.TaskConflict as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    from src.core import jobs, task_events
+    owner = int(current_user(request)["user_id"])
+
+    def read_result():
+        with jobs.read_transaction() as conn:
+            _read_owned_job(conn, job_id, owner)
+            try:
+                return task_events.operation_result(job_id, operation_id, conn=conn)
+            except task_events.TaskConflict as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return JSONResponse(await _bounded_task_read(read_result), headers={"Cache-Control": "no-store"})
 
 
 from src.core.user_questions import QuestionAnswer as QuestionAnswerRequest
@@ -4070,10 +4168,19 @@ async def _dispatch_question_child(child_job_id: str, user: dict, *, queued_turn
 @app.get("/api/tasks/{job_id}/questions")
 @app.get("/api/v2/chat/jobs/{job_id}/questions")
 async def get_task_questions(job_id: str, request: Request):
-    job = _owned_protocol_job(job_id, request)
+    from src.core import jobs
+    from src.core.task_events import recovery_cursor
     from src.core.user_questions import list_questions
-    return {"questions": list_questions(job_id, owner_user_id=int(current_user(request)["user_id"]),
-                                         session_id=job["session_id"])}
+    owner = int(current_user(request)["user_id"])
+
+    def read_questions():
+        with jobs.read_transaction() as conn:
+            job = _read_owned_job(conn, job_id, owner)
+            return {"recovery_cursor": recovery_cursor(conn, job_id),
+                    "questions": list_questions(job_id, owner_user_id=owner,
+                        session_id=job["session_id"], conn=conn) if job["owner_user_id"] is not None else []}
+
+    return JSONResponse(await _bounded_task_read(read_questions), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/tasks/{job_id}/questions/{question_id}/answer")
@@ -4152,12 +4259,19 @@ async def update_chat_task(job_id: str, req: TaskUpdateRequest, request: Request
 
 @app.get("/api/v2/chat/jobs/{job_id}/updates/{update_request_id}")
 async def chat_task_update_status(job_id: str, update_request_id: str, request: Request):
-    _owned_protocol_job(job_id, request)
+    from src.core import jobs
     from src.core.task_events import update_request_status
-    result = update_request_status(job_id, update_request_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail={"code": "task_update_not_found"})
-    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    owner = int(current_user(request)["user_id"])
+
+    def read_update():
+        with jobs.read_transaction() as conn:
+            _read_owned_job(conn, job_id, owner)
+            result = update_request_status(job_id, update_request_id, conn=conn)
+            if result is None:
+                raise HTTPException(status_code=404, detail={"code": "task_update_not_found"})
+            return result
+
+    return JSONResponse(await _bounded_task_read(read_update), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/v2/chat/jobs/{job_id}/approvals/{approval_id}")
@@ -4360,13 +4474,17 @@ async def resume_chat_operation(job_id: str, req: ResumeOperationRequest, reques
 
 @app.get("/sessions/{session_id}/jobs")
 async def list_session_jobs(session_id: str, request: Request):
-    """v8.3.7 M2: 会话最近任务列表。S1 补会话归属校验。"""
-    user = current_user(request)
-    require_owned_session(session_id, user)
-    from src.core.jobs import list_for_session
-    from src.core.task_events import public_job_record
-    jobs = list_for_session(session_id, owner_user_id=int(user["user_id"]), visible_only=True)
-    return {"jobs": [public_job_record(job) for job in jobs]}
+    """Observe recent tasks for this session without creating writer work."""
+    from src.core import jobs, task_events
+    owner = int(current_user(request)["user_id"])
+
+    def read_jobs():
+        with jobs.read_transaction() as conn:
+            _read_session_owner(conn, session_id, owner)
+            rows = jobs.list_for_session(session_id, owner_user_id=owner, visible_only=True, conn=conn)
+            return {"jobs": [task_events.public_job_record(row) for row in rows]}
+
+    return JSONResponse(await _bounded_task_read(read_jobs), headers={"Cache-Control": "no-store"})
 
 
 # ── v8.4.11 用户中断：停止当前任务（书中 §4.7.6 取消式处理）──

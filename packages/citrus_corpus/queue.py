@@ -63,13 +63,16 @@ class IntakeQueue:
                connection=None, fingerprint_namespace=""):
         if expected_sha256 is not None and not SHA256.fullmatch(expected_sha256):
             raise ValueError("source_sha256_invalid")
-        if expected_sha256 is None and request["kind"] != "explicit":
+        if expected_sha256 is None and request["kind"] not in {"explicit", "automatic"}:
             raise ValueError("source_sha256_required")
         if not isinstance(revision, str) or len(revision) > 128:
             raise ValueError("revision_invalid")
         actor = public_text(actor, 128)
         if not actor:
             raise ValueError("actor_required")
+        # Earlier workers only claim literal queued/leased states. Keep new jobs
+        # in this same table but invisible to those workers during code rollback.
+        pending_state = "automatic_queued" if request["kind"] == "automatic" else "queued"
         payload = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
         if len(payload.encode()) > 8192:
             raise ValueError("intake_request_too_large")
@@ -80,46 +83,79 @@ class IntakeQueue:
         now = self.now()
         with (self.store.write(timeout=timeout) if connection is None else nullcontext(connection)) as conn:
             existing = conn.execute("SELECT * FROM intake WHERE fingerprint=?", (fingerprint,)).fetchone()
-            if existing and existing["state"] not in {"failed", "expired"}:
+            if existing and (existing["state"] not in {"failed", "expired", "metadata_only"}
+                             or (existing["state"] == "metadata_only" and existing["updated"] > now - 86400)):
                 return self._view(existing)
-            pending = conn.execute("SELECT count(*) FROM intake WHERE state IN ('queued','leased')").fetchone()[0]
+            pending = conn.execute("SELECT count(*) FROM intake WHERE state IN ('queued','leased','automatic_queued','automatic_leased')").fetchone()[0]
             daily = conn.execute("SELECT count(*) FROM intake WHERE created>?", (now - 86400,)).fetchone()[0]
             if pending >= MAX_PENDING or daily >= MAX_JOBS_PER_DAY:
                 raise ValueError("corpus_queue_full")
             if persist is not None:
                 persist()
             if existing:
-                conn.execute("""UPDATE intake SET actor=?, request=?, state='queued', created=?, updated=?,
+                conn.execute("""UPDATE intake SET actor=?, request=?, identity=?, expected_sha256=?, raw_sha256=NULL,
+                             document_id=NULL, version_id=NULL, state=?, created=?, updated=?,
                              not_before=?, attempts=0, lease=NULL, lease_until=NULL, error=NULL WHERE id=?""",
-                             (actor, payload, now, now, now, existing["id"]))
+                             (actor, payload, identity, expected_sha256, pending_state, now, now, now, existing["id"]))
                 job_id = existing["id"]
             else:
                 job_id = uuid4().hex
                 conn.execute("""INSERT INTO intake
                              (id,fingerprint,identity,request,actor,state,expected_sha256,created,updated,not_before)
-                             VALUES(?,?,?,?,?,'queued',?,?,?,?)""",
-                             (job_id, fingerprint, identity, payload, actor, expected_sha256, now, now, now))
+                             VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                             (job_id, fingerprint, identity, payload, actor, pending_state, expected_sha256, now, now, now))
             return self._view(conn.execute("SELECT * FROM intake WHERE id=?", (job_id,)).fetchone())
 
-    def claim(self, *, network=False):
+    def claim(self, *, network=False, automatic=False):
         now = self.now()
         with self.store.write() as conn:
             conn.execute("""UPDATE intake SET state='expired', lease=NULL, lease_until=NULL, updated=?, error='intake_expired'
-                         WHERE created<=? AND (state='queued' OR (state='leased' AND lease_until<=?))""",
+                         WHERE created<=? AND (state IN ('queued','automatic_queued') OR (state IN ('leased','automatic_leased') AND lease_until<=?))""",
                          (now, now - JOB_TTL, now))
             conn.execute("""UPDATE intake SET state='failed', lease=NULL, lease_until=NULL, updated=?, error='lease_exhausted'
-                         WHERE state='leased' AND lease_until<=? AND attempts>=?""", (now, now, MAX_ATTEMPTS))
-            row = conn.execute("""SELECT * FROM intake WHERE ((state='queued' AND not_before<=?)
-                         OR (state='leased' AND lease_until<=?))
+                         WHERE state IN ('leased','automatic_leased') AND lease_until<=? AND attempts>=?""", (now, now, MAX_ATTEMPTS))
+            row = conn.execute("""SELECT * FROM intake WHERE ((state IN ('queued','automatic_queued') AND not_before<=?)
+                         OR (state IN ('leased','automatic_leased') AND lease_until<=?))
                          AND (? OR json_extract(request, '$.kind') <> 'explicit')
-                         ORDER BY created,id LIMIT 1""", (now, now, int(network))).fetchone()
+                         AND (? OR state NOT IN ('automatic_queued','automatic_leased'))
+                         ORDER BY CASE WHEN json_extract(request, '$.kind')='automatic'
+                            AND json_extract(request, '$.path')='foreground' THEN 0 ELSE 1 END,
+                            created,id LIMIT 1""", (now, now, int(network), int(automatic))).fetchone()
             if row is None:
                 return None
             token = uuid4().hex
-            conn.execute("""UPDATE intake SET state='leased', attempts=attempts+1, lease=?, lease_until=?,
-                         updated=? WHERE id=?""", (token, now + LEASE_SECONDS, now, row["id"]))
+            leased_state = "automatic_leased" if row["state"].startswith("automatic_") else "leased"
+            conn.execute("""UPDATE intake SET state=?, attempts=attempts+1, lease=?, lease_until=?,
+                         updated=? WHERE id=?""", (leased_state, token, now + LEASE_SECONDS, now, row["id"]))
             return {**dict(row), "request": json.loads(row["request"]), "lease": token,
                     "attempts": row["attempts"] + 1}
+
+    def resolve_automatic(self, conn, job, *, identity, request, digest=None, error=None):
+        """Bind a verified work and exact bytes to the current fenced lease."""
+        self._fence(conn, job)
+        if digest is None:
+            conn.execute("""UPDATE intake SET identity=?,state='metadata_only',updated=?,
+                         lease=NULL,lease_until=NULL,error=? WHERE id=?""",
+                         (identity, self.now(), error, job["id"]))
+            return None
+        conn.execute("""UPDATE intake SET identity=?,request=?,expected_sha256=?,raw_sha256=?
+                     WHERE id=?""", (identity, json.dumps(request, ensure_ascii=False), digest, digest, job["id"]))
+        return {**job, "identity": identity, "request": request, "expected_sha256": digest}
+
+    def recent(self, limit=30):
+        if not 1 <= limit <= 100:
+            raise ValueError("limit_out_of_range")
+        from .pointers import read_pointer
+
+        generation = read_pointer(self.store.root)
+        with self.store.read() as conn:
+            rows = conn.execute("""SELECT intake.*,v.rights FROM intake LEFT JOIN versions AS v
+                                   USING(document_id,version_id) ORDER BY updated DESC,id LIMIT ?""", (limit,)).fetchall()
+            active = conn.execute("SELECT selection FROM publications WHERE generation=? AND published IS NOT NULL",
+                                  (generation,)).fetchone()
+        visible = {(row["document_id"], row["version_id"]) for row in json.loads(active[0])} if active else set()
+        return [{**self._view(row), "rights": row["rights"], "published": row["rights"] == "granted"
+                 and (row["document_id"], row["version_id"]) in visible} for row in rows]
 
     def remember_original(self, job, digest):
         with self.store.write(timeout=2) as conn:
@@ -128,7 +164,7 @@ class IntakeQueue:
 
     def _fence(self, conn, job):
         current = conn.execute("SELECT state,lease,lease_until FROM intake WHERE id=?", (job["id"],)).fetchone()
-        if (not current or current["state"] != "leased" or current["lease"] != job["lease"]
+        if (not current or current["state"] not in {"leased", "automatic_leased"} or current["lease"] != job["lease"]
                 or current["lease_until"] <= self.now()):
             raise ValueError("corpus_lease_lost")
 
@@ -141,11 +177,12 @@ class IntakeQueue:
     def fail(self, job, code):
         now = self.now()
         retry = code in _TRANSIENT and job["attempts"] < MAX_ATTEMPTS
+        pending_state = "automatic_queued" if job["request"]["kind"] == "automatic" else "queued"
         with self.store.write(timeout=2) as conn:
             self._fence(conn, job)
             conn.execute("""UPDATE intake SET state=?, lease=NULL, lease_until=NULL, updated=?,
                          not_before=?,error=? WHERE id=?""",
-                         ("queued" if retry else "failed", now, now + 15 * job["attempts"], code, job["id"]))
+                         (pending_state if retry else "failed", now, now + 15 * job["attempts"], code, job["id"]))
 
     def status(self, job_id):
         with self.store.read() as conn:
@@ -157,4 +194,6 @@ class IntakeQueue:
     @staticmethod
     def _view(row):
         fields = ("id", "state", "attempts", "raw_sha256", "document_id", "version_id", "error")
-        return {field: row[field] for field in fields}
+        request = json.loads(row["request"])
+        return {**{field: row[field] for field in fields}, "state": row["state"].removeprefix("automatic_"),
+                "path": request.get("path") if request.get("kind") == "automatic" else request.get("kind")}

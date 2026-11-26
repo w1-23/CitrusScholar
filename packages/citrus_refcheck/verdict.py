@@ -3,7 +3,7 @@ from collections import defaultdict
 import re
 
 from .compare import compare_fields
-from .providers import normalize_doi, norm_title
+from .providers import normalize_arxiv_id, normalize_doi, norm_title
 
 RULE_VERSION = "reference-verdict/1"
 _DIRECT_REGISTRIES = frozenset({"Crossref", "DataCite", "arXiv"})
@@ -75,11 +75,11 @@ def project_verdict(entry, result, *, audit_id):
     facts = result.get("facts") or {}
     records = [r for r in facts.get("records", []) if r.get("record_sha256")]
     providers = facts.get("providers") or {}
-    doi, arxiv = normalize_doi(claims.get("doi")), claims.get("arxiv_id")
+    doi, arxiv = normalize_doi(claims.get("doi")), normalize_arxiv_id(claims.get("arxiv_id"))
     uncertain_fields = entry.get("uncertain_fields", [])
     checks = [(r, compare_fields(claims, r, uncertain_fields=uncertain_fields)) for r in records]
     direct = [(r, f) for r, f in checks if ((doi and normalize_doi(r.get("doi")) == doi)
-              or (not doi and arxiv and r.get("arxiv_id") == arxiv))]
+              or (not doi and arxiv and normalize_arxiv_id(r.get("arxiv_id")) == arxiv))]
     title_matches = defaultdict(list)
     for r, fields in checks:
         if (fields["title"]["status"] == "matched"
@@ -111,6 +111,22 @@ def project_verdict(entry, result, *, audit_id):
             identity = "confirmed"
 
     differences, variants, unknowns = [], [], []
+    if doi and arxiv:
+        arxiv_records = [row for row in records if normalize_arxiv_id(row.get("arxiv_id")) == arxiv
+                         and row.get("source") in {"arXiv", "DataCite (arXiv DOI)"}]
+        linked = any(normalize_doi(row.get("doi")) == doi or doi in (row.get("related_dois") or ())
+                     for row in arxiv_records)
+        linked |= any(normalize_arxiv_id(row.get("arxiv_id")) == arxiv or any(
+            normalize_doi(other.get("doi")) in (row.get("related_dois") or ())
+            for other in arxiv_records if normalize_doi(other.get("doi"))) for row, _ in direct)
+        if not arxiv_records or not linked:
+            identity = "unresolved"
+            unknowns.append({"field": "arxiv_id", "missing_evidence": "independent_identifier_link",
+                             "reason": "not_observed" if not arxiv_records else "relationship_unconfirmed"})
+    retractions = [row for row, _ in direct if row.get("retracted") is True]
+    if retractions:
+        differences.append({"field": "publication_status", "submitted": None, "registered": "retracted",
+                            "reason": "registry_reports_retraction", "evidence_refs": [_evidence(row) for row in retractions]})
     if identity != "confirmed":
         unknowns.append({"field": "identity", "missing_evidence": "unique_registry_identity", "reason": identity})
     if entry.get("parse_status") == "invalid_row" or uncertain_fields:

@@ -419,3 +419,103 @@ def test_skill_release_is_pinned_at_admission_without_leaking_into_public_view(t
     fresh = _admit(_request(cid="client-fresh"))
     assert fresh["bounded_payload"]["selected_skills"] == []
     assert not any(key in fresh["bounded_payload"] for key in pin)
+
+
+class _CrashBetweenStores(BaseException):
+    pass
+
+
+def test_combined_limit_rejects_before_any_queue_or_upload_write(monkeypatch):
+    limit = turn_envelope.MAX_ATTACHMENT_BYTES
+    library = _library_file(content=b"a" * (limit - 2))
+    with pytest.raises(HTTPException) as error:
+        _admit(_request(file_refs=[library], attachments=[_attachment(content=b"xyz")]))
+    assert error.value.status_code == 413
+    assert not _queue_rows() and not _resource_rows()
+    assert [row["file_id"] for row in _file_rows()] == [library]
+    assert not turn_envelope.staging.pending()
+
+    at_limit = _admit(_request(file_refs=[library], attachments=[_attachment(content=b"xy")]))
+    assert at_limit["attachment_bytes"] == limit
+    assert len(_resource_rows()) == 2
+
+
+def test_reconcile_hard_interruption_between_pin_and_queue_receipt(monkeypatch):
+    library = _library_file()
+    enqueue = turn_queue.enqueue_turn
+    def crash(**kwargs):
+        assert _resource_rows() and len(_file_rows()) == 2
+        raise _CrashBetweenStores
+    with monkeypatch.context() as broken:
+        broken.setattr(turn_queue, "enqueue_turn", crash)
+        with pytest.raises(_CrashBetweenStores):
+            _admit(_request(file_refs=[library], attachments=[_attachment()]))
+    assert turn_queue.enqueue_turn is enqueue
+    assert not _queue_rows() and turn_envelope.staging.pending()
+    turn_envelope.reconcile_staged_turn_inputs()
+    assert not _resource_rows() and not turn_envelope.staging.pending()
+    assert [row["file_id"] for row in _file_rows()] == [library]
+    assert session_files.list_turn_files(SESSION, OWNER, [CLIENT]) == {}
+
+
+def test_reconcile_preserves_committed_receipt_and_pin_after_interruption(monkeypatch):
+    enqueue = turn_queue.enqueue_turn
+    def crash(**kwargs):
+        enqueue(**kwargs)
+        raise _CrashBetweenStores
+    body = _request(attachments=[_attachment()])
+    with monkeypatch.context() as broken:
+        broken.setattr(turn_queue, "enqueue_turn", crash)
+        with pytest.raises(_CrashBetweenStores):
+            _admit(body)
+    pinned = _resource_rows()
+    assert len(pinned) == 1 and turn_envelope.staging.pending()
+    assert not _admit(body)["created"]
+    turn_envelope.reconcile_staged_turn_inputs()
+    assert not turn_envelope.staging.pending()
+    assert _resource_rows() == pinned
+    assert len(session_files.list_turn_files(SESSION, OWNER, [CLIENT])[CLIENT]) == 1
+
+
+def test_reconcile_removes_recorded_unindexed_upload_after_interruption(monkeypatch):
+    write_bytes = Path.write_bytes
+    written = []
+    def crash(path, content):
+        result = write_bytes(path, content)
+        if path.is_relative_to(session_files.FILES_ROOT):
+            written.append(path)
+            raise _CrashBetweenStores
+        return result
+    with monkeypatch.context() as broken:
+        broken.setattr(Path, "write_bytes", crash)
+        with pytest.raises(_CrashBetweenStores):
+            _admit(_request(attachments=[_attachment()]))
+    assert len(written) == 1 and written[0].is_file() and not _file_rows()
+    turn_envelope.reconcile_staged_turn_inputs()
+    assert not written[0].exists() and not turn_envelope.staging.pending()
+
+
+def test_reconcile_after_actual_admission_process_death():
+    import json
+    import subprocess
+    import sys
+
+    script = """
+import json, os, sys
+from pathlib import Path
+from src.api import turn_envelope
+from src.core import chat_turn_queue as queue, jobs
+from src.session import files
+jobs._DB_PATH, files.DB_PATH, files.FILES_ROOT = map(Path, sys.argv[1:4])
+body = json.loads(sys.argv[4])
+queue.enqueue_turn = lambda **kwargs: os._exit(73)
+turn_envelope.admit_turn(request=body, owner_user_id=int(sys.argv[5]), session_id=body['session_id'],
+                         account_epoch=3, request_id='killed-admission', enforce_rate=False)
+"""
+    args = [str(path) for path in (jobs._DB_PATH, session_files.DB_PATH, session_files.FILES_ROOT)]
+    run = subprocess.run([sys.executable, "-c", script, *args,
+                          json.dumps(_request(attachments=[_attachment()])), str(OWNER)], timeout=25)
+    assert run.returncode == 73
+    assert not _queue_rows() and _resource_rows() and turn_envelope.staging.pending()
+    turn_envelope.reconcile_staged_turn_inputs()
+    assert not _file_rows() and not _resource_rows() and not turn_envelope.staging.pending()

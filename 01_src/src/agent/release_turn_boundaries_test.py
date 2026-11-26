@@ -215,10 +215,11 @@ def test_public_browse_uses_backend_readiness_and_preserves_source_boundaries(mo
     assert "deepseek_search" not in ready
     assert "browse_web" in ready
     prompt = system_prompt(ready)
-    assert "优先用本轮已授权的公开网络 Search" in prompt
-    assert "不必两路都查或比较搜索提供方" in prompt
-    assert "已知公开 URL 可 Fetch" in prompt and "不得把私有附件原文" in prompt
-    assert "Browse 已对本轮开放时，可按需" in prompt
+    assert "缺少公开事实时用获准的 Search" in prompt
+    assert "不默认双查、不比较搜索提供方" in prompt
+    assert "只有缺少实质正文证据才 Fetch" in prompt and "不外发私有附件" in prompt
+    assert "交互浏览公开网页与下载" in prompt
+    assert "联网检索、" not in prompt
     catalog = build_preset_catalog()
     assert catalog.resolve("deepseek_fetch", ready).name == "deepseek_fetch"
     assert catalog.resolve("search_literature", ready).name == "search_literature"
@@ -248,3 +249,68 @@ def test_public_browse_uses_backend_readiness_and_preserves_source_boundaries(mo
     assert "browse_web" not in allowed_presets(dict(legacy, session_id=""), has_tables=False, has_pool=False)
     monkeypatch.setattr("src.browse.service.enabled", lambda: False)
     assert "browse_web" not in allowed_presets(legacy, has_tables=False, has_pool=False)
+
+
+_FETCH_WIRE_NAMES = {"deepseek_search", "deepseek_fetch", "deepseek_fetch_paper", "local_hybrid_search"}
+
+
+async def _capture_fetch_wire(prompt, catalog):
+    """Use the stock model node and real SDK serialization, without a provider request."""
+    import json
+    from unittest.mock import patch
+
+    import httpx
+    from langchain_core.messages import SystemMessage
+    from langchain_openai import ChatOpenAI
+
+    from src.agent.framework_test_support import invoke_model_once
+    from src.core import task_events
+    from src.core.provider_transport import AsyncDeepSeekTransport
+    from src.core.request_context import estimate_request, model_request
+
+    base = "https://api.deepseek.com/v1"
+    actual, requests, estimated = [], [], []
+
+    async def model_attempt(model, messages, invoke, **_kwargs):
+        estimated.append(model_request(model, messages)[1])
+        return await invoke()
+
+    def respond(request):
+        assert request.method == "POST" and str(request.url) == base + "/chat/completions"
+        actual.append(request.content)
+        requests.append(json.loads(request.content))
+        rows = [{"id": "fixture", "object": "chat.completion.chunk", "model": "deepseek-fixture", "created": 1,
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                for delta, finish in [({"role": "assistant", "content": "answer"}, None), ({}, "stop")]]
+        return httpx.Response(200, text="".join(f"data: {json.dumps(row)}\n\n" for row in rows) + "data: [DONE]\n\n",
+                              headers={"Content-Type": "text/event-stream"})
+
+    transport = AsyncDeepSeekTransport(base, httpx.MockTransport(respond))
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
+        model = ChatOpenAI(use_responses_api=False, model="deepseek-fixture", api_key="synthetic", base_url=base,
+                          max_retries=0, http_async_client=client)
+        with patch.object(task_events, "run_model_attempt", model_attempt):
+            answer = await invoke_model_once(model, catalog, _FETCH_WIRE_NAMES,
+                [SystemMessage(prompt), HumanMessage("Compare the evidence")],
+                ExecutionIdentity(7, "wire-session", "wire-turn", "wire-run"))
+        assert answer.content == "answer"
+    assert len(actual) == len(requests) == len(estimated) == 1
+    metrics = estimate_request(requests[0])
+    assert metrics == estimated[0]
+    return requests[0], metrics, len(actual[0])
+
+
+def test_live_research_prompt_and_stable_schemas_reach_actual_model_body():
+    from src.agent.host_policy import system_prompt
+    from src.agent.preset_catalog import build_preset_catalog
+
+    catalog = build_preset_catalog()
+    live_prompt = system_prompt(_FETCH_WIRE_NAMES)
+    body, metrics, size = asyncio.run(_capture_fetch_wire(live_prompt, catalog))
+    assert body["messages"][0] == {"role": "system", "content": live_prompt}
+    assert body["tools"] == catalog.schemas(_FETCH_WIRE_NAMES)
+    assert len(body["tools"]) == 4
+    assert "只有缺少实质正文证据才 Fetch" in body["messages"][0]["content"]
+    assert "source_routing_examples" not in body["messages"][0]["content"]
+    assert all(len(row["function"]["description"]) <= 230 for row in body["tools"])
+    assert size > 0 and metrics["components"]["system"] > 0 and metrics["components"]["tool_schemas"] > 0

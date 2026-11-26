@@ -12,6 +12,7 @@ import re
 import time
 from urllib.parse import quote, urlencode
 
+from citrus_refcheck.providers import normalize_arxiv_id
 from src.core.cancel import raise_if_cancelled
 from src.core.capability_policy import allows
 from src.core.tracing import web_search_enabled
@@ -42,6 +43,10 @@ def _doi_routes(doi):
             ("openalex", f"https://api.openalex.org/works/doi:{value}?select=is_retracted"))
 
 
+def _arxiv_route(arxiv):
+    return "datacite", "https://api.datacite.org/dois/10.48550/arxiv." + quote(arxiv, safe="/")
+
+
 def _title_routes(title, author):
     # Match URL identities expected by the pinned upstream observation parser.
     cross = urlencode({"query.bibliographic": f"{title} {author}".strip(), "rows": 3,
@@ -69,7 +74,7 @@ def _minimal_body(provider, data, searching):
         if not isinstance(record, dict) or not isinstance(record.get("attributes"), dict):
             return None
         return {"data": {"attributes": keep(record["attributes"],
-            ("doi", "titles", "creators", "publicationYear", "publisher"))}}
+            ("doi", "titles", "creators", "publicationYear", "publisher", "relatedIdentifiers"))}}
     fields = ("id", "doi", "title", "display_name", "publication_year", "authorships", "is_retracted", "primary_location")
     if searching:
         return {"results": [keep(row, fields) for row in (data.get("results") or [])[:3]]}
@@ -280,10 +285,11 @@ def advance_observations(report, previous=None, *, identity=None, deadline=None)
                 state["coverage"].append({"record_index": record["record_index"], "status": status})
                 state["offset"] = position + 1
 
-            if record.get("status") in {"verified", "mismatch"}:
+            submitted = record.get("submitted") or {}
+            arxiv = normalize_arxiv_id(submitted.get("arxiv_id"))
+            if record.get("status") in {"verified", "mismatch", "retracted"} and not arxiv:
                 complete("previously_observed")
                 continue
-            submitted = record.get("submitted") or {}
             doi = str(submitted.get("doi") or "").casefold()
             title = " ".join(str(submitted.get("title") or "").split())[:350]
             author = str(submitted.get("author") or "")[:250]
@@ -291,24 +297,27 @@ def advance_observations(report, previous=None, *, identity=None, deadline=None)
                 routes = _doi_routes(doi) if _DOI.fullmatch(doi) else ()
             else:
                 routes = _title_routes(title, _first_surname(author)) if title else ()
+            doi_routes = len(routes) if doi else 0
+            if arxiv:
+                routes = (*routes, _arxiv_route(arxiv)) if doi else (_arxiv_route(arxiv),)
             if not routes:
                 complete("no_queryable_identifier")
                 continue
             try:
                 for index, (provider, url) in enumerate(routes):
-                    if doi:
+                    if index < doi_routes:
                         cross = cassette.get(routes[0][1], {}).get("status")
                         datacite = cassette.get(routes[1][1], {}).get("status")
                         if index == 1 and cross != 404 or index == 2 and datacite != 404 or index == 3 and cross != 200:
                             continue
                     if url not in cassette:
-                        receipt = guarded(url, lambda: query(provider, url, not doi))
+                        receipt = guarded(url, lambda: query(provider, url, not (doi or arxiv)))
                         cassette[url] = receipt or {"status": 0, "body": None, "queried_at": None}
                         if exact_size() > _MAX_OBSERVATIONS:
                             del cassette[url]
                             raise StopWindow("cassette_size_limit")
                     statuses.append(cassette[url]["status"])
-                if not doi:
+                if not doi and not arxiv:
                     # Provider parsers, not model text, produce RefChecker candidates.
                     def supplement():
                         status, rows, _ = literature._crossref_search(title, rows=3)

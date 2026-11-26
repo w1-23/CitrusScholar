@@ -127,7 +127,7 @@
     if (response.status === 401) { location.replace('/?next=%2Fadmin'); throw new Error('登录已失效'); }
     if (response.status === 403) throw new Error('仅管理员可访问');
     if (!response.ok) {
-      var error = new Error(data.detail || '请求失败');
+      var error = new Error(typeof data.detail === 'string' ? data.detail : (data.detail && data.detail.code) || '请求失败');
       error.status = response.status;
       throw error;
     }
@@ -241,6 +241,7 @@
     el('refreshButton').disabled = true;
     var loaders = [loadUsers, loadQueue, loadModel, loadDevice, loadAudit, loadApplications, loadInvites];
     if (el('corpusList')) loaders.push(loadCorpus);
+    if (el('isolatedCorpusPanel')) loaders.push(loadIsolatedCorpus);
     try { await loadPanels(loaders); }
     catch (error) { notify(error.message); }
     finally { el('refreshButton').disabled = false; }
@@ -401,6 +402,54 @@
     if (before) query += '&before_id=' + encodeURIComponent(before);
     return loadPanel('corpus', function (read) { return read('/api/v2/admin/corpus/candidates' + query); },
       renderCorpusCandidates, function () { return status === corpusFilter() && before === (status === 'fulltext_missing' && corpusBefore); });
+  }
+  var isolatedCorpusBase = '/api/v2/isolated-corpus/admin/';
+  function loadIsolatedCorpus() {
+    return loadPanel('isolatedCorpus', async function (read) {
+      try { return await read(isolatedCorpusBase + 'intake'); }
+      catch (error) { if (error.status === 404) return null; throw error; }
+    }, function (data) {
+      el('isolatedCorpusPanel').hidden = !data;
+      if (!data) return;
+      el('isolatedCorpusForm').hidden = !data.automatic_enabled;
+      var labels = {queued: '等待处理', leased: '正在处理', metadata_only: '仅书目信息（未验证全文或授权）',
+        failed: '未入库', expired: '任务过期', prepared: '全文已准备'};
+      var paths = {foreground: '复用本轮原件', background: '后台补齐', saved: '预存原件',
+        explicit: '指定来源', observed: '历史原件观察'};
+      el('isolatedCorpusJobs').innerHTML = data.jobs.length ? data.jobs.map(function (job) {
+        var state = job.rights === 'revoked' ? '授权已撤销' : job.published ? '已发布' :
+          job.state === 'prepared' && job.rights === 'granted' ? '已授权，未发布' :
+          job.state === 'prepared' && job.rights === 'needs_review' ? '等待授权' : labels[job.state];
+        return '<article class="corpus-item"><div class="corpus-main"><strong>' + esc(state || job.state) +
+          '</strong><small>' + esc(paths[job.path] || '') + ' · <code>' + esc(job.id) + '</code>' +
+          (job.error ? ' · ' + esc(job.error) : '') + '</small></div></article>';
+      }).join('') : '<p class="muted">暂无任务</p>';
+    });
+  }
+  function changeIsolatedCorpusKind() {
+    var title = el('isolatedCorpusKind').value === 'public_title';
+    el('isolatedCorpusAttestationLabel').hidden = !title;
+    el('isolatedCorpusAttestation').required = title;
+    el('isolatedCorpusAttestation').checked = false;
+  }
+  async function submitIsolatedCorpus(event) {
+    event.preventDefault();
+    var button = el('isolatedCorpusSubmit'), status = el('isolatedCorpusStatus');
+    var key = el('isolatedCorpusKind').value, value = el('isolatedCorpusValue').value.trim();
+    if (!value || button.disabled) return;
+    var payload = {};
+    payload[key] = value;
+    if (key === 'public_title') payload.title_is_public = el('isolatedCorpusAttestation').checked;
+    button.disabled = true;
+    try {
+      var result = await jsonRequest(isolatedCorpusBase + 'public-paper',
+        {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+      el('isolatedCorpusValue').value = '';
+      changeIsolatedCorpusKind();
+      status.textContent = '已取得任务回执 ' + result.job.id;
+      await loadIsolatedCorpus();
+    } catch (error) { if (error.name !== 'AbortError') status.textContent = error.message; }
+    finally { button.disabled = false; }
   }
   function resetCorpusOriginal() {
     if (corpusOriginalRequest) corpusOriginalRequest.abort();
@@ -831,6 +880,13 @@
       });
       el('corpusRefresh').addEventListener('click', function () { loadCorpus().catch(function (e) { notify(e.message); }); });
       el('corpusStatus').addEventListener('change', function () { corpusBefore = null; loadCorpus().catch(function (e) { notify(e.message); }); });
+    }
+    if (el('isolatedCorpusPanel')) {
+      el('isolatedCorpusRefresh').addEventListener('click', function () {
+        loadIsolatedCorpus().catch(function (e) { notify(e.message); });
+      });
+      el('isolatedCorpusKind').addEventListener('change', changeIsolatedCorpusKind);
+      el('isolatedCorpusForm').addEventListener('submit', submitIsolatedCorpus);
     }
     await refresh();
   }

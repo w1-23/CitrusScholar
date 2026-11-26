@@ -328,7 +328,7 @@ def review_sheet(data: bytes, name: str, *, sheet_scope: str = "",
         result["data"]["checklist"] = old_rows + new_rows
         known_checks = {row.get("check") for row in new_rows}
         for row in old_rows + new_rows:
-            if row["check"] in selected and row["state"] in {"partial_coverage", "not_applicable", "not_executed"}:
+            if row["check"] in selected and row["state"] in {"partial_coverage", "invalid_input", "failed", "not_applicable", "not_executed"}:
                 all_gaps.append({"sheet": table.sheet, "region_id": table.region_id,
                                  "check": row["check"], "state": row["state"],
                                  "reason": row.get("reasons", row.get("reason", ""))})
@@ -355,14 +355,14 @@ def review_sheet(data: bytes, name: str, *, sheet_scope: str = "",
             }
         check_partial = any(row["state"] == "partial_coverage" for row in new_rows)
         required_missing = any(
-            row.get("state") in {"not_applicable", "not_executed", "partial_coverage", "failed"}
+            row.get("state") in {"not_applicable", "not_executed", "partial_coverage", "invalid_input", "failed"}
             and row.get("check") in required_checks
             for row in old_rows + new_rows
         )
-        failed = any(row.get("state") == "failed" for row in old_rows + new_rows)
+        invalid_or_failed = any(row.get("state") in {"invalid_input", "failed"} for row in old_rows + new_rows)
         truncated_findings = any(item.get("check") == "findings_truncated" for item in findings)
         if (table.coverage.get("truncated") or check_partial or required_missing
-                or failed or truncated_findings):
+                or invalid_or_failed or truncated_findings):
             result["status"] = "partial"
         else:
             result["status"] = "complete"

@@ -1,13 +1,15 @@
 """Exercise the real static UI in Chrome with isolated task and account responses.
 
-Serve 01_src/web on a loopback origin, then run this script with --origin,
---chrome and --output. The Chrome profile is temporary. Requires websocket-client
+Run with --chrome and --output. DevTools serves checkout assets and fixture
+responses to a virtual origin without starting an HTTP server. The Chrome profile is temporary. Requires websocket-client
 and Pillow. Evidence goes to the explicitly selected output directory.
 """
 import argparse
 import base64
 import json
+from hashlib import sha256
 from io import BytesIO
+import mimetypes
 from pathlib import Path
 import subprocess
 import tempfile
@@ -19,9 +21,12 @@ from PIL import Image
 import websocket
 
 
-EXPORT_PATH = '/api/v2/figures/projects/imported-project/export/svg?v=2'
+FIGURE_PATH = '/api/v2/figure-workbench/projects/' + 'a' * 32
+EXPORT_PATH = FIGURE_PATH + '/export/svg?revision=2'
+WEB = Path(__file__).resolve().parents[1]
 SAVED_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="360" height="180" viewBox="0 0 360 180">'
              '<text id="fixture-title" x="20" y="40">已更新标题</text></svg>').encode('utf-8')
+ORIGINAL_SVG = SAVED_SVG.decode().replace('已更新标题', '示例标题').encode()
 
 
 class Browser:
@@ -32,18 +37,30 @@ class Browser:
         self.frames = []
         self.export_requests = []
 
-    def respond_to_export(self, event):
+    def respond(self, event):
         request = event['request']
+        url = urlparse(request['url'])
+        resource = event['requestId']
         method = request['method']
-        self.export_requests.append((method, request['url']))
-        if method not in {'HEAD', 'GET'}:
-            self.send('Fetch.fulfillRequest', requestId=event['requestId'], responseCode=405)
-            return
-        self.send('Fetch.fulfillRequest', requestId=event['requestId'], responseCode=200,
-                  responseHeaders=[{'name': 'Content-Type', 'value': 'image/svg+xml'},
-                                   {'name': 'Content-Disposition', 'value': 'attachment; filename="fixture.svg"'},
-                                   {'name': 'Content-Length', 'value': str(len(SAVED_SVG))}],
-                  body=base64.b64encode(SAVED_SVG if method == 'GET' else b'').decode('ascii'))
+        if url.path in {FIGURE_PATH + '/preview/svg', FIGURE_PATH + '/export/svg'}:
+            if url.path.endswith('/export/svg'):
+                self.export_requests.append((method, request['url']))
+            revision = '2' if url.query == 'revision=2' else '1'
+            body = SAVED_SVG if revision == '2' else ORIGINAL_SVG
+            headers = {'Content-Type': 'image/svg+xml', 'X-Figure-Revision': revision,
+                       'X-Figure-SHA256': sha256(body).hexdigest()}
+        else:
+            routes = {'/': 'index.html', '/figures': 'figure-workbench.html', '/figures/legacy': 'figures.html'}
+            file = (WEB / routes.get(url.path, url.path.lstrip('/'))).resolve()
+            if (url.path not in routes and not url.path.startswith('/assets/')) or not file.is_relative_to(WEB) or not file.is_file():
+                self.send('Fetch.fulfillRequest', requestId=resource, responseCode=404)
+                return
+            body = file.read_bytes()
+            mime = 'text/javascript' if file.suffix == '.js' else mimetypes.guess_type(file)[0]
+            headers = {'Content-Type': mime or 'application/octet-stream'}
+        self.send('Fetch.fulfillRequest', requestId=resource, responseCode=200,
+                  responseHeaders=[{'name': key, 'value': value} for key, value in headers.items()],
+                  body=base64.b64encode(body if method != 'HEAD' else b'').decode('ascii'))
 
     def send(self, method, **params):
         self.next_id += 1
@@ -60,7 +77,7 @@ class Browser:
                 self.frames.append((data['metadata']['timestamp'], base64.b64decode(data['data'])))
                 self.send('Page.screencastFrameAck', sessionId=data['sessionId'])
             if event == 'Fetch.requestPaused':
-                self.respond_to_export(data)
+                self.respond(data)
             if event == 'Runtime.exceptionThrown':
                 self.errors.append(data['exceptionDetails'].get('exception', {}).get('description', data))
             if event == 'Runtime.consoleAPICalled' and data['type'] == 'error':
@@ -124,7 +141,7 @@ def run(browser, origin, output):
     browser.call('Network.enable')
     browser.call('Page.setDownloadBehavior', behavior='allow', downloadPath=str(output.resolve()))
     export_url = origin + EXPORT_PATH
-    browser.call('Fetch.enable', patterns=[{'urlPattern': export_url}])
+    browser.call('Fetch.enable', patterns=[{'urlPattern': origin + '/*'}])
     browser.call('Emulation.setDeviceMetricsOverride', width=1360, height=900, deviceScaleFactor=1, mobile=False)
     browser.call('Page.addScriptToEvaluateOnNewDocument', source=script)
     browser.call('Page.startScreencast', format='jpeg', quality=82, maxWidth=1100, everyNthFrame=2)
@@ -207,7 +224,7 @@ def run(browser, origin, output):
               f"({text('#ctxUsed')}) === '9.2K / 86K' && !({text('#ctxUsageRows')}).includes('缓存覆盖率')")
         capture('context-zero')
         phase('usage')
-        check('Known capacity is displayed with the estimate', f"({text('#ctxUsed')}) === '10.4K / 131K' && ({text('#ctxTriggerPct')}) === '8%'")
+        check('Known capacity is displayed with the estimate', f"({text('#ctxUsed')}) === '10.4K / 131K' && ({text('#ctxTriggerPct')}) === '13%'")
         capture('context-reported')
         evaluate("setReduceMotion(true)")
         check('Reduced motion in Porcelain theme', "document.documentElement.dataset.theme === 'porcelain' && getComputedStyle(document.querySelector('.research-task-orbit')).animationName === 'none'")
@@ -278,16 +295,23 @@ def run(browser, origin, output):
               "document.querySelector('.turn-answer[data-display-status=completed]') && !document.querySelector('.is-running') "
               "&& document.querySelector('#send-btn').getAttribute('aria-label') === '发送消息' "
               "&& document.querySelector('#user-input').value === '第二条独立消息'")
+        check('Server timings distinguish admission, provider packet, and visible answer',
+              "document.querySelector('.turn-timings')?.textContent.includes('提交到首段可见答复 12.1 秒') && document.querySelector('.turn-timings')?.textContent.includes('模型调用到服务商首包 0.9 秒') && document.querySelector('.turn-timings')?.textContent.includes('队列等待 3.0 秒')")
         capture('completed')
+        browser.click('.turn-explicit-continuation')
+        check('Selecting a completed turn makes attachment inheritance explicit', "!document.querySelector('#composer-continuation').hidden")
+        browser.click('#clear-composer-continuation')
+        check('Cancelling inheritance restores ordinary message mode', "document.querySelector('#composer-continuation').hidden")
         browser.click('#send-btn')
         check('Separate FIFO admissions keep their request identity',
-              "experienceRequests().posts.length === 2 && experienceRequests().posts[0].client_request_id !== experienceRequests().posts[1].client_request_id && experienceRequests().posts[1].query === '第二条独立消息'")
+              "experienceRequests().posts.length === 2 && experienceRequests().posts[0].client_request_id !== experienceRequests().posts[1].client_request_id && experienceRequests().posts[1].query === '第二条独立消息' && !('continue_from' in experienceRequests().posts[1])")
         check('Independent requests do not need a Browse flag',
               "experienceRequests().posts.every(post => !('browse_requested' in post))")
-        fill('第三条独立消息')
+        fill('继续核对表头')
+        browser.click('.turn-explicit-continuation')
         browser.click('#send-btn')
-        check('Subsequent new request omits the Browse flag',
-              "experienceRequests().posts.length === 3 && !('browse_requested' in experienceRequests().posts[2])")
+        check('Explicit continuation sends only the exact selected prior request',
+              "experienceRequests().posts.length === 3 && experienceRequests().posts[2].continue_from === 'browser-fixture-request' && !('browse_requested' in experienceRequests().posts[2]) && document.querySelector('#composer-continuation').hidden")
         evaluate('experienceQueueAvailability(false)')
         check('Unavailable queue retains known user bubbles and reports the sync gap',
               "document.querySelector('#composer-task-status').textContent.includes('消息状态待同步') "
@@ -334,49 +358,40 @@ def run(browser, origin, output):
         browser.click('#sessionFilePreviewOverlay .overlay-close')
         check('The preview modal closes before navigating to the workbench', "document.querySelector('#sessionFilePreviewOverlay').hidden")
         browser.click('#figureRailBtn')
-        check('The real workbench entry navigates to /figures', "location.pathname === '/figures' && document.querySelector('#workbench')")
-        check('The workbench opens with its inspector collapsed', "document.querySelector('#rightSidebar')?.hidden")
-        evaluate("if (document.querySelector('#leftSidebar').hidden) document.querySelector('#toggleLeft').click()")
-        check('The figure drawer opens through its real toolbar control',
-              "!document.querySelector('#leftSidebar').hidden && document.querySelector('#toggleLeft').getAttribute('aria-expanded') === 'true' && document.querySelectorAll('#projectList [data-open]').length === 30")
-        for expected in (60, 90, 120, 122):
-            browser.click('#loadMoreProjects')
-            check(f'Project paging reaches {expected} entries', f"document.querySelectorAll('#projectList [data-open]').length === {expected}")
-        check('Desktop import opens on entry', "!document.querySelector('#importPanel').hidden && document.querySelector('#importToggle').getAttribute('aria-expanded') === 'true'")
-        browser.click('#importToggle')
-        check('The import panel can be collapsed', "document.querySelector('#importPanel').hidden")
-        browser.click('#importToggle')
-        check('CSV origin bytes are shown before mapping', "document.querySelector('#importPreviewBody')?.textContent.includes('north, south') && !document.querySelector('#importMapping').disabled")
-        evaluate("const picker = document.querySelector('#dataFileSelect'); picker.value = 'workbook'; picker.dispatchEvent(new Event('change',{bubbles:true}));")
-        check('Workbook preview reads real cells from the server-selected sheet', "document.querySelector('#importPreviewBody').textContent.includes('1\\t42') && document.querySelector('#importPreviewNote').textContent.includes('Measurements')")
-        evaluate("const metric = document.querySelector('#importY'); metric.value = 'Value'; metric.dispatchEvent(new Event('change',{bubbles:true}));")
-        browser.click('#importButton')
-        check('Mapping review does not create a project', "!document.querySelector('#importConfirm').hidden && experienceRequests().imports.length === 0")
-        capture('figure-preview-and-confirm')
-        browser.click('#importConfirmButton')
-        check('Confirm sends exactly one mapped file and selects the returned project',
-              "experienceRequests().imports.length === 1 && experienceRequests().imports[0].file_id === 'workbook' && experienceRequests().imports[0].mapping.y === 'Value' && document.querySelector('#projectTitle').textContent.includes('隔离夹具')")
-        check('Project creation closes the import drawer', "document.querySelector('#leftSidebar')?.hidden")
-        capture('figure-created')
-        browser.click('#toggleLeft')
-        browser.click('#objectTree [data-gid=fixture-title]')
-        evaluate("const editor = document.querySelector('#propertyPanel [data-prop=text]'); editor.value = '已更新标题'; editor.dispatchEvent(new Event('input', {bubbles: true})); editor.dispatchEvent(new Event('change', {bubbles: true}));")
-        browser.click('#saveButton')
-        check('The workbench saves edits against the current revision',
-              "experienceRequests().saves.length === 1 && experienceRequests().saves[0].expected_revision === 1 && experienceRequests().saves[0].overrides.some(edit => edit.gid === 'fixture-title' && edit.value === '已更新标题') && document.querySelector('#downloadSvg').href.endsWith('/export/svg?v=2')")
-        browser.click('#exportMenu summary')
-        browser.click('#downloadSvg')
-        downloaded = output / 'fixture.svg'
+        check('The real workbench entry navigates to /figures', "location.pathname === '/figures' && document.querySelector('#groupTree') && !document.querySelector('#importPanel')")
+        check('Inspector drawer starts collapsed', "document.querySelector('#toggleInspector')?.getAttribute('aria-expanded') === 'false'")
+        browser.click('#openLibrary')
+        check('The real workbench dialog lists the first 12 projects', "document.querySelector('#library').open && document.querySelectorAll('#assetList .asset-button').length === 12")
+        for expected in (24, 26):
+            browser.click('#assetMore')
+            check(f'Project paging reaches {expected} entries', f"document.querySelectorAll('#assetList .asset-button').length === {expected}")
+        browser.click('#assetList .asset-button[aria-label="隔离夹具图件"]')
+        check('Opening a figure verifies the initial preview and closes the picker',
+              "!document.querySelector('#library').open && !document.querySelector('#canvasSheet').hidden && document.querySelector('#revision').textContent === '版本 1'")
+        evaluate("if (document.querySelector('#toggleGroups').getAttribute('aria-expanded') === 'false') document.querySelector('#toggleGroups').click()")
+        browser.click('#groupTree [data-group="category:root:text"] > .tree-row .tree-arrow')
+        browser.click('#groupTree [data-group=fixture-title-group] .tree-name')
+        check('The group inspector exposes the title field', "document.querySelector('#propertyPanel [name=text]')")
+        evaluate("const editor = document.querySelector('#propertyPanel [name=text]'); editor.value = '已更新标题'; editor.dispatchEvent(new Event('input', {bubbles: true}));")
+        browser.click('#propertyPanel form button.primary')
+        check('The workbench verifies the group draft before enabling Save', "experienceRequests().previews.length === 1 && experienceRequests().previews[0].draft_revision > 0 && !document.querySelector('#save').disabled")
+        capture('figure-preview')
+        browser.click('#save')
+        check('The workbench saves group commands against the current revision',
+              "experienceRequests().saves.length === 1 && experienceRequests().saves[0].expected_revision === 1 && experienceRequests().saves[0].commands.some(edit => edit.group_id === 'fixture-title-group' && edit.property === 'text' && edit.value === '已更新标题') && document.querySelector('#revision').textContent === '版本 2'")
+        browser.click('#exports summary')
+        browser.click('#exportMenu button:first-of-type')
+        downloaded = output / '隔离夹具图件-v2.svg'
 
         def download_completed():
             evaluate('true')
             return downloaded.is_file()
 
         until(download_completed, 'The fixture SVG did not download')
-        assert browser.export_requests == [('HEAD', export_url), ('GET', export_url)], browser.export_requests
+        assert browser.export_requests == [('GET', export_url)], browser.export_requests
         assert downloaded.read_bytes() == SAVED_SVG, 'Downloaded SVG does not match the saved revision bytes'
         results.append({'check': 'Export verifies and downloads the saved SVG revision', 'status': 'PASS',
-                        'observed': {'revision': 2, 'methods': ['HEAD', 'GET'], 'bytes': len(SAVED_SVG)}})
+                        'observed': {'revision': 2, 'methods': ['GET'], 'sha256': sha256(SAVED_SVG).hexdigest()}})
     except Exception:
         capture('failure')
         diagnostic = evaluate('''({url: location.href,
@@ -402,11 +417,11 @@ def run(browser, origin, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--chrome', required=True)
-    parser.add_argument('--origin', default='http://127.0.0.1:8165')
+    parser.add_argument('--origin', default='http://citrus-experience.test')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     origin = args.origin.rstrip('/')
-    assert urlparse(origin).hostname in {'127.0.0.1', 'localhost'}, 'Only use a loopback fixture origin'
+    assert origin == 'http://citrus-experience.test', 'Only use the isolated virtual fixture origin'
     args.output.mkdir(parents=True, exist_ok=True)
     opener = build_opener(ProxyHandler({}))
     with tempfile.TemporaryDirectory(prefix='citrus-chromium-', ignore_cleanup_errors=True) as profile:

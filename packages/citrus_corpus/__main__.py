@@ -63,6 +63,8 @@ def parser():
     worker = commands.add_parser("worker")
     worker.add_argument("--watch", action="store_true")
     worker.add_argument("--allow-network", action="store_true")
+    worker.add_argument("--allow-automatic", action="store_true",
+                        help="enable existing host resolver for durable public-paper receipts")
     worker.add_argument("--allow-redirect-host", action="append", default=[])
     worker.add_argument("--network-marker", help="optional file whose presence authorizes network dispatch")
     publish = commands.add_parser("publish")
@@ -139,9 +141,17 @@ def _run(args):
             return args.allow_network and (args.network_marker is None or Path(args.network_marker).is_file())
 
         acquire = ExplicitAcquirer(args.allow_redirect_host, allowed=network_allowed)
+        automatic = None
+        if args.allow_automatic:
+            if not args.allow_network:
+                raise ValueError("corpus_automatic_network_required")
+            from src.corpus_integration.automatic_worker import AutomaticWorker
+
+            automatic = AutomaticWorker(store.root, network_allowed=network_allowed)
         while True:
             try:
-                result = intake.process_one(acquire=acquire if network_allowed() else None)
+                result = intake.process_one(acquire=acquire if network_allowed() else None,
+                                            automatic=automatic if automatic and automatic.enabled() else None)
             except (sqlite3.Error, OSError, ValueError) as exc:
                 if not args.watch:
                     raise

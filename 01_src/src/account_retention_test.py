@@ -104,7 +104,8 @@ assert {{p: p.read_bytes() for p in before}} == before
     assert SUBJECT not in result.stdout + result.stderr
     text = next(output.glob("*.txt")).read_text(encoding="utf-8")
     assert SUBJECT not in text
-    assert "neighbor-visible" in text and '"total_ms": 9' in text
+    assert "neighbor-visible" not in text and '"total_ms": 9' in text
+    assert "仅元数据" in text
     assert {p: p.read_bytes() for p in historical} == historical
 
     run(root, SETUP + f'''
@@ -131,7 +132,7 @@ cancel('session_new_00', new, 'shared_key')
 ''')
     python(root, EXPORT, "--today", "--runtime", root, "--out-dir", output)
     text = next(output.glob("*.txt")).read_text(encoding="utf-8")
-    assert SUBJECT not in text and "neighbor-visible" in text and "new-owner-content" in text
+    assert all(marker not in text for marker in (SUBJECT, "neighbor-visible", "new-owner-content"))
     assert {p: p.read_bytes() for p in historical} == historical
 
 
@@ -230,7 +231,7 @@ session(sid, owner)
 job = turn(sid, owner, 'export_key', {SUBJECT!r})
 cancel(sid, owner, 'export_key')
 output = auth.PROJECT_ROOT / 'test-output'
-output.mkdir()
+output.mkdir(mode=0o700)
 original = output / 'previous.txt'
 original.write_text('previous archive')
 with sqlite3.connect(jobs._DB_PATH) as db:
@@ -270,3 +271,87 @@ def test_claim_operator_does_not_drop_admitted_work(tmp_path):
         assert current_store().active_count(1) == 1
         assert not auth.user_by_id(1)['active']
     ''')
+
+
+def test_legacy_audit_deleted_owner_hidden_before_count_and_exact_cleanup_retries(tmp_path):
+    run(tmp_path, SETUP + f'''
+from datetime import datetime, timezone
+from src import admin_audit
+from src.core.account_admission import current_store
+from src.core import turn_logs
+from pathlib import Path
+import time
+admin_audit.init_store()
+old = auth.create_local_account('synthetic_audit_old', {PASSWORD!r})
+neighbor = auth.create_local_account('synthetic_audit_other', {PASSWORD!r})
+session('session_old_audit', old)
+session('session_other_audit', neighbor)
+job = turn('session_old_audit', old, 'same_key', {SUBJECT!r})
+other = turn('session_other_audit', neighbor, 'same_key', 'neighbor query')
+cancel('session_old_audit', old, 'same_key')
+cancel('session_other_audit', neighbor, 'same_key')
+with sqlite3.connect(jobs._DB_PATH) as db:
+    finish, = db.execute('SELECT finished_at FROM chat_turn_queue WHERE root_job_id=?', (job,)).fetchone()
+day = datetime.fromtimestamp(finish, timezone.utc).date().isoformat()
+root = auth.PROJECT_ROOT / 'logs' / 'turns'
+target = root / day / (job + '.txt')
+other_target = root / day / (other + '.txt')
+assert target.is_file() and other_target.is_file()
+(target.parent / 'unrelated.txt').write_text('unrelated')
+next_day = root / '1999-01-01'
+next_day.mkdir()
+(next_day / target.name).write_text('different exact date')
+with sqlite3.connect(admin_audit.DB_PATH) as db:
+    db.execute('INSERT INTO request_audit(request_id,user_id,username,session_id,query,answer,created_at) '
+               'VALUES(?,?,?,?,?,?,?)', ('legacy_req', old, 'synthetic_audit_old', 'session_old_audit',
+                                         {SUBJECT!r}, {SUBJECT!r}, time.time()))
+    db.execute('INSERT INTO request_audit(request_id,user_id,username,session_id,query,created_at) '
+               'VALUES(?,?,?,?,?,?)', ('orphan_req', 99999, 'gone', 'gone', {SUBJECT!r}, time.time()))
+admin_audit.start_request(request_id='neighbor_req', user_id=neighbor, username='synthetic_audit_other',
+    session_id='session_other_audit', query={SUBJECT!r}, attachments=[{{'name':{SUBJECT!r},'size_bytes':5}}])
+admin_audit.finish_request(request_id='neighbor_req', answer={SUBJECT!r},
+    retrieval_trace={{'query':{SUBJECT!r},'total_ms':9}})
+assert admin_audit.list_requests()['total'] == 2
+assert admin_audit.list_requests(query={SUBJECT!r})['total'] == 1
+assert current_store().close_admission(old)
+assert admin_audit.list_requests(query={SUBJECT!r})['total'] == 0
+page = admin_audit.list_requests(limit=1)
+assert page['total'] == 1 and len(page['items']) == 1
+assert {SUBJECT!r} not in repr(page) and page['items'][0]['attachments'] == [{{'approx_bytes':5}}]
+assert admin_audit.list_requests(offset=1)['items'] == []
+# A non-file at the exact path must keep the account fenced and retryable.
+target.unlink()
+target.mkdir()
+assert not auth.delete_user_account(old)
+assert auth.user_by_id(old) is not None and not auth.user_by_id(old)['active']
+with sqlite3.connect(jobs._DB_PATH) as db:
+    assert db.execute('SELECT 1 FROM chat_turn_queue WHERE root_job_id=?', (job,)).fetchone()
+target.rmdir()
+target.write_text({SUBJECT!r})
+assert auth.delete_user_account(old, raise_if_busy=True)
+assert not target.exists() and other_target.is_file() and (next_day / target.name).is_file()
+assert (target.parent / 'unrelated.txt').is_file()
+with sqlite3.connect(admin_audit.DB_PATH) as db:
+    assert db.execute('SELECT request_id FROM request_audit ORDER BY request_id').fetchall() == [('neighbor_req',), ('orphan_req',)]
+''')
+
+
+def test_export_correlates_exactly_and_requires_private_destination_for_full(tmp_path):
+    python(tmp_path, EXPORT, '--today', '--full', '--runtime', tmp_path, expected=2)
+    run(tmp_path, rf'''
+import importlib.util
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('offline_turn_export', {str(EXPORT)!r})
+exporter = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(exporter)
+from src.logger import redact_log_text
+assert redact_log_text('secret=example-value\nuser\x1b') == '[REDACTED] user '
+root = Path({str(tmp_path)!r})
+valid, wrong = '0123456789ab', 'abcabcabcabc'
+(root / 'business.log').write_text(f'now | job={{valid}} | elapsed_ms=8 \n'
+    f'now | job={{valid}}ff | elapsed_ms=99 \n'
+    f'now | job={{valid}} | job={{wrong}} | elapsed_ms=88 \n')
+rows, errors = exporter.correlated_logs(root, {{valid: valid}})
+assert not errors and len(rows[valid]) == 1
+assert '"elapsed_ms": 8' in next(iter(rows[valid]))
+''')

@@ -12,8 +12,10 @@ class Catalog:
     def __init__(self, store):
         self.store = store
 
-    def record(self, queue, job, raw_digest, source_format, markdown):
+    def record(self, queue, job, raw_digest, source_format, markdown, *, allowed=lambda: True):
         with self.store.write(timeout=2) as conn:
+            if not allowed():
+                raise prepare.PreparationError("network_scope_denied")
             storage, canonical, aliases = bibliography.version_group(conn, job["identity"])
             # Metadata registrations can connect aliases between the early
             # duplicate check and extraction. Recheck inside the final write.
@@ -30,6 +32,8 @@ class Catalog:
                          VALUES (?,?,?,?,?,?,?,?,'needs_review',?)""",
                          (storage, document_id, version_id, raw_digest, metadata["content_sha256"],
                           metadata["chunk_count"], previous[0] if previous else None, source_format, time.time()))
+            if not allowed():
+                raise prepare.PreparationError("network_scope_denied")
             self._automatic_grant(conn, job, document_id, version_id, raw_digest)
             queue.complete(conn, job, document=document_id, version=version_id, digest=raw_digest)
 
@@ -49,8 +53,10 @@ class Catalog:
         prepare.write_document(self.store.documents, document_id, version_id, metadata, markdown)
         return metadata
 
-    def complete_duplicate(self, queue, job, raw_digest):
+    def complete_duplicate(self, queue, job, raw_digest, *, allowed=lambda: True):
         with self.store.write(timeout=2) as conn:
+            if not allowed():
+                raise prepare.PreparationError("network_scope_denied")
             _, _, aliases = bibliography.version_group(conn, job["identity"])
             return self._complete_duplicate(conn, queue, job, raw_digest, aliases)
 

@@ -79,3 +79,15 @@ test('shows cache coverage only if directly reported counters cover reported inp
   assert.equal(project({...snapshot, provider_usage:{...usage, cache_read:0, cache_uncached:24000}}).usage.coverage, 0);
   assert.equal(project({...snapshot, provider_usage:{...usage, attempt_id:'foreign'}}).usage, null);
 });
+
+
+test('the header ring measures the application cap independently of the model drawer', () => {
+  const view = project({estimate_scope: 'full_request_estimate', estimated_input_tokens: 7000,
+    application_input_limit: 8000, input_limit: 8500, model_window: 100000});
+  assert.equal(view.capacity, 100000);
+  assert.equal(view.ratio, .07);
+  assert.equal(view.ringLimit, 8000);
+  assert.equal(view.ringRatio, .875);
+  assert.equal(project({estimate_scope: 'full_request_estimate', estimated_input_tokens: 7000,
+    model_window: 100000}).ringRatio, null);
+});

@@ -1,6 +1,6 @@
 """Resolve an exact journal record and optional original, independently of Fetch output."""
 from dataclasses import dataclass
-from hashlib import md5
+from hashlib import md5, sha256
 import html
 import json
 import re
@@ -57,9 +57,46 @@ class Paper:
 
     def registration(self) -> dict:
         link = ("https://doi.org/" + quote(self.doi, safe="/") if self.doi
-                else f"https://pubmed.ncbi.nlm.nih.gov/{self.pmid}/")
+                else f"https://pubmed.ncbi.nlm.nih.gov/{self.pmid}/" if self.pmid
+                else f"https://pmc.ncbi.nlm.nih.gov/articles/{self.pmcid}/")
         return {"doi": self.doi, "pmid": self.pmid, "pmcid": self.pmcid,
                 "title": self.title, "source_url": link}
+
+
+@dataclass(frozen=True)
+class VerifiedOriginal:
+    """Internal proof produced only by an authenticated first-party fetch."""
+    doi: str
+    pmid: str
+    pmcid: str
+    title: str
+    raw: bytes
+    sha256: str
+    license_id: str
+    evidence_url: str
+    text_url: str
+
+
+def verified_original(paper: dict, license_id: str, evidence_url: str, *, doi="", pmid=""):
+    """Validate the fixed-host transport's original and official metadata without I/O.
+
+    Only the PMC Cloud Fetch adapter calls this with bytes from its no-redirect
+    HTTPS transport. Vendor, model, and public HTTP payloads are not proof.
+    This does not decide journal eligibility; the standalone worker does.
+    """
+    try:
+        doi, pmid, _ = public_identifiers(doi, pmid)
+        proof_paper, proof_license, text_url, expected = _cloud_metadata(paper["metadata_raw"], evidence_url)
+        if ((doi and doi != proof_paper.doi) or (pmid and pmid != proof_paper.pmid)
+                or text_url != paper["url"] or proof_license != license_id):
+            return None
+        raw = paper["raw_bytes"]
+        if not _complete_original(raw, expected):
+            return None
+        return VerifiedOriginal(proof_paper.doi, proof_paper.pmid, proof_paper.pmcid, proof_paper.title,
+                                raw, sha256(raw).hexdigest(), proof_license, evidence_url, text_url)
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 class ExcludedPaper(ValueError):
@@ -103,6 +140,32 @@ def identifiers(doi: str, pmid: str, winner_url: str = "") -> tuple[str, str]:
     return "", ""
 
 
+def public_identifiers(doi="", pmid="", pmcid="", winner_url=""):
+    """Normalize exact inputs and allow only known identifier URL routes."""
+    if doi or pmid or pmcid:
+        clean_doi = _doi(doi)
+        clean_pmid = _id(pmid.strip(), _PMID) if isinstance(pmid, str) else ""
+        clean_pmc = _id(pmcid.strip().upper(), _PMCID) if isinstance(pmcid, str) else ""
+        if any(raw and not clean for raw, clean in zip((doi, pmid, pmcid), (clean_doi, clean_pmid, clean_pmc))):
+            raise ValueError("identifier_invalid")
+        return clean_doi, clean_pmid, clean_pmc
+    doi, pmid = identifiers("", "", winner_url)
+    if doi or pmid:
+        return doi, pmid, ""
+    if not isinstance(winner_url, str) or len(winner_url) > 2048:
+        return "", "", ""
+    parts = urlsplit(winner_url)
+    if parts.scheme != "https" or parts.query or parts.fragment:
+        return "", "", ""
+    if parts.netloc == "pmc.ncbi.nlm.nih.gov":
+        match = re.fullmatch(r"/articles/(PMC[1-9][0-9]{0,11})(?:\.[1-9][0-9]{0,8})?/?", parts.path)
+    elif parts.netloc == "www.ebi.ac.uk":
+        match = re.fullmatch(r"/europepmc/webservices/rest/(PMC[1-9][0-9]{0,11})/fullTextXML", parts.path)
+    else:
+        match = None
+    return "", "", match[1] if match else ""
+
+
 def _read(url, deadline, *, allowed, max_bytes=_MAX_METADATA, params=None):
     if url.startswith(_NCBI):
         _pace_ncbi(deadline)
@@ -112,6 +175,8 @@ def _read(url, deadline, *, allowed, max_bytes=_MAX_METADATA, params=None):
     with requests.get(url, params=params, timeout=(min(3, remaining), min(8 if url == _EUROPE_PMC else 4, remaining)), stream=True,
                       headers={"Accept-Encoding": "identity"}, allow_redirects=False) as response:
         length = response.headers.get("Content-Length")
+        if response.status_code in {408, 429, 500, 502, 503, 504}:
+            raise OSError("paper_source_temporarily_unavailable")
         if (response.status_code != 200 or response.headers.get("Content-Encoding", "identity").lower() != "identity"
                 or (length is not None and (not length.isdecimal() or int(length) > max_bytes))):
             raise ValueError("paper_source_invalid_response")
@@ -166,10 +231,17 @@ def _title(value):
     return value
 
 
-def _europe_pmc(read, doi, pmid):
+def _europe_pmc(read, doi, pmid, pmcid="", title=""):
     # A PMID search also checks a supplied DOI, rather than losing evidence of
     # disagreement in a query that already intersects both fields.
-    term = f"EXT_ID:{pmid} AND SRC:MED" if pmid else f'DOI:"{doi}"'
+    if pmid:
+        term = f"EXT_ID:{pmid} AND SRC:MED"
+    elif doi:
+        term = f'DOI:"{doi}"'
+    elif pmcid:
+        term = f"PMCID:{pmcid} AND SRC:MED"
+    else:
+        term = f'TITLE:"{title}" AND SRC:MED'
     data = _record(read(_EUROPE_PMC, params={"query": term, "format": "json", "resultType": "core", "pageSize": 3}))
     result_list = data.get("resultList")
     rows = result_list.get("result") if isinstance(result_list, dict) else None
@@ -179,7 +251,8 @@ def _europe_pmc(read, doi, pmid):
         raise ExcludedPaper("exact_record_ambiguous")
     item = rows[0]
     found_doi, found_pmid = _doi(item.get("doi")), _id(item.get("pmid"), _PMID)
-    if (doi and doi != found_doi) or (pmid and pmid != found_pmid):
+    found_pmcid = _id(item.get("pmcid"), _PMCID)
+    if (doi and doi != found_doi) or (pmid and pmid != found_pmid) or (pmcid and pmcid != found_pmcid):
         raise ExcludedPaper("identifier_mismatch")
     types = item.get("pubTypeList")
     types = types.get("pubType") if isinstance(types, dict) else None
@@ -194,7 +267,10 @@ def _europe_pmc(read, doi, pmid):
             or any(not isinstance(c, dict) or re.search(r"retract|withdraw|expression.?of.?concern",
                    str(c.get("type")), re.I) for c in corrections)):
         raise ExcludedPaper("not_a_current_journal_article")
-    return Paper(found_doi, found_pmid, _id(item.get("pmcid"), _PMCID), _title(item.get("title")))
+    published_title = _title(item.get("title"))
+    if title and norm_title(title) != norm_title(published_title):
+        raise ExcludedPaper("public_title_mismatch")
+    return Paper(found_doi, found_pmid, found_pmcid, published_title)
 
 
 def _is_journal_article(types, venue):
@@ -269,41 +345,73 @@ def _version(read, pmcid):
     return match[1] if match else ""
 
 
-def _original(read, paper):
-    version = _version(read, paper.pmcid)
-    if not version:
-        return {}
-    key = f"{paper.pmcid}.{version}"
-    evidence_url = f"{_CLOUD}/metadata/{key}.json"
-    metadata = _record(read(evidence_url))
-    if (metadata.get("pmcid") != paper.pmcid or type(metadata.get("version")) is not int
-            or str(metadata["version"]) != version or _id(metadata.get("pmid"), _PMID) != paper.pmid
-            or (paper.doi and _doi(metadata.get("doi")) != paper.doi)):
-        return {}
+def _cloud_metadata(raw, evidence_url):
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= _MAX_METADATA:
+        raise ValueError("pmc_metadata_invalid")
+    match = re.fullmatch(rf"{re.escape(_CLOUD)}/metadata/(PMC[1-9][0-9]{{0,11}})\.([1-9][0-9]{{0,8}})\.json",
+                         evidence_url)
+    if not match:
+        raise ValueError("pmc_metadata_invalid")
+    pmcid, version = match.groups()
+    key = f"{pmcid}.{version}"
+    metadata = _record(raw)
+    if (metadata.get("pmcid") != pmcid or type(metadata.get("version")) is not int
+            or str(metadata["version"]) != version):
+        raise ValueError("pmc_metadata_identity_mismatch")
     if metadata.get("is_retracted") is True:
         raise ExcludedPaper("pmc_retracted")
     raw_code = metadata.get("license_code")
     license_id = _LICENSE_CODES.get(raw_code.strip().casefold()) if type(raw_code) is str else None
     if (metadata.get("is_retracted") is not False or metadata.get("is_pmc_openaccess") is not True
-            or not license_id or not isinstance(metadata.get("title"), str)
-            or norm_title(metadata["title"]) != norm_title(paper.title)):
-        return {}
+            or not license_id):
+        raise ValueError("pmc_license_unavailable")
     path = f"/{key}/{key}.txt"
     text_uri = metadata.get("text_url")
     expected = re.fullmatch(rf"{re.escape('s3://pmc-oa-opendata' + path)}\?md5=([0-9a-f]{{32}})",
                             text_uri) if isinstance(text_uri, str) else None
     if not expected:
-        return {}
-    raw = read(_CLOUD + path, max_bytes=_MAX_ORIGINAL)
-    if (md5(raw, usedforsecurity=False).hexdigest() != expected[1] or b"\x00" in raw
-            or len(raw.decode("utf-8").strip()) < 1500):
-        return {}
-    return {"raw": raw, "license_id": license_id, "evidence_url": evidence_url, "text_url": _CLOUD + path}
+        raise ValueError("pmc_original_unavailable")
+    paper = Paper(_doi(metadata.get("doi")), _id(metadata.get("pmid"), _PMID), pmcid, _title(metadata.get("title")))
+    return paper, license_id, _CLOUD + path, expected[1]
 
 
-def resolve(doi: str, pmid: str, *, allowed) -> dict | None:
-    """Attempt bounded proof for one exact work, with link-only fallback."""
-    if not (doi or pmid) or identifiers(doi, pmid) != (doi, pmid):
+def _complete_original(raw, expected):
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= _MAX_ORIGINAL or b"\x00" in raw:
+        return False
+    text = raw.decode("utf-8").lstrip("\ufeff \t\r\n")
+    return (len(text.rstrip()) >= 1500 and not text.startswith(("<", "%PDF-"))
+            and md5(raw, usedforsecurity=False).hexdigest() == expected)
+
+
+def _original(read, paper, reuse=lambda *_: None):
+    version = _version(read, paper.pmcid)
+    if not version:
+        return {}
+    key = f"{paper.pmcid}.{version}"
+    evidence_url = f"{_CLOUD}/metadata/{key}.json"
+    try:
+        known, license_id, text_url, expected = _cloud_metadata(read(evidence_url), evidence_url)
+    except ExcludedPaper:
+        raise
+    except ValueError:
+        return {}
+    if ((paper.pmid and known.pmid != paper.pmid) or (paper.doi and known.doi != paper.doi)
+            or norm_title(known.title) != norm_title(paper.title)):
+        return {}
+    raw = reuse(evidence_url, license_id)
+    if not _complete_original(raw, expected):
+        raw = read(text_url, max_bytes=_MAX_ORIGINAL)
+        if not _complete_original(raw, expected):
+            return {}
+    return {"raw": raw, "license_id": license_id, "evidence_url": evidence_url, "text_url": text_url}
+
+
+def resolve(doi: str, pmid: str, *, allowed, pmcid="", title="", cached=None, reuse=lambda *_: None,
+            strict=False) -> dict | None:
+    """Resolve one exact current journal record and, when proven, its original."""
+    if not (doi or pmid or pmcid or title) or public_identifiers(doi, pmid, pmcid) != (doi, pmid, pmcid):
+        return None
+    if title and (any((doi, pmid, pmcid)) or _title(title) != title or any(c in title for c in '\"<>')):
         return None
     deadline = monotonic() + _NETWORK_BUDGET_SECONDS
 
@@ -312,28 +420,49 @@ def resolve(doi: str, pmid: str, *, allowed) -> dict | None:
 
     try:
         paper = None
-        registries = (_pubmed, _europe_pmc) if pmid else (_europe_pmc, _pubmed)
+        temporary_failure = None
+        def europe_pmc(read, doi, pmid):
+            return _europe_pmc(read, doi, pmid, pmcid, title)
+
+        if title or (pmcid and not (doi or pmid)):
+            registries = (europe_pmc,)
+        else:
+            registries = (_pubmed, europe_pmc) if pmid else (europe_pmc, _pubmed)
         for registry in registries:
             try:
                 paper = registry(read, doi, pmid)
             except ExcludedPaper:
                 raise
-            except _UNAVAILABLE:
+            except _UNAVAILABLE as exc:
+                temporary_failure = exc
                 continue
             if paper is not None:
                 break
-        if paper is None and doi and not pmid:
+        if paper is None and doi and not (pmid or pmcid):
             paper = _crossref(read, doi)
         if paper is None:
+            if strict and temporary_failure is not None:
+                raise temporary_failure
             return None
+        if pmcid and paper.pmcid != pmcid:
+            raise ExcludedPaper("identifier_mismatch")
         result = paper.registration()
+        if cached is not None:
+            return {**result, **cached} if norm_title(cached["proof_title"]) == norm_title(paper.title) else None
         if paper.pmcid:
             try:
-                result.update(_original(read, paper))
+                result.update(_original(read, paper, reuse))
             except ExcludedPaper:
                 raise
-            except _UNAVAILABLE:
-                pass
+            except _UNAVAILABLE as exc:
+                if strict and isinstance(exc, (OSError, HTTPError)):
+                    raise
         return result
+    except ExcludedPaper:
+        if strict:
+            raise
+        return None
     except _UNAVAILABLE:
+        if strict:
+            raise
         return None

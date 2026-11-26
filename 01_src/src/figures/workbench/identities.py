@@ -1,7 +1,7 @@
 """Bind saved render addresses to independently verified source identities."""
 from collections import Counter
 
-from citrus_figures.presentation_ids import axes_address, series_address
+from citrus_figures.presentation_ids import axes_address, presentation_key, series_address
 
 
 class DeclarativeIdentity:
@@ -24,7 +24,7 @@ class DeclarativeIdentity:
             for series_index, item in enumerate(series):
                 key, name = (item.key, item.name) if item is not None else (None, "")
                 address = series_address(index, leaf.panel_id, gid, series_index, key=key, name=name)
-                self.series.setdefault((index, address), []).append((series_index, key))
+                self.series.setdefault((index, address), []).append((series_index, key, name))
 
     @staticmethod
     def _matches(locator, **expected):
@@ -35,7 +35,8 @@ class DeclarativeIdentity:
         if panel is None:
             return None
         gid, panel_id = panel
-        if row["gid"] == gid and self._matches(row["locator"], panel_id=panel_id):
+        if (row["gid"] == gid and self._matches(row["locator"], panel_id=panel_id)
+                and self._matches(row, presentation_key=presentation_key(panel_id, "axes"))):
             return panel_id or "single-spec-panel"
         return None
 
@@ -43,9 +44,11 @@ class DeclarativeIdentity:
         known = self.series.get((index, row["gid"]), [])
         if len(known) != 1:
             return None
-        series_index, key = known[0]
+        series_index, key, name = known[0]
         _, panel_id = self.panels[index]
         if not self._matches(row["locator"], panel_id=panel_id, series_id=row["gid"], series_index=series_index):
+            return None
+        if not self._matches(row, presentation_key=presentation_key(panel_id, "series", series_key=key, source_group=name)):
             return None
         if "semantic_key" in row and row["semantic_key"] != key:
             return None
@@ -63,7 +66,8 @@ class DeclarativeIdentity:
             return False
         lookup = self.series_key if role == "series" else self.panel
         prior, current = lookup(index, before), lookup(index, after)
-        if prior is None or prior != current:
+        if (prior is None or prior != current
+                or "presentation_key" in before and before["presentation_key"] != after.get("presentation_key")):
             return False
         # This is an addition-only migration. A contradictory existing value,
         # changed coordinate, scope or artist cannot be normalized away.

@@ -20,9 +20,10 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from src.config import PROJECT_ROOT
@@ -68,10 +69,15 @@ def unsettled_history_job_sql(conn, tables: set[str]) -> str:
                         "AND tq.owner_user_id=j.owner_user_id AND tq.session_id=j.session_id "
                         "AND j.job_id IN (tq.root_job_id,tq.active_child_job_id))")
     if {"owner_user_id", "question_id", "parent_job_id"}.issubset(cols) and "task_questions" in tables:
+        question_cols = {r[1] for r in conn.execute("PRAGMA table_info(task_questions)")}
+        current_question = ("AND q.recovery_cursor=COALESCE((SELECT MAX(e.seq) FROM task_events e "
+                            "WHERE e.job_id=q.job_id AND e.event='agent_recovery'),0) "
+                            if "recovery_cursor" in question_cols and "task_events" in tables else "")
         evidence.append("EXISTS (SELECT 1 FROM task_questions q LEFT JOIN task_jobs c ON c.job_id=q.child_job_id "
                         "AND c.question_id=q.id AND c.parent_job_id=q.job_id "
                         "AND c.owner_user_id=q.owner_user_id AND c.session_id=q.session_id "
                         "WHERE q.job_id=j.job_id AND q.owner_user_id=j.owner_user_id AND q.session_id=j.session_id "
+                        + current_question +
                         "AND ((q.status IN ('cancelled','expired') AND q.child_job_id='') "
                         "OR (q.status='answered' AND c.job_id IS NOT NULL)))")
     if evidence:
@@ -135,6 +141,24 @@ def _connect():
         conn.rollback()
         conn.close()
         raise
+
+
+@contextmanager
+def read_transaction(*, path=None):
+    """Read one initialized store snapshot without schema setup or writer locks."""
+    uri = Path(path if path is not None else _DB_PATH).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=0.15)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
+        yield conn
+
+
+def read_job(job_id, *, conn=None):
+    if conn is None:
+        with read_transaction() as reader:
+            return read_job(job_id, conn=reader)
+    row = conn.execute("SELECT * FROM task_jobs WHERE job_id=?", (job_id,)).fetchone()
+    return dict(row) if row is not None else None
 
 
 class IdempotencyConflict(ValueError):
@@ -560,6 +584,12 @@ def claim_agent_recovery(identity, *, answered: bool = False, account_epoch=None
             "job_id": identity.run_id, "request_id": identity.user_turn_id,
             "status": "admitted", "previous_terminal_seq": terminal[0],
             "reactivated_updates": reactivated_updates})
+        # Old pending questions are no longer a runnable decision. Expiry
+        # owns pin deletion, so a rollback cannot expose a still-current pin.
+        conn.execute("UPDATE task_questions SET status='expired', "
+                     "pin_until=CASE WHEN pin_until>0 THEN MIN(pin_until,?) ELSE 0 END "
+                     "WHERE job_id=? AND recovery_cursor<? AND status='pending'",
+                     (time.time(), identity.run_id, event["seq"]))
         return {"budget": dict(budget), "recovery_cursor": event["seq"], "claim": claim}
 
 
@@ -629,7 +659,7 @@ def decode_terminal_snapshot(job: Optional[dict]) -> dict:
 
 def list_for_session(session_id: str, limit: int = 10, *,
                      include_active: bool = False,
-                     owner_user_id: int | None = None, visible_only: bool = False) -> list:
+                     owner_user_id: int | None = None, visible_only: bool = False, conn=None) -> list:
     """Recent jobs, optionally retaining every live or waiting task as well."""
     if owner_user_id is not None and (type(owner_user_id) is not int or owner_user_id <= 0):
         return []
@@ -652,11 +682,12 @@ def list_for_session(session_id: str, limit: int = 10, *,
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
     try:
-        with closing(_connect()) as conn:
-            conn.row_factory = sqlite3.Row
-            return [dict(r) for r in conn.execute(query, params)]
-    except Exception as e:
-        logger.warning(f"[Jobs] list_for_session failed: {e}")
+        with (read_transaction() if conn is None else nullcontext(conn)) as reader:
+            return [dict(row) for row in reader.execute(query, params)]
+    except sqlite3.Error as exc:
+        if conn is not None:
+            raise
+        logger.warning("[Jobs] list_for_session failed: %s", type(exc).__name__)
         return []
 
 
@@ -703,14 +734,16 @@ def purge_protocol_for_owner(owner_user_id: int) -> None:
                              "SELECT job_id FROM task_jobs WHERE owner_user_id=?)", (int(owner_user_id),))
 
 
-def find_chat_job_id(session_id: str, owner_user_id: int, client_request_id: str) -> str | None:
+def find_chat_job_id(session_id: str, owner_user_id: int, client_request_id: str, *, conn=None, visible_only=False) -> str | None:
     """Read the original chat claim without admission, recovery or dispatch."""
-    with closing(_connect()) as conn:
-        row = conn.execute(
-            "SELECT job_id FROM task_jobs WHERE owner_user_id=? AND client_request_id=? "
-            "AND session_id=? AND job_type='chat'",
-            (owner_user_id, client_request_id, session_id),
-        ).fetchone()
+    if conn is None:
+        with read_transaction() as reader:
+            return find_chat_job_id(session_id, owner_user_id, client_request_id, conn=reader, visible_only=visible_only)
+    row = conn.execute(
+        "SELECT job_id FROM task_jobs WHERE owner_user_id=? AND client_request_id=? "
+        "AND session_id=? AND job_type='chat'" + (" AND history_hidden=0" if visible_only else ""),
+        (owner_user_id, client_request_id, session_id),
+    ).fetchone()
     return str(row[0]) if row is not None else None
 
 

@@ -251,13 +251,13 @@ def test_fetched_paper_can_be_cited_without_showing_internal_id(citation_session
     monkeypatch.setattr(deepseek_search_fetch, '_retain_paper', lambda *args, **kwargs: None)
     monkeypatch.setattr(deepseek_search_fetch, '_retain_missing_paper', lambda **kwargs: None)
 
-    def race(candidates, deadline, doi, title, attempts):
+    async def race(candidates, deadline, doi, pmid, title, attempts):
         attempts.append(source)
-        return None if abstract_only else source
+        return (None if abstract_only else source), None
 
     monkeypatch.setattr(deepseek_search_fetch, '_race_candidates', race)
     assert turn_source_ledger.allocate_citation_refs(run.sid, 'client-request', 'web', 1) == ['W1']
-    body, artifact = deepseek_search_fetch.deepseek_fetch_paper.func(urls=[url])
+    body, artifact = asyncio.run(deepseek_search_fetch.deepseek_fetch_paper.coroutine(urls=[url]))
     assert '[W2]' in body
     assert artifact['web_results'][0]['citation_ref'] == 'W2'
     record_tool('deepseek_fetch_paper', 'paper-read', body, artifact)

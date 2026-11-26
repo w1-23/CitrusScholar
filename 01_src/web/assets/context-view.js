@@ -39,6 +39,8 @@
     const capacity = modelWindow ?? inputLimit;
     const limitKind = modelWindow != null ? 'window' : inputLimit != null ? 'input' : null;
     const ratio = used != null && capacity != null ? used / capacity : null;
+    const ringLimit = full && count(data.application_input_limit) || inputLimit;
+    const ringRatio = used != null && ringLimit != null ? used / ringLimit : null;
     const state = ratio == null ? 'unknown' : ratio >= .93 ? 'critical' : ratio >= .75 ? 'warning' : 'healthy';
     const rows = full && data.components && typeof data.components === 'object' && used != null
       ? COMPONENTS.map(([key, label, detail], index) => ({key, label, detail, slot: index + 1, value: count(data.components[key])})) : [];
@@ -52,7 +54,7 @@
     const free = ratio != null ? Math.max(0, capacity - used) : null;
     if (free != null) rows.push({key: 'free', label: '未用额度', slot: -1, value: free,
       detail: limitKind === 'input' ? '按应用单次输入上限扣除估算输入。' : '窗口容量扣除估算输入，未扣除为生成预留的令牌。'});
-    return {used, full, capacity, inputLimit, modelWindow, limitKind, ratio, state, rows, breakdown, free,
+    return {used, full, capacity, inputLimit, ringLimit, ringRatio, modelWindow, limitKind, ratio, state, rows, breakdown, free,
       chartTotal: full && used != null && breakdown !== 'inconsistent' ? Math.max(used, capacity ?? 0) : 0,
       historical: !full && used != null, estimateMethod: data.estimate_method, model: full ? data.model : '',
       outputReserve: full ? count(data.output_tokens) : null, usage: full ? providerUsage(data) : null,
@@ -212,16 +214,17 @@
     }
 
     function render() {
-      const {used, capacity, ratio, state, historical, limitKind, chartTotal, inputLimit, modelWindow, breakdown} = current;
+      const {used, capacity, ratio, state, historical, limitKind, chartTotal, inputLimit, modelWindow, breakdown, ringRatio} = current;
       const chartAvailable = chartTotal > 0;
       const percentage = percent(ratio);
       const basis = LIMIT_LABEL[limitKind] || '';
-      drawer.dataset.level = trigger.dataset.level = state;
+      drawer.dataset.level = state;
+      trigger.dataset.level = ringRatio == null ? 'unknown' : ringRatio >= .93 ? 'critical' : ringRatio >= .75 ? 'warning' : 'healthy';
       tree.hidden = !chartAvailable || !treeMode.checked;
       grid.hidden = !chartAvailable || !gridMode.checked;
       gridMode.disabled = treeMode.disabled = !chartAvailable;
-      headerArc.setAttribute('stroke-dasharray', `${Math.min(ratio ?? 0, 1) * 100} 100`);
-      el('ctxTriggerPct').textContent = ratio == null ? short(used) : percentage;
+      headerArc.setAttribute('stroke-dasharray', `${Math.min(ringRatio ?? 0, 1) * 100} 100`);
+      el('ctxTriggerPct').textContent = ringRatio == null ? short(used) : percent(ringRatio);
       el('ctxUsed').textContent = short(used) + (used == null || capacity == null ? '' : ' / ' + short(capacity));
       el('ctxUsed').title = used == null ? '' : `${used.toLocaleString()}${capacity == null ? '' : ' / ' + capacity.toLocaleString()} tokens`;
       el('ctxStatus').textContent = ratio == null ? '' : percentage;
@@ -242,7 +245,7 @@
         current.outputReserve != null ? '输出预留 ' + short(current.outputReserve) : ''].filter(Boolean);
       metadata.textContent = extra.join(' · ');
       metadata.hidden = !extra.length;
-      trigger.setAttribute('aria-label', used == null ? '上下文用量' : `估算输入 ${short(used)}${ratio == null ? '，占用比例未知' : `，占${basis} ${percentage}`}`);
+      trigger.setAttribute('aria-label', used == null ? '上下文用量' : `估算输入 ${short(used)}${ringRatio == null ? '，应用上限比例未知' : `，占应用单次输入上限 ${percent(ringRatio)}`}`);
       trigger.title = trigger.getAttribute('aria-label');
       renderCharts();
       renderLegend();

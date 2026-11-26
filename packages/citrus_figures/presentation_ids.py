@@ -1,5 +1,14 @@
 """Pure declarative renderer addresses shared with revision verification."""
 from hashlib import sha256
+import json
+
+
+def presentation_key(panel_id, role, *, series_key=None, source_group=""):
+    """Bind new declarative targets to frozen source, not mutable artist labels."""
+    parts = [panel_id or None, role]
+    if role == "series":
+        parts.extend(("explicit", series_key) if series_key is not None else ("source_group", source_group))
+    return "presentation_v1:" + sha256(json.dumps(parts, ensure_ascii=True).encode()).hexdigest()
 
 
 def axes_address(index, panel_id, *, multipanel):

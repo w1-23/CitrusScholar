@@ -421,7 +421,7 @@ def export_svg(figure: Any) -> bytes:
 
     buffer = io.BytesIO()
     options = {"facecolor": "none", "transparent": True} if getattr(figure, "_citrus_transparent", False) else {"facecolor": "white"}
-    figure.savefig(buffer, format="svg", **options)
+    figure.savefig(buffer, format="svg", metadata={"Date": None}, **options)
     return buffer.getvalue()
 
 
@@ -466,7 +466,7 @@ def export_all(rendered: RenderedFigure, *, formats: tuple[str, ...] = ("svg", "
     # SVG text is part of the editor/export contract even for a captured
     # script or a raw Figure built under third-party rc defaults. Keep this
     # local to the export so neither Seaborn nor this engine leaks global rc.
-    with render_context({**(rendered.rc_params or {}), "svg.fonttype": "none"}):
+    with render_context({**(rendered.rc_params or {}), "svg.fonttype": "none", "svg.hashsalt": "citrusqa-figure"}):
         return _export_all(rendered, formats=formats, dpi=dpi)
 
 

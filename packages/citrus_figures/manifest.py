@@ -620,6 +620,10 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
             "locator": {k: v for k, v in entry.items()
                         if k not in {"artist", "members", "error_members"} and _is_plain(v)},
         }
+        if source == "spec" and role in {"axes", "series"}:
+            binding = getattr(artist, "_citrus_presentation_key", None)
+            if binding is not None:
+                record["presentation_key"] = binding
         # Identity metadata is deliberately outside the Artist locator. In
         # particular, series_id/panel prefixes and parent indices are not keys.
         identity_artists = [artist]

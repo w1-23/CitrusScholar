@@ -55,13 +55,75 @@ _SOURCE_LABEL = re.compile(r"(?<![\w./])([A-Za-z0-9][\w. ()-]{0,79}\.(?:csv|xlsx
 _REPORT_ID = re.compile(r"(?<![a-fA-F0-9])[a-f0-9]{32}(?![a-fA-F0-9])")
 
 
+_NEW_REFERENCE = re.compile(r"\b(?:10\.\d{4,9}/|arxiv\s*[:/]|arxiv\.org/)|(?:新(?:的|增)?|另[一个查]|再(?:查|核验|审查))[^，。！？!?]{0,20}(?:文献|引用|参考|数据|文件|DOI)", re.I)
+_PRIOR_REPORT_REFERENCE = re.compile(
+    r"(?:之前|此前|先前|刚才|上(?:一)?(?:份|次|轮|面)|原(?:来的)?(?:审查|核验|报告)|另存为|"
+    r"那[一几\d\s]{0,12}(?:份|处|个|些|次)|已有(?:的)?(?:审查|报告)|"
+    r"\b(?:previous|earlier|last|prior|existing|saved|that)\s+(?:findings?|report|audit|verification|results?|duplicate blocks?)\b)", re.I)
+
+
 def fusion_report_followup(query, *, previous_query=""):
     from src.graph.intent_text import intent_with_negation, mask_literal_payload
     text = mask_literal_payload(query).strip()
-    if _SHORT_LIST.fullmatch(text) or intent_with_negation(text, _FINDINGS_REQUEST):
+    if _NEW_REFERENCE.search(text):
+        return False
+    if _SHORT_LIST.fullmatch(text):
+        return True
+    if (_PRIOR_REPORT_REFERENCE.search(text) or _REPORT_ID.search(text)) and intent_with_negation(text, _FINDINGS_REQUEST):
         return True
     return bool(previous_query and _CONTINUE.fullmatch(text)
                 and fusion_report_followup(previous_query))
+
+
+def _report_selectors(contract, query, previous_query):
+    from src.graph.intent_text import mask_literal_payload
+
+    source = previous_query if _CONTINUE.fullmatch(query.strip()) else query
+    source = mask_literal_payload(source)
+    ids = set(_REPORT_ID.findall(source))
+    names = set(_SOURCE_LABEL.findall(source)) if contract.intent != "alternate_file" else set()
+    return source, ids, names
+
+
+def _verified_report_candidates(identity, release, allowed, *, ids, names):
+    from .fusion_worker import consume_fusion, historical_report_candidates
+
+    # Multiple selectors still need one real report lineage before routing
+    # read-only; the resolver will ask the user to disambiguate.
+    exact = next(iter(ids)) if len(ids) == 1 else None
+    name = next(iter(names)) if len(names) == 1 else None
+    matches = historical_report_candidates(identity, skill_release=release, skill_ids=allowed,
+        exact_id=exact, requested_source=name)
+    verified = []
+    for execution_id, skill_id, source in matches[:64]:
+        try:
+            value = consume_fusion(identity, execution_id=execution_id, skill_release=release,
+                                   skill_id=skill_id, source_identity=source)
+        except (KeyError, LookupError, PermissionError, ValueError, OSError):
+            continue
+        if value.get("status") == "succeeded" and isinstance(value.get("report"), dict):
+            verified.append((execution_id, skill_id, source, value))
+            if len(verified) == 2:  # Only uniqueness matters.
+                break
+    return verified
+
+
+def verified_report_route(identity, release, contract, query, previous_query):
+    """Host-only preflight; intent alone cannot narrow the live tool set."""
+    from src.core.capability_policy import allows
+    from .code_tools import code_execution_context
+
+    if not fusion_report_followup(query, previous_query=previous_query):
+        return False
+    source_query, ids, names = _report_selectors(contract, query, previous_query)
+    try:
+        allowed = {skill for skill in SKILL_IDS if allows("skill:" + skill)}
+        if _DUPLICATE_REQUEST.search(source_query):
+            allowed &= {"research-integrity"}
+        with code_execution_context(identity, "fusion-report-route", skill_release=release):
+            return bool(allowed and _verified_report_candidates(identity, release, allowed, ids=ids, names=names))
+    except (KeyError, LookupError, PermissionError, ValueError, OSError):
+        return False
 
 
 def installed_fusion(release, rows):
@@ -157,15 +219,33 @@ def _workbook_source(identity, reference):
 def run_external_skill(skill_id: SkillID, inputs=None, options=None):
     """Run the pinned external literature, XLSX data-audit, or research-integrity Skill. Use exact authorized file_id and sha256 per input role. Data audit needs workbook and scoped regions. Literature accepts bibliography and/or typed references. No raw observations or URLs are accepted."""
     from .fusion_worker import schedule_fusion
+    from .fusion_worker_contract import confirmed_workbook_regions
 
+    if skill_id == "data-audit":
+        try:
+            regions = (options or {}).get("regions")
+            normalized = confirmed_workbook_regions(regions, _delivery.get()[1])
+            options = {**options, "regions": [{**original, "range": region["bounds"]}
+                                             for original, region in zip(regions, normalized)]}
+        except (TypeError, ValueError):
+            return _response({"error": "请确认真实工作表和有界区域，如 'Sheet 1'!A1:D20。默认区域首行为表头；若不同，请一并确认表头行。"},
+                             "not_run", "external_workbook_regions_unconfirmed")
     try:
         identity, call_id, release = _bound(skill_id)
         refs = {role: ref.model_dump() if isinstance(ref, InputRef) else InputRef.model_validate(ref).model_dump()
                 for role, ref in (inputs or {}).items()}
+        if skill_id == "data-audit":
+            from contextlib import closing
+            from citrus_audit.readers import open_xlsx_readonly
+
+            data, filename = _workbook_source(identity, refs["workbook"])
+            with closing(open_xlsx_readonly(data, filename, data_only=True)) as workbook:
+                if any(region["sheet"] not in workbook.sheetnames for region in options["regions"]):
+                    return _response({"error": "确认的工作表不在源文件中。"}, "not_run", "external_workbook_sheet_missing")
         receipt = schedule_fusion(identity, operation_id=call_id, skill_release=release,
                                   skill_id=skill_id, inputs=refs, options=options or {})
         return _queued(receipt)
-    except (LookupError, PermissionError, ValueError, OSError):
+    except (KeyError, LookupError, PermissionError, ValueError, OSError):
         return _response({"error": "输入、权限或固定的 Skill 发行不可用。"}, "not_run", "external_skill_not_admitted")
 
 
@@ -336,15 +416,11 @@ def resolve_external_report(findings_offset: int = 0):
     """Read only the exact accepted external report authorized by a findings-list or report-delivery follow-up. No algorithm is rerun. Continue with findings_page.next_offset; never invent missing findings or positions."""
     from src.core.capability_policy import allows
     from src.graph.intent_text import mask_literal_payload
-    from .fusion_worker import consume_fusion, historical_report_candidates
-
     contract, query, previous_query = _delivery.get()
     query = mask_literal_payload(query).strip()
     if not fusion_report_followup(query, previous_query=previous_query):
         return _response({"error": "本轮没有明确要求读取先前审查发现。"}, "not_run", "external_report_not_requested")
-    source_query = previous_query if _CONTINUE.fullmatch(query) else query
-    ids = set(_REPORT_ID.findall(source_query))
-    names = set(_SOURCE_LABEL.findall(source_query)) if contract.intent != "alternate_file" else set()
+    source_query, ids, names = _report_selectors(contract, query, previous_query)
     if len(ids) > 1 or len(names) > 1:
         return _response({"error": "请指定要读取的一份审查结果。"}, "not_run", "external_report_ambiguous")
     try:
@@ -354,16 +430,13 @@ def resolve_external_report(findings_offset: int = 0):
         if not allowed:
             raise PermissionError("external_report_scope_unavailable")
         identity, _, release = _bound(sorted(allowed)[0])
-        matches = historical_report_candidates(identity, skill_release=release, skill_ids=allowed,
-            exact_id=next(iter(ids), None), requested_source=next(iter(names), None))
+        matches = _verified_report_candidates(identity, release, allowed, ids=ids, names=names)
         if len(matches) > 1:
             return _response({"error": "同一会话有多份已接受审查结果。请指明源文件或精确执行 ID。"},
                              "not_run", "external_report_ambiguous")
         if not matches:
             raise LookupError("external_report_unavailable")
-        execution_id, skill_id, source_identity = matches[0]
-        value = consume_fusion(identity, execution_id=execution_id, skill_release=release,
-                              skill_id=skill_id, source_identity=source_identity)
+        execution_id, skill_id, _, value = matches[0]
         return _deliver(identity, value, execution_id, skill_id, findings_offset=findings_offset, historical=True)
     except (KeyError, LookupError, PermissionError, ValueError, OSError):
         return _response({"error": "没有可验证的原审查私有报告。没有推断位置、数量或另行执行。"},

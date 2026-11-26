@@ -119,10 +119,11 @@ class FrozenScriptIdentity:
         return (_axes(manifest) if manifest.get("source") == "script" and manifest.get("semantic_identity_version") == 1
                 and manifest.get("frozen_render_receipt") == receipt else {})
 
-    def confirms(self, manifest):
+    def confirms(self, manifest, svg):
         try:
-            return self._panels(manifest, self.receipt).keys() == self.panels.keys()
-        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            axes = self._panels(manifest, self.receipt)
+            return bool(axes and axes.keys() == self.panels.keys() and _svg_axes(svg, manifest, axes))
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError, ET.ParseError):
             return False
 
     def series_key(self, index, row):

@@ -144,7 +144,7 @@ async def _run(state, identity, ledger):
     from .code_tools import register_code_tools, CODE_TOOL_NAMES
     register_code_tools(catalog)
     from .fusion_tools import (FUSION_TOOL_NAMES, REPLACED_TOOLS, SKILL_IDS, external_fusion_required,
-                               fusion_delivery_scope, fusion_report_followup, installed_fusion, register_fusion_tools)
+                               fusion_delivery_scope, installed_fusion, register_fusion_tools, verified_report_route)
     from src.graph.task_contract import fusion_delivery_for_turn
     from .nature_skill_tools import NATURE_TOOL_NAMES, installed_nature, register_nature_tools
     external_release = installed_fusion(release, installed_rows)
@@ -154,11 +154,17 @@ async def _run(state, identity, ledger):
                      and state["skill_release_inventory_sha256"] in legacy_receipt_pins)
     external_required = external_fusion_required() and not legacy_resume
     previous_report_query = ""
-    report_history_verified = False
+    report_routes = {}
 
     def report_followup():
-        return (not (state.get("attachment_refs") or tables) and report_history_verified
-                and fusion_report_followup(str(state.get("query") or ""), previous_query=previous_report_query))
+        if not external_release or state.get("attachment_refs") or tables:
+            return False
+        text = str(state.get("query") or "")
+        key = (text, previous_report_query)
+        if key not in report_routes:
+            contract = fusion_delivery_for_turn(text)
+            report_routes[key] = verified_report_route(identity, release, contract, text, previous_report_query)
+        return report_routes[key]
     if external_release:
         register_fusion_tools(catalog)
     if external_nature:
@@ -268,7 +274,7 @@ async def _run(state, identity, ledger):
         prompt += ("\n外部核验、数据审查与科研诚信按已安装 Skill 和绑定的文件身份运行。"
                    "文献先调用 run_external_skill 解析，再用 continue_external_literature 对同一执行补查，"
                    "最后收集；没有联网权限时收集原结果并说明缺口。"
-                   "数据审查先明确真实工作表与区域。collect_external_skill 按本轮用户明确需要的格式交付，"
+                   "数据审查先确认实际工作表及明确 A1 矩形（如 'Sheet 1'!A1:D20）；不能自行确认候选区域。collect_external_skill 按本轮用户明确需要的格式交付，"
                    "以实际附带的文件回执为准。仅文字结论及未要求文件时不发布工作簿。"
                    "追问审查清单，应读取可验证的既有报告，而不重新执行检查或编造位置和数量。")
     if host.allowed_names & NATURE_TOOL_NAMES:
@@ -296,7 +302,6 @@ async def _run(state, identity, ledger):
                "资料库类别或追问。可以参考这样的长度和用词：" + intro_example + "。")
     messages, trace_start = assemble_supervisor_messages(prompt, state, human)
     messages = ops._sanitize_history_tool_protocol(messages)
-    import re
     history = messages
     query = str(state.get("query") or "")
     # Only authenticated human text may ground a follow-up topic.
@@ -306,10 +311,7 @@ async def _run(state, identity, ledger):
                and m.additional_kwargs.get("context_trusted") is True
                and m.additional_kwargs.get("run_id") != identity.run_id]
     previous_report_query = earlier[-1] if earlier else ""
-    audit_topic = re.compile(r"审查|核验|科研诚信|造假|造价|重复(?:区段|区块|数据)|\b(?:integrity|audit|verification)\b", re.I)
-    report_history_verified = (bool(audit_topic.search(query)) or any(audit_topic.search(text) for text in earlier[-3:])
-        or any(isinstance(m, ToolMessage) and m.name in {"collect_external_skill", "resolve_external_report"}
-               for m in history[-60:]))
+
     if report_followup():
         read_only = "resolve_external_report" in refresh_allowed()
         prompt += ("\n请用 resolve_external_report 读取已接受的审查报告，按真实检查范围答复。"
@@ -383,7 +385,6 @@ async def _run(state, identity, ledger):
                 "figures": figures.export_recovery(identity),
                 "script_budget_scope": state["script_budget_scope"],
                 "query": state["query"], "previous_report_query": previous_report_query,
-                "report_history_verified": report_history_verified,
                 "update_version": update_version, "final_review": deepcopy(final_review),
                 "artifact_requirements": deepcopy(requirements),
                 "records": host.records,
@@ -392,7 +393,7 @@ async def _run(state, identity, ledger):
                 "messages": list(host.messages.values()), "dispatched": host.dispatched}
 
     def restore_host(saved):
-        nonlocal update_version, original_request_state, trace_start, requirements, previous_report_query, report_history_verified
+        nonlocal update_version, original_request_state, trace_start, requirements, previous_report_query
         original = saved["original_request_state"]
         binding = {"user_id": identity.owner_user_id, "session_id": identity.session_id,
                    "request_id": identity.user_turn_id, "job_id": identity.run_id}
@@ -401,7 +402,6 @@ async def _run(state, identity, ledger):
             raise task_events.TaskConflict("identity_conflict")
         figures.restore_recovery(identity, saved.get("figures"))
         previous_report_query = str(saved.get("previous_report_query") or "")
-        report_history_verified = saved.get("report_history_verified") is True
         assets = saved.get("working_assets")
         if assets is not None and (not isinstance(assets, dict)
                 or not set(assets).issubset(asset_fields)

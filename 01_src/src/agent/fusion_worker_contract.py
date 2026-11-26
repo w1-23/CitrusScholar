@@ -99,7 +99,8 @@ def load_bundle(release: Path, skill: str) -> Bundle:
     if (type(manifest) is not dict or set(manifest) != {"schema", "entrypoint", "skills", "files", "dependencies"}
             or manifest["schema"] != "citrus.fusion-bundle/1" or manifest["entrypoint"] != ENTRYPOINT
             or type(manifest["skills"]) is not dict or not set(manifest["skills"]) <= SKILLS
-            or any(version != "0.1.0" for version in manifest["skills"].values())
+            or any(version not in ({"0.1.0", "0.1.1"} if name in {"data-audit", "literature-verification"} else {"0.1.0"})
+                   for name, version in manifest["skills"].items())
             or skill not in manifest["skills"]):
         raise ValueError("fusion_bundle_schema_mismatch")
     members = manifest["files"]
@@ -154,9 +155,66 @@ def validate_reference(ref):
     identifier(ref["file_id"])
 
 
+def workbook_regions(regions):
+    """Check the same bounded A1 rectangles at the tool and worker boundary."""
+    from citrus_audit.readers import _region_box, normalize_regions
+
+    if type(regions) is not list or not 1 <= len(regions) <= 16:
+        raise ValueError("fusion_workbook_region_count_invalid")
+    mapped, ids = [], set()
+    for region in regions:
+        if type(region) is not dict or not {"id", "sheet", "range"} <= region.keys() or not region.keys() <= {
+                "id", "sheet", "range", "header_row", "rules", "experimental_design"}:
+            raise ValueError("fusion_workbook_region_shape_invalid")
+        key, sheet = region["id"], region["sheet"]
+        if not isinstance(key, str) or not key or len(key) > 160 or key != key.strip() or key in ids:
+            raise ValueError("fusion_workbook_region_id_invalid")
+        if not isinstance(sheet, str) or not sheet.strip() or len(sheet) > 31:
+            raise ValueError("fusion_workbook_sheet_invalid")
+        ids.add(key)
+        rules = region.get("rules", [])
+        if type(rules) is not list or len(rules) > 64:
+            raise ValueError("fusion_workbook_rule_count_invalid")
+        left, top, right, bottom = _region_box(region["range"])
+        if (right - left + 1) * (bottom - top + 1) > 50_000:
+            raise ValueError("fusion_workbook_region_size_limit")
+        mapped.append({"sheet": sheet, "bounds": region["range"], "region_id": key,
+                       "header_rows": [region.get("header_row", top)]})
+    return normalize_regions(mapped, limit=16)
+
+
+def confirmed_workbook_regions(regions, query):
+    """An offered/guessed region is not authority; require the user's exact coordinates."""
+    from citrus_audit.readers import _region_box
+    from src.graph.intent_text import mask_literal_payload
+
+    normalized = workbook_regions(regions)
+    text = mask_literal_payload(query)
+    clauses = re.split(r"[。！？?;；\n]", text)
+    for original, region in zip(regions, normalized):
+        sheet = original["sheet"]
+        reference = re.compile(r"(?<![\w.'])" + r"(?:'" + re.escape(sheet.replace("'", "''")) + r"'|"
+                               + re.escape(sheet) + r")\s*!\s*(?i:" + re.escape(region["bounds"]) + r")(?![\w:])")
+        candidates = [part for part in clauses if reference.search(part)]
+        exclusions = (r"不(?:要|检查|审查|使用|选)|排除|剔除|比如|例如|举例|候选|是否|能否|还是|"
+                      r"\b(?:not|exclude|except|example|candidate|whether|or)\b")
+        if not candidates or any(re.search(exclusions, reference.sub("", part), re.I) for part in candidates):
+            raise ValueError("fusion_workbook_region_unconfirmed")
+        if region["header_rows"][0] != _region_box(region["bounds"])[1]:
+            header = region["header_rows"][0]
+            marker = rf"(?:表头(?:行)?\s*(?:[:：=]|是|为|在)?\s*第?\s*{header}\s*行?(?!\d)|\bheader\s+row\s*[:=]?\s*{header}\b)"
+            if not any(len(reference.findall(part)) == 1 and re.search(marker, part, re.I) for part in candidates):
+                raise ValueError("fusion_workbook_header_unconfirmed")
+    return normalized
+
+
 def make_request(skill, refs, options, observations):
     if type(options) is not dict or not options.keys() <= OPTION_KEYS[skill] or "observations" in options:
         raise ValueError("fusion_options_invalid")
+    if skill == "data-audit":
+        if set(refs) != {"workbook"}:
+            raise ValueError("fusion_workbook_input_required")
+        workbook_regions(options.get("regions"))
     if len(refs) + (observations is not None) > 32:
         raise ValueError("fusion_input_count_limit")
     cassette = None

@@ -1,10 +1,12 @@
 """Register one work resolved by the host's trusted literature connector."""
 from hashlib import sha256
+import json
 import re
 
 from . import bibliography, originals, rights
-from .prepare import MAX_SOURCE_BYTES, public_text
+from .prepare import MAX_SOURCE_BYTES, PreparationError, public_text
 from .queue import IntakeQueue, target_url, work_identity
+from citrus_refcheck.providers import norm_title
 
 
 class AutoIntake:
@@ -18,6 +20,92 @@ class AutoIntake:
     def __init__(self, store):
         self.store = store
         self.queue = IntakeQueue(store)
+
+    def submit(self, *, owner, epoch, producer, doi="", pmid="", pmcid="", title="", proof=None):
+        """Persist public identifiers or a previously authenticated source observation."""
+        if (type(owner) is not int or owner <= 0 or type(epoch) is not int or epoch <= 0
+                or producer not in {"fetch", "literature", "admin"}):
+            raise ValueError("automatic_principal_invalid")
+        ids = _identities(doi, pmid, pmcid, required=not title)
+        if title:
+            if (ids or producer == "fetch" or title != public_text(title, 512)
+                    or len(norm_title(title)) < 8 or any(c in title for c in '\"<>')):
+                raise ValueError("public_title_invalid")
+        request = {"kind": "automatic", "path": "background", "producer": producer, "epoch": epoch,
+                   "doi": doi, "pmid": pmid, "pmcid": pmcid, "title": title}
+        digest = persist = None
+        if proof is not None:
+            if producer != "fetch" or title:
+                raise ValueError("automatic_proof_invalid")
+            raw = proof.raw
+            digest = sha256(raw).hexdigest()
+            if digest != proof.sha256 or not 0 < len(raw) <= MAX_SOURCE_BYTES:
+                raise ValueError("original_hash_mismatch")
+            license_id, _ = rights.automatic_evidence(proof.pmcid, proof.license_id, proof.evidence_url, proof.text_url)
+            request.update(path="foreground", doi=proof.doi, pmid=proof.pmid, pmcid=proof.pmcid,
+                           proof_title=proof.title, license=license_id,
+                           evidence_url=proof.evidence_url, text_url=proof.text_url)
+            ids = _identities(proof.doi, proof.pmid, proof.pmcid)
+            persist = lambda: originals.archive(self.store.originals, raw)
+        identity = ids[0] if ids else "title:" + sha256(norm_title(title).encode()).hexdigest()
+        fingerprint = sha256(json.dumps([ids, identity], ensure_ascii=False).encode()).hexdigest()
+        # Background receipts coalesce repeated discoveries in the same UTC day
+        # without preventing a future rediscovery from finding a newer version.
+        revision = str(int(self.queue.now() // 86400)) if digest is None else ""
+        return self.queue.submit(identity, request, actor=f"account-{owner}", expected_sha256=digest,
+                                 revision=revision, persist=persist, timeout=0.1,
+                                 fingerprint_namespace=f"automatic:{owner}:{epoch}:{producer}:{request['path']}:{fingerprint}")
+
+    def resolve_job(self, queue, job, record, *, allowed):
+        """Promote eligible metadata and bind provenance to original bytes once."""
+        identifiers = _identities(record["doi"], record["pmid"], record["pmcid"])
+        with self.store.write(timeout=2) as conn:
+            if not allowed():
+                raise PreparationError("network_scope_denied")
+            queue._fence(conn, job)
+            _, storage = bibliography.register(conn, identifiers=identifiers, legacy_aliases=_legacy_aliases(identifiers),
+                                               title=record["title"], source_url=record["source_url"])
+            raw = record.get("raw")
+            if raw is None:
+                return queue.resolve_automatic(conn, job, identity=storage, request=job["request"],
+                                               error="full_original_or_rights_unavailable")
+            digest = sha256(raw).hexdigest()
+            if job["expected_sha256"] and job["expected_sha256"] != digest:
+                raise PreparationError("original_hash_mismatch")
+            license_id, _ = rights.automatic_evidence(record["pmcid"], record["license_id"],
+                                                      record["evidence_url"], record["text_url"])
+            # The foreground and resumed worker already have a hash-verified
+            # archive. A newly acquired background source is archived here.
+            if not job["expected_sha256"]:
+                if not (self.store.originals / digest).exists():
+                    originals.archive(self.store.originals, raw)
+                elif originals.read_archive(self.store.originals, digest) != raw:
+                    raise PreparationError("original_integrity_invalid")
+            if not allowed():
+                raise PreparationError("network_scope_denied")
+            request = {**job["request"], "doi": record["doi"], "pmid": record["pmid"], "pmcid": record["pmcid"],
+                       "title": record["title"], "source_url": record["source_url"], "format": "text",
+                       "rights_basis": rights.PMC_CLOUD_EVIDENCE, "license": license_id,
+                       "evidence_url": record["evidence_url"], "text_url": record["text_url"]}
+            request.pop("proof_title", None)
+            return queue.resolve_automatic(conn, job, identity=storage, request=request, digest=digest)
+
+    def proven_original(self, evidence_url, license_id):
+        """Look up prior exact provenance, even after an operator revoked publication."""
+        with self.store.read() as conn:
+            rows = conn.execute("""SELECT raw_sha256 FROM rights_events WHERE basis=?
+                                   AND json_extract(evidence,'$.locator')=? AND json_extract(evidence,'$.license')=?
+                                   UNION SELECT raw_sha256 FROM intake WHERE raw_sha256 IS NOT NULL
+                                   AND json_extract(request,'$.rights_basis')=?
+                                   AND json_extract(request,'$.evidence_url')=? AND json_extract(request,'$.license')=?
+                                   LIMIT 2""", (rights.PMC_CLOUD_EVIDENCE, evidence_url, license_id,
+                                                rights.PMC_CLOUD_EVIDENCE, evidence_url, license_id)).fetchall()
+        if len(rows) != 1:
+            return None
+        try:
+            return originals.read_archive(self.store.originals, rows[0][0])
+        except FileNotFoundError:
+            return None
 
     def register(self, *, doi="", pmid="", pmcid="", title, source_url, raw: bytes | None = None,
                  license_id="", evidence_url="", text_url=""):
@@ -57,7 +145,7 @@ class AutoIntake:
             return bibliography.lookup(conn, _identities(doi, pmid, pmcid))
 
 
-def _identities(doi, pmid, pmcid):
+def _identities(doi, pmid, pmcid, *, required=True):
     if not all(isinstance(item, str) for item in (doi, pmid, pmcid)):
         raise ValueError("bibliography_identity_invalid")
     pmid, pmcid = pmid.strip(), pmcid.strip().upper()
@@ -68,7 +156,7 @@ def _identities(doi, pmid, pmcid):
     identities = tuple(value for value in (work_identity(doi=doi) if doi else "",
                                            f"pmid:{pmid}" if pmid else "",
                                            f"pmcid:{pmcid}" if pmcid else "") if value)
-    if not identities:
+    if required and not identities:
         raise ValueError("work_identity_required")
     return identities
 

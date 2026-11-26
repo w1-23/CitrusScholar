@@ -143,6 +143,18 @@ class ReleaseGateTest(unittest.TestCase):
             gate.stage(self.args)
         self.assertEqual(gate.sha(self.release / 'release.json'), evidence['manifest_sha256'])
 
+    def test_seventeenth_historical_mount_preserves_existing_path_pins(self):
+        config = dict(self.baseline)
+        first, = config['historical_skill_releases']
+        config['historical_skill_releases'] = [dict(first, mount_path=str(self.root / f'old-mount-{i}'))
+                                                for i in range(16)]
+        rows = gate.history(config)
+        self.assertEqual(rows[:-1], config['historical_skill_releases'])
+        self.assertEqual(rows[-1]['mount_path'], config['skill_release'])
+        config['historical_skill_releases'] *= 2
+        with self.assertRaisesRegex(ValueError, 'Too many historical releases'):
+            gate.history(config)
+
     def test_wrapper_preflight_and_exact_read_only_web_model_binds(self):
         gate.stage(self.args)
         for role in ('web', 'worker'):

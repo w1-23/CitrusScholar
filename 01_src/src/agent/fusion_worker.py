@@ -298,7 +298,7 @@ def _historical_bundle(service, row, skill_id, current):
     if all(stored.get(field) == value for field, value in _meta(current).items()):
         return current
     roots = os.environ.get("CITRUS_FUSION_REPORT_RELEASES", "").split(os.pathsep)
-    if len(roots) > 12:
+    if len(roots) > 32:
         raise ValueError("external_report_release_limit")
     candidates = []
     for raw in dict.fromkeys(roots):

@@ -246,11 +246,11 @@ def command(config, role):
         if (skill_release / 'python').is_dir():
             python_path.insert(0, f'{skill_release}/python')
     historical = config.get('historical_skill_releases', [])
-    if not isinstance(historical, list) or len(historical) > 16:
+    if not isinstance(historical, list) or len(historical) > 32:
         raise ValueError('Invalid historical Skill release registry')
     if role == 'web':
         used = {Path(path) for path, _mode in binds}
-        pre_fusion, fusion_history = [], []
+        pre_fusion, fusion_history, seen_inventory = [], [], set()
         for item in historical:
             if not isinstance(item, dict) or item.keys() != {'path', 'mount_path', 'sha256'}:
                 raise ValueError('Invalid historical Skill release entry')
@@ -262,6 +262,9 @@ def command(config, role):
                 raise ValueError('Historical Skill mount overlaps an existing deployment bind')
             used.add(destination)
             result += ['--bind', f'{prior}:{destination}:ro']
+            if item['sha256'] in seen_inventory:
+                continue  # Preserve the mount for exact path pins, but index identical bytes once.
+            seen_inventory.add(item['sha256'])
             if (prior / 'fusion/bundle.json').is_file():
                 fusion_history.append(str(destination))
             elif not (prior / 'fusion').exists():

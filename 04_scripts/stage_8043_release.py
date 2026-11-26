@@ -172,7 +172,7 @@ def history(config):
     require(isinstance(old, list), 'Invalid baseline historical release list')
     path = config['skill_release']
     result = [*old, {'path': path, 'mount_path': path, 'sha256': config['skill_release_sha256']}]
-    require(len(result) <= 16, 'Too many historical releases for the launcher')
+    require(len(result) <= 32, 'Too many historical releases for the launcher')
     mounts = set()
     for item in result:
         require(isinstance(item, dict) and set(item) == {'path', 'mount_path', 'sha256'},

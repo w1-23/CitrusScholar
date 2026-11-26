@@ -40,7 +40,7 @@ class ReadbackCache:
                               row.get("evidence_ref"), self.selector_hash, cursor, max_chars])
         self.eligible = complete and row.get("status") == "complete" and not row.get("error_text")
 
-    def lookup(self):
+    def lookup(self, *, include_text=False):
         if not self.eligible or not (prior := prior_readback_page(self.row, self.page_key)):
             return None
         try:
@@ -65,7 +65,8 @@ class ReadbackCache:
                 tuple(self.fields) if payload["page"].get("complete") else (),
                 _hash(text), stored["created_at"])
             return {"reused_readback": {**receipt, "original_page_bytes": len(text.encode("utf-8"))},
-                    "page": payload["page"], "evidence_cache": asdict(evidence)}
+                    "page": payload["page"], "evidence_cache": asdict(evidence),
+                    **({"previous_text": text} if include_text and payload["page"].get("complete") else {})}
         except (PermissionError, sqlite3.Error, KeyError, TypeError, ValueError, AttributeError, RecursionError):
             return None
 

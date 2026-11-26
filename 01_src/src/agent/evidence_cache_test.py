@@ -89,6 +89,21 @@ def test_same_page_uses_verified_receipt_before_selecting_twice(identity, monkey
     assert json.loads(result_tools.read_tool_result.invoke(args))["reason"] == "result_access_denied"
 
 
+def test_mixed_selector_only_resolves_missing_fields(identity, monkeypatch):
+    source = '{"numeric": 1.234567891234567891, "group": "A"}'
+    assert tool_results.record(tool_call_id="fields", tool_name="source", session_id=SESSION,
+                               request_id="request", status="complete", result_text=source)
+    def read(fields):
+        return result_tools.read_tool_result.invoke({"tool_call_id": "fields", "fields": fields})
+    assert tool_results.record(tool_call_id="numeric-page", tool_name="read_tool_result", session_id=SESSION,
+                               request_id="request", status="complete", result_text=read(["/numeric"]))
+    seen, select = [], result_tools._select
+    monkeypatch.setattr(result_tools, "_select", lambda data, path: (seen.append(path), select(data, path))[1])
+    result = json.loads(read(["/numeric", "/group"]))
+    assert seen == ["/group"] and result["missing_fields"] == []
+    assert result["result_text"] == '{"/numeric": 1.234567891234567891, "/group": "A"}'
+
+
 @pytest.mark.parametrize("kind", ["csv", "xlsx"])
 def test_inspect_audit_and_draw_only_selected_frozen_fields(identity, monkeypatch, kind):
     import citrus_audit

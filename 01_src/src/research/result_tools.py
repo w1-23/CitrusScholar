@@ -227,6 +227,19 @@ def read_tool_result(tool_call_id: str, start_char: int = 0,
                                   tool_result_ref=source, storage=storage)
         selected = {}
         for path in dict.fromkeys(fields):
+            if len(fields) > 1 and start_char == 0:
+                first = _next_cursor(source, 0, [path])
+                prior = ReadbackCache(row, source, [path], first, max_chars, complete=storage["complete"])
+                saved = (prior.lookup(include_text=True) or {}).get("previous_text")
+                if saved is not None:
+                    try:
+                        one = json.loads(saved, parse_float=_JsonNumber, parse_int=_JsonNumber,
+                                         parse_constant=_reject_non_json_constant)
+                        if type(one) is dict and set(one) == {path}:
+                            selected[path] = one[path]
+                            continue
+                    except (ValueError, RecursionError):
+                        pass
             try:
                 selected[path] = _select(data, path)
             except (ValueError, KeyError, IndexError):

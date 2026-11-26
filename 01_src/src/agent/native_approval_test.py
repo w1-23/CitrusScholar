@@ -228,3 +228,95 @@ def test_live_approval_waiter_observes_canonical_job_decision(tmp_path, monkeypa
             await wait_for_approval_decisions(replace(who, owner_user_id=8), (aid,), timeout=0)
 
     asyncio.run(scenario())
+
+
+
+@pytest.mark.parametrize("scenario", ["grant", "expire", "dispatch_recorded", "pending", "stale_checkpoint",
+                                       "not_claimed", "unsettled_earlier_call"])
+def test_harness_restart_native_approval_is_bound_and_does_not_replay(tmp_path, monkeypatch, scenario):
+    from dataclasses import asdict
+    from src.agent.harness import HarnessRuntime, execution_lock
+    from src.agent.recovery import load_recovery_state
+    from src.agent.runtime import AdmissionStopped, FinalCheck, RunLimits
+
+    monkeypatch.setattr(jobs, '_DB_PATH', tmp_path / 'restart-tasks.sqlite3')
+    run = jobs.claim_job('session-restart', 'turn-restart', owner_user_id=7).job_id
+    who = ExecutionIdentity(7, 'session-restart', 'turn-restart', run)
+    task_events.init_budget(run, float('inf'), max_calls=4, max_tokens=8192)
+    original = {"user_id": 7, "session_id": who.session_id, "job_id": run, "request_id": who.user_turn_id,
+                "client_request_id": "fixture", "idempotency_key": "fixture", "query": "original"}
+    provider = ('https://test.invalid/v1', 'fixture-restart')
+    scope = framework_checkpoint_scope(who, provider)
+    schema = {"function": {"name": "guarded", "description": "fixture",
+                           "parameters": {"type": "object", "properties": {}}}}
+    effects, offered = [], []
+
+    async def model(messages, identity, **_):
+        if isinstance(messages[-1], ToolMessage):
+            return AIMessage("finished")
+        return AIMessage("", tool_calls=[{"name": "guarded", "args": {}, "id": "restart-call"}])
+
+    async def execute(call, identity):
+        effects.append(call['id'])
+        return ToolMessage('performed', name=call['name'], tool_call_id=call['id']), {}
+
+    async def admit(*_):
+        pass
+
+    async def check(*_):
+        return FinalCheck()
+
+    async def simulate_interruption(identity, keys):
+        offered.extend(keys)
+        if scenario not in {'pending', 'expire'}:
+            task_events.decide_approval(run, keys[0], 'granted')
+        elif scenario == 'expire':
+            task_events.decide_approval(run, keys[0], 'expired')
+        raise RuntimeError('fixture_process_stopped')
+
+    def runtime(**options):
+        return HarnessRuntime(ScriptedModel(script=model), execute, admit, check, RunLimits(4), [schema],
+                              native_approval_tools=('guarded',), wait_native_approval=simulate_interruption,
+                              export_host=lambda: {"identity": asdict(who), "original_request_state": original},
+                              **options)
+
+    async def scenario_run():
+        kwargs = {'checkpoint_config': scope, 'agent_options': {'task_subagent': False}}
+        previous = runtime()
+        with execution_lock(tmp_path / 'locks', (7, who.session_id)):
+            async with open_framework_checkpoint(tmp_path, who, provider) as saver:
+                with pytest.raises(RuntimeError, match='fixture_process_stopped'):
+                    await previous.run(who, [HumanMessage('fixture')], saver=saver, **kwargs)
+        assert not effects and len(offered) == 1 and previous.diagnostic_checkpoint
+        with pytest.raises(task_events.TaskConflict, match="recovery_requires_reconciliation"):
+            await load_recovery_state(tmp_path, who, provider)  # Policy is off.
+        if scenario in {'grant', 'expire'}:
+            assert jobs.mark_interrupted_jobs() == 1
+            recovered = await load_recovery_state(tmp_path, who, provider, native_approval_tools=('guarded',))
+            assert recovered['messages'] == []
+            assert recovered['agent_approval_restart_checkpoint'] == previous.diagnostic_checkpoint
+            jobs.claim_agent_recovery(who)
+        elif scenario == 'pending':
+            with pytest.raises(task_events.TaskConflict, match="recovery_requires_reconciliation"):
+                await load_recovery_state(tmp_path, who, provider, native_approval_tools=('guarded',))
+        if scenario not in {'grant', 'expire', 'not_claimed'}:
+            assert jobs.update_job(run, current_step='recovering')
+        if scenario == 'unsettled_earlier_call':
+            task_events.start_operation(run, 7, 'earlier', {}, tool_call_id='different-call')
+        if scenario == 'dispatch_recorded':
+            task_events.start_operation(run, 7, 'guarded', {}, tool_call_id='restart-call')
+        ref = 'mismatched' if scenario == 'stale_checkpoint' else previous.diagnostic_checkpoint
+        with execution_lock(tmp_path / 'locks', (7, who.session_id)):
+            async with open_framework_checkpoint(tmp_path, who, provider) as saver:
+                recovery = runtime(approval_restart_checkpoint=ref)
+                if scenario not in {'grant', 'expire'}:
+                    with pytest.raises(AdmissionStopped, match='recovery_requires_reconciliation'):
+                        await recovery.run(who, [], saver=saver, resume=True, **kwargs)
+                    assert not effects
+                else:
+                    result = await recovery.run(who, [], saver=saver, resume=True, **kwargs)
+                    assert result.status == 'complete'
+                    assert effects == (['restart-call'] if scenario == 'grant' else [])
+        assert len(offered) == 1
+
+    asyncio.run(scenario_run())

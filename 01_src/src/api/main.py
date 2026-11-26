@@ -4558,9 +4558,11 @@ async def recover_chat_agent(job_id: str, req: RecoverAgentRequest, request: Req
                 if _turn_execution_busy(job_id):
                     raise task_events.TaskConflict("recovery_already_active")
                 identity = ExecutionIdentity(owner, sid, str(job["request_id"]), job_id)
+                approval_policy = (("commit_document_index",) if settings.PERMISSION_NATIVE_SHARED_INDEX else ())
+                approval_options = {"native_approval_tools": approval_policy} if approval_policy else {}
                 state = await run_account_async(lease, load_recovery_state(
                     PROJECT_ROOT / "state", identity,
-                    (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())))
+                    (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()), **approval_options))
                 # All file identities come from the protected original request. Resolve
                 # ownership and current availability again while the account is leased.
                 file_ids = [str(ref["file_id"]) for ref in state.get("attachment_refs", [])]

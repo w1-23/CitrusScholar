@@ -278,3 +278,39 @@ def approval_resume(snapshot: StateSnapshot, identity: ExecutionIdentity, *,
             raise InvalidNativeApproval('approval_decision_not_final')
         resume[binding.interrupt_id] = {'type': decision}
     return Command(resume=resume)
+
+
+
+def restart_approval_command(snapshot: StateSnapshot, identity: ExecutionIdentity, *,
+                             scope: Mapping[str, str], tool_names: tuple[str, ...],
+                             checkpoint_ref: str) -> tuple[Command, tuple[str, ...]]:
+    """Resume a still-parked call only after the authorized recovery claim.
+
+    The caller holds the session execution fence. A previous dispatch record
+    vetoes a replay even if the latest graph snapshot still looks parked.
+    """
+    from src.core.jobs import require_settled_operations
+    from src.core.task_events import read_transaction, TaskConflict
+
+    if (not _identifier(checkpoint_ref)
+            or snapshot.config.get('configurable', {}).get('checkpoint_id') != checkpoint_ref):
+        raise InvalidNativeApproval('approval_restart_checkpoint_changed')
+    records = durable_approvals(snapshot, identity, scope=scope, tool_names=tool_names)
+    if len(records) != 1:
+        raise InvalidNativeApproval('approval_requires_single_call')
+    binding = records[0].binding
+    with read_transaction() as conn:
+        job = conn.execute('SELECT owner_user_id, session_id, request_id, status, current_step '
+                           'FROM task_jobs WHERE job_id=?', (identity.run_id,)).fetchone()
+        if not job or tuple(job) != (*identity.turn_key, 'running', 'recovering'):
+            raise InvalidNativeApproval('approval_restart_not_admitted')
+        if conn.execute('SELECT 1 FROM task_operations WHERE job_id=? AND tool_call_id=? LIMIT 1',
+                        (identity.run_id, binding.tool_call_id)).fetchone():
+            raise InvalidNativeApproval('approval_call_already_dispatched')
+        try:
+            require_settled_operations(conn, identity.run_id)
+        except TaskConflict as exc:
+            raise InvalidNativeApproval('approval_prior_operations_unsettled') from exc
+    command = approval_resume(snapshot, identity, scope=scope, tool_names=tool_names, records=records)
+    denied = (binding.tool_call_id,) if records[0].status != 'granted' else ()
+    return command, denied

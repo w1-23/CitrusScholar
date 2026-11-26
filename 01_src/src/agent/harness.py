@@ -142,6 +142,7 @@ class HarnessRuntime:
     # always come from the job database after re-reading the checkpoint.
     native_approval_tools: tuple[str, ...] = ()
     wait_native_approval: Any = None
+    approval_restart_checkpoint: str = ""
     diagnostic_checkpoint: str = ""
 
     async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None,
@@ -698,6 +699,9 @@ class HarnessRuntime:
                     not (closed or orphan_closed) or has_unsettled_work(prior) or snapshot.interrupts))):
                 raise AdmissionStopped("native_thread_requires_reconciliation")
         initial = None
+        approval_restart = False
+        if adapter.approval_restart_checkpoint and (not resume or not approval_tools or not prior or continuing_thread):
+            raise AdmissionStopped("recovery_requires_reconciliation")
         if prior and not continuing_thread:
             if not resume:
                 raise ValueError("existing_turn_requires_explicit_resume")
@@ -731,7 +735,22 @@ class HarnessRuntime:
                                 and message.additional_kwargs.get("run_id") == identity.run_id
                                 and message.additional_kwargs.get("host_publication")):
                             adapter.restore_tool_observation(message, proposed.get(message.tool_call_id))
-            if _pending_calls(prior["messages"]):
+            if adapter.approval_restart_checkpoint:
+                from .native_approval import InvalidNativeApproval, restart_approval_command
+
+                if (prior.get("stop_status") or prior.get("unknown_operations") or prior.get("execution_wake")
+                        or adapter.user_input is not None or len(tool_nodes) != 1 or snapshot.next != tool_nodes
+                        or len(_pending_calls(prior["messages"])) != 1):
+                    raise AdmissionStopped("recovery_requires_reconciliation")
+                try:
+                    initial, denied = await asyncio.to_thread(restart_approval_command, snapshot, identity,
+                        scope=config["configurable"], tool_names=approval_tools,
+                        checkpoint_ref=adapter.approval_restart_checkpoint)
+                except InvalidNativeApproval as exc:
+                    raise AdmissionStopped("recovery_requires_reconciliation") from exc
+                denied_approval_calls.update(denied)
+                approval_restart = True
+            if not approval_restart and _pending_calls(prior["messages"]):
                 from .recovery import committed_tool_receipts
                 if (not adapter.restore_tool_observation or len(tool_nodes) != 1
                         or snapshot.next != tool_nodes or snapshot.interrupts):
@@ -760,9 +779,11 @@ class HarnessRuntime:
             await observed(prior)
             if self.validate_resume:
                 self.validate_resume()
-            if _pending_calls(prior["messages"]) or set(snapshot.next) - pre_model_nodes:
+            if not approval_restart and (_pending_calls(prior["messages"]) or set(snapshot.next) - pre_model_nodes):
                 raise AdmissionStopped("recovery_requires_reconciliation")
-            if snapshot.interrupts:
+            if approval_restart:
+                pass  # The exact native ToolNode resume runs inside the bounded invoke below.
+            elif snapshot.interrupts:
                 waiting = _interruption(snapshot)
                 await observed(waiting)
                 if waiting["stop_status"] == "waiting":
@@ -825,7 +846,7 @@ class HarnessRuntime:
                 "unknown_operations": [], "execution_waits": [], "execution_wake": [], "user_input_wake": {}, "batch_status": "",
                 "stop_status": "", "stop_reason": "", "rejected_responses": []}
         await event("run_started", latest)
-        if isinstance(initial, Command):
+        if isinstance(initial, Command) and not approval_restart:
             # Only the Suspension middleware can run through this breakpoint.
             # Commit the paired observation before acknowledging its durable
             # notification, independently of any remaining model budget.

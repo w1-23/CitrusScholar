@@ -843,6 +843,7 @@ async def _run(state, identity, ledger):
         can_recover_output=lambda: task_events.budget_headroom(identity.run_id),
         guard_native_execute=guard_native_execute, native_approval_tools=approval_tools,
         wait_native_approval=wait_native_approval if approval_tools else None,
+        approval_restart_checkpoint=state.get("agent_approval_restart_checkpoint", ""),
         user_input=state.get("agent_question_resume"), bind_user_input=bind_user_input,
         accept_user_input=accept_user_input, acknowledge_user_input=acknowledge_user_input,
         check_retired_question=lambda run_id: asyncio.to_thread(user_questions.retired_question, identity, run_id))

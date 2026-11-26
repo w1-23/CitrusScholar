@@ -51,9 +51,15 @@ def publication_stages(payload: dict) -> list[dict]:
             stage, next_stage = "started", "committed"
         else:
             continue
-        projected.append({"file_index": index, "filename": filename, "stage": stage,
+        row = {"file_index": index, "filename": filename, "stage": stage,
                           "url": url if stage == "confirmed" else "", "sha256": digest,
-                          "next_stage": next_stage})
+                          "next_stage": next_stage}
+        artifact_id = item.get("artifact_id")
+        if (stage in {"committed", "confirmed"} and isinstance(artifact_id, str)
+                and re.fullmatch(r"[a-f0-9]{32}", artifact_id)
+                and (stage != "confirmed" or url.rsplit("/", 1)[-1] == artifact_id)):
+            row["artifact_id"] = artifact_id
+        projected.append(row)
     return projected
 
 

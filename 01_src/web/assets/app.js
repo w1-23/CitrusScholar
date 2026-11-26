@@ -2723,6 +2723,77 @@ function turnQueueIsExecuting(state) {
   return ['running', 'detached', 'cancel_requested'].indexOf(state.status) >= 0;
 }
 
+function appendPublicationReconciliation(node, sid, cid) {
+  var url = turnQueueURL(sid) + '/' + encodeURIComponent(cid) + '/reconcile/publications';
+  var panel = node._publicationPanel;
+  if (panel && panel._publicationURL === url) { node.appendChild(panel); return; }
+  panel = document.createElement('details');
+  panel._publicationURL = url;
+  node._publicationPanel = panel;
+  var summary = document.createElement('summary');
+  summary.textContent = '查看逐文件发布状态';
+  panel.appendChild(summary);
+  var list = document.createElement('ul');
+  panel.appendChild(list);
+  var status = document.createElement('span');
+  status.setAttribute('role', 'status');
+  panel.appendChild(status);
+  panel.addEventListener('toggle', async function () {
+    if (!panel.open || panel._publicationLoaded) return;
+    panel._publicationLoaded = true;
+    try {
+      var response = await accountFetch(url);
+      if (!response.ok) throw new Error('publication_status');
+      var payload = await response.json();
+      if (!payload.files.length) status.textContent = '这轮没有可核验的文件回执。';
+      payload.files.forEach(function (file) {
+        var li = document.createElement('li');
+        var label = document.createElement('span');
+        function show(stage) {
+          var state = {started: '已开始，缺少持久化证据', committed: '已保存，待确认登记', confirmed: '已确认'}[stage];
+          label.textContent = (file.filename || ('文件 ' + file.file_index)) + ' · ' + state + ' · 操作 ' + file.operation_id;
+        }
+        function link(href) {
+          if (!href || !href.startsWith('/api/v2/session/' + encodeURIComponent(sid) + '/artifacts/')) return;
+          var download = document.createElement('a');
+          download.href = href;
+          download.textContent = '下载';
+          li.appendChild(download);
+        }
+        show(file.stage);
+        li.appendChild(label);
+        link(file.url);
+        list.appendChild(li);
+        if (!file.can_restore) return;
+        var restore = document.createElement('button');
+        restore.type = 'button';
+        restore.textContent = '补登记此文件';
+        restore.onclick = async function () {
+          restore.disabled = true;
+          try {
+            var route = url + '/' + encodeURIComponent(file.operation_id) + '/' + encodeURIComponent(file.file_index);
+            var restored = await accountFetch(route, {method: 'POST'});
+            if (!restored.ok) throw new Error('publication_unconfirmed');
+            var outcome = await restored.json();
+            show(outcome.stage);
+            link(outcome.url);
+            restore.remove();
+            status.textContent = '文件已确认，未重新执行计算。';
+          } catch (_) {
+            status.textContent = '文件仍待确认。请稍后重试。';
+            restore.disabled = false;
+          }
+        };
+        li.appendChild(restore);
+      });
+    } catch (_) {
+      panel._publicationLoaded = false;
+      status.textContent = '暂时无法读取发布状态。';
+    }
+  });
+  node.appendChild(panel);
+}
+
 function queueStateLabel(entry) {
   if (!entry) return '';
   var names = {queued: '待发送', claimed: '准备执行', running: '执行中',
@@ -4788,8 +4859,10 @@ async function sendMsg(paperVerification, continueFrom) {
       node.hidden = false;
       var settled = document.createElement('span');
       settled.className = 'turn-queue-status';
-      settled.textContent = entry.clear_reason === 'cancelled' ? '已取消' : '未开始执行';
+      var reconciled = entry.clear_reason === 'turn_reconciled_by_user';
+      settled.textContent = reconciled ? '轮次已对账' : (entry.clear_reason === 'cancelled' ? '已取消' : '未开始执行');
       node.appendChild(settled);
+      if (reconciled) appendPublicationReconciliation(node, requestSessionId, clientRequestId);
       return;
     }
     node.hidden = false;
@@ -4804,6 +4877,7 @@ async function sendMsg(paperVerification, continueFrom) {
       settle.textContent = '确认并继续';
       settle.setAttribute('aria-label', '确认上一轮结果无法核对并继续本会话');
       settle.onclick = function () { reconcileQueuedEntry(); };
+      appendPublicationReconciliation(node, requestSessionId, clientRequestId);
       node.appendChild(settle);
     }
   }
@@ -6099,11 +6173,16 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     entry = entryNow;
     if (binding) binding.queueEntry = entry;
     markQueuedBubble(userContent, content, entry);
-    queueStatus.hidden = entry.state !== 'reconcile_required';
+    var reconciled = entry.state === 'terminal' && entry.clear_reason === 'turn_reconciled_by_user';
+    queueStatus.hidden = entry.state !== 'reconcile_required' && !reconciled;
     queueStatus.replaceChildren();
     var label = document.createElement('span');
     label.textContent = entry.state === 'terminal' && entry.clear_reason === 'cancelled' ? '已取消' : queueStateLabel(entry);
     queueStatus.appendChild(label);
+    if (reconciled) {
+      label.textContent = '轮次已对账';
+      appendPublicationReconciliation(queueStatus, sid, entry.client_request_id);
+    }
     if (entry.state === 'terminal' && !entry.dispatch_at && entry.clear_reason && !hasSavedAnswer) {
       var cancelled = entry.clear_reason === 'cancelled';
       answer.dataset.displayStatus = cancelled ? 'cancelled' : 'failed';
@@ -6126,6 +6205,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
         } catch (_) { if (owns()) showBanner('解除状态核对的请求暂未确认，请稍后重试。'); }
         finally { settle.disabled = false; }
       };
+      appendPublicationReconciliation(queueStatus, sid, entry.client_request_id);
       queueStatus.appendChild(settle);
     }
 

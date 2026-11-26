@@ -128,6 +128,9 @@ def runtime(monkeypatch, tmp_path):
         (root + "/messages", main.session_messages, "GET"),
         ("/api/v1/session/{session_id}/clear", main.clear_session_endpoint, "POST"),
         ("/sessions/{session_id}/jobs", main.list_session_jobs, "GET"),
+        (root + "/turn-queue/{client_request_id}/reconcile/publications", main.list_chat_turn_publications, "GET"),
+        (root + "/turn-queue/{client_request_id}/reconcile/publications/{operation_id}/{file_index}",
+         main.restore_chat_turn_publication, "POST"),
         (root + "/turn-queue/{client_request_id}/reconcile", main.reconcile_chat_turn, "POST"),
         ("/api/v2/chat/jobs/{job_id}/recover-agent", main.recover_chat_agent, "POST"),
         (root + "/turn-queue", main.enqueue_chat_turn, "POST"),
@@ -903,3 +906,57 @@ def test_update_status_observes_exact_committed_receipt_under_writer(runtime):
         reply = runtime.client.get(base + "version-one")
         assert reply.status_code == 200 and reply.json() == update
         assert runtime.client.get(base + "unknown").status_code == 404
+
+
+
+def test_publication_reconciliation_only_registers_owned_committed_bytes(runtime, monkeypatch, tmp_path):
+    from langchain_core.messages import ToolMessage
+
+    from src.core import publication_reconcile, tracing
+    from src.research import tools
+    from src.research.delivery_reconciliation import capture_delivery, delivery_outcome
+
+    for module in (main, tools, files):
+        monkeypatch.setattr(module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(tools, "get_user_id", lambda: runtime.owner)
+    monkeypatch.setattr(tools, "get_session_id", lambda: runtime.sid)
+    monkeypatch.setattr(tracing, "get_client_request_id", lambda: "file-turn")
+    monkeypatch.setattr(tracing, "get_current_tool_name", lambda: "deliver_research_artifact")
+    root = send(runtime, "file-turn", "publication only")
+    wait_for(lambda: "file-turn" in runtime.started)
+    job_id = root["job_id"]
+    op, lease = task_events.start_operation(job_id, runtime.owner, "deliver_research_artifact", {},
+                                            tool_call_id="fixture-publication")
+    with capture_delivery("deliver_research_artifact", "fixture-publication"):
+        existing = tools._save_artifact("one.txt", b"previously confirmed", "text/plain")
+        with monkeypatch.context() as patch:
+            def fail(**kwargs):
+                raise OSError("simulated outbox interruption")
+            patch.setattr(publication_reconcile, "register_publication", fail)
+            with pytest.raises(ValueError, match="artifact_registration_failed"):
+                tools._save_artifact("two.txt", b"only register these bytes", "text/plain")
+        outcome = delivery_outcome("partial", "", [{"url": existing}])
+    task_events.finish_operation(op, lease, ToolMessage(content="{}", tool_call_id="fixture-publication",
+        name="deliver_research_artifact", artifact={"_tool_outcome": outcome}))
+    endpoint = runtime.path + "/file-turn/reconcile/publications"
+    assert runtime.client.get(endpoint).status_code == 409
+    runtime.released.add("file-turn")
+    wait_for(lambda: state(runtime, "file-turn") == "reconcile_required")
+    cookie = runtime.client.cookies.get("citrus_auth")
+    runtime.client.cookies.set("citrus_auth", runtime.other)
+    assert runtime.client.get(endpoint).status_code in (403, 404)
+    assert runtime.client.post(f"{endpoint}/{op}/2").status_code in (403, 404)
+    runtime.client.cookies.set("citrus_auth", cookie)
+    response = runtime.client.get(endpoint)
+    assert response.status_code == 200, response.text
+    one, two = response.json()["files"]
+    assert one["stage"] == "confirmed" and one["url"] == existing and not one["can_restore"]
+    assert two["stage"] == "committed" and two["can_restore"]
+    assert "sha256" not in two and "artifact_id" not in two
+    assert runtime.client.post(f"{endpoint}/{op}/1").status_code == 409
+    restored = runtime.client.post(f"{endpoint}/{op}/2")
+    assert restored.status_code == 200, restored.text
+    assert runtime.client.post(f"{endpoint}/{op}/2").json() == restored.json()
+    assert {row["filename"] for row in files.list_files(runtime.sid, runtime.owner)} == {"one.txt", "two.txt"}
+    assert runtime.started.count("file-turn") == 1
+    assert task_events.operation_result(job_id, op)["outcome"]["status"] == "unknown"

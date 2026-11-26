@@ -704,7 +704,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
     from src.core.cancel import raise_if_cancelled
     from src.core.tracing import get_client_request_id, get_current_tool_name
     from src.core.publication_reconcile import enqueue_publication, register_publication
-    from src.research.delivery_reconciliation import publication_started, publication_confirmed
+    from src.research.delivery_reconciliation import publication_committed, publication_confirmed, publication_started
 
     owner_user_id = int(get_user_id() or 0)
     session_id = str(get_session_id() or "")
@@ -814,6 +814,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
         if not exact_existing:
             existing = None
 
+    receipt = None
     if existing is not None:
         artifact_id = str(existing["artifact_id"])
         path = Path(str(existing["path"])).resolve()
@@ -865,7 +866,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                     published_existing = None
             if published_existing is None:
                 raise_if_cancelled("artifact:before_commit")
-                publication_started()
+                receipt = publication_started(safe)
                 os.replace(part, path)
                 if str(logical_task_id).startswith("figure:"):
                     # One logical figure keeps one version chain even when a
@@ -918,7 +919,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
             if published_existing is not None:
                 artifact_id = str(published_existing["artifact_id"])
                 path = Path(str(published_existing["path"])).resolve()
-                publication_started()
+                receipt = publication_started(safe)
                 try:
                     part.unlink(missing_ok=True)
                 except OSError:
@@ -942,7 +943,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
 
     try:
         if existing is not None:
-            publication_started()
+            receipt = publication_started(safe)
             # Legacy/exact retry: the immutable artifact already exists. Only
             # this authorized live path may bind an old ownerless row.
             with closing(sqlite3.connect(str(db))) as conn, conn:
@@ -953,6 +954,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                 if append_key:
                     conn.execute("INSERT OR REPLACE INTO artifact_append_batches VALUES(?,?)",
                                  (append_key, artifact_id))
+        publication_committed(sha256=output_sha256, receipt=receipt, artifact_id=artifact_id)
         registered = register_publication(db_path=db, artifact_id=artifact_id,
                              project_root=PROJECT_ROOT, client_request_id=request_id,
                              allow_ownerless=owner_user_id == 0)
@@ -965,7 +967,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
         ledger.clear(logical)
         raise DeliverableRejected("artifact_registration_failed", "文件已保存，但资料库登记失败；可重试发布。") from exc
     url = f"/api/v2/session/{session_id}/artifacts/{artifact_id}"
-    publication_confirmed(url)
+    publication_confirmed(url, sha256=output_sha256, receipt=receipt)
     ledger.clear(logical)
     return url
 

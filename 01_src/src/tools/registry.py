@@ -544,6 +544,9 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
                 artifact["_tool_outcome"] = {
                     "status": "unknown", "reason_code": "write_requires_reconciliation",
                     "artifacts": outcome.get("artifacts", [])}
+                from src.research.delivery_reconciliation import observed_publication_files
+                if published_files := observed_publication_files(reconciliation):
+                    artifact["_tool_outcome"]["files"] = published_files
                 from src.core.op_receipt import make_receipt
                 artifact["op_receipt"] = make_receipt(name, tool_call["id"], message.content, artifact)
                 message = message.model_copy(update={"artifact": artifact, "status": "error"})

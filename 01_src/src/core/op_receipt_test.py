@@ -99,3 +99,37 @@ def test_prose_cannot_create_publication_facts_with_plausible_refs():
     assert "publication" not in make_receipt("collect_external_skill", "call-five", text, {})["coverage"]
     assert publication_stages(_artifact([{"file_index": 1, "url": CONFIRMED,
         "sha256": "b" * 64}])) == []
+
+
+
+def test_publication_operation_evidence_is_bounded_and_requires_owned_job(monkeypatch):
+    from contextlib import nullcontext
+    import json
+    import sqlite3
+
+    from src.core import publication_reconcile, task_events
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.executescript("""
+            CREATE TABLE task_jobs(job_id TEXT, owner_user_id INTEGER, session_id TEXT);
+            CREATE TABLE task_operations(operation_id TEXT, job_id TEXT, owner_user_id INTEGER,
+                                         status TEXT, result TEXT, updated_at INTEGER);
+            INSERT INTO task_jobs VALUES ('job-a', 7, 'session-one');
+        """)
+        candidate = {"file_index": 2, "filename": "two.xlsx", "artifact_id": "e" * 32,
+                     "sha256": "d" * 64, "committed": True}
+        duplicate = {**candidate, "file_index": 3}
+        foreign = {**candidate, "file_index": 4, "confirmed": True,
+                   "url": "/api/v2/session/session-two/artifacts/" + "e" * 32}
+        result = json.dumps({"artifact": {"_tool_outcome": {"reason_code": "write_requires_reconciliation",
+                             "files": [candidate, duplicate, duplicate, foreign]}}})
+        conn.executemany("INSERT INTO task_operations VALUES (?, 'job-a', ?, ?, ?, 1)",
+                         [("op-a", 7, "unknown", result), ("op-b", 8, "unknown", result),
+                          ("op-running", 7, "running", result), ("op-bad", 7, "unknown", "[")])
+        monkeypatch.setattr(task_events, "read_transaction", lambda: nullcontext(conn))
+        read = publication_reconcile.operation_publication_evidence
+        assert read(owner=7, session_id="session-one", job_id="job-a") == [
+            {"operation_id": "op-a", "file_index": 2, "filename": "two.xlsx", "stage": "committed",
+             "artifact_id": "e" * 32, "sha256": "d" * 64, "next_stage": "confirmed", "url": ""}]
+        assert read(owner=8, session_id="session-one", job_id="job-a") == []
+        assert read(owner=7, session_id="session-two", job_id="job-a") == []

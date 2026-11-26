@@ -102,6 +102,43 @@ def _snapshot(conn: sqlite3.Connection, artifact_id: str) -> tuple[dict, dict]:
     return a, p
 
 
+def operation_publication_evidence(*, owner: int, session_id: str, job_id: str) -> list[dict]:
+    """Read evidence from settled writes in one owned job, without changing its outcome."""
+    import json
+    from src.core.op_receipt import publication_stages
+    from src.core.task_events import read_transaction
+
+    with read_transaction() as conn:
+        rows = conn.execute(
+            "SELECT op.operation_id, op.result FROM task_operations AS op "
+            "JOIN task_jobs AS job ON job.job_id=op.job_id "
+            "WHERE op.job_id=? AND op.owner_user_id=? AND job.owner_user_id=? "
+            "AND job.session_id=? AND job.owner_user_id>0 AND op.status='unknown' "
+            "AND op.result<>'' ORDER BY op.updated_at DESC, op.operation_id LIMIT 32",
+            (job_id, owner, owner, session_id),
+        ).fetchall()
+    result = []
+    for operation_id, encoded in rows:
+        try:
+            payload = json.loads(encoded)
+        except (ValueError, RecursionError):
+            continue
+        artifact = payload.get("artifact") if isinstance(payload, dict) else None
+        outcome = artifact.get("_tool_outcome") if isinstance(artifact, dict) else None
+        if not isinstance(outcome, dict) or outcome.get("reason_code") != "write_requires_reconciliation":
+            continue
+        facts = publication_stages(artifact)
+        indexes = [item["file_index"] for item in facts]
+        sid_prefix = f"/api/v2/session/{session_id}/artifacts/"
+        for item in facts:
+            if len(result) >= 32:
+                return result
+            if indexes.count(item["file_index"]) != 1 or (item["url"] and not item["url"].startswith(sid_prefix)):
+                continue
+            result.append({"operation_id": operation_id, **item})
+    return result
+
+
 def _verify_bytes(artifact: dict, *, project_root: Path) -> Path:
     sid, aid, filename = (str(artifact[key]) for key in ("session_id", "artifact_id", "filename"))
     if (not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", sid)
@@ -175,11 +212,14 @@ def _check_index(files, artifact: dict, owner: int, path: Path, *, file_id: str 
 
 def register_publication(*, db_path: Path, artifact_id: str,
                          project_root: Path, client_request_id: str = "",
-                         allow_ownerless: bool = False) -> dict[str, Any]:
+                         allow_ownerless: bool = False,
+                         expected_scope: tuple[int, str, str, str] | None = None) -> dict[str, Any]:
     """Idempotent live/recovery registration; mark committed only after verification.
 
     db_path/project_root are trusted application paths, never HTTP parameters.
     Recovery leaves allow_ownerless=False. Live legacy CLI publication may opt in.
+    Scoped recovery binds the owner, session, original request and digest, and
+    reuses an already confirmed registration without writing it again.
     """
     from src.core.account_leases import account_lease
     from src.session import files
@@ -187,6 +227,13 @@ def register_publication(*, db_path: Path, artifact_id: str,
     with closing(sqlite3.connect(str(db_path))) as conn, conn:
         artifact, pending = _snapshot(conn, artifact_id)
     owner, sid = int(pending["owner_user_id"]), str(pending["session_id"])
+    if expected_scope is not None:
+        expected_owner, expected_session, expected_request, expected_digest = expected_scope
+        if (type(expected_owner) is not int or expected_owner <= 0 or not expected_request
+                or client_request_id not in ("", expected_request)
+                or (owner, sid, artifact.get("request_id"), pending["artifact_sha256"])
+                   != (expected_owner, expected_session, expected_request, expected_digest)):
+            raise PublicationRejected("publication_recovery_scope_mismatch")
     if owner <= 0 and not allow_ownerless:
         raise PublicationRejected("unbound_publication_owner")
     with account_lease(owner) if owner > 0 else nullcontext():
@@ -194,6 +241,15 @@ def register_publication(*, db_path: Path, artifact_id: str,
             raise PublicationRejected("publication_owner_inactive_or_session_mismatch")
         path = _verify_bytes(artifact, project_root=project_root)
         files.init_store()
+        if expected_scope is not None and pending["state"] == "committed":
+            indexed_id = pending["file_id"]
+            if not indexed_id:
+                raise PublicationRejected("registration_not_persisted")
+            _check_index(files, artifact, owner, path, file_id=indexed_id)
+            entry = files.get_file(sid, indexed_id, owner_user_id=owner)
+            if not entry or entry.get("sha256") != pending["artifact_sha256"]:
+                raise PublicationRejected("registration_not_persisted")
+            return entry
         _check_index(files, artifact, owner, path)
         registered = files.register_file(
             session_id=sid, owner_user_id=owner, filename=artifact["filename"],

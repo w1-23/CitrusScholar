@@ -25,6 +25,7 @@ class PublicationReceipt:
     confirmed: bool = False
     url: str = ""
     sha256: str = ""
+    artifact_id: str = ""
 
     @property
     def status(self):
@@ -48,9 +49,12 @@ class PublicationReceipt:
         return "started"
 
     def as_dict(self):
-        return {"file_index": self.file_index, "filename": self.filename, "status": self.status,
+        result = {"file_index": self.file_index, "filename": self.filename, "status": self.status,
                 "started": self.started, "committed": self.committed, "confirmed": self.confirmed,
                 "url": self.url, "sha256": self.sha256, "next_stage": self.next_stage}
+        if self.artifact_id:
+            result["artifact_id"] = self.artifact_id
+        return result
 
 
 @dataclass
@@ -108,7 +112,7 @@ def publication_started(filename="", file_index=None):
     return None
 
 
-def publication_committed(*, sha256="", filename="", file_index=None, receipt=None):
+def publication_committed(*, sha256="", filename="", file_index=None, receipt=None, artifact_id=""):
     """Verified bytes left the publisher and reached the artifact registry."""
     evidence = _current.get()
     if evidence is None:
@@ -117,6 +121,8 @@ def publication_committed(*, sha256="", filename="", file_index=None, receipt=No
     if target is None:
         target = evidence.begin(filename, file_index)
     target.committed = True
+    if artifact_id:
+        target.artifact_id = artifact_id
     if sha256:
         target.sha256 = str(sha256)
     if filename:
@@ -126,13 +132,13 @@ def publication_committed(*, sha256="", filename="", file_index=None, receipt=No
     return target
 
 
-def publication_confirmed(url, *, sha256=""):
+def publication_confirmed(url, *, sha256="", receipt=None):
     """The registered URL was returned. Never implies a review was rerun."""
     evidence = _current.get()
     if evidence is None:
         return None
-    target = next((receipt for receipt in evidence.receipts
-                   if receipt.started and not receipt.url), None)
+    target = receipt if isinstance(receipt, PublicationReceipt) else next(
+        (item for item in evidence.receipts if item.started and not item.url), None)
     if target is None:
         target = evidence.begin()
         target.committed = True
@@ -161,11 +167,18 @@ def publication_bound(url, *, sha256="", filename="", file_index=None):
         return publication_confirmed(url, sha256=sha256)
     if sha256:
         target.sha256 = str(sha256)
+    if file_index is not None and not target.filename:
+        target.file_index = file_index
     if filename:
         target.filename = str(filename)
-    if file_index is not None:
-        target.file_index = file_index
     return target
+
+
+def observed_publication_files(evidence):
+    """Return only the publisher facts captured by this dispatch."""
+    if not isinstance(evidence, _PublicationEvidence):
+        return []
+    return [receipt.as_dict() for receipt in evidence.receipts]
 
 
 def before_publication():
@@ -179,7 +192,7 @@ def delivery_outcome(status, reason, receipts):
     files = []
     known = False
     if evidence is not None:
-        files = [receipt.as_dict() for receipt in evidence.receipts]
+        files = observed_publication_files(evidence)
         confirmed = {item["url"] for item in files if item["confirmed"]}
         if any(not item["confirmed"] for item in files) or confirmed != set(links):
             # A partly unknown publication stays unknown; a file that appeared

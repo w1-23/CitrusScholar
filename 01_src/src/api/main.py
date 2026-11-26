@@ -2277,6 +2277,77 @@ async def cancel_chat_turn(session_id: str, client_request_id: str, request: Req
 
 
 
+@app.get("/api/v2/session/{session_id}/turn-queue/{client_request_id}/reconcile/publications")
+async def list_chat_turn_publications(session_id: str, client_request_id: str, request: Request):
+    return await _chat_turn_publications(session_id, client_request_id, request)
+
+
+@app.post("/api/v2/session/{session_id}/turn-queue/{client_request_id}/reconcile/publications/{operation_id}/{file_index}")
+async def restore_chat_turn_publication(session_id: str, client_request_id: str, operation_id: str,
+                                        file_index: int, request: Request):
+    if not re.fullmatch(r"[a-f0-9]{32}", operation_id) or not 1 <= file_index <= 1000:
+        raise HTTPException(status_code=400, detail="发布回执标识无效。")
+    return await _chat_turn_publications(session_id, client_request_id, request, (operation_id, file_index))
+
+
+async def _chat_turn_publications(session_id, client_request_id, request, target=None):
+    from src.agent.harness import execution_lock
+    from src.core import chat_turn_queue as queue, publication_reconcile as publication
+    from src.core.account_leases import AccountUnavailable, acquire_account_lease, run_account_thread
+
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", client_request_id):
+        raise HTTPException(status_code=400, detail="请求标识无效。")
+    user = current_user(request)
+    owner = int(user["user_id"])
+
+    def read_or_restore():
+        turn = queue.get_turn(owner_user_id=owner, session_id=session_id, client_request_id=client_request_id)
+        if not turn:
+            raise queue.TurnNotFound("turn_not_found")
+        if turn["state"] not in {queue.RECONCILE_REQUIRED, queue.TERMINAL}:
+            raise queue.TurnStateConflict(turn["state"])
+        job = _turn_job(turn)
+        facts = publication.operation_publication_evidence(owner=owner, session_id=session_id,
+                                                           job_id=job["job_id"]) if job else []
+        if target is None:
+            return {"files": [{key: value for key, value in row.items() if key not in {"artifact_id", "sha256"}}
+                              | {"can_restore": row["stage"] == "committed" and bool(row.get("artifact_id"))}
+                              for row in facts]}
+        row = next((row for row in facts if (row["operation_id"], row["file_index"]) == target), None)
+        if not row or row["stage"] != "committed" or not row.get("artifact_id"):
+            raise HTTPException(status_code=409, detail="此文件没有可恢复的持久发布记录。")
+        aid = row["artifact_id"]
+        publication.register_publication(db_path=PROJECT_ROOT / "state/research_artifacts.sqlite3", artifact_id=aid,
+                                         project_root=PROJECT_ROOT,
+                                         expected_scope=(owner, session_id, client_request_id, row["sha256"]))
+        return {"operation_id": target[0], "file_index": target[1], "stage": "confirmed",
+                "url": f"/api/v2/session/{session_id}/artifacts/{aid}"}
+
+    async with _turn_session_lock(session_id):
+        _require_active_turn_session(session_id, user)
+        try:
+            lease = acquire_account_lease(owner)
+        except AccountUnavailable as exc:
+            raise HTTPException(status_code=409, detail="账号当前不可用。") from exc
+        try:
+            if target is None:
+                result = await run_account_thread(lease, read_or_restore)
+            else:
+                with execution_lock(PROJECT_ROOT / "state" / "agent_locks", (owner, session_id)):
+                    result = await run_account_thread(lease, read_or_restore)
+        except queue.TurnQueueError as exc:
+            raise _turn_queue_http_error(exc) from exc
+        except (publication.PublicationRejected, OSError, sqlite3.Error) as exc:
+            raise HTTPException(status_code=409, detail="文件仍待确认，未重新执行计算。") from exc
+        except RuntimeError as exc:
+            if str(exc) != "agent_run_already_active":
+                raise
+            raise HTTPException(status_code=409, detail="此会话仍有执行中的任务。") from exc
+        finally:
+            lease.release()
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/v2/session/{session_id}/turn-queue/{client_request_id}/reconcile")
 async def reconcile_chat_turn(session_id: str, client_request_id: str, request: Request):
     """Settle exact run evidence, or deliberately isolate a stopped unknown run."""

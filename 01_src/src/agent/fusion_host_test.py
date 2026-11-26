@@ -433,7 +433,12 @@ def test_cas_answer_carries_confirmed_exact_coordinates(monkeypatch, tmp_path, s
     with fusion_tools.fusion_delivery_scope(FusionDelivery(), query="需要审查工作簿",
             workbook_confirmation="确认 Trials!$B$3:$D$20，表头为第4行。"):
         assert run("data-audit", inputs, regions)[1].get("execution_id") == "b" * 32
-    assert len(chosen) == 1 and chosen[0]["inputs"] == inputs and chosen[0]["options"] == regions
+        _, projected = run("data-audit", inputs, {**regions, "plot_fields": ["value"]})
+        assert projected["input_contract"]["plot_projection"] == {
+            "status": "unavailable", "requested_fields": ["value"],
+            "reason_code": "workbook_plot_projection_unavailable"}
+        assert "dataset_ref" not in projected
+    assert len(chosen) == 2 and all(item["inputs"] == inputs and item["options"] == regions for item in chosen)
 
 
 def test_region_confirmation_does_not_borrow_header_from_adjacent_region():

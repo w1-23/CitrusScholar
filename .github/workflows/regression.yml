@@ -85,6 +85,7 @@ jobs:
             01_src/src/agent/fusion_worker_test.py \
             01_src/src/agent/file_baseline_autonomy_test.py \
             01_src/src/api/reference_fusion_cutover_test.py \
+            01_src/src/research/fusion_plot_projection_test.py \
             01_src/src/research/fusion_workbook_test.py \
             01_src/src/research/fusion_reference_batch_test.py \
             01_src/src/research/script_runtime_preflight_test.py \

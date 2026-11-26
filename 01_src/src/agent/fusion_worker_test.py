@@ -128,3 +128,36 @@ class WorkerContractTests(unittest.TestCase):
                     self.assertIsNone(files.get_task_input_file(7, IDENTITY.run_id, row["file_id"], row["sha256"]))
                 self.assertIsNone(files.get_task_input_file(7, OTHER.run_id, first["file_id"], first["sha256"]))
                 self.assertIsNone(files.get_task_input_file(7, IDENTITY.run_id, first["file_id"], "a" * 64))
+
+
+
+def test_private_projection_is_bound_but_not_submitted(monkeypatch):
+    from types import SimpleNamespace
+    import pytest
+    from src.agent import fusion_worker as worker
+
+    raw = b"fixture selected cells"
+    bound = {}
+
+    def bind(wid, *, path, file_id, expected_revision, expected_sha256, source):
+        bound[path] = expected_sha256
+        return {"revision": expected_revision + 1}
+
+    workspace = SimpleNamespace(snapshot=lambda *a, **kw: {"files": []}, bind=bind)
+    monkeypatch.setattr(worker, "_register", lambda identity, path, data: "a" * 32)
+    revision, submitted = worker._bind(object(), workspace, {"workspace_id": "ws", "revision": 0},
+        "job", {}, {worker.LAUNCHER: b"script", worker.REQUEST: b"request", worker.PLOT_SNAPSHOT: raw})
+    assert revision == 3 and submitted == (worker.REQUEST,)
+    pin = {"plot_projection_sha256": bound[worker.PLOT_SNAPSHOT]}
+
+    def read(wid, *, path, version, expected_sha256):
+        assert (wid, path, version, expected_sha256) == ("ws", worker.PLOT_SNAPSHOT, 1, worker.sha(raw))
+        return raw
+
+    service = SimpleNamespace(workspace=SimpleNamespace(read_bytes=read))
+    request = SimpleNamespace(workspace_id="ws")
+    assert worker._accepted_plot_projection(service, request, {}) == {}
+    assert worker._accepted_plot_projection(service, request, pin) == {"_plot_projection": raw}
+    service.workspace.read_bytes = lambda *a, **kw: b"altered"
+    with pytest.raises(ValueError, match="fusion_frozen_projection_mismatch"):
+        worker._accepted_plot_projection(service, request, pin)

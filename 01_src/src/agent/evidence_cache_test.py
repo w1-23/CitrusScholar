@@ -153,3 +153,66 @@ def test_inspect_audit_and_draw_only_selected_frozen_fields(identity, monkeypatc
     assert list(frame.columns) == ["value"] and list(frame.index) == [2, 3]
     assert [int(value) for value in frame["value"]] == [12, 24]
     assert record["dataset_ref"] in refs and review_calls == [1]
+
+
+
+def test_fusion_workbook_frozen_plot(identity, monkeypatch):
+    import openpyxl
+    from src.agent import fusion_tools, fusion_worker
+    from src.agent.identity import ExecutionIdentity
+    from src.figures.dataset_codec import decode_frame
+    from src.figures.projects import script_replay_inputs, snapshot_script_inputs
+
+    files = identity
+    who = ExecutionIdentity(OWNER, SESSION, "request", tracing.get_job_id())
+    monkeypatch.setattr("src.core.account_leases.account_lease", lambda _owner, **kw: nullcontext())
+    book = openpyxl.Workbook()
+    book.active.title = "Trials"
+    for row in [("group", "value", "extra"), ("A", 12, "not selected"), ("B", 24, "not selected")]:
+        book.active.append(row)
+    stream = BytesIO()
+    book.save(stream)
+    book.close()
+    data = stream.getvalue()
+    entry = files.register_file(session_id=SESSION, owner_user_id=OWNER, filename="sample.xlsx",
+                                content=data, mime="application/octet-stream", origin="uploaded")
+    ref = {key: entry[key] for key in ("file_id", "sha256")}
+    region = {"sheet": "Trials", "range": "A1:C3", "id": "main", "header_row": 1}
+    eid = "e" * 32
+    requests = []
+    monkeypatch.setattr(fusion_tools, "_bound", lambda skill: (who, "fixture", None))
+    monkeypatch.setattr(fusion_tools, "_workbook_source", lambda *_: (data, "sample.xlsx"))
+    monkeypatch.setattr(fusion_worker, "schedule_fusion", lambda _, **kw:
+        (requests.append(kw), {"execution_id": eid, "status": "queued"})[1])
+    with fusion_tools.fusion_delivery_scope(fusion_tools.FusionDelivery(), query="确认 Trials!A1:C3，表头第1行"):
+        _, queued = fusion_tools.run_external_skill.func("data-audit", {"workbook": ref},
+            {"regions": [region], "plot_fields": ["value"]})
+    assert queued["input_contract"]["plot_projection"]["status"] == "pending_audit"
+    request, = requests
+    assert request["options"] == {"regions": [region]}
+    assert b"not selected" not in request["plot_projection"]
+    result = {"status": "succeeded", "inputs": {"workbook": ref}, "options": request["options"],
+              "report": {"status": "partial", "coverage": [{"check": "eda_profile", "status": "checked",
+                         "region_id": "main"}]},
+              "receipt": {"execution_id": eid, "process_stopped": True, "network_policy": "offline"},
+              "_plot_projection": request["plot_projection"], "_account_epoch": 1}
+    monkeypatch.setattr(fusion_worker, "consume_fusion", lambda *a, **kw: result)
+    monkeypatch.setattr(fusion_tools, "_workbook_source", lambda *_: pytest.fail("unexpected source reread"))
+    assert "plot_datasets" not in fusion_tools.collect_external_skill.func(eid, "data-audit")[1]
+    result["report"]["status"] = "complete"
+    projection = result.pop("_plot_projection")
+    result["_plot_projection_unavailable"] = True
+    _, degraded = fusion_tools.collect_external_skill.func(eid, "data-audit")
+    assert degraded["_tool_outcome"]["status"] == "complete"
+    assert degraded["plot_projection"]["status"] == "unavailable" and "plot_datasets" not in degraded
+    result.pop("_plot_projection_unavailable")
+    result["_plot_projection"] = projection
+    body, public = fusion_tools.collect_external_skill.func(eid, "data-audit")
+    assert "_plot_projection" not in body and "not selected" not in body
+    record, = public["plot_datasets"]
+    assert record["source_sha256"] == ref["sha256"] and record["returned_fields"] == ["value"]
+    Path(files.get_account_file(ref["file_id"], OWNER, touch=False)["path"]).unlink()
+    frozen, _ = snapshot_script_inputs(record["inputs_binding"], OWNER, SESSION)
+    _, paths, _ = script_replay_inputs({"input_snapshots": frozen}, OWNER)
+    frame = decode_frame(json.loads(Path(paths["data"]).read_text()))
+    assert list(frame.columns) == ["value"] and list(frame["value"]) == [12, 24]

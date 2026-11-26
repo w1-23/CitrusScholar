@@ -483,8 +483,19 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
                 if any(region["sheet"] not in workbook.sheetnames for region in options["regions"]):
                     return _response({"error": "确认的工作表不在源文件中。"}, "not_run", "external_workbook_sheet_missing")
                 contract = excel_workbook_contract(workbook.sheetnames, normalized)
+            projection_options = {}
+            if plot_fields:
+                from src.research.fusion_plot_projection import freeze_confirmed_workbook
+
+                contract["plot_projection"] = {"status": "pending_audit", "requested_fields": plot_fields}
+                try:
+                    projection_options["plot_projection"] = freeze_confirmed_workbook(data, filename,
+                        source_sha256=refs[role]["sha256"], regions=normalized, fields=plot_fields)
+                except (KeyError, ValueError, OSError):
+                    contract["plot_projection"].update(status="unavailable",
+                        reason_code="workbook_plot_projection_unavailable")
             receipt = schedule_fusion(identity, operation_id=call_id, skill_release=release,
-                                      skill_id=skill_id, inputs=refs, options=options or {})
+                                      skill_id=skill_id, inputs=refs, options=options or {}, **projection_options)
             return _queued(receipt, contract=contract)
         receipt = schedule_fusion(identity, operation_id=call_id, skill_release=release,
                                   skill_id=skill_id, inputs=refs, options=options or {})
@@ -642,6 +653,15 @@ def _deliver(identity, value, execution_id, skill_id, *, findings_offset=0, hist
                 curated = {**curated, "status": "partial"}
     if findings_offset or status not in {"complete", "partial"}:
         return _response(public, status, "external_skill_report")
+    if skill_id == "data-audit" and value.get("_plot_projection_unavailable") and not historical:
+        public["plot_projection"] = {"status": "unavailable", "reason_code": "workbook_plot_projection_unavailable"}
+    if skill_id == "data-audit" and status == "complete" and not historical and value.get("_plot_projection"):
+        from src.research.fusion_plot_projection import publish_verified_workbook_projection
+
+        try:
+            public["plot_datasets"] = publish_verified_workbook_projection(identity, value, execution_id)
+        except (KeyError, LookupError, PermissionError, ValueError, OSError):
+            public["plot_projection"] = {"status": "unavailable", "reason_code": "workbook_plot_projection_unavailable"}
     try:
         selected_format = contract.format if contract.intent == "alternate_file" else (
             "xlsx" if contract.intent == "annotated_xlsx" and skill_id == "literature-verification" else "")

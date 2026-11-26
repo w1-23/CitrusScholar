@@ -132,6 +132,7 @@ def runtime(monkeypatch, tmp_path):
         (root + "/turn-queue/{client_request_id}/reconcile/publications/{operation_id}/{file_index}",
          main.restore_chat_turn_publication, "POST"),
         (root + "/turn-queue/{client_request_id}/reconcile", main.reconcile_chat_turn, "POST"),
+        ("/api/v2/chat/jobs/{job_id}/approvals/{approval_id}", main.decide_task_approval, "POST"),
         ("/api/v2/chat/jobs/{job_id}/recover-agent", main.recover_chat_agent, "POST"),
         (root + "/turn-queue", main.enqueue_chat_turn, "POST"),
         (root + "/turn-queue", main.list_chat_turns, "GET"),
@@ -960,3 +961,80 @@ def test_publication_reconciliation_only_registers_owned_committed_bytes(runtime
     assert {row["filename"] for row in files.list_files(runtime.sid, runtime.owner)} == {"one.txt", "two.txt"}
     assert runtime.started.count("file-turn") == 1
     assert task_events.operation_result(job_id, op)["outcome"]["status"] == "unknown"
+
+
+
+@pytest.mark.parametrize("decision", ["granted", "rejected"])
+def test_owned_http_approval_resumes_only_the_original_native_call(runtime, decision):
+    from functools import partial
+    from langchain_core.messages import ToolMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    from src.agent.framework_test_support import ScriptedModel
+    from src.agent.harness import HarnessRuntime
+    from src.agent.identity import ExecutionIdentity
+    from src.agent.native_approval import wait_for_approval_decisions
+    from src.agent.runtime import FinalCheck, RunLimits
+    from src.core.progress_bus import set_request_queue
+
+    rid = "fixture-http-approval"
+    run = jobs.claim_job(runtime.sid, rid, owner_user_id=runtime.owner).job_id
+    identity = ExecutionIdentity(runtime.owner, runtime.sid, rid, run)
+    effects = []
+    tool = "commit_document_index"
+
+    async def model(messages, identity, **_):
+        if isinstance(messages[-1], ToolMessage):
+            return AIMessage("done")
+        return AIMessage("", tool_calls=[{"name": tool, "args": {}, "id": "fixture-guarded-call"}])
+
+    async def execute(call, who):
+        assert who == identity
+        effects.append(call["id"])
+        return ToolMessage("done", name=tool, tool_call_id=call["id"]), {}
+
+    async def admit(*_):
+        return None
+
+    async def accept(*_):
+        return FinalCheck()
+
+    async def invoke():
+        events = task_events.DurableEventQueue(run)
+        set_request_queue(events)
+        agent = HarnessRuntime(ScriptedModel(script=model), execute, admit, accept, RunLimits(3),
+            [{"type": "function", "function": {"name": tool, "description": "fixture",
+                                               "parameters": {"type": "object", "properties": {}}}}],
+            native_approval_tools=(tool,),
+            wait_native_approval=partial(wait_for_approval_decisions, timeout=10, poll_interval=0.01))
+        return await agent.run(identity, [HumanMessage("fixture")], saver=InMemorySaver(),
+                               agent_options={"task_subagent": False})
+
+    future = runtime.client.portal.start_task_soon(invoke)
+    owner_cookie = runtime.client.cookies.get("citrus_auth")
+    try:
+        def request_events():
+            with task_events.read_transaction() as conn:
+                return conn.execute("SELECT data FROM task_events WHERE job_id=? AND event='permission_request'",
+                                    (run,)).fetchall()
+
+        wait_for(lambda: bool(request_events()) or future.done())
+        if future.done():
+            pytest.fail(f"graph stopped before approval: {future.result()}")
+        import json
+        event, = request_events()
+        aid = json.loads(event[0])["approval_id"]
+        path = f"/api/v2/chat/jobs/{run}/approvals/{aid}"
+        runtime.client.cookies.set("citrus_auth", runtime.other)
+        assert runtime.client.post(path, json={"decision": "granted"}).status_code in (403, 404)
+        assert not effects and task_events.approval_status(aid) == "pending"
+        runtime.client.cookies.set("citrus_auth", owner_cookie)
+        response = runtime.client.post(path, json={"decision": decision})
+        assert response.status_code == 200 and response.json()["status"] == decision
+        result = future.result(timeout=5)
+        assert result.status == "complete"
+        assert effects == (["fixture-guarded-call"] if decision == "granted" else [])
+        assert len(request_events()) == 1
+    finally:
+        runtime.client.cookies.set("citrus_auth", owner_cookie)
+        if not future.done():
+            future.cancel()

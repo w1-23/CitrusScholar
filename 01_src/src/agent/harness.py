@@ -138,6 +138,10 @@ class HarnessRuntime:
     # re-ask costs a real call, so it may not overdraw the same ledger.
     can_recover_output: Any = None
     guard_native_execute: Any = None
+    # Trusted host opt-in. The waiter signals availability only; decisions
+    # always come from the job database after re-reading the checkpoint.
+    native_approval_tools: tuple[str, ...] = ()
+    wait_native_approval: Any = None
     diagnostic_checkpoint: str = ""
 
     async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None,
@@ -370,6 +374,12 @@ class HarnessRuntime:
                     return {"messages": [RemoveMessage(id=response.id)],
                             "rejected_responses": [*state.get("rejected_responses", []), response],
                             "stop_status": "incomplete", "stop_reason": invalid, "jump_to": "end"}
+                if len(response.tool_calls) != 1 and any(
+                        item["name"] in approval_tools for item in response.tool_calls):
+                    # Never pause a ToolNode which can execute sibling effects.
+                    return {"messages": [RemoveMessage(id=response.id)],
+                            "stop_status": "incomplete", "stop_reason": "approval_requires_single_call",
+                            "host_state": host_snapshot(), "jump_to": "end"}
                 if not response.tool_calls:
                     followup_used = state.get("delivery_followup_used", False)
                     check_final = (adapter.check_final_after_followup if followup_used else None) or adapter.check_final
@@ -439,7 +449,12 @@ class HarnessRuntime:
                             if result.additional_kwargs.get("operation_uncertain") is True:
                                 signal = {"uncertain": True,
                                           "operation_id": result.additional_kwargs["operation_id"]}
-                        if name in host_tools:
+                        if (name in approval_tools and cid in denied_approval_calls
+                                and isinstance(result, ToolMessage) and result.status == "error"):
+                            message = result.model_copy(update={
+                                "additional_kwargs": {"execution_dispatched": False},
+                                "artifact": {"_tool_outcome": {"status": "not_run", "reason_code": "approval_rejected"}}})
+                        elif name in host_tools:
                             update = result.update if isinstance(result, Command) else None
                             if (not isinstance(update, dict) or set(update) != {"messages", "operation_signals"}
                                     or not isinstance(update["messages"], list) or len(update["messages"]) != 1
@@ -583,7 +598,16 @@ class HarnessRuntime:
         if "task_subagent" not in options:
             from src.config import settings as runtime_settings
             options["task_subagent"] = bool(getattr(runtime_settings, "AGENT_ENABLE_TASK_SUBAGENT", True))
-        graph = create_framework_agent(self.model, tools, [Suspension(), Policy(), ProviderPolicy()], saver,
+        middleware = [Suspension(), Policy(), ProviderPolicy()]
+        approval_tools = adapter.native_approval_tools
+        denied_approval_calls = set()
+        if approval_tools:
+            from .native_approval import native_approval_middleware
+
+            if not set(approval_tools) <= host_tools or not callable(adapter.wait_native_approval):
+                raise ValueError("native_approval_policy_unavailable")
+            middleware.append(native_approval_middleware(approval_tools))
+        graph = create_framework_agent(self.model, tools, middleware, saver,
                                        HarnessState, context_schema=_RunContext, **options)
         config = {"configurable": checkpoint_config or {"thread_id": identity.run_id},
                   "recursion_limit": max(64, self.limits.max_model_steps * 6 + 20)}
@@ -835,6 +859,23 @@ class HarnessRuntime:
 
                 result = await invoke_with_public_progress(graph, initial, config,
                     context=run_context, job_id=identity.run_id)
+                while approval_tools and result.interrupts and all(
+                        isinstance(item.value, dict) and item.value.get("type") == "tool_approval"
+                        for item in result.interrupts):
+                    from .native_approval import approval_resume, durable_approvals
+
+                    policy = {"scope": config["configurable"], "tool_names": approval_tools}
+                    parked = await graph.aget_state(config)
+                    requested = await asyncio.to_thread(durable_approvals, parked, identity, register=True, **policy)
+                    await adapter.wait_native_approval(identity, tuple(row.approval_id for row in requested))
+                    current = await graph.aget_state(config)
+                    records = await asyncio.to_thread(durable_approvals, current, identity, **policy)
+                    if tuple(row.binding for row in records) != tuple(row.binding for row in requested):
+                        raise AdmissionStopped("recovery_requires_reconciliation")
+                    next_input = approval_resume(current, identity, records=records, **policy)
+                    denied_approval_calls.update(row.binding.tool_call_id for row in records if row.status != "granted")
+                    result = await invoke_with_public_progress(graph, next_input, config,
+                        context=run_context, job_id=identity.run_id)
                 state = _interruption(await graph.aget_state(config)) if result.interrupts else result.value
             if timer.expired():
                 state = {**latest, "stop_status": "incomplete", "stop_reason": "deadline"}

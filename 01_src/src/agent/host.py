@@ -821,6 +821,13 @@ async def _run(state, identity, ledger):
             raise QuestionWakeDeferred("question_wake_ack_deferred") from exc
 
     from .native_execute_receipt import dispatch_once as guard_native_execute
+    from .native_approval import wait_for_approval_decisions
+
+    approval_tools = (("commit_document_index",) if settings.PERMISSION_NATIVE_SHARED_INDEX
+                      and "commit_document_index" in allowed else ())
+
+    async def wait_native_approval(who, keys):
+        await wait_for_approval_decisions(who, keys, timeout=settings.PERMISSION_WAIT_SEC)
 
     runtime = HarnessRuntime(model, execute, admit, check_final,
         RunLimits(max_model_steps=settings.AGENT_MAX_MODEL_CALLS, deadline=deadline),
@@ -834,7 +841,8 @@ async def _run(state, identity, ledger):
         not_run=not_run, check_terminal_orphan=lambda values: is_terminal_orphan(identity, values),
         restore_tool_observation=restore_tool_observation, model_call=metered_model,
         can_recover_output=lambda: task_events.budget_headroom(identity.run_id),
-        guard_native_execute=guard_native_execute,
+        guard_native_execute=guard_native_execute, native_approval_tools=approval_tools,
+        wait_native_approval=wait_native_approval if approval_tools else None,
         user_input=state.get("agent_question_resume"), bind_user_input=bind_user_input,
         accept_user_input=accept_user_input, acknowledge_user_input=acknowledge_user_input,
         check_retired_question=lambda run_id: asyncio.to_thread(user_questions.retired_question, identity, run_id))

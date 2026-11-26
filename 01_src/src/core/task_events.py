@@ -122,6 +122,12 @@ def _append(conn, job_id, event, data):
                 "AND json_extract(data, '$.note_id')=? LIMIT 1",
                 (job_id, data["note_id"])).fetchone():
             return None
+    if event == "permission_request" and data.get("approval_id"):
+        existing = conn.execute("SELECT seq,data,created_at FROM task_events WHERE job_id=? AND event=? "
+                                "AND json_extract(data,'$.approval_id')=? ORDER BY seq LIMIT 1",
+                                (job_id, event, data["approval_id"])).fetchone()
+        if existing:
+            return {"seq": existing[0], "event": event, "data": json.loads(existing[1]), "created_at": existing[2]}
     terminal = current_terminal_event(conn, job_id)
     if terminal is not None and event not in {"operation", "agent_recovery", "context_maintenance"}:
         # One terminal frame per explicitly admitted event generation. Earlier

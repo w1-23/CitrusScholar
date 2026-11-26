@@ -129,6 +129,7 @@ jobs:
             01_src/src/agent/model_length_recovery_test.py
             01_src/src/agent/subagent_runtime_test.py
             01_src/src/agent/context_compaction_test.py
+            01_src/src/agent/project_memory_test.py
             01_src/src/agent/native_approval_test.py
             01_src/src/agent/evidence_cache_test.py
             01_src/src/agent/sandbox_backend_test.py

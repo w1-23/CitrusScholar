@@ -153,7 +153,7 @@ function resetAccountState() {
   currentRoundId = 0; currentQuery = ''; totalTokens = 0;
   _agentTokenBuffer = ''; _agentTokenName = '';
   window._fullTextFromDone = {}; window._remapAppliedRounds = {};
-  _pendingPermission = null; _runtimeConfig = null; _providerModelLists = {};
+  resetPermissionCards(); _runtimeConfig = null; _providerModelLists = {};
   _providerCatalog = JSON.parse(JSON.stringify(_defaultProviderCatalog));
   signupAvatarDataUrl = ''; settingsAvatarDataUrl = '';
   signupAvatarPreset = '01'; settingsAvatarPreset = '01';
@@ -2241,6 +2241,8 @@ function renderMarkdownSafe(text) {
 /* ─── v8.4.3: 运行时配置（上下文预算/权限模式单一来源，删本地硬编码）─── */
 var _runtimeConfig = null;
 var _pendingPermission = null;
+var _permissionQueue = [];
+var _decidedPermissionIds = new Set();
 var _permWaitSec = 90;   /* v8.4.12: 审批卡片超时提示（config 下发，缺省 90s） */
 /* v8.5.0 开源版：未配置 API Key 时显示引导遮罩 */
 function maybeShowApiSetup(cfg) {
@@ -2545,7 +2547,44 @@ function applyAppVersion() {
 
 /* ─── v8.4.3/8.4.12: 权限审批卡片（授权动作不写入对话历史）───
    v8.4.12: 全 CSS 变量驱动（浅/深色模式一致），会话窗口上方居中弹出 */
+function resetPermissionCards() {
+  _pendingPermission = null;
+  _permissionQueue.length = 0;
+  _decidedPermissionIds.clear();
+  document.getElementById('permission-card')?.remove();
+}
+function advancePermissionCard() {
+  if (!_pendingPermission && _permissionQueue.length) showPermissionCard(_permissionQueue.shift());
+}
+function settlePermissionCard(id) {
+  if (id) {
+    _decidedPermissionIds.add(id);
+    if (_decidedPermissionIds.size > 128) _decidedPermissionIds.delete(_decidedPermissionIds.values().next().value);
+    _permissionQueue = _permissionQueue.filter(function (item) { return item.approval_id !== id; });
+  }
+  if (_pendingPermission && _pendingPermission.approval_id === id) {
+    document.getElementById('permission-card')?.remove();
+    _pendingPermission = null;
+  }
+  advancePermissionCard();
+}
+function syncPermissionCards(jobId, approvals) {
+  if (!jobId || !Array.isArray(approvals)) return;
+  var pending = approvals.filter(function (item) { return item.status === 'pending'; });
+  var ids = new Set(pending.map(function (item) { return item.approval_id; }));
+  _permissionQueue = _permissionQueue.filter(function (item) { return item.job_id !== jobId || ids.has(item.approval_id); });
+  if (_pendingPermission && _pendingPermission.job_id === jobId && !ids.has(_pendingPermission.approval_id)) {
+    settlePermissionCard(_pendingPermission.approval_id);
+  }
+  pending.forEach(function (item) { showPermissionCard(Object.assign({}, item, {job_id: jobId})); });
+}
 function showPermissionCard(data) {
+  var id = data.approval_id;
+  if (id && (_decidedPermissionIds.has(id) || _pendingPermission?.approval_id === id)) return;
+  if (_pendingPermission && id) {
+    if (!_permissionQueue.some(function (item) { return item.approval_id === id; })) _permissionQueue.push(data);
+    return;
+  }
   _pendingPermission = data;
   var existing = document.getElementById('permission-card');
   if (existing) existing.remove();
@@ -2577,7 +2616,7 @@ function decidePermission(toolName, decision, scope) {
       var data = await response.json();
       if (epoch !== authEpoch || sid !== sessionId || _pendingPermission !== pending) return;
       if (!response.ok) throw new Error(data.detail && data.detail.message || '权限决定未保存，请重试。');
-      if (card) card.remove(); _pendingPermission = null;
+      settlePermissionCard(pending?.approval_id);
       // Approval continues the original execution; never replay the chat POST.
     }).catch(function(error) {
       if (epoch !== authEpoch || sid !== sessionId || _pendingPermission !== pending) return;
@@ -2711,9 +2750,7 @@ function disposeTaskView(preserveQueue) {
   composerRunning = false;
   window._activeTurnStatusUpdater = null;
   if (currentAbortController) { currentAbortController.abort(); currentAbortController = null; }
-  var permission = document.getElementById('permission-card');
-  if (permission) permission.remove();
-  _pendingPermission = null;
+  resetPermissionCards();
   refreshTaskComposer();
 }
 
@@ -4408,18 +4445,7 @@ async function sendMsg(paperVerification, continueFrom) {
       }
       return;
     }
-    if (_pendingPermission && _pendingPermission.job_id === taskStore.state.job_id && Array.isArray(job.approvals)) {
-      var pendingApproval = job.approvals.find(function(approval) { return approval.approval_id === _pendingPermission.approval_id; });
-      if (!pendingApproval || pendingApproval.status !== 'pending') {
-        var staleApprovalCard = document.getElementById('permission-card'); if (staleApprovalCard) staleApprovalCard.remove();
-        _pendingPermission = null;
-      }
-    }
-    (job.approvals || []).forEach(function(approval) {
-      if (approval.status === 'pending' && (!_pendingPermission || _pendingPermission.approval_id !== approval.approval_id)) {
-        showPermissionCard(Object.assign({job_id: taskStore.state.job_id}, approval));
-      }
-    });
+    syncPermissionCards(taskStore.state.job_id, job.approvals);
     if (!job.terminal_snapshot || !CitrusTaskState.displayStatus(job) || hasTerminalEvent) return;
     applyTurnEnvelope({turn_envelope: job.terminal_snapshot});
     hasTerminalEvent = true; snapshotOnly = true; _turnDisconnected = false;
@@ -4628,10 +4654,7 @@ async function sendMsg(paperVerification, continueFrom) {
         showPermissionCard(data);
         break;
       case 'permission_decision':
-        if (_pendingPermission && _pendingPermission.approval_id === data.approval_id) {
-          var approvalCard = document.getElementById('permission-card'); if (approvalCard) approvalCard.remove();
-          _pendingPermission = null;
-        }
+        if (data.approval_id) settlePermissionCard(data.approval_id);
         break;
       case 'task_update':
         break; // Version/pending state is reduced by CitrusTaskState.
@@ -6041,17 +6064,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (binding && owns()) selectActiveTurn();
     if (!ownsComposer()) return;
     var state = store.state, terminal = CitrusTaskState.isTerminal(state);
-    var approvals = terminal ? [] : state.approvals;
-    if (_pendingPermission && _pendingPermission.job_id === state.job_id) {
-      var pending = approvals.find(function(item) { return item.approval_id === _pendingPermission.approval_id && item.status === 'pending'; });
-      if (!pending) {
-        var card = document.getElementById('permission-card'); if (card) card.remove();
-        _pendingPermission = null;
-      }
-    }
-    approvals.forEach(function(item) {
-      if (item.status === 'pending' && (!_pendingPermission || _pendingPermission.approval_id !== item.approval_id)) showPermissionCard(Object.assign({job_id: state.job_id}, item));
-    });
+    syncPermissionCards(state.job_id, terminal ? [] : state.approvals);
   }
   function snapshot(job) {
     if (!owns()) return;

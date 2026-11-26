@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from time import monotonic
 import uuid
 from typing import Any
 
@@ -162,11 +163,16 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
         if "RENDER_SCRIPT_EMIT_NOT_AVAILABLE" in described:
             payload["error_code"] = "render_script_emit_not_available"
         return content, payload
+    started = monotonic()
+    timing = dict(worker_execution_and_render=result.duration_ms, manifest_and_qa=0,
+                  publication=0, project_initialization=0)
     try:
         receipt = validate_receipt(result.outputs["result"], contract, job_id=job.job_id)
     except (KeyError, TypeError, ValueError):
         return _error("WORKER_PROTOCOL", "沙箱未确认版本2输出协议，请更新工作器。",
                       execution_stage="output_verification_failed")
+
+    timing["manifest_and_qa"] += int((monotonic() - started) * 1000)
 
     # Bind lineage to verified server inputs, not to caller-supplied owner/path.
     parents = {}
@@ -234,6 +240,7 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
                 figure.update(reason_code="figure_input_unavailable",
                               error="图件依赖的数据未成功保存。")
                 continue
+            started = monotonic()
             manifest_blob = result.outputs.get(f"figure:{name}:manifest")
             if not manifest_blob:
                 slot = receipt["slots"].get(f"figure:{name}:manifest", {})
@@ -251,6 +258,7 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
             figure["delivery_stage"] = "rendered"
             accept_current_render_qa(manifest, blobs, "initial")
             figure["current_qa"] = current_qa_summary(manifest)
+            timing["manifest_and_qa"] += int((monotonic() - started) * 1000)
             from src.figures.spec import parse_qa_profile
             qa = manifest.get("qa_receipt") or {}
             if (not isinstance(manifest.get("objects"), list) or qa.get("version") != 1
@@ -292,8 +300,11 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
                         contract=contract, figure=item, execution_id=execution_id,
                         fmt=fmt, logical_task_id=logical_task_id,
                         request_id=request_id, request_goal_id=request_goal_id)
-                    entry = _publish(f"{stem}{suffix}", payload, mime,
-                                     logical_task_id=publication_id)
+                    started = monotonic()
+                    try:
+                        entry = _publish(f"{stem}{suffix}", payload, mime, logical_task_id=publication_id)
+                    finally:
+                        timing["publication"] += int((monotonic() - started) * 1000)
                     record = {"format": fmt, **entry}
                     figure["exports"].append(record)
                     exports.append(record)
@@ -304,8 +315,10 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
             figure["delivery_stage"] = "figure_published"
             manifest["data_provenance"] = {"input_snapshots": source.get("input_snapshots", []),
                                           "dataset_refs": selected_refs, "execution_id": execution_id}
+            started = monotonic()
             project = _record_project(title=figure["title"], source_kind="script", source=figure_source,
                 manifest=manifest, exports=figure["exports"], data_refs=data_refs + selected_refs + frozen_refs)
+            timing["project_initialization"] += int((monotonic() - started) * 1000)
             if project:
                 from src.figures.projects import _can_edit
                 figure.update(figure_id=project["figure_id"], project_registered=True,
@@ -343,7 +356,7 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
     summary = {"execution_id": execution_id, "protocol_version": 2,
         "execution_stage": "worker_receipt_verified", "deliverable_stage": deliverable_stage,
         "script_sha256": script_hash, "backend": result.backend, "duration_ms": result.duration_ms,
-        "tables": tables, "dataset_refs": [item["dataset_ref"] for item in tables if item.get("dataset_ref")],
+        "timings_ms": timing, "tables": tables, "dataset_refs": [item["dataset_ref"] for item in tables if item.get("dataset_ref")],
         "figures": figures, "exports": exports, "figure_placeholders": placeholders,
         "stdout": receipt.get("stdout", ""),
         "note": "中间表为内部资产；正式附件仅包括已发布图件。执行成功不等于研究结论成立。",

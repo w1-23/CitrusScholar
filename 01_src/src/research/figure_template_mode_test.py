@@ -83,6 +83,12 @@ def _exercise(monkeypatch):
     assert result["timeout"]["unit"] == "worker_wall_clock_seconds"
     assert result["timeout"]["kind"] == "template"
     assert result["timeout"]["template"] == "volcano"
+    timing = result['timings_ms']
+    assert timing == json.loads(content)['timings_ms']
+    assert set(timing) == {'input_snapshot_and_replay', 'worker_execution_and_render',
+                           'manifest_and_qa', 'publication', 'project_initialization'}
+    assert all(type(value) is int and value >= 0 for value in timing.values())
+    assert timing['worker_execution_and_render'] == result['duration_ms']
     # Typography is recorded before publication.
     assert result["typography"]["style_policy"] == "template_registry"
     assert result["typography"]["embedding"]["pdf"] != "not_provided"

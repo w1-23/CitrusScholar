@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import logging
+from time import monotonic
 from typing import Any
 
 from langchain_core.tools import tool
@@ -250,6 +251,7 @@ def _run_research_figure_script(
         bindings = _json_arg(inputs_json, "inputs_json") or {}
         profile = parse_qa_profile(_json_arg(qa_profile_json, "qa_profile_json"))
         internal_file_ids = []
+        input_started = monotonic()
         replay_snapshots = (script_record or {}).get("replay_input_snapshots")
         analysis_ref = _json_arg(analysis_result_ref_json, "analysis_result_ref_json")
         analysis_meta = {}
@@ -319,6 +321,7 @@ def _run_research_figure_script(
     timeout_receipt = _describe_timeout(
         kind=timeout_kind, timeout_sec=timeout_sec, input_bytes=input_bytes,
         figures=figure_count, template_id=str((template_meta or {}).get("template_id") or ""))
+    timing = {"input_snapshot_and_replay": int((monotonic() - input_started) * 1000)}
     if contract:
         from src.research.script_execution import publish_script_outputs
         captured: dict[str, Any] = {}
@@ -336,10 +339,14 @@ def _run_research_figure_script(
             return published
         if isinstance(payload, dict):
             payload["timeout"] = timeout_receipt
+            if "timings_ms" in payload:
+                payload["timings_ms"].update(timing)
             _attach_typography(payload, style_record, captured.get("result"))
             payload.setdefault("mode", "template" if template_meta else "script")
             if template_meta:
                 payload["template"] = template_meta
+            if "timings_ms" in payload:
+                content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         return content, payload
     outputs = {fmt: f"figure.{fmt}" for fmt in formats}
     outputs["manifest"] = "objects.json"
@@ -372,6 +379,8 @@ def _run_research_figure_script(
             payload["diagnostic"] = result.diagnostic
         return content, payload
 
+    timing["worker_execution_and_render"] = result.duration_ms
+    started = monotonic()
     try:
         manifest_bytes = result.outputs["manifest"]
         if len(manifest_bytes) > 4 * 1024 * 1024:
@@ -389,6 +398,8 @@ def _run_research_figure_script(
         return _error("WORKER_PROTOCOL", "绘图沙箱没有返回完整对象清单，请更新沙箱镜像后重试。",
                       execution_stage="output_verification_failed")
 
+    timing["manifest_and_qa"] = int((monotonic() - started) * 1000)
+    started = monotonic()
     manifest["data_provenance"] = {"input_snapshots": snapshots,
                                    "snapshot_policy": source["snapshot_policy"], **analysis_meta}
     stem = output_name or title or "figure"
@@ -419,9 +430,12 @@ def _run_research_figure_script(
     if not published:
         return _error("PUBLISH", "请求格式均未交付。", execution_stage="figure_publication_failed")
 
+    timing["publication"] = int((monotonic() - started) * 1000)
+    started = monotonic()
     project = _record_project(
         title=title or stem, source_kind="script",
         source=source, manifest=manifest, exports=published, data_refs=data_refs)
+    timing["project_initialization"] = int((monotonic() - started) * 1000)
     workspace_url = f"/figures?project={project['figure_id']}" if project else ""
     if project:
         published.append({"format": "project", "figure_id": project["figure_id"],
@@ -452,6 +466,7 @@ def _run_research_figure_script(
         "figure_placeholder": placeholder,
         "backend": result.backend,
         "duration_ms": result.duration_ms,
+        "timings_ms": timing,
         "editable": False,
         "mode": "template" if template_meta else "script",
         "timeout": timeout_receipt,

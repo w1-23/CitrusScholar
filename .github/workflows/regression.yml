@@ -125,28 +125,28 @@ jobs:
             01_src/src/figures/workbench/d_audit_test.py \
             01_src/src/research/standalone_audit_workbook_format_test.py \
             01_src/src/retrieval/generation_boundary_test.py \
-            01_src/src/session/workspace_retention_test.py
-            01_src/src/agent/workspace_backend_test.py
-            01_src/src/agent/model_length_recovery_test.py
-            01_src/src/agent/subagent_runtime_test.py
-            01_src/src/agent/context_compaction_test.py
-            01_src/src/agent/project_memory_test.py
-            01_src/src/agent/native_approval_test.py
-            01_src/src/agent/evidence_cache_test.py
-            01_src/src/agent/sandbox_backend_test.py
-            01_src/src/agent/native_execute_receipt_test.py
-            01_src/src/code_execution/execution_bridge_test.py
-            01_src/src/agent/fusion_capability_test.py
-            01_src/src/agent/runtime_capability_table_test.py
-            01_src/src/research/fusion_csv_table_test.py
-            01_src/src/research/delivery_reconciliation_test.py
-            01_src/src/core/native_stream_projection_test.py
-            01_src/src/core/op_receipt_test.py
-            01_src/src/figures/preview_cache_test.py
-            01_src/src/research/figure_template_mode_test.py
-            01_src/src/research/nature_forward_compat_test.py
-            packages/citrus_figures/template_registry_test.py
-            packages/citrus_figures/typography_test.py
+            01_src/src/session/workspace_retention_test.py \
+            01_src/src/agent/workspace_backend_test.py \
+            01_src/src/agent/model_length_recovery_test.py \
+            01_src/src/agent/subagent_runtime_test.py \
+            01_src/src/agent/context_compaction_test.py \
+            01_src/src/agent/project_memory_test.py \
+            01_src/src/agent/native_approval_test.py \
+            01_src/src/agent/evidence_cache_test.py \
+            01_src/src/agent/sandbox_backend_test.py \
+            01_src/src/agent/native_execute_receipt_test.py \
+            01_src/src/code_execution/execution_bridge_test.py \
+            01_src/src/agent/fusion_capability_test.py \
+            01_src/src/agent/runtime_capability_table_test.py \
+            01_src/src/research/fusion_csv_table_test.py \
+            01_src/src/research/delivery_reconciliation_test.py \
+            01_src/src/core/native_stream_projection_test.py \
+            01_src/src/core/op_receipt_test.py \
+            01_src/src/figures/preview_cache_test.py \
+            01_src/src/research/figure_template_mode_test.py \
+            01_src/src/research/nature_forward_compat_test.py \
+            packages/citrus_figures/template_registry_test.py \
+            packages/citrus_figures/typography_test.py \
             packages/citrus_figures/timeouts_test.py
   release-contract:
     name: Immutable 8043 release contract

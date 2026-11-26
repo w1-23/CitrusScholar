@@ -195,6 +195,14 @@ def deliverable_segments(clause: str) -> list[str]:
     return segments
 
 
+_COMPACT_NEGATED_OUTPUT = re.compile(
+    r"(?:^|[，,、]|(?:且|并且|也))\s*(?:绝不|不)\s*$")
+
+
+def _negated_output_action(clause: str, start: int) -> bool:
+    return negated_before(clause, start) or bool(_COMPACT_NEGATED_OUTPUT.search(clause[:start]))
+
+
 def _output_tail(clause: str) -> tuple[str, str]:
     """Return ``(tail, clause)`` for the first positive output action.
 
@@ -212,7 +220,7 @@ def _output_tail(clause: str) -> tuple[str, str]:
             and not _EXPORT_DIRECT_COMMAND_RE.search(clause)):
         return "", clause
     for match in _EXPORT_ACTION_RE.finditer(clause):
-        if negated_before(clause, match.start()):
+        if _negated_output_action(clause, match.start()):
             continue
         # "导出链路 / 生成流程 / 导出功能" name an operation, not a command.
         if _ACTION_MENTION_SUFFIX_RE.match(clause[match.end():]):
@@ -276,7 +284,7 @@ _TOOL_USAGE_CLAUSE_RE = re.compile(
 def _has_positive_action(clause: str) -> bool:
     """True only for a real, non-negated command verb (not a noun mention)."""
     for match in _EXPORT_ACTION_RE.finditer(clause):
-        if negated_before(clause, match.start()):
+        if _negated_output_action(clause, match.start()):
             continue
         if _ACTION_MENTION_SUFFIX_RE.match(clause[match.end():]):
             continue
@@ -339,7 +347,7 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
             has_action = _has_positive_action(segment)
             if not tail:
                 if has_action or not active or re.search(
-                        r"不要|无需|不用|请勿|禁止|读取|上传|附件|输入|原始|read\b|input\b", segment, re.I):
+                        r"不要|无需|不用|请勿|禁止|(?:^|[、，,])\s*(?:绝不|不)\s*(?:绘图|绘制|画|导出|输出|生成|联网)|读取|上传|附件|输入|原始|read\b|input\b", segment, re.I):
                     continue
                 if not (_FORMAT_TOKEN_RE.search(segment) or deliverable_segment_has_output(segment)):
                     continue

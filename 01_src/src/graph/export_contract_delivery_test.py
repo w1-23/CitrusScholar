@@ -59,3 +59,16 @@ class GenericDeliveryEvidenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def test_compact_drawing_prohibition_is_not_a_missing_deliverable():
+    from src.graph.export_contract import deliverable_contract
+    from src.graph.task_contract import contract_for_turn
+
+    for query in ("只检查附件数值区块是否重复，给出证据和未覆盖范围，不绘图、不联网。",
+                  "逐条核验附件中的文献 DOI 和题名，优先正式登记来源，不绘图。"):
+        assert not deliverable_contract(query)
+        assert not contract_for_turn(query, has_tables=True).deliverables
+    assert [item["formats"] for item in deliverable_contract("不绘图，只给我一个 HTML 文件。") ] == [["html"]]
+    assert deliverable_contract("不绘图，但请导出 SVG 文件。")[0]["formats"] == ["svg"]

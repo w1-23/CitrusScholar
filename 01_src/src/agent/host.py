@@ -278,6 +278,10 @@ async def _run(state, identity, ledger):
         prompt += ("\n本轮科学方法范围：" + ", ".join(sorted(method_scope)) +
             "。仅用本轮工具完成用户目标；已取得足够的正式结果后直接交付，不重复运行或读取已有结果。"
             "单表 CSV 无工作表/区域；真实歧义才澄清。审查不附带作图；分析回执不等同于图件。")
+    if "nature-figure" in method_scope and "run_research_figure_script" in allowed:
+        prompt += ("\n绘图平台合同：本轮统一科研绘图工具运行 Python/Matplotlib。"
+                   "未指定语言而且没有既定任务语言时，直接使用这个后端，不询问 Python/R，不读取或写入默认偏好。"
+                   "明确指定 R 时保留该约束，不静默改用 Python；没有可用的 R 执行入口就说明限制。")
     if "local_hybrid_search" in host.allowed_names:
         try:
             from src.retrieval.corpus_registry import load_corpus_registry

@@ -162,7 +162,14 @@ def runtime(monkeypatch, tmp_path):
 
 def wait_for(predicate):
     deadline = monotonic() + 6
-    while not predicate():
+    while True:
+        try:
+            if predicate():
+                return
+        except sqlite3.OperationalError as exc:
+            # The live consumer may briefly own the database during an observation.
+            if getattr(exc, "sqlite_errorcode", 0) & 0xff not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                raise
         if monotonic() >= deadline:
             pytest.fail("expected queue transition did not happen")
         sleep(0.025)
@@ -325,14 +332,7 @@ def test_native_question_complete_http_and_protected_graph(runtime, monkeypatch,
         max_tokens=kwargs["max_tokens"], stream_usage=True, http_async_client=client))
 
     def wait_native(*expected):
-        def observed():
-            try:
-                return state(runtime, "native-http") in expected
-            except sqlite3.OperationalError as exc:
-                if exc.sqlite_errorcode not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
-                    raise
-                return False
-        wait_for(observed)
+        wait_for(lambda: state(runtime, "native-http") in expected)
 
     class SimulatedProcessLoss(BaseException):
         pass

@@ -112,7 +112,7 @@ class CandidatePreparation(unittest.TestCase):
         self.assertEqual(inventory, {p.relative_to(release).as_posix(): _sha(p.read_bytes())
                                     for p in release.rglob("*") if p.is_file() and p.name != "inventory.json"})
         bundle = payload("fusion/bundle.json")
-        self.assertEqual(bundle["skills"], dict.fromkeys(FUSION_IDS, "0.1.0") | {"data-audit": "0.1.2", "literature-verification": "0.1.2"})
+        self.assertEqual(bundle["skills"], dict.fromkeys(FUSION_IDS, "0.1.0") | {"data-audit": "0.1.3", "literature-verification": "0.1.2"})
         self.assertLessEqual(len(bundle["files"]), 94)
         for name, digest in bundle["files"].items():
             self.assertEqual(logical_path("/input/fusion/" + name), "/input/fusion/" + name)
@@ -149,6 +149,58 @@ class CandidatePreparation(unittest.TestCase):
         self.assertEqual(derived, _adapt_worker_sandbox(original, pin))
         with self.assertRaisesRegex(ValueError, "fusion_source_hash_mismatch: original sandbox.py"):
             _adapt_worker_sandbox(original + b"# tampered", pin)
+
+    def test_workbook_vba_scope_cannot_cross_worker_roles(self):
+        worker = self.active / "fusion/03_skill_fusion"
+        source = r'''import hashlib
+from pathlib import Path
+import tempfile
+from zipfile import ZipFile
+from contract import read_inputs
+
+content_type = b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/workbook.xml" ContentType="application/vnd.ms-excel.sheet.macroEnabled.main+xml"/><Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/></Types>'
+rels = b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>'
+with tempfile.TemporaryDirectory() as workspace:
+    root = Path(workspace)
+
+    def write(name, *, extra=None, types=content_type, relationships=rels):
+        path = root / name
+        with ZipFile(path, "w") as archive:
+            archive.writestr("[Content_Types].xml", types)
+            archive.writestr("xl/_rels/workbook.xml.rels", relationships)
+            archive.writestr("xl/vbaProject.bin", b"inert marker")
+            if extra:
+                archive.writestr(extra, b"inert marker")
+        return {"path": name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    def rejected(skill, role, ref, expected):
+        try:
+            read_inputs(root, [{**ref, "role": role}], skill=skill)
+        except ValueError as exc:
+            assert str(exc) == expected, str(exc)
+        else:
+            raise AssertionError((skill, role, ref, expected))
+
+    ref = write("workbook.xlsm")
+    assert read_inputs(root, [{**ref, "role": "workbook"}], skill="data-audit")["workbook"] == root / ref["path"]
+    for skill, role, attempt in (("data-audit", "table", ref), ("research-integrity", "workbook", ref),
+                                 ("literature-verification", "workbook", ref),
+                                 ("data-audit", "workbook", write("workbook.xlsx")),
+                                 ("data-audit", "workbook", write("other.xlsm"))):
+        rejected(skill, role, attempt, "archive_active_or_encrypted_content")
+    rejected("data-audit", "workbook", {**ref, "sha256": "0" * 64}, "input_hash_mismatch")
+    for extra in ("xl/vbaProjectSignature.bin", "xl/activeX/control.bin", "xl/macrosheets/sheet.xml", "xl/embeddings/ole.bin"):
+        rejected("data-audit", "workbook", write("workbook.xlsm", extra=extra), "archive_active_or_encrypted_content")
+    impostor = write("workbook.xlsm", types=content_type.replace(b"sheet.macroEnabled.main", b"sheet.main"))
+    rejected("data-audit", "workbook", impostor, "archive_workbook_type_mismatch")
+    external = write("workbook.xlsm", relationships=rels.replace(b'Target="vbaProject.bin"', b'Target="vbaProject.bin" TargetMode="External"'))
+    rejected("data-audit", "workbook", external, "archive_active_workbook_relationship")
+'''
+        environment = {**os.environ, "PYTHONPATH": str(worker)}
+        completed = subprocess.run([sys.executable, "-B", "-c", source], env=environment, cwd=self.root,
+                                   capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("标准 XLSM", (self.active / "skills/data-audit/INTERFACE_CONTRACT.md").read_text())
 
     def test_empty_enable_and_determinism(self):
         empty = self.stage("empty", "--include-runtime", "--enable")

@@ -213,6 +213,48 @@ def test_native_thread_accepts_new_turn_after_cancelling_model(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("failing_phase", ["first_turn", "later_turn", "before_checkpoint"])
+def test_framework_diagnostic_reports_only_the_failing_run_checkpoint(tmp_path, failing_phase):
+    async def scenario():
+        async def model(_, identity, **kwargs):
+            assert identity.run_id == "previous"
+            return AIMessage("previous answer")
+
+        def admit(_, identity):
+            if identity.run_id == "current":
+                raise AttributeError("fixture pre-model failure")
+
+        async def event(record):
+            if failing_phase == "before_checkpoint" and record.identity.run_id == "current":
+                raise AttributeError("fixture before checkpoint")
+
+        async def accept(*_):
+            return FinalCheck()
+
+        runtime = HarnessRuntime(ScriptedModel(script=model), None, admit, accept, RunLimits(), [], on_event=event)
+        previous = ExecutionIdentity(1, "diagnostic-session", "turn-1", "previous")
+        current = ExecutionIdentity(1, "diagnostic-session", "turn-2", "current")
+        provider = ("https://example.test", "fixture")
+        scope = framework_checkpoint_scope(current, provider)
+        config = {"configurable": scope}
+        async with open_framework_checkpoint(tmp_path, current, provider) as saver:
+            if failing_phase != "first_turn":
+                result = await runtime.run(previous, [HumanMessage("previous question")], saver=saver,
+                                           checkpoint_config=scope)
+                assert result.status == "complete"
+            with pytest.raises(AttributeError, match="^fixture"):
+                await runtime.run(current, [HumanMessage("current question")], saver=saver, checkpoint_config=scope)
+            saved = await saver.aget_tuple(config)
+            if failing_phase == "before_checkpoint":
+                assert saved.checkpoint["channel_values"]["active_run_id"] == previous.run_id
+                assert runtime.diagnostic_checkpoint == ""
+            else:
+                assert saved.checkpoint["channel_values"]["active_run_id"] == current.run_id
+                assert runtime.diagnostic_checkpoint == saved.checkpoint["id"]
+
+    asyncio.run(scenario())
+
+
 def test_framework_notification_keeps_the_real_user_turn():
     identity = ExecutionIdentity(1, "thread", "turn", "job")
     user = HumanMessage("question", additional_kwargs=identity.message_metadata("user"))

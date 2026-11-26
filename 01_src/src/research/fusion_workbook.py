@@ -55,11 +55,12 @@ def _text(value, limit=500):
     return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
-def _review_targets(report, digest):
+def _review_targets(report, digest, suffix):
     execution = report.get("execution") or {}
     inputs = execution.get("inputs") or []
     if (execution.get("skill") != "data-audit" or len(inputs) != 1
-            or inputs[0].get("role") != "workbook" or inputs[0].get("sha256") != digest):
+            or inputs[0].get("role") != "workbook" or inputs[0].get("sha256") != digest
+            or Path(inputs[0].get("path") or "").suffix.lower() != suffix):
         raise ValueError("Fusion report does not identify the authorized workbook")
     regions = (execution.get("options") or {}).get("regions") or []
     if not 1 <= len(regions) <= 16:
@@ -177,6 +178,7 @@ def _project_findings(report, digest, targets, bounds):
     return sorted(summaries, key=lambda item: (item["summary_location"], item["check"], item["detail"]))
 
 
+_XLSM_COPY_NOTICE = "由原始 XLSM 派生的无宏 XLSX 标注副本。VBA 和外部链接定义未保留，未运行宏或重算公式，原文件未修改。"
 _CSV_SHEET = "CSV 原始记录"
 _MAX_CSV_CELLS = 250_000
 _MAX_CSV_RECORDS = 5001
@@ -292,7 +294,7 @@ def publish_fusion_workbook(report, *, source_file_id, source_sha256, source_nam
     raise_if_cancelled("data_audit_workbook")
     suffix = Path(source_name).suffix.lower()
     if (not isinstance(source_file_id, str) or not source_file_id.strip() or len(source_file_id) > 256
-            or suffix not in {".xlsx", ".csv"} or not isinstance(source_bytes, bytes)
+            or suffix not in {".xlsx", ".xlsm", ".csv"} or not isinstance(source_bytes, bytes)
             or sha256(source_bytes).hexdigest() != source_sha256):
         raise ValueError("Authorized Fusion workbook identity does not match its bytes")
     status = report.get("status")
@@ -302,15 +304,18 @@ def publish_fusion_workbook(report, *, source_file_id, source_sha256, source_nam
         data, targets, summaries = _csv_workbook(report, source_bytes, source_sha256)
     else:
         data = source_bytes
-        areas, bounds = _review_targets(report, source_sha256)
+        areas, bounds = _review_targets(report, source_sha256, suffix)
         summaries = _project_findings(report, source_sha256, areas, bounds)
         targets = list(areas.values())
+    macro_free = suffix == ".xlsm"
     content, stats = export_reviewed_workbook(data, targets=targets,
-        source_sha256=source_sha256, original=suffix == ".xlsx", status=status, presentation="annotated",
-        exact_locations=True, summary_findings=summaries)
+        source_sha256=source_sha256, original=suffix != ".csv", status=status, presentation="annotated",
+        exact_locations=True, summary_findings=summaries, macro_free_copy=macro_free,
+        summary_note=_XLSM_COPY_NOTICE if macro_free else "")
     content = normalize_ooxml_bytes(content)
     digest = sha256(content).hexdigest()
-    filename = tools._short_stem(source_name) + ("_CSV派生_审查标注.xlsx" if suffix == ".csv" else "_审查标注.xlsx")
+    tag = {".csv": "_CSV派生", ".xlsm": "_XLSM无宏副本"}.get(suffix, "")
+    filename = tools._short_stem(source_name) + tag + "_审查标注.xlsx"
     publication_key = sha256(json.dumps([source_file_id, source_sha256, digest, "fusion-annotated/1"],
                                          separators=(",", ":")).encode()).hexdigest()
     raise_if_cancelled("data_audit_workbook")
@@ -322,4 +327,5 @@ def publish_fusion_workbook(report, *, source_file_id, source_sha256, source_nam
         raise ValueError("Fusion workbook was not registered")
     return {"url": url, "filename": filename, "sha256": digest, "size_bytes": len(content),
             "source_file_id": source_file_id, "source_sha256": source_sha256,
-            "file_index": 1, "cells": stats["marked_cells"], "source_format": suffix[1:]}
+            "file_index": 1, "cells": stats["marked_cells"], "source_format": suffix[1:],
+            **({"notice": _XLSM_COPY_NOTICE} if macro_free else {})}

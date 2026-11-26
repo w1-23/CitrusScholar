@@ -105,6 +105,13 @@ def _exercise_real_figure():
         outputs_json={'version': 2, 'tables': [], 'figures': []}, _sandbox_runner=runner)
     assert analysis['execution_stage'] == 'worker_receipt_verified', analysis
     assert analysis['deliverable_stage'] == 'analysis_only' and not analysis['_tool_outcome']['artifacts']
+    assert 'outputs_json.figures' in analysis['figure_delivery_notice']
+    tracing.set_original_query('只分析数据，不用画图。')
+    _, analysis_only = figure_tools._run_research_figure_script(script="emit.report({'checked': 5})\n",
+        outputs_json={'version': 2, 'tables': [], 'figures': []}, _sandbox_runner=runner)
+    assert analysis_only['deliverable_stage'] == 'analysis_only'
+    assert 'figure_delivery_notice' not in analysis_only
+    tracing.set_original_query('使用 Python 绘制散点图并导出 SVG。')
     _, missing = figure_tools._run_research_figure_script(script='pass\n',
         outputs_json=contract, _sandbox_runner=runner)
     assert missing['deliverable_stage'] == 'figure_unpublished' and not missing['exports'], missing

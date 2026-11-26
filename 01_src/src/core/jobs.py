@@ -528,7 +528,11 @@ def mark_interrupted_jobs() -> int:
                 conn.execute("UPDATE agent_execution_segments SET phase='cancel_parked',generation=generation+1,token=? WHERE job_id=?",
                              (uuid.uuid4().hex, run_id))
                 continue
-            if job["phase"] in {"parking", "resuming", "active", "restart_wait"}:
+            finalizing_question = job["phase"] == "finalizing" and conn.execute(
+                "SELECT 1 FROM task_questions WHERE job_id=? AND owner_user_id=? AND session_id=? "
+                "AND recovery_cursor=? AND status IN ('pending','expired') AND interrupt_id<>'' LIMIT 1",
+                (run_id, job["owner_user_id"], job["session_id"], task_events.recovery_cursor(conn, run_id))).fetchone()
+            if job["phase"] in {"parking", "resuming", "active", "restart_wait"} or finalizing_question:
                 # A protected wait can commit before the outer API records its
                 # reference. Startup inspects the exact protected graph either way.
                 conn.execute("UPDATE agent_execution_segments SET phase='restart_wait',generation=generation+1,token=? WHERE job_id=?",

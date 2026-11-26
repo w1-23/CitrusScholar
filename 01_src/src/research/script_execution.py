@@ -48,6 +48,14 @@ def _accept_frozen_render(item: dict, manifest: dict, parents: dict, table_hashe
     return {"version": 1, "input_snapshots": snapshots, "receipt": receipt}, refs
 
 
+def _requested_figures(query: str, *, has_tables: bool) -> list[dict]:
+    """Reuse the same user-turn deliverable contract as the host."""
+    from src.graph.task_contract import FIGURE_KINDS, contract_for_turn
+
+    return [item for item in contract_for_turn(query, has_tables=has_tables).deliverables
+            if FIGURE_KINDS.intersection(item.get("kinds", []))]
+
+
 def _singleton_figure_goal(*, query: str, has_tables: bool,
                            request_id: str, execution_id: str) -> str:
     """Return host evidence for exactly one requested figure, else ``""``.
@@ -63,10 +71,7 @@ def _singleton_figure_goal(*, query: str, has_tables: bool,
             or len(_FIGURE_NOUN_RE.findall(text)) != 1):
         return ""
     try:
-        from src.graph.task_contract import FIGURE_KINDS, contract_for_turn
-        requirements = contract_for_turn(text, has_tables=has_tables).deliverables
-        figures = [item for item in requirements
-                   if FIGURE_KINDS.intersection(item.get("kinds", []))]
+        figures = _requested_figures(text, has_tables=has_tables)
     except Exception:
         return ""
     if len(figures) != 1:
@@ -129,8 +134,10 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
         # non-empty execution id below is the safe, turn-local fallback.
         pass
     request_id = str(get_client_request_id() or "")
+    query = original_query()
+    has_tables = bool(source.get("input_snapshots"))
     request_goal_id = _singleton_figure_goal(
-        query=original_query(), has_tables=bool(source.get("input_snapshots")),
+        query=query, has_tables=has_tables,
         request_id=request_id, execution_id=execution_id)
     job = SandboxJob(script=text, inputs=inputs, sources=paths,
         expected_input_sha256=hashes, qa_profile=profile,
@@ -342,6 +349,12 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
         "note": "中间表为内部资产；正式附件仅包括已发布图件。执行成功不等于研究结论成立。",
         "_tool_outcome": {"status": status, "reason_code": reason,
                           "artifacts": [item["artifact_url"] for item in exports if item.get("artifact_url")]}}
+    if not figures and query and any(requirement.get("phase", "initial") != "edit"
+                                     for requirement in _requested_figures(query, has_tables=has_tables)):
+        summary["figure_delivery_notice"] = (
+            "本次仅分析，未生成图件。若仍缺本轮请求的图件，下次应声明 outputs_json.figures "
+            "后实际渲染，不要再次做同样的只分析步骤。匹配的模板或脚本优先按 script_ref 执行，"
+            "已产出的中间表可通过 dataset_ref 绑定。改变输出契约须发起新运行，不用 repair_from_run_id。")
     failed_formats = [receipt["slots"][f"figure:{item['name']}:{fmt}"]
                       for item in contract["figures"] for fmt in item["formats"]]
     if (status == "failed" and not publication_started and failed_formats

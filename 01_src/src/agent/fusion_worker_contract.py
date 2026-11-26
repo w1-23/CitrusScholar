@@ -31,7 +31,8 @@ OPTION_KEYS = {
                                      "shared_image_pairs", "tolerance", "gel_lanes"}),
 }
 IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff"})
-EXTENSIONS = {"bibliography": {".pdf", ".bib"}, "workbook": {".xlsx"},
+WORKBOOK_EXTENSIONS = frozenset({".xlsx", ".xlsm"})
+EXTENSIONS = {"bibliography": {".pdf", ".bib"}, "workbook": WORKBOOK_EXTENSIONS,
               "table": {".csv"}, "source": {".csv", ".tsv", ".xlsx"},
               "reported": {".csv", ".tsv", ".xlsx"}, "gel": IMAGE_EXTS}
 ROLES = {"literature-verification": {"bibliography"}, "data-audit": {"workbook"},
@@ -100,7 +101,7 @@ def load_bundle(release: Path, skill: str) -> Bundle:
             or manifest["schema"] != "citrus.fusion-bundle/1" or manifest["entrypoint"] != ENTRYPOINT
             or type(manifest["skills"]) is not dict or not set(manifest["skills"]) <= SKILLS
             or any(version not in {
-                "data-audit": {"0.1.0", "0.1.1", "0.1.2"},
+                "data-audit": {"0.1.0", "0.1.1", "0.1.2", "0.1.3"},
                 "literature-verification": {"0.1.0", "0.1.1", "0.1.2"},
                 "research-integrity": {"0.1.0"},
             }[name] for name, version in manifest["skills"].items())

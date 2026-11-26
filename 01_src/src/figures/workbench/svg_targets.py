@@ -121,6 +121,24 @@ class SvgTargets:
         return tuple(self.nodes[ident][0] for ident in ids if len(self.nodes[ident]) == 1
                      and self._belongs_to(self.nodes[ident][0], owner))
 
+    def visual_mark(self, mark, annotation):
+        """Validate a renderer-declared standalone path group in the precise SVG."""
+        index, gid = mark.get("axes_index"), mark.get("gid")
+        owner = self.axes.get(index) if type(index) is int else None
+        if owner is None or not isinstance(gid, str):
+            return None
+        if mark.get("parent_gid") is not None:
+            if (not annotation or annotation["locator"].get("axes_index") != index
+                    or annotation.get("artist") != "Annotation" or mark.get("role") != "arrow"
+                    or gid != annotation["gid"] + ".workbench_arrow"):
+                return None
+        elif not re.fullmatch(re.escape(owner.get("id")) + r"\.workbench_patch_[0-9]+", gid):
+            return None
+        node = self._group(gid, owner)
+        if node is not None and len(node) and all(child.tag == _SVG + "path" and child.get("d") for child in node):
+            return node
+        return None
+
     def projection(self, nodes):
         clips = set()
         for node in nodes:

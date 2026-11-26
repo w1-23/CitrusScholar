@@ -126,7 +126,9 @@ class _Registries:
         def add(provider, key, lookup):
             receipt = self._request(provider, key, lookup, deadline, attempts)
             records.extend(receipt["records"])
-            return receipt["status"]
+
+        def exact_doi_records():
+            return [row for row in records if providers.normalize_doi(row.get("doi")) == value]
 
         if query.kind == "doi":
             # The parser sees registries only, even if an identifier contains punctuation.
@@ -134,10 +136,11 @@ class _Registries:
                     part in {"", ".", ".."} for part in value.split("/")):
                 return Observation("DOI registries", 0, error="invalid_identifier")
             encoded = quote(value, safe="/")
-            status = add("Crossref", ["doi", value], lambda: literature._crossref_work(encoded))
-            if status == 404 or (status == 200 and not any(row.get("doi") == value for row in records)):
+            add("Crossref", ["doi", value], lambda: literature._crossref_work(encoded))
+            if not exact_doi_records():
+                # An unknown or failed dispatch does not rule out an independent registry.
                 add("DataCite", ["doi", value], lambda: literature._datacite_work(encoded))
-            if (status in (200, 404) and not any(row.get("doi") == value and row.get("retracted") is True for row in records)):
+            if not any(row.get("retracted") is True for row in exact_doi_records()):
                 add("OpenAlex", ["doi", value], lambda: literature._openalex_work(encoded))
         elif query.kind == "arxiv":
             exact = f"10.48550/arxiv.{value}"
@@ -153,15 +156,17 @@ class _Registries:
                 add("OpenAlex", ["title", value], lambda: literature._openalex_search(value, 3))
         statuses = [attempt["http_status"] for attempt in attempts]
         error = ""
-        if records:
+        if records and (query.kind != "doi" or exact_doi_records()):
             status = 200
         elif 429 in statuses:
-            status = 429
+            # The adapter already cools down the affected provider. A partial multi-source
+            # failure must not cool down the complete DOI or title lookup route.
+            status, error = (0, "rate_limited") if query.kind in {"doi", "search"} else (429, "")
         elif any(status not in (200, 404) for status in statuses):
             status = next(status for status in statuses if status not in (200, 404))
             error = next((row["reason"] for row in attempts if row["http_status"] == status and row["reason"]), "provider_error")
         else:
-            status = 404
+            status = 200 if records else 404
         with self.lock:
             self.attempts[query] = attempts
         return Observation(" + ".join(dict.fromkeys(row["provider"] for row in attempts)), status,

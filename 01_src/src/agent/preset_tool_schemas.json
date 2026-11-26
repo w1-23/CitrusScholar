@@ -816,7 +816,7 @@
       "type": "function",
       "function": {
         "name": "search_literature",
-        "description": "检索学术文献身份（题名/自然语言/DOI/arXiv 号/作者+年份），返回候选记录、来源链接、相似度、字段冲突与各数据库错误状态。中文题名会自动补英文检索；可多次并行调用以核对多篇文献。未检索到不代表文献不存在。只给 DOI/arXiv 号时，请把引用串里写出的题名放进 claimed_title，工具会核对题名是否被改写（title_variant 冲突）。",
+        "description": "查找学术文献候选（题名/自然语言/DOI/arXiv 号/作者+年份），返回来源链接、相似度、字段冲突与各登记库状态。候选不是核验结论。批量核验已有参考文献时，若本轮提供 verify_uploaded_references，可一次传入列表、文本或附件。未检索到不代表文献不存在。有引用题名时传入 claimed_title，可检查标识符对应记录的题名是否冲突。",
         "parameters": {
           "properties": {
             "query": {

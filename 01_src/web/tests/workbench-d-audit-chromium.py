@@ -376,6 +376,32 @@ def run(browser, api, output):
     assert next(g for g in native2['groups'] if g['id'] == two[0]['id'])['values']['color'] == '#5b1258'
     assert next(g for g in native2['groups'] if g['id'] == two[1]['id'])['values'] == two[1]['values']
 
+    marks_path = project(api, 'Frozen arrow and patch ink')
+    open_project(page, marks_path)
+    marks = json.loads(api.call('GET', marks_path)['body'])
+    mark_objects = marks['object_contract']['objects']
+    mark_groups = {g['id']: g for g in marks['groups'] if g['kind'] in ('arrow', 'patch')}
+    assert sorted(g['kind'] for g in mark_groups.values()) == ['arrow', 'arrow', 'patch']
+    assert {mark_objects[g['parent']]['role'] for g in mark_groups.values()} == {'annot', 'panel'}
+    for group_id in mark_groups:
+        binding = mark_objects[group_id]
+        assert not binding['capabilities'] and binding['readonlyReason']
+        assert len(binding['geometry']['svgIds']) == 1
+        mark = geometry(page, binding, expected=group_id)
+        page.mouse.click(mark['x'], mark['y'])
+        assert chosen(page) == group_id
+        expect(page.get_by_role('button', name='应用到此组')).to_have_count(0)
+    page.screenshot(path=str(output / 'native-arrow-patch.png'))
+    mark_series = next(g for g in marks['groups'] if g['kind'] == 'series')
+    edit_mark_project = {'expected_revision': 1, 'draft_revision': 19, 'source_sha256': marks['source_sha256'],
+                         'commands': [{'group_id': mark_series['id'], 'property': 'color', 'value': '#6b4a25'}]}
+    saved_marks = api.call('POST', marks_path + '/save', edit_mark_project)
+    assert saved_marks['status'] == 200, saved_marks['body']
+    after_marks = json.loads(saved_marks['body'])
+    assert after_marks['source_sha256'] == marks['source_sha256']
+    assert {gid: after_marks['object_contract']['objects'][gid]['geometry'] for gid in mark_groups} == {
+        gid: mark_objects[gid]['geometry'] for gid in mark_groups}
+
     r_path = project(api, 'Pinned ggplot2')
     for _ in range(5):
         r_first.append(open_project(page, r_path))
@@ -410,9 +436,28 @@ def run(browser, api, output):
     page.reload()
     expect(page.locator('#revision')).to_have_text('版本 2')
     assert b'#386294' in api.call('GET', r_path + '/export/svg?revision=2')['body']
+    def pick_in_narrow_view(view, press):
+        expect(view.get_by_role('button', name='对象组', exact=True)).to_be_visible()
+        zoom = view.get_by_label('自定义画布缩放百分比')
+        zoom.fill('190')
+        view.get_by_role('button', name='应用画布缩放').click()
+        narrow_point = geometry(view, r_obj, expected=r_obj['objectId'])
+        assert view.locator('#canvas').evaluate('node => node.scrollWidth > node.clientWidth && node.scrollLeft > 0')
+        assert view.evaluate('document.documentElement.scrollWidth === innerWidth')
+        press(narrow_point['x'], narrow_point['y'])
+        expect(view.locator('#inspector')).to_be_visible()
+        expect(view.locator('#inspectorTitle')).to_be_focused()
+        assert chosen(view) == r_obj['objectId']
+
     page.set_viewport_size({'width': 390, 'height': 760})
-    expect(page.get_by_role('button', name='对象组', exact=True)).to_be_visible()
+    pick_in_narrow_view(page, page.mouse.click)
     page.screenshot(path=str(output / 'r-narrow.png'))
+    touch = browser.new_context(viewport={'width': 390, 'height': 760}, is_mobile=True, has_touch=True)
+    touch.route('**/*', api.route)
+    touch_page = touch.new_page()
+    open_project(touch_page, r_path)
+    pick_in_narrow_view(touch_page, touch_page.touchscreen.tap)
+    touch.close()
 
     ordinary = project(api, 'Ordinary SVG')
     open_project(page, ordinary)
@@ -433,11 +478,15 @@ def run(browser, api, output):
     assert duplicate != saved_svg
     duplicate_hash = sha256(duplicate).hexdigest()
 
+    def replace_contract(response, **overrides):
+        altered = {**saved_detail, 'object_contract': {**saved_detail['object_contract'], **overrides}}
+        response['body'] = json.dumps(altered).encode()
+        response['headers']['content-length'] = str(len(response['body']))
+
     def duplicate_response(url, response):
         if url == tss_url:
-            altered = {**saved_detail, 'object_contract': {**saved_detail['object_contract'], 'renderKey': duplicate_hash}}
-            response['body'] = json.dumps(altered).encode()
-            response['headers']['content-length'] = str(len(response['body']))
+            replace_contract(response, renderKey=duplicate_hash,
+                             objects={key: {**entry, 'renderKey': duplicate_hash} for key, entry in tss_objects.items()})
         if url == path + '/preview/svg?revision=3':
             response['body'] = duplicate
             response['headers'].update({'x-figure-sha256': duplicate_hash, 'content-length': str(len(duplicate))})
@@ -447,6 +496,20 @@ def run(browser, api, output):
     expect(page.locator('#preview')).to_be_visible()
     expect(page.locator('#picking')).to_be_disabled()
     expect(page.locator('#groupTree')).to_be_visible()
+
+    # A trusted preview can still arrive with an incompatible object snapshot.
+    # Keep its exact image and working tree, but never hit the stale assignments.
+    for overrides in ({'revision': 2}, {'renderKey': '0' * 64}, {'objectId': 'wrong-object'}):
+        def stale_objects(url, response):
+            if url == tss_url:
+                replace_contract(response, objects={key: {**entry, **overrides} for key, entry in tss_objects.items()})
+
+        api.mutate = stale_objects
+        page.reload()
+        expect(page.locator('#preview')).to_be_visible()
+        expect(page.locator('#picking')).to_be_disabled()
+        expect(page.locator('#groupTree')).to_be_visible()
+        assert page.locator('#preview').evaluate('node => !node.classList.contains("interactive-preview")')
 
     def wrong_digest(url, response):
         if url == path + '/preview/svg?revision=3':

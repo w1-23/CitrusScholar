@@ -268,10 +268,16 @@ def test_two_questions_preserve_original_queue_position_through_cleanup(runtime)
     assert sum(row["event"] == "agent_recovery" for row in events) == 2
 
 
-def test_native_question_complete_http_and_protected_graph(runtime, monkeypatch, tmp_path):
+@pytest.mark.parametrize("crash_phase,decision", [
+    ("none", "answer"), ("before_binding", "answer"), ("before_terminal", "answer"),
+    ("before_binding", "expired"), ("before_terminal", "cancelled"),
+])
+def test_native_question_complete_http_and_protected_graph(runtime, monkeypatch, tmp_path, crash_phase, decision):
     import json
     import httpx
     from langchain_openai import ChatOpenAI
+    from src.agent.execution_segments import ExecutionSegments
+    from src.agent.identity import ExecutionIdentity
     from src.agent.native_send_budget_test import BASE, PROVIDER, _chat_stream
     from src.config import ModelTransport, settings
     from src.core.provider_transport import AsyncDeepSeekTransport
@@ -281,6 +287,7 @@ def test_native_question_complete_http_and_protected_graph(runtime, monkeypatch,
     monkeypatch.setattr("src.config.PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(type(settings), "model_transport",
         lambda *_args, **_kwargs: ModelTransport("deepseek", PROVIDER, BASE, "fixture", {}))
+    monkeypatch.setattr("src.core.tool_results._schema_ready", False)
     monkeypatch.setattr("src.agent.recovery.load_recovery_state", runtime.real_checkpoint_loader)
     monkeypatch.setattr(graph, "build_graph", lambda _: build_general_agent_graph())
     wire = []
@@ -312,17 +319,83 @@ def test_native_question_complete_http_and_protected_graph(runtime, monkeypatch,
     monkeypatch.setattr("src.core.llm_pool.get_llm", lambda **kwargs: ChatOpenAI(use_responses_api=False,
         model=PROVIDER, api_key="fixture", base_url=BASE, max_retries=0,
         max_tokens=kwargs["max_tokens"], stream_usage=True, http_async_client=client))
+
+    def wait_native(*expected):
+        def observed():
+            try:
+                return state(runtime, "native-http") in expected
+            except sqlite3.OperationalError as exc:
+                if exc.sqlite_errorcode not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    raise
+                return False
+        wait_for(observed)
+
+    class SimulatedProcessLoss(BaseException):
+        pass
+
+    def crash_before_binding(*args, **kwargs):
+        raise SimulatedProcessLoss()
+
+    def crash_before_terminal(self, *args, **kwargs):
+        assert kwargs["status"] == "awaiting_input"
+        raise SimulatedProcessLoss()
+
     try:
-        turn = send(runtime, "native-http", original)
-        run = turn["job_id"]
-        wait_for(lambda: state(runtime, "native-http") in {"terminal", "awaiting_input"})
+        with monkeypatch.context() as interruption:
+            if crash_phase == "before_binding":
+                interruption.setattr(user_questions, "save_question_context", crash_before_binding)
+            elif crash_phase == "before_terminal":
+                interruption.setattr(ExecutionSegments, "finish_terminal", crash_before_terminal)
+            turn = send(runtime, "native-http", original)
+            run = turn["job_id"]
+            if crash_phase != "none":
+                wait_native(queue.RECONCILE_REQUIRED)
+        if crash_phase != "none":
+            before = runtime.client.get(f"/jobs/{run}/events").json()["events"]
+            assert not any(item["event"] == "done" for item in before)
+            job = jobs.get_job(run)
+            identity = ExecutionIdentity(runtime.owner, runtime.sid, job["request_id"], run)
+            segment = ExecutionSegments(identity)
+            expected_phase = "active" if crash_phase == "before_binding" else "finalizing"
+            assert segment.snapshot()["phase"] == expected_phase
+            with task_events.transaction() as conn:
+                if decision == "expired":
+                    conn.execute("UPDATE task_questions SET expires_at=1 WHERE job_id=?", (run,))
+                draft = dict(conn.execute("SELECT * FROM task_questions WHERE job_id=?", (run,)).fetchone())
+            assert bool(draft["interrupt_id"]) == (crash_phase == "before_terminal")
+            assert len(wire) == 1
+            jobs.mark_interrupted_jobs()
+            for _ in range(2):
+                runtime.client.portal.call(main._reconcile_turn_queue_startup)
+            assert len(wire) == 1
+            restored = runtime.client.get(f"/jobs/{run}/events").json()["events"]
+            paused, = [item["data"]["question"] for item in restored if item["event"] == "done"]
+            for key in ("id", "version", "expires_at"):
+                assert paused[key] == draft[key]
+            assert paused["interrupt_id"] and (not draft["interrupt_id"] or paused["interrupt_id"] == draft["interrupt_id"])
+            if decision == "expired":
+                assert paused["status"] == "expired"
+                assert not any(item["event"] == "request_user_input" for item in restored)
+                wait_native("terminal")
+                halted = queue.get_turn(owner_user_id=runtime.owner, session_id=runtime.sid, client_request_id="native-http")
+                assert halted["clear_reason"] == "question_expired" and len(wire) == 1
+                return
+        wait_native("terminal", "awaiting_input")
         assert state(runtime, "native-http") == "awaiting_input"
         first = runtime.client.get(f"/jobs/{run}/events").json()["events"]
         parked, = [item["data"]["question"] for item in first if item["event"] == "request_user_input"]
         assert parked["options"][0]["refs"] == [] and parked["interrupt_id"]
+        if decision == "cancelled":
+            assert not answer_question(runtime, run, cancelled=True)["resume_job_id"]
+            wait_native("terminal")
+            halted = queue.get_turn(owner_user_id=runtime.owner, session_id=runtime.sid, client_request_id="native-http")
+            assert halted["clear_reason"] == "question_cancelled" and len(wire) == 1
+            return
         assert answer_question(runtime, run)["resume_job_id"] == run
-        wait_for(lambda: state(runtime, "native-http") == "terminal")
+        wait_native("terminal")
         assert jobs.get_job(run)["status"] == "completed"
+        duplicate = answer_question(runtime, run, question=parked)
+        assert not duplicate["created"] and duplicate["resume_job_id"] == run
         with task_events.read_transaction() as conn:
             assert conn.execute("SELECT COUNT(*) FROM task_jobs WHERE parent_job_id=?", (run,)).fetchone()[0] == 0
             assert conn.execute("SELECT COUNT(*) FROM task_operations WHERE job_id=? AND tool_name='request_user_input'", (run,)).fetchone()[0] == 1

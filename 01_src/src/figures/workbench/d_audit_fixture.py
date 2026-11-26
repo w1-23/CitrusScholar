@@ -28,6 +28,8 @@ def seed(library, patch, r_source):
     library.spec(tss, title='TSS synthetic reconstruction')
     source, manifest, original, refs = native_multipanel(library, patch)
     library.project(source, manifest, original, title='Native frozen two-panel', kind='script', refs=refs)
+    source, manifest, original, refs = native_multipanel(library, patch, visual_marks=True)
+    library.project(source, manifest, original, title='Frozen arrow and patch ink', kind='script', refs=refs)
     library.spec(leaf(), OTHER, 'Foreign')
     ordinary = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 80"><title>Ordinary</title>' \
                '<desc>Static sample</desc><circle id="standalone" cx="45" cy="35" r="24" fill="#174488"/></svg>'

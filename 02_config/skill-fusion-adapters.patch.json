@@ -1,8 +1,36 @@
 {
+  "INTERFACE_CONTRACT.md": [
+    [
+      "`workbook` 接受 XLSX。",
+      "`workbook` 接受 XLSX 和标准 XLSM。XLSM 的普通 VBA 项目仅为不透明输入，不执行、不审查，不支持签名、旧式宏工作表、ActiveX、嵌入对象或加密。公式仅使用原缓存与静态分析，不重算。申请标注时仅交付清楚标明的无宏 XLSX 副本，保留原件不变。"
+    ]
+  ],
+  "contract.py": [
+    [
+      "def inspect_zip(path):",
+      "def inspect_zip(path, *, allow_vba=False):"
+    ],
+    [
+      "            if entry.flag_bits & 1 or any(x in name for x in (\"vbaproject\", \"macrosheets\", \"activex\", \"embeddings\")):\n                raise ValueError(\"archive_active_or_encrypted_content\")",
+      "            # VBA bytes are opaque to Data Audit. No other active part is allowed.\n            opaque_vba = allow_vba and entry.filename == \"xl/vbaProject.bin\"\n            if entry.flag_bits & 1 or (not opaque_vba and any(\n                    marker in name for marker in (\"vbaproject\", \"macrosheet\", \"activex\", \"embeddings\"))):\n                raise ValueError(\"archive_active_or_encrypted_content\")\n        if allow_vba:\n            validate_vba_metadata(archive)\n\n\ndef validate_vba_metadata(archive):\n    # Match the native OOXML workbook and the one standard VBA part, never just the suffix.\n    from xml.etree import ElementTree as ET\n\n    def metadata(path):\n        info = archive.getinfo(path)\n        if info.file_size > 1 << 20:\n            raise ValueError(\"archive_workbook_metadata_size\")\n        text = archive.read(info).decode(\"utf-8-sig\")\n        if \"<!DOCTYPE\" in text.upper() or \"<!ENTITY\" in text.upper():\n            raise ValueError(\"archive_workbook_xml_declaration\")\n        return ET.fromstring(text)\n\n    project = \"xl/vbaProject.bin\"\n    markers = (\"vbaproject\", \"macrosheet\", \"activex\", \"embeddings\")\n    ct = \"{http://schemas.openxmlformats.org/package/2006/content-types}\"\n    rel = \"{http://schemas.openxmlformats.org/package/2006/relationships}Relationship\"\n    types = metadata(\"[Content_Types].xml\")\n    workbook_types = [node.get(\"ContentType\", \"\").lower() for node in types.findall(ct + \"Override\")\n                      if node.get(\"PartName\") == \"/xl/workbook.xml\"]\n    if workbook_types != [\"application/vnd.ms-excel.sheet.macroenabled.main+xml\"]:\n        raise ValueError(\"archive_workbook_type_mismatch\")\n    active_types = [node for node in types if any(x in node.get(\"ContentType\", \"\").lower() for x in markers)]\n    if any(node.get(\"ContentType\", \"\").lower() != \"application/vnd.ms-office.vbaproject\" or not (\n             (node.tag == ct + \"Default\" and node.get(\"Extension\") == \"bin\") or\n             (node.tag == ct + \"Override\" and node.get(\"PartName\") == \"/\" + project)) for node in active_types):\n        raise ValueError(\"archive_active_workbook_content_type\")\n    relationships = metadata(\"xl/_rels/workbook.xml.rels\")\n    active_rels = [node for node in relationships.findall(rel) if any(\n        x in (node.get(\"Type\", \"\") + node.get(\"Target\", \"\")).lower() for x in markers)]\n    if any(node.get(\"Type\") != \"http://schemas.microsoft.com/office/2006/relationships/vbaProject\"\n           or node.get(\"TargetMode\") not in (None, \"Internal\")\n           or node.get(\"Target\") not in (\"vbaProject.bin\", \"/\" + project) for node in active_rels):\n        raise ValueError(\"archive_active_workbook_relationship\")\n    expected = int(project in archive.namelist())\n    if not len(active_types) == len(active_rels) == expected:\n        raise ValueError(\"archive_inconsistent_workbook_vba_metadata\")"
+    ],
+    [
+      "def read_inputs(root, refs):",
+      "def read_inputs(root, refs, *, skill=None):"
+    ],
+    [
+      "            inspect_zip(path)",
+      "            inspect_zip(path, allow_vba=(skill == \"data-audit\" and role == \"workbook\"\n                                         and ref[\"path\"] == \"workbook.xlsm\"))"
+    ]
+  ],
   "data-audit/manifest.json": [
     [
       "\"version\": \"0.1.0\"",
       "\"version\": \"0.1.2\""
+    ],
+    [
+      "\"version\": \"0.1.2\"",
+      "\"version\": \"0.1.3\""
     ]
   ],
   "data-audit/scripts/adapter.py": [
@@ -89,6 +117,26 @@
     [
       "    output[\"findings_total\"] = len(output[\"findings\"]) + output[\"findings\"].omitted",
       "    for row in output[\"coverage\"]:\n        row.setdefault(\"scope\", \"confirmed_region\")\n        row.setdefault(\"method_version\", METHOD_VERSION)\n    for item in output[\"findings\"]:\n        item[\"evidence\"].setdefault(\"method_version\", METHOD_VERSION)\n        item[\"evidence\"].setdefault(\"reason\", \"review source evidence and scope before correction\")\n    output[\"findings_total\"] = len(output[\"findings\"]) + output[\"findings\"].omitted"
+    ],
+    [
+      "METHOD_VERSION = \"fusion-data-audit/0.1.2\"",
+      "METHOD_VERSION = \"fusion-data-audit/0.1.3\""
+    ],
+    [
+      "    call = subprocess.run([sys.executable, \"-B\", str(cli), str(path), \"--json\", \"-\", \"--fail-on\", \"None\"],\n                          capture_output=True, text=True, timeout=22)\n    if call.returncode not in (0, 2) or not call.stdout.strip():\n        raise RuntimeError(\"spreadsheet_auditor_unavailable: \" + call.stderr[-500:])\n    raw = json.loads(call.stdout)",
+      "    # Never delegate XLSX/XLSM to a spreadsheet application, even if one is installed.\n    with tempfile.NamedTemporaryFile(mode=\"w\", suffix=\".json\", dir=os.environ[\"MPLCONFIGDIR\"]) as config:\n        json.dump({\"recalc\": {\"enabled\": False}}, config)\n        config.flush()\n        call = subprocess.run([sys.executable, \"-B\", str(cli), str(path), \"--config\", config.name,\n                               \"--json\", \"-\", \"--fail-on\", \"None\"],\n                              capture_output=True, text=True, timeout=22)\n    if call.returncode not in (0, 2, 6) or not call.stdout.strip():\n        raise RuntimeError(\"spreadsheet_auditor_unavailable: \" + call.stderr[-500:])\n    raw = json.loads(call.stdout)\n    coverage = raw[\"coverage\"]\n    if (coverage.get(\"recalculation\") or {}).get(\"status\") != \"disabled\":\n        raise ValueError(\"spreadsheet_auditor_recalculation_not_disabled\")"
+    ],
+    [
+      "    coverage = raw[\"coverage\"]\n    complete = coverage.get(\"complete\", False)",
+      "    complete = coverage.get(\"complete\", False)"
+    ],
+    [
+      "    if not path or path.suffix.lower() != \".xlsx\" or not regions:\n        output[\"status\"] = \"unsupported\"\n        output[\"limitations\"].append(\"provide an XLSX workbook and explicitly confirmed regions\")",
+      "    if not path or path.suffix.lower() not in {\".xlsx\", \".xlsm\"} or not regions:\n        output[\"status\"] = \"unsupported\"\n        output[\"limitations\"].append(\"provide an XLSX or XLSM workbook and explicitly confirmed regions\")"
+    ],
+    [
+      "    with closing(load_workbook(path, keep_links=False)) as workbook, closing(\n            load_workbook(path, keep_links=False, data_only=True)) as formula_cache:",
+      "    if path.suffix.lower() == \".xlsm\":\n        output[\"limitations\"].append(\"VBA is not executed or audited; only worksheet cells, cached values and static formulas are inspected\")\n    with closing(load_workbook(path, keep_vba=False, keep_links=False)) as workbook, closing(\n            load_workbook(path, keep_vba=False, keep_links=False, data_only=True)) as formula_cache:"
     ]
   ],
   "literature-verification/manifest.json": [
@@ -137,6 +185,12 @@
     [
       "    observed = json.loads(inputs[\"observations\"].read_bytes()) if \"observations\" in inputs else {}\n    cassette = observed.get(\"http\", {})",
       "    if \"observations\" not in inputs:\n        return batch_report(response, rows, None)\n    observed = json.loads(inputs[\"observations\"].read_bytes())\n    if \"reference_batch\" in observed:\n        return batch_report(response, rows, observed[\"reference_batch\"])\n    cassette = observed.get(\"http\", {})"
+    ]
+  ],
+  "run.py": [
+    [
+      "        inputs = read_inputs(input_root, request.get(\"inputs\", []))",
+      "        inputs = read_inputs(input_root, request.get(\"inputs\", []), skill=args.skill)"
     ]
   ]
 }

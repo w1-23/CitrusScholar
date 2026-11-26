@@ -66,14 +66,15 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         tracing.set_user_id(7)
         tracing.set_session_id(self.sid)
 
-    def delivery(self, call_id, content):
+    def delivery(self, call_id, content, *, tool_name="analyze", args=None):
         reference = tool_results.record_with_reference(tool_call_id=call_id, session_id=self.sid,
-            request_id="request", tool_name="analyze", status="complete", result_text=content)
+            request_id="request", tool_name=tool_name, status="complete", result_text=content)
         self.assertIsNotNone(reference)
-        original = ToolMessage(content=content, name="analyze", tool_call_id=call_id,
+        self.assertTrue(tool_results.pin_references(self.sid, [call_id]))
+        original = ToolMessage(content=content, name=tool_name, tool_call_id=call_id,
                                additional_kwargs={"result_reference": reference},
                                artifact={"op_receipt": {"status": "complete"}})
-        return first_delivery(original, call={}, reader_available=True)
+        return first_delivery(original, call={"args": args or {}}, reader_available=True)
 
     def serialized(self, text):
         return len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
@@ -89,6 +90,69 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view["control_observation"]["next_action"], "read")
         self.assertEqual(view["read_with"]["tool"], "read_tool_result")
         self.assertEqual(tool_results.fetch_for_current_request(result.tool_call_id)["result_text"], original)
+
+    async def test_large_figure_receipt_delivers_exact_reuse_and_actual_outcome(self):
+        script_ref = {"kind": "research_script", "id": "a" * 32, "version": 2, "sha256": "b" * 64}
+        dataset_ref = {**script_ref, "kind": "dataset_snapshot", "id": "c" * 32}
+        artifact_url = "/api/artifact/example/real.svg"
+        for status, stage, artifacts in (("partial", "figure_published", [artifact_url]),
+                                         ("failed", "figure_unpublished", [])):
+            with self.subTest(status=status):
+                receipt = {"report": "long QA" * 10_000,
+                    "deliverable_stage": stage, "execution_stage": "worker_receipt_verified",
+                    "script_ref": script_ref, "run_id": "d" * 32, "dataset_refs": [dataset_ref],
+                    "_tool_outcome": {"status": status, "reason_code": "script_outputs_incomplete",
+                                      "artifacts": artifacts},
+                    "figures": [{"name": "f", "status": status, "delivery_stage": "rendered",
+                                 "reason_code": "figure_verification_failed", "qa": "detail" * 9000}]}
+                content = json.dumps(receipt)
+                result = self.delivery("figure-" + status, content, tool_name="run_research_figure_script")
+                view = json.loads(result.content)["control_observation"]
+                self.assertLessEqual(self.serialized(result.content), FIRST_DELIVERY_BYTES)
+                self.assertEqual(view["script_ref"], script_ref)
+                self.assertEqual(view["dataset_refs"], [dataset_ref])
+                self.assertEqual(view["run_id"], receipt["run_id"])
+                self.assertEqual(view["deliverable_stage"], stage)
+                self.assertEqual(view["_tool_outcome"], receipt["_tool_outcome"])
+                self.assertEqual(view["figure_stages"][0]["reason_code"], "figure_verification_failed")
+                self.assertEqual(tool_results.fetch_for_current_request(result.tool_call_id)["result_text"], content)
+
+    async def test_workspace_list_discovers_usable_refs_without_source_readback(self):
+        from contextlib import nullcontext
+        from src import config
+        from src.research import script_assets, script_presets
+        from src.research.workspace_tools import research_workspace
+
+        with (patch.object(config, "PROJECT_ROOT", Path(self.session_store.db_path).parent),
+              patch.object(script_assets, "_lease", return_value=nullcontext())):
+            source = "# synthetic private source marker\nprint(2)\n"
+            private = script_assets.save_script(7, self.sid, name="private.py", source=source)
+            scripts = [private["script_ref"]]
+            for index in range(1, 15):
+                saved = script_assets.save_script(7, self.sid, name=f"fixture_{index}.py", source=f"print({index})")
+                scripts.insert(0, saved["script_ref"])
+            args = {"operation": "list"}
+            content = research_workspace.invoke(args)
+            self.assertNotIn("render_script", content)
+            self.assertNotIn("private source marker", content)
+            delivered = self.delivery("workspace-list", content, tool_name="research_workspace", args=args)
+            self.assertLessEqual(self.serialized(delivered.content), FIRST_DELIVERY_BYTES)
+            view = json.loads(delivered.content)["workspace_overview"]
+            presets = script_presets.list_presets()
+            self.assertEqual([item["script_ref"] for item in view["presets"]],
+                             [item["script_ref"] for item in presets])
+            self.assertEqual(view["presets"][1]["parameter_names"], list(presets[1]["parameters"]))
+            self.assertEqual(view["scripts"][0]["script_ref"], scripts[0])
+            self.assertGreater(view["scripts_omitted"], 0)
+            detailed = json.loads(research_workspace.invoke({"operation": "read", "script_ref": scripts[-1]}))
+            self.assertEqual(detailed["source"], source)
+            builtin = json.loads(research_workspace.invoke({"operation": "read", "script_ref": presets[1]["script_ref"]}))
+            self.assertIn("render_script", builtin["outputs"]["figures"][0])
+            tracing.set_user_id(8)
+            self.addCleanup(tracing.set_user_id, 7)
+            other = json.loads(research_workspace.invoke({"operation": "read", "script_ref": scripts[-1]}))
+            self.assertNotIn("source", other)
+            self.assertEqual(other["_tool_outcome"]["status"], "failed")
 
     async def test_escaped_surrogate_in_field_name_keeps_verified_reference(self):
         original = json.dumps({"\ud800": "x" * 5000, "status": "complete"})

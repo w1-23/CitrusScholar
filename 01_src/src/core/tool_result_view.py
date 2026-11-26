@@ -26,6 +26,58 @@ _CONTROL_PRIORITY = (
 )
 
 
+_SCRIPT_PRIORITY = (
+    "_tool_outcome", "deliverable_stage", "execution_stage", "figure_delivery_notice",
+    "script_ref", "run_id", "failure_phase", "error_code", "figure_stages", "dataset_refs", "error",
+)
+
+
+class _JsonNumber(str):
+    """Keep the original spelling of numbers in general previews."""
+
+
+def _asset_ref(value):
+    # These identity tuples contain a version integer expected verbatim by the
+    # workspace and script runner. Do not convert arbitrary scientific numbers.
+    if not isinstance(value, dict) or set(value) != {"kind", "id", "version", "sha256"}:
+        return None
+    kind, identity, version, digest = (value[key] for key in ("kind", "id", "version", "sha256"))
+    if (kind not in ("research_script", "builtin_script", "dataset_snapshot")
+            or not isinstance(identity, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", identity)
+            or not isinstance(version, _JsonNumber) or not re.fullmatch(r"[1-9][0-9]{0,18}", version)
+            or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)):
+        return None
+    return {**value, "version": int(version)}
+
+
+def _script_controls(value):
+    value["script_ref"] = _asset_ref(value.get("script_ref"))
+    if isinstance(value.get("dataset_refs"), list):
+        value["dataset_refs"] = [ref for item in value["dataset_refs"] if (ref := _asset_ref(item))]
+    if isinstance(value.get("figures"), list) and value["figures"]:
+        value["figure_stages"] = [
+            {key: item[key] for key in ("name", "status", "delivery_stage", "reason_code")
+             if isinstance(item.get(key), str)}
+            for item in value["figures"][:8] if isinstance(item, dict)]
+    return value
+
+
+def _workspace_overview(value):
+    def rows(items, *, builtin):
+        for item in items:
+            if not isinstance(item, dict) or not (ref := _asset_ref(item.get("script_ref"))):
+                continue
+            if builtin:
+                parameters = item.get("parameters")
+                yield {"script_ref": ref, "parameter_names": list(parameters) if isinstance(parameters, dict) else []}
+            else:
+                name = item.get("name")
+                yield {"script_ref": ref, "name": name if isinstance(name, str) else ""}
+
+    return {key: list(rows(value[key], builtin=key == "presets"))
+            for key in ("presets", "scripts") if isinstance(value.get(key), list)}
+
+
 def _json(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -182,11 +234,11 @@ def first_delivery(message, *, call: dict, reader_available: bool):
     index = []
     control = {}
     total_controls = 0
-    table_overview = None
+    table_overview = workspace_overview = None
     try:
         # Keep the original spelling of numbers; the reference, not this view,
         # is authoritative evidence for scientific quantities and units.
-        value = json.loads(text, parse_float=str, parse_int=str, parse_constant=str)
+        value = json.loads(text, parse_float=_JsonNumber, parse_int=_JsonNumber, parse_constant=_JsonNumber)
         if isinstance(value, dict):
             if message.name == "inspect_uploaded_table":
                 table_overview = _table_overview(value)
@@ -197,8 +249,15 @@ def first_delivery(message, *, call: dict, reader_available: bool):
                 content_wire_bytes(index)
             except UnicodeError:
                 index = []
-            for key in _CONTROL_PRIORITY:
-                if key in value:
+            priority = _CONTROL_PRIORITY
+            if message.name == "run_research_figure_script":
+                value = _script_controls(value)
+                priority = tuple(dict.fromkeys((*_SCRIPT_PRIORITY, *_CONTROL_PRIORITY)))
+            elif message.name == "research_workspace" and (call.get("args") or {}).get("operation", "list") == "list":
+                workspace_overview = _workspace_overview(value)
+                content_wire_bytes(workspace_overview)  # Fail closed on malformed text below.
+            for key in priority:
+                if key in value and value[key] is not None:
                     total_controls += 1
                     try:
                         if content_wire_bytes(_json(value[key])) <= FIRST_DELIVERY_BYTES:
@@ -206,7 +265,7 @@ def first_delivery(message, *, call: dict, reader_available: bool):
                     except (ValueError, TypeError, RecursionError):
                         continue
     except (ValueError, TypeError, RecursionError):
-        pass
+        workspace_overview = None
     artifact = message.artifact if isinstance(message.artifact, dict) else {}
     receipt = artifact.get("op_receipt")
     status = receipt.get("status") if isinstance(receipt, dict) else None
@@ -234,6 +293,15 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         payload["table_overview"] = table_overview
         payload.pop("previews")
 
+    if workspace_overview:
+        payload["delivery"] = "stored_result_reference"
+        payload["workspace_overview"] = workspace_overview
+        payload.pop("previews")
+        payload["notice"] = ("内置预设可直接按 script_ref 执行。只需查参数说明时，按字段读取；"
+                             "仅修改源码时才调用 research_workspace.read。")
+        for group in ("scripts", "presets"):
+            workspace_overview[group + "_omitted"] = 0
+
     def render():
         payload["control_fields_omitted"] = total_controls - len(control)
         return _json(payload)
@@ -251,6 +319,12 @@ def first_delivery(message, *, call: dict, reader_available: bool):
     while content_wire_bytes(rendered) > FIRST_DELIVERY_BYTES and control:
         control.pop(next(reversed(control)))
         rendered = render()
+    if workspace_overview:
+        for group in ("scripts", "presets"):
+            while content_wire_bytes(rendered) > FIRST_DELIVERY_BYTES and workspace_overview.get(group):
+                workspace_overview[group].pop()
+                workspace_overview[group + "_omitted"] += 1
+                rendered = render()
     if content_wire_bytes(rendered) > FIRST_DELIVERY_BYTES:
         return _failure(message, "result_reference_too_large", verified=True)
     metadata = {**message.additional_kwargs, "first_delivery_reference": True}

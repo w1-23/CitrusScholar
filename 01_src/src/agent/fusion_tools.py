@@ -217,9 +217,9 @@ def _workbook_source(identity, reference):
 
 @tool(args_schema=RunArgs, response_format="content_and_artifact")
 def run_external_skill(skill_id: SkillID, inputs=None, options=None):
-    """Run the pinned external literature, XLSX data-audit, or research-integrity Skill. Use exact authorized file_id and sha256 per input role. Data audit needs workbook and scoped regions. Literature accepts bibliography and/or typed references. No raw observations or URLs are accepted."""
+    """Run the pinned external literature, XLSX/XLSM data-audit, or research-integrity Skill. Use exact authorized file_id and sha256 per input role. Data audit needs workbook and scoped regions. Literature accepts bibliography and/or typed references. No raw observations or URLs are accepted."""
     from .fusion_worker import schedule_fusion
-    from .fusion_worker_contract import confirmed_workbook_regions
+    from .fusion_worker_contract import WORKBOOK_EXTENSIONS, confirmed_workbook_regions
 
     try:
         identity, call_id, release = _bound(skill_id)
@@ -228,10 +228,18 @@ def run_external_skill(skill_id: SkillID, inputs=None, options=None):
         if skill_id == "data-audit":
             from contextlib import closing
             from citrus_audit.readers import open_xlsx_readonly
+            from citrus_audit._zip_safety import validate_macro_workbook
 
             data, filename = _workbook_source(identity, refs["workbook"])
-            if Path(filename).suffix.lower() != ".xlsx":
-                return _response({"error": "此 Skill 只支持 .xlsx 工作簿。"}, "not_run", "external_workbook_format_unsupported")
+            suffix = Path(filename).suffix.lower()
+            if suffix not in WORKBOOK_EXTENSIONS:
+                return _response({"error": "此 Skill 只支持 .xlsx 或 .xlsm 工作簿。"}, "not_run", "external_workbook_format_unsupported")
+            if suffix == ".xlsm":
+                try:
+                    validate_macro_workbook(data)
+                except ValueError:
+                    return _response({"error": "无法安全解析此 XLSM。仅支持标准 OOXML 工作簿和普通 VBA 项目，不支持签名、宏工作表、ActiveX、嵌入对象或加密。"},
+                                     "not_run", "external_workbook_format_unsupported")
             regions = (options or {}).get("regions")
             _, query, _, confirmation = _delivery.get()
             try:
@@ -419,7 +427,7 @@ def _deliver(identity, value, execution_id, skill_id, *, findings_offset=0, hist
             raw, name = (historical_fusion_source(identity, value, ref) if historical else _workbook_source(identity, ref))
             artifact = publish_fusion_workbook(curated, source_file_id=ref["file_id"],
                 source_sha256=ref["sha256"], source_name=name, source_bytes=raw)
-        public["workbook"] = {k: artifact[k] for k in ("filename", "url", "cells", "source_format")}
+        public["workbook"] = {k: artifact[k] for k in ("filename", "url", "cells", "source_format", "notice") if k in artifact}
         return _response(public, status, "external_skill_report", receipts=[artifact])
     except (KeyError, LookupError, ValueError, PermissionError, OSError):
         public["report_file_error"] = "请求的正式文件未生成；已接受审查结论仍可用。"

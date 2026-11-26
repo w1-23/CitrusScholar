@@ -15,7 +15,7 @@ def system_prompt(available: set[str]) -> str:
         ("deepseek_search", "联网检索"),
         ("deepseek_fetch", "网页正文提取"),
         ("deepseek_fetch_paper", "在线论文提取"),
-        ("search_literature", "公开文献目录核验"),
+        ("search_literature", "公开文献候选查找"),
         ("browse_web", "交互浏览公开网页与下载"),
     ) if name in available]
     if network_modes:

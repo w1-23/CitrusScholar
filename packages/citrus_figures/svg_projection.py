@@ -114,6 +114,41 @@ def projection_manifest(rendered, bbox):
     return metadata
 
 
+def visual_marks(rendered):
+    """Name known painted marks outside the persisted replay target inventory."""
+    from matplotlib.patches import Arrow, Circle, Ellipse, FancyArrow, FancyArrowPatch, PathPatch, Polygon, Rectangle, Wedge
+    from matplotlib.text import Annotation
+
+    arrows = {Arrow, FancyArrow, FancyArrowPatch}
+    patches = {Circle, Ellipse, PathPatch, Polygon, Rectangle, Wedge}
+    panels = {entry["axes_index"]: gid for gid, entry in rendered.locators.items() if entry.get("role") == "axes"}
+    owned = {id(member) for entry in rendered.locators.values() for member in
+             (entry.get("artist"), *(entry.get("members") or ()), *(entry.get("error_members") or ()))}
+    result = []
+    for i, ax in enumerate(rendered.axes):
+        if i not in panels or getattr(ax, "_colorbar", None) is not None:
+            continue
+        for index, patch in enumerate(ax.patches):
+            kind = type(patch)
+            if id(patch) not in owned and kind in arrows | patches:
+                result.append((f"{panels[i]}.workbench_patch_{index}", i, "arrow" if kind in arrows else "patch", patch, None))
+    for gid, entry in rendered.locators.items():
+        artist = entry.get("artist")
+        axis = entry.get("axes_index")
+        if entry.get("role") == "annot" and axis in panels and type(artist) is Annotation:
+            if type(artist.arrow_patch) is FancyArrowPatch:
+                result.append((f"{gid}.workbench_arrow", axis, "arrow", artist.arrow_patch, gid))
+    if len(result) > 200:
+        return []  # Leave dense unmatched marks in the original SVG, not the picking index.
+    points = []
+    for gid, axis, role, artist, parent in result:
+        if artist.get_gid() not in {None, gid}:
+            continue  # Preserve an SVG id explicitly chosen by the source author.
+        artist.set_gid(gid)
+        points.append({"gid": gid, "axes_index": axis, "role": role, "parent_gid": parent})
+    return points
+
+
 def annotate_svg(source: str, rendered) -> str:
     """Identify actual Line2D marker instances before flattening removes use.
 

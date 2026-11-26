@@ -1,11 +1,14 @@
 {
   "adapter_revisions": {
-    "patch_sha256": "c61e985f631747985e2b11baeb6724c17e50e53e45156f0662b88c3ebbac1c7e",
+    "patch_sha256": "a864f13abce151a7d77e75bf5665ea3287bd8243c8ea2c32755e54ce291773ce",
     "staged_sha256": {
-      "data-audit/manifest.json": "e8362da266b32d9f11589b283c9013820824a407086ce90b029dc0ac04154103",
-      "data-audit/scripts/adapter.py": "37d2011708d8ee11ff8706a2a0aa018b70ab634405b36137ba3a43a459a0fc85",
+      "INTERFACE_CONTRACT.md": "2931c9cf246cc214148f3ac198b10ef38ed7220316a61b5a72b456383a5c6fc2",
+      "contract.py": "f17657a24cea5354c4f2133bfa2e7f082558e714624aae5b0b127fb082fdcfe1",
+      "data-audit/manifest.json": "ab9e0666b015567fab676f3aba8ee45b75b29fbc71c7a72c24e2361febcc3a04",
+      "data-audit/scripts/adapter.py": "5bd5a9c9941bf58363dc7bd877589b6e92ddf071737da58252ba5e2a0b93adff",
       "literature-verification/manifest.json": "9ca6610a97972c16c7a1631abd11a0be534f67bdd2862982ce0479fd27563ea5",
-      "literature-verification/scripts/adapter.py": "9146f1d92cb894f9e02dbf12586a0e30053b8a51f868af073b0f8f7c4831437c"
+      "literature-verification/scripts/adapter.py": "9146f1d92cb894f9e02dbf12586a0e30053b8a51f868af073b0f8f7c4831437c",
+      "run.py": "cef1d410eb6acf696019d00d4c29e7427dbf99b8667a70eed439dce85dab14e0"
     }
   },
   "eda_license": {

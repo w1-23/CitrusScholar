@@ -7,11 +7,12 @@ const MOVABLE = new Set(['title', 'xlabel', 'ylabel', 'legend', 'annot', 'colorb
 
 export async function imageAsset(response, format, expectedDigest) {
   const blob = await response.blob();
-  const asset = { url: URL.createObjectURL(blob), svg: '', width: 0, height: 0 };
+  const asset = { url: URL.createObjectURL(blob), svg: '', digest: null, width: 0, height: 0 };
   try {
     if (expectedDigest) {
       const bytes = await blob.arrayBuffer();
       if (await hexDigest(bytes) !== expectedDigest) throw new Error('预览内容与已登记的摘要不一致。');
+      asset.digest = expectedDigest;
       if (format === 'svg') asset.svg = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     }
     const image = new Image();
@@ -25,6 +26,19 @@ export async function imageAsset(response, format, expectedDigest) {
     URL.revokeObjectURL(asset.url);
     throw error;
   }
+}
+
+function verifiedObjects(project, asset) {
+  const contract = project.object_contract;
+  if (!asset.svg || !asset.digest || contract?.renderKey !== asset.digest ||
+      contract.revision !== project.render_version || !contract.objects ||
+      typeof contract.objects !== 'object' || Array.isArray(contract.objects)) return null;
+  const groups = new Set(project.groups.map((group) => group.id));
+  const entries = Object.entries(contract.objects);
+  if (!entries.length || entries.some(([id, entry]) => !groups.has(id) || entry?.objectId !== id ||
+      entry.revision !== contract.revision || entry.renderKey !== contract.renderKey ||
+      !Array.isArray(entry.geometry?.svgIds))) return null;
+  return contract.objects;
 }
 
 export class CanvasView {
@@ -86,9 +100,9 @@ export class CanvasView {
     this.image.src = asset.url;
     this.image.alt = project.title;
     this.pickCycle = null;
-    const contract = project.object_contract;
-    if (asset.svg && contract?.renderKey && Object.keys(contract.objects).length) {
-      try { this.scene = new SvgScene(this.mount, asset.svg, contract.objects); }
+    const objects = verifiedObjects(project, asset);
+    if (objects) {
+      try { this.scene = new SvgScene(this.mount, asset.svg, objects); }
       catch { this.mount.shadowRoot?.replaceChildren(); }
     }
     this.image.classList.toggle('interactive-preview', !!this.scene?.enabled);

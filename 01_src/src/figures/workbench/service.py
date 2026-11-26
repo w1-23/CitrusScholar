@@ -1,6 +1,7 @@
 """Adapt authorized figure revisions into the workbench's group vocabulary."""
 from __future__ import annotations
 
+from collections import Counter
 import xml.etree.ElementTree as ET
 
 from citrus_figures.workbench_styles import COLORMAPS
@@ -9,7 +10,7 @@ from src.figures.declarative_snapshot import SnapshotError, load_snapshot
 from src.figures.document import SCHEMA, _digest
 from src.figures.workbench import artifacts, nature_vectors
 from src.figures.workbench.frozen_script_identity import FrozenScriptIdentity
-from src.figures.workbench.groups import Inventory, invalid
+from src.figures.workbench.groups import Inventory, _group_id, invalid
 from src.figures.workbench.object_contract import contract
 from src.figures.workbench.svg_targets import SvgTargets
 
@@ -59,7 +60,8 @@ def list_assets(owner, *, limit, offset, query="", kind="", chart="", access="")
             if access:
                 if nature_vectors.is_plot(row):
                     try:
-                        editable = bool(nature_vectors.detail(row, owner)["groups"])
+                        snapshot = nature_vectors.detail(row, owner)
+                        editable = any(group["properties"] for group in snapshot["groups"])
                     except projects.ProjectError:
                         editable = False
                 elif editable is None:
@@ -163,6 +165,39 @@ def _inventory(project, owner, *, check_preview=True, preview_svg=None):
                                             disabled="图件的已保存对象清单无法验证。")
 
 
+def _visual_marks(project, manifest, inventory, groups, geometry):
+    """Expose exact native paint for inspection without creating replay targets."""
+    marks = manifest.get("workbench_marks")
+    if not isinstance(marks, list) or len(marks) > 200:
+        return
+    valid = [mark for mark in marks if isinstance(mark, dict) and isinstance(mark.get("gid"), str)]
+    ids = Counter(mark["gid"] for mark in valid)
+    panels, annotations = {}, {}
+    for group in inventory.groups.values():
+        if not group.rows:
+            continue
+        row = group.rows[0]
+        if group.kind == "panel":
+            panels[row["locator"]["axes_index"]] = group.id
+        elif group.kind == "annot":
+            annotations[row["gid"]] = (group.id, row)
+    labels = {"arrow": "箭头", "patch": "独立形状"}
+    for mark in valid:
+        gid, role, index, parent_gid = (mark.get(key) for key in ("gid", "role", "axes_index", "parent_gid"))
+        if (not isinstance(role, str) or role not in labels or type(index) is not int or index not in panels
+                or ids[gid] != 1 or gid in inventory.rows or parent_gid is not None and not isinstance(parent_gid, str)):
+            continue
+        parent_id, annotation = annotations.get(parent_gid, (panels[index], None))
+        node = inventory.svg_targets.visual_mark(mark, annotation)
+        if node is None:
+            continue
+        ident = _group_id(project["figure_id"], ("visual_mark", gid))
+        groups.append({"id": ident, "kind": role, "label": labels[role], "parent": parent_id,
+                       "pick_ids": [gid], "properties": [], "values": {}, "line_marker_fill": False,
+                       "reason": "此标记可精确选取，但其样式和几何未开放重放。"})
+        geometry[ident] = (role, *inventory.svg_targets.projection((node,)))
+
+
 def _present(project, manifest, inventory, *, formats, draft_revision=None):
     groups = inventory.public() if manifest["objects"] else []
     targets = inventory.svg_targets
@@ -181,6 +216,7 @@ def _present(project, manifest, inventory, *, formats, draft_revision=None):
                 artist = group.rows[0].get("artist")
                 role = {"Line2D": "line", "PathCollection": "scatter", "Rectangle": "patch"}.get(artist, role)
             geometry[group.id] = (role, *targets.projection(nodes))
+        _visual_marks(project, manifest, inventory, groups, geometry)
     return {"figure_id": project["figure_id"], "title": project.get("title") or "未命名图件",
             "render_version": project["render_version"], "read_only_reason": inventory.disabled,
             "groups": groups, "format_capabilities": formats,

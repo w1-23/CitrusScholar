@@ -53,7 +53,28 @@ def _source():
     return output.getvalue()
 
 
-def _report(digest):
+def _macro_package(normal, *, extra=None, project=True):
+    """Native OOXML metadata and an inert (not executable) project marker."""
+    output = BytesIO()
+    with ZipFile(BytesIO(normal)) as source, ZipFile(output, "w") as target:
+        for entry in source.namelist():
+            data = source.read(entry)
+            if entry == "[Content_Types].xml":
+                data = data.replace(b"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                                    b"application/vnd.ms-excel.sheet.macroEnabled.main+xml")
+                if project:
+                    data = data.replace(b"</Types>", b'<Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/></Types>')
+            elif entry == "xl/_rels/workbook.xml.rels" and project:
+                data = data.replace(b"</Relationships>", b'<Relationship Id="rId99" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>')
+            target.writestr(entry, data)
+        if project:
+            target.writestr("xl/vbaProject.bin", b"synthetic inert marker, not a VBA program")
+        if extra:
+            target.writestr(extra, b"additional inactive fixture marker")
+    return output.getvalue()
+
+
+def _report(digest, *, suffix="xlsx"):
     def loc(cells=None, region="brix", sheet=PRIMARY, **other):
         return dict(source_file_hash=digest, sheet_name=sheet, region_id=region, cell_range=cells, **other)
 
@@ -63,7 +84,7 @@ def _report(digest):
 
     return {
         "status": "partial",
-        "execution": {"skill": "data-audit", "inputs": [{"role": "workbook", "path": "book.xlsx", "sha256": digest}],
+        "execution": {"skill": "data-audit", "inputs": [{"role": "workbook", "path": f"workbook.{suffix}", "sha256": digest}],
             "options": {"regions": [
                 {"id": "brix", "sheet": PRIMARY, "range": "B4:D6"},
                 {"id": "merge", "sheet": PRIMARY, "range": "F1:G3"},
@@ -106,6 +127,53 @@ def registry(tmp_path, monkeypatch):
     monkeypatch.setattr(publication_reconcile, "_owner_valid", lambda sid, owner: (sid, owner) == (SESSION, OWNER))
     monkeypatch.setattr(session_manager, "get_session_owner", lambda sid: OWNER if sid == SESSION else None)
     return request, state
+
+
+def test_native_xlsm_registered_as_named_macro_free_copy(tmp_path, registry):
+    _, state = registry
+    original = tmp_path / "book.XLSM"
+    raw = _macro_package(_source())
+    original.write_bytes(raw)
+    digest = sha256(raw).hexdigest()
+    fields = dict(source_file_id="1" * 32, source_sha256=digest, source_name=original.name, source_bytes=raw)
+    with pytest.raises(ValueError, match="does not identify"):
+        publish_fusion_workbook(_report(digest), **fields)
+    receipt = publish_fusion_workbook(_report(digest, suffix="xlsm"), **fields)
+    assert receipt["filename"] == "book_XLSM无宏副本_审查标注.xlsx"
+    assert receipt["source_format"] == "xlsm" and receipt["source_sha256"] == digest
+    assert receipt["cells"] == 5 and "原文件未修改" in receipt["notice"]
+    assert sha256(original.read_bytes()).hexdigest() == digest
+    with ZipFile(original) as archive:
+        assert archive.read("xl/vbaProject.bin").startswith(b"synthetic inert marker")
+    with closing(sqlite3.connect(state / "research_artifacts.sqlite3")) as db:
+        ((path,),) = db.execute("SELECT path FROM artifacts")
+    content = Path(path).read_bytes()
+    assert sha256(content).hexdigest() == receipt["sha256"]
+    with ZipFile(BytesIO(content)) as archive:
+        assert not any("vba" in item.lower() for item in archive.namelist())
+        assert b"macroenabled" not in archive.read("[Content_Types].xml").lower()
+        assert b"vbaproject" not in archive.read("xl/_rels/workbook.xml.rels").lower()
+    with closing(openpyxl.load_workbook(BytesIO(content))) as workbook:
+        sheet = workbook[PRIMARY]
+        assert sheet["D5"].value == "=1+2" and sheet["D6"].value == "=#REF!"
+        assert sheet["D6"].comment is not None and sheet["C6"].comment is not None
+        assert workbook["Secondary"].sheet_state == "hidden"
+        assert receipt["notice"] in workbook["审查结果_2"]["A1"].value
+    with closing(openpyxl.load_workbook(BytesIO(content), data_only=True)) as workbook:
+        assert workbook[PRIMARY]["D5"].value == 3 and workbook[PRIMARY]["D6"].value is None
+
+
+@pytest.mark.parametrize("part", ["xl/vbaProjectSignature.bin", "xl/activeX/activeX1.bin",
+                                   "xl/macrosheets/sheet1.xml", "xl/embeddings/oleObject1.bin"])
+def test_macro_active_parts_are_not_parsed_or_published(part, monkeypatch):
+    from src.research import tools
+
+    raw = _macro_package(_source(), extra=part)
+    digest = sha256(raw).hexdigest()
+    monkeypatch.setattr(tools, "_save_artifact", lambda *_a, **_kw: pytest.fail("published an unsupported XLSM"))
+    with pytest.raises(ValueError, match="active part"):
+        publish_fusion_workbook(_report(digest, suffix="xlsm"), source_file_id="2" * 32,
+                                source_sha256=digest, source_name="sample.xlsm", source_bytes=raw)
 
 
 def test_real_xlsx_and_registration_dedupe(tmp_path, registry):

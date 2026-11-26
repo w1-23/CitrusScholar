@@ -24,7 +24,6 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from contextlib import closing
-from difflib import SequenceMatcher
 from itertools import islice
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1815,250 +1814,17 @@ def _normalize_doi(value: str) -> str:
     return doi.rstrip(".,;:，。；）)]}")
 
 
-def _title_from_metadata(record: dict[str, Any], provider: str) -> str:
-    if provider == "crossref":
-        values = record.get("title") or []
-        return str(values[0]) if values else ""
-    return str(record.get("titles", [{}])[0].get("title") or "")
-
-
-_REGISTRY_TIMEOUT = 10.0
-_WEB_FALLBACK_LIMIT = 30
-_TITLE_MATCH_THRESHOLD = 0.82
-_WEB_TITLE_THRESHOLD = 0.75
-
-
-def _norm_title(value: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", str(value or ""))
-    text = html.unescape(text).casefold()
-    text = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", text)
-    return " ".join(text.split())
-
-
-def _title_score(left: str, right: str) -> float:
-    a, b = _norm_title(left), _norm_title(right)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    ratio = SequenceMatcher(None, a, b).ratio()
-    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    # 只有短题名本身足够长、且占长题名的多数时，包含关系才算强证据；
-    # 否则 “quantum entanglement” 会命中任何含该词组的题名。
-    if len(shorter) >= 20 and shorter in longer and len(shorter) / len(longer) >= 0.6:
-        return max(ratio, 0.9)
-    return ratio
-
-
-def _metadata_candidate(doi: str, timeout: float = _REGISTRY_TIMEOUT) -> tuple[str, dict | None, str]:
-    """兼容旧接口：按 DOI 查登记元数据，返回 (status, record, error)。"""
-    provider, record, errors = _lit.lookup_doi(doi)
-    if record:
-        return "metadata_found", record, ""
-    if errors:
-        return "unverified", None, errors
-    return "not_found_in_checked_registries", None, ""
-
-
-_ARXIV_HINT_RE = re.compile(r"(?i)(?:arxiv[:/\s]*|abs/)(\d{4}\.\d{4,5})(?:v\d+)?")
-_BARE_ARXIV_RE = re.compile(r"^\d{4}\.\d{4,5}(?:v\d+)?$")
-
-
-def _split_arxiv_hint(*values: Any) -> str:
-    """从「arxiv:2502.18274」「https://arxiv.org/abs/2502.18274v2」或裸号里取出 arXiv 号。
-
-    引用清单常把 arXiv 写成 ``doi: arxiv:2502.18274``；若只把它当 DOI 查，
-    登记库里永远查不到，条目会退化成 title_candidate / network_error。
-    """
-    for value in values:
-        text = str(value or "").strip()
-        if not text:
-            continue
-        match = _ARXIV_HINT_RE.search(text)
-        if match:
-            return match.group(1)
-        if _BARE_ARXIV_RE.match(text):
-            return re.sub(r"v\d+$", "", text)
-    return ""
-
-
-def _verify_reference_record(raw: dict[str, Any], allow_web: bool = True) -> dict[str, Any]:
-    """单条核验：调用统一的学术检索能力，如实记录证据，不自行裁决真伪。"""
-    doi = _normalize_doi(raw.get("doi", ""))
-    arxiv_id = _split_arxiv_hint(raw.get("arxiv_id", ""), raw.get("doi", ""))
-    if arxiv_id and (not doi or "arxiv" in doi.lower()):
-        doi = ""
-    title = str(raw.get("title") or "").strip()
-    year = str(raw.get("year") or "")[:4]
-    authors = str(raw.get("authors") or "")
-    row: dict[str, Any] = {"doi": doi, "arxiv_id": arxiv_id,
-                           "input_title": title, "input_authors": authors,
-                           "input_year": year, "citation": str(raw.get("citation") or "")}
-    if not doi and not arxiv_id and not title:
-        row.update(status="not_checked", detail="缺少 DOI / arXiv 号与标题；需要人工核对")
-        return row
-
-    # Reuse the request's existing network authorization before any registry,
-    # DOI lookup, translation or web fallback (including before cache reuse).
-    from src.core.tracing import web_search_enabled
-    if not web_search_enabled():
-        row.update(status="not_checked", reason="network_disabled",
-                   detail="当前请求未启用联网；未查询 DOI 或文献登记库，未完成核验。")
-        return row
-
-    # 有 DOI 时先精确解析：标识符命中就按“一致/冲突”判定，
-    # 不能因为题名对不上就降级成“仅题名候选”（那会让 DOI 错配漏判）。
-    if doi:
-        def lookup():
-            _provider, record, error = _lit.lookup_doi(doi)
-            return {"candidates": [record] if record else [],
-                    "errors": {"doi": error} if error else {}}
-
-        metadata = _verify_metadata_cached({"kind": "doi", "doi": doi}, lookup)
-        direct = next(iter(metadata["candidates"]), None)
-        if direct:
-            direct = _lit._annotate(direct, title, doi, "", authors, year)
-            evidence = _lit.evidence_row(direct)
-            row.update({
-                "doi": evidence["doi"] or doi,
-                "provider": evidence["source"],
-                "metadata_title": evidence["title"],
-                "metadata_authors": evidence["authors"],
-                "metadata_year": evidence["year"],
-                "metadata_journal": evidence["venue"],
-                "source_url": evidence["url"],
-                "title_similarity": evidence["title_similarity"],
-                "literature_type": evidence["type"],
-                "arxiv_id": evidence["arxiv_id"] or arxiv_id,
-                "evidence_source": evidence["source"],
-                "evidence_url": evidence["url"],
-                "field_conflicts": evidence["conflicts"],
-            })
-            if not evidence["conflicts"]:
-                row["status"] = "metadata_matched"
-                row["detail"] = f"{evidence['source']} 返回的记录与输入标识符一致。"
-            else:
-                row["status"] = "metadata_mismatch"
-                row["detail"] = ("标识符指向的记录与输入字段冲突：" + (evidence["conflicts"] or "未知")
-                                 + "；需人工确认，不能当作已核验。")
-            return row
-
-    result = _verify_metadata_cached(
-        {"kind": "search", "doi": doi, "arxiv_id": arxiv_id,
-         "title": title, "authors": authors, "year": year, "allow_web": bool(allow_web)},
-        lambda: _lit.search_literature(
-            query=title, doi=doi, arxiv_id=arxiv_id, authors=authors, year=year,
-            limit=5, web_fallback=allow_web, claimed_title=title))
-    # Cached provider metadata has no claim-specific match flags. Recompute
-    # them for this invocation, just as on the exact-DOI path above.
-    annotated = [_lit._annotate(item, title, doi, arxiv_id, authors, year)
-                 for item in (result.get("candidates") or [])]
-    candidates = [item for item in annotated
-                  if item.get("identifier_match")
-                  or float(item.get("title_similarity") or 0) >= _lit.CANDIDATE_FLOOR]
-    errors: dict[str, str] = result.get("errors") or {}
-    identified = next((item for item in candidates if item.get("identifier_match")), None)
-    best = identified or (candidates[0] if candidates else None)
-
-    if best is None:
-        if errors:
-            row.update(status="network_error", provider=", ".join(errors),
-                       detail="登记库查询失败（" + "; ".join(f"{key}:{value}" for key, value in errors.items())
-                              + "）；未完成核验，不能据此判断文献不存在。")
-        else:
-            row.update(status="not_found_in_checked_registries",
-                       detail="所查登记库与检索均未给出可核对记录；未查到不等于文献不存在。")
-        return row
-
-    evidence = _lit.evidence_row(best)
-    row.update({
-        "doi": evidence["doi"] or row["doi"],
-        "provider": evidence["source"],
-        "metadata_title": evidence["title"],
-        "metadata_authors": evidence["authors"],
-        "metadata_year": evidence["year"],
-        "metadata_journal": evidence["venue"],
-        "source_url": evidence["url"],
-        "title_similarity": evidence["title_similarity"],
-        "literature_type": evidence["type"],
-        "arxiv_id": evidence["arxiv_id"] or arxiv_id,
-        "evidence_source": evidence["source"],
-        "evidence_url": evidence["url"],
-        "field_conflicts": evidence["conflicts"],
-    })
-    if best.get("identifier_match") and not best.get("field_conflicts"):
-        row["status"] = "metadata_matched"
-        row["detail"] = f"{evidence['source']} 返回的记录与输入标识符一致。"
-    elif best.get("identifier_match"):
-        row["status"] = "metadata_mismatch"
-        row["detail"] = ("标识符指向的记录与输入字段冲突：" + (evidence["conflicts"] or "未知")
-                         + "；需人工确认，不能当作已核验。")
-    elif evidence["source"] == "Web search":
-        row["status"] = "web_candidate"
-        row["detail"] = "登记库未命中，网页检索给出候选 DOI 并已回登记库核对；需人工确认。"
-    else:
-        row["status"] = "title_candidate"
-        row["detail"] = "仅题名检索命中；题名相似不等于身份已确认，请核对 DOI、作者与年份。"
-    return row
-
-
 @tool
 def search_literature(query: str = "", doi: str = "", arxiv_id: str = "",
                       authors: str = "", year: str = "", limit: int = 8,
                       sources: str = "", web_fallback: bool = False,
                       claimed_title: str = "") -> str:
-    """检索学术文献身份（题名/自然语言/DOI/arXiv 号/作者+年份），返回候选记录、来源链接、相似度、字段冲突与各数据库错误状态。中文题名会自动补英文检索；可多次并行调用以核对多篇文献。未检索到不代表文献不存在。只给 DOI/arXiv 号时，请把引用串里写出的题名放进 claimed_title，工具会核对题名是否被改写（title_variant 冲突）。"""
+    """查找学术文献候选（题名/自然语言/DOI/arXiv 号/作者+年份），返回来源链接、相似度、字段冲突与各登记库状态。候选不是核验结论。批量核验已有参考文献时，若本轮提供 verify_uploaded_references，可一次传入列表、文本或附件。未检索到不代表文献不存在。有引用题名时传入 claimed_title，可检查标识符对应记录的题名是否冲突。"""
     result = _lit.search_literature(query=query, doi=doi, arxiv_id=arxiv_id,
                                     authors=authors, year=year, limit=limit,
                                     sources=sources, web_fallback=web_fallback,
                                     claimed_title=claimed_title)
     return json.dumps(result, ensure_ascii=False, indent=1)
-
-
-# Cache provider metadata, never a verdict about a previous caller's claims.
-_VERIFY_MEMO: dict[str, tuple[float, dict]] = {}
-_VERIFY_MEMO_TTL_SEC = 6 * 3600.0
-_VERIFY_MEMO_LOCK = threading.Lock()
-
-
-def _verify_memo_key(raw: dict) -> str:
-    # Search keys include every retrieval input, without title truncation;
-    # exact DOI keys deliberately omit the citing author's mutable claims.
-    material = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
-
-
-def _verify_metadata_cached(query: dict, fetch) -> dict:
-    from copy import deepcopy
-
-    key = _verify_memo_key(query)
-    now = time.time()
-    with _VERIFY_MEMO_LOCK:
-        hit = _VERIFY_MEMO.get(key)
-        if hit and now - hit[0] < _VERIFY_MEMO_TTL_SEC:
-            return deepcopy(hit[1])
-    result = fetch()
-    # search_literature currently returns normalized provider records plus
-    # annotations. Strip all comparison output before memoizing the records.
-    metadata = {
-        "candidates": [{key: deepcopy(value) for key, value in record.items()
-                        if key not in {"identifier_match", "field_conflicts", "title_similarity"}}
-                       for record in (result.get("candidates") or [])],
-        "errors": deepcopy(result.get("errors") or {}),
-    }
-    # An outage or empty search must remain retryable, not sticky for six hours.
-    if metadata["candidates"]:
-        with _VERIFY_MEMO_LOCK:
-            _VERIFY_MEMO[key] = (now, deepcopy(metadata))
-            if len(_VERIFY_MEMO) > 4000:
-                for stale in sorted(_VERIFY_MEMO, key=lambda k: _VERIFY_MEMO[k][0])[:1000]:
-                    _VERIFY_MEMO.pop(stale, None)
-    return metadata
-
-
-def _verify_reference_cached(raw: dict, allow_web: bool) -> dict:
-    # Authorization and claim comparison run on every call, including hits.
-    return _verify_reference_record(raw, allow_web)
 
 
 def _parse_reference_line(line: str, doi: str) -> dict:
@@ -3205,12 +2971,14 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         })
     # Every selected source contributes one result, including failures. Carry
     # identity separately from its display name (duplicate filenames are legal).
+    checks_material = json.dumps(checks, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    checks_sha256 = hashlib.sha256(checks_material.encode("utf-8")).hexdigest()
     for source_index, result_item in zip(requested, results):
         original = tables[source_index]
         result_item.update(file_index=source_index,
             source_file_id=str(original.get("file_id") or ""),
             source_sha256=hashlib.sha256(original.get("data") or b"").hexdigest(),
-            requested_sheet=sheet_name, checks_sha256=_verify_memo_key(checks),
+            requested_sheet=sheet_name, checks_sha256=checks_sha256,
             source_selection='account_file_ids' if _audit_file_ids(file_ids_json) else 'current_turn_attachments',
             audit_mode="rules_with_annotations" if annotations else "rules")
     if not results:

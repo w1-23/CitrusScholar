@@ -252,7 +252,8 @@ def export_snapshot(snapshot, *, presentation='annotated', explain_visible=False
 
 def export_reviewed_workbook(data, *, targets, source_sha256, original=True,
                              status='complete', issue_list=False, overview=False, rules=False,
-                             presentation='legacy', exact_locations=False, summary_findings=None):
+                             presentation='legacy', exact_locations=False, summary_findings=None,
+                             macro_free_copy=False, summary_note=''):
     """Render absolute coordinates from an existing review on verified workbook bytes.
 
     Exact-only reviews never redirect a merged placeholder to a different cell.
@@ -260,17 +261,31 @@ def export_reviewed_workbook(data, *, targets, source_sha256, original=True,
     """
     if original and hashlib.sha256(data).hexdigest() != source_sha256:
         raise ValueError('Reviewed workbook hash mismatch')
-    if original:
+    if macro_free_copy:
+        if not original:
+            raise ValueError('Macro-free copy requires original workbook bytes')
+        from ._zip_safety import validate_macro_workbook
+        validate_macro_workbook(data)
+    elif original:
         from ._zip_safety import validate_zip_bytes
         validate_zip_bytes(data)
-    wb = load_workbook(io.BytesIO(data), rich_text=True)
+    wb = load_workbook(io.BytesIO(data), rich_text=True, keep_vba=False, keep_links=not macro_free_copy)
+    if macro_free_copy:
+        for defined_names in (wb.defined_names, *(ws.defined_names for ws in wb.worksheets)):
+            for name, definition in list(defined_names.items()):
+                if definition.vbProcedure or definition.xlm or name.lower() in {'auto_open', 'auto_close'}:
+                    del defined_names[name]
     entries = [{'table': {**target, 'sheet': target['sheet_name']},
                 'result': {'data': {'findings': target['findings'],
                                     'rule_execution': target.get('rule_execution') or {}}}}
                for target in targets]
-    return _render_workbook(wb, entries, source_bytes=data, source_sha256=source_sha256,
+    content, stats = _render_workbook(wb, entries, source_bytes=data, source_sha256=source_sha256,
                             status=status, original=original, issue_list=issue_list, overview=overview, rules=rules,
-                            presentation=presentation, exact_locations=exact_locations, summary_findings=summary_findings)
+                            presentation=presentation, exact_locations=exact_locations, summary_findings=summary_findings,
+                            summary_note=summary_note)
+    if macro_free_copy:
+        validate_macro_workbook(content, derived=True)
+    return content, stats
 
 
 def finding_coordinates(item, columns):
@@ -306,7 +321,7 @@ def finding_coordinates(item, columns):
 
 def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, original,
                      keep_vba=False, explain_visible=False, issue_list=False, overview=False, rules=False,
-                     presentation='legacy', exact_locations=False, summary_findings=None):
+                     presentation='legacy', exact_locations=False, summary_findings=None, summary_note=''):
     original_names=list(wb.sheetnames)
     bounds={ws.title:(ws.max_row,ws.max_column) for ws in wb.worksheets}
     if sum(height*width for height,width in bounds.values()) > 2_000_000:
@@ -407,6 +422,8 @@ def _render_workbook(wb, entries, *, source_bytes, source_sha256, status, origin
         if len(scope_parts) > 20:
             scope_text += f'；另有 {len(scope_parts)-20} 个区域'
         scope_text += f'。执行状态：{status}。未执行或覆盖不足的项目见报告。'
+        if summary_note:
+            scope_text += ' ' + summary_note
         summary_sheet = _unique_sheet_title(wb, '审查结果')
         ws = wb.create_sheet(summary_sheet)
         added.append(summary_sheet)

@@ -388,26 +388,36 @@ def test_independent_arxiv_observation_uses_one_distinct_registry_receipt(monkey
     assert result["coverage"][0]["status"] == "queried"
 
 
-def test_workbook_xlsm_rejected_and_cas_answer_carries_confirmed_exact_coordinates(monkeypatch, tmp_path):
+@pytest.mark.parametrize("suffix", ["xlsx", "XLSM"])
+def test_cas_answer_carries_confirmed_exact_coordinates(monkeypatch, tmp_path, suffix):
     from hashlib import sha256
     from io import BytesIO
     from openpyxl import Workbook
     from src.agent.fusion_worker_contract import input_path
     from src.graph.task_contract import FusionDelivery
 
-    with pytest.raises(ValueError, match="fusion_input_format_invalid"):
-        input_path("data-audit", "workbook", "macros.XLSM")
+    filename = f"workbook.{suffix}"
+    assert input_path("data-audit", "workbook", filename) == f"/input/fusion-data/workbook.{suffix.lower()}"
+    for skill, role, name in (("data-audit", "workbook", "unsupported.xlsb"),
+                              ("data-audit", "workbook", "unsupported.csv"),
+                              ("research-integrity", "source", "unsupported.xlsm"),
+                              ("research-integrity", "reported", "unsupported.xlsm")):
+        with pytest.raises(ValueError, match="fusion_input_format_invalid"):
+            input_path(skill, role, name)
     output = BytesIO()
     book = Workbook()
     book.active.title = "Trials"
     book.save(output)
     book.close()
     data = output.getvalue()
+    if suffix == "XLSM":
+        from src.research.fusion_workbook_test import _macro_package
+        data = _macro_package(data)
     ref = {"file_id": "a" * 32, "sha256": sha256(data).hexdigest()}
     inputs = {"workbook": ref}
     regions = {"regions": [{"id": "experiment", "sheet": "Trials", "range": "B3:D20", "header_row": 4}]}
     chosen = []
-    name = ["macros.xlsm"]
+    name = ["unsupported.xlsb"]
     monkeypatch.setattr(fusion_tools, "_bound", lambda _skill: (object(), "fixture-call", tmp_path))
     monkeypatch.setattr(fusion_tools, "_workbook_source", lambda _identity, exact: (data, name[0]) if exact == ref else pytest.fail("wrong source"))
     def schedule(_identity, **kwargs):
@@ -417,7 +427,7 @@ def test_workbook_xlsm_rejected_and_cas_answer_carries_confirmed_exact_coordinat
     run = fusion_tools.run_external_skill.func
     _, result = run("data-audit", inputs, regions)
     assert result["_tool_outcome"]["reason_code"] == "external_workbook_format_unsupported"
-    name[0] = "workbook.xlsx"
+    name[0] = filename
     with fusion_tools.fusion_delivery_scope(FusionDelivery(), query="继续", previous_query="审查 Trials!B3:D20，表头为第4行。"):
         assert run("data-audit", inputs, regions)[1]["_tool_outcome"]["reason_code"] == "external_workbook_regions_unconfirmed"
     with fusion_tools.fusion_delivery_scope(FusionDelivery(), query="需要审查工作簿",

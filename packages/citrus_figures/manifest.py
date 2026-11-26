@@ -599,8 +599,9 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
     if figure is not None:
         figure.canvas.draw()
         _discover_semantics(rendered)
-    from citrus_figures.svg_projection import projection_manifest
+    from citrus_figures.svg_projection import projection_manifest, visual_marks
     projections = projection_manifest(rendered, _artist_bbox) if figure is not None else {}
+    marks = visual_marks(rendered) if figure is not None else []
     style_nodes = getattr(rendered, "_svg_style_nodes", {})
     objects: list[dict[str, Any]] = []
     for gid, entry in rendered.locators.items():
@@ -802,6 +803,7 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
         "source": source,
         "figure_size_px": [width, height] if width else None,
         "objects": objects,
+        **({"workbench_marks": marks} if marks else {}),
         **({"qa_receipt": scientific_qa_receipt(rendered)} if include_qa else {}),
         "shared_legend_groups": {
             label: [gid for gid, _ in members]

@@ -122,7 +122,7 @@ def _adapt_worker_sandbox(raw: bytes, pin: dict) -> bytes:
 
 _ADAPTER_PATCH = "02_config/skill-fusion-adapters.patch.json"
 _ADAPTER_PATCH_MEMBERS = frozenset(f"{name}/{item}" for name in ("data-audit", "literature-verification")
-                                 for item in ("scripts/adapter.py", "manifest.json"))
+                                 for item in ("scripts/adapter.py", "manifest.json")) | {"contract.py", "run.py", "INTERFACE_CONTRACT.md"}
 
 
 def _adapter_revisions(repo: Path, handoff: Path, lock: dict) -> dict[str, bytes]:
@@ -205,9 +205,11 @@ def _stage_analysis(repo: Path, handoff: Path, upstreams: Path, release: Path,
         base = f"skills/{name}"
         public = {}
         for source, dest in ((f"{name}/SKILL.md", "SKILL.md"),
-                             (f"{name}/references/workflow.md", "references/workflow.md"),
-                             ("INTERFACE_CONTRACT.md", "INTERFACE_CONTRACT.md")):
+                             (f"{name}/references/workflow.md", "references/workflow.md")):
             public[dest] = _locked_copy(handoff, source, lock["handoff_files"][source], release, f"{base}/{dest}")
+        interface = "INTERFACE_CONTRACT.md"
+        staged_interface = f"03_skill_fusion/{interface}"
+        public[interface] = _locked_copy(bundle, staged_interface, files[staged_interface], release, f"{base}/{interface}")
         script = f"{base}/{APPROVED_SCRIPT}"
         approvals[script] = _write(release, script, f"# Citrus approved fusion skill: {name}\n".encode() + wrapper)
         # User-visible release identity covers payload bytes and this Skill's approved launcher.

@@ -214,7 +214,7 @@ class ExecutionSegments:
             self._step(conn, 'waiting_code', 'parked')
             return 'parked'
 
-    def classify_restart_wait(self, snapshot, *, execution_wait=None, question_resume=False):
+    def classify_restart_wait(self, snapshot, *, execution_wait=None, question_resume=False, question_pause=None):
         """Fenced startup classification after reading the old protected graph."""
         with self._admit(), task_events.transaction() as conn:
             row = self._row(conn)
@@ -224,6 +224,9 @@ class ExecutionSegments:
             if question_resume:
                 if not self._repark_question(conn, row):
                     raise task_events.TaskConflict("question_resume_repark_conflict")
+                return
+            if question_pause is not None:
+                self._adopt_question_pause(conn, row, question_pause)
                 return
             if execution_wait:
                 checkpoint_ref, waits = execution_wait["checkpoint_ref"], tuple(execution_wait["wait_ids"])
@@ -244,6 +247,31 @@ class ExecutionSegments:
                     'turn_envelope': envelope.as_dict(), 'recovery': 'interrupted_terminal'})
             conn.execute('UPDATE agent_execution_segments SET phase=?,generation=generation+1,token=? WHERE job_id=?',
                          ('parked' if execution_wait else 'interrupted', uuid.uuid4().hex, self.identity.run_id))
+
+    def _adopt_question_pause(self, conn, row, pause):
+        from src.core import user_questions
+        from src.core.turn_envelope import build_turn_envelope
+
+        run_id = self.identity.run_id
+        self._reference(pause["checkpoint_ref"])
+        if row["wait_ids"] != "[]" or task_events.current_terminal_event(conn, run_id) is not None:
+            raise task_events.TaskConflict("question_pause_adoption_conflict")
+        self._settled(conn, run_id)
+        receipt = conn.execute("SELECT 1 FROM task_operations WHERE operation_id=? AND job_id=? AND owner_user_id=? "
+            "AND tool_call_id=? AND tool_name='request_user_input' AND status='complete' "
+            "AND result<>'' AND host_observation<>''", (pause["operation_id"], run_id,
+                self.identity.owner_user_id, pause["tool_call_id"])).fetchone()
+        if receipt is None:
+            raise task_events.TaskConflict("question_pause_receipt_missing")
+        question = user_questions.adopt_question_pause(conn, self.identity, pause)
+        envelope = build_turn_envelope(answer=question["prompt"], requested_status="awaiting_input",
+            display_status="awaiting_input", job_status="awaiting_input", stop_reason="user_input_required",
+            history_saved=False)
+        payload = {"job_id": run_id, "session_id": self.identity.session_id, "answer": question["prompt"],
+                   "turn_status": envelope.display_status, "turn_envelope": envelope.as_dict(),
+                   "history_saved": False, "question": question, "pending_question": question}
+        self._write_terminal(conn, self._job(conn), done_payload=payload, status="awaiting_input",
+                             current_step="awaiting_input")
 
     def start(self):
         """Only a new init job may gain its first segment; retries cannot dispatch."""
@@ -431,42 +459,48 @@ class ExecutionSegments:
                 # Another path already owns the durable terminal fact. Never
                 # rewrite it and never close the segment from a later claim.
                 raise task_events.TaskConflict("execution_segment_terminal_conflict")
-            # Record the phase fact before the terminal frame (later events are
-            # suppressed once a done fact exists), then commit both together.
-            task_events._append(conn, self.identity.run_id, "execution_segment",
-                                {"job_id": self.identity.run_id, "phase": "terminal"})
-            task_events._append(conn, self.identity.run_id, "done", done_payload)
-            now = datetime.now().isoformat()
-            guard = "job_id=? AND status IN ('running','detached','cancel_requested')"
-            if status == "cancelled":
-                # Same transition as jobs.mark_stopped: current_step, progress
-                # summary and error are intentionally left untouched.
+            self._write_terminal(conn, job, done_payload=done_payload, status=status,
+                current_step=current_step, progress_summary=progress_summary, error=error,
+                stop_reason=stop_reason, stop_note=stop_note)
+
+    def _write_terminal(self, conn, job, *, done_payload, status, current_step,
+                        progress_summary="", error="", stop_reason="", stop_note=""):
+        # Record the phase fact before the terminal frame (later events are
+        # suppressed once a done fact exists), then commit both together.
+        task_events._append(conn, self.identity.run_id, "execution_segment",
+                            {"job_id": self.identity.run_id, "phase": "terminal"})
+        task_events._append(conn, self.identity.run_id, "done", done_payload)
+        now = datetime.now().isoformat()
+        guard = "job_id=? AND status IN ('running','detached','cancel_requested')"
+        if status == "cancelled":
+            # Same transition as jobs.mark_stopped: current_step, progress
+            # summary and error are intentionally left untouched.
+            changed = conn.execute(
+                "UPDATE task_jobs SET status='cancelled',stop_reason=?,stop_note=?,"
+                "finished_at=?,updated_at=? WHERE " + guard,
+                (stop_reason or "user", stop_note, now, now, self.identity.run_id)).rowcount
+        elif status == "completed":
+            # Same transition as jobs.mark_completed_if_open: error and a
+            # prior stop_note survive unless this completion carries one.
+            note = stop_note or ("停止请求晚于完成" if job["status"] == "cancel_requested" else "")
+            if note:
                 changed = conn.execute(
-                    "UPDATE task_jobs SET status='cancelled',stop_reason=?,stop_note=?,"
-                    "finished_at=?,updated_at=? WHERE " + guard,
-                    (stop_reason or "user", stop_note, now, now, self.identity.run_id)).rowcount
-            elif status == "completed":
-                # Same transition as jobs.mark_completed_if_open: error and a
-                # prior stop_note survive unless this completion carries one.
-                note = stop_note or ("停止请求晚于完成" if job["status"] == "cancel_requested" else "")
-                if note:
-                    changed = conn.execute(
-                        "UPDATE task_jobs SET status='completed',current_step=?,"
-                        "progress_summary=?,stop_note=?,finished_at=?,updated_at=? WHERE " + guard,
-                        (current_step, progress_summary, note, now, now,
-                         self.identity.run_id)).rowcount
-                else:
-                    changed = conn.execute(
-                        "UPDATE task_jobs SET status='completed',current_step=?,"
-                        "progress_summary=?,finished_at=?,updated_at=? WHERE " + guard,
-                        (current_step, progress_summary, now, now, self.identity.run_id)).rowcount
+                    "UPDATE task_jobs SET status='completed',current_step=?,"
+                    "progress_summary=?,stop_note=?,finished_at=?,updated_at=? WHERE " + guard,
+                    (current_step, progress_summary, note, now, now,
+                     self.identity.run_id)).rowcount
             else:
                 changed = conn.execute(
-                    "UPDATE task_jobs SET status=?,current_step=?,progress_summary=?,error=?,"
-                    "finished_at=?,updated_at=? WHERE " + guard,
-                    (status, current_step, progress_summary, error, now, now,
-                     self.identity.run_id)).rowcount
-            if changed != 1:
-                raise task_events.TaskConflict("execution_segment_terminal_conflict")
-            conn.execute("UPDATE agent_execution_segments SET phase='terminal',token=? WHERE job_id=?",
-                         (uuid.uuid4().hex, self.identity.run_id))
+                    "UPDATE task_jobs SET status='completed',current_step=?,"
+                    "progress_summary=?,finished_at=?,updated_at=? WHERE " + guard,
+                    (current_step, progress_summary, now, now, self.identity.run_id)).rowcount
+        else:
+            changed = conn.execute(
+                "UPDATE task_jobs SET status=?,current_step=?,progress_summary=?,error=?,"
+                "finished_at=?,updated_at=? WHERE " + guard,
+                (status, current_step, progress_summary, error, now, now,
+                 self.identity.run_id)).rowcount
+        if changed != 1:
+            raise task_events.TaskConflict("execution_segment_terminal_conflict")
+        conn.execute("UPDATE agent_execution_segments SET phase='terminal',token=? WHERE job_id=?",
+                     (uuid.uuid4().hex, self.identity.run_id))

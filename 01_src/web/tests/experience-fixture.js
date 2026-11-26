@@ -86,7 +86,7 @@
     const rendered = async (value, revision, draftRevision = null) => {
       const renderKey = await hash(asSvg(value));
       return {figure_id: svgId, title, render_version: revision, options: {}, source_sha256: await hash(asSvg(original)),
-      object_contract: {revision, draftRevision, renderKey, objects: {'fixture-title-group': {geometry: {svgIds: ['fixture-title']}}}},
+      object_contract: {revision, draftRevision, renderKey, objects: {'fixture-title-group': {objectId: 'fixture-title-group', revision, renderKey, geometry: {svgIds: ['fixture-title']}}}},
       format_capabilities: {svg: {state: 'ready'}}, figure_size: [360, 180],
       hit_manifest: {objects: [{gid: 'fixture-title', role: 'title', bbox: {x0: 20, y0: 18, x1: 105, y1: 42}}]},
       groups: [{id: 'fixture-title-group', kind: 'title', parent: null, label: original,

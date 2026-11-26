@@ -180,7 +180,7 @@ def research_workspace(
                            if operation == "read_skill_resource" else {"skill": info, "entrypoint": page})
         if operation == "list":
             return _result({"workspace": "current_session", "capabilities": capability_catalog(),
-                            "presets": list_presets(), "scripts": assets.list_scripts(owner, session),
+                            "presets": list_presets(include_renderer=False), "scripts": assets.list_scripts(owner, session),
                             "skills": current_turn_skills().rows(),
                             "reuse_order": ["existing_tool", "existing_script_parameters", "local_revision", "new_script_if_needed"]})
         if operation == "runs":

@@ -351,15 +351,39 @@ def save_question_context(job_id, context, *, question_id, interrupt_id, checkpo
         encoded_context = canonical(context)
         _pin_scripts(row["id"], row["owner_user_id"], row["session_id"], context,
                      previous_refs=previous_scripts)
-        conn.execute("UPDATE task_questions SET context=?,interrupt_id=?,checkpoint_ref=? WHERE id=? AND status='pending'",
-                     (encoded_context, interrupt_id, checkpoint_ref, row["id"]))
-        question = _view(conn.execute("SELECT * FROM task_questions WHERE id=?", (row["id"],)).fetchone())
-        record = _append(conn, job_id, "request_user_input", {"question": question}) if not row["interrupt_id"] else None
+        question, record = _bind_native_pause(conn, row, interrupt_id, checkpoint_ref, encoded_context)
     if record:
         from src.core.progress_bus import get_progress_queue, _encode_event
         queue = get_progress_queue()
         if getattr(queue, "job_id", None) == job_id:
             queue.put_nowait(_encode_event(record["event"], record["data"]) | {"id": str(record["seq"])})
+    return question
+
+
+def _bind_native_pause(conn, row, interrupt_id, checkpoint_ref, context):
+    conn.execute("UPDATE task_questions SET context=?,interrupt_id=?,checkpoint_ref=? WHERE id=? AND status=?",
+                 (context, interrupt_id, checkpoint_ref, row["id"], row["status"]))
+    question = _view(conn.execute("SELECT * FROM task_questions WHERE id=?", (row["id"],)).fetchone())
+    record = (_append(conn, row["job_id"], "request_user_input", {"question": question})
+              if not row["interrupt_id"] and row["status"] == "pending" else None)
+    return question, record
+
+
+def adopt_question_pause(conn, identity, pause):
+    """Bind an exact protected interrupt in the existing restart transaction."""
+    _authorized(conn, identity.run_id, identity.owner_user_id, identity.session_id)
+    row = conn.execute("SELECT * FROM task_questions WHERE job_id=? AND owner_user_id=? AND session_id=? "
+        "AND recovery_cursor=? AND id=? AND version=? AND status IN ('pending','expired') "
+        "AND answer_hash='' AND resume_cursor=0 AND child_job_id=''",
+        (identity.run_id, identity.owner_user_id, identity.session_id, recovery_cursor(conn, identity.run_id),
+         pause["question_id"], pause["version"])).fetchone()
+    reference = pause["interrupt_id"], pause["checkpoint_ref"]
+    if row is None or (row["interrupt_id"], row["checkpoint_ref"]) not in {("", ""), reference}:
+        raise QuestionConflict("pending_question_interrupt_mismatch")
+    if row["status"] == "pending" and row["expires_at"] <= time.time():
+        conn.execute("UPDATE task_questions SET status='expired' WHERE id=? AND status='pending'", (row["id"],))
+        row = conn.execute("SELECT * FROM task_questions WHERE id=?", (row["id"],)).fetchone()
+    question, _ = _bind_native_pause(conn, row, *reference, row["context"])
     return question
 
 

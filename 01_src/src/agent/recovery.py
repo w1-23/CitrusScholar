@@ -219,9 +219,34 @@ def _verify_question_interrupt(interrupts, checkpoint_id, question_resume):
         raise TaskConflict("question_resume_checkpoint_conflict")
 
 
+def _discover_question_pause(identity, saved, values, pending_interrupts):
+    from dataclasses import asdict
+    from .harness import has_unsettled_work
+
+    interrupts = [pause for group in pending_interrupts for pause in group]
+    questions = [(call_id, signal) for call_id, signal in (values.get('operation_signals') or {}).items()
+                 if signal.get('pending_question')]
+    if (len(interrupts) != 1 or len(questions) != 1 or values.get('stop_status')
+            or (values.get('host_state') or {}).get('identity') != asdict(identity)
+            or has_unsettled_work(values, ignore_question=True)):
+        raise TaskConflict('recovery_question_pause_invalid')
+    call_id, signal = questions[0]
+    question, operation_id = signal['pending_question'], signal.get('operation_id')
+    pause = interrupts[0]
+    if (type(call_id) is not str or not call_id or type(operation_id) is not str or not operation_id
+            or type(question) is not dict or set(question) != {'question_id', 'version'}
+            or type(question['question_id']) is not str or not question['question_id']
+            or type(question['version']) is not int or question['version'] < 1
+            or type(pause.id) is not str or not pause.id
+            or pause.value != {'kind': 'user_input', **question}):
+        raise TaskConflict('recovery_question_pause_invalid')
+    return {**question, 'interrupt_id': pause.id, 'checkpoint_ref': saved.checkpoint['id'],
+            'tool_call_id': call_id, 'operation_id': operation_id}
+
+
 async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                               provider_scope: tuple[str, str], *, execution_wait: dict | None = None,
-                              discover_execution_wait=False, question_resume=None) -> dict:
+                              discover_execution_wait=False, question_resume=None, discover_question=False) -> dict:
     """Read the exact committed framework state. Legacy executors are never resumed."""
     from src.core.jobs import get_job
     from .deep_agent_runtime import EXECUTOR_ID
@@ -255,6 +280,10 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
             pending_interrupts = [value for _, channel, value in saved.pending_writes or () if channel == INTERRUPT]
     if not isinstance(values, dict) or not values.get("messages"):
         raise TaskConflict("recovery_checkpoint_invalid")
+    if discover_question:
+        if question_resume is not None or execution_wait is not None or discover_execution_wait:
+            raise TaskConflict('recovery_question_pause_invalid')
+        return _discover_question_pause(identity, saved, values, pending_interrupts)
     status = values.get("stop_status")
     answered = status == "complete" and values.get("stop_reason") == "answered"
     signals = list((values.get("operation_signals") or {}).values())

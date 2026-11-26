@@ -423,7 +423,7 @@ def test_legacy_known_address_migrates_while_conflicting_or_absent_address_stays
     assert sibling["color"] != "#123456"
 
 
-def native_multipanel(library, monkeypatch):
+def native_multipanel(library, monkeypatch, *, visual_marks=False):
     """Two unregistered axes with repeated categories and mixed native marks."""
     from src.config import settings
     from src.figures import sandbox
@@ -446,6 +446,19 @@ for i, ax in enumerate(axes):
     ax.grid(axis='y', alpha=.2)
     if i:
         ax.legend(loc='lower right', fontsize=8)
+"""
+    if visual_marks:
+        renderer += """
+from matplotlib.patches import FancyArrow, Rectangle
+axes[0].add_patch(Rectangle((.12, .48), .14, .12, transform=axes[0].transAxes,
+                            facecolor='#610afd', edgecolor='#441099', zorder=8))
+axes[0].add_patch(FancyArrow(.35, .85, .2, 0, width=.04, transform=axes[0].transAxes,
+                             facecolor='#ab3412', zorder=8))
+axes[0].add_patch(Rectangle((.05, .28), .05, .08, transform=axes[0].transAxes,
+                            gid='author-patch', facecolor='#167887', zorder=8))
+axes[0].annotate('Measured effect', xy=(.88, .50), xytext=(.57, .81),
+                 xycoords='axes fraction', textcoords='axes fraction',
+                 arrowprops={'arrowstyle': '->', 'color': '#188f7c', 'linewidth': 3}, zorder=9)
 """
     script = ("import pandas as pd\n"
               "emit.table('categories', pd.DataFrame({'x': [0, 1, 2, 3]}))\n"

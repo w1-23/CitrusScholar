@@ -135,6 +135,27 @@ class HarnessRuntime:
 
     async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None,
                   agent_options=None, pinned_skills=()):
+        self.diagnostic_checkpoint = ""
+        try:
+            return await self._run(identity, messages, saver=saver, resume=resume,
+                checkpoint_config=checkpoint_config, agent_options=agent_options, pinned_skills=pinned_skills)
+        except Exception:
+            # The caller still owns the scoped saver and execution lock here.
+            await self._capture_failure_checkpoint(saver, identity, checkpoint_config)
+            raise
+
+    async def _capture_failure_checkpoint(self, saver, identity, checkpoint_config):
+        try:
+            scope = dict(checkpoint_config or {"thread_id": identity.run_id})
+            scope.pop("checkpoint_id", None)  # Diagnose the committed head, not the run's entry checkpoint.
+            async with asyncio.timeout(0.25):
+                saved = await saver.aget_tuple({"configurable": scope})
+            if saved and saved.checkpoint["channel_values"].get("active_run_id") == identity.run_id:
+                self.diagnostic_checkpoint = saved.checkpoint["id"]
+        except Exception:
+            pass  # Diagnostic I/O must never replace the original graph exception.
+
+    async def _run(self, identity, messages, *, saver, resume, checkpoint_config, agent_options, pinned_skills):
         adapter = self
         latest = {"messages": list(messages), "model_steps": 0}
         read_permits = asyncio.Semaphore(4)
@@ -463,7 +484,6 @@ class HarnessRuntime:
         config = {"configurable": checkpoint_config or {"thread_id": identity.run_id},
                   "recursion_limit": max(64, self.limits.max_model_steps * 6 + 20)}
         snapshot = await graph.aget_state(config)
-        self.diagnostic_checkpoint = (snapshot.config or {}).get("configurable", {}).get("checkpoint_id", "")
         topology = graph.get_graph()
         tool_nodes = tuple(name for name, node in topology.nodes.items() if isinstance(node.data, ToolNode))
         # The native before-model chain can include conditional middleware

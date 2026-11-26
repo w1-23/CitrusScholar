@@ -2390,10 +2390,12 @@ def _reconcile_startup_wait(job):
     snapshot = segments.snapshot()
     root = PROJECT_ROOT / "state"
     lease = acquire_account_lease(identity.owner_user_id, expected_epoch=snapshot["account_epoch"])
-    async def read_state(wait, question=None):
+    async def read_state(wait, question=None, *, discover_question=False):
+        options = {"discover_question": True} if discover_question else {}
         return await run_account_async(lease, load_recovery_state(root, identity,
             (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()), execution_wait=wait,
-            discover_execution_wait=wait is None and question is None, question_resume=question))
+            discover_execution_wait=wait is None and question is None and not discover_question,
+            question_resume=question, **options))
 
     try:
         with execution_lock(root / "agent_locks", (identity.owner_user_id, identity.session_id)):
@@ -2409,6 +2411,14 @@ def _reconcile_startup_wait(job):
                         pass
                     else:
                         segments.classify_restart_wait(snapshot, question_resume=True)
+                        return "awaiting_input"
+                if not wait_ids:
+                    try:
+                        pause = asyncio.run(read_state(None, discover_question=True))
+                    except TaskConflict:
+                        pass
+                    else:
+                        segments.classify_restart_wait(snapshot, question_pause=pause)
                         return "awaiting_input"
                 wait = {"checkpoint_ref": snapshot["checkpoint_ref"], "wait_ids": wait_ids} if wait_ids else None
                 state = asyncio.run(read_state(wait))

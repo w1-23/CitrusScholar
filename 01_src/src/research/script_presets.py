@@ -436,8 +436,15 @@ def get_preset(ref: dict | str, *, include_source: bool = True) -> dict:
     return result
 
 
-def list_presets() -> list[dict]:
-    return [get_preset(name, include_source=False) for name in _PRESETS]
+def list_presets(*, include_renderer: bool = True) -> list[dict]:
+    presets = [get_preset(name, include_source=False) for name in _PRESETS]
+    if not include_renderer:
+        # Discovery carries parameter specs and output slots, not executable
+        # renderer bodies. An exact read or a by-reference run uses defaults.
+        for preset in presets:
+            for figure in preset["outputs"]["figures"]:
+                figure.pop("render_script", None)
+    return presets
 
 
 def capability_catalog() -> list[dict]:

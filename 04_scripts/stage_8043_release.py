@@ -302,7 +302,7 @@ def overlap(left, right):
     return left.is_relative_to(right) or right.is_relative_to(left)
 
 
-def release_config(baseline, preserved, output, commit, sandbox_pin, skill_pin, *, methods_only=False):
+def release_config(baseline, preserved, output, commit, sandbox_pin, skill_pin, *, methods_only=False, modules=None):
     config = dict(baseline, source_root=str(output / 'source'), source_head=commit,
                   sandbox_sha256=sandbox_pin, skill_release=str(output / 'skills-release'),
                   skill_release_sha256=skill_pin, external_fusion_required=True,
@@ -313,6 +313,11 @@ def release_config(baseline, preserved, output, commit, sandbox_pin, skill_pin, 
         config.pop('scientific_methods_only', None)
     for label, filename in IMAGES.items():
         config[f'{label}_sif'] = str(output / 'images' / filename)
+    if modules is not None:
+        require(isinstance(modules, dict) and set(modules) == {'selfcorpus', 'workbench'},
+                'Invalid external module contract')
+        config['external_modules'] = modules
+        config['port'] = 8060
     return config
 
 
@@ -355,8 +360,10 @@ def stage(args):
     (source / SOURCE_MANIFEST).unlink(missing_ok=True)
     write_object(source / SOURCE_MANIFEST, source_overlay(args.commit, tree, baseline['source_head'], members))
     write_object(output / 'source-sha256.json', {'commit': args.commit, 'files': hashes(inventory(source))})
+    module_input = getattr(args, 'external_modules', None)
+    modules = read_object(existing(module_input)) if module_input is not None else None
     config = release_config(baseline, preserved, output, args.commit, args.sandbox_sha256, args.skill_release_sha256,
-                            methods_only=(skill / METHOD_RELEASE_FILE).is_file())
+                            methods_only=(skill / METHOD_RELEASE_FILE).is_file(), modules=modules)
     write_object(output / 'deployment.json', config)
     (output / 'launch.py').write_text(WRAPPER, encoding='utf-8')
     (output / 'launch.py').chmod(0o700)
@@ -406,7 +413,7 @@ def verify(output, repository=None, manifest_pin=None):
     require(set(meta['images']) == set(IMAGES) and
             config == release_config(baseline, preserved, output, commit,
                                      meta['images']['sandbox'], meta['active_skill_sha256'],
-                                     methods_only=(skill / METHOD_RELEASE_FILE).is_file()),
+                                     methods_only=(skill / METHOD_RELEASE_FILE).is_file(), modules=config.get('external_modules')),
             'Deployment does not match pinned paths and inherited runtime contract')
     for label in IMAGES:
         require(meta['images'][label] == config[f'{label}_sha256'], f'{label} SIF manifest mismatch')
@@ -441,6 +448,7 @@ def main():
     for arg in ('repository', 'commit', 'baseline-deployment', 'sandbox-sif', 'sandbox-sha256',
                 'skill-release', 'skill-release-sha256', 'output'):
         create.add_argument(f'--{arg}', required=True)
+    create.add_argument('--external-modules', help='Explicit independent module contract configuration')
     check = commands.add_parser('verify', help='Verify a staged release without starting it')
     check.add_argument('--release', required=True)
     check.add_argument('--repository', help='Rebuild and compare the entire committed archive')

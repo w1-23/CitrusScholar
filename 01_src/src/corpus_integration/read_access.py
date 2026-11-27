@@ -7,6 +7,12 @@ from .settings import isolated_enabled, isolated_search_configured, legacy_enabl
 
 
 def shared_search_available():
+    from .selfcorpus_search import enabled
+
+    if enabled():
+        # Advertise the selected route even if misconfigured, so that failures
+        # are explicit and never make the previous index a fallback.
+        return True
     if isolated_enabled():
         return isolated_search_configured()
     from src.shared_corpus.runtime import current_runtime

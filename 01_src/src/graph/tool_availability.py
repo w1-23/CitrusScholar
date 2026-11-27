@@ -225,14 +225,18 @@ def runtime_env(*, source_scope: str = SCOPE_AUTO, attachments: int = 0,
     if scope not in KNOWN_SCOPES:
         scope = SCOPE_AUTO
     from src.core.tool_catalog import TOOL_METADATA
+    from src.corpus_integration.selfcorpus_search import enabled as selfcorpus_enabled
     from src.corpus_integration.settings import isolated_enabled
     denied = frozenset(denied or ())
     # Some persisted-evidence reads do not require a live index or candidate
     # pool. Removing those preconditions must not bypass explicit source scope.
     denied |= frozenset(name for name, meta in TOOL_METADATA.items()
                         if _blocked_source(meta.capabilities, scope, bool(retrieval)))
-    if isolated_enabled():
+    if isolated_enabled() or selfcorpus_enabled():
         denied |= {"propose_document_ingest", "prepare_document", "commit_document_index"}
+    if selfcorpus_enabled():
+        # The old candidate expansion assumes exact-span legacy read entries.
+        denied |= {"search_candidates"}
     return Env(
         network=bool(network),
         local_corpus=bool(local_corpus),

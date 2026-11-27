@@ -471,17 +471,17 @@ def _local_paper_exists(doi: str, title: str) -> bool:
 
 
 def _legacy_corpus_enabled() -> bool:
+    from src.corpus_integration.selfcorpus_search import enabled
     from src.corpus_integration.settings import legacy_enabled
 
-    return legacy_enabled()
+    return not enabled() and legacy_enabled()
 
 
 def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "",
                   official: tuple[dict, str, str] | None = None,
                   official_lookup: bool = True) -> dict | None:
     """Dispatch fetched content to the configured retention policy."""
-    from src.corpus_integration.settings import legacy_enabled
-    if not legacy_enabled():
+    if not _legacy_corpus_enabled():
         return None
     if not _enabled("local_rag"):
         return None
@@ -536,9 +536,10 @@ def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "
 def _queue_paper_registration(doi: str, pmid: str, winner: dict | None = None, *,
                               official: tuple[dict, str, str] | None = None,
                               source_url: str = "") -> None:
+    from src.corpus_integration.selfcorpus_search import enabled
     from src.corpus_integration.settings import growth_enabled
 
-    if not growth_enabled() or not (_enabled("web_fetch") and _enabled("bibliographic_lookup")):
+    if enabled() or not growth_enabled() or not (_enabled("web_fetch") and _enabled("bibliographic_lookup")):
         return
     try:
         from src.core.tracing import get_user_id
@@ -556,9 +557,7 @@ def _queue_paper_registration(doi: str, pmid: str, winner: dict | None = None, *
 
 
 def _retain_missing_paper(*, doi: str, pmid: str, title: str, url: str) -> dict | None:
-    from src.corpus_integration.settings import legacy_enabled
-
-    if not legacy_enabled():
+    if not _legacy_corpus_enabled():
         return None
     if not _enabled("local_rag"):
         return None
@@ -1019,6 +1018,25 @@ def _local_hybrid_search_impl(query: str, corpus_types: list[str], limit: int = 
     if not _enabled("local_rag"):
         message, artifact = _disabled("local_rag", "main_results")
         return message, {**artifact, "local_status": "disabled"}
+    from src.corpus_integration import selfcorpus_search
+
+    if selfcorpus_search.enabled():
+        requested = {str(value or "").strip().casefold() for value in (corpus_types or [])}
+        if requested != {selfcorpus_search.FAMILY_ID}:
+            reason = "selfcorpus_family_required"
+            return "[LOCAL_SEARCH_SELECT_AGENT_LITERATURE]", {"main_results": [], "local_status": "invalid_family",
+                "_tool_outcome": {"status": "not_run", "reason_code": reason, "artifacts": []}}
+        if l1_categories:
+            reason = "selfcorpus_topic_filter_unsupported"
+            return "[LOCAL_SEARCH_TOPIC_UNSUPPORTED]", {"main_results": [], "local_status": "invalid_topic",
+                "_tool_outcome": {"status": "not_run", "reason_code": reason, "artifacts": []}}
+        payload = selfcorpus_search.tool_result(query, max(1, min(limit, 5 if render else 12)), personal=True)
+        rows = payload.pop("results")
+        observation = {**payload, "candidates": rows}
+        return (_bounded_candidate_view(observation) if render else ""), {
+            **payload, "main_results": [], "shared_results": observation["candidates"],
+            "selected_result_count": len(observation["candidates"]), "corpus_types": [selfcorpus_search.FAMILY_ID],
+        }
     from src.corpus_integration.read_access import isolated_search
     from src.corpus_integration.settings import isolated_enabled
     from src.shared_corpus.runtime import FAMILY_ID, current_runtime, retrieval_reader

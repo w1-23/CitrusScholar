@@ -507,6 +507,17 @@ async def account_auth_guard(request: Request, call_next):
         if denied is not None:
             return denied
     path = request.url.path
+    if (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+            and (path == "/figure-workbench" or path == "/figures/legacy"
+                 or path.startswith(("/api/v2/figure-workbench/", "/api/v2/figures/")))):
+        # Existing assets use the stable session/file APIs. Legacy project GETs
+        # may reconcile publication, so do not expose them as read-only routes.
+        return JSONResponse({"detail": {"code": "legacy_workbench_retired"}}, status_code=410,
+                            headers={"Cache-Control": "no-store"})
+    if (os.getenv("CITRUS_SELFCORPUS_RETRIEVAL") == "1" and request.method not in {"GET", "HEAD", "OPTIONS"}
+            and (path.startswith(("/api/v2/isolated-corpus/", "/api/v2/shared-corpus/", "/api/v2/admin/corpus/")))):
+        return JSONResponse({"detail": {"code": "legacy_corpus_read_only"}}, status_code=410,
+                            headers={"Cache-Control": "no-store"})
     if (getattr(request.app.state, "core_accepting_requests", None) is False
             and (path in {"/admin", "/figures", "/figure-workbench"} or path.startswith(("/api/", "/jobs/", "/sessions/", "/figures/")))
             and request.method != "OPTIONS"):
@@ -5236,11 +5247,19 @@ if _frontend_assets.exists():
 # ── The figure workspace ──────────────────────────────────────────────────
 # A separate page and a separate family of endpoints, mounted here so that
 # the rest of the service is untouched by the feature.
-from src.api import figure_router, figure_workbench_router  # noqa: E402
+_workbench_external = os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+if _workbench_external:
+    from src.api.workbench_gateway import workbench_gateway
 
-app.include_router(figure_router.router)
-app.include_router(figure_workbench_router.router)
-app.include_router(figure_workbench_router.page_router)
+    app.include_router(workbench_gateway(current_user))
+else:
+    from src.api import figure_router, figure_workbench_router
+
+    app.include_router(figure_router.router)
+    app.include_router(figure_workbench_router.router)
+    app.include_router(figure_workbench_router.page_router)
+from src.api.workbench_bridge import register_workbench_bridge  # noqa: E402
+register_workbench_bridge(app, current_user=current_user, require_owned_session=require_owned_session)
 from src.api.integrity_router import router as integrity_router  # noqa: E402
 app.include_router(integrity_router)
 from src.api.reference_router import router as reference_router  # noqa: E402
@@ -5256,7 +5275,15 @@ if os.getenv("CITRUS_CORPUS_MODE") == "isolated":
 
 @app.get("/figures")
 async def serve_figures_page(request: Request):
-    return await figure_workbench_router.workbench_page(request)
+    if not _workbench_external:
+        return await figure_workbench_router.workbench_page(request)
+    from fastapi.responses import HTMLResponse
+
+    current_user(request)
+    return HTMLResponse("""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<title>Workbench</title><body><main><h1>工作台</h1><p id="workbench-open-status" role="status">正在打开工作台…</p>
+<p><a href="/">返回会话</a></p></main><script src="/assets/workbench-launch.js" defer></script></body></html>""",
+        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/figures/legacy", include_in_schema=False)

@@ -183,7 +183,7 @@ def run(browser, output):
             overlay.get_by_role('button', name='缩小图片').click()
             overlay.get_by_role('button', name='适应窗口').click()
             expect(overlay.get_by_role('button', name='适应窗口')).to_have_attribute('aria-pressed', 'true')
-            assert overlay.locator('iframe,object,svg').count() == 0
+            assert overlay.locator('.sf-image-wrap :is(iframe,object,svg)').count() == 0
             expect(overlay.get_by_role('button', name=re.compile('可编辑副本|SVG 源码|导出|文件信息'))).to_have_count(0)
         elif kind == 'pdf':
             if page.evaluate('navigator.pdfViewerEnabled') is False:

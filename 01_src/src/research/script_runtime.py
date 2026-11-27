@@ -244,7 +244,14 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                 # internal file IDs. Running/unknown writes cannot be replayed.
                 previous = assets.get_run(owner, session, repair_from_run_id)
                 if previous["status"] == "succeeded":
-                    raise ValueError("Repair target already succeeded; this is not a failed run. Create a new run with explicit input bindings and figure outputs instead.")
+                    error = "Repair target already succeeded; this is not a failed run. Create a new run with explicit input bindings and figure outputs instead."
+                    content, payload = receipt(error, {"error": error, "failure_phase": "preflight",
+                        "error_code": "repair_target_already_succeeded", "script_persisted": False,
+                        "run_reserved": False, "_tool_outcome": {"status": "not_run",
+                            "reason_code": "script_execution_rejected", "artifacts": []}})
+                    from src.research.script_reconciliation import observe_preflight_rejection
+                    observe_preflight_rejection(payload)
+                    return content, payload
                 if previous["status"] not in {"failed", "partial"}:
                     raise ValueError("Repair requires a retained failed or partial run; inspect other run states first")
                 replay = (previous.get("result") or {}).get("replay")

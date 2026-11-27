@@ -134,6 +134,34 @@ def test_failed_renderer_and_rejected_repair_can_be_replaced_by_same_goal_svg():
     assert not _same_repair_target(rejected, corrected, records=[failed | {"status": "unknown"}, success])
 
 
+def test_already_succeeded_render_repair_requires_earlier_same_source_receipt():
+    from types import SimpleNamespace
+    from src.agent.host import _already_succeeded_render_repair
+
+    name = "run_research_figure_script"
+    parent = "a" * 32
+    rejected = {"name": name, "id": "denied", "args": {"repair_from_run_id": parent}}
+    corrected = {"name": name, "id": "selected", "args": {}}
+    snapshot = [{"file_id": "b" * 32, "sha256": "c" * 64}]
+    published = {"status": "complete", "reason_code": "figure_published"}
+    messages = {
+        "parent": SimpleNamespace(name=name, artifact={"run_id": parent, "input_snapshots": snapshot,
+                                                    "_tool_outcome": published}),
+        "denied": SimpleNamespace(name=name, artifact={"error_code": "repair_target_already_succeeded",
+                                                     "repair_from_run_id": parent}),
+        "selected": SimpleNamespace(name=name, artifact={"input_snapshots": snapshot, "_tool_outcome": published}),
+    }
+    order = {"parent": 0, "denied": 1, "selected": 2}
+    assert _already_succeeded_render_repair(rejected, corrected, messages, order)
+    assert not _already_succeeded_render_repair(rejected, corrected, messages, order | {"parent": 3})
+    for cid, changes in (("selected", {"input_snapshots": [{"file_id": "d" * 32}]}),
+                         ("parent", {"_tool_outcome": {"status": "partial"}}),
+                         ("denied", {"error_code": "other"}),
+                         ("denied", {"repair_from_run_id": "e" * 32})):
+        message = SimpleNamespace(name=name, artifact=messages[cid].artifact | changes)
+        assert not _already_succeeded_render_repair(rejected, corrected, messages | {cid: message}, order)
+
+
 def test_saved_identity_report_separates_rate_limit_from_unprocessed(monkeypatch):
     from src.research import reference_audit, reference_tools
 

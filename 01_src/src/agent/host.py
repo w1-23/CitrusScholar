@@ -613,7 +613,8 @@ async def _run(state, identity, ledger):
         text = public_answer_text(answer.content)
         if not text.strip() or ops._DSML_PROTOCOL_RE.search(text):
             return FinalCheck(False, ("尚未形成有效答复。需要工具时使用原生工具调用；不要用工具协议文本冒充答案。",))
-        from src.core.turn_outcome import claims_file_delivery, completion_from_answer, repairable_proposal_reason
+        from src.core.turn_outcome import (claims_file_delivery, completion_from_answer, repairable_proposal_reason,
+                                           uses_single_render_delivery)
         statement = completion_from_answer(text, host.records)
         if any(row.get('name') == 'browse_web' for row in host.records):
             from src.core.progress_bus import emit_progress
@@ -633,7 +634,7 @@ async def _run(state, identity, ledger):
         delivery_gaps, artifact_contract, delivery_manifest = [], None, None
         figure_previews = {}
         if requirements:
-            from src.core.turn_outcome import _effective_artifact_records, artifact_goal_evidence, figure_answer_refs, uses_single_render_delivery
+            from src.core.turn_outcome import _effective_artifact_records, artifact_goal_evidence, figure_answer_refs
             from src.research.tools import validate_artifact_links
             effective = _effective_artifact_records(host.records)
             links = list(dict.fromkeys(item["link"] for row in effective
@@ -688,6 +689,15 @@ async def _run(state, identity, ledger):
             and row["tool_call_id"] not in host.dispatched
             and not host.messages[row["tool_call_id"]].additional_kwargs.get("execution_dispatched")
             and not host.messages[row["tool_call_id"]].additional_kwargs.get("operation_uncertain")]
+        figure_refs = {cid for goal in statement.goals if goal.kind == "deliverable" for cid in goal.evidence_call_ids}
+
+        def repair_matches(rejected_id, corrected_id):
+            rejected, corrected = calls.get(rejected_id), calls.get(corrected_id)
+            return (_same_repair_target(rejected, corrected, records=host.records)
+                    or (corrected_id in figure_refs and uses_single_render_delivery(requirements)
+                        and _already_succeeded_render_repair(
+                        rejected, corrected, host.messages, positions)))
+
         repairs = list(statement.proposal_repairs)
         claimed_repairs = {claim.rejected_call_id for claim in repairs}
         if statement.status == "completed" and not statement.remaining:
@@ -703,8 +713,7 @@ async def _run(state, identity, ledger):
                 corrected = next((r.get("tool_call_id") for r in host.records
                     if r.get("status") == "complete" and r.get("tool_call_id") in goal_refs
                     and positions.get(cid, float("inf")) < positions.get(r.get("tool_call_id"), -1)
-                    and _same_repair_target(calls.get(cid), calls.get(r.get("tool_call_id")),
-                                            records=host.records)), None)
+                    and repair_matches(cid, r.get("tool_call_id"))), None)
                 if corrected:
                     repairs.append(ProposalRepair(rejected_call_id=cid, corrected_call_id=corrected,
                         reason="提案在执行前被拒绝；本轮随后使用成功操作满足了所声明的目标。"))
@@ -720,8 +729,7 @@ async def _run(state, identity, ledger):
             no_dispatch = host.proven_no_dispatch(claim.rejected_call_id)
             if (no_dispatch and positions.get(claim.rejected_call_id, float("inf")) <
                     positions.get(claim.corrected_call_id, -1)
-                    and _same_repair_target(calls.get(claim.rejected_call_id), calls.get(claim.corrected_call_id),
-                                            records=host.records)):
+                    and repair_matches(claim.rejected_call_id, claim.corrected_call_id)):
                 verified_repairs.append(claim.rejected_call_id)
         # Exploratory read receipts describe individual attempts, not additional
         # user obligations. Once the agent cites successful evidence for its
@@ -1028,6 +1036,31 @@ def _same_audit_target(original, replacement):
         return normalized(original) == normalized(replacement)
     except (TypeError, ValueError):
         return False
+
+
+def _already_succeeded_render_repair(rejected, corrected, messages, positions):
+    """Match a preflight-only rejection to the selected, same-source render."""
+    name = "run_research_figure_script"
+    if not rejected or not corrected or rejected["name"] != name or corrected["name"] != name:
+        return False
+    parent = (rejected.get("args") or {}).get("repair_from_run_id")
+    denied, delivered = messages.get(rejected["id"]), messages.get(corrected["id"])
+    denied = getattr(denied, "artifact", None) or {}
+    delivered = getattr(delivered, "artifact", None) or {}
+    snapshots = delivered.get("input_snapshots")
+    published = {"status": "complete", "reason_code": "figure_published"}
+    if (not parent or not snapshots or denied.get("error_code") != "repair_target_already_succeeded"
+            or any((delivered.get("_tool_outcome") or {}).get(k) != v for k, v in published.items())
+            or denied.get("repair_from_run_id") != parent):
+        return False
+    for cid, message in messages.items():
+        if message.name != name or positions.get(cid, float("inf")) >= positions[rejected["id"]]:
+            continue
+        artifact = message.artifact or {}
+        if (artifact.get("run_id") == parent and artifact.get("input_snapshots") == snapshots
+                and all((artifact.get("_tool_outcome") or {}).get(k) == v for k, v in published.items())):
+            return True
+    return False
 
 
 def _same_repair_target(rejected, corrected, *, records=()):

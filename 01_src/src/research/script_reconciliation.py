@@ -27,6 +27,28 @@ class _FailureEvidence:
     source: dict | None = None
     result_digest: str = ""
     preflight_digest: str = ""
+    undeclared_table: str = ""
+    repair_projection: dict | None = None
+    repair_digest: str = ""
+
+    def output_contract_repair(self, message, *, reconciled):
+        """Return host-only comparison keys for a bound, acknowledged invocation."""
+        if not self.repair_projection or not self.repair_digest:
+            return None
+        if "missing" in self.repair_projection and not reconciled:
+            return None
+        try:
+            payload = json.loads(message.content)
+            receipt = (message.artifact or {}).get("op_receipt") or {}
+            if (_digest(payload) == self.repair_digest
+                    and receipt.get("run_id") == payload["run_id"]
+                    and receipt.get("repair_identity") == payload["repair_identity"]
+                    and receipt.get("status") == payload["_tool_outcome"]["status"]
+                    and receipt.get("reason_code") == payload["_tool_outcome"]["reason_code"]):
+                return self.repair_projection
+        except (ValueError, TypeError, AttributeError, KeyError):
+            pass
+        return None
 
     def matches(self, message) -> bool:
         """Recheck private invocation evidence before relaxing unknown."""
@@ -88,7 +110,7 @@ def observe_preflight_rejection(payload):
         evidence.preflight_digest = _digest(payload)
 
 
-def observe_failed_worker(result, source: dict, *, validated_output_failure=False):
+def observe_failed_worker(result, source: dict, *, validated_output_failure=False, explicit_outputs=False):
     """Called only at adapter branches that have made no publication attempt.
 
     A successful worker with a validated v2 failure receipt can also be observed;
@@ -110,6 +132,11 @@ def observe_failed_worker(result, source: dict, *, validated_output_failure=Fals
         return
     evidence.source = json.loads(json.dumps({key: source[key] for key in
         ("run_id", "script_ref", "input_snapshots")}))
+    diagnostic = result.diagnostic
+    if (explicit_outputs and known_failure and result.exit_code == EXIT_SCRIPT_ERROR
+            and diagnostic.get("stage") == "analysis"
+            and diagnostic.get("error_code") == "undeclared_table_output"):
+        evidence.undeclared_table = diagnostic.get("output_name") or ""
 
 
 def finalize_failed_worker(owner, session, run, payload, warning):
@@ -124,3 +151,51 @@ def finalize_failed_worker(owner, session, run, payload, warning):
             or payload.get("replay", {}).get("input_snapshots") != evidence.source["input_snapshots"]):
         return
     evidence.result_digest = _digest(payload)
+
+
+def finalize_output_contract(owner, session, run, payload, warning, *, snapshots, environment):
+    """Compare exact contracts modulo renderer source and one unused new table."""
+    from src.core.tracing import get_client_request_id
+
+    evidence = _current.get()
+    request = get_client_request_id()
+    if (evidence is None or not request or warning is not None or not isinstance(snapshots, list)
+            or (owner, session) != (evidence.owner, evidence.session)
+            or not payload.get("repair_identity") or not run.get("logical_task_id")):
+        return
+    outcome = payload.get("_tool_outcome") or {}
+    contract = run.get("output_contract") or {}
+    figures = contract.get("figures") or []
+    if not figures:
+        return
+    # Preserve the renderer/analysis boundary while permitting renderer code edits.
+    contract = {**contract, "figures": [
+        {**figure, **({"render_script": True} if "render_script" in figure else {})}
+        for figure in figures]}
+    facts = [owner, session, request, run["logical_task_id"].split(":", 1)[0],
+             run["inputs"], run["parameters"],
+             environment, [{key: item.get(key) for key in
+                 ("variable", "sha256", "source_file_id", "dataset_ref")} for item in snapshots]]
+    tables = contract["tables"]
+    if (outcome.get("status") == "failed" and outcome.get("reason_code") == "SCRIPT_ERROR"
+            and not outcome.get("artifacts") and evidence.result_digest and evidence.undeclared_table):
+        name = evidence.undeclared_table
+        if any(item["name"].casefold() == name.casefold() for item in tables + figures):
+            return
+        projection = {"missing": {name: _digest([facts, contract])}}
+    elif (outcome.get("status") == "complete" and outcome.get("reason_code") == "figure_published"
+            and payload.get("execution_stage") == "worker_receipt_verified"
+            and outcome.get("artifacts")):
+        # No original slot, figure parent or intermediate table may depend on the
+        # declaration removed for comparison. The new slot is auxiliary only.
+        used = {parent.casefold() for item in tables + figures for parent in item.get("parents", [])}
+        added = {table["name"]: _digest([facts, {**contract, "tables": [
+            item for item in tables if item is not table]}])
+            for table in tables if table["name"].casefold() not in used}
+        if not added:
+            return
+        projection = {"added": added}
+    else:
+        return
+    evidence.repair_projection = projection
+    evidence.repair_digest = _digest(payload)

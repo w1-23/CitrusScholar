@@ -291,8 +291,31 @@ def _set_object(dst, src, key, projector):
 
 def project_artifact_delivery(value):
     row = _object(value)
-    return project_fields(row, ids="status", numbers="unavailable_count", nullable="unavailable_count") | {
-        "verified_file_ids": _ids(row.get("verified_file_ids"))}
+    result = project_fields(row, ids="status", numbers="unavailable_count", nullable="unavailable_count") | {
+        "verified_file_ids": list(dict.fromkeys(_ids(row.get("verified_file_ids"))))}
+    if row.get("schema_version") != "artifact-delivery/1":
+        return result
+
+    def asset(item):
+        fields = project_fields(item, ids="asset_ref format sha256 render_id qa_status", numbers="size_bytes",
+                                texts="filename mime_type", nullable="render_id")
+        if not fields.get("asset_ref") or not fields.get("sha256"):
+            return {}
+        url = item.get("url")
+        if not isinstance(url, str) or not re.fullmatch(r"/api/v2/session/[A-Za-z0-9_-]{8,128}/artifacts/[a-f0-9]{32}", url):
+            return {}
+        validation = _object(item.get("validation"))
+        fields.update(url=url, validation={"status": project_fields(validation, ids="status").get("status", ""),
+                                           "checks": _ids(validation.get("checks"))})
+        return fields
+
+    assets = _array(row.get("artifacts"), asset)
+    return result | project_fields(row, ids="delivery_id logical_task_id delivery_status render_id", nullable="render_id") | {
+        "schema_version": "artifact-delivery/1", "artifacts": assets,
+        "user_links": list(dict.fromkeys(item["url"] for item in assets)),
+        "limitations": _ids(row.get("limitations")),
+        "obligations": _array(row.get("obligations"), lambda item: project_fields(item, texts="label") | {
+            "formats": _ids(_object(item).get("formats"))})}
 
 
 def _source_ref(value):
@@ -522,6 +545,22 @@ def project_public_event(event, data):
     else:
         result = {}
     return result | cursor
+
+
+def project_diagnostic_progress(event, value):
+    """Stdlib-only progress projection for private operator archives.
+
+    Exporting structured evidence never requires rendering the browser's
+    richer labels or loading the LangGraph runtime on the operator host.
+    """
+    if event == "context_maintenance":
+        return project_public_event(event, value)
+    row = _object(value)
+    cursor = project_fields(row, numbers="seq")
+    if event != "assistant_progress" or private_record(row) or row.get("kind") == "model_preview":
+        return cursor
+    return cursor | project_fields(row, ids="schema event_id job_id run_id tool_call_id operation_id logical_step_id "
+                                         "note_id kind status reason_code tool_name")
 
 
 def _since_ms(start, end):

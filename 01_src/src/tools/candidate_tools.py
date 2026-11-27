@@ -282,6 +282,11 @@ def search_candidates(query: str, limit: int = 6) -> Tuple[str, dict]:
     metadata for newly added candidates only — read their text with
     ``read_candidate``. Existing candidate ids stay stable.
     """
+    from src.corpus_integration.settings import unified_enabled
+
+    if unified_enabled():
+        return "[LOCAL_CORPUS_USE_UNIFIED] Use local_hybrid_search for new retrieval.", {
+            "main_results": [], "_tool_outcome": _outcome("not_run", "corpus_use_unified")}
     query = str(query or "").strip()
     if not query:
         return (
@@ -297,7 +302,9 @@ def search_candidates(query: str, limit: int = 6) -> Tuple[str, dict]:
         from src.retrieval.corpus_registry import load_corpus_registry
 
         registry = load_corpus_registry()
-        families |= set(registry.matching_families(query))
+        # The durable pool contains only legacy exact-span evidence.
+        base_families = registry.family_ids & registry.search_family_ids
+        families = (families | registry.matching_families(query)) & base_families
         if not families:
             from src.retrieval.local_query_language import normalize_local_query
 
@@ -309,7 +316,7 @@ def search_candidates(query: str, limit: int = 6) -> Tuple[str, dict]:
                     {"main_results": [], "pool": pool.summary() if pool else {},
                      "_tool_outcome": _outcome("not_run", "translation_failed")},
                 )
-            families |= set(registry.matching_families(normalized))
+            families |= registry.matching_families(normalized) & base_families
     except Exception as exc:  # noqa: BLE001 - report honestly, never crash the turn
         return (
             f"[CANDIDATE_SEARCH_ERROR] 补充检索未执行：语料注册表读取失败（{type(exc).__name__}）。",

@@ -109,6 +109,8 @@ def _append(conn, job_id, event, data):
     _job(conn, job_id)
     from src.core.progress_bus import stamp_sse_event, _encode_event
     from src.core.public_delivery import project_public_event
+    if event == "text" and data.get("delivery") != "committed":
+        return None
     if event != "task_state":
         data = project_public_event(event, data)
     if event == "text" and "content" not in data:
@@ -596,15 +598,22 @@ def abandon_operation(operation_id, lease):
         conn.execute("UPDATE task_operations SET status='interrupted',lease_until=0,updated_at=? WHERE operation_id=? AND lease=? AND status='running'", (time.time(), operation_id, lease))
 
 
-def operation_result(job_id, operation_id, *, include_retry=False, conn=None):
+def operation_result(job_id, operation_id, *, include_retry=False, allow_pending_receipt=False, conn=None):
     with read_transaction(conn) as conn:
         job = _job(conn, job_id)
-        row = conn.execute("SELECT result,outcome,input_hash,result_refs,retry_of FROM task_operations "
+        row = conn.execute("SELECT status,result,outcome,input_hash,result_refs,retry_of FROM task_operations "
                            "WHERE job_id=? AND operation_id=? AND owner_user_id=? AND owner_user_id>0",
                            (job_id, operation_id, job["owner_user_id"])).fetchone()
-        if row is None or not row["result"]:
+        if row is None:
             raise TaskConflict("operation_result_unavailable")
+        if not row["result"]:
+            if not allow_pending_receipt or row["status"] not in {"running", "interrupted", "unknown"}:
+                raise TaskConflict("operation_result_unavailable")
+            return {"job_id": job_id, "operation_id": operation_id, "status": row["status"],
+                    "input_hash": row["input_hash"], "result_available": False, "result": None,
+                    "outcome": {"status": row["status"]}, "result_refs": []}
         return {"job_id": job_id, "operation_id": operation_id,
+                **({"status": row["status"], "result_available": True} if allow_pending_receipt else {}),
                 "input_hash": row["input_hash"], "result": json.loads(row["result"]),
                 "outcome": json.loads(row["outcome"]), "result_refs": json.loads(row["result_refs"]),
                 **({"retry_of": row["retry_of"]} if include_retry else {})}

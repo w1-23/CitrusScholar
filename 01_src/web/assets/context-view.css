@@ -13,21 +13,18 @@
 #ctxTriggerPct { position:absolute; font-size:9px; font-weight:700; font-variant-numeric:tabular-nums; }
 
 .ctx-context-view { background:var(--ui-popover); }
+/* Make the open state focusable immediately. */
+#ctxDrawer.open { transition:none; }
+/* Expand normally. On very short or zoomed screens keep off-screen controls reachable. */
+body[data-page="chat"] #ctxDrawer { overflow:auto; scrollbar-width:none; }
 .ctx-context-view .ctx-drawer-header { justify-content:space-between; gap:10px; }
-.ctx-context-view .ctx-drawer-title { margin:0; white-space:nowrap; }
-.ctx-context-view .ctx-drawer-body { display:grid; grid-template-columns:minmax(0,1fr); gap:9px; align-content:start; }
+.ctx-context-view .ctx-drawer-title { margin:0; min-width:0; white-space:normal; overflow-wrap:anywhere; }
+.ctx-context-view .ctx-drawer-body { display:grid; grid-template-columns:minmax(0,1fr); gap:9px; align-content:start; flex:none; overflow:visible; }
 .ctx-context-view .ctx-drawer-close { display:grid; place-items:center; flex:none; }
 .ctx-context-view .ctx-drawer-close .ui-icon { width:17px; height:17px; }
 .ctx-context-view .ctx-view-picker { margin-inline-start:auto; }
 .ctx-context-view .ctx-view-picker label:has(input:disabled) { opacity:.48; cursor:default; }
 .ctx-context-view .ctx-view-picker label:has(input:disabled) input { cursor:default; }
-.context-amount { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
-.context-amount strong { font-size:26px; letter-spacing:-.035em; font-variant-numeric:tabular-nums; }
-.context-amount p { margin:2px 0 0; color:var(--text-secondary); font-size:12px; }
-.context-level { margin-inline-start:auto; font-size:11px; padding:3px 8px; border-radius:999px;
-  color:var(--text-primary); background:var(--accent-muted); font-variant-numeric:tabular-nums; }
-[data-level="warning"] .context-level { background:var(--warning-glow); }
-[data-level="critical"] .context-level { background:var(--error-glow); }
 .context-meta { margin:0; color:var(--text-secondary); font-size:11px; line-height:1.5; overflow-wrap:anywhere; }
 
 .context-gauge-grid { display:grid; grid-template-columns:repeat(20,minmax(0,1fr)); gap:3px; }
@@ -49,14 +46,21 @@
 .context-legend .context-legend-row {
   grid-template-columns:minmax(0,1fr) minmax(44px,auto) 40px; gap:7px; text-align:start;
   min-height:26px; width:100%; border:0; border-radius:5px; padding:2px 4px;
-  font:inherit; font-size:11px; background:transparent; color:var(--text-primary); cursor:pointer;
+  font:inherit; font-size:11px; white-space:normal; background:transparent; color:var(--text-primary); cursor:pointer;
 }
 .context-legend .context-legend-row:is(:hover,[aria-expanded="true"]) { background:var(--bg-hover); }
-.context-legend .context-legend-row .ctx-item-name { gap:6px; overflow-wrap:anywhere; }
+.context-legend .context-legend-row .ctx-item-name { gap:6px; }
+.context-legend .ctx-item-name span { min-width:0; overflow-wrap:anywhere; }
 .context-category-detail { margin:0; padding:6px 8px; background:var(--bg-elevated); border-radius:5px; color:var(--text-secondary); font-size:11px; line-height:1.5; white-space:normal; overflow-wrap:anywhere; }
 .context-provider { margin:0; padding-top:5px; }
 .context-usage-rows { display:grid; grid-template-columns:auto auto; gap:4px 7px; margin:5px 0 0; color:var(--text-secondary); font-size:11px; }
 .context-usage-rows dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; }
+@media (min-width:1025px) {
+  body[data-page="chat"].session-files-open #ctxDrawer { max-height:calc(var(--ui-viewport-height) - var(--app-header-h) - 16px); }
+  body[data-page="chat"]:has(#ctxDrawer.open) .session-files-panel {
+    top:calc(var(--app-header-h) + max(var(--right-dock-split), var(--context-dock-height, 0px) + 16px));
+  }
+}
 @media (pointer:coarse) {
   .app-header .ctx-circle-btn { width:44px; min-height:44px; }
   .context-legend .context-legend-row { min-height:36px; }

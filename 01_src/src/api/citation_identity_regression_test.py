@@ -305,3 +305,40 @@ def test_grouped_citations_keep_markdown_and_match_replay_and_history(citation_s
     saved = run.client.get(f'/sessions/{run.sid}/messages').json()['turns'][0]['answer']
     assert ''.join(row['data']['content'] for row in replay if row['event'] == 'text') == saved['content'] == body
     assert next(row['data']['bubbles'] for row in replay if row['event'] == 'citations') == saved['citation_bubbles']
+
+
+
+def test_mixed_search_preserves_legacy_exact_span_and_rejects_selfcorpus_replay(citation_session, monkeypatch):
+    from src.corpus_integration import selfcorpus_search
+    from src.research.result_tools import _shared_result_accessible
+    from src.retrieval import runtime
+    from src.tools import deepseek_search_fetch as fetch
+    from src.tools.candidate_tools import read_candidate
+
+    run = citation_session
+    monkeypatch.setenv("CITRUS_SELFCORPUS_RETRIEVAL", "1")
+    original = "Intro. Original exact span. Following paragraph."
+    legacy = {"corpus_id": "cqa_literature", "paper_id": "paper_mixed_identity",
+              "chunk_id": "chunk_mixed_identity", "title": "Legacy fixture", "text": original}
+    monkeypatch.setattr(fetch, "_base_hybrid_search", lambda *args, **kwargs: ("", {
+        "main_results": [legacy], "local_status": "hit", "base_generation": "base-old", "query": "citrus"}))
+    monkeypatch.setattr(runtime, "get_rag", lambda: SimpleNamespace(index_generation="base-old"))
+    incremental = {"source_family": selfcorpus_search.FAMILY_ID, "title": "New fixture",
+                   "selfcorpus_citation_ref": "corpus:chunk-new", "excerpt": "Incremental bounded evidence"}
+    monkeypatch.setattr(selfcorpus_search, "tool_result", lambda *args, **kwargs: {
+        "results": [incremental], "local_status": "hit", "_tool_outcome": {"status": "complete"}})
+    content, artifact = fetch.local_hybrid_search.func("citrus", ["literature", selfcorpus_search.FAMILY_ID])
+    assert [item["title"] for item in json.loads(content)["candidates"]] == ["Legacy fixture", "New fixture"]
+    assert artifact["main_results"][0]["citation_ref"] == "L1"
+    assert artifact["shared_results"] == [incremental]
+    assert not _shared_result_accessible({"tool_name": "local_hybrid_search"}, content, None)
+    record_tool("local_hybrid_search", "mixed-search", content, artifact)
+    records = run.client.get(f"/sessions/{run.sid}/turn-sources?request_id=client-request").json()["sources"]
+    assert len(records) == 1 and records[0]["read_ref"]["generation"] == "base-old"
+    source = records[0]
+    args = {"source_ref": source["source_ref"], "turn_id": run.job, "generation": "base-old"}
+    body, evidence = read_candidate.func(**args, offset=7, max_chars=20)
+    assert original[7:27] in body and evidence["read_ref"]["start"] == 7 and evidence["read_ref"]["end"] == 27
+    assert run.client.get("/corpus/source", params={"record": source["record_key"]}).json()["markdown"] == original
+    run.user["user_id"] = 32
+    assert run.client.get("/corpus/source", params={"record": source["record_key"]}).status_code == 404

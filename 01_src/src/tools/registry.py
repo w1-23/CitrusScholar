@@ -560,6 +560,16 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
                 cancelled.additional_kwargs["operation_uncertain"] = bool(
                     message.additional_kwargs.get("execution_dispatched"))
             return cancelled
+        if name == "run_research_figure_script" and reconciliation is not None:
+            artifact = dict(message.artifact or {})
+            receipt = dict(artifact.get("op_receipt") or {})
+            receipt.pop("figure_output_repair", None)
+            projection = reconciliation.output_contract_repair(message, reconciled=reconciled)
+            if projection:
+                receipt["figure_output_repair"] = projection
+            if receipt:
+                artifact["op_receipt"] = receipt
+                message = message.model_copy(update={"artifact": artifact})
         # Recheck inputs before committing the local result checkpoint.
         if mode != "never" and _recovery_inputs(name, args, owner) != (mode, refs):
             raise task_events.TaskConflict("checkpoint_input_changed")

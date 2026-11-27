@@ -136,7 +136,9 @@ def project_native_progress(data: dict) -> dict:
     if not isinstance(data, dict):
         return {}
     if data.get("source") == NATIVE_STREAM_SOURCE:
-        return project_native_stream_event(data)
+        # Provisional model prose has no trusted public provenance. This also
+        # suppresses its content on replay of rows written by earlier releases.
+        return {} if data.get("kind") == "model_preview" else project_native_stream_event(data)
     if (data.keys() - _EVENT_KEYS or data.get("origin") != "langgraph"
             or data.get("source") != "write_todos" or data.get("visibility") != "public"
             or not isinstance(data.get("job_id"), str) or not _ID.fullmatch(data["job_id"])
@@ -412,7 +414,8 @@ class NativeStreamProjector:
 
     def __init__(self, *, job_id: str, run_id: str, max_events: int = 60,
                  max_chars: int = 4000, min_chars: int = 64,
-                 min_interval: float = 0.5, now=time.time):
+                 min_interval: float = 0.5, now=time.time, model_preview: bool = True):
+        self._model_preview = model_preview
         self.job_id, self.run_id = str(job_id), str(run_id or job_id)
         self.max_events, self.max_chars = max(1, int(max_events)), max(0, int(max_chars))
         self.min_chars, self.min_interval = max(1, int(min_chars)), max(0.0, float(min_interval))
@@ -522,6 +525,8 @@ class NativeStreamProjector:
             # Native tool proposal: the model's own call identity, never args.
             self._note_tool_fragments(fragments)
             return []
+        if not self._model_preview:
+            return []
         if (getattr(message, "additional_kwargs", None) or {}).get("reasoning_content"):
             return []
         if getattr(message, "tool_calls", None):
@@ -599,8 +604,9 @@ class NativeStreamProjector:
         if interrupts:
             for value in interrupts if isinstance(interrupts, (list, tuple)) else (interrupts,):
                 events.extend(self.interrupt(value))
-        for output in data.values():
-            events.extend(self._tool_calls(output))
+        # State loaders and persistence nodes can return historical messages.
+        # Only the execution node can announce a current proposal.
+        events.extend(self._tool_calls(data.get("supervisor")))
         return events
 
     def _tool_calls(self, output):
@@ -611,6 +617,9 @@ class NativeStreamProjector:
         events = []
         for message in messages:
             if not isinstance(message, AIMessage):
+                continue
+            meta = message.additional_kwargs
+            if meta.get("run_id", self.run_id) != self.run_id:
                 continue
             for call in message.tool_calls or ():
                 tool_call_id = _safe_token(call.get("id"))

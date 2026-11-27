@@ -1123,6 +1123,12 @@ def validate_artifact_links(
                         except OSError:
                             actual_sha = ""
                         base["hash_matches"] = actual_sha == expected_sha
+                        if base["hash_matches"]:
+                            try:
+                                base["sha256"] = expected_sha
+                                base["size_bytes"] = path.stat().st_size
+                            except OSError:
+                                base["hash_matches"] = False
                     else:
                         # Legacy rows had no stored hash. They remain readable
                         # after the path/ownership checks, but are labelled so

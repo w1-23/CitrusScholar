@@ -1,0 +1,7 @@
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS evidence_refs (
+  ref TEXT PRIMARY KEY, subject TEXT NOT NULL, identity TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS corpus_extensions (name TEXT PRIMARY KEY, version INTEGER NOT NULL);
+INSERT OR IGNORE INTO corpus_extensions VALUES('evidence_refs',1);
+COMMIT;

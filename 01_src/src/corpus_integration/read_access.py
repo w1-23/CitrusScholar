@@ -7,6 +7,16 @@ from .settings import isolated_enabled, isolated_search_configured, legacy_enabl
 
 
 def shared_search_available():
+    from .settings import unified_enabled
+
+    if unified_enabled():
+        return False
+    from .selfcorpus_search import enabled
+
+    if enabled():
+        # The shared-only tool addresses Selfcorpus when enabled. Its failure
+        # never substitutes the historical shared reader.
+        return True
     if isolated_enabled():
         return isolated_search_configured()
     from src.shared_corpus.runtime import current_runtime

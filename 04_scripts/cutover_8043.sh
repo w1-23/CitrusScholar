@@ -5,7 +5,7 @@
 # config_sha256, active_state), watch_state, and helper (path, sha256).
 set -Eeuo pipefail
 umask 077
-root=/home/WZQ/citrusscholar
+root=/srv/citrusscholar
 py=/usr/bin/python3.12
 scripts=$(dirname -- "$(realpath -e -- "$0")")
 unitdir="$HOME/.config/systemd/user"

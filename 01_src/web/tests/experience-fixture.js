@@ -11,6 +11,7 @@
   const file = (id, filename) => ({file_id: id, filename, kind: 'table', origin: 'uploaded', size_bytes: 128,
     download_url: '/api/v2/files/' + id + '/download', last_accessed_at: 1700000000});
   const dataFiles = [file('fixture-file-0', 'Measurements.csv'), file('workbook', 'Measurements.xlsx')];
+  const inherited = {...file('f'.repeat(32), 'Measurements.csv'), mime_type: 'text/csv'};
   const svgId = 'a'.repeat(32);
   const delivered = {file_id: 'b'.repeat(32), artifact_id: 'c'.repeat(32), filename: '核验结果.csv',
     kind: 'table', origin: 'generated', source_session_id: sid, turn_request_id: rid, size_bytes: 128};
@@ -125,13 +126,14 @@
     } else if (p.endsWith('/messages')) {
       const history = state().turns == null && has('done') && p.includes('/' + sid + '/') ? [{
         turn_request_id: rid, job_id: job, job_status: 'completed', display_status: 'completed',
-        terminal_snapshot: envelope(), user: {content: queue().query},
+        terminal_snapshot: envelope(), user: {content: queue().query, attachments: [inherited]},
         answer: {content: answer, citation_bubbles: citations}, files: [delivered],
       }] : [];
       body = {messages: [], turns: [...history, ...Array.from({length: state().turns || 0}, (_, i) => ({
         turn_request_id: 'saved-' + i, user: {content: '历史问题 ' + i}, answer: {content: '历史回答 ' + i}, display_status: 'completed',
       }))], has_more: false};
     }
+    else if (p === '/api/v2/session/' + sid + '/continuation/' + rid) body = {attachments: [inherited]};
     else if (p.startsWith('/api/v2/session/' + otherSid + '/')) body = {turns: []};
     else if (p === '/api/v2/chat/jobs/' + job + '/cancel' && settings?.method === 'POST') {
       save({cancels: [...(state().cancels || []), job]});

@@ -179,14 +179,9 @@ def _public_artifact_delivery(delivery: Any) -> dict | None:
     if not isinstance(delivery, dict) or delivery.get("status") not in (
             "available", "partial", "unavailable"):
         return None
-    ids = delivery.get("verified_file_ids")
-    if not isinstance(ids, (list, tuple)):
-        ids = []
-    count = delivery.get("unavailable_count")
-    return {"status": delivery["status"],
-            "verified_file_ids": list(dict.fromkeys(value for value in ids
-                if isinstance(value, str) and value)),
-            "unavailable_count": count if type(count) is int and count >= 0 else None}
+    from src.core.public_delivery import project_artifact_delivery
+
+    return project_artifact_delivery(delivery)
 
 
 def public_terminal_snapshot(envelope: dict) -> dict:

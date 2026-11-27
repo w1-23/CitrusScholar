@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/Tavotto/Tavotto.git",
+  "commit": "b6de338c3b8d104d64930f18828b9675acb261a5",
+  "version_at_commit": "0.21.3",
+  "license": "AGPL-3.0-only",
+  "license_file_git_blob": "be3f7b28e564e7dd05eaf59d64adba1a4065ac0e",
+  "dependency_lock_git_blob": "75e91d02adacd35cb6eab4abaaf586a0178ee4e6",
+  "runtime_lock_git_blob": "d74f4ee172fd3836caf38edd8b34385f7f412390",
+  "font_allowlist_git_blob": "97a71738bb03861fdaec048d4786e69d0982c0b7",
+  "engine_git_blobs": {
+    "worker.py": "33e1dba4c4211c260f6025c85d810016501bed53",
+    "figsession.py": "00063adf4be6add76e7ae208ca7622ce7240e2c1",
+    "manifest.py": "6bda8d31fe354acb616b5d3af2d3483b2b36b03c",
+    "overrides.py": "995a20ee8d27ce78a251a172a0547b91e92c5777",
+    "layoutsession.py": "8afdbbf0f95717076c6caf8e7298c7e818f6484b",
+    "versionstore.py": "c34104c09d85f17de6ce893e51d6754ae076d276",
+    "preflight.py": "fa3b8807836844540ecf19582b94b07d99ede88d",
+    "exportjob.py": "04c9d6225a9dc6808ed5032ab4e03bb17bdc2b51"
+  },
+  "source_of_record": "Pinned upstream Git tree, not the local archive. Local archive has no .git and at least preflight.py differs."
+}

@@ -44,6 +44,7 @@ function panel() {
 function host(body) { return body.querySelector('.task-native-stream'); }
 function rows(body) { const node = host(body); return node ? node.querySelectorAll('.task-native-row') : []; }
 function rowKinds(body) { return rows(body).map(row => row.dataset.kind); }
+function actions(body) { return body.querySelector('.research-action-list')?.querySelectorAll('.term-line') || []; }
 
 test('legacy events keep their own surface and never create native rows', () => {
   const {process, body} = panel();
@@ -87,11 +88,13 @@ test('provisional model text stays hidden by default', () => {
 test('lifecycle rows are visible in the default surface', () => {
   const {process, body} = panel();
   nativeEvents().forEach(event => process.receive('assistant_progress', event));
-  assert.equal(JSON.stringify(rowKinds(body)), JSON.stringify(['subagent', 'tool', 'interrupt']));
+  assert.deepEqual(rowKinds(body), ['subagent', 'interrupt']);
+  assert.equal(actions(body).length, 1);
+  assert.match(actions(body)[0].textContent, /已提交/);
   const node = host(body);
   assert.equal(node.hidden, false);
   assert.equal(node.querySelectorAll('.task-native-row.is-active').length, 1);
-  assert.equal(node.querySelectorAll('.task-native-row.is-proposed').length, 1);
+  assert.equal(node.querySelectorAll('.task-native-row.is-proposed').length, 0);
   assert.equal(node.getAttribute('data-unrecorded'), '0');
   assert.equal(node.getAttribute('style'), null, 'rows are styled by app.css, never inline');
 });
@@ -101,11 +104,12 @@ test('a replayed page appends nothing twice', () => {
   const events = nativeEvents();
   events.forEach(event => process.receive('assistant_progress', event));
   const first = rows(body).length;
-  assert.equal(first, 3);
+  assert.equal(first, 2);
   events.forEach(event => process.receive('assistant_progress', event));
   events.slice().reverse().forEach(event => process.receive('assistant_progress', event));
   assert.equal(rows(body).length, first);
-  assert.equal(JSON.stringify(rowKinds(body)), JSON.stringify(['subagent', 'tool', 'interrupt']));
+  assert.deepEqual(rowKinds(body), ['subagent', 'interrupt']);
+  assert.equal(actions(body).length, 1);
 });
 
 test('a terminal frame freezes the surface and marks unrecorded endings', () => {
@@ -114,23 +118,24 @@ test('a terminal frame freezes the surface and marks unrecorded endings', () => 
   process.receive('done', {job_id: JOB, answer: '已完成', seq: 14,
     turn_envelope: {display_status: 'completed'}});
   const node = host(body);
-  assert.equal(node.getAttribute('data-unrecorded'), '2');
-  assert.equal(node.querySelectorAll('.task-native-row.is-unrecorded').length, 2);
+  assert.equal(node.getAttribute('data-unrecorded'), '1');
+  assert.equal(node.querySelectorAll('.task-native-row.is-unrecorded').length, 1);
   // A late native frame can no longer add a row.
   process.receive('assistant_progress', frame('tool_proposed',
     {tool_call_id: 'call_9', tool_name: 'execute'}, 15));
-  assert.equal(rows(body).length, 3);
-  assert.equal(JSON.stringify(rowKinds(body)), JSON.stringify(['subagent', 'tool', 'interrupt']));
+  assert.equal(rows(body).length, 2);
+  assert.deepEqual(rowKinds(body), ['subagent', 'interrupt']);
+  assert.equal(actions(body).length, 1);
 });
 
-test('the explicit switch shows provisional text until the answer lands', () => {
+test('legacy preview switches cannot expose provisional text', () => {
   const {b, process, body} = panel();
   b.ctx.NATIVE_STREAM_PREVIEW = true;
   process.receive('assistant_progress', frame('model_preview',
     {call_id: CALL, delta_index: 0, text: '第一段结论'}, 41));
   const preview = body.querySelector('.task-native-preview');
-  assert.ok(preview, 'the opt-in preview renders');
-  assert.equal(preview.querySelector('.task-native-preview-text').textContent, '第一段结论');
+  assert.equal(preview, null);
+  assert.doesNotMatch(body.textContent, /第一段结论/);
   process.receive('text', {content: '最终答复', delivery: 'committed', seq: 42});
   assert.equal(body.querySelectorAll('.task-native-preview').length, 0);
   process.receive('assistant_progress', frame('model_preview',
@@ -144,12 +149,13 @@ test('recovery reopens the native surface for the same turn', () => {
     {tool_call_id: 'call_1', tool_name: 'read_tool_result'}, 51));
   process.receive('done', {job_id: JOB, answer: '', seq: 52,
     turn_envelope: {display_status: 'failed'}});
-  assert.equal(rows(body).length, 1);
+  assert.equal(actions(body).length, 1);
   process.receive('agent_recovery', {job_id: JOB, status: 'admitted', seq: 53, recovery_cursor: 53});
-  assert.equal(rows(body).length, 0, 'a recovered turn starts from a clean projection');
   process.receive('assistant_progress', frame('tool_proposed',
     {tool_call_id: 'call_2', tool_name: 'execute'}, 54));
-  assert.equal(rows(body).length, 1);
+  assert.equal(actions(body).length, 2);
+  assert.match(actions(body)[0].textContent, /未记录结束状态/);
+  assert.match(actions(body)[1].textContent, /已提交/);
 });
 
 test('a client without the native projection keeps working unchanged', () => {
@@ -185,22 +191,46 @@ test('the native surface is styled by app.css and stays reachable on small scree
 });
 
 
-test('result before proposal is not duplicated, and continuation owns only its job', () => {
+test('one card owns proposal, execution, and receipt in either order', () => {
   const {process, body} = panel();
   process.receive('job', {job_id: JOB});
-  process.receive('tool_result', {job_id: JOB, tool_call_id: 'call_1', tool_name: 'read_tool_result', status: 'complete'});
-  process.receive('assistant_progress', nativeEvents()[1]);
+  const receipt = {job_id: JOB, tool_call_id: 'call_1', tool_name: 'read_tool_result', status: 'complete'};
+  const proposed = nativeEvents()[1];
+  process.receive('assistant_progress', proposed);
+  const original = actions(body)[0];
+  assert.match(original.textContent, /已提交/);
+  process.receive('tool_call_start', Object.assign({}, receipt, {status: 'running'}));
+  assert.equal(actions(body)[0], original);
+  assert.match(original.textContent, /处理中/);
+  process.receive('operation', Object.assign({}, receipt, {operation_id: 'op-1'}));
+  process.receive('tool_result', receipt);
+  process.receive('assistant_progress', proposed);
+  assert.equal(actions(body).length, 1);
+  assert.equal(actions(body)[0], original);
+  assert.match(original.textContent, /已完成/);
+
+  process.resetDetails();
+  process.receive('job', {job_id: JOB});
+  process.receive('tool_result', receipt);
+  process.receive('assistant_progress', proposed);
+  process.receive('tool_executing', Object.assign({}, receipt, {status: 'running'}));
+  assert.equal(actions(body).length, 1);
+  assert.match(actions(body)[0].textContent, /已完成/);
   assert.equal(rows(body).length, 0);
-  process.receive('assistant_progress', frame('tool_proposed', {tool_call_id: 'call_2', tool_name: 'read_tool_result'}, 15));
-  assert.equal(rows(body).length, 1);
-  process.receive('done', {turn_envelope: {display_status: 'awaiting_input'}});
-  assert.equal(rows(body)[0].dataset.status, 'proposed');
+
+  process.receive('operation', Object.assign({}, receipt, {operation_id: 'op-1', attempt: 2, status: 'failed'}));
+  assert.equal(actions(body).length, 2);
+  assert.match(actions(body)[1].textContent, /第 2 次尝试/);
+});
+
+test('continuation rejects proposals from another job or run', () => {
+  const {process, body} = panel();
   process.receive('job', {job_id: 'child-job'});
-  process.receive('assistant_progress', frame('tool_proposed', {tool_call_id: 'stale', tool_name: 'read_tool_result'}, 16));
-  const child = Object.assign(frame('tool_proposed', {tool_call_id: 'child-call', tool_name: 'read_tool_result'}, 1),
-    {job_id: 'child-job', run_id: 'child-job'});
-  process.receive('assistant_progress', child);
-  assert.equal(rows(body).length, 1);
-  process.receive('operation', {job_id: 'child-job', tool_call_id: 'child-call', tool_name: 'read_tool_result', status: 'complete'});
-  assert.equal(rows(body).length, 0);
+  process.receive('assistant_progress', nativeEvents()[1]);
+  const proposal = frame('tool_proposed', {job_id: 'child-job', run_id: 'stale-run',
+    tool_call_id: 'same-call', tool_name: 'read_tool_result'}, 1);
+  process.receive('assistant_progress', proposal);
+  assert.equal(actions(body).length, 0);
+  process.receive('assistant_progress', Object.assign({}, proposal, {run_id: 'child-job'}));
+  assert.equal(actions(body).length, 1);
 });

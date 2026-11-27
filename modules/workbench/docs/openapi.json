@@ -1,0 +1,2318 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Citrus Figure Workbench API",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Health",
+        "operationId": "health_healthz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/launch": {
+      "post": {
+        "summary": "Launch",
+        "operationId": "launch_api_v1_launch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Launch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/standalone": {
+      "post": {
+        "summary": "Standalone",
+        "operationId": "standalone_api_v1_standalone_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/session": {
+      "get": {
+        "summary": "Get Session",
+        "operationId": "get_session_api_v1_session_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/assets": {
+      "post": {
+        "summary": "Upload",
+        "operationId": "upload_api_v1_assets_post",
+        "parameters": [
+          {
+            "name": "x-filename",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "X-Filename"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/library": {
+      "get": {
+        "summary": "Library List",
+        "operationId": "library_list_api_v1_library_get",
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:png|svg|pdf|jpeg|jpg|py|r|csv|tsv|json|txt|xlsx|parquet|npy)?$",
+              "default": "",
+              "title": "Format"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(?:script|static|dependency)?$",
+              "default": "",
+              "title": "Type"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/library/{ref}/preview": {
+      "get": {
+        "summary": "Library Preview",
+        "operationId": "library_preview_api_v1_library__ref__preview_get",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures": {
+      "get": {
+        "summary": "List Figures",
+        "operationId": "list_figures_api_v1_figures_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview-cards": {
+      "get": {
+        "summary": "Preview Cards",
+        "operationId": "preview_cards_api_v1_preview_cards_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewCards"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview-cards/{ref}/thumbnail": {
+      "get": {
+        "summary": "Preview Thumbnail",
+        "operationId": "preview_thumbnail_api_v1_preview_cards__ref__thumbnail_get",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "title": "Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview-runs": {
+      "post": {
+        "summary": "Prepare Preview",
+        "operationId": "prepare_preview_api_v1_preview_runs_post",
+        "parameters": [
+          {
+            "name": "idempotency-key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{8,128}$",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewRun"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewOperation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/preview-runs/{ref}": {
+      "get": {
+        "summary": "Preview Operation",
+        "operationId": "preview_operation_api_v1_preview_runs__ref__get",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewOperation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/import": {
+      "post": {
+        "summary": "Import Figure",
+        "operationId": "import_figure_api_v1_figures_import_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ImportRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PreviewImport"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}": {
+      "get": {
+        "summary": "Get Figure",
+        "operationId": "get_figure_api_v1_figures__ref__get",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FigureDocument"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/objects": {
+      "get": {
+        "summary": "Get Objects",
+        "operationId": "get_objects_api_v1_figures__ref__objects_get",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/pick": {
+      "post": {
+        "summary": "Hit Test",
+        "operationId": "hit_test_api_v1_figures__ref__pick_post",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Pick"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/groups/{gid}": {
+      "get": {
+        "summary": "Get Group",
+        "operationId": "get_group_api_v1_figures__ref__groups__gid__get",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "gid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Gid"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/groups/resolve": {
+      "post": {
+        "summary": "Group Selection",
+        "operationId": "group_selection_api_v1_figures__ref__groups_resolve_post",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupSelection"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/groups/{gid}/move": {
+      "post": {
+        "summary": "Group Movement",
+        "operationId": "group_movement_api_v1_figures__ref__groups__gid__move_post",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "gid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Gid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupMove"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FigureDocument"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/groups/{gid}/scale": {
+      "post": {
+        "summary": "Group Scaling",
+        "operationId": "group_scaling_api_v1_figures__ref__groups__gid__scale_post",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "gid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Gid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GroupScale"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FigureDocument"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/preview": {
+      "get": {
+        "summary": "Preview",
+        "operationId": "preview_api_v1_figures__ref__preview_get",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/overrides": {
+      "patch": {
+        "summary": "Edit",
+        "operationId": "edit_api_v1_figures__ref__overrides_patch",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Edit"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FigureDocument"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/native-overrides": {
+      "patch": {
+        "summary": "Native Edit",
+        "operationId": "native_edit_api_v1_figures__ref__native_overrides_patch",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NativeEdit"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FigureDocument"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/history": {
+      "get": {
+        "summary": "History",
+        "operationId": "history_api_v1_figures__ref__history_get",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevisionHistory"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/history/{revision}/name": {
+      "put": {
+        "summary": "Name Revision",
+        "operationId": "name_revision_api_v1_figures__ref__history__revision__name_put",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "title": "Revision"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionName"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevisionSummary"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/restore": {
+      "post": {
+        "summary": "Restore",
+        "operationId": "restore_api_v1_figures__ref__restore_post",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Restore"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FigureDocument"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/figures/{ref}/export": {
+      "post": {
+        "summary": "Export",
+        "operationId": "export_api_v1_figures__ref__export_post",
+        "parameters": [
+          {
+            "name": "ref",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "title": "Ref"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Export"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Capture": {
+        "properties": {
+          "ordinal": {
+            "type": "integer",
+            "maximum": 7.0,
+            "minimum": 0.0,
+            "title": "Ordinal"
+          },
+          "count": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Count"
+          },
+          "signature": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Signature"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ordinal",
+          "count",
+          "signature"
+        ],
+        "title": "Capture"
+      },
+      "Edit": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "overrides": {
+            "patternProperties": {
+              "^[a-zA-Z0-9_:.-]{1,160}$": {
+                "$ref": "#/components/schemas/Override"
+              }
+            },
+            "type": "object",
+            "maxProperties": 64,
+            "minProperties": 1,
+            "title": "Overrides"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "overrides"
+        ],
+        "title": "Edit"
+      },
+      "Export": {
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "png",
+              "svg",
+              "pdf"
+            ],
+            "title": "Format"
+          },
+          "width_mm": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 400.0,
+                "minimum": 15.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width Mm"
+          },
+          "height_mm": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 400.0,
+                "minimum": 15.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height Mm"
+          },
+          "dpi": {
+            "type": "integer",
+            "maximum": 450.0,
+            "minimum": 72.0,
+            "title": "Dpi",
+            "default": 150
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "format"
+        ],
+        "title": "Export"
+      },
+      "FigureDocument": {
+        "properties": {
+          "renderer": {
+            "$ref": "#/components/schemas/Renderer"
+          },
+          "editability": {
+            "type": "string",
+            "enum": [
+              "semantic",
+              "partial",
+              "layout_only",
+              "preview_only"
+            ],
+            "title": "Editability"
+          },
+          "panels": {
+            "items": {
+              "$ref": "#/components/schemas/Panel"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Panels"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/FigureObject"
+            },
+            "type": "array",
+            "maxItems": 1200,
+            "title": "Objects"
+          },
+          "limitations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Limitations"
+          },
+          "native_manifest": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/JsonValue"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Manifest"
+          },
+          "native_editability": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "semantic",
+                  "partial",
+                  "layout_only",
+                  "preview_only"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Native Editability"
+          },
+          "capture": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Capture"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "type": "string",
+            "const": "figure-document/1",
+            "title": "Schema Version",
+            "default": "figure-document/1"
+          },
+          "figure_id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Figure Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceInfo"
+          },
+          "layout": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Layout"
+          },
+          "preview_format": {
+            "type": "string",
+            "enum": [
+              "png",
+              "svg",
+              "pdf"
+            ],
+            "title": "Preview Format",
+            "default": "png"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "renderer",
+          "editability",
+          "panels",
+          "objects",
+          "limitations",
+          "figure_id",
+          "name",
+          "revision",
+          "source"
+        ],
+        "title": "FigureDocument"
+      },
+      "FigureObject": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Id"
+          },
+          "panel_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Panel Id"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "properties": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Properties"
+          },
+          "editable": {
+            "items": {
+              "type": "string",
+              "const": "text"
+            },
+            "type": "array",
+            "title": "Editable"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "label",
+          "properties",
+          "editable"
+        ],
+        "title": "FigureObject"
+      },
+      "GroupMove": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "dx_mm": {
+            "type": "number",
+            "maximum": 400.0,
+            "minimum": -400.0,
+            "title": "Dx Mm"
+          },
+          "dy_mm": {
+            "type": "number",
+            "maximum": 400.0,
+            "minimum": -400.0,
+            "title": "Dy Mm"
+          },
+          "locked_gids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+            },
+            "type": "array",
+            "maxItems": 1200,
+            "title": "Locked Gids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "dx_mm",
+          "dy_mm"
+        ],
+        "title": "GroupMove"
+      },
+      "GroupScale": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "factor": {
+            "type": "number",
+            "maximum": 10.0,
+            "minimum": 0.05,
+            "title": "Factor"
+          },
+          "locked_gids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+            },
+            "type": "array",
+            "maxItems": 1200,
+            "title": "Locked Gids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "factor"
+        ],
+        "title": "GroupScale"
+      },
+      "GroupSelection": {
+        "properties": {
+          "gids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+            },
+            "type": "array",
+            "maxItems": 120,
+            "minItems": 1,
+            "title": "Gids"
+          },
+          "locked_gids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+            },
+            "type": "array",
+            "maxItems": 1200,
+            "title": "Locked Gids"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "gids"
+        ],
+        "title": "GroupSelection"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ImportOptions": {
+        "properties": {
+          "parse_mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "editable",
+              "preview_only"
+            ],
+            "title": "Parse Mode",
+            "default": "auto"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ImportOptions"
+      },
+      "ImportRequest": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "options": {
+            "$ref": "#/components/schemas/ImportOptions"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "title": "ImportRequest"
+      },
+      "JsonValue": {},
+      "Launch": {
+        "properties": {
+          "ticket": {
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 16,
+            "title": "Ticket"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ticket"
+        ],
+        "title": "Launch"
+      },
+      "NativeEdit": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "patches": {
+            "items": {
+              "$ref": "#/components/schemas/NativePatch"
+            },
+            "type": "array",
+            "maxItems": 128,
+            "minItems": 1,
+            "title": "Patches"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "patches"
+        ],
+        "title": "NativeEdit"
+      },
+      "NativePatch": {
+        "properties": {
+          "gid": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Gid"
+          },
+          "prop": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Prop"
+          },
+          "value": {
+            "$ref": "#/components/schemas/JsonValue"
+          },
+          "identity": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 300
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identity"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "gid",
+          "prop",
+          "value"
+        ],
+        "title": "NativePatch"
+      },
+      "Override": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 500,
+            "title": "Text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "Override"
+      },
+      "Panel": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "Panel"
+      },
+      "Pick": {
+        "properties": {
+          "x": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "X"
+          },
+          "y": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Y"
+          },
+          "locked_gids": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+            },
+            "type": "array",
+            "maxItems": 1200,
+            "title": "Locked Gids"
+          },
+          "current_gid": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Gid"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "x",
+          "y"
+        ],
+        "title": "Pick"
+      },
+      "PreviewCard": {
+        "properties": {
+          "preview_ref": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Preview Ref"
+          },
+          "preview_version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Preview Version"
+          },
+          "figure_ordinal": {
+            "type": "integer",
+            "maximum": 7.0,
+            "minimum": 0.0,
+            "title": "Figure Ordinal"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "thumbnail_url": {
+            "type": "string",
+            "title": "Thumbnail Url"
+          },
+          "preview_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Preview Sha256"
+          },
+          "capability": {
+            "type": "string",
+            "enum": [
+              "native",
+              "semantic",
+              "preview_only"
+            ],
+            "title": "Capability"
+          },
+          "source_state": {
+            "type": "string",
+            "enum": [
+              "verified",
+              "unavailable",
+              "not_applicable"
+            ],
+            "title": "Source State"
+          },
+          "bundle_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundle Sha256"
+          },
+          "runtime_ref": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Ref"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "preview_ref",
+          "preview_version",
+          "figure_ordinal",
+          "label",
+          "thumbnail_url",
+          "preview_sha256",
+          "capability",
+          "source_state"
+        ],
+        "title": "PreviewCard"
+      },
+      "PreviewCards": {
+        "properties": {
+          "cards": {
+            "items": {
+              "$ref": "#/components/schemas/PreviewCard"
+            },
+            "type": "array",
+            "title": "Cards"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "cards"
+        ],
+        "title": "PreviewCards"
+      },
+      "PreviewImport": {
+        "properties": {
+          "preview_ref": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Preview Ref"
+          },
+          "preview_version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Preview Version"
+          },
+          "options": {
+            "$ref": "#/components/schemas/ImportOptions"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "preview_ref",
+          "preview_version"
+        ],
+        "title": "PreviewImport"
+      },
+      "PreviewOperation": {
+        "properties": {
+          "cards": {
+            "items": {
+              "$ref": "#/components/schemas/PreviewCard"
+            },
+            "type": "array",
+            "title": "Cards"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Operation Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "ready",
+              "failed"
+            ],
+            "title": "Status"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "source_missing",
+                  "library_unavailable",
+                  "invalid_source_or_capture",
+                  "isolated_render_failed",
+                  "renderer_unavailable",
+                  "interrupted",
+                  "internal_error"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "cards",
+          "operation_id",
+          "status",
+          "created_at"
+        ],
+        "title": "PreviewOperation"
+      },
+      "PreviewRun": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "title": "PreviewRun"
+      },
+      "Renderer": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Id"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "version"
+        ],
+        "title": "Renderer"
+      },
+      "Restore": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "revision"
+        ],
+        "title": "Restore"
+      },
+      "RevisionHistory": {
+        "properties": {
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/RevisionSummary"
+            },
+            "type": "array",
+            "title": "Versions"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "versions"
+        ],
+        "title": "RevisionHistory"
+      },
+      "RevisionName": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 80,
+            "title": "Name"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "RevisionName"
+      },
+      "RevisionSummary": {
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "title": "Revision"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "revision",
+          "created_at"
+        ],
+        "title": "RevisionSummary"
+      },
+      "Source": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "script",
+              "rendered_asset",
+              "project_bundle"
+            ],
+            "title": "Kind"
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "python",
+              "r",
+              "unknown"
+            ],
+            "title": "Language"
+          },
+          "entrypoint_ref": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Entrypoint Ref"
+          },
+          "assets": {
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+            },
+            "type": "array",
+            "maxItems": 32,
+            "title": "Assets"
+          },
+          "hashes": {
+            "patternProperties": {
+              "^[a-zA-Z0-9_:.-]{1,160}$": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            },
+            "type": "object",
+            "maxProperties": 33,
+            "title": "Hashes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind",
+          "language",
+          "entrypoint_ref"
+        ],
+        "title": "Source"
+      },
+      "SourceInfo": {
+        "properties": {
+          "language": {
+            "type": "string",
+            "enum": [
+              "python",
+              "r",
+              "vector",
+              "raster"
+            ],
+            "title": "Language"
+          },
+          "source_ref": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Source Ref"
+          },
+          "source_hash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Source Hash"
+          },
+          "library_asset_ref": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-zA-Z0-9_:.-]{1,160}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Library Asset Ref"
+          },
+          "library_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 120
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Library Version"
+          },
+          "receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "language",
+          "source_ref",
+          "source_hash"
+        ],
+        "title": "SourceInfo"
+      },
+      "SourceReceipt": {
+        "properties": {
+          "preview_ref": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+            "title": "Preview Ref"
+          },
+          "preview_version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Preview Version"
+          },
+          "bundle_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Bundle Sha256"
+          },
+          "runtime_ref": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Runtime Ref"
+          },
+          "capture": {
+            "$ref": "#/components/schemas/Capture"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "preview_ref",
+          "preview_version",
+          "bundle_sha256",
+          "runtime_ref",
+          "capture"
+        ],
+        "title": "SourceReceipt"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

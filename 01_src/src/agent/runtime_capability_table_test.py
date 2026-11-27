@@ -118,6 +118,22 @@ def test_prompt_lists_runnable_rows_and_states_closures():
     assert len(test_table.runnable()) >= 3
 
 
+def test_dataset_methods_replace_the_closed_or_legacy_audit_rows():
+    names = ("prepare_audit_dataset", "audit_prepared_dataset", "inspect_uploaded_table")
+    table = build_for(available_names=names)
+    rows = {row.task: row for row in table.rows}
+    for task in ("audit.csv", "audit.workbook"):
+        row = rows[task]
+        assert row.tools == names[:2]
+        assert row.status != NOT_RUNNABLE and not row.waits
+        assert "直接引用回执" in row.hint and "partial" in row.hint
+    assert "不传 scope、工作表或 A1 坐标" in rows["audit.csv"].inputs[0]
+    assert "不可执行 · 数据审查（CSV 单表）" not in assert_only_exposed_tools(table)
+    for denied in (build_for(available_names=names, authorized_skills=()),
+                   build_for(available_names=names[1:])):
+        assert {row.task: row for row in denied.rows}["audit.csv"].status == NOT_RUNNABLE
+
+
 def test_csv_routes_differ_in_wait_semantics_and_wording():
     worker = build_for(csv_route=CSV_ROUTE_WORKER)
     generic = build_for(csv_route=CSV_ROUTE_GENERIC)

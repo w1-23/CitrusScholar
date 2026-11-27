@@ -134,6 +134,7 @@ _SEPARATE_PRODUCT_RE = re.compile(
     r"(?i)分别|各自|另一份|第[二三四五六]份|不同的|不同内容|"
     r"respectively|separate\b|distinct\b|different\b|"
     r"for\s+\w+\s+and\b")
+_SAME_RENDER_EXPORT_RE = re.compile(r"^同一次渲染的\s*(?:可直接下载|可供下载|可下载)?\s*")
 _SAME_BODY_RE = re.compile(
     r"(?i)内容相同|同一份正文|同一正文|同样的内容|同样的正文|"
     r"same\s+(?:content|body|text)|identical\s+(?:content|body|text)")
@@ -342,6 +343,7 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
         if ((_LABEL_CLAUSE_RE.match(clause) or _TOOL_USAGE_CLAUSE_RE.search(clause))
                 and not _has_positive_action(clause)):
             continue
+        same_render_segment = -2
         for segment_index, segment in enumerate(deliverable_segments(clause)):
             tail, kind_text = _output_tail(segment)
             has_action = _has_positive_action(segment)
@@ -364,11 +366,23 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
                 "", tail, flags=re.I).strip() or tail.strip()
             formats = list(dict.fromkeys(_FORMAT_ALIASES[m.group(0).casefold()]
                                          for m in _FORMAT_TOKEN_RE.finditer(tail)))
+            if (segment_index == same_render_segment + 1 and len(formats) == 1
+                    and formats[0] in _KIND_FORMATS["figure_package"]
+                    and _FORMAT_TOKEN_RE.fullmatch(segment.strip())):
+                previous = requirements[-1]
+                if formats[0] not in previous["formats"]:
+                    previous["formats"].append(formats[0])
+                same_render_segment = segment_index
+                continue
+            same_render = bool(formats and set(formats) <= _KIND_FORMATS["figure_package"]
+                               and _SAME_RENDER_EXPORT_RE.match(tail))
             # A term used as the subject of an audit/verification is not a
             # request to produce that figure. "JSON image-reuse evidence report"
             # must remain a report rather than silently becoming a drawing.
             kinds = list(dict.fromkeys(kind for kind, pattern in _KIND_INTENTS
                                        if pattern.search(_mask_audit_subject(kind_text))))
+            if same_render and not kinds:
+                kinds = ["figure"]
             if (not kinds and re.search(r"(?:绘制|画)\s*(?:[一二两三四五六七八九十]+|\d+)\s*张\s*图", kind_text)):
                 kinds = ["figure"]
             # Scene names are not file requests. A review/report/evidence table
@@ -430,6 +444,8 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
             if "figure" in kinds:
                 normalized["_explicit_formats"] = bool(formats)
             requirements.append(normalized)
+            if same_render and "figure" in kinds:
+                same_render_segment = segment_index
     stated_figure_formats = {fmt for requirement in requirements
                              if "figure" in requirement["kinds"]
                              and requirement.get("_explicit_formats")

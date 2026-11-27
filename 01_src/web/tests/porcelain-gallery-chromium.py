@@ -48,6 +48,8 @@ def run(browser, output):
     page_errors, api_posts = [], []
     page.on('pageerror', lambda err: page_errors.append(str(err)))
     sid = 'gallery-fixture-session'
+    svg_id = 'a' * 32
+    source_turn = 'gallery-svg-turn'
     data = {
         'a' * 32: ('Curves.svg', 'svg', 'image/svg+xml', b'<svg xmlns="http://www.w3.org/2000/svg" width="580" height="360"><rect width="580" height="360" fill="#286445"/><circle cx="290" cy="180" r="75" fill="#7a3c96"/></svg>'),
         'b' * 32: ('Samples.png', 'image', 'image/png', png(580, 360)),
@@ -95,11 +97,14 @@ def run(browser, output):
         elif path == '/api/v2/auth/me':
             route.fulfill(json={'user': {'user_id': 17, 'username': 'Gallery Fixture', 'role': 'user'}})
         elif path == '/api/v2/files':
-            files = [{'file_id': fid, 'filename': name, 'kind': kind, 'mime_type': mime, 'origin': 'uploaded',
+            files = [{'file_id': fid, 'filename': name, 'kind': kind, 'mime_type': mime,
+                      'origin': 'generated' if fid == svg_id else 'uploaded',
+                      **({'source_session_id': sid, 'turn_request_id': source_turn} if fid == svg_id else {}),
                       'size_bytes': len(body), 'sha256': digest(body),
                       'download_url': f'/api/v2/files/{fid}/download', 'preview_url': f'/api/v2/files/{fid}/preview'}
                      for fid, (name, kind, mime, body) in data.items()]
-            route.fulfill(json={'uploaded': files, 'generated': []})
+            route.fulfill(json={kind: [file for file in files if file['origin'] == kind]
+                                for kind in ('uploaded', 'generated')})
         elif path.startswith('/api/v2/files/') and path.endswith('/download'):
             route.continue_()
         elif path.startswith('/api/v2/files/'):
@@ -144,16 +149,23 @@ def run(browser, output):
     }''')
     output.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(output / 'gallery-desktop.png'))
-    gallery_menu = panel.locator('[data-file-act=more]').first
-    gallery_menu.click()
-    menu = page.get_by_role('menu', name='更多操作')
-    expect(menu).to_be_visible()
-    assert menu.evaluate('''menu => {
-      const rect = menu.getBoundingClientRect();
-      return rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight;
-    }''')
-    page.keyboard.press('Escape')
-    expect(gallery_menu).to_be_focused()
+    experience = page.locator(f'.session-file-item[data-file-id="{svg_id}"]')
+    action_names = lambda row: row.locator('[data-file-act]').evaluate_all('(items) => items.map(i => i.dataset.fileAct)')
+    assert action_names(experience) == ['preview', 'download', 'reference', 'jump']
+    assert action_names(panel.locator('.session-file-item', has_text='Samples.png')) == ['preview', 'download', 'reference']
+    assert experience.get_by_role('button', name='下载原件 Curves.svg').inner_text() in {'下载原件', '原件'}
+    with page.expect_download() as direct_original:
+        experience.get_by_role('button', name='下载原件 Curves.svg').click()
+    assert digest(direct_original.value.path().read_bytes()) == digest(data[svg_id][3])
+    page.evaluate("""() => {
+        window.fixtureJumps = [];
+        window.jumpToFileTurn = (...pair) => { window.fixtureJumps.push(pair); return true; };
+    }""")
+    experience.get_by_role('button', name='定位到来源会话 Curves.svg').click()
+    page.wait_for_function('fixtureJumps.length > 0', timeout=3000)
+    assert page.evaluate('fixtureJumps.length') == 1
+    assert page.evaluate('fixtureJumps[0]') == [sid, source_turn]
+
     overlay = page.locator('#sessionFilePreviewOverlay')
     for fid, (name, kind, mime, source) in data.items():
         panel.get_by_role('button', name=f'预览 {name}').click()
@@ -171,7 +183,8 @@ def run(browser, output):
             overlay.get_by_role('button', name='缩小图片').click()
             overlay.get_by_role('button', name='适应窗口').click()
             expect(overlay.get_by_role('button', name='适应窗口')).to_have_attribute('aria-pressed', 'true')
-            assert overlay.locator('iframe,object,svg').count() == 0
+            assert overlay.locator('.sf-image-wrap :is(iframe,object,svg)').count() == 0
+            expect(overlay.get_by_role('button', name=re.compile('可编辑副本|SVG 源码|导出|文件信息'))).to_have_count(0)
         elif kind == 'pdf':
             if page.evaluate('navigator.pdfViewerEnabled') is False:
                 expect(overlay.locator('.sf-pdf-fallback')).to_contain_text('没有内嵌 PDF 阅读器')
@@ -192,6 +205,26 @@ def run(browser, output):
         expect(overlay).not_to_be_visible()
         expect(panel.get_by_role('button', name=f'预览 {name}')).to_be_focused()
 
+    page.evaluate("""({fid, sid, turn}) => {
+        toggleSessionFiles(false);
+        const content = document.createElement('div');
+        content.dataset.sessionId = sid;
+        content.dataset.requestId = turn;
+        document.getElementById('chat-container').appendChild(content);
+        appendTurnGeneratedFiles(content, [{file_id: fid, filename: 'Curves.svg', kind: 'svg',
+          origin: 'generated', source_session_id: sid, turn_request_id: turn,
+          download_url: `/api/v2/files/${fid}/download`}]);
+    }""", {'fid': svg_id, 'sid': sid, 'turn': source_turn})
+    chat_file = page.locator('.turn-file-card')
+    expect(chat_file.locator('.file-primary-action')).to_have_count(3)
+    expect(chat_file.get_by_role('button', name='预览 Curves.svg')).to_be_visible()
+    expect(chat_file.get_by_role('button', name='引用 Curves.svg')).to_be_visible()
+    expect(chat_file.get_by_role('link', name='下载原件 Curves.svg')).to_have_attribute('href', f'/api/v2/files/{svg_id}/download')
+    assert action_names(chat_file) == ['reference']
+    chat_file.get_by_role('button', name='引用 Curves.svg').click()
+    assert page.evaluate('window._selectedAccountFileRefs.map(x => x.file_id)') == [svg_id]
+    assert page.evaluate('fixtureJumps.length') == 1
+    page.evaluate('toggleSessionFiles(true)')
     page.set_viewport_size({'width': 390, 'height': 760})
     panel.get_by_role('button', name='预览 Samples.png').click()
     expect(overlay.locator('img')).to_be_visible()
@@ -201,7 +234,7 @@ def run(browser, output):
     context.close()
     server.shutdown()
     server.server_close()
-    print('Chromium gallery/pointer/menu and SVG, PNG, PDF, XLSX unmodified download fixtures passed')
+    print('Chromium library/chat file actions and SVG, PNG, PDF, XLSX unmodified download fixtures passed')
 
 
 if __name__ == '__main__':

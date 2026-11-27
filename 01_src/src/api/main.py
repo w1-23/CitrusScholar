@@ -153,16 +153,25 @@ def _retrieval_not_ready(state):
 
 
 async def _serve_model_runtime(state):
-    from src.retrieval.runtime import RetrievalUnavailable
+    from src.corpus_integration.settings import unified_enabled
 
-    try:
-        state.rag_runtime = await optional_call("rag-warmup", _warm_retrieval)
-        state.retrieval_ready = True
-        logger.info("[Lifespan] RAG engine warmed up")
-    except Exception as exc:
-        state.retrieval_error = ((exc.reason_code, exc.empty_allowed) if isinstance(exc, RetrievalUnavailable)
-                                 else ("retrieval_unavailable", False))
-        logger.error("[Lifespan] RAG warm-up failed: %s", type(exc).__name__)
+    if unified_enabled():
+        from src.corpus_integration.evidence_client import service_available
+
+        state.retrieval_ready = bool(await optional_call("corpus-service-check", service_available))
+        if not state.retrieval_ready:
+            state.retrieval_error = ("corpus_unavailable", False)
+    else:
+        from src.retrieval.runtime import RetrievalUnavailable
+
+        try:
+            state.rag_runtime = await optional_call("rag-warmup", _warm_retrieval)
+            state.retrieval_ready = True
+            logger.info("[Lifespan] RAG engine warmed up")
+        except Exception as exc:
+            state.retrieval_error = ((exc.reason_code, exc.empty_allowed) if isinstance(exc, RetrievalUnavailable)
+                                     else ("retrieval_unavailable", False))
+            logger.error("[Lifespan] RAG warm-up failed: %s", type(exc).__name__)
     await observe_runtime("model-evidence", state.model_evidence.publish, _read_model_evidence,
                           _UNVERIFIED_MODELS)
 
@@ -507,6 +516,18 @@ async def account_auth_guard(request: Request, call_next):
         if denied is not None:
             return denied
     path = request.url.path
+    if (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+            and (path == "/figure-workbench" or path == "/figures/legacy"
+                 or path.startswith(("/api/v2/figure-workbench/", "/api/v2/figures/")))):
+        # Existing assets use the stable session/file APIs. Legacy project GETs
+        # may reconcile publication, so do not expose them as read-only routes.
+        return JSONResponse({"detail": {"code": "legacy_workbench_retired"}}, status_code=410,
+                            headers={"Cache-Control": "no-store"})
+    from src.corpus_integration.settings import selfcorpus_enabled, unified_enabled
+    if ((selfcorpus_enabled() or unified_enabled()) and request.method not in {"GET", "HEAD", "OPTIONS"}
+            and (path.startswith(("/api/v2/isolated-corpus/", "/api/v2/shared-corpus/", "/api/v2/admin/corpus/")))):
+        return JSONResponse({"detail": {"code": "legacy_corpus_read_only"}}, status_code=410,
+                            headers={"Cache-Control": "no-store"})
     if (getattr(request.app.state, "core_accepting_requests", None) is False
             and (path in {"/admin", "/figures", "/figure-workbench"} or path.startswith(("/api/", "/jobs/", "/sessions/", "/figures/")))
             and request.method != "OPTIONS"):
@@ -532,8 +553,10 @@ async def account_auth_guard(request: Request, call_next):
             # Cookie-bearing writes must prove same-origin. Logout remains
             # callable so a stale cookie can always be cleared.
             return JSONResponse({"detail": "缺少同源请求校验信息，请刷新页面后重试。"}, status_code=403)
+    workbench_browser = (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+                         and (path == "/figures" or path == "/workbench" or path.startswith("/workbench/")))
     if (path in _ANONYMOUS_AUTH_PATHS or path == "/health"
-            or (not path.startswith("/api/")
+            or (not workbench_browser and not path.startswith("/api/")
                 and not path.startswith(("/jobs/", "/sessions/")))):
         return await call_next(request)
 
@@ -3355,7 +3378,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             # Frames are projected onto the existing public protocol and stored by
             # the durable event queue; this never rebuilds the Agent Loop and a
             # projection failure can only lose progress detail, never the turn.
-            native_stream = NativeStreamProjector(job_id=job_id, run_id=identity.run_id)
+            native_stream = NativeStreamProjector(job_id=job_id, run_id=identity.run_id, model_preview=False)
 
             def emit_native(frames) -> None:
                 for frame in frames or ():
@@ -3366,7 +3389,8 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                        type(exc).__name__)
 
             if recovery_cursor or recovery_state:
-                emit_native(native_stream.resume("recovery"))
+                reason = "answer" if initial_state.get("agent_question_resume") else "recovery"
+                emit_native(native_stream.resume(reason))
 
             pending_supervisor_output = None
             graph_stream = graph.astream(initial_state, stream_mode=list(NATIVE_STREAM_MODES),
@@ -4239,7 +4263,7 @@ async def get_operation_result(job_id: str, operation_id: str, request: Request)
         with jobs.read_transaction() as conn:
             _read_owned_job(conn, job_id, owner)
             try:
-                return task_events.operation_result(job_id, operation_id, conn=conn)
+                return task_events.operation_result(job_id, operation_id, allow_pending_receipt=True, conn=conn)
             except task_events.TaskConflict as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -5235,11 +5259,19 @@ if _frontend_assets.exists():
 # ── The figure workspace ──────────────────────────────────────────────────
 # A separate page and a separate family of endpoints, mounted here so that
 # the rest of the service is untouched by the feature.
-from src.api import figure_router, figure_workbench_router  # noqa: E402
+_workbench_external = os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+if _workbench_external:
+    from src.api.workbench_gateway import workbench_gateway
 
-app.include_router(figure_router.router)
-app.include_router(figure_workbench_router.router)
-app.include_router(figure_workbench_router.page_router)
+    app.include_router(workbench_gateway(current_user))
+else:
+    from src.api import figure_router, figure_workbench_router
+
+    app.include_router(figure_router.router)
+    app.include_router(figure_workbench_router.router)
+    app.include_router(figure_workbench_router.page_router)
+from src.api.workbench_bridge import register_workbench_bridge  # noqa: E402
+register_workbench_bridge(app, current_user=current_user, require_owned_session=require_owned_session)
 from src.api.integrity_router import router as integrity_router  # noqa: E402
 app.include_router(integrity_router)
 from src.api.reference_router import router as reference_router  # noqa: E402
@@ -5255,7 +5287,15 @@ if os.getenv("CITRUS_CORPUS_MODE") == "isolated":
 
 @app.get("/figures")
 async def serve_figures_page(request: Request):
-    return await figure_workbench_router.workbench_page(request)
+    if not _workbench_external:
+        return await figure_workbench_router.workbench_page(request)
+    from fastapi.responses import HTMLResponse
+
+    current_user(request)
+    return HTMLResponse("""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<title>Workbench</title><body><main><h1>工作台</h1><p id="workbench-open-status" role="status">正在打开工作台…</p>
+<p><a href="/">返回会话</a></p></main><script src="/assets/workbench-launch.js" defer></script></body></html>""",
+        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/figures/legacy", include_in_schema=False)
@@ -5309,7 +5349,9 @@ def _runtime_snapshot(state):
 
 
 def _readiness_requirements():
-    return {"full": os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1",
+    from src.corpus_integration.settings import unified_enabled
+
+    return {"external_corpus": unified_enabled(), "full": os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1",
             "worker_required": os.getenv("CITRUS_REQUIRE_FIGURE_WORKER", "0").strip().lower()
             in {"1", "true", "yes", "on"}}
 
@@ -6716,30 +6758,36 @@ async def list_account_file_library(request: Request, session_id: str = ""):
 async def upload_account_library_file(session_id: str, request: Request, filename: str):
     """Store a private library file without starting a chat turn."""
     from mimetypes import guess_type
+    from src.api.workbench_bridge import BUNDLE_FILE_FORMATS, SCRIPT_FORMATS, SCRIPT_MIME, valid_bundle_name, valid_script_bytes
+    from src.api.workbench_bridge_protocol import ASSET_LIMIT
     from src.api.turn_envelope import MAX_NAME_CHARS, MAX_UPLOAD_BYTES, _ALLOWED_UPLOAD_SUFFIXES, _register_upload
 
     user = current_user(request)
     _require_active_turn_session(session_id, user)
     name = filename.strip()
-    # SVG is a private library original, not an inline chat attachment.
-    allowed_suffixes = _ALLOWED_UPLOAD_SUFFIXES | {"svg"}
+    # SVG and plotting source are private library originals, not inline chat attachments.
+    suffix = Path(name).suffix.lower().lstrip(".")
+    script = suffix in SCRIPT_FORMATS
+    allowed_suffixes = _ALLOWED_UPLOAD_SUFFIXES | {"svg", "parquet", "npy"} | SCRIPT_FORMATS
     if (not name or len(name) > MAX_NAME_CHARS or any(c in name for c in ("/", "\\"))
             or any(ord(c) < 32 for c in name)
-            or Path(name).suffix.lower().lstrip(".") not in allowed_suffixes):
+            or suffix not in allowed_suffixes or (suffix in BUNDLE_FILE_FORMATS and not valid_bundle_name(name))):
         raise HTTPException(400, "文件名或文件格式不受支持。")
     content = bytearray()
     async for block in request.stream():
-        if len(content) + len(block) > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, "单个文件不能超过 20 MB。")
+        if len(content) + len(block) > (ASSET_LIMIT if script else MAX_UPLOAD_BYTES):
+            raise HTTPException(413, "绘图源文件超过 Workbench 导入限制。" if script else "单个文件不能超过 20 MB。")
         content.extend(block)
     if not content:
         raise HTTPException(400, "无法上传空文件。")
+    if script and not valid_script_bytes(bytes(content)):
+        raise HTTPException(400, "绘图源文件必须是非空 UTF-8 文本。")
     owner = int(user["user_id"])
 
     def store():
         _require_active_turn_session(session_id, user)
         return _register_upload(session_id=session_id, owner_user_id=owner, name=name,
-                                mime=guess_type(name)[0] or "application/octet-stream",
+                                mime=SCRIPT_MIME if script else (guess_type(name)[0] or "application/octet-stream"),
                                 content=bytes(content), client_request_id="")
 
     async with _turn_session_lock(session_id):
@@ -6806,11 +6854,15 @@ _ISOLATED_FILE_POLICY = "default-src 'none'; base-uri 'none'; form-action 'none'
 
 def _protected_file_preview(info: dict, *, library_tile: bool = False):
     """Shared response policy for the account and historical session URLs."""
+    from src.api.workbench_bridge import SCRIPT_FORMATS
     from src.session.files import _canonical_mime, kind_for
 
     filename = info["filename"]
     mime = _canonical_mime(filename, info.get("mime_type", ""))
     kind = kind_for(filename, mime)
+    # A script is downloadable by its owner, never rendered in a browser preview.
+    if Path(filename).suffix.lower().lstrip(".") in SCRIPT_FORMATS:
+        raise HTTPException(404, "绘图源文件仅支持下载或导入 Workbench。")
     if library_tile and (kind not in {"image", "svg"} or info["size_bytes"] > 2 * 1024 * 1024):
         raise HTTPException(404, "该文件没有资料库缩略图。")
     if kind in {"html", "svg"}:
@@ -6847,8 +6899,9 @@ def _original_file_download(info: dict):
 async def preview_account_file(file_id: str, request: Request, library_tile: bool = False):
     user = current_user(request)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_account_file, file_id,
-                                   int(user["user_id"]), touch=not library_tile)
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_account_file(file_id,
+                                   int(user["user_id"]), touch=not library_tile)))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
     return _protected_file_preview(info, library_tile=library_tile)
@@ -6858,8 +6911,9 @@ async def preview_account_file(file_id: str, request: Request, library_tile: boo
 async def download_account_file(file_id: str, request: Request):
     user = current_user(request)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_account_file, file_id,
-                                   int(user["user_id"]), touch=True)
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_account_file(file_id,
+                                   int(user["user_id"]), touch=True)))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
     return _original_file_download(info)
@@ -6903,8 +6957,9 @@ async def preview_session_file(session_id: str, file_id: str, request: Request):
     from src.core.resource_access import PRIVATE_FILE
     require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_file, session_id, file_id,
-                                   touch=True, owner_user_id=int(user["user_id"]))
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_file(session_id, file_id,
+                                   touch=True, owner_user_id=int(user["user_id"]))))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于此会话")
 
@@ -6918,8 +6973,9 @@ async def download_session_file(session_id: str, file_id: str, request: Request)
     from src.core.resource_access import PRIVATE_FILE
     require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_file, session_id, file_id,
-                                   touch=True, owner_user_id=int(user["user_id"]))
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_file(session_id, file_id,
+                                   touch=True, owner_user_id=int(user["user_id"]))))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于此会话")
     return _original_file_download(info)
@@ -7031,6 +7087,23 @@ def _turn_producer_job(session_id: str, owner: int, request_id: str, producer_jo
 
 def _producer_request_id(job: dict) -> str:
     return str(job.get("client_request_id") or job.get("request_id") or "")
+
+
+@app.get("/api/v2/session/{session_id}/continuation/{request_id}")
+async def session_continuation_inputs(session_id: str, request_id: str, request: Request):
+    """List only persisted inputs eligible for explicit reuse in this session."""
+    from src.api.turn_envelope import _continued_inputs
+    from src.core.resource_access import PRIVATE_FILE
+
+    user = current_user(request)
+    require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", request_id):
+        raise HTTPException(400, "无效的附件继承来源。")
+    items = await asyncio.to_thread(_continued_inputs, int(user["user_id"]), session_id,
+                                    request_id, verify_bytes=True)
+    return JSONResponse({"attachments": [{"file_id": item["file_id"], "filename": item["name"],
+        "mime_type": item["type"], "size_bytes": item["size_bytes"]} for item in items]},
+        headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/v2/session/{session_id}/turn-artifacts")

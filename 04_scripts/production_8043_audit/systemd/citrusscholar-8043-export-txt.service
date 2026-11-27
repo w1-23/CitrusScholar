@@ -1,8 +1,0 @@
-[Unit]
-Description=Export completed CitrusScholar 8043 chat turns to TXT
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 -B /home/WZQ/citrusscholar/tools/auto_export_8043_turns.py
-UMask=0077
-NoNewPrivileges=true

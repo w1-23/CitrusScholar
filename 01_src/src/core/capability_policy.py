@@ -18,6 +18,7 @@ TOOL_CAPABILITIES = {
     "deepseek_fetch_paper": ("web_fetch",),
     "browse_web": ("browser",),
     "search_literature": ("bibliographic_lookup",),
+    "verify_literature_references": ("bibliographic_lookup",),
     "fetch_and_audit_open_supplements": ("web_fetch", "bibliographic_lookup"),
     "local_hybrid_search": ("local_rag",),
     "inspect_candidates": ("local_rag",),

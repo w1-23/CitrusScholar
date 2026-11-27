@@ -125,6 +125,19 @@ def _shared_result_accessible(row, text, fetch_result, *, allow_rqa=True) -> boo
     except (ValueError, RecursionError):
         # An incomplete retrieval receipt can hide its authorization pointers.
         return not text.lstrip().startswith("{") and name == "local_hybrid_search"
+    if isinstance(payload, dict) and payload.get("corpus_contract") == 1:
+        # Unified results may contain owner-scoped excerpts, even when a
+        # separate exact readback is available through the bound citation.
+        return False
+    from src.corpus_integration.selfcorpus_search import FAMILY_ID
+
+    # Selfcorpus excerpts have no Host exact-span readback or later access
+    # revalidation. Do not replay a retained mixed payload containing them.
+    field = "candidates" if name == "local_hybrid_search" else "results"
+    candidates = payload.get(field) if isinstance(payload, dict) else None
+    if isinstance(candidates, list) and any(isinstance(item, dict) and item.get("source_family") == FAMILY_ID
+                                           for item in candidates):
+        return False
     rows = source_rows(name, text)
     if not rows:
         return name == "local_hybrid_search" or (isinstance(payload, dict)

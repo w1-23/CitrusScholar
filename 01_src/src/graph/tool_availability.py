@@ -96,6 +96,7 @@ class Env:
     research_tools: bool = True
     script_sandbox: bool = False
     shared_corpus: bool = False
+    incremental_corpus: bool = False
     denied: frozenset[str] = field(default_factory=frozenset)
     # Explicit user constraints. They are facts about the request, not guesses
     # about its topic: "只查本地库" and "这轮别检索" are statements, not keywords
@@ -225,14 +226,18 @@ def runtime_env(*, source_scope: str = SCOPE_AUTO, attachments: int = 0,
     if scope not in KNOWN_SCOPES:
         scope = SCOPE_AUTO
     from src.core.tool_catalog import TOOL_METADATA
-    from src.corpus_integration.settings import isolated_enabled
+    from src.corpus_integration.selfcorpus_search import enabled as selfcorpus_enabled
+    from src.corpus_integration.settings import isolated_enabled, unified_enabled
+    unified = unified_enabled()
     denied = frozenset(denied or ())
     # Some persisted-evidence reads do not require a live index or candidate
     # pool. Removing those preconditions must not bypass explicit source scope.
     denied |= frozenset(name for name, meta in TOOL_METADATA.items()
                         if _blocked_source(meta.capabilities, scope, bool(retrieval)))
-    if isolated_enabled():
+    if isolated_enabled() or selfcorpus_enabled() or unified:
         denied |= {"propose_document_ingest", "prepare_document", "commit_document_index"}
+    if unified:
+        denied |= {"search_candidates", "search_agent_corpus"}
     return Env(
         network=bool(network),
         local_corpus=bool(local_corpus),
@@ -248,6 +253,7 @@ def runtime_env(*, source_scope: str = SCOPE_AUTO, attachments: int = 0,
         visualization=bool(visualization),
         capability_denials=frozenset(capability_denials or ()),
         candidate_pool=bool(candidate_pool),
+        incremental_corpus=unified or selfcorpus_enabled(),
         shared_corpus=(shared_corpus_available()
                        if shared_corpus is None else bool(shared_corpus)),
     )
@@ -307,6 +313,9 @@ def matching_producer_kinds(required_kinds) -> frozenset[str]:
 def missing_requirements(tool_name: str, env: Env) -> tuple[str, ...]:
     """Requirement tokens this tool needs but `env` cannot satisfy."""
     requires = declarations()[tool_name][0]
+    if (tool_name == "local_hybrid_search" and env.incremental_corpus and env.retrieval
+            and env.source_scope != SCOPE_WEB and "local_corpus" not in env.capability_denials):
+        requires = requires - {REQUIRES_LOCAL_CORPUS}
     return tuple(sorted(token for token in requires if not env.has(token)))
 
 
@@ -371,8 +380,8 @@ def explain(env: Env) -> dict[str, str]:
     from src.core.tool_catalog import capabilities
 
     declared = declarations()
-    for name, (requires, _, _) in declared.items():
-        missing = tuple(sorted(token for token in requires if not env.has(token)))
+    for name in declared:
+        missing = missing_requirements(name, env)
         blocked_source = _blocked_source(capabilities(name), env.source_scope, env.retrieval)
         capability = unavailable_capability(name, env)
         if blocked_source == "retrieval":

@@ -1,5 +1,8 @@
 # CitrusScholar · 科研智能体工作台
 
+[双模块彻底融合](docs/dual-module-release.md) 提供主体、Workbench 和 Selfcorpus 的统一源码包与独立部署说明。
+
+
 > 产品名为 **CitrusScholar**，GitHub 仓库保留 [`w1-23/QAagent`](https://github.com/w1-23/QAagent)。既有数据库、环境名和存储键不随品牌变更迁移。
 
 CitrusScholar 以一个 General Agent 为主体，根据自然语言目标选择工具、阅读结果并继续处理。领域资料 RAG 和科研预设提供专业方法与可核验的执行结果；它们不接管主循环，也不要求先识别场景才能使用通用检索、文件和编码能力。实际可用能力受账号权限、服务配置和运行环境约束。

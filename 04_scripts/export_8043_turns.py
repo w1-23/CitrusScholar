@@ -147,12 +147,9 @@ def receipt(raw, *, show_errors):
 
 
 def event_details(event, data):
-    if event == "context_maintenance":
-        return _delivery.project_public_event(event, data)
+    if event in {"assistant_progress", "context_maintenance"}:
+        return _delivery.project_diagnostic_progress(event, data)
     value = details(data, EVENT_KEYS)
-    if event == "assistant_progress" and data.get("visibility") == "public":
-        if text := _delivery.public_answer_text(data.get("text")):
-            value["text"] = text
     if event == "status" and isinstance(data.get("summary"), str):
         value["summary"] = data["summary"]
     if event == "citations":
@@ -398,7 +395,7 @@ def export_turn(conn, turn, out):
             if isinstance(data, dict):
                 timing.observe(event, data, created_at=row["created_at"])
                 if (_delivery.private_record(data) or event in {"draft", "reasoning", "thinking", "task_state", "plan"}
-                        or (event == "assistant_progress" and data.get("visibility") != "public")):
+                        or (event == "assistant_progress" and not event_details(event, data).get("status"))):
                     continue
                 if event == "answer_start":
                     answer_armed = True

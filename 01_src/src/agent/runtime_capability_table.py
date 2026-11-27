@@ -471,6 +471,19 @@ def _fusion_audit_artifacts() -> tuple[str, ...]:
 
 
 def _audit_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
+    prepare, audit = "prepare_audit_dataset", "audit_prepared_dataset"
+    if SKILL_DATA_AUDIT in facts.skills and facts.has(prepare) and facts.has(audit):
+        return tuple(CapabilityRow(
+            task=task, label=label, status=RUNNABLE, tools=(prepare, audit),
+            inputs=(input_note,), artifacts=("DatasetRef、已执行检查、覆盖和原始位置回执",),
+            hint=("先固定授权附件，再把原样 DatasetRef 交给审查。审查回执已覆盖用户要求时，"
+                  "直接引用回执作答并结束这一目标。仅在有真实证据缺口时补查；"
+                  "保留回执的 partial、not_run 和覆盖限制。"),
+            source="available_names+skill_authorization")
+            for task, label, input_note in (
+                ("audit.csv", "数据审查（CSV 单表）", "本轮授权 CSV；直接准备，不传 scope、工作表或 A1 坐标"),
+                ("audit.workbook", "数据审查（XLSX/XLSM）", "本轮授权工作簿；只有用户确实指定范围时才传 scope"),
+            ))
     worker = facts.first(FUSION_TOOL)
     authorized = SKILL_DATA_AUDIT in facts.skills
     legacy = facts.first(LEGACY_AUDIT_TOOL)

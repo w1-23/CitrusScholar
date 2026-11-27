@@ -23,7 +23,7 @@ Run `workbench-d-ggplot.R` with `/opt/citrus-r/bin/Rscript --vanilla` inside the
 
 ## Measurements
 
-The final recorded focused run on the fixed desktop Chromium fixture logged `/home/WZQ/citrusscholar/preflight/audit-d-chromium.9EPHiKyB/output/metrics.json`. The measurements are fixture observations, with small sample counts and no running-service latency. The pointer timing is from the browser pointer handler to a callback after the local update in the same animation frame. It measures neither display presentation nor total raster/compositor cost.
+The final recorded focused run on the fixed desktop Chromium fixture logged `/srv/example/test-fixtures/metrics.json`. The measurements are fixture observations, with small sample counts and no running-service latency. The pointer timing is from the browser pointer handler to a callback after the local update in the same animation frame. It measures neither display presentation nor total raster/compositor cost.
 
 | Measurement | Synthetic TSS p50 / p95 (ms) | R ggplot2 p50 / p95 (ms) |
 |---|---:|---:|

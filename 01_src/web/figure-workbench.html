@@ -7,10 +7,12 @@
   <title>图件工作台 · CitrusScholar</title>
   <script src="/assets/citrus-theme.js?v=2"></script>
   <link rel="stylesheet" href="/assets/workbench/workbench.css?v=5">
+  <link rel="stylesheet" href="/assets/guide.css?v=7">
   <link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
   <script src="/assets/figures/hit_geometry.js?v=1" defer></script>
   <script type="module" src="/assets/workbench/main.js?v=9"></script>
-</head>
+  <script src="/assets/guide.js?v=7" defer></script>
+<link rel="icon" type="image/png" href="/assets/citrus-brand.png"></head>
 <body class="figure-workbench">
   <header class="toolbar">
     <div class="workspace-name">
@@ -18,6 +20,7 @@
       <h1>图件工作台</h1>
     </div>
     <nav aria-label="工作台操作">
+      <button id="workbenchGuideButton" type="button" data-citrus-guide="workbench" title="使用指南" aria-label="使用指南">?</button>
       <button id="openLibrary">打开图件</button>
       <button id="toggleGroups" class="drawer-button" aria-controls="groups" aria-expanded="false">对象组</button>
       <button id="toggleInspector" class="drawer-button" aria-controls="inspector" aria-expanded="false">属性</button>

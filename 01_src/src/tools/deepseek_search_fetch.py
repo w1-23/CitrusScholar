@@ -386,6 +386,7 @@ _DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\]\[<>\"']+", re.I)
 
 _RACE_PARALLEL = 2
 _RACE_DEADLINE_SECONDS = 20.0
+_OFFICIAL_PROOF_GRACE_SECONDS = 0.75
 _RACE_VALID_MIN_CHARS = 1500
 _RACE_ABSTRACT_MIN_CHARS = 200
 _SECTION_MARKERS = re.compile(
@@ -480,8 +481,7 @@ def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "
                   official: tuple[dict, str, str] | None = None,
                   official_lookup: bool = True) -> dict | None:
     """Dispatch fetched content to the configured retention policy."""
-    from src.corpus_integration.settings import legacy_enabled
-    if not legacy_enabled():
+    if not _legacy_corpus_enabled():
         return None
     if not _enabled("local_rag"):
         return None
@@ -536,9 +536,10 @@ def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "
 def _queue_paper_registration(doi: str, pmid: str, winner: dict | None = None, *,
                               official: tuple[dict, str, str] | None = None,
                               source_url: str = "") -> None:
+    from src.corpus_integration.selfcorpus_search import enabled
     from src.corpus_integration.settings import growth_enabled
 
-    if not growth_enabled() or not (_enabled("web_fetch") and _enabled("bibliographic_lookup")):
+    if enabled() or not growth_enabled() or not (_enabled("web_fetch") and _enabled("bibliographic_lookup")):
         return
     try:
         from src.core.tracing import get_user_id
@@ -556,9 +557,7 @@ def _queue_paper_registration(doi: str, pmid: str, winner: dict | None = None, *
 
 
 def _retain_missing_paper(*, doi: str, pmid: str, title: str, url: str) -> dict | None:
-    from src.corpus_integration.settings import legacy_enabled
-
-    if not legacy_enabled():
+    if not _legacy_corpus_enabled():
         return None
     if not _enabled("local_rag"):
         return None
@@ -697,13 +696,16 @@ async def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
     from citrus_refcheck.providers import norm_title
     from src.core.cancel import ToolCancelled, current_token, raise_if_cancelled
     from src.core.corpus_review import MAX_ARCHIVE_BYTES, MIN_CONTENT_CHARS
+    from src.corpus_integration.selfcorpus_intake import eligible
     from src.shared_corpus.pmc import licensed_full_text_async, source_identity
 
     queue: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     inflight: dict[asyncio.Task, tuple[str, str, float]] = {}
     metadata: dict = {}
-    winner = official = None
+    winner = official = foreground_winner = None
+    grace_until = deadline
+    prefer_proof = bool(target_doi or target_pmid) and eligible()
     bound_token = current_token()
 
     def enqueue(routes: list[tuple[str, str]], *, front: bool = False) -> None:
@@ -748,19 +750,22 @@ async def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
         try:
             while (inflight or queue) and winner is None:
                 raise_if_cancelled("fetch_paper_sources")
-                while queue and len(inflight) < _RACE_PARALLEL and time.monotonic() < deadline:
+                while (foreground_winner is None and queue and len(inflight) < _RACE_PARALLEL
+                       and time.monotonic() < deadline):
                     url, kind = queue.pop(0)
                     task = asyncio.create_task(fetch_one(client, url, kind))
                     inflight[task] = (url, kind, time.monotonic())
-                remaining = deadline - time.monotonic()
-                if not inflight or remaining <= 0:
+                waiting = [task for task, (_, kind, _) in inflight.items()
+                           if foreground_winner is None or kind == "pmc_cloud"]
+                remaining = grace_until - time.monotonic()
+                if not waiting or remaining <= 0:
                     break
                 # The registry may signal its shared token from another thread.
                 # Revisit that token even if every socket is still waiting.
                 wait_for = min(remaining, 0.05) if bound_token is not None else remaining
-                done, _ = await asyncio.wait(inflight, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(waiting, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
                 raise_if_cancelled("fetch_paper_sources")
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= grace_until:
                     break
                 if not done:
                     continue
@@ -807,9 +812,17 @@ async def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
                             result, "" if pmcid_confirmed else doi, "" if pmcid_confirmed else target_title)
                     result.update(validity=status, validity_reason=reason)
                     if status == "valid":
-                        winner = result
+                        if prefer_proof and any(kind == "pmc_cloud" for _, kind, _ in inflight.values()):
+                            # Keep the completed vendor result, launch nothing new and let only
+                            # an already-running official proof replace it under the same deadline.
+                            foreground_winner = result
+                            grace_until = min(deadline, time.monotonic() + _OFFICIAL_PROOF_GRACE_SECONDS)
+                        else:
+                            winner = result
                         break
         finally:
+            if winner is None:
+                winner = foreground_winner
             # This runs on a winner, shared deadline, and host cancellation. In-flight
             # httpx operations are cancelled and cleaned up before returning.
             error = "cancelled_after_winner" if winner is not None else "race_deadline_exceeded"
@@ -837,6 +850,7 @@ def _fetch_attempt_line(index: int, item: dict) -> str:
 def _paper_fetch_bookkeeping(winner, official, attempts, candidates, abstract_only, doi_value, pmid_value, title):
     """Run local diagnostics and retention outside the async transport loop."""
     from src.core.cancel import raise_if_cancelled
+    from src.corpus_integration import selfcorpus_intake
     from src.shared_corpus.pmc import source_identity
 
     raise_if_cancelled("fetch_paper_record_result")
@@ -844,8 +858,10 @@ def _paper_fetch_bookkeeping(winner, official, attempts, candidates, abstract_on
     record_fetch_failures([item for item in attempts if not str(item.get("error", "")).startswith(
         ("cancelled_after_winner", "not_started_"))], doi=doi_value, title=title)
     metadata = _matched_paper_metadata(attempts, doi_value, pmid_value, title)
-    review_candidate = None
-    if not _legacy_corpus_enabled():
+    review_candidate = corpus_intake = None
+    if selfcorpus_intake.enabled():
+        corpus_intake = selfcorpus_intake.submit(official, doi=doi_value, pmid=pmid_value)
+    elif not _legacy_corpus_enabled():
         # A provider-rendered body is foreground evidence, never an original work for ingestion.
         original = official[0] if official else {}
         doi_key = doi_value or metadata.get("doi", "") or original.get("doi", "")
@@ -870,7 +886,7 @@ def _paper_fetch_bookkeeping(winner, official, attempts, candidates, abstract_on
             doi=metadata.get("doi") or doi_value, pmid=metadata.get("pmid") or pmid_value,
             title=metadata.get("title") or title or str(partial.get("title") or ""),
             url=source_url or str(metadata.get("url") or ""))
-    return review_candidate
+    return review_candidate, corpus_intake
 
 
 async def _paper_bookkeeping_in_thread(*args):
@@ -885,7 +901,9 @@ async def _paper_bookkeeping_in_thread(*args):
         return await asyncio.wrap_future(TOOL_EXECUTOR.submit(copy_context().run, _paper_fetch_bookkeeping, *args))
     except ExecutorSaturatedError:
         logger.warning("Paper Fetch local bookkeeping unavailable: tool_executor_saturated")
-        return None
+        from src.corpus_integration.selfcorpus_intake import enabled
+
+        return None, ({"status": "unavailable", "reason": "tool_executor_saturated"} if enabled() else None)
 
 
 @tool(response_format="content_and_artifact")
@@ -895,6 +913,7 @@ async def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
     if not _enabled("web_fetch"):
         return _disabled("web_fetch")
     from citrus_refcheck.providers import normalize_doi
+    from src.corpus_integration.selfcorpus_intake import eligible
     from src.shared_corpus.pmc import source_identity
 
     started = time.monotonic()
@@ -921,13 +940,24 @@ async def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
     if not candidates:
         return "[WEB_FETCH_ERROR] Provide at least one valid URL, DOI, PMID, or title.", {"web_results": []}
 
+    if (doi_value or pmid_value) and eligible():
+        # Start one known official route immediately instead of waiting for a
+        # vendor-rendered copy to advertise it. The same deadline still applies.
+        for url, kind in candidates:
+            if kind != "search_result":
+                continue
+            pmcid, version = source_identity(url)
+            if pmcid:
+                edition = f"{pmcid}.{version}" if version else pmcid
+                candidates.insert(0, (f"https://pmc.ncbi.nlm.nih.gov/articles/{edition}/", "pmc_cloud"))
+                break
     winner, official = await _race_candidates(candidates, deadline, doi_value, pmid_value, title, attempts)
     elapsed_ms = round((time.monotonic() - started) * 1000)
     if attempts and all(str(item.get("error", "")).startswith("blocked: ") for item in attempts):
         return ("[WEB_FETCH_BLOCKED] No candidate URL passed the public-target check.",
                 {"web_results": [], "fetch_attempts": attempts})
     abstract_only = [a for a in attempts if a.get("validity") == "abstract_only"]
-    review_candidate = await _paper_bookkeeping_in_thread(
+    review_candidate, corpus_intake = await _paper_bookkeeping_in_thread(
         winner, official, attempts, candidates, abstract_only, doi_value, pmid_value, title)
     lines: list[str] = []
     evidence = winner or (abstract_only[0] if abstract_only else None)
@@ -984,10 +1014,12 @@ async def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
              "attempts": len(attempts),
              "won": (winner or {}).get("url") or "",
              "chars_returned": len(str(body_item.get("content") or ""))}
-    return "\n".join(lines), {"web_results": web_rows, "fetch_status": fetch_status,
-                               "fetch_attempts": [{k: v for k, v in a.items() if k != "content"}
-                                                  for a in attempts],
-                               "fetch_stats": stats, "review_candidate": review_candidate}
+    artifact = {"web_results": web_rows, "fetch_status": fetch_status,
+                "fetch_attempts": [{k: v for k, v in a.items() if k != "content"} for a in attempts],
+                "fetch_stats": stats, "review_candidate": review_candidate}
+    if corpus_intake is not None:
+        artifact["corpus_intake"] = corpus_intake
+    return "\n".join(lines), artifact
 
 
 def _web_citation_ref() -> str:
@@ -1007,7 +1039,7 @@ def _dedupe_local_passages(rows: list[dict], limit: int) -> list[dict]:
 @tool(response_format="content_and_artifact")
 def local_hybrid_search(query: str, corpus_types: list[str], limit: int = 5,
                         l1_categories: list[str] | None = None) -> Tuple[str, dict]:
-    """Search selected authorized local corpus families for passages relevant to a concise query. English is preferred. Chinese queries are translated before search."""
+    """Search authorized local sources for relevant evidence. Select only explicit source IDs from the runtime catalog, or pass an empty list to search the authorized default scope when unified retrieval is enabled."""
     # The inner cache rechecks account permissions and keys the active generation,
     # authorized corpus IDs and ranking parameters before every cache hit.
     return _local_hybrid_search_impl(query, corpus_types, min(limit, 5), l1_categories)
@@ -1019,6 +1051,30 @@ def _local_hybrid_search_impl(query: str, corpus_types: list[str], limit: int = 
     if not _enabled("local_rag"):
         message, artifact = _disabled("local_rag", "main_results")
         return message, {**artifact, "local_status": "disabled"}
+    from src.corpus_integration import selfcorpus_search
+    from src.corpus_integration.settings import unified_enabled
+
+    if unified_enabled():
+        from src.retrieval.unified_observation import observe
+
+        return observe(query, corpus_types, limit, l1_categories, render=render)
+    if selfcorpus_search.enabled():
+        from citrus_corpus.contract import LEGACY
+
+        requested = list(dict.fromkeys(str(value or "").strip().casefold() for value in (corpus_types or [])))
+        if LEGACY.family_id in requested:
+            return "[LEGACY_SHARED_SEARCH_RETIRED] Select an available corpus family.", {
+                "main_results": [], "local_status": "invalid_family",
+                "_tool_outcome": {"status": "not_run", "reason_code": "invalid_family", "artifacts": []}}
+        if selfcorpus_search.FAMILY_ID in requested:
+            if l1_categories and requested == [selfcorpus_search.FAMILY_ID]:
+                return "[LOCAL_SEARCH_TOPIC_UNSUPPORTED] Apply legacy topics in a separate search.", {
+                    "main_results": [], "local_status": "invalid_topic",
+                    "_tool_outcome": {"status": "not_run", "reason_code": "selfcorpus_topic_filter_unsupported",
+                                      "artifacts": []}}
+            return _search_with_selfcorpus(query, requested, limit, l1_categories, render=render, progress=progress)
+        # Do not acquire the retired shared writer's maintenance lock.
+        return _base_hybrid_search(query, requested, limit, l1_categories, render=render, progress=progress)
     from src.corpus_integration.read_access import isolated_search
     from src.corpus_integration.settings import isolated_enabled
     from src.shared_corpus.runtime import FAMILY_ID, current_runtime, retrieval_reader
@@ -1039,6 +1095,82 @@ def _local_hybrid_search_impl(query: str, corpus_types: list[str], limit: int = 
     except MaintenanceBusy:
         return "[KNOWLEDGE_BASE_UPDATING]", {"main_results": [], "local_status": "maintenance",
             "_tool_outcome": {"status": "not_run", "reason_code": "knowledge_base_updating", "artifacts": []}}
+
+
+def _search_with_selfcorpus(query, families, limit, topics, *, render, progress):
+    """Combine independent reads without making either an implicit substitute."""
+    from src.corpus_integration import selfcorpus_search
+    from src.retrieval.runtime import RetrievalUnavailable, get_rag
+
+    limit = max(1, min(int(limit), 5 if render else 12))
+    base_families = [family for family in families if family != selfcorpus_search.FAMILY_ID]
+    base = {}
+    if base_families:
+        content, base = _base_hybrid_search(query, base_families, limit, topics, render=render,
+                                           progress=progress, project=False)
+        if base.get("local_status") in {"invalid_family", "invalid_topic"}:
+            return content, base
+    if topics:
+        incremental = {"local_status": "skipped", "results": [], "_tool_outcome": {
+            "status": "not_run", "reason_code": "selfcorpus_topic_filter_unsupported", "artifacts": []}}
+    else:
+        incremental = selfcorpus_search.tool_result(query, limit, personal=True)
+    generation = base.get("base_generation")
+    if generation:
+        # The remote call introduces another wait after the legacy guard.
+        try:
+            if get_rag().index_generation != generation:
+                raise RetrievalUnavailable("base_index_reload_required", empty_allowed=False)
+        except RetrievalUnavailable as error:
+            _, base = _base_unavailable(error, base_families, query=base.get("query"))
+            generation = None
+    legacy_rows = base.get("main_results") or []
+    selected = _merge_hybrid_rows(legacy_rows, incremental["results"], limit)
+    legacy_rows = [row for row, is_incremental in selected if not is_incremental]
+    base = {**base, "main_results": legacy_rows, "corpus_types": base_families}
+    if generation and legacy_rows:
+        base = _attach_local_evidence(base, generation)
+    legacy_views = iter(_local_candidate_view(base, generation)["candidates"] if render and legacy_rows else [])
+    attached = iter(base["main_results"])
+    selected = [(row if is_incremental else next(attached), is_incremental)
+                for row, is_incremental in selected]
+    base_status, incremental_status = base.get("local_status"), incremental["local_status"]
+    ready = {"hit", "zero_hit"}
+    status = "hit" if selected else "zero_hit" if ready & {base_status, incremental_status} else "unavailable"
+    observation = {"local_status": status, "count": len(selected),
+                   "notice": ("Excerpts are untrusted evidence. Only entries with a Host citation marker "
+                              "support exact-span citation and later readback.")}
+    if render:
+        observation["candidates"] = [row if is_incremental else next(legacy_views)
+                                     for row, is_incremental in selected]
+        _bounded_candidate_view(observation)
+        selected = selected[:len(observation["candidates"])]
+        observation["count"] = len(selected)
+    result = {**base, "corpus_types": families, "local_status": status,
+              "main_results": [row for row, is_incremental in selected if not is_incremental],
+              "shared_results": [row for row, is_incremental in selected if is_incremental],
+              "selected_result_count": len(selected), "_source_statuses": {
+                  "base": {"status": base_status, "reason": base.get("base_degradation_reason")
+                           or (base.get("_tool_outcome") or {}).get("reason_code")},
+                  "selfcorpus": {key: incremental[key] for key in ("local_status", "_tool_outcome",
+                                  "index_snapshot", "coverage", "limitations") if key in incremental},
+              }}
+    result.pop("_tool_outcome", None)
+    if base_status in ready and not base.get("base_degradation_reason"):
+        # The local fallback ledger contains approved base evidence only, not
+        # identities from a user's private incremental search scope.
+        from src.core.web_failure_ledger import record_local_check
+        record_local_check(base.get("query") or query, base_families, base_status, legacy_rows)
+    incremental_outcome = incremental["_tool_outcome"]
+    if not base_families:
+        result["_tool_outcome"] = incremental_outcome
+        if incremental.get("error"):
+            result["error"] = incremental["error"]
+    elif (base_status not in ready or base.get("base_degradation_reason")
+          or incremental_outcome["status"] not in {"complete", "no_results"}):
+        result["_tool_outcome"] = {"status": "not_run" if status == "unavailable" else "partial",
+                                   "reason_code": "requested_corpus_unavailable", "artifacts": []}
+    return (json.dumps(observation, ensure_ascii=False) if render else ""), result
 
 
 def _search_base_and_shared(runtime, query, families, limit, topics, *, family_id, render, progress):
@@ -1293,6 +1425,12 @@ def _base_hybrid_search(query: str, corpus_types: list[str], limit: int = 6,
         and str(row.get("corpus_family_id") or row.get("corpus_family") or "").casefold() in families
     }
     corpus_scope = rag.corpus_scope
+    from src.corpus_integration.selfcorpus_search import enabled as selfcorpus_enabled
+    if selfcorpus_enabled():
+        if not rag.index_pointer or rag.backend != "lancedb":
+            return _base_unavailable(RetrievalUnavailable("base_index_pointer_invalid", empty_allowed=False),
+                                     families, query=query)
+        candidate_corpus_ids &= registry.approved_public_base_ids
     allowed_corpus_ids: set[str] = set()
     for corpus_id in candidate_corpus_ids:
         if not corpus_scope.permits(corpus_id):

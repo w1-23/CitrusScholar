@@ -1601,10 +1601,10 @@ function renderAttachmentSelection() {
 
 function appendSentLibraryReferences(contentEl, files) {
   if (!contentEl || !files || !files.length) return;
-  var gallery = document.createElement('div'); gallery.className = 'sent-attachment-gallery sent-library-gallery';
+  var gallery = document.createElement('div'); gallery.className = 'sent-attachment-gallery sent-attachment-references sent-library-gallery';
   files.forEach(function(file) {
     var card = document.createElement('button'); card.type = 'button';
-    card.className = 'sent-attachment-card sent-library-card';
+    card.className = 'sent-attachment-card sent-attachment-reference sent-library-card';
     card.title = file.filename || '资料库文件';
     var icon = document.createElement('span'); icon.className = 'sent-attachment-icon';
     icon.textContent = String(file.filename || '').split('.').pop().toUpperCase().slice(0, 5) || 'FILE';
@@ -1619,10 +1619,10 @@ function appendSentLibraryReferences(contentEl, files) {
 
 function appendRestoredAttachmentCards(contentEl, files) {
   if (!contentEl || !Array.isArray(files) || !files.length) return;
-  var gallery = document.createElement('div'); gallery.className = 'sent-attachment-gallery restored-attachment-gallery';
+  var gallery = document.createElement('div'); gallery.className = 'sent-attachment-gallery sent-attachment-references restored-attachment-gallery';
   files.forEach(function(file) {
     var card = document.createElement('button'); card.type = 'button';
-    card.className = 'sent-attachment-card sent-library-card';
+    card.className = 'sent-attachment-card sent-attachment-reference sent-library-card';
     card.title = file.filename || '附件';
     if ((file.kind === 'image' || /^image\//.test(file.mime_type || '')) && file.preview_url) {
       var img = document.createElement('img'); img.className = 'sent-attachment-image';
@@ -1643,10 +1643,10 @@ function appendRestoredAttachmentCards(contentEl, files) {
 function appendSentAttachmentPreviews(contentEl, files) {
   if (!contentEl || !files || !files.length) return;
   var gallery = document.createElement('div');
-  gallery.className = 'sent-attachment-gallery';
+  gallery.className = 'sent-attachment-gallery sent-attachment-references';
   files.forEach(function(file) {
     var card = document.createElement('div');
-    card.className = 'sent-attachment-card';
+    card.className = 'sent-attachment-card sent-attachment-reference';
     card.title = file.name;
     if (/^image\/(jpeg|png|webp|gif)$/.test(file.type || '') || /\.(jpe?g|png|webp|gif)$/i.test(file.name || '')) {
       var previewUrl = URL.createObjectURL(file);
@@ -2926,7 +2926,22 @@ function refreshTaskComposer() {
     if (icon) icon.setAttribute('href', executing ? '/assets/citrus-icons.svg#ui-stop' : '/assets/citrus-icons.svg#ui-send');
   }
   var continuation = document.getElementById('composer-continuation');
-  if (continuation) continuation.hidden = !(composerContinuation && composerContinuation.session === sessionId);
+  if (continuation) {
+    var selection = composerContinuation && composerContinuation.session === sessionId ? composerContinuation : null;
+    continuation.hidden = !selection;
+    var references = continuation.querySelector('.continuation-attachment-references');
+    if (references && references._selection !== selection) {
+      references._selection = selection;
+      references.replaceChildren();
+      (selection && selection.attachments || []).forEach(function (file) {
+        var chip = document.createElement('span');
+        chip.className = 'continuation-attachment-reference';
+        chip.textContent = file.filename;
+        chip.title = file.filename;
+        references.appendChild(chip);
+      });
+    }
+  }
   var hint = document.getElementById('composer-task-status');
   if (hint) {
     hint.textContent = queueSyncUnavailable ? '消息状态待同步，可刷新重试。'
@@ -2938,8 +2953,8 @@ function refreshTaskComposer() {
   }
 }
 
-function setComposerContinuation(requestId) {
-  composerContinuation = requestId ? {session: sessionId, requestId: requestId} : null;
+function setComposerContinuation(requestId, attachments) {
+  composerContinuation = requestId ? {session: sessionId, requestId: requestId, attachments: attachments || []} : null;
   refreshTaskComposer();
 }
 var clearContinuation = document.getElementById('clear-composer-continuation');
@@ -3481,18 +3496,7 @@ function publicTaskStage(value) {
   return text.replace(/\s+/g, ' ').slice(0, 600);
 }
 
-/* F-14: provisional model text is opt-in. The default surface shows only
-   lifecycle rows (tool proposals, sub-agent start/end, interrupt, resume) so a
-   streamed fragment is never mistaken for the delivered answer. Enable with
-   ?native_preview=1 or window.CITRUS_NATIVE_PREVIEW = true (or by setting this
-   binding before the first frame is rendered). */
-var NATIVE_STREAM_PREVIEW = (function () {
-  try {
-    if (typeof location !== 'undefined' && location.search &&
-        /(?:^\?|&)native_preview=1(?:&|$)/.test(location.search)) return true;
-    return typeof window !== 'undefined' && window.CITRUS_NATIVE_PREVIEW === true;
-  } catch (_) { return false; }
-}());
+/* Native lifecycle facts are public. Model drafts never reach this panel. */
 
 function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
@@ -3598,12 +3602,12 @@ function createResearchProcessPanel(goal) {
     if (!ownsDetails()) return;
     CitrusTaskCards.renderNativeStream(nativeHost, CitrusTaskCards.nativeStreamModel(
       nativeStream.view(), {toolName: displayToolName, clean: publicTaskStage,
-        preview: NATIVE_STREAM_PREVIEW}));
+        preview: false}));
   }
   function receiveNativeStreamEvent(type, data) {
     if (!nativeStream) return;
     if (['assistant_progress', 'tool_result', 'operation'].indexOf(type) >= 0) {
-      if (type === 'assistant_progress' && data.kind === 'model_preview' && !NATIVE_STREAM_PREVIEW) return;
+      if (type === 'assistant_progress' && ['model_preview', 'tool_proposed'].indexOf(data.kind) >= 0) return;
       if (!nativeStream.receive(type, data)) return;
     } else if (type === 'text' && data && data.delivery === 'committed') {
       if (!nativeStream.commit()) return;
@@ -3662,7 +3666,14 @@ function createResearchProcessPanel(goal) {
       refreshActiveLabel();
     }
     else if (type === 'request_user_input' || type === 'question') label.textContent = '等待你的选择';
-    else if (type === 'assistant_progress') progress(data);
+    else if (type === 'assistant_progress') {
+      if (data.kind === 'tool_proposed' && !settled && (!nativeStream || !nativeStream.state.closed) &&
+          CitrusTaskState.nativeStreamEvent && CitrusTaskState.nativeStreamEvent(data) &&
+          data.run_id === data.job_id) {
+        view.action({job_id: data.job_id, run_id: data.run_id, tool_call_id: data.tool_call_id,
+          tool_name: data.tool_name, seq: data.seq, status: 'proposed'});
+      } else progress(data);
+    }
     else if (type === 'status' && !settled && data.summary && ['preparing_attachments', 'starting', 'waiting_code'].includes(data.stage)) {
       activeMilestone = publicTaskStage(data.summary); refreshActiveLabel();
     }
@@ -3671,7 +3682,8 @@ function createResearchProcessPanel(goal) {
         (data.tool_call_id || data.operation_id || data.logical_key || Array.isArray(data.aliases) && data.aliases.length) &&
         data.internal !== true && ['private', 'internal'].indexOf(data.visibility) < 0) {
       var actionStatus = data.status || (type === 'tool_result' ? (data.is_error ? 'failed' : 'complete') : 'running');
-      view.action(Object.assign({}, data.outcome || {}, data, {status: actionStatus}));
+      view.action(Object.assign({}, data.outcome || {}, data, {status: actionStatus,
+        run_id: data.run_id || data.job_id || knownJobId}));
       refreshActiveLabel();
     }
     // status/plan/thinking/section/context events are never promoted to prose.
@@ -3687,7 +3699,10 @@ function createResearchProcessPanel(goal) {
   }
   return {element: panel, label: label, elapsed: elapsed, body: body,
     receive: receive, terminal: terminal, answerVisible: answerVisible, projection: view.projection,
-    syncTask: syncTask, stopClock: stopClock, readState: readState};
+    resetDetails: function (jobId) {
+      knownJobId = String(jobId || ''); settled = false; progressSeq = 0; activeMilestone = '';
+      view.reset(); view.begin(knownJobId); resetNativeStreamPanel();
+    }, syncTask: syncTask, stopClock: stopClock, readState: readState};
 }
 
 
@@ -3723,13 +3738,15 @@ function appendMessageActions(content, role, text) {
   var assistant = role === 'assistant';
   if (assistant && !String(text || '').trim()) return;
   var actionHost = message || content;
-  if (actionHost.querySelector('.message-actions')) return;
+  var existing = actionHost.querySelector('.message-actions');
+  if (existing) { existing._messageText = String(text || ''); return; }
   var actions = document.createElement('div');
   actions.className = 'message-actions' + (assistant ? ' assistant-actions' : '');
+  actions._messageText = String(text || '');
   var copy = document.createElement('button');
   copy.type = 'button'; copy.className = 'message-action'; copy.title = '复制内容';
   copy.setAttribute('aria-label', '复制内容'); copy.innerHTML = uiIcon('copy') + '<span>复制</span>';
-  copy.addEventListener('click', function() { copyMessageText(String(text || ''), copy); });
+  copy.addEventListener('click', function() { copyMessageText(actions._messageText, copy); });
   actions.appendChild(copy);
   if (role === 'user') {
     var edit = document.createElement('button');
@@ -3748,20 +3765,88 @@ function appendMessageActions(content, role, text) {
     });
     actions.appendChild(edit);
   }
-  if (assistant && content.dataset.requestId && content.dataset.sessionId === sessionId && (text || '').trim()) {
-    var prior = content.dataset.requestId, sid = sessionId;
-    var next = document.createElement('button');
-    next.type = 'button'; next.className = 'message-action turn-explicit-continuation';
-    next.textContent = '沿用本轮附件';
-    next.title = '明确继承此轮保存的附件';
-    next.addEventListener('click', function () {
-      if (sid !== sessionId || !chatContainer.contains(content)) return;
-      setComposerContinuation(prior); userInput.focus();
-    });
-    actions.appendChild(next);
-  }
   actionHost.appendChild(actions);
   if (assistant) appendFeedback(actions);
+}
+
+function confirmTurnAttachmentInheritance(content) {
+  var host = content.closest('.message') || content;
+  var actions = host.querySelector('.assistant-actions');
+  var sid = content.dataset.sessionId, rid = content.dataset.requestId;
+  if (!content._hasAttachmentInputs || !actions || !rid || sid !== sessionId || content._inheritanceRead) return;
+  var view = captureSessionView(), read = {};
+  content._inheritanceRead = read;
+  function owns() { return view.owns() && chatContainer.contains(content) && content._inheritanceRead === read && host.contains(actions); }
+  async function load(attempt) {
+    if (!owns()) return;
+    try {
+      var response = await accountFetch('/api/v2/session/' + encodeURIComponent(sid) + '/continuation/' + encodeURIComponent(rid));
+      if (!owns()) return;
+      var data = await response.json();
+      if (!owns()) return;
+      // A terminal event can arrive just before the durable queue receipt settles.
+      if (response.status === 409 && data && data.detail && data.detail.code === 'turn_baseline_not_ready' && attempt < 2) {
+        setTimeout(function () { void load(attempt + 1); }, 600 * (attempt + 1));
+        return;
+      }
+      if (!response.ok) return;
+      var attachments = data && Array.isArray(data.attachments) ? data.attachments.filter(function (file) {
+        return file && typeof file.file_id === 'string' && !!file.file_id && typeof file.filename === 'string';
+      }) : [];
+      if (!owns() || !attachments.length) return;
+      var next = document.createElement('button');
+      next.type = 'button'; next.className = 'message-action turn-explicit-continuation';
+      next.textContent = '沿用本轮附件';
+      next.title = '明确继承此轮保存的附件';
+      next.addEventListener('click', function () {
+        if (!owns()) return;
+        setComposerContinuation(rid, attachments); userInput.focus();
+      });
+      actions.insertBefore(next, actions.querySelector('.msg-feedback'));
+    } catch (_) { /* Only a positive server confirmation exposes this action. */ }
+  }
+  void load(0);
+}
+
+function renderPublicTerminalNotice(content, data, hasAnswer) {
+  var existing = content.querySelector('.turn-terminal-notice');
+  var terminal = data && (data.turn_envelope || data.terminal_snapshot || data);
+  var notice = '';
+  if (!hasAnswer && terminal && CitrusTaskState.displayStatus(data) && isPublicAnswerEvent(data) && isPublicAnswerEvent(terminal)) {
+    var notices = (Array.isArray(terminal.notices) ? terminal.notices : []).concat([data.stop_notice, data.notice]);
+    for (var i = 0; i < notices.length && !notice; i++) {
+      var item = notices[i];
+      var text = typeof item === 'string' ? item : item && isPublicAnswerEvent(item) && item.message;
+      if (typeof text === 'string') notice = text.trim();
+    }
+  }
+  if (!notice) { if (hasAnswer && existing) existing.remove(); return !!existing && !hasAnswer; }
+  var node = existing || document.createElement('p');
+  node.className = 'turn-terminal-notice'; node.setAttribute('role', 'status');
+  if (node.textContent !== notice) node.textContent = notice;
+  var answer = content.querySelector('.turn-answer');
+  if (!existing) content.insertBefore(node, answer && answer.nextSibling);
+  return true;
+}
+
+function renderUndispatchedTurnNotice(content, answer, cancelled) {
+  var status = cancelled ? 'cancelled' : 'failed';
+  answer.dataset.displayStatus = status;
+  answer.style.display = 'none';
+  renderPublicTerminalNotice(content, {display_status: status, notice: cancelled
+    ? '已取消，这条消息不会执行。' : '这条消息未能开始执行，请重新发送。'}, false);
+}
+
+function resetTurnOutcome(content) {
+  var host = content.closest('.message') || content;
+  ['.assistant-actions', '.turn-files', '.turn-terminal-notice'].forEach(function (selector) {
+    var node = host.querySelector(selector);
+    if (node) node.remove();
+  });
+  content._inheritanceRead = null;
+  content._turnFileRead = null;
+  content._turnFileProducerIds = null;
+  content._verifiedDeliveryAssets = null;
 }
 
 function copyMessageText(text, button) {
@@ -3837,6 +3922,10 @@ function restoreTurnGeneratedFiles(content, sid, requestId, producerJobId, data,
   var artifactIds = Array.isArray(data.artifact_ids) ? data.artifact_ids : envelope.artifact_ids;
   if (Array.isArray(artifactIds)) artifactIds = artifactIds.map(String);
   var verifiedFileIds = delivery && delivery.verified_file_ids;
+  if (delivery && delivery.schema_version === 'artifact-delivery/1') {
+    artifactIds = (Array.isArray(delivery.artifacts) ? delivery.artifacts : []).map(function (asset) { return asset.asset_ref; });
+    verifiedFileIds = null;
+  }
   var key = JSON.stringify([producerJobId, artifactIds, verifiedFileIds]);
   if (content._turnFileRead === key) return;
   content._turnFileRead = key;
@@ -3872,15 +3961,35 @@ function syncHistoryTurnFiles() {
   }).catch(function() {});
 }
 
-function appendTurnGeneratedFiles(content, files, headingText) {
+function suppressDuplicateTurnArtifactLinks(content) {
+  var answer = content.querySelector('.turn-answer');
+  if (!answer) return;
+  var host = content.closest('.message') || content;
+  var urls = new Set();
+  host.querySelectorAll('.turn-file-card').forEach(function (card) {
+    if (card.dataset.assetUrl) urls.add(card.dataset.assetUrl);
+  });
+  if (!urls.size) return;
+  answer.querySelectorAll('a').forEach(function (link) {
+    if (!urls.has(link.getAttribute('href'))) return;
+    var label = document.createElement('span'); label.textContent = link.textContent;
+    link.parentNode.insertBefore(label, link);
+    link.remove();
+  });
+}
+
+function appendTurnGeneratedFiles(content, files) {
   if (!content || !files || !files.length) return;
   var host = content.closest('.message') || content;
   var ownerSession = content.dataset.sessionId || sessionId;
   var producerRequests = turnFileScopes(content);
+  var deliveryAssets = content._verifiedDeliveryAssets;
   // A canonical turn's file references are authoritative. Conflicting metadata
   // is never allowed to move a file into another session or turn.
   files = files.filter(function(file) {
-    return isPublicTurnFile(file) && file.file_id && (!file.source_session_id || String(file.source_session_id) === ownerSession)
+    var asset = deliveryAssets && deliveryAssets.get(String(file.artifact_id || file.file_id || ''));
+    return (!deliveryAssets || !!asset) &&
+      isPublicTurnFile(file) && file.file_id && (!file.source_session_id || String(file.source_session_id) === ownerSession)
       && (!file.turn_request_id || producerRequests.has(String(file.turn_request_id)));
   });
   if (!files.length) return;
@@ -3891,7 +4000,7 @@ function appendTurnGeneratedFiles(content, files, headingText) {
   if (!section) {
     section = document.createElement('section'); section.className = 'turn-files';
     var heading = document.createElement('div'); heading.className = 'turn-files-heading';
-    heading.textContent = headingText || '本轮生成文件'; section.appendChild(heading);
+    heading.textContent = '本轮产出'; section.appendChild(heading);
     list = document.createElement('div'); list.className = 'turn-file-list';
     section.appendChild(list);
   } else if (!list) {
@@ -3899,15 +4008,22 @@ function appendTurnGeneratedFiles(content, files, headingText) {
     section.appendChild(list);
   }
   var added = 0;
-  var seen = {};
+  var seen = new Map();
   host.querySelectorAll('.turn-file-card').forEach(function(existing) {
-    seen[String(existing.dataset.fileId || '')] = true;
+    seen.set(String(existing.dataset.fileId || ''), existing);
   });
   files.forEach(function(file) {
     var fid = String((file && file.file_id) || '');
-    if (fid && seen[fid]) return;          // same file must not appear twice in one bubble
-    if (fid) seen[fid] = true;
+    var asset = deliveryAssets && deliveryAssets.get(String(file.artifact_id || file.file_id || ''));
+    var assetUrl = asset && safeProductUrl(asset.url, true);
+    var existing = seen.get(fid);
+    if (existing) { // A later manifest can verify a card already rendered from history.
+      if (assetUrl) existing.dataset.assetUrl = assetUrl;
+      return;
+    }
     var card = document.createElement('div'); card.className = 'turn-file-card';
+    seen.set(fid, card);
+    if (assetUrl) card.dataset.assetUrl = assetUrl;
     if (fid) card.dataset.fileId = fid;
     var type = document.createElement('span'); type.className = 'turn-file-type';
     type.textContent = String(file.kind || file.filename || 'FILE').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 5) || 'FILE';
@@ -3936,10 +4052,10 @@ function appendTurnGeneratedFiles(content, files, headingText) {
       card.appendChild(image);
     }
     card.appendChild(type); card.appendChild(info); card.appendChild(preview);
-    if (svgUrl) {
+    if (svgUrl || assetUrl) {
       var download = document.createElement('a');
       download.className = 'turn-file-open';
-      download.href = svgUrl;
+      download.href = svgUrl || assetUrl;
       download.download = '';
       download.textContent = '下载原件';
       card.appendChild(download);
@@ -3947,10 +4063,11 @@ function appendTurnGeneratedFiles(content, files, headingText) {
     list.appendChild(card);
     added++;
   });
-  if (!added) return;                     // no new file: keep the DOM as it was
-  if (section.parentNode) return;
-  if (host !== content) host.insertBefore(section, content.nextSibling);
-  else content.appendChild(section);
+  if (added && !section.parentNode) {
+    if (host !== content) host.insertBefore(section, content.nextSibling);
+    else content.appendChild(section);
+  }
+  suppressDuplicateTurnArtifactLinks(content);
 }
 
 /* v8.6 用户反馈（书 §4.6 反馈循环）: 助手回答下方追加 👍/👎 记录条（纯记录，不影响回答）
@@ -4201,7 +4318,7 @@ function toolStatusText(status, reason) {
   return '未完成' + reasonText;
 }
 
-async function sendMsg(paperVerification, continueFrom) {
+async function sendMsg(paperVerification) {
   if (!currentAccount || !sessionId || accountDocumentRetired || historyRequest) return false;
   var epoch = authEpoch, requestSessionId = sessionId;
   function ownsTurn() { return epoch === authEpoch && requestSessionId === sessionId && (!botContent || chatContainer.contains(botContent)); }
@@ -4220,11 +4337,13 @@ async function sendMsg(paperVerification, continueFrom) {
     }
     return;
   }
+  var inherited = null;
   if (!paperVerification) {
     _composerNotice = '';
-    if (!continueFrom && composerContinuation && composerContinuation.session === requestSessionId) continueFrom = composerContinuation.requestId;
+    if (composerContinuation && composerContinuation.session === requestSessionId) inherited = composerContinuation;
     setComposerContinuation(null);
   }
+  var continueFrom = inherited && inherited.requestId;
   mascotSay('planning');
   var visualizeForRequest = !paperVerification && visualizationEnabled;
   var draftKey = composerDraftKey();
@@ -4249,13 +4368,16 @@ async function sendMsg(paperVerification, continueFrom) {
   var stopMsg = document.getElementById('stop-msg');
   if (stopMsg) stopMsg.style.display = 'none';
   if (!paperVerification) userInput.placeholder = '有什么想做的？';
-  var userMessageContent = addMessage('user', escapeHtml(query) +
-    (filesForRequest.length + fileRefsForRequest.length ? '<div class="sent-attachment-count">已附加 ' + (filesForRequest.length + fileRefsForRequest.length) + ' 个文件</div>' : ''), null, true);
+  var userMessageContent = addMessage('user', escapeHtml(query), null, true);
   var _sentPreviewStart = _sentAttachmentPreviewUrls.length;
   appendSentAttachmentPreviews(userMessageContent, filesForRequest);
   // Only URLs created for this optimistic row are revoked if admission fails.
   var _optimisticSentPreviewUrls = _sentAttachmentPreviewUrls.slice(_sentPreviewStart);
-  appendSentLibraryReferences(userMessageContent, fileRefsForRequest);
+  var shownRefs = inherited ? inherited.attachments.slice() : [];
+  fileRefsForRequest.forEach(function (file) {
+    if (!shownRefs.some(function (ref) { return ref.file_id === file.file_id; })) shownRefs.push(file);
+  });
+  appendSentLibraryReferences(userMessageContent, shownRefs);
   appendMessageActions(userMessageContent, 'user', query);
   // P0: 提交瞬间先给导航一个临时刻度，服务端确认后换成正式 message_id
   if (window.turnRail && window.turnRail.addPending) window.turnRail.addPending(clientRequestId, query);
@@ -4396,6 +4518,7 @@ async function sendMsg(paperVerification, continueFrom) {
   var answerDiv = document.createElement('div'); answerDiv.className = 'turn-answer';
   answerDiv.style.display = 'none';
 
+  botContent._hasAttachmentInputs = !!(filesForRequest.length || fileRefsForRequest.length || continueFrom);
   var citationsDiv = document.createElement('div');
   citationsDiv.hidden = true;
 
@@ -4468,24 +4591,35 @@ async function sendMsg(paperVerification, continueFrom) {
       statusLabel.textContent = '等待你的选择';
       if (ownsControls()) { clearTimeout(spinnerTimeout); setSendDisabled(false); }
     }
-    if (!ownsControls()) {
-      if (CitrusTaskState.displayStatus(job)) {
-        applyTurnEnvelope({turn_envelope: job.terminal_snapshot}); hasTerminalEvent = true; snapshotOnly = true; finishStatus();
-        loadTurnGeneratedFiles(job.terminal_snapshot);
-      }
-      return;
-    }
-    syncPermissionCards(taskStore.state.job_id, job.approvals);
+    var controlsOwned = ownsControls();
+    if (controlsOwned) syncPermissionCards(taskStore.state.job_id, job.approvals);
     if (!job.terminal_snapshot || !CitrusTaskState.displayStatus(job) || hasTerminalEvent) return;
-    applyTurnEnvelope({turn_envelope: job.terminal_snapshot});
-    hasTerminalEvent = true; snapshotOnly = true; _turnDisconnected = false;
-    clearTimeout(spinnerTimeout); clearStageLine(); finishStatus(); setSendDisabled(false);
-    loadTurnGeneratedFiles(job.terminal_snapshot);
-    if (activeTurnCancel === stopCurrentTurn) activeTurnCancel = null;
-    if (!fullText && !existingJobNotice) {
-      answerDiv.style.display = '';
-      answerDiv.textContent = '任务已结束；可从会话记录查看已保存的回答。';
+    applyTurnEnvelope(job);
+    hasTerminalEvent = true; snapshotOnly = true;
+    clearTimeout(spinnerTimeout); clearStageLine(); finishStatus();
+    projectTerminalContent(job);
+    loadTurnGeneratedFiles(job);
+    if (controlsOwned) {
+      setSendDisabled(false);
+      if (activeTurnCancel === stopCurrentTurn) activeTurnCancel = null;
     }
+  }
+
+  function projectTerminalContent(data) {
+    if (isPublicAnswerEvent(data) && typeof data.answer === 'string' && data.answer.trim() && data.answer.indexOf('An error occurred') !== 0) {
+      fullText = data.answer;
+      (window._fullTextFromDone = window._fullTextFromDone || {})[clientRequestId] = 1;
+    }
+    var hasAnswer = !!fullText.trim();
+    answerDiv.style.display = hasAnswer ? '' : 'none';
+    if (hasAnswer) {
+      answerDiv.innerHTML = renderMarkdownSafe(fullText.replace(/__NEED_COMPLEX__/g, ''));
+      suppressDuplicateTurnArtifactLinks(botContent);
+      processPanel.answerVisible();
+      appendMessageActions(botContent, 'assistant', fullText.replace(/__NEED_COMPLEX__/g, ''));
+      confirmTurnAttachmentInheritance(botContent);
+    }
+    renderPublicTerminalNotice(botContent, data, hasAnswer);
   }
 
   function applyTurnEnvelope(data) {
@@ -4538,7 +4672,8 @@ async function sendMsg(paperVerification, continueFrom) {
     if (!renderPending) {
       renderPending = true;
       requestAnimationFrame(function() {
-        if (!ownsTurn()) return;
+        renderPending = false;
+        if (!ownsTurn() || hasTerminalEvent && !snapshotOnly) return;
         var s = fullText.replace(/__NEED_COMPLEX__/g, '');
         var frx = /---\s*\*\*.. \u6df1\u5165\u63a2\u7d22.*?\*\*([\s\S]*?)$/;
         var m = s.match(frx);
@@ -4560,14 +4695,14 @@ async function sendMsg(paperVerification, continueFrom) {
           cc.appendChild(cd); answerDiv.appendChild(cc);
         }
         if (ownsControls()) followChatTail(false);
-        renderPending = false;
       });
     }
   }
 
   function handleSendFollowUp(q) {
     userInput.value = q;
-    sendMsg(null, clientRequestId);
+    setComposerContinuation(null);
+    sendMsg();
   }
 
   function showBanner(msg) {
@@ -4593,7 +4728,8 @@ async function sendMsg(paperVerification, continueFrom) {
     processPanel.receive(type, data);
     renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     if (type === 'agent_recovery' && data.status === 'admitted') {
-      isCancelled = false; hasTerminalEvent = false; snapshotOnly = false; fullText = ''; botContent._turnFileRead = null;
+      isCancelled = false; hasTerminalEvent = false; snapshotOnly = false; fullText = '';
+      resetTurnOutcome(botContent);
       answerDiv.replaceChildren(); answerDiv.style.display = 'none';
       renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
       var timing = botContent.querySelector('.turn-timings'); if (timing) timing.remove();
@@ -4630,11 +4766,7 @@ async function sendMsg(paperVerification, continueFrom) {
     if (!ownsControls()) {
       if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
         applyTurnEnvelope(data); hasTerminalEvent = true; clearTimeout(spinnerTimeout); finishStatus();
-        if (data.answer) {
-          fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText);
-          if (String(data.answer).trim()) processPanel.answerVisible();
-        }
-        if (fullText) appendMessageActions(botContent, 'assistant', fullText);
+        projectTerminalContent(data);
         loadTurnGeneratedFiles(data);
       }
       return;
@@ -4738,9 +4870,6 @@ async function sendMsg(paperVerification, continueFrom) {
         if (_turnEnvelope && _turnEnvelope.history_saved === false) {
           showBanner('本轮历史未确认写入；刷新后可能无法恢复。');
         }
-        if (_turnEnvelope && _turnEnvelope.notices && _turnEnvelope.notices.length) {
-          showBanner(_turnEnvelope.notices.join('；'));
-        }
         // P0: 本轮已落库——拉一次最新索引，把临时刻度换成真实 ID
         if (window.turnRail && window.turnRail.sync) window.turnRail.sync(clientRequestId, query);
         clearTimeout(spinnerTimeout); isCancelled = hasTerminalEvent; answerDiv.style.display=''; finishStatus();
@@ -4752,39 +4881,12 @@ async function sendMsg(paperVerification, continueFrom) {
         } else if (data.citation_mismatch) {
           showBanner('部分引用与本轮资料未能对应，请核对原文。');
         }
-        // v10.0（卡点③）: 修复循环的修正答案不流式上屏，须以 done.answer 覆盖草稿
-        var _repaired = !!(data.audit && data.audit.repaired);
-        // v10.5（F6，用户口径）: **判官看的是 done.answer，人看的也必须是 done.answer**
-        //   ——即"重编号后的最终答案"。后端已在出口保证 done.answer 为终稿编号
-        //   （expert_graph.py 的 F6 块），因此这里一律以它为准覆盖草稿。
-        //   此前只在 audit.repaired 为真时覆盖，导致两类错位：
-        //     ① 强制收尾题（预算/熔断/跑满轮次）用户看到的是"历轮草稿拼接"，
-        //        判官评的却是终稿 —— final84 实测 38/84 题落此坑；
-        //     ② 被改写但未置 repaired 标志的题同理。
-        //   例外：done.answer 为空或为错误串时保留草稿（错误事件另有提示）。
-        var _fromDone = (window._fullTextFromDone = window._fullTextFromDone || {});
-        var _ansOk = !!data.answer && data.answer.indexOf('An error occurred') !== 0;
-        if (_ansOk) {
-          fullText = data.answer;
-          _fromDone[clientRequestId] = 1;
-          if (_repaired) {
-            showBanner('回答已完成一致性检查。');
-          }
-        } else if (!fullText && data.answer) {
-          fullText = data.answer;
-          _fromDone[clientRequestId] = 1;
+        projectTerminalContent(data);
+        if (fullText && _turnEnvelope && Array.isArray(_turnEnvelope.notices)) {
+          var notices = _turnEnvelope.notices.filter(function (notice) { return typeof notice === 'string'; });
+          if (notices.length) showBanner(notices.join('；'));
         }
-        // A cancelled or empty turn has no answer, but it still has a real
-        // terminal text (stop marker / honest notice). Show it instead of an
-        // empty bubble; never fabricate answer prose.
-        if (!fullText && data.stop_notice) {
-          fullText = String(data.stop_notice);
-          _fromDone[clientRequestId] = 1;
-        }
-        if (!fullText && data.notice && _terminal !== 'completed') {
-          fullText = String(data.notice);
-          _fromDone[clientRequestId] = 1;
-        }
+        if (data.answer && data.audit && data.audit.repaired) showBanner('回答已完成一致性检查。');
         // v10.0（卡点③）: 审计结果轻提示（critical / 需求未满足）
         try {
           var _au = data.audit || {};
@@ -4796,9 +4898,6 @@ async function sendMsg(paperVerification, continueFrom) {
             showBanner('回答可能未覆盖问题的全部要求，请检查后续内容。');
           }
         } catch (_ae) {}
-        if (fullText) {
-          answerDiv.innerHTML=renderMarkdownSafe(fullText.replace(/__NEED_COMPLEX__/g,''));
-        }
         if (fullText.indexOf('__NEED_COMPLEX__')>=0) {
           var uc=document.createElement('div');uc.style.cssText='margin-top:12px;text-align:center';
           var ub=document.createElement('button');ub.className='need-complex-btn';ub.textContent='继续深入检索';
@@ -4807,9 +4906,6 @@ async function sendMsg(paperVerification, continueFrom) {
         }
         if (data.session_id) sessionId=data.session_id;if(sessionId)localStorage.setItem(sessionStorageKey(),sessionId);
         window.dispatchEvent(new Event('citrus:turn-finished'));
-        if (CitrusTaskState.isTerminal({display_status: _terminal})) {
-          appendMessageActions(botContent, 'assistant', fullText.replace(/__NEED_COMPLEX__/g, ''));
-        }
         loadTurnGeneratedFiles(data);
         setSendDisabled(false);userInput.focus();break;
       case 'error':
@@ -4824,10 +4920,9 @@ async function sendMsg(paperVerification, continueFrom) {
         if (window.turnRail && window.turnRail.dropPending) window.turnRail.dropPending(clientRequestId);
         clearTimeout(spinnerTimeout);isCancelled=true;setSendDisabled(false);userInput.focus();
         if (activeTurnCancel === stopCurrentTurn) activeTurnCancel = null;
-        if(!fullText){finishStatus();answerDiv.style.display='';answerDiv.textContent=data.code === 'model_credential_unconfigured'
-          ? '主模型尚未配置，请联系管理员配置模型后重试。附件仍可在资料库中查看。'
-          : '这次没有完成，请稍后重试。';}
-        else { finishStatus(); showBanner('回答提前中断，当前内容可能不完整。'); }
+        finishStatus();
+        projectTerminalContent(data);
+        if (fullText) showBanner('回答提前中断，当前内容可能不完整。');
         loadTurnGeneratedFiles(data);
         break;
       case 'heartbeat': break; // Execution time is derived from the server start stamp.
@@ -4948,6 +5043,7 @@ async function sendMsg(paperVerification, continueFrom) {
     if (!observer || queueFollowedJobId === observer) return;
     if (queueFollowedJobId) {
       fullText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
+      resetTurnOutcome(botContent);
       answerDiv.replaceChildren(); answerDiv.style.display = 'none';
       renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
       hasTerminalEvent = false; snapshotOnly = false;
@@ -4974,7 +5070,7 @@ async function sendMsg(paperVerification, continueFrom) {
       isCancelled = true; hasTerminalEvent = true; _turnDisplayStatus = 'cancelled';
       clearTimeout(spinnerTimeout); processPanel.stopClock();
       processPanel.terminal('cancelled');
-      answerDiv.style.display = ''; answerDiv.textContent = '已取消，这条消息不会执行。';
+      renderUndispatchedTurnNotice(botContent, answerDiv, true);
       statusLabel.textContent = '已取消';
       setSendDisabled(false);
       selectActiveTurn();
@@ -4983,7 +5079,7 @@ async function sendMsg(paperVerification, continueFrom) {
       clearTimeout(spinnerTimeout); clearStatus();
       isCancelled = true; hasTerminalEvent = true; _turnDisplayStatus = 'failed';
       processPanel.terminal('failed');
-      answerDiv.style.display = ''; answerDiv.textContent = '这条消息未能开始执行，请重新发送。';
+      renderUndispatchedTurnNotice(botContent, answerDiv, false);
       statusLabel.textContent = '未开始执行';
       setSendDisabled(false);
       selectActiveTurn();
@@ -5024,7 +5120,7 @@ async function sendMsg(paperVerification, continueFrom) {
     writeComposerDraft(draftKey, rawDraft);
     if (current) {
       userInput.value = rawDraft;
-      if (continueFrom) setComposerContinuation(continueFrom);
+      if (inherited) setComposerContinuation(inherited.requestId, inherited.attachments);
       refreshTaskComposer();
     }
     return true;
@@ -5063,6 +5159,7 @@ async function sendMsg(paperVerification, continueFrom) {
     var detail = body && body.detail && typeof body.detail === 'object' ? body.detail : {};
     var code = detail.code || (body && body.code);
     if (!admissionRejectionConfirmed(status, code)) { recordUnknownAdmission(); return; }
+    if (code === 'turn_baseline_unavailable' || code === 'turn_baseline_not_found') inherited = null;
     requestSubmitted = false;
     recordKnownNonAdmission();
     if (!ownsTurn()) return;
@@ -5848,6 +5945,11 @@ function renderArtifactDelivery(container, delivery) {
     node.setAttribute('role', 'status');
     container.appendChild(node);
   }
+  if (delivery && delivery.schema_version === 'artifact-delivery/1') {
+    container._verifiedDeliveryAssets = new Map((Array.isArray(delivery.artifacts) ? delivery.artifacts : []).map(function (asset) {
+      return [String(asset.asset_ref || ''), asset];
+    }));
+  }
   var text = artifactDeliveryText(delivery);
   node.hidden = !text;
   if (!text) { node.replaceChildren(); return node; }
@@ -5897,16 +5999,23 @@ function normalizeHistoryTurn(raw) {
   for (var f = 0; f < rawFiles.length; f++) { if (rawFiles[f]) files.push(rawFiles[f]); }
   var ids = Array.isArray(t.message_ids) ? t.message_ids
     : (Array.isArray(t.messageIds) ? t.messageIds : []);
+  var status = CitrusTaskState.displayStatus(t);
+  var savedAnswer = t.answer || null;
+  // Legacy cancellation pinned a notice in an assistant row for persistence.
+  // Only its exact public marker in a cancelled turn is not answer content.
+  var stoppedMarker = '已按你的停止请求中止本轮：上面已完成的步骤与其结果保留；被停止的步骤没有采用结果，也没有登记任何成果。';
+  var stopNotice = status === 'cancelled' && savedAnswer && savedAnswer.content === stoppedMarker ? stoppedMarker : '';
   return {
     turnRequestId: String(t.turn_request_id || t.turnRequestId || ''),
     user: t.user || null,
-    answer: t.answer || null,
+    answer: stopNotice ? null : savedAnswer,
+    stopNotice: stopNotice,
     trace: trace,
     files: files,
     messageIds: ids.slice(),
     partial: !!t.partial,
     intentSummary: publicTaskStage(t.intent_summary || t.task_summary),
-    displayStatus: CitrusTaskState.displayStatus(t),
+    displayStatus: status,
     stageLabel: publicTaskStage(t.stage_label),
     jobId: String(t.job_id || ''),
     jobStatus: String(t.job_status || ''),
@@ -5961,7 +6070,8 @@ function mergeHistoryTurns(earlierTurns, laterTurns) {
     if (key && byKey[key]) {
       var base = byKey[key];
       if (!base.user && turn.user) base.user = turn.user;
-      if (turn.answer) base.answer = turn.answer;
+      if (turn.answer || turn.stopNotice) base.answer = turn.answer;
+      if (turn.answer || turn.stopNotice) base.stopNotice = turn.stopNotice;
       if (turn.intentSummary) base.intentSummary = turn.intentSummary;
       if (turn.displayStatus) base.displayStatus = turn.displayStatus;
       if (turn.stageLabel) base.stageLabel = turn.stageLabel;
@@ -6026,14 +6136,14 @@ function mergeQueuedHistory(history, entries) {
     }
     if (!root.user) root.user = {content: entry.query || '', request_id: entry.client_request_id, attachments: entry.attachments || []};
     if (segment && segment !== root) {
-      if (segment.answer) {
-        root.answer = segment.answer;
-        root.answerProducerJobId = segment.jobId;
-      }
+      root.answer = segment.answer;
+      root.stopNotice = segment.stopNotice;
+      root.answerProducerJobId = segment.answer ? segment.jobId : '';
       root.trace = segment.trace;
       root.messageIds = root.messageIds.concat(segment.messageIds);
     }
     if (observed && observed !== root.jobId) {
+      if (!segment) { root.answer = null; root.stopNotice = ''; root.answerProducerJobId = ''; }
       root.jobId = observed;
       root.jobStatus = segment ? segment.jobStatus : '';
       root.question = segment ? segment.question : null;
@@ -6124,7 +6234,10 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       if (labels[store.state.status]) process.label.textContent = labels[store.state.status];
     }
     projectContext(); questionLabel(); syncWaiting(); reconcileControls();
-    if (CitrusTaskState.isTerminal(store.state)) loadGeneratedFiles(job);
+    if (CitrusTaskState.isTerminal(store.state)) {
+      if (!finalAnswerReceived) renderPublicTerminalNotice(content, job, hasSavedAnswer || !!streamedAnswer.trim());
+      loadGeneratedFiles(job);
+    }
   }
   function loadGeneratedFiles(data) {
     var jobId = store.state.job_id, recovery = store.state.recovery_cursor;
@@ -6155,7 +6268,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     renderArtifactDelivery(content, store.state.artifact_delivery);
     if (type === 'agent_recovery' && data.status === 'admitted') {
       answer.dataset.displayStatus = '';
-      finalAnswerReceived = false; armed = false; streamedAnswer = ''; content._turnFileRead = null;
+      finalAnswerReceived = false; armed = false; streamedAnswer = ''; resetTurnOutcome(content);
       hasSavedAnswer = false; answer.replaceChildren();
       if (citationContainer) renderCitationBubbles(citationContainer, [], turn.turnRequestId, sid);
       var timing = content.querySelector('.turn-timings'); if (timing) timing.remove();
@@ -6179,16 +6292,9 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
         if (!hasSavedAnswer) answer.replaceChildren();
       }
     }
-    if (type === 'done' || type === 'error') {
-      var text = data.answer || (!hasSavedAnswer && CitrusTaskState.displayStatus(data) && streamedAnswer);
-      if (text) { answer.innerHTML = renderMarkdownSafe(text); process.answerVisible(); }
-    }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
       renderTurnTimings(content, data);
-      finalAnswerReceived = true;
-      if (CitrusTaskState.isTerminal(store.state)) {
-        appendMessageActions(content, 'assistant', data.answer || streamedAnswer || (turn.answer && turn.answer.content));
-      }
+      projectTerminal(data);
       process.terminal(CitrusTaskState.displayStatus(data));
       answer.dataset.displayStatus = CitrusTaskState.displayStatus(data);
       loadGeneratedFiles(data);
@@ -6197,13 +6303,24 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     syncWaiting();
     reconcileControls();
   }});
+  function projectTerminal(data) {
+    var text = isPublicAnswerEvent(data) && typeof data.answer === 'string' && data.answer.trim() ? data.answer
+      : hasSavedAnswer ? turn.answer.content : streamedAnswer;
+    if (String(text || '').trim()) {
+      answer.innerHTML = renderMarkdownSafe(text);
+      suppressDuplicateTurnArtifactLinks(content);
+      process.answerVisible();
+      appendMessageActions(content, 'assistant', text);
+      confirmTurnAttachmentInheritance(content);
+    }
+    renderPublicTerminalNotice(content, data, !!String(text || '').trim());
+    finalAnswerReceived = true;
+  }
   var transport = CitrusTaskTransport.create({store: store, fetch: accountFetch, owns: owns, onSnapshot: snapshot,
     onTerminalDelivery: function (data) {
       if (!owns() || finalAnswerReceived) return;
       process.receive('done', data);
-      if (data.answer) { answer.innerHTML = renderMarkdownSafe(data.answer); process.answerVisible(); }
-      finalAnswerReceived = true;
-      appendMessageActions(content, 'assistant', data.answer || streamedAnswer || (turn.answer && turn.answer.content));
+      projectTerminal(data);
     },
     onReadState: function (source, failed) {
       if (!owns()) return;
@@ -6250,9 +6367,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       appendPublicationReconciliation(queueStatus, sid, entry.client_request_id);
     }
     if (entry.state === 'terminal' && !entry.dispatch_at && entry.clear_reason && !hasSavedAnswer) {
-      var cancelled = entry.clear_reason === 'cancelled';
-      answer.dataset.displayStatus = cancelled ? 'cancelled' : 'failed';
-      answer.textContent = cancelled ? '已取消，这条消息不会执行。' : '这条消息未能开始执行，请重新发送。';
+      renderUndispatchedTurnNotice(content, answer, entry.clear_reason === 'cancelled');
     }
     var job = observeQueuedJob(entry);
     if (entry.state === 'reconcile_required') {
@@ -6278,6 +6393,8 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (job && job !== observed) {
       if (observed && observed !== job) {
         hasSavedAnswer = false; answer.replaceChildren(); answer.dataset.displayStatus = '';
+        resetTurnOutcome(content);
+        if (citationContainer) renderCitationBubbles(citationContainer, [], turn.turnRequestId, sid);
       }
       process.receive('job', {job_id: job});
       observed = job;
@@ -6300,50 +6417,47 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
 function bindSettledHistoryDetails(turn, content, answer, process) {
   // Persistent preview is sufficient for the initial history viewport.
   // Fetch full public events only if this specific turn is expanded.
-  var sid = sessionId, epoch = authEpoch, controller = null, done = false;
+  var sid = sessionId, epoch = authEpoch, observer = null, done = false;
   var recoveryAnswer = !String(turn.answer && turn.answer.content || "").trim();
   var button = document.createElement('button');
   button.type = 'button'; button.className = 'research-tool-toggle';
   button.textContent = '查看完整过程';
   process.element.appendChild(button);
   function owns() { return epoch === authEpoch && sid === sessionId && chatContainer.contains(content); }
-  historyTaskDisposers.push(function () { if (controller) controller.abort(); });
+  historyTaskDisposers.push(function () { if (observer) observer.stop(); });
   button.onclick = async function () {
-    if (controller || done || !owns()) return;
-    controller = new AbortController(); button.disabled = true;
+    if (observer || done || !owns()) return;
+    button.disabled = true;
     var jobId = (turn.queueEntry || {}).active_child_job_id || turn.jobId;
+    var applying = false, recoveredAnswer = false;
+    var store = CitrusTaskState.create({onEvent: function (type, data) {
+      if (!applying) { process.resetDetails(jobId); applying = true; }
+      process.receive(type, data);
+      if (type !== 'done' && type !== 'error') return;
+      renderTurnTimings(content, data);
+      if (recoveryAnswer && typeof data.answer === 'string' && data.answer.trim() && isPublicAnswerEvent(data)) {
+        recoveredAnswer = true;
+        answer.innerHTML = renderMarkdownSafe(data.answer);
+        suppressDuplicateTurnArtifactLinks(content);
+        appendMessageActions(content, 'assistant', data.answer);
+        confirmTurnAttachmentInheritance(content);
+        renderPublicTerminalNotice(content, data, true);
+      } else if (recoveryAnswer && !recoveredAnswer && CitrusTaskState.displayStatus(data)) {
+        renderPublicTerminalNotice(content, data, false);
+      }
+    }});
+    store.hydrate({job_id: jobId});
+    observer = CitrusTaskTransport.create({store: store, owns: owns, fetch: accountFetch});
     try {
-      var cursor = 0, previous, page;
-      do {
-        previous = cursor;
-        var response = await accountFetch('/jobs/' + encodeURIComponent(jobId) + '/events?after=' + cursor + '&limit=200',
-                                          {signal: controller.signal});
-        if (!response.ok) throw new Error('history_events_unavailable');
-        page = await response.json();
-        if (!owns()) return;
-        if (page.protocol !== 'citrus-task/1' || page.job_id !== jobId || !Array.isArray(page.events)) throw new Error('history_event_identity_mismatch');
-        page.events.forEach(function (event) {
-          if (!Number.isSafeInteger(event.seq) || event.seq <= cursor) return;
-          cursor = event.seq;
-          var type = event.event, data = Object.assign({}, event.data || {}, {seq: event.seq});
-          process.receive(type, data);
-          if ((type === 'done' || type === 'error') && event.seq >= (page.recovery_cursor || 0)) renderTurnTimings(content, data);
-          if (recoveryAnswer && event.seq >= (page.recovery_cursor || 0) && (type === 'done' || type === 'error') && typeof data.answer === 'string' &&
-              data.answer.trim() && isPublicAnswerEvent(data)) {
-            answer.innerHTML = renderMarkdownSafe(data.answer);
-            appendMessageActions(content, 'assistant', data.answer);
-          }
-        });
-        if (page.next_cursor !== cursor || page.has_more && cursor <= previous) throw new Error('history_event_cursor_invalid');
-      } while (page.has_more && owns());
+      await observer.replay(jobId);
       if (!owns()) return;
       process.terminal(turn.displayStatus);
       done = true;
-      button.textContent = cursor ? '完整过程已加载' : '没有更多过程记录';
+      button.textContent = store.state.cursor ? '完整过程已加载' : '没有更多过程记录';
     } catch (_) {
       if (owns()) button.textContent = '过程记录暂不可用，点击重试';
     } finally {
-      controller = null;
+      observer.stop(); observer = null;
       if (owns()) button.disabled = done;
     }
   };
@@ -6388,9 +6502,12 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     if (turn.turnRequestId) contentEl.dataset.requestId = String(turn.turnRequestId);
     (turn.fileProducerRequestIds || []).forEach(function (rid) { recordTurnFileProducer(contentEl, rid); });
     contentEl.dataset.sessionId = sessionId;
+    contentEl._hasAttachmentInputs = !!(turn.user && turn.user.attachments && turn.user.attachments.length);
     var answerBody = document.createElement('div'); answerBody.className = 'turn-answer';
     answerBody.dataset.displayStatus = turn.displayStatus;
     answerBody.innerHTML = renderMarkdownSafe(answer.content); contentEl.appendChild(answerBody);
+    renderPublicTerminalNotice(contentEl, {terminal_snapshot: turn.terminalSnapshot, display_status: turn.displayStatus,
+      stop_notice: turn.stopNotice}, !!String(answer.content || '').trim());
     if (answer.citation_bubbles && answer.citation_bubbles.length) {
       var citationRow = document.createElement('div');
       contentEl.appendChild(citationRow);
@@ -6426,9 +6543,10 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     }
     if (!turn.jobId || process.terminal(turn.displayStatus)) {
       appendMessageActions(contentEl, 'assistant', answer.content || '');
+      confirmTurnAttachmentInheritance(contentEl);
     }
     // P0-A: 该轮生成文件只在这一处、按 file_id 幂等追加一次。
-    if (turn.files.length) appendTurnGeneratedFiles(contentEl, turn.files, '本轮生成文件');
+    if (turn.files.length) appendTurnGeneratedFiles(contentEl, turn.files);
   }
   syncEarlierHistoryButton();
   syncHistoryTurnFiles();

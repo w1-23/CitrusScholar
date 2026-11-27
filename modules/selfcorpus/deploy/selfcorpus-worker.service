@@ -1,0 +1,16 @@
+[Unit]
+Description=Selfcorpus research ingestion worker
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/selfcorpus
+EnvironmentFile=%h/.config/selfcorpus/selfcorpus.env
+ExecStart=%h/.local/share/selfcorpus/.venv/bin/selfcorpus worker
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -262,7 +262,8 @@ def _local_cited_document(ref: dict, row: dict, session_id: str, user: dict) -> 
         if (chunk["next_offset"] is None and chunk["source"]["locator"] == locator
                 and sha256(chunk["text"].encode("utf-8")).hexdigest() == locator.get("input_sha256")
                 and chunk["text"][ref["start"]:ref["end"]] == exact["text"]):
-            reconstructed = corpus_source.reconstruct_cited_document(locator, ref["generation"], user)
+            reconstructed = (corpus_source.reconstruct_cited_document(locator, ref["generation"], user)
+                             if not ref["ref"].startswith("ce1:") else None)
             if reconstructed is not None and allows("local_rag"):
                 # Check the evidence again after expanding to the entire document.
                 if not _local_evidence(ref, session_id, user, preview=True):

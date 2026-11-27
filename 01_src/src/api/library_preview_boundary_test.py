@@ -108,6 +108,58 @@ def test_library_svg_selection_returns_isolated_previews_and_exact_download(libr
     assert thumb.headers["Content-Security-Policy"] == preview.headers["Content-Security-Policy"]
 
 
+@pytest.mark.parametrize("filename,source", [("plot.py", b"print('figure')\n"), ("plot.R", b"plot(1:4)\n")])
+def test_plot_source_upload_is_download_only_and_account_owned(library, filename, source):
+    client, session, sibling, foreign = library
+    endpoint = f"/api/v2/session/{session}/files/upload"
+    params = {"filename": filename}
+    assert client.post(endpoint, params=params, content=source).status_code == 401
+    assert client.post(endpoint, params=params, headers=OTHER, content=source).status_code in {403, 404}
+    for invalid in (b"", b"\0binary", b"\xff", b"  \n"):
+        assert client.post(endpoint, params=params, headers=OWNER, content=invalid).status_code == 400
+    uploaded = client.post(endpoint, params=params, headers={**OWNER, "Content-Type": "text/html"}, content=source)
+    assert uploaded.status_code == 201, uploaded.text
+    metadata, = client.get("/api/v2/files", headers=OWNER).json()["uploaded"]
+    ref = uploaded.json()["file_id"]
+    assert metadata["file_id"] == ref and metadata["mime_type"] == "text/plain; charset=utf-8"
+    assert source.decode().strip() not in str(metadata)
+    for base in (f"/api/v2/files/{ref}", f"/api/v2/session/{session}/files/{ref}"):
+        assert client.get(base + "/preview", headers=OWNER).status_code == 404
+        saved = client.get(base + "/download", headers=OWNER)
+        assert saved.content == source and saved.headers["Content-Disposition"].startswith("attachment;")
+        assert saved.headers["X-Content-Type-Options"] == "nosniff"
+        assert client.get(base + "/download", headers=OTHER).status_code in {403, 404}
+    assert client.get(f"/api/v2/session/{sibling}/files/{ref}/download", headers=OWNER).status_code == 404
+    assert client.get(f"/api/v2/session/{foreign}/files/{ref}/download", headers=OTHER).status_code == 404
+
+
+def test_plot_source_upload_checks_workbench_size_and_not_chat_ingress(library, monkeypatch):
+    import base64
+    from src.api import turn_envelope, workbench_bridge_protocol
+
+    client, session, *_ = library
+    monkeypatch.setattr(workbench_bridge_protocol, "ASSET_LIMIT", 3)
+    response = client.post(f"/api/v2/session/{session}/files/upload", params={"filename": "plot.py"},
+                           headers=OWNER, content=b"plot()")
+    assert response.status_code == 413
+    with pytest.raises(HTTPException) as error:
+        turn_envelope._decode_upload({"name": "plot.py", "data": base64.b64encode(b"plot()").decode()},
+                                     remaining=1024)
+    assert error.value.status_code == 400
+
+
+def test_byte_mismatch_rejects_all_browser_file_read_routes(library):
+    client, session_id, *_ = library
+    row = files.register_file(session_id=session_id, owner_user_id=31, filename="bound.txt",
+                              content=b"checked", mime="text/plain", origin=files.ORIGIN_UPLOADED)
+    file_id = row["file_id"]
+    info = files.get_account_file(file_id, 31)
+    info["path"].write_bytes(b"changed")  # Same length: the SHA, not stat, rejects it.
+    for prefix in (f"/api/v2/files/{file_id}", f"/api/v2/session/{session_id}/files/{file_id}"):
+        for action in ("preview", "download"):
+            assert client.get(f"{prefix}/{action}", headers=OWNER).status_code == 404
+
+
 def test_legacy_svg_rows_and_html_report_sandbox_stay_compatible(library):
     client, session_id, *_ = library
     for filename, content, mime, frame in (("historic.svg", SVG, "image/svg+xml", "'none'"),

@@ -156,7 +156,7 @@ def publish_script_outputs(*, runner, text: str, title: str, output_name: str,
         return _error("SANDBOX_ERROR", f"隔离执行失败：{exc}", execution_stage="sandbox_failed")
     if not result.ok:
         from src.research.script_reconciliation import observe_failed_worker
-        observe_failed_worker(result, source)
+        observe_failed_worker(result, source, explicit_outputs=True)
         described = result.describe() or "脚本未完成；未接收本次残留输出。"
         content, payload = _error("SCRIPT_ERROR", described, execution_stage="sandbox_failed")
         if result.diagnostic:

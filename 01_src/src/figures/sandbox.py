@@ -814,7 +814,7 @@ def _script_diagnostic(value: Any) -> dict:
     code = value.get("error_code")
     if code not in ("invalid_input_contract", "input_binding_failed", "script_syntax",
                     "forbidden_import", "script_error", "unreadable_labels",
-                    "render_script_emit_not_available", "input_type_mismatch"):
+                    "render_script_emit_not_available", "input_type_mismatch", "undeclared_table_output"):
         return {}
     result = {"stage": value["stage"], "error_code": code}
     line = value.get("line")
@@ -828,6 +828,12 @@ def _script_diagnostic(value: Any) -> dict:
         if (isinstance(parameter, str) and re.fullmatch(r"data\[(?:'[_a-zA-Z][_a-zA-Z0-9]{0,63}'|\?)\]", parameter)
                 and actual in ("Path", "PosixPath", "WindowsPath", "non-DataFrame")):
             result.update(parameter=parameter, expected="DataFrame", actual=actual)
+    if code == "undeclared_table_output":
+        name = value.get("output_name")
+        if (value["stage"] != "analysis" or not isinstance(name, str)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name)):
+            return {}
+        result["output_name"] = name
     inputs = value.get("inputs")
     if isinstance(inputs, dict):
         known = {name: kind for name, kind in list(inputs.items())[:16]

@@ -71,10 +71,26 @@ class CorpusRegistry:
         return frozenset(set(self.corpora) | set(self.corpus_access))
 
     @property
-    def search_family_ids(self) -> set[str]:
-        """Base index families plus the separate, enabled shared search family."""
-        from src.corpus_integration.read_access import shared_search_available
+    def approved_public_base_ids(self) -> frozenset[str]:
+        """Five approved source batches, resolved to generation-local corpus IDs."""
+        approved: dict[str, list[str]] = {}
+        for corpus_id, spec in self.corpora.items():
+            source = str(spec.get("source_batch") or corpus_id)
+            generated_id = "corpus_" + deterministic_id(spec["family_id"], source, length=24)
+            if (source in SHARED_PUBLIC_CORPUS_NAMES and corpus_id in {source, generated_id}
+                    and spec["table_name"] == corpus_id and self.access_level_for_corpus(corpus_id) == "public"):
+                approved.setdefault(source, []).append(corpus_id)
+        # Ambiguous mappings have no authorized table, not a broadened scope.
+        return frozenset(ids[0] for ids in approved.values() if len(ids) == 1)
 
+    @property
+    def search_family_ids(self) -> set[str]:
+        """Base families plus the independent search route enabled by deployment."""
+        from src.corpus_integration.read_access import shared_search_available
+        from src.corpus_integration.selfcorpus_search import FAMILY_ID, enabled
+
+        if enabled():
+            return {self.corpora[corpus_id]["family_id"] for corpus_id in self.approved_public_base_ids} | {FAMILY_ID}
         families = self.family_ids
         if shared_search_available():
             families.add(LEGACY.family_id)
@@ -82,6 +98,11 @@ class CorpusRegistry:
 
     def family(self, family_id: str) -> dict[str, Any] | None:
         key = str(family_id or "").strip().casefold()
+        from src.corpus_integration.selfcorpus_search import FAMILY_ID
+
+        if key == FAMILY_ID:
+            return {"display_name": "Selfcorpus 增量文献库",
+                    "description": "检索当前账号有权读取的个人与共享增量语料，返回当轮可用片段。"}
         if key == LEGACY.family_id and key not in self.families:
             return dict(_SHARED_SEARCH_FAMILY)
         return self.families.get(key)
@@ -95,6 +116,12 @@ class CorpusRegistry:
         ids = sorted(available if active is None else available & active)
         lines = [f"- `{family_id}`：{self.display_name(family_id)}。{(self.family(family_id) or {}).get('description', '')}"
                  for family_id in ids]
+        from src.corpus_integration.selfcorpus_search import FAMILY_ID
+
+        if FAMILY_ID in ids:
+            lines.append("本地文献检索未被限定到指定资料类别时，可将 `selfcorpus` 与相关既有类别一起传给 "
+                         "local_hybrid_search。用户指定资料类别时，使用其限定的选择。"
+                         "Selfcorpus 保留原查询，不支持既有类别的主题过滤。")
         return "\n".join(lines) or "当前没有可检索的本地语料类别。"
 
     def matching_families(self, query: object) -> set[str]:

@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import unicodedata
-from urllib.parse import urlsplit, urlunsplit
+
+from src.retrieval.evidence_contract import canonical_http_url
+from src.retrieval.turn_budget import TurnRetrievalBudget
 
 
 _DEFAULTS = {
@@ -48,21 +50,8 @@ def _url(value):
     if not isinstance(value, str):
         return value
     raw = value.strip()
-    try:
-        parts = urlsplit(raw)
-        # Do not collapse paths, queries, case-sensitive credentials, or
-        # different schemes. Drop only the fragment and default port.
-        if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username is not None:
-            return raw
-        port = parts.port
-        host = parts.hostname.casefold()
-        if ":" in host:
-            host = f"[{host}]"
-        if port is not None and port != (443 if parts.scheme == "https" else 80):
-            host = f"{host}:{port}"
-        return urlunsplit((parts.scheme, host, parts.path or "/", parts.query, ""))
-    except ValueError:
-        return raw
+    # Neither queries, paths, schemes nor invalid URLs are rewritten.
+    return canonical_http_url(raw) or raw
 
 
 def _candidate_read(name, args):
@@ -118,6 +107,36 @@ class RetrievalLedger:
     _retried: set[str] = field(default_factory=set)
     _retryable: set[str] = field(default_factory=set)
     _settled_ids: set[str] = field(default_factory=set)
+    _retry_parents: dict[str, str] = field(default_factory=dict)
+    budget: TurnRetrievalBudget = field(default_factory=TurnRetrievalBudget)
+
+    def admit(self, name: str, call_id: str, args: Mapping) -> str | None:
+        reason = self.budget.admit(name, call_id, args)
+        if reason and (key := retrieval_key(name, args)) and self._first_calls.get(key) == call_id:
+            # The existing claim precedes budget admission. A rejected call
+            # has no observation for future duplicate calls to reference.
+            if original := self._retry_parents.pop(call_id, None):
+                self._first_calls[key] = original
+                self._retried.discard(key)
+                self._retryable.add(key)
+            else:
+                self._first_calls.pop(key)
+        return reason
+
+    def restore_admission(self, name: str, call_id: str, args: Mapping) -> None:
+        self.budget.restore(name, call_id, args)
+
+    def observe(self, name: str, call_id: str, artifact, *, status: str, reason: str, content=None) -> None:
+        self.budget.observe(name, call_id, artifact, status=status, reason=reason, content=content)
+
+    def timer_state(self) -> float | None:
+        return self.budget.timer_state()
+
+    def restore_timer_state(self, started_at) -> None:
+        self.budget.restore_timer_state(started_at)
+
+    def summary(self) -> dict:
+        return self.budget.summary()
 
     def claim(self, name: str, args: Mapping, call_id: str) -> str | None:
         """Call on the async tool node before any await of the actual handler."""
@@ -130,6 +149,7 @@ class RetrievalLedger:
             self._retryable.remove(key)
             self._retried.add(key)
             self._first_calls[key] = call_id
+            self._retry_parents[call_id] = original
             return None
         return original
 
@@ -152,6 +172,7 @@ class RetrievalLedger:
         if not key or call_id in self._settled_ids or self._first_calls.get(key) != call_id:
             return
         self._settled_ids.add(call_id)
+        self._retry_parents.pop(call_id, None)
         if not uncertain and status in {"failed", "unavailable"} and reason in {
             "timeout", "translation_failed", "dependency", "candidate_search_failed", "network", "source_unavailable",
         } and key not in self._retried and name not in {"read_tool_result", "read_context_evidence"}:

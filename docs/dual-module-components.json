@@ -1,0 +1,35 @@
+{
+  "release": "dual-module-complete-fusion",
+  "display_name": "双模块彻底融合",
+  "format": "citrusscholar-source-bundle/v1",
+  "components": {
+    "host": {
+      "source": "01_src",
+      "verified_runtime_commit": "5edf6816923f8d00306ba69114dc447e76687900",
+      "license": "MIT",
+      "ui_outer_port": 8060
+    },
+    "workbench": {
+      "source": "modules/workbench",
+      "version": "0.1.0",
+      "license": "AGPL-3.0-only",
+      "tavotto_git_revision": "b6de338c3b8d104d64930f18828b9675acb261a5",
+      "internal_port": 8062,
+      "feature_release": "dual-module-complete-fusion"
+    },
+    "selfcorpus": {
+      "source": "modules/selfcorpus",
+      "version": "0.1.4",
+      "license": "NOASSERTION",
+      "existing_runtime_wheel_sha256": "8af8a7d7deb53bc62c99f38f6a6c1b688123a9ae73729f0b333ce892a33baf89",
+      "internal_port": 8061
+    }
+  },
+  "distribution": {
+    "database": false,
+    "credentials": false,
+    "models": false,
+    "images": false,
+    "tavotto_upstream_checkout": false
+  }
+}

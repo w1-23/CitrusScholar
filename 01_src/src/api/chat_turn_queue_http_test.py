@@ -126,6 +126,7 @@ def runtime(monkeypatch, tmp_path):
     for path, handler, method in (
         ("/api/v2/sessions", main.list_sessions, "GET"),
         (root + "/messages", main.session_messages, "GET"),
+        (root + "/continuation/{request_id}", main.session_continuation_inputs, "GET"),
         (root + "/artifacts/{artifact_id}", main.download_research_artifact, "GET"),
         ("/api/v1/session/{session_id}/clear", main.clear_session_endpoint, "POST"),
         ("/sessions/{session_id}/jobs", main.list_session_jobs, "GET"),
@@ -820,6 +821,11 @@ def test_only_explicit_visible_executed_baseline_contributes_attachments(runtime
         return runtime.client.post(runtime.path, json={"query": "follow up", "client_request_id": cid,
                                                      "continue_from": baseline})
 
+    def available(baseline="baseline"):
+        return runtime.client.get(f"/api/v2/session/{runtime.sid}/continuation/{baseline}")
+
+    assert available().status_code == 409
+    assert available("not-a-turn").status_code == 404
     assert continue_from("too-early").status_code == 409
     assert continue_from("missing", "not-a-turn").status_code == 404
     runtime.released.add("baseline")
@@ -836,8 +842,14 @@ def test_only_explicit_visible_executed_baseline_contributes_attachments(runtime
     assert inherited["file_id"] == source_file["file_id"]
     assert inherited["sha256"] == source_file["sha256"]
     assert inherited["source"] == "previous_turn"
+    candidates = available()
+    assert candidates.status_code == 200 and candidates.headers["Cache-Control"] == "private, no-store"
+    assert candidates.json() == {"attachments": [{"file_id": source_file["file_id"],
+        "filename": "only-source.txt", "mime_type": "text/plain; charset=utf-8", "size_bytes": 9}]}
     runtime.released.update({"ordinary", "explicit"})
     wait_for(lambda: state(runtime, "explicit") == "terminal")
+    assert available("explicit").json() == candidates.json()
+    assert available("ordinary").json() == {"attachments": []}
     clear = runtime.client.post(f"/api/v1/session/{runtime.sid}/clear")
     assert clear.status_code == 200, clear.text
     assert continue_from("hidden").status_code == 404
@@ -1050,8 +1062,8 @@ def test_owned_http_approval_resumes_only_the_original_native_call(runtime, deci
 
 
 @pytest.mark.parametrize(("task", "retry_svg"), [
-    ("figure", False), ("figure", True), ("data-audit", False), ("question-answering", False),
-], ids=["figure", "figure-after-preflight-rejection", "data-audit", "question-answering"])
+    ("figure", False), ("figure", True), ("data-audit", False), ("dataset-audit", False), ("dataset-audit-partial", False), ("question-answering", False),
+], ids=["figure", "figure-after-preflight-rejection", "data-audit", "dataset-audit", "dataset-audit-partial", "question-answering"])
 def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime, monkeypatch, tmp_path, task, retry_svg):
     """Real HTTP handlers, official graph and operations; only the LLM wire is a fixture."""
     import json
@@ -1071,6 +1083,28 @@ def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime,
         lambda *_args, **_kwargs: ModelTransport("deepseek", PROVIDER, BASE, "fixture", {}))
     monkeypatch.setattr("src.core.tool_results._schema_ready", False)
     monkeypatch.setattr(graph, "build_graph", lambda _: build_general_agent_graph())
+    dataset_case = task.startswith("dataset-audit")
+    partial = task == "dataset-audit-partial"
+    if dataset_case:
+        pytest.importorskip("pandera.pandas")
+        from src.agent.scientific_method_tools import METHOD_IDS
+
+        release = tmp_path / "fixture-methods"
+        inventory = {}
+        for method in METHOD_IDS:
+            directory = release / "skills" / method
+            directory.mkdir(parents=True)
+            resource = directory / "SKILL.md"
+            resource.write_text(f"---\nname: {method}\ndescription: Fixture method\n---\nFixture\n")
+            from hashlib import sha256
+            inventory[resource.relative_to(release).as_posix()] = sha256(resource.read_bytes()).hexdigest()
+        (release / "release.json").write_text(json.dumps(dict.fromkeys(METHOD_IDS, "a" * 40)))
+        (release / "inventory.json").write_text(json.dumps(inventory))
+        (release / "scientific-methods.json").write_text("{}")
+        monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(release))
+        monkeypatch.setenv("CITRUS_SCIENTIFIC_METHODS_ONLY", "1")
+        monkeypatch.setenv("CITRUS_EXTERNAL_FUSION", "required")
+        monkeypatch.setenv("CITRUS_CODE_EXECUTION", "offline-development")
     wire = []
     fixture = b"sample,value\nA,1\nA,1\nB,2\n"
     query, tool, args, answer = {
@@ -1080,12 +1114,16 @@ def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime,
         "data-audit": ("审查这个数据有没有异常，只要文字结论。", "audit_uploaded_data", {
             "file_indexes_json": [0]}, "数据审查结果已返回。"),
         "question-answering": ("转座子是什么？", "", {}, "转座子是能在基因组中改变位置的 DNA 序列。"),
+        "dataset-audit": ("Audit the attached CSV for data quality. Report only missing cells and exact duplicate rows, with source locations. Use only the attachment. No web, generated files, or source edits.",
+            "prepare_audit_dataset", {"file_index": 0}, "The duplicate rows are 2 and 3."),
+        "dataset-audit-partial": ("Audit this CSV for data quality. Check numeric ranges. No network.",
+            "prepare_audit_dataset", {"file_index": 0}, "No range bounds were supplied."),
     }[task]
 
     def receive(request):
         body = json.loads(request.content)
         wire.append(body)
-        assert len(wire) <= (2 + int(retry_svg) if tool else 1)
+        assert len(wire) <= (3 if dataset_case else 2 + int(retry_svg) if tool else 1)
         names = {entry["function"]["name"] for entry in body.get("tools", ())}
         if task == "figure":
             assert not names & {"audit_uploaded_data", "run_external_skill", "execute", "task", "deepseek_search"}
@@ -1094,6 +1132,25 @@ def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime,
         if not tool:
             return _chat_stream(answer=answer)
         assert tool in names
+        if dataset_case:
+            prompt = "\n".join(str(row.get("content", "")) for row in body["messages"] if row["role"] == "system")
+            assert "不可执行 · 数据审查（CSV 单表）" not in prompt
+            assert "不传 scope、工作表或 A1 坐标" in prompt
+            if len(wire) == 1:
+                return _chat_stream([("source-chain-tool", tool, args)])
+            if len(wire) == 2:
+                content, = [row["content"] for row in body["messages"] if row.get("tool_call_id") == "source-chain-tool"]
+                ref = json.loads(content)["dataset_ref"]
+                checks = {"checks": ["range"] if partial else ["missing", "duplicate"]}
+                return _chat_stream([("dataset-check", "audit_prepared_dataset", {"dataset_ref": ref, "checks": checks})])
+            content, = [row["content"] for row in body["messages"] if row.get("tool_call_id") == "dataset-check"]
+            assert content.startswith("{"), repr(content)[:3500]
+            report = json.loads(content)
+            assert report["status"] == ("partial" if partial else "complete")
+            assert ("inspect_uploaded_table" in names) == partial
+            if not partial:
+                assert [row["row"] for row in report["findings"]] == [2, 3]
+            return _chat_stream(answer=answer)
         if retry_svg and len(wire) == 1:
             return _chat_stream([("rejected-svg", tool, {**args, "svg": "<svg>"})])
         if len(wire) == 1 + int(retry_svg):
@@ -1122,7 +1179,10 @@ def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime,
         events = runtime.client.get(f"/jobs/{run}/events").json()["events"]
         terminal, = [item["data"] for item in events if item["event"] == "done"]
         assert terminal.get("history_saved"), terminal
-        assert terminal["turn_status"] == "completed", (terminal.get("answer"), terminal.get("turn_envelope"))
+        if partial:
+            assert terminal["turn_envelope"]["display_status"] == "partial", terminal
+        else:
+            assert terminal["turn_status"] == "completed", (terminal.get("answer"), terminal.get("turn_envelope"))
         assert answer in terminal["answer"]
         with task_events.read_transaction() as conn:
             operations = conn.execute("SELECT tool_name,status FROM task_operations WHERE job_id=? ORDER BY rowid",
@@ -1130,6 +1190,8 @@ def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime,
         expected = [(tool, "not_run")] if retry_svg else []
         if tool:
             expected.append((tool, "complete"))
+        if dataset_case:
+            expected.append(("audit_prepared_dataset", "partial" if partial else "complete"))
         assert [tuple(row) for row in operations] == expected
         if task == "figure":
             import re

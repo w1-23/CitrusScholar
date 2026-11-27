@@ -273,7 +273,7 @@ def authorize_fusion_code(identity, release):
 
 
 def _host_private_workspace(workspace):
-    return workspace.get("metadata", {}).get("code_scope") in {FUSION_CODE_SCOPE, "citrus.nature-plot/1"}
+    return workspace.get("metadata", {}).get("code_scope") in {FUSION_CODE_SCOPE, "citrus.nature-plot/1", "citrus.numeric-integrity/1"}
 
 
 def _key(*values):

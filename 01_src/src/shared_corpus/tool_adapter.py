@@ -106,8 +106,11 @@ def _identity():
 
 
 def _runtime():
+    from src.corpus_integration.selfcorpus_search import enabled
     from src.shared_corpus.runtime import current_runtime
 
+    if enabled():
+        raise _ToolUnavailable("shared_corpus_disabled", "旧版共享文献收录接口已停用。")
     runtime = current_runtime()
     if runtime is None:
         raise _ToolUnavailable("shared_corpus_disabled", "共享文献库未启用。")
@@ -317,6 +320,10 @@ def commit_document_index() -> str:
 @tool
 def search_agent_corpus(query: str, limit: int = 6) -> str:
     """Search the shared literature corpus published by administrators. Returns bounded excerpts with document and version read references. Only published, non-revoked content is visible; the query is plain text."""
+    from src.corpus_integration.settings import unified_enabled
+
+    if unified_enabled():
+        return _not_run("corpus_use_unified", "请使用统一的本地资料检索。")
     text = str(query or "").strip()
     if not text:
         return _not_run("query_empty", "请提供检索词。")
@@ -334,6 +341,10 @@ def search_agent_corpus(query: str, limit: int = 6) -> str:
 
         if not allows("local_rag"):
             return _not_run("local_rag_disabled", "本地检索未启用。")
+        from src.corpus_integration import selfcorpus_search
+
+        if selfcorpus_search.enabled():
+            return json.dumps(selfcorpus_search.tool_result(text, min(size, 5), personal=False), ensure_ascii=False)
         _owner, _role = _identity()
         runtime = isolated_search() if isolated_enabled() else _runtime()
         if runtime is None or runtime.unavailable or runtime.generation is None:

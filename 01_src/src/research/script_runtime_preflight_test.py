@@ -116,6 +116,8 @@ class ScriptRuntimeRejectionTests(unittest.TestCase):
         self.assertEqual(json.loads(content), payload)
         self.assertEqual(payload["_tool_outcome"]["status"], "not_run")
         self.assertEqual(payload["failure_phase"], "preflight")
+        self.assertEqual(payload["error_code"], "repair_target_already_succeeded")
+        self.assertEqual(payload["repair_from_run_id"], "d" * 32)
         self.assertIn("already succeeded", payload["error"])
         self.assertIn("new run", payload["error"])
 

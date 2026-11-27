@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -107,7 +108,6 @@ def completion_from_answer(answer: str, records) -> CompletionEnvelope:
 
 def claims_file_delivery(answer: str) -> bool:
     """Detect affirmative file or figure delivery claims in ordinary answers."""
-    import re
     from src.graph.intent_text import intent_clauses, negated_before
 
     claim = re.compile(
@@ -128,50 +128,81 @@ def claims_file_delivery(answer: str) -> bool:
     return False
 
 
-def _single_render_assets(requirements, rows, assets):
-    """Prefer one exact final render for an ordinary single-figure request."""
-    from src.graph.export_contract import deliverable_match_groups
+_FIGURE_MIME = {"svg": "image/svg+xml", "png": "image/png", "pdf": "application/pdf", "tiff": "image/tiff"}
+_FIGURE_ANSWER_REF = re.compile(
+    r"(?<![\w/])(?:/api/v2/files/[a-f0-9]{32}/download|"
+    r"/api/v2/session/[A-Za-z0-9_-]{8,128}/artifacts/[a-f0-9]{32})(?![\w/])")
+
+
+def figure_answer_refs(answer):
+    """Return exact artifact and file download references from the model answer."""
+    return list(dict.fromkeys(_FIGURE_ANSWER_REF.findall(answer)))
+
+
+def uses_single_render_delivery(requirements):
     from src.graph.task_contract import FIGURE_KINDS
 
     if len(requirements) != 1:
-        return None
+        return False
     requirement = requirements[0]
-    if (not set(requirement.get("kinds") or ()).intersection(FIGURE_KINDS)
-            or requirement.get("phase", "initial") != "initial" or requirement.get("figure_id")):
+    return (bool(FIGURE_KINDS.intersection(requirement.get("kinds") or ()))
+            and requirement.get("phase", "initial") == "initial" and not requirement.get("figure_id")
+            and not (set(requirement.get("formats") or ()) - _FIGURE_MIME.keys()))
+
+
+def _render_receipt_figures(row, name):
+    cid, receipt = row.get("tool_call_id"), row.get("op_receipt") or {}
+    if (not cid or not isinstance(receipt, dict) or receipt.get("schema_version") != 1
+            or not receipt.get("run_id")
+            or (receipt.get("tool_call_id"), receipt.get("tool_name"), receipt.get("status"),
+                receipt.get("reason_code")) != (cid, name, "complete", "figure_published")):
+        return None
+    figures = (receipt.get("coverage") or {}).get("figures")
+    return figures if isinstance(figures, list) and figures else None
+
+
+def _single_render_assets(requirements, rows, assets, answer_render_refs):
+    """Prefer the figure named by the answer, with the latest receipt as fallback."""
+    from src.graph.export_contract import deliverable_match_groups
+
+    if not uses_single_render_delivery(requirements):
         return None
     name = "run_research_figure_script"
-    mime_by_format = {"svg": "image/svg+xml", "png": "image/png", "pdf": "application/pdf", "tiff": "image/tiff"}
-    if set(requirement.get("formats") or ()) - mime_by_format.keys():
-        return None
+    answer_refs = set(answer_render_refs)
+    fallback, first_row, identified = None, True, []
     for row in reversed(rows):
-        if row.get("status") != "complete" or (row.get("name") or row.get("tool_name")) != name:
+        if (row.get("status") != "complete" or (row.get("name") or row.get("tool_name")) != name
+                or (row.get("reason") or row.get("reason_code")) != "figure_published"):
             continue
-        if (row.get("reason") or row.get("reason_code")) != "figure_published":
-            continue
-        cid, receipt = row.get("tool_call_id"), row.get("op_receipt") or {}
-        if (not cid or not isinstance(receipt, dict) or receipt.get("schema_version") != 1
-                or not receipt.get("run_id")
-                or (receipt.get("tool_call_id"), receipt.get("tool_name"), receipt.get("status"),
-                    receipt.get("reason_code")) != (cid, name, "complete", "figure_published")):
-            return None
-        figures = (receipt.get("coverage") or {}).get("figures")
-        if not isinstance(figures, list) or not figures:
-            return None  # Keep legacy receipts on the existing matcher.
-        current = [(owner, asset) for owner, asset in assets if owner == cid and asset.get("producer_tool") == name]
-        matches = []
-        for figure in figures:
-            if not isinstance(figure, dict) or not figure.get("figure_id") or figure.get("status") != "complete":
-                continue
-            exports = {(item.get("artifact_url"), item.get("artifact_id"), mime_by_format[item["format"]])
-                       for item in figure.get("exports") or ()
-                       if isinstance(item, dict) and item.get("format") in mime_by_format}
-            group = [(owner, asset) for owner, asset in current
-                     if (asset.get("link"), asset.get("artifact_id"), asset.get("mime")) in exports]
-            if deliverable_match_groups([asset for _, asset in group], requirements):
-                matches.append(group)
-        # Never combine two figures or backfill a missing format from a stale run.
-        return matches[0] if len(matches) == 1 else []
-    return None
+        figures = _render_receipt_figures(row, name)
+        if figures is not None:
+            current = [(owner, asset) for owner, asset in assets
+                       if owner == row["tool_call_id"] and asset.get("producer_tool") == name]
+            matches = []
+            for figure in figures:
+                if not isinstance(figure, dict) or not figure.get("figure_id") or figure.get("status") != "complete":
+                    continue
+                exports = [item for item in figure.get("exports") or ()
+                           if isinstance(item, dict) and item.get("format") in _FIGURE_MIME]
+                keys = {(item.get("artifact_url"), item.get("artifact_id"), _FIGURE_MIME[item["format"]])
+                        for item in exports}
+                group = [(owner, asset) for owner, asset in current
+                         if (asset.get("link"), asset.get("artifact_id"), asset.get("mime")) in keys]
+                complete = deliverable_match_groups([asset for _, asset in group], requirements)
+                if complete:
+                    matches.append(group)
+                if any(answer_refs.intersection((item.get("artifact_url"), item.get("download_url")))
+                       for item in exports):
+                    identified.append(group if complete else [])
+            if first_row:
+                fallback = matches[0] if len(matches) == 1 else []
+        if not answer_refs:
+            return fallback
+        first_row = False
+    # Never combine figures or fill a gap in the named render from another run.
+    if identified:
+        return identified[0] if len(identified) == 1 else []
+    return fallback
 
 
 def _effective_artifact_records(records):
@@ -182,14 +213,15 @@ def _effective_artifact_records(records):
     return sorted(effective_tool_records(records), key=lambda row: positions[row.get("tool_call_id")])
 
 
-def artifact_goal_evidence(requirements, rows, verified_links, *, single_render_receipt=False):
+def artifact_goal_evidence(requirements, rows, verified_links, *, single_render_receipt=False, answer_render_refs=()):
     from src.graph.export_contract import deliverable_match_groups
     assets = [(row["tool_call_id"], item) for row in rows
               if row.get("tool_call_id") and row.get("status") in {"complete", "partial"}
               for item in row.get("artifact_validations", ())
               if (item.get("valid") and item.get("request_matches") is True
                   and item.get("link") in verified_links)]
-    render_assets = _single_render_assets(requirements, rows, assets) if single_render_receipt else None
+    render_assets = (_single_render_assets(requirements, rows, assets, answer_render_refs)
+                     if single_render_receipt else None)
     if render_assets is not None:
         assets = render_assets
     matches = deliverable_match_groups([item for _, item in assets], requirements)
@@ -349,8 +381,12 @@ def reviewed_completion_valid(outcome, records, *, answer=None) -> bool:
             from src.core.task_result import effective_tool_records
             single_render_receipt = contract.get("single_render_receipt") is True
             rows = _effective_artifact_records(records) if single_render_receipt else effective_tool_records(records)
+            answer_render_refs = contract.get("answer_render_refs", [])
+            if (not isinstance(answer_render_refs, list) or any(not isinstance(ref, str) for ref in answer_render_refs)
+                    or not set(answer_render_refs).issubset(figure_answer_refs(statement.answer))):
+                return False
             goals, gaps = artifact_goal_evidence(contract["requirements"], rows, set(contract["verified_links"]),
-                single_render_receipt=single_render_receipt)
+                single_render_receipt=single_render_receipt, answer_render_refs=answer_render_refs)
             if (goals != [goal for goal in statement.goals if goal.kind == "deliverable"]
                     or (gaps and statement.status == "completed")
                     or tuple(gaps) != tuple(gap for gap in data.get("gaps", ())

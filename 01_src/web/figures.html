@@ -7,16 +7,16 @@
   <title>图表工作台 · CitrusScholar</title>
   <script src="/assets/citrus-theme.js?v=2"></script>
   <link rel="stylesheet" href="/assets/app.css?v=44">
-  <link rel="stylesheet" href="/assets/figures.css?v=15">
-  <link rel="stylesheet" href="/assets/guide.css?v=3">
+  <link rel="stylesheet" href="/assets/figures.css?v=16">
+  <link rel="stylesheet" href="/assets/guide.css?v=7">
   <link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
   <script src="/assets/figures/edit_model.js?v=2" defer></script>
   <script src="/assets/figures/scene_projection.js?v=2" defer></script>
   <script src="/assets/figures/hit_geometry.js?v=1" defer></script>
   <script src="/assets/xlsx.full.min.js?v=1" defer></script>
   <script src="/assets/figures.js?v=20" defer></script>
-  <script src="/assets/guide.js?v=5" defer></script>
-</head>
+  <script src="/assets/guide.js?v=7" defer></script>
+<link rel="icon" type="image/png" href="/assets/citrus-brand.png"></head>
 <body class="figure-app">
   <svg class="icon-definitions" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
     <defs>
@@ -36,7 +36,7 @@
 
   <header class="workbench-toolbar">
     <div class="workspace-identity">
-      <a class="brand" href="/" aria-label="CitrusScholar 问答首页"><span class="brand-mark">C</span><strong>CitrusScholar</strong></a>
+      <a class="brand" href="/" aria-label="CitrusScholar 问答首页"><img class="brand-mark" src="/assets/citrus-brand.png" alt=""><strong>CitrusScholar</strong></a>
       <span class="identity-divider" aria-hidden="true"></span>
       <span class="workspace-name">图表工作台</span>
       <h1 id="projectTitle">未打开图件</h1>
@@ -165,7 +165,7 @@
         <div id="propertyScope" class="property-scope" aria-live="polite" hidden></div>
         <div id="propertyPanel" class="property-panel"><p class="property-empty">在画板或左侧列表中选择对象。</p></div>
         <section id="propertyDraftControls" class="property-drafts" aria-label="恢复未保存的属性" hidden></section>
-        <button class="editor-guide" id="figureGuideButton" type="button" data-citrus-guide="figures" data-guide-focus-fallback="#toggleRight">编辑指南与快捷键</button>
+        <button class="editor-guide" id="figureGuideButton" type="button" data-citrus-guide="figures" data-guide-focus-fallback="#toggleRight">使用指南</button>
       </section>
       <section class="inspector-section" id="canvasSection" role="tabpanel" aria-labelledby="canvasTab" hidden>
         <h2 class="section-title">画布信息</h2>

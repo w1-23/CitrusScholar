@@ -1121,8 +1121,25 @@ async function refreshSharedMaintenance(epoch) {
 
 async function startAuthenticatedApp() {
   var epoch = authEpoch;
-  showAuthGate(false);
   sessionId = localStorage.getItem(sessionStorageKey());
+  var returnUrl = new URL(location.href);
+  var returnSession = returnUrl.searchParams.get('figure_session');
+  if (returnSession !== null) {
+    returnUrl.searchParams.delete('figure_session');
+    history.replaceState(history.state, '', returnUrl);
+    if (returnSession !== sessionId && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(returnSession)) {
+      // Verify ownership and existence before replacing the remembered chat.
+      var origin = await accountFetch('/api/v2/session/' + returnSession + '/turns?limit=1', {cache:'no-store'})
+        .catch(function () { return null; });
+      if (epoch !== authEpoch) return;
+      if (origin && origin.ok) {
+        sessionId = returnSession;
+        localStorage.setItem(sessionStorageKey(), sessionId);
+        window.dispatchEvent(new CustomEvent('citrus:session-changed', {detail:{session_id:sessionId}}));
+      }
+    }
+  }
+  showAuthGate(false);
   restoreComposerSession();
   var configReady;
   if (currentAccount && currentAccount.role === 'admin') configReady = loadRuntimeConfig();
@@ -3584,13 +3601,14 @@ function createResearchProcessPanel(goal) {
   }
   function receiveNativeStreamEvent(type, data) {
     if (!nativeStream) return;
-    if (type === 'assistant_progress') {
+    if (['assistant_progress', 'tool_result', 'operation'].indexOf(type) >= 0) {
+      if (type === 'assistant_progress' && data.kind === 'model_preview' && !NATIVE_STREAM_PREVIEW) return;
       if (!nativeStream.receive(type, data)) return;
     } else if (type === 'text' && data && data.delivery === 'committed') {
       if (!nativeStream.commit()) return;
     } else if (type === 'text_reset') {
       if (!nativeStream.discard()) return;
-    } else if (type === 'done' || type === 'error') {
+    } else if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
       if (!nativeStream.terminal()) return;
     } else return;
     renderNativeStreamPanel();
@@ -3612,13 +3630,17 @@ function createResearchProcessPanel(goal) {
   function answerVisible() { /* Public paragraphs remain visible beside the answer. */ }
   function receive(type, data) {
     data = data || {};
-    if (data.internal === true || data.private === true || ['private', 'internal'].indexOf(data.visibility) >= 0) return;
+    if (data.internal === true || data.private === true || data.is_draft === true || data.draft === true || ['private', 'internal'].indexOf(data.visibility) >= 0) return;
     receiveNativeStreamEvent(type, data);
     var savedResolutions = (data.turn_envelope || data.terminal_snapshot || data).tool_resolutions;
     if (Array.isArray(savedResolutions)) view.resolution({resolutions: savedResolutions});
     if (type === 'job') {
       var nextJobId = String(data.job_id || knownJobId);
-      if (nextJobId && nextJobId !== knownJobId) { activeMilestone = ''; progressSeq = 0; view.begin(nextJobId); refreshActiveLabel(); }
+      if (nextJobId && nextJobId !== knownJobId) {
+        activeMilestone = ''; progressSeq = 0; settled = false;
+        view.begin(nextJobId); nativeStream && nativeStream.reset(nextJobId);
+        view.terminal(false); renderNativeStreamPanel(); refreshActiveLabel();
+      }
       knownJobId = nextJobId;
     }
     else if (type === 'task_plan' || type === 'status' && data.stage === 'task_plan') {
@@ -3639,6 +3661,9 @@ function createResearchProcessPanel(goal) {
     }
     else if (type === 'request_user_input' || type === 'question') label.textContent = '等待你的选择';
     else if (type === 'assistant_progress') progress(data);
+    else if (type === 'status' && !settled && data.summary && ['preparing_attachments', 'starting', 'waiting_code'].includes(data.stage)) {
+      activeMilestone = publicTaskStage(data.summary); refreshActiveLabel();
+    }
     else if (type === 'tool_progress') view.progress(data);
     else if (['tool_call_start', 'tool_executing', 'tool_result', 'operation'].indexOf(type) >= 0 &&
         (data.tool_call_id || data.operation_id || data.logical_key || Array.isArray(data.aliases) && data.aliases.length) &&
@@ -3725,7 +3750,7 @@ function appendMessageActions(content, role, text) {
     var prior = content.dataset.requestId, sid = sessionId;
     var next = document.createElement('button');
     next.type = 'button'; next.className = 'message-action turn-explicit-continuation';
-    next.textContent = '继续此轮';
+    next.textContent = '沿用本轮附件';
     next.title = '明确继承此轮保存的附件';
     next.addEventListener('click', function () {
       if (sid !== sessionId || !chatContainer.contains(content)) return;
@@ -4391,6 +4416,9 @@ async function sendMsg(paperVerification, continueFrom) {
   var taskStore = CitrusTaskState.create({onEvent: handleEvent, request_id: clientRequestId, session_id: requestSessionId});
   var taskTransport = CitrusTaskTransport.create({store: taskStore, fetch: accountFetch, owns: ownsTurn,
     onSnapshot: reconcileTaskSnapshot,
+    onTerminalDelivery: function (data) {
+      if (ownsTurn() && (!hasTerminalEvent || snapshotOnly)) handleEvent('done', data);
+    },
     onReadState: function (source, failed) {
       if (!ownsTurn()) return;
       processPanel.readState(source, failed);
@@ -4440,7 +4468,7 @@ async function sendMsg(paperVerification, continueFrom) {
     }
     if (!ownsControls()) {
       if (CitrusTaskState.displayStatus(job)) {
-        applyTurnEnvelope({turn_envelope: job.terminal_snapshot}); hasTerminalEvent = true; finishStatus();
+        applyTurnEnvelope({turn_envelope: job.terminal_snapshot}); hasTerminalEvent = true; snapshotOnly = true; finishStatus();
         loadTurnGeneratedFiles(job.terminal_snapshot);
       }
       return;
@@ -4604,6 +4632,7 @@ async function sendMsg(paperVerification, continueFrom) {
           fullText = data.answer; answerDiv.style.display = ''; answerDiv.innerHTML = renderMarkdownSafe(fullText);
           if (String(data.answer).trim()) processPanel.answerVisible();
         }
+        if (fullText) appendMessageActions(botContent, 'assistant', fullText);
         loadTurnGeneratedFiles(data);
       }
       return;
@@ -4917,9 +4946,11 @@ async function sendMsg(paperVerification, continueFrom) {
     if (!observer || queueFollowedJobId === observer) return;
     if (queueFollowedJobId) {
       fullText = ''; isAnswerStarted = false; isFinalAnswerArmed = false;
+      answerDiv.replaceChildren(); answerDiv.style.display = 'none';
       renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
       hasTerminalEvent = false; snapshotOnly = false;
     }
+    processPanel.receive('job', {job_id: observer});
     queueFollowedJobId = observer;
     myBinding.following = true;
     clearTimeout(spinnerTimeout);
@@ -4989,7 +5020,11 @@ async function sendMsg(paperVerification, continueFrom) {
     if (current && userInput.value) saveComposerInput();
     if (composerDraft(draftKey).revision !== sentDraftRevision) return false;
     writeComposerDraft(draftKey, rawDraft);
-    if (current) { userInput.value = rawDraft; refreshTaskComposer(); }
+    if (current) {
+      userInput.value = rawDraft;
+      if (continueFrom) setComposerContinuation(continueFrom);
+      refreshTaskComposer();
+    }
     return true;
   }
 
@@ -6152,6 +6187,13 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     reconcileControls();
   }});
   var transport = CitrusTaskTransport.create({store: store, fetch: accountFetch, owns: owns, onSnapshot: snapshot,
+    onTerminalDelivery: function (data) {
+      if (!owns() || finalAnswerReceived) return;
+      process.receive('done', data);
+      if (data.answer) { answer.innerHTML = renderMarkdownSafe(data.answer); process.answerVisible(); }
+      finalAnswerReceived = true;
+      appendMessageActions(content, 'assistant', data.answer || streamedAnswer || (turn.answer && turn.answer.content));
+    },
     onReadState: function (source, failed) {
       if (!owns()) return;
       process.readState(source, failed);
@@ -6223,6 +6265,10 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     }
 
     if (job && job !== observed) {
+      if (observed && observed !== job) {
+        hasSavedAnswer = false; answer.replaceChildren(); answer.dataset.displayStatus = '';
+      }
+      process.receive('job', {job_id: job});
       observed = job;
       streamedAnswer = ''; armed = false; finalAnswerReceived = false;
       content.dataset.jobId = job;

@@ -1,9 +1,9 @@
 import { byId, element } from './dom.js';
-import { renderInspector, renderTree } from './controls.js?v=4';
+import { renderInspector, renderTree } from './controls.js?v=5';
 import { CanvasView, imageAsset } from './canvas.js?v=6';
 import { hexDigest } from './sha256.js?v=1';
 import { initializeLibrary } from './library.js?v=4';
-import { legacyEditorUrl, sourceReturnUrl } from './navigation.js?v=1';
+import { legacyEditorUrl, sessionReturnUrl } from './navigation.js?v=2';
 import { categoryValues, displayGroups } from './categories.js?v=1';
 
 const api = '/api/v2/figure-workbench';
@@ -134,11 +134,7 @@ function renderToolbar() {
   editor.hidden = !legacy;
   if (legacy) editor.href = legacy;
   else editor.removeAttribute('href');
-  const back = byId('returnSession');
-  const source = sourceReturnUrl(project);
-  byId('returnFiles').hidden = !source;
-  back.href = source || '/?files=1';
-  back.textContent = source ? '← 返回来源会话' : '← 返回资料库';
+  byId('returnSession').href = sessionReturnUrl(project);
 }
 
 function renderExports() {

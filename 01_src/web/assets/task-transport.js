@@ -58,6 +58,13 @@
     function snapshot(data) {
       if (!owns() || !data) return;
       if (!store.hydrate(data)) return;
+      // A status response can recover the durable done frame when replay has
+      // already advanced past it. Bound it to the producer and consumed cursor.
+      var final = data.terminal_delivery;
+      if (final && final.job_id === store.state.job_id &&
+          Number.isSafeInteger(final.seq) && final.seq === (data.terminal_snapshot || {}).terminal_seq &&
+          final.seq <= store.state.cursor && final.seq > (store.state.recovery_cursor || 0) &&
+          root.CitrusTaskState.displayStatus(final) && options.onTerminalDelivery) options.onTerminalDelivery(final);
       if (options.onSnapshot) options.onSnapshot(data);
     }
     function replay(jobId) {

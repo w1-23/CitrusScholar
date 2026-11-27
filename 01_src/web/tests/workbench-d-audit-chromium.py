@@ -329,7 +329,8 @@ def run(browser, api, output):
     dialog.get_by_role('button', name='使用此颜色').click()
     picker.click()
     expect(dialog.get_by_role('button', name='#1d557a')).to_be_visible()
-    dialog.press('Escape')
+    page.keyboard.press('Escape')
+    expect(dialog).to_be_hidden()
     page.get_by_role('radio', name='菱形', exact=True).press('Space')
     page.get_by_role('radio', name='虚线', exact=True).press('Space')
     page.get_by_label('填充方式', exact=True).select_option('none')
@@ -385,19 +386,29 @@ def run(browser, api, output):
     assert {mark_objects[g['parent']]['role'] for g in mark_groups.values()} == {'annot', 'panel'}
     for group_id in mark_groups:
         binding = mark_objects[group_id]
-        assert not binding['capabilities'] and binding['readonlyReason']
+        assert binding['capabilities']
         assert len(binding['geometry']['svgIds']) == 1
         mark = geometry(page, binding, expected=group_id)
         page.mouse.click(mark['x'], mark['y'])
         assert chosen(page) == group_id
-        expect(page.get_by_role('button', name='应用到此组')).to_have_count(0)
+        expect(page.get_by_role('button', name='应用到此组')).to_have_count(1)
     page.screenshot(path=str(output / 'native-arrow-patch.png'))
-    mark_series = next(g for g in marks['groups'] if g['kind'] == 'series')
-    edit_mark_project = {'expected_revision': 1, 'draft_revision': 19, 'source_sha256': marks['source_sha256'],
-                         'commands': [{'group_id': mark_series['id'], 'property': 'color', 'value': '#6b4a25'}]}
-    saved_marks = api.call('POST', marks_path + '/save', edit_mark_project)
-    assert saved_marks['status'] == 200, saved_marks['body']
-    after_marks = json.loads(saved_marks['body'])
+    expect(page.get_by_role('link', name='← 返回会话')).to_have_attribute(
+        'href', '/?figure_session=ca7d045c-04d3-4b2f-b6f8-5e07b26d8f22')
+    patch = next(g for g in mark_groups.values() if g['kind'] == 'patch')
+    point = geometry(page, mark_objects[patch['id']], expected=patch['id'])
+    page.mouse.click(point['x'], point['y'])
+    assert chosen(page) == patch['id']
+    page.get_by_label('填充颜色', exact=True).fill('#6b4a25')
+    page.get_by_role('button', name='应用到此组').click()
+    expect(page.locator('#status')).to_have_text('草稿预览已更新。', timeout=20000)
+    page.locator('#save').click()
+    expect(page.locator('#revision')).to_have_text('版本 2', timeout=20000)
+    after_marks = json.loads(api.call('GET', marks_path + '?revision=2')['body'])
+    reopened = next(g for g in after_marks['groups'] if g['id'] == patch['id'])
+    assert reopened['values']['facecolor'] == '#6b4a25'
+    exported = api.call('GET', marks_path + '/export/svg?revision=2')
+    assert exported['status'] == 200 and b'fill="#6b4a25"' in exported['body']
     assert after_marks['source_sha256'] == marks['source_sha256']
     assert {gid: after_marks['object_contract']['objects'][gid]['geometry'] for gid in mark_groups} == {
         gid: mark_objects[gid]['geometry'] for gid in mark_groups}

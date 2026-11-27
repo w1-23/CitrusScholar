@@ -194,7 +194,7 @@ def _visual_marks(project, manifest, inventory, groups, geometry):
         ident = _group_id(project["figure_id"], ("visual_mark", gid))
         groups.append({"id": ident, "kind": role, "label": labels[role], "parent": parent_id,
                        "pick_ids": [gid], "properties": [], "values": {}, "line_marker_fill": False,
-                       "reason": "此标记可精确选取，但其样式和几何未开放重放。"})
+                       "reason": "此标记可精确选取，但当前版本没有可验证的样式重放。几何保持锁定。"})
         geometry[ident] = (role, *inventory.svg_targets.projection((node,)))
 
 
@@ -219,6 +219,7 @@ def _present(project, manifest, inventory, *, formats, draft_revision=None):
         _visual_marks(project, manifest, inventory, groups, geometry)
     return {"figure_id": project["figure_id"], "title": project.get("title") or "未命名图件",
             "render_version": project["render_version"], "read_only_reason": inventory.disabled,
+            "return_session_id": project.get("session_id"),
             "groups": groups, "format_capabilities": formats,
             **contract(groups, project["render_version"], svg=targets.svg if targets else None,
                        draft_revision=draft_revision, source_sha256=(project.get("document_json") or {}).get("source_sha256"),

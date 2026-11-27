@@ -89,6 +89,22 @@ def test_same_page_uses_verified_receipt_before_selecting_twice(identity, monkey
     assert json.loads(result_tools.read_tool_result.invoke(args))["reason"] == "result_access_denied"
 
 
+def test_equivalent_selector_lists_reuse_verified_page(identity, monkeypatch):
+    assert tool_results.record(tool_call_id="fields", tool_name="source", session_id=SESSION,
+                               request_id="request", status="complete",
+                               result_text=json.dumps({"value": "x" * 120, "group": "A"}))
+    args = {"tool_call_id": "fields", "max_chars": 25}
+    original = result_tools.read_tool_result.invoke({**args, "fields": ["value", " /group ", "/value"]})
+    assert tool_results.record(tool_call_id="canonical-page", tool_name="read_tool_result",
+                               session_id=SESSION, request_id="request", status="complete", result_text=original)
+    original = json.loads(original)
+    assert original["selected_fields"] == ["/group", "/value"]
+    monkeypatch.setattr(result_tools, "_select", lambda *_: pytest.fail("equivalent page was re-selected"))
+    replay = json.loads(result_tools.read_tool_result.invoke({**args, "fields": ["/group", "/value"]}))
+    assert replay["status"] == "reused" and replay["page"] == original["page"]
+    assert replay["reused_readback"]["tool_call_id"] == "canonical-page"
+
+
 def test_mixed_selector_only_resolves_missing_fields(identity, monkeypatch):
     source = '{"numeric": 1.234567891234567891, "group": "A"}'
     assert tool_results.record(tool_call_id="fields", tool_name="source", session_id=SESSION,
@@ -101,7 +117,7 @@ def test_mixed_selector_only_resolves_missing_fields(identity, monkeypatch):
     monkeypatch.setattr(result_tools, "_select", lambda data, path: (seen.append(path), select(data, path))[1])
     result = json.loads(read(["/numeric", "/group"]))
     assert seen == ["/group"] and result["missing_fields"] == []
-    assert result["result_text"] == '{"/numeric": 1.234567891234567891, "/group": "A"}'
+    assert result["result_text"] == '{"/group": "A", "/numeric": 1.234567891234567891}'
 
 
 @pytest.mark.parametrize("kind", ["csv", "xlsx"])

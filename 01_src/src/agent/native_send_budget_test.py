@@ -129,6 +129,87 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
                 agent_options={"system_prompt": "fixture system prompt"})
         return result, host
 
+    async def test_finalization_keeps_one_call_and_estimated_tokens_for_an_answer(self):
+        max_tokens = 100_000
+        for max_calls in (2, 8):
+            with self.subTest(max_calls=max_calls, max_tokens=max_tokens):
+                self.sid = await sessions.session_manager.get_or_create_session(None, 7)
+                tracing.set_session_id(self.sid)
+                identity = self.job(max_calls)
+                task_events.init_budget(identity.run_id, float("inf"), max_calls=max_calls,
+                                        max_tokens=max_tokens, final_calls=1)
+                wire = []
+                evidence = "verified bytes " + "Z" * 10_000
+
+                def transport(request):
+                    payload = json.loads(request.content)
+                    wire.append(payload)
+                    if len(wire) == 1:
+                        self.assertTrue(payload.get("tools"))
+                        return _chat_stream([("evidence", EVIDENCE, {})], completion_tokens=4000)
+                    self.assertFalse(payload.get("tools"))
+                    self.assertTrue(any(msg["role"] == "tool" and msg["content"] == evidence
+                                        for msg in payload["messages"]))
+                    self.assertIn("final answer now", json.dumps(payload["messages"][0]["content"]))
+                    return _chat_stream(answer="verified evidence; remaining work is incomplete")
+
+                async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(transport)),
+                                             trust_env=False) as client:
+                    model = ChatOpenAI(use_responses_api=False, model=PROVIDER, api_key="fixture", base_url=BASE,
+                        max_retries=0, max_tokens=4096, stream_usage=True, http_async_client=client)
+                    result, _ = await self.run_turn(model, identity, "check evidence", {"evidence": evidence})
+                self.assertEqual((result.status, result.reason), ("complete", "answered"))
+                self.assertEqual(len(wire), 2)
+                self.assertTrue(all((msg.get("max_tokens") or msg.get("max_completion_tokens")) == 4096 for msg in wire))
+                with task_events.read_transaction() as conn:
+                    rows = conn.execute("SELECT purpose,reserved_tokens FROM task_model_attempts WHERE job_id=? ORDER BY created_at",
+                                        (identity.run_id,)).fetchall()
+                self.assertEqual([row["purpose"] for row in rows], ["main_loop", "final_synthesis"])
+                budget = task_events.projection(identity.run_id)["budget"]
+                self.assertEqual((budget["calls"], budget["tokens"], budget["final_calls"], budget["deadline"]),
+                                 (2, 4210, 1, None))
+                self.assertGreater(budget["final_tokens"], 4096)
+                self.assertEqual((budget["max_calls"], budget["max_tokens"]), (max_calls, max_tokens))
+                jobs.update_job(identity.run_id, status="completed")
+                # Next run has ample slots but room for just the initial
+                # exploration and the estimated final wire it protects.
+                max_tokens = rows[0]["reserved_tokens"] + budget["final_tokens"]
+
+    async def test_last_call_finalization_cannot_dispatch_or_retry_tools(self):
+        identity = self.job(3)
+        task_events.init_budget(identity.run_id, float("inf"), max_calls=1, max_tokens=100_000, final_calls=1)
+        wire = []
+
+        def transport(request):
+            payload = json.loads(request.content)
+            wire.append(payload)
+            self.assertFalse(payload.get("tools"))
+            return _chat_stream([("forbidden", EVIDENCE, {})])
+
+        async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(transport)),
+                                     trust_env=False) as client:
+            model = ChatOpenAI(use_responses_api=False, model=PROVIDER, api_key="fixture", base_url=BASE,
+                max_retries=0, max_tokens=4096, stream_usage=True, http_async_client=client)
+            result, host = await self.run_turn(model, identity, "finish now", {}, recover_output=True)
+        self.assertEqual((result.status, result.reason), ("incomplete", "invalid_tool_call"))
+        self.assertEqual(len(wire), 1)
+        self.assertFalse(host.messages)
+        self.assertFalse(result.pending_tool_calls)
+
+    def test_expired_deadline_blocks_both_exploration_and_finalization(self):
+        identity = self.job(4)
+        deadline = time.time() - 1
+        task_events.init_budget(identity.run_id, deadline, max_calls=1, max_tokens=100_000, final_calls=1)
+        # Resuming/duplicate initialization must not extend a deadline or reset a reserve.
+        task_events.init_budget(identity.run_id, float("inf"), max_calls=8, max_tokens=1_000_000)
+        for purpose in ("main_loop", "final_synthesis"):
+            with self.assertRaisesRegex(task_events.TaskConflict, "model_budget_exhausted:deadline"):
+                task_events.reserve_attempt(identity.run_id, purpose, 4096, finalization_tokens=4096)
+        budget = task_events.projection(identity.run_id)["budget"]
+        self.assertEqual((budget["calls"], budget["tokens"], budget["max_calls"],
+                          budget["max_tokens"], budget["final_calls"], budget["deadline"]),
+                         (0, 0, 1, 100_000, 1, deadline))
+
     async def test_same_thread_second_fresh_job_edits_only_proven_old_wire_observations(self):
         self.assertEqual((version("deepagents"), version("langchain")), ("0.7.38", "1.5.0"))
         self.assertEqual(task_events.model_input_limit(4096), 128_000)

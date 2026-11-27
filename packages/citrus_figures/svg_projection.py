@@ -114,15 +114,19 @@ def projection_manifest(rendered, bbox):
     return metadata
 
 
-def visual_marks(rendered):
-    """Name known painted marks outside the persisted replay target inventory."""
+# These deliberately share the original inspection IDs.
+MARK_ROLES = frozenset({"patch", "arrow"})
+
+
+def visual_marks(rendered, *, register=False):
+    """Find independent native paint, retaining legacy inspection addresses."""
     from matplotlib.patches import Arrow, Circle, Ellipse, FancyArrow, FancyArrowPatch, PathPatch, Polygon, Rectangle, Wedge
     from matplotlib.text import Annotation
 
     arrows = {Arrow, FancyArrow, FancyArrowPatch}
     patches = {Circle, Ellipse, PathPatch, Polygon, Rectangle, Wedge}
     panels = {entry["axes_index"]: gid for gid, entry in rendered.locators.items() if entry.get("role") == "axes"}
-    owned = {id(member) for entry in rendered.locators.values() for member in
+    owned = {id(member) for entry in rendered.locators.values() if entry.get("role") not in MARK_ROLES for member in
              (entry.get("artist"), *(entry.get("members") or ()), *(entry.get("error_members") or ()))}
     result = []
     for i, ax in enumerate(rendered.axes):
@@ -145,8 +149,44 @@ def visual_marks(rendered):
         if artist.get_gid() not in {None, gid}:
             continue  # Preserve an SVG id explicitly chosen by the source author.
         artist.set_gid(gid)
-        points.append({"gid": gid, "axes_index": axis, "role": role, "parent_gid": parent})
+        mark = {"gid": gid, "axes_index": axis, "role": role, "parent_gid": parent}
+        if register:
+            rendered.locators[gid] = {"artist": artist, "axes_index": axis, "role": role,
+                                      "parent_gid": parent, "paint_version": 1}
+        points.append(mark)
     return points
+
+
+def native_mark_paint(artist):
+    """Edit existing solid paint only, keeping transparency and shape topology."""
+    import math
+    from matplotlib.colors import to_hex
+    from matplotlib.patches import FancyArrowPatch
+
+    paint, limitations = {}, []
+    if not artist.get_visible() or artist.get_path_effects() or artist.get_hatch() or artist.get_sketch_params():
+        return paint, ["unverified_paint"]
+    face, edge = artist.get_facecolor(), artist.get_edgecolor()
+    if artist.get_fill() and face[3] > 0:
+        # Open FancyArrowPatch paths can report a fill without painting one.
+        if type(artist) is not FancyArrowPatch:
+            paint["facecolor"] = to_hex(face)
+    if "facecolor" not in paint:
+        limitations.append("no_fill")
+    width = artist.get_linewidth()
+    if edge[3] > 0 and math.isfinite(width) and width > 0:
+        paint["edgecolor"] = to_hex(edge)
+        # FancyArrowPatch uses width to construct or shorten the actual
+        # arrow path even for annotations. Keep that path frozen.
+        if type(artist) is FancyArrowPatch:
+            limitations.append("geometry_width")
+        elif 0.2 <= width <= 8:
+            paint["linewidth"] = width
+        else:
+            limitations.append("unsupported_width")
+    else:
+        limitations.append("no_stroke")
+    return paint, limitations
 
 
 def annotate_svg(source: str, rendered) -> str:

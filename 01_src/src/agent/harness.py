@@ -271,6 +271,9 @@ class HarnessRuntime:
                 invalid = "invalid_tool_call" if response.invalid_tool_calls else ""
                 if reason == "length" or reason in NON_SUCCESS_TERMINALS:
                     invalid = "model_" + reason
+                finalizing = response.response_metadata.get("citrus_budget_finalization") is True
+                if finalizing and response.tool_calls and not invalid:
+                    invalid = "invalid_tool_call"
                 ids = [call.get("id") for call in response.tool_calls]
                 previous = {call.get("id") for message in state["messages"][:-1]
                     if isinstance(message, AIMessage)
@@ -288,7 +291,7 @@ class HarnessRuntime:
                     return {"messages": [RemoveMessage(id=response.id)],
                             "rejected_responses": [*state.get("rejected_responses", []), response],
                             "stop_status": "incomplete", "stop_reason": "model_stream_unconfirmed", "jump_to": "end"}
-                if adapter.recover_output and invalid == "invalid_tool_call":
+                if adapter.recover_output and not finalizing and invalid == "invalid_tool_call":
                     # No tool in this response has been dispatched. Preserve raw
                     # arguments privately, and pair every valid native call with
                     # an explicit not_run result before asking the SAME model.
@@ -326,7 +329,7 @@ class HarnessRuntime:
                     await event("model_output_rejected", {**state, "stop_reason": invalid}, ids)
                     return {"messages": additions, "rejected_responses": [*state.get("rejected_responses", []), response],
                             "host_state": host_snapshot(), "jump_to": "model"}
-                if (adapter.recover_output and invalid == "model_length"
+                if (adapter.recover_output and not finalizing and invalid == "model_length"
                         and not state.get("length_recovery_used")
                         and (adapter.can_recover_output() if adapter.can_recover_output else True)):
                     # The provider hit the single-call output cap. Nothing in
@@ -386,7 +389,7 @@ class HarnessRuntime:
                     check_final = (adapter.check_final_after_followup if followup_used else None) or adapter.check_final
                     check = await check_final(response, tuple(state["messages"]), identity)
                     if not check.accepted:
-                        if followup_used:
+                        if followup_used or finalizing:
                             return {"stop_status": "incomplete", "stop_reason": "final_validation_failed",
                                     "host_state": host_snapshot(), "jump_to": "end"}
                         return {"messages": [control(delivery_feedback(check))], "delivery_followup_used": True,

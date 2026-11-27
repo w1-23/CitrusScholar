@@ -226,6 +226,7 @@ def replay(job_id, after=0, limit=200, *, conn=None):
                 "has_more": len(rows) > limit, "status": job["status"],
                 "recovery_cursor": recovery_cursor(conn, job_id),
                 "terminal_snapshot": public_job_terminal(job),
+                "terminal_delivery": _terminal_delivery(conn, job, after),
                 "context_snapshot": _latest_context_snapshot(conn, job_id)}
 
 
@@ -262,6 +263,20 @@ def _public_terminal(envelope):
             "处理请求时发生内部错误，请稍后重试",
         )]
     return visible
+
+
+def _terminal_delivery(conn, job, after=None):
+    """Recover the same authorized done payload, not job prose or model traces."""
+    snapshot = public_job_terminal(job)
+    sequence = snapshot.get("terminal_seq")
+    if (snapshot.get("display_status") not in {"completed", "partial", "failed", "cancelled"}
+            or type(sequence) is not int or sequence <= 0 or (after is not None and sequence > after)):
+        return None
+    row = current_terminal_event(conn, job["job_id"])
+    if not row or row["seq"] != sequence:
+        return None
+    from src.core.public_delivery import project_public_event
+    return project_public_event("done", json.loads(row["data"])) | {"seq": sequence, "job_id": job["job_id"]}
 
 
 def public_job_terminal(job):
@@ -327,6 +342,7 @@ def projection(job_id, *, include_job=False, conn=None):
         if budget and not __import__('math').isfinite(budget["deadline"]):
             budget["deadline"] = None
         return {**status,
+                "terminal_delivery": _terminal_delivery(conn, job) if include_job else None,
                 "recovery_cursor": recovery_cursor(conn, job_id),
                 "event_cursor": conn.execute("SELECT COALESCE(MAX(seq),0) FROM task_events WHERE job_id=?", (job_id,)).fetchone()[0],
                 "task_version": updates[-1]["version"] if updates else 0,
@@ -752,7 +768,7 @@ def _attempt_response(scope, response, error):
 
 
 async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", output_tokens=None, usage_session_id=None,
-                            streaming=False):
+                            streaming=False, finalization_tokens=None):
     from src.core.tracing import get_job_id, get_session_id
     from src.core.cache_metrics import extract_usage, emit_usage_from_response
     from src.core.request_context import estimate_request, model_request, _observation, _epoch, _logical_call
@@ -789,7 +805,7 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
     try:
         if estimate["estimated_input_tokens"] > limit:
             reason = "context_budget_exhausted"
-            if purpose == "main_loop" and estimate["tool_message_count"]:
+            if purpose in {"main_loop", "final_synthesis"} and estimate["tool_message_count"]:
                 # Attribute the overage using the converted request. This
                 # hypothetical payload is never sent or used for admission.
                 without_observations = {**payload, "messages": [
@@ -797,7 +813,8 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
                 if estimate_request(without_observations)["estimated_input_tokens"] <= limit:
                     reason = "context_budget_exhausted:tool_observations"
             raise TaskConflict(reason)
-        attempt_id = reserve_attempt(get_job_id(), purpose, estimate["estimated_total_tokens"])
+        attempt_id = reserve_attempt(get_job_id(), purpose, estimate["estimated_total_tokens"],
+                                     finalization_tokens=finalization_tokens)
     except TaskConflict as exc:
         publish_context(status="not_admitted", error=str(exc))
         raise
@@ -856,13 +873,14 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
                 pass
 
 
-def init_budget(job_id, deadline, max_calls=64, max_tokens=None):
+def init_budget(job_id, deadline, max_calls=64, max_tokens=None, *, final_calls=0):
     if max_tokens is None:
         from src.config import settings
         max_tokens = settings.AGENT_MAX_MODEL_TOKENS
     with transaction() as conn:
         _job(conn, job_id)
-        conn.execute("INSERT OR IGNORE INTO task_budgets(job_id,deadline,max_calls,max_tokens) VALUES (?,?,?,?)", (job_id, deadline, max_calls, max_tokens))
+        conn.execute("INSERT OR IGNORE INTO task_budgets(job_id,deadline,max_calls,max_tokens,final_calls) "
+                     "VALUES (?,?,?,?,?)", (job_id, deadline, max_calls, max_tokens, final_calls))
 
 
 def budget_headroom(job_id, *, calls=1, tokens=0):
@@ -888,7 +906,7 @@ def budget_headroom(job_id, *, calls=1, tokens=0):
     return True
 
 
-def reserve_attempt(job_id, purpose, estimated_tokens):
+def reserve_attempt(job_id, purpose, estimated_tokens, *, finalization_tokens=None):
     """Reserve every attempt, including failures with unknown provider usage."""
     if not job_id:
         return ""
@@ -902,18 +920,27 @@ def reserve_attempt(job_id, purpose, estimated_tokens):
             raise TaskConflict("model_budget_exhausted:deadline")
         if row["calls"] >= row["max_calls"]:
             raise TaskConflict(f"model_budget_exhausted:calls ({row['calls']}/{row['max_calls']})")
+        final_tokens = row["final_tokens"]
+        may_finalize = purpose == "main_loop" and row["final_calls"] and finalization_tokens is not None
+        if may_finalize:
+            final_tokens = max(1, int(finalization_tokens))
         if row["tokens"] + tokens > row["max_tokens"]:
+            # The full tool-capable wire may no longer fit even though the
+            # tool-free alternative independently fits the hard budget.
+            if may_finalize and row["tokens"] + final_tokens <= row["max_tokens"]:
+                raise TaskConflict("model_budget_reserved:finalization")
             raise TaskConflict(f"model_budget_exhausted:tokens ({row['tokens']}+{tokens}>{row['max_tokens']})")
         if not str(purpose).startswith("final_synthesis"):
             from src.core.request_context import _observation
             parent = _observation.get() or {}
             is_final_fallback = str(parent.get("purpose", "")).startswith("final_synthesis")
             if not is_final_fallback and (row["calls"] + 1 + row["final_calls"] > row["max_calls"]
-                    or row["tokens"] + tokens + row["final_tokens"] > row["max_tokens"]):
-                if row["final_calls"] or row["final_tokens"]:
+                    or row["tokens"] + tokens + final_tokens > row["max_tokens"]):
+                if row["final_calls"] or final_tokens:
                     raise TaskConflict("model_budget_reserved:finalization")
         attempt_id = uuid.uuid4().hex
-        conn.execute("UPDATE task_budgets SET calls=calls+1,tokens=tokens+? WHERE job_id=?", (tokens, job_id))
+        conn.execute("UPDATE task_budgets SET calls=calls+1,tokens=tokens+?,final_tokens=? WHERE job_id=?",
+                     (tokens, final_tokens, job_id))
         conn.execute("INSERT INTO task_model_attempts(attempt_id,job_id,purpose,status,reserved_tokens,created_at) VALUES (?,?,?,'running',?,?)", (attempt_id, job_id, purpose, tokens, time.time()))
         _append(conn, job_id, "model_attempt", {"attempt_id": attempt_id, "purpose": purpose,
                 "status": "running", "reserved_tokens": tokens})

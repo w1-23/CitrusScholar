@@ -458,12 +458,12 @@ def _legacy_audit_artifacts() -> tuple[str, ...]:
 
 
 def _fusion_audit_artifacts() -> tuple[str, ...]:
-    """The pinned data-audit contract: a report, and a workbook only on request.
+    """Observed data-audit results and an optional workbook publication.
 
     Publication belongs to the host: only an ``annotated_xlsx`` delivery contract
     produces the annotated workbook, so a text-only request is never promised one.
     """
-    return ("审查报告（findings/coverage/review_id）",
+    return ("审查结果回执（findings/coverage/review_id，可直接用于答复）",
             "标注工作簿（仅当本轮交付合同为 annotated_xlsx）")
 
 
@@ -583,7 +583,7 @@ def _literature_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
     tools = facts.first(FUSION_TOOL, CONTINUE_TOOL, COLLECT_TOOL)
     authorized = SKILL_LITERATURE in facts.skills
     legacy = facts.first(LEGACY_VERIFY_TOOL)
-    fusion_artifacts = ("核验报告（findings/evidence/locations/coverage/limitations）",)
+    fusion_artifacts = ("核验结果回执（findings/evidence/locations/coverage/limitations，可直接用于答复）",)
     artifacts = _artifacts(LEGACY_VERIFY_TOOL) or fusion_artifacts
     unauthorized = "skill_capability_unauthorized:" + SKILL_LITERATURE
     rows: list[CapabilityRow] = []
@@ -597,7 +597,9 @@ def _literature_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
             inputs=("bibliography（.bib/.pdf）与/或类型化 references；不接受原始观察或 URL",),
             artifacts=fusion_artifacts, waits=facts.waits_for(tools),
             hint=(_collector_advice(facts)
-                  + "；" + continuing + collecting + "；通用搜索结果不能替代核验回执"),
+                  + "；" + continuing + collecting + "；通用搜索结果不能替代核验回执。"
+                  "精确 DOI 登记已确认时，单独说明 identity_registry 和 registry_gaps：补充来源限流不推翻身份，"
+                  "不证明未撤稿，也不为此自动重复查找。仅为用户要求且缺证的具体字段补证。"),
             source="fusion_surface+skill"))
     elif legacy:
         rows.append(CapabilityRow(

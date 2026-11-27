@@ -6,13 +6,8 @@ export function legacyEditorUrl(project) {
   return project.editor_url === href ? href : '';
 }
 
-export function sourceReturnUrl(project) {
-  if (!isId(project?.figure_id)) return '';
-  try {
-    const handoff = JSON.parse(sessionStorage.getItem('citrus:figure-source') || 'null');
-    if (handoff?.project === project.figure_id && isId(handoff.file)) {
-      return `/?files=1&source=${handoff.file}`;
-    }
-  } catch { /* Storage is optional. */ }
-  return '';
+export function sessionReturnUrl(project) {
+  const session = project?.return_session_id;
+  return typeof session === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(session)
+    ? `/?figure_session=${session}` : '/';
 }

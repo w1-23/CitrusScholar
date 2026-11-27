@@ -301,3 +301,21 @@ test('first sequenced SSE job binds its exact replay before a legacy gap is fill
   assert.deepEqual(frames, ['job', 'done']);
   assert.equal(store.state.cursor, 22);
 });
+
+
+test('status recovers the identified committed payload after replay lacked the final text', async t => {
+  const terminalSnapshot = {...envelope, terminal_seq: 3};
+  const recovered = {...terminal.data, seq: 3, turn_envelope: terminalSnapshot};
+  const snapshot = {...job, terminal_snapshot: terminalSnapshot, terminal_delivery: recovered};
+  const pages = [page([running, output, {seq: 3, event: 'done', data: {}}], 3, {status: 'completed', terminal_snapshot: terminalSnapshot}),
+    reply(snapshot), reply({...snapshot, terminal_delivery: {...recovered, job_id: 'old-parent'}})];
+  const received = [];
+  const store = CitrusTaskState.create({});
+  const transport = CitrusTaskTransport.create({store, owns: () => true, fetch: async () => pages.shift(),
+    onTerminalDelivery: data => received.push(data.answer)});
+  t.after(() => transport.stop());
+  await transport.follow(job.job_id);
+  assert.equal(CitrusTaskState.isTerminal(store.state), true);
+  await transport.refresh(job.job_id, false);
+  assert.deepEqual(received, ['Final answer']);
+});

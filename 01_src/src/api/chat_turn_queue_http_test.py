@@ -209,6 +209,11 @@ def test_background_fifo_cancel_and_replay(runtime):
         terminal = [row for row in events if row["event"] == "done"]
         assert len(terminal) == 1
         assert terminal[0]["data"]["history_saved"] is True
+        job_url = f'/jobs/{turn["job_id"]}'
+        delivery = runtime.client.get(job_url).json()["terminal_delivery"]
+        assert delivery == terminal[0]["data"] | {"job_id": turn["job_id"]}
+        assert delivery["answer"]
+        assert runtime.client.get(job_url + "/events", params={"after": delivery["seq"]}).json()["terminal_delivery"] == delivery
 
 
 def test_rediscovery_idempotency_and_owner_scope(runtime):
@@ -222,6 +227,7 @@ def test_rediscovery_idempotency_and_owner_scope(runtime):
     assert runtime.client.get(discover).status_code == 404
     assert runtime.client.get(runtime.path).status_code in {403, 404}
     assert runtime.client.get(f'/jobs/{first["job_id"]}/events').status_code == 404
+    assert runtime.client.get(f'/jobs/{first["job_id"]}').status_code == 404
 
 
 def test_legacy_stream_observes_one_persistent_job(runtime):

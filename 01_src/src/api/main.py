@@ -3122,7 +3122,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
         init_budget(job_id, (time.time() + max(0.0, request_deadline - time.monotonic())
                              if math.isfinite(request_deadline) else math.inf),
                     max_calls=int(settings.AGENT_MAX_MODEL_CALLS),
-                    max_tokens=int(settings.AGENT_MAX_MODEL_TOKENS))
+                    max_tokens=int(settings.AGENT_MAX_MODEL_TOKENS), final_calls=1)
     from src.agent.identity import ExecutionIdentity
     from src.agent.execution_segments import ExecutionSegments
     identity = ExecutionIdentity(int(user["user_id"]), sid, rid, job_id)
@@ -3272,7 +3272,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             await event_queue.put(evt)
 
         async def commit_terminal(done_payload, *, status, current_step,
-                                  progress_summary="", error="", stop_reason="user",
+                                  progress_summary="", error="", stop_reason=None,
                                   stop_note="", completed_note=""):
             """Persist one terminal view and close its segment atomically.
 
@@ -3281,6 +3281,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             The live notification then dedups to that same terminal sequence.
             Legacy explicit recovery without a segment keeps the old ordering.
             """
+            stop_reason = stop_reason or str((done_payload.get("turn_envelope") or {}).get("stop_reason") or "")
             if segments is not None and segment_claim is not None:
                 segments.finish_terminal(
                     segment_claim, done_payload=done_payload, status=status,
@@ -6320,7 +6321,7 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
             notes = public_working_notes(job["job_id"])
         except Exception as exc:
             logger.warning("public_progress_failed stage=history kind=%s", type(exc).__name__)
-            notes = []
+            return questions
         turn["trace"] = [item for item in turn["trace"] if item.get("kind") != "note"]
         turn["trace"].extend(notes)
         return questions

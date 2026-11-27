@@ -627,17 +627,6 @@ async def _run(state, identity, ledger):
                         for call in message.tool_calls]
         positions = {call["id"]: index for index, call in enumerate(native_calls)}
         calls = {call["id"]: call for call in native_calls}
-        if "data-audit" in method_scope and tables:
-            from src.graph.agent_operations import _explicit_data_audit
-            from src.graph.intent_text import mask_literal_payload
-            from .research_routes import has_data_audit_report
-
-            if (_explicit_data_audit(mask_literal_payload(state["query"]))
-                    and not has_data_audit_report(host.records, calls)):
-                gap = "尚未取得本轮数据审查的完整回执；读表或提交执行不等于审查完成。"
-                public_answer += "\n\n" + gap
-                statement = statement.model_copy(update={"answer": public_answer,
-                    "status": "partial", "remaining": [*statement.remaining, gap]})
         # A rejected proposal is not an executed obligation. The agent may fix
         # parameters OR select a different appropriate tool. Bind that repair to
         # later successful goal evidence only after proving zero dispatch.
@@ -743,6 +732,15 @@ async def _run(state, identity, ledger):
                 "goals": [goal for goal in statement.goals if goal.evidence_call_ids],
                 "proposal_repairs": [claim for claim in statement.proposal_repairs
                                      if claim.rejected_call_id in verified_repairs]})
+        from .research_routes import uncollected_skill_results
+
+        pending_results = uncollected_skill_results(host.records, calls, host.messages)
+        if pending_results:
+            labels = {"data-audit": "数据审查", "literature-verification": "文献核验"}
+            gap = "本轮已提交" + "、".join(labels[skill] for skill in sorted(pending_results)) + "，尚未取得执行结果。"
+            public_answer += "\n\n" + gap
+            statement = statement.model_copy(update={"answer": public_answer,
+                "status": "partial", "remaining": [*statement.remaining, gap]})
         from src.core.turn_sources import answer_citations
         public_answer, ref_data = await asyncio.to_thread(answer_citations, public_answer,
             session_id=identity.session_id, request_id=host._result_request_id(),

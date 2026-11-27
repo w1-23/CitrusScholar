@@ -105,7 +105,21 @@
         seq: Number.isSafeInteger(data.seq) ? data.seq : 0, status: 'streaming'};
       return true;
     }
+    var recorded = new Set();
+    function recordedTool(data) {
+      var id = data && data.tool_call_id;
+      if (typeof id !== 'string' || !ID.test(id) || (data.job_id && state.job_id && data.job_id !== state.job_id)) return false;
+      if (!state.job_id && data.job_id) state.job_id = data.job_id;
+      recorded.add(id);
+      if (recorded.size > 512) recorded.delete(recorded.values().next().value);
+      var index = find(state.tools, 'tool_call_id', id);
+      if (index < 0) return false;
+      state.tools.splice(index, 1);
+      state.unrecorded = countUnrecorded();
+      return true;
+    }
     function tool(data) {
+      if (recorded.has(data.tool_call_id)) return false;
       var index = find(state.tools, 'tool_call_id', data.tool_call_id);
       if (index >= 0) {
         var previous = state.tools[index];
@@ -139,6 +153,11 @@
       return true;
     }
     function receive(type, data) {
+      if (type === 'tool_result' || type === 'operation') {
+        if (!data || data.internal === true || data.private === true || ['private', 'internal'].indexOf(data.visibility) >= 0 ||
+            ['complete', 'no_results', 'succeeded', 'failed', 'partial', 'cancelled', 'not_run', 'skipped', 'unknown'].indexOf(data.status || (data.outcome || {}).status) < 0) return false;
+        return recordedTool(data);
+      }
       if (state.closed || !nativeStreamEvent(data) || !sameJob(data)) return false;
       // Once the delivered answer owns the text surface, a late token can never
       // resurrect a provisional preview.
@@ -184,10 +203,11 @@
       state.preview = null;
       return changed;
     }
-    function reset() {
+    function reset(jobId) {
+      recorded.clear();
       state.preview = null; state.tools = []; state.subagents = []; state.interrupt = null;
       state.resume = null; state.closed = false; state.committed = false; state.unrecorded = 0;
-      if (options.job_id) state.job_id = String(options.job_id);
+      state.job_id = String(jobId || ''); state.run_id = '';
     }
     function terminal() {
       if (state.closed) return false;
@@ -246,12 +266,27 @@
       });
       return changed;
     }
-    function note(data) {
-      if (!nativeProgress(data) || data.status !== 'in_progress' || seen.has(data.note_id)) return null;
-      seen.add(data.note_id);
-      var item = {kind: 'note', id: ++nextId, text: data.text, generation: generation, note_id: data.note_id};
+    function addNote(key, text) {
+      if (seen.has(key)) return null;
+      seen.add(key);
+      var item = {kind: 'note', id: ++nextId, text: text, generation: generation, note_id: key};
       entries.push(item);
       return item;
+    }
+    function note(data) {
+      return nativeProgress(data) && data.status === 'in_progress' ? addNote(data.note_id, data.text) : null;
+    }
+    function milestone(data) {
+      if (data.status !== 'complete') return null;
+      var message = {
+        inspect_uploaded_table: '已读取附件中的表格信息',
+        figure_published: '图件已渲染并通过交付校验',
+        audit_review_completed: '数据审查结果已就绪'
+      };
+      var code = data.reason_code === 'figure_published' && data.tool_name === 'run_research_figure_script'
+        ? 'figure_published' : data.reason_code === 'audit_review_completed' && data.tool_name === 'run_external_skill'
+          ? 'audit_review_completed' : data.tool_name === 'inspect_uploaded_table' ? 'inspect_uploaded_table' : '';
+      return code ? addNote('milestone:' + generation + ':' + code, message[code]) : null;
     }
     function plan(data) {
       if (!data || !data.plan_id || !Array.isArray(data.steps)) return false;
@@ -301,7 +336,7 @@
       });
       return true;
     }
-    return {begin: begin, entries: entries, note: note, action: action, plan: plan, resolution: resolution, currentPlan: function () { return currentPlan; }};
+    return {begin: begin, entries: entries, note: note, milestone: milestone, action: action, plan: plan, resolution: resolution, currentPlan: function () { return currentPlan; }};
   }
   // Presentation only: queue and job state remain authoritative. Time starts at
   // the durable execution stamp, never at submission or observer attachment.
@@ -537,10 +572,10 @@
       // F-14: native stream facts share the ordered event stream, so they are
       // reduced after sequencing and before any presentation. The committed
       // answer always clears a provisional preview.
-      if (type === 'assistant_progress') nativeStream.receive(type, data);
+      if (['assistant_progress', 'tool_result', 'operation'].indexOf(type) >= 0) nativeStream.receive(type, data);
       else if (type === 'text' && data.delivery === 'committed') nativeStream.commit();
       else if (type === 'text_reset') nativeStream.discard();
-      else if (type === 'done' || type === 'error') nativeStream.terminal();
+      else if ((type === 'done' || type === 'error') && displayStatus(data)) nativeStream.terminal();
       state.native_stream = nativeStream.view();
       if (type === 'artifact_delivery') applyDelivery(data);
       if (data.artifact_delivery) applyDelivery(Object.assign({}, data.artifact_delivery,

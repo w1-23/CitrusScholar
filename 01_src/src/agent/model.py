@@ -8,7 +8,7 @@ import math
 import time
 
 from langchain_core.callbacks import AsyncCallbackManager, BaseCallbackHandler
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage
 from langchain_core.messages.tool import invalid_tool_call
 from langchain_core.utils.function_calling import convert_to_openai_function, convert_to_openai_tool
 
@@ -184,6 +184,7 @@ class ModelDriver:
     async def _invoke(self, request, handler, identity: ExecutionIdentity, *, allowed, host_tools,
                       historical_readback, edit_history):
         from src.core.provider_transport import async_deepseek_attempt
+        from src.core.request_context import model_request
         from src.core.task_events import TaskConflict, run_model_attempt
         from .deep_agent_runtime import (NATIVE_EXECUTE_TOOLS, NATIVE_FILE_TOOLS,
                                          NATIVE_TASK_TOOLS)
@@ -228,11 +229,24 @@ class ModelDriver:
                 if offered:
                     view, estimate_model, schemas = edited[len(system):], candidate, read_schemas
 
+        # Reserve the estimated tool-free alternative at the same output cap.
+        instruction = ("Provide the final answer now using only the evidence already available. "
+                       "Be concise, state what remains incomplete, and do not call tools or claim unverified work.")
+        if request.system_message is not None:
+            content = request.system_message.content
+            final_system = request.system_message.model_copy(update={"content": (
+                content + "\n\n" + instruction if isinstance(content, str) else
+                [*content, {"type": "text", "text": instruction}])})
+        else:
+            final_system = SystemMessage(content=instruction)
+        final_model = model.bind(**options)
+        final_messages = [final_system, *view]
+        _, final_estimate = model_request(final_model, final_messages)
         model_response = None
 
-        async def invoke():
+        async def invoke(*, final=False):
             nonlocal model_response
-            if offered:
+            if offered and not final:
                 historical_readback.historical_result_offers.update(offered)
             from src.core.request_context import _observation
             scope = _observation.get()
@@ -240,14 +254,20 @@ class ModelDriver:
             observed_model = model.model_copy(update={"cache": False, "callbacks": AsyncCallbackManager.configure(
                 inheritable_callbacks=model.callbacks, local_callbacks=[evidence])})
             try:
-                async with async_deepseek_attempt(observed_model, [*system, *view], options) as private:
-                    model_response = await handler(request.override(model=observed_model, messages=view, tools=schemas,
-                                                                     model_settings=options))
-            except AttributeError as error:
+                async with async_deepseek_attempt(observed_model, final_messages if final else [*system, *view],
+                                                  options) as private:
+                    model_response = await handler(request.override(model=observed_model, messages=view,
+                        tools=[] if final else schemas, system_message=final_system if final else request.system_message,
+                        model_settings=options))
+            except Exception as error:
                 # Core 1.8.0 can mask an internally cancelled provider call
                 # while creating its end callback. Trust the prior error event.
-                if evidence.cancelled:
+                if isinstance(error, AttributeError) and evidence.cancelled:
                     raise asyncio.CancelledError() from error
+                # The SDK can wrap a transport hook error. Only a denial
+                # recorded before transport can switch to the final-only wire.
+                if not final and scope and scope.get("pre_transport_denial") == "model_budget_reserved:finalization":
+                    raise TaskConflict("model_budget_reserved:finalization") from None
                 raise
             if len(model_response.result) != 1 or not isinstance(model_response.result[0], AIMessage):
                 raise TypeError("model_must_return_ai_message")
@@ -259,13 +279,26 @@ class ModelDriver:
                 return private.protect(checked)
             return checked
 
+        final = False
         try:
-            response = await run_model_attempt(estimate_model, [*system, *view], invoke,
-                purpose="main_loop", usage_session_id=identity.session_id, streaming=True)
+            try:
+                response = await run_model_attempt(estimate_model, [*system, *view], invoke,
+                    purpose="main_loop", usage_session_id=identity.session_id, streaming=True,
+                    finalization_tokens=final_estimate["estimated_total_tokens"])
+            except TaskConflict as error:
+                if str(error) != "model_budget_reserved:finalization":
+                    raise
+                final = True
+                response = await run_model_attempt(final_model, final_messages,
+                    lambda: invoke(final=True), purpose="final_synthesis",
+                    usage_session_id=identity.session_id, streaming=True)
         except TaskConflict as error:
             reason = str(error)
             if (reason == "context_budget_exhausted:tool_observations" or
                     reason == "context_budget_exhausted" and historical_readback is not None):
                 raise AdmissionStopped(reason) from None
             raise
+        if final:
+            response = response.model_copy(update={"response_metadata": {
+                **response.response_metadata, "citrus_budget_finalization": True}})
         return replace(model_response, result=[response])

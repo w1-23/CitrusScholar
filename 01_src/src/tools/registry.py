@@ -509,9 +509,9 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
             from src.research.script_reconciliation import capture_script_failure
             reconciliation_scope = capture_script_failure(owner, job["session_id"])
         elif name in {"deliver_research_artifact", "audit_uploaded_data", "collect_external_skill", "collect_nature_plot",
-                      "resolve_external_report"}:
+                      "resolve_external_report", "code_deliver"}:
             from src.research.delivery_reconciliation import capture_delivery
-            reconciliation_scope = capture_delivery(name, tool_call["id"])
+            reconciliation_scope = capture_delivery(name, tool_call["id"], defer_confirmation=name == "code_deliver")
         elif name in ZERO_WRITE_TOOL_NAMES:
             reconciliation_scope = capture_zero_write(owner, job["session_id"], job_id, name, tool_call["id"])
         with reconciliation_scope as reconciliation:
@@ -533,7 +533,7 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
             if (not readonly
                     and message.additional_kwargs.get("execution_dispatched")
                     and (outcome["status"] in {"failed", "cancelled", "unknown"}
-                         or (outcome["status"] == "not_run" and name in ZERO_WRITE_TOOL_NAMES)
+                         or (outcome["status"] == "not_run" and (name in ZERO_WRITE_TOOL_NAMES or name == "code_deliver"))
                          or (name == "deliver_research_artifact" and outcome["status"] in {"not_run", "partial"})
                          or outcome.get("reason_code") in {"timeout", "network", "request_deadline"})
                     and not (outcome["status"] in {"failed", "not_run", "partial"} and reconciled)):

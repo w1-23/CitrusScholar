@@ -72,3 +72,24 @@ def test_compact_drawing_prohibition_is_not_a_missing_deliverable():
         assert not contract_for_turn(query, has_tables=True).deliverables
     assert [item["formats"] for item in deliverable_contract("不绘图，只给我一个 HTML 文件。") ] == [["html"]]
     assert deliverable_contract("不绘图，但请导出 SVG 文件。")[0]["formats"] == ["svg"]
+
+
+def test_scientific_method_results_do_not_imply_downloads_but_explicit_files_remain():
+    from src.graph.task_contract import contract_for_turn, fusion_delivery_for_turn
+
+    for query in ("审查 Sheet1 并输出问题清单和覆盖范围。",
+                  "逐条核验附件文献，给出核验报告和未覆盖范围。",
+                  "核验 DOI 与题名，直接在对话里回复，不生成报告文件。"):
+        assert not contract_for_turn(query, has_tables=True).deliverables
+        assert not fusion_delivery_for_turn(query, has_tables=True).format
+
+    for query, formats in (
+        ("审查 Sheet1 并生成审查结果文件。", [[]]),
+        ("请核验文献。导出核验报告。", [["docx"]]),
+        ("审查数据并导出可下载的报告文件。", [["html"]]),
+        ("检查附件表格，并生成一份 HTML 审查报告和一份 JSON 审查报告。", [["html"], ["json"]]),
+        ("审查表格并导出 CSV 和 PDF。", [["csv"], ["pdf"]]),
+        ("审查附件并交付两个 JSON 文件。", [["json"], ["json"]]),
+    ):
+        assert [item["formats"] for item in contract_for_turn(query, has_tables=True).deliverables] == formats
+    assert not fusion_delivery_for_turn("审查表格并导出 CSV 和 PDF。", has_tables=True).format

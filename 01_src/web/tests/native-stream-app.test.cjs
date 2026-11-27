@@ -183,3 +183,24 @@ test('the native surface is styled by app.css and stays reachable on small scree
   assert.match(css, /grid-template-columns: 10px minmax\(0, 1fr\)/,
     'rows use a shrinkable text column so long names never overflow');
 });
+
+
+test('result before proposal is not duplicated, and continuation owns only its job', () => {
+  const {process, body} = panel();
+  process.receive('job', {job_id: JOB});
+  process.receive('tool_result', {job_id: JOB, tool_call_id: 'call_1', tool_name: 'read_tool_result', status: 'complete'});
+  process.receive('assistant_progress', nativeEvents()[1]);
+  assert.equal(rows(body).length, 0);
+  process.receive('assistant_progress', frame('tool_proposed', {tool_call_id: 'call_2', tool_name: 'read_tool_result'}, 15));
+  assert.equal(rows(body).length, 1);
+  process.receive('done', {turn_envelope: {display_status: 'awaiting_input'}});
+  assert.equal(rows(body)[0].dataset.status, 'proposed');
+  process.receive('job', {job_id: 'child-job'});
+  process.receive('assistant_progress', frame('tool_proposed', {tool_call_id: 'stale', tool_name: 'read_tool_result'}, 16));
+  const child = Object.assign(frame('tool_proposed', {tool_call_id: 'child-call', tool_name: 'read_tool_result'}, 1),
+    {job_id: 'child-job', run_id: 'child-job'});
+  process.receive('assistant_progress', child);
+  assert.equal(rows(body).length, 1);
+  process.receive('operation', {job_id: 'child-job', tool_call_id: 'child-call', tool_name: 'read_tool_result', status: 'complete'});
+  assert.equal(rows(body).length, 0);
+});

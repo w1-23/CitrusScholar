@@ -290,7 +290,7 @@
       },
       plan: function (data) { if (projection.plan(data)) draw(); },
       terminal: function (value) { settled = value !== false; host.classList.toggle('is-terminal', settled); draw(); },
-      action: function (data) { projection.action(data); draw(); },
+      action: function (data) { projection.action(data); projection.milestone(data); draw(); },
       resolution: function (data) { if (projection.resolution(data)) draw(); },
       progress: function (data) {
         // Progress can update an existing real operation, never invent a tool.
@@ -356,8 +356,10 @@
       line.setAttribute('data-kind', row.kind);
       line.setAttribute('data-status', row.status);
       line.classList.add('is-' + row.status);
-      line.appendChild(node('span', 'task-native-title', row.title));
-      if (row.detail) line.appendChild(node('span', 'task-native-detail', ' · ' + row.detail));
+      var text = node('span', 'task-native-copy');
+      text.appendChild(node('span', 'task-native-title', row.title));
+      if (row.detail) text.appendChild(node('span', 'task-native-detail', ' · ' + row.detail));
+      line.appendChild(text);
       parts.push(line);
     });
     if (model.previewing) {

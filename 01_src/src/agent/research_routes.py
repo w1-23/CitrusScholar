@@ -83,20 +83,28 @@ def accepts_method(tool, args, scope):
 
 
 
-def has_data_audit_report(records, calls):
-    """A submitted Worker job or table inspection is not an audit report."""
+def uncollected_skill_results(records, calls, messages):
+    """Only an accepted Worker submission creates a collection obligation."""
+    pending = set()
     for row in records:
-        if row.get("status") != "complete" or row.get("inherited_from_job_id"):
+        if row.get("inherited_from_job_id"):
             continue
+        cid = row.get("tool_call_id")
         name = row.get("name") or row.get("tool_name")
-        if name == "audit_uploaded_data":
-            return True
-        call = calls.get(row.get("tool_call_id")) or {}
-        if not accepts_method(name, call.get("args") or {}, {"data-audit"}):
+        if name not in {"run_external_skill", "continue_external_literature", "collect_external_skill"}:
             continue
-        reason = str(row.get("reason") or row.get("reason_code") or "")
-        if name == "collect_external_skill" and reason == "external_skill_report":
-            return True
-        if name == "run_external_skill" and reason in {"external_csv_table_review_complete", "audit_review_completed"}:
-            return True
-    return False
+        reason = row.get("reason") or row.get("reason_code")
+        args = (calls.get(cid) or {}).get("args") or {}
+        skill = "literature-verification" if name == "continue_external_literature" else args.get("skill_id")
+        artifact = getattr(messages.get(cid), "artifact", None)
+        if skill not in ("data-audit", "literature-verification") or not isinstance(artifact, dict):
+            continue
+        if (name in {"run_external_skill", "continue_external_literature"}
+                and reason == "external_skill_ready" and row.get("status") == "complete"
+                and artifact.get("collect_required") is True and artifact.get("_code_execution_id")):
+            pending.add((skill, artifact["_code_execution_id"]))
+        elif (name == "collect_external_skill" and row.get("status") in {"complete", "partial"}
+              and reason in {"external_skill_report", "external_report_not_published"}
+              and artifact.get("execution_id") == args.get("execution_id")):
+            pending.discard((skill, args.get("execution_id")))
+    return frozenset(skill for skill, _ in pending)

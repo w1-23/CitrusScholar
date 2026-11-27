@@ -126,10 +126,43 @@ def summary(report, *, findings_offset=0, findings_limit=36):
 def annotate_record_coverage(record, by_index):
     status = by_index.get(record["record_index"], "not_queried")
     record["host_coverage"] = status
+    _annotate_doi_registry_gaps(record)
     if (not record.get("method") and status not in {"queried", "previously_observed"}
             and record.get("status") == "not_found"):
         record["worker_status"] = "not_found"
         record["status"] = "unavailable" if status == "provider_unavailable" else "not_checked"
+
+
+def _annotate_doi_registry_gaps(record):
+    """Explain failed receipts without changing a verdict or filling coverage."""
+    if (record.get("method") != "citrus_refcheck/reference-verification/1"
+            or record.get("status") not in {"verified", "retracted"}
+            or record.get("reason") != "identifier_match"):
+        return
+    from citrus_refcheck.providers import normalize_doi
+
+    submitted = record.get("submitted") or {}
+    matched = record.get("registered") or {}
+    doi = normalize_doi(submitted.get("doi"))
+    source = matched.get("source")
+    attempts = record.get("attempts") or []
+    if (not doi or doi != normalize_doi(matched.get("doi"))
+            or source not in {"Crossref", "DataCite", "OpenAlex"}
+            or not any(a.get("provider") == source and a.get("http_status") == 200 for a in attempts)):
+        return
+    gaps = []
+    for attempt in attempts:
+        provider = attempt.get("provider")
+        if provider not in {"Crossref", "DataCite", "OpenAlex"} or attempt.get("http_status") in {200, 404}:
+            continue
+        # Once Crossref/DataCite returned the exact DOI, this adapter only
+        # consults OpenAlex to supplement retraction evidence.
+        scope = ("supplementary_retraction_lookup" if provider == "OpenAlex" and source != "OpenAlex"
+                 else "alternate_identity_registry")
+        gaps.append({**_project(attempt, ("provider", "http_status", "reason", "record_id")), "scope": scope})
+    if gaps:
+        record["identity_registry"] = source
+        record["registry_gaps"] = gaps
 
 
 def _csv_value(value):
@@ -151,7 +184,7 @@ def _render(payload, fmt, *, literature):
     title = "文献核验结果" if literature else "外部 Skill 审查结果"
     if fmt in {"csv", "tsv"}:
         if literature:
-            fields = (*RECORD, "submitted", "attempts", "host_coverage", "worker_status")
+            fields = (*RECORD, "submitted", "attempts", "host_coverage", "worker_status", "identity_registry", "registry_gaps")
             rows = payload["records"]
         else:
             fields = ("finding_id", "rule_id", "severity", "observed_value", "expected_value", "locations", "locations_total", "evidence")
@@ -163,7 +196,7 @@ def _render(payload, fmt, *, literature):
         book = Workbook()
         sheet = book.active
         sheet.title = "文献逐条核验"
-        fields = (*RECORD, "submitted", "attempts", "host_coverage", "worker_status")
+        fields = (*RECORD, "submitted", "attempts", "host_coverage", "worker_status", "identity_registry", "registry_gaps")
         sheet.append(fields)
         for row_number, row in enumerate(payload["records"], 2):
             for column, field in enumerate(fields, 1):

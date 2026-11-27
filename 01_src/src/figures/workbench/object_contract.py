@@ -15,7 +15,7 @@ def contract(groups, revision, *, svg, draft_revision=None, source_sha256=None, 
             'objectId': ident, 'parentId': group['parent'], 'role': role,
             'geometry': {'svgIds': list(ids)} if ids else {'svgIds': [], 'mode': 'tree_only'},
             'clip': list(clips), 'zOrder': order, 'capabilities': group['properties'],
-            'readonlyReason': group['reason'] or (None if group['properties'] else '此对象没有可编辑的样式。'),
+            'readonlyReason': None if group['properties'] else (group['reason'] or '此对象没有可编辑的样式。'),
             'revision': revision, 'renderKey': render_key,
         }
     return {'object_contract': {'revision': revision, 'draftRevision': draft_revision,

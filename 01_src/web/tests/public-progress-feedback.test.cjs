@@ -144,3 +144,23 @@ test('flat history fallback ignores old narrated rows', () => {
   assert.equal(unfinished.answer, null);
   assert.doesNotMatch(JSON.stringify(unfinished), /首批响应/);
 });
+
+
+test('public figure milestones are deduplicated in live and restored timelines', () => {
+  const {b, panel} = mount();
+  const table = {tool_call_id: 'read-table', tool_name: 'inspect_uploaded_table', status: 'complete'};
+  const figure = {tool_call_id: 'figure', tool_name: 'run_research_figure_script', status: 'complete', reason_code: 'figure_published'};
+  const frames = [{event: 'tool_result', data: table, seq: 4}, {event: 'tool_result', data: figure, seq: 6}];
+  for (const ev of frames) panel.receive(ev.event, ev.data);
+  panel.receive('tool_result', {...figure, tool_call_id: 'repeat'});
+  panel.receive('tool_result', {...figure, tool_call_id: 'draft', draft: true, summary: 'untrusted-draft'});
+  panel.receive('tool_result', {...table, private: true, summary: 'private-raw'});
+  const old = mount().panel;
+  old.terminal('completed');
+  b.ctx.projectHistoryTrace(old, frames);
+  for (const view of [panel, old]) {
+    assert.deepEqual([...view.body.querySelectorAll('.research-process-note')].map(x => x.textContent),
+      ['已读取附件中的表格信息', '图件已渲染并通过交付校验']);
+    assert.doesNotMatch(view.body.textContent, /untrusted-draft|private-raw/);
+  }
+});

@@ -52,6 +52,8 @@ EDITABLE_BY_ROLE: dict[str, tuple[str, ...]] = {
     "series": ("color", "linewidth", "visible", "label", "alpha", "facecolor", "edgecolor", *LINE_STYLE_PROPS),
     "point": ("color", "visible", "alpha", *MARKER_STYLE_PROPS),
     "bar": ("color", "facecolor", "edgecolor", "linewidth", "alpha", "visible"),
+    "patch": ("facecolor", "edgecolor", "linewidth"),
+    "arrow": ("facecolor", "edgecolor", "linewidth"),
     "grid": ("color", "linewidth", "linestyle", "alpha", "visible"),
     "errorbar": ("color", "linewidth", "linestyle", "alpha", "visible", "capsize"),
     "colorbar": ("visible", "label", "offset_px"),
@@ -608,9 +610,9 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
     if figure is not None:
         figure.canvas.draw()
         _discover_semantics(rendered)
-    from citrus_figures.svg_projection import projection_manifest, visual_marks
+    from citrus_figures.svg_projection import MARK_ROLES, native_mark_paint, projection_manifest, visual_marks
+    marks = visual_marks(rendered, register=source == "script") if figure is not None else []
     projections = projection_manifest(rendered, _artist_bbox) if figure is not None else {}
-    marks = visual_marks(rendered) if figure is not None else []
     style_nodes = getattr(rendered, "_svg_style_nodes", {})
     objects: list[dict[str, Any]] = []
     for gid, entry in rendered.locators.items():
@@ -717,6 +719,11 @@ def _build_manifest(rendered: RenderedFigure, *, source: str,
             # source identity. Do not guess their series links from labels.
             record["editable"] = []
             record["editing_limitation"] = "unverified_figure_legend_links"
+        if role in MARK_ROLES:
+            paint, limitations = native_mark_paint(artist)
+            record["editable"] = [prop for prop in record["editable"] if prop in paint]
+            record["paint_limitations"] = limitations
+            record.update(paint)
         if source == "script" and record["editable"]:
             from citrus_figures.style_replay import style_capabilities
             record["editable"], reason = style_capabilities(artist, role, members or [artist], record["editable"])

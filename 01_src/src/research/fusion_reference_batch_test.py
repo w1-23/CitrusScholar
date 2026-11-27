@@ -298,3 +298,42 @@ def test_alternate_registries_obey_provider_request_budget(monkeypatch):
     assert result["records"][0]["status"] == "not_processed"
     assert result["coverage"] == {"requested": 1, "actual": 0, "gap": 1}
     assert result["provider_requests"] == 2
+
+
+@pytest.mark.parametrize("limited,identity,scope", [
+    ("crossref", "DataCite", "alternate_identity_registry"),
+    ("openalex", "Crossref", "supplementary_retraction_lookup"),
+])
+def test_exact_doi_identity_and_retraction_coverage_are_separate_in_collected_result(
+        monkeypatch, limited, identity, scope):
+    doi = "10.5555/exact"
+    submitted = {"doi": f"https://doi.org/{doi}", "title": "Exact fixture"}
+
+    def lookup(url, *, params=None, source):
+        assert url.endswith(doi)
+        if source == limited:
+            return 429, None, "http_429"
+        if source == "crossref":
+            return 200, {"message": {"DOI": doi, "title": ["Exact fixture"]}}, ""
+        if source == "datacite":
+            return 200, {"data": {"attributes": {"doi": doi, "titles": [{"title": "Exact fixture"}]}}}, ""
+        return 404, None, ""
+
+    monkeypatch.setattr(literature, "_get", lookup)
+    batch = fusion_reference_batch.run_reference_batch([{"record_index": 1, "submitted": submitted}],
+        check=lambda: None, send=lambda _, operation: operation(), deadline=time.monotonic() + 3)
+    record, = batch["records"]
+    assert record["status"] == "verified" and record["reason"] == "identifier_match"
+    worker = {"status": "succeeded", "report": {"status": "complete", "records": [dict(record, submitted=submitted)]}}
+    monkeypatch.setattr(fusion_tools, "_literature_coverage", lambda *_a, **_k: (
+        {"counts": {"provider_unavailable": 1}, "can_continue": False}, {1: "provider_unavailable"}))
+    body, artifact = fusion_tools._deliver(object(), worker, "d" * 32, "literature-verification")
+    public = json.loads(body)
+    assert public["status"] == "partial" and artifact["_tool_outcome"]["status"] == "partial"
+    projected, = public["records"]
+    gap, = projected["registry_gaps"]
+    raw = next(row for row in record["attempts"] if row["http_status"] == 429)
+    assert gap == {"scope": scope, **{key: raw[key] for key in ("provider", "http_status", "reason", "record_id")}}
+    assert projected["identity_registry"] == identity and projected["status"] == "verified"
+    assert projected["host_coverage"] == "provider_unavailable"
+    assert projected["retraction_status"] == "not_established"

@@ -64,6 +64,7 @@ class _PublicationEvidence:
     receipts: list[PublicationReceipt] = field(default_factory=list)
     preflight: bool = False
     outcome: dict | None = None
+    defer_confirmation: bool = False
 
     @property
     def started(self):
@@ -96,8 +97,8 @@ _current = ContextVar("delivery_publication_evidence", default=None)
 
 
 @contextmanager
-def capture_delivery(tool_name, call_id):
-    evidence = _PublicationEvidence(tool_name, call_id)
+def capture_delivery(tool_name, call_id, *, defer_confirmation=False):
+    evidence = _PublicationEvidence(tool_name, call_id, defer_confirmation=defer_confirmation)
     token = _current.set(evidence)
     try:
         yield evidence
@@ -132,10 +133,10 @@ def publication_committed(*, sha256="", filename="", file_index=None, receipt=No
     return target
 
 
-def publication_confirmed(url, *, sha256="", receipt=None):
-    """The registered URL was returned. Never implies a review was rerun."""
+def publication_confirmed(url, *, sha256="", receipt=None, verified_by_caller=False):
+    """Record confirmation, optionally only after the caller verifies delivery."""
     evidence = _current.get()
-    if evidence is None:
+    if evidence is None or (evidence.defer_confirmation and not verified_by_caller):
         return None
     target = receipt if isinstance(receipt, PublicationReceipt) else next(
         (item for item in evidence.receipts if item.started and not item.url), None)
@@ -198,7 +199,7 @@ def delivery_outcome(status, reason, receipts):
             # A partly unknown publication stays unknown; a file that appeared
             # is not proof that the registry confirmed it.
             status, reason = "unknown", "write_requires_reconciliation"
-        elif status == "failed" and not files:
+        elif status in {"failed", "not_run"} and not files:
             status, reason = "not_run", reason
             known = True
         elif status == "partial":

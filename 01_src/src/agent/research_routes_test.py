@@ -100,20 +100,39 @@ def test_conservative_scope_keeps_general_and_combined_requests():
 
 
 
-def test_audit_completion_requires_the_correct_report_not_the_submission():
-    from src.agent.research_routes import has_data_audit_report
+@pytest.mark.parametrize("skill,tool", [("data-audit", "run_external_skill"),
+                                        ("literature-verification", "run_external_skill"),
+                                        ("literature-verification", "continue_external_literature")])
+def test_only_actual_worker_submissions_need_a_matching_collection(skill, tool):
+    from types import SimpleNamespace
 
-    calls = {"csv": {"args": {"skill_id": "data-audit"}},
-             "worker": {"args": {"skill_id": "data-audit"}},
-             "other": {"args": {"skill_id": "research-integrity"}}}
-    start = row("run_external_skill", tool_call_id="worker", reason="external_skill_ready")
-    wrong_method = row("collect_external_skill", tool_call_id="other", reason="external_skill_report")
-    report = row("collect_external_skill", tool_call_id="worker", reason="external_skill_report")
-    assert not has_data_audit_report([row("inspect_uploaded_table"), start, wrong_method], calls)
-    assert not has_data_audit_report([{**report, "status": "partial"}], calls)
-    assert has_data_audit_report([start, report], calls)
-    assert has_data_audit_report([row("run_external_skill", tool_call_id="csv", reason="audit_review_completed")], calls)
+    from src.agent.fusion_tools import _queued
+    from src.agent.research_routes import uncollected_skill_results
+    from src.core.turn_outcome import completion_errors, completion_from_answer
 
+    current, other = "a" * 32, "b" * 32
+    _, submitted = _queued({"execution_id": current, "status": "succeeded"})
+    start = row(tool, tool_call_id="start", reason="external_skill_ready")
+    inspect = row("inspect_uploaded_table", tool_call_id="inspect")
+    csv = row("run_external_skill", tool_call_id="csv", reason="audit_review_completed")
+    report = row("collect_external_skill", tool_call_id="report", reason="external_skill_report")
+    messages = {"start": SimpleNamespace(artifact=submitted),
+                "report": SimpleNamespace(artifact={"execution_id": current})}
+    calls = {"start": {"args": {} if tool == "continue_external_literature" else {"skill_id": skill}},
+             "csv": {"args": {"skill_id": "data-audit"}},
+             "report": {"args": {"skill_id": skill, "execution_id": current}}}
+
+    assert not uncollected_skill_results([], calls, messages)
+    assert not uncollected_skill_results([inspect, csv], calls, messages)
+    assert not uncollected_skill_results([start | {"inherited_from_job_id": "older"}], calls, messages)
+    assert uncollected_skill_results([inspect, start], calls, messages) == {skill}
+    wrong = calls | {"report": {"args": {"skill_id": skill, "execution_id": other}}}
+    assert uncollected_skill_results([start, report], wrong, messages) == {skill}
+    assert not uncollected_skill_results([start, report], calls, messages)
+    partial = report | {"status": "partial"}
+    assert not uncollected_skill_results([start, partial], calls, messages)
+    rows = [start, partial]
+    assert "execution_blocker:report" in completion_errors(completion_from_answer("仅有部分结果。", rows), rows)
 
 
 def test_scoped_tools_reach_stock_deepagents_model_node():

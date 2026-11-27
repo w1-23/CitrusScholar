@@ -72,6 +72,8 @@ def test_visual_marks_are_verified_supplemental_addresses(library, monkeypatch):
     source, manifest, svg, refs = native_multipanel(library, monkeypatch, visual_marks=True)
     marks = manifest['workbench_marks']
     assert sorted(mark['role'] for mark in marks) == ['arrow', 'arrow', 'patch']
+    # Emulate the pre-paint-contract manifest, which exposed inspection only.
+    manifest['objects'] = [row for row in manifest['objects'] if row['role'] not in {'patch', 'arrow'}]
     assert {mark['gid'] for mark in marks}.isdisjoint(row['gid'] for row in manifest['objects'])
     assert b'id="author-patch"' in svg
 
@@ -94,3 +96,57 @@ def test_visual_marks_are_verified_supplemental_addresses(library, monkeypatch):
     response = client.post(prefix + '/save', json=payload)
     assert response.status_code == 422 and response.json()['code'] == 'group_property_unavailable'
     assert client.get(prefix + '/preview/svg?revision=1').content == svg
+
+
+
+def test_native_mark_paint_preview_save_reopen_and_export(library, monkeypatch):
+    import xml.etree.ElementTree as ET
+
+    source, manifest, svg, refs = native_multipanel(library, monkeypatch, visual_marks=True)
+    fid = library.project(source, manifest, svg, kind='script', refs=refs)
+    client = TestClient(library.app(monkeypatch))
+    prefix = f'/api/v2/figure-workbench/projects/{fid}'
+    initial = client.get(prefix).json()
+    patch = next(row for row in initial['groups'] if row['kind'] == 'patch')
+    solid_arrow = next(row for row in initial['groups'] if row['kind'] == 'arrow' and 'facecolor' in row['properties'])
+    open_arrow = next(row for row in initial['groups'] if row['kind'] == 'arrow' and 'edgecolor' in row['properties'])
+    assert patch['properties'] == ['edgecolor', 'facecolor', 'linewidth']
+    assert solid_arrow['properties'] == ['facecolor'] and '描边' in solid_arrow['reason']
+    assert open_arrow['properties'] == ['edgecolor'] and '填充' in open_arrow['reason']
+    assert '线宽参与箭头几何计算' in open_arrow['reason']
+    commands = [command(patch, 'facecolor', '#624193'), command(patch, 'edgecolor', '#153355'),
+                command(patch, 'linewidth', 2.7), command(open_arrow, 'edgecolor', '#884488'),
+                command(solid_arrow, 'facecolor', '#552299')]
+    payload = {'expected_revision': 1, 'draft_revision': 12, 'source_sha256': initial['source_sha256'],
+               'commands': commands}
+    before = store.get_project(fid, OWNER)
+    denied = client.post(prefix + '/save', json={**payload, 'commands': [command(open_arrow, 'facecolor', '#223355')]})
+    assert denied.status_code == 422 and denied.json()['code'] == 'group_property_unavailable'
+    draft = client.post(prefix + '/preview', json=payload)
+    assert draft.status_code == 200, draft.text
+    assert store.get_project(fid, OWNER) == before
+    saved = client.post(prefix + '/save', json=payload)
+    assert saved.status_code == 200, saved.text
+    reopened = client.get(prefix + '?revision=2').json()
+    for result in (draft.json(), saved.json(), reopened):
+        values = {row['id']: row['values'] for row in result['groups']}
+        for edit in commands:
+            assert values[edit['group_id']][edit['property']] == edit['value']
+    exported = client.get(prefix + '/export/svg?revision=2')
+    assert exported.status_code == 200
+    assert sha256(exported.content).hexdigest() == reopened['object_contract']['renderKey']
+    ns = {'s': 'http://www.w3.org/2000/svg'}
+    for previous, updated in ((svg, draft.json()['svg']), (svg, exported.content)):
+        old, new = [ET.fromstring(item) for item in (previous, updated)]
+        target = f".//s:g[@id='{patch['pick_ids'][0]}']/s:path"
+        assert old.find(target, ns).get('d') == new.find(target, ns).get('d')
+        assert new.find(target, ns).get('fill') == '#624193'
+        assert new.find(target, ns).get('stroke') == '#153355'
+        assert float(new.find(target, ns).get('stroke-width')) == 2.7
+        arrow = f".//s:g[@id='{solid_arrow['pick_ids'][0]}']/s:path"
+        assert old.find(arrow, ns).get('fill-opacity') == new.find(arrow, ns).get('fill-opacity') == '0.6'
+    committed = store.get_project(fid, OWNER)
+    assert committed['source_json'] == before['source_json']
+    assert committed['manifest_json']['style_replay_proof']['coordinates_sha256'] == (
+        source['frozen_render']['receipt']['style_replay']['coordinates_sha256'])
+    assert client.post(prefix + '/save', json=payload).status_code == 409

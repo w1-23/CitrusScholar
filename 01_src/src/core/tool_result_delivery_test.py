@@ -324,6 +324,7 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["selected_values"]["/qa/nullable"])
         self.assertIn("0.12345678901234567890", result["result_text"])
         self.assertIsNone(result["page"]["next_start_char"])
+        self.assertIsNone(result["page"]["next_args"])
 
     async def test_readback_rejections_and_corruption_do_not_count_as_execution_failures(self):
         from src.tools.outcome import safe_tool_step
@@ -396,8 +397,10 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         original, reference = await page("first", start_char=25)
         self.assertEqual(original["result_text"], raw[25:75])
+        next_args = original["page"]["next_args"]
         cursor = original["page"]["next_cursor"]
-        second, _ = await page("second", cursor=cursor)
+        self.assertEqual(next_args, {"tool_call_id": "source", "cursor": cursor, "max_chars": 50})
+        second, _ = await page("second", **next_args)
         self.assertEqual(second["result_text"], raw[75:125])
         repeated, _ = await page("repeat", start_char=25)
         self.assertEqual(repeated["status"], "reused")
@@ -409,6 +412,16 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         retried_cursor, _ = await page("cursor-retry", cursor=cursor)
         self.assertEqual((retried_cursor["status"], retried_cursor["page"]), ("reused", second["page"]))
         self.assertFalse(host._prepare_result_readback({"tool_call_id": "source", "cursor": "forged"}, "forged"))
+
+        selected, _ = await page("selected", fields=["field"])
+        next_selected = selected["page"]["next_args"]
+        self.assertFalse(host._prepare_result_readback({**next_selected, "fields": ["/other"]}, "wrong-fields"))
+        self.assertFalse(host._prepare_result_readback({**next_selected, "start_char": 51}, "wrong-offset"))
+        continued, _ = await page("selected-next", **next_selected)
+        self.assertEqual(continued["selected_fields"], ["/field"])
+        self.assertEqual(continued["page"]["start_char"], selected["page"]["end_char"])
+        projected = json.dumps({"/field": "éλ字" * 3000}, ensure_ascii=False)
+        self.assertEqual(selected["result_text"] + continued["result_text"], projected[:100])
         next_job = jobs.claim_job(self.sid, "next", owner_user_id=7, client_request_id="different", payload={})
         tracing.set_job_id(next_job.job_id)
         fresh = json.loads(read_tool_result.invoke({"tool_call_id": "source", "start_char": 25, "max_chars": 50}))

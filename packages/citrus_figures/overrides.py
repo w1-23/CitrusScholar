@@ -434,6 +434,11 @@ def apply_overrides(rendered: RenderedFigure, manifest: dict[str, Any],
                 artist._citrus_transparent = value
             elif role == "errorbar":
                 _set_error_style(members or artist, prop, value)
+            elif role in {"patch", "arrow"} and prop in {"facecolor", "edgecolor"}:
+                from matplotlib.colors import to_rgba
+                # RGB-only edits must not overwrite the original alpha.
+                rgba = getattr(artist, "get_" + prop)()
+                getattr(artist, "set_" + prop)(to_rgba(value, alpha=rgba[3]))
             elif prop in {"facecolor", "edgecolor"}:
                 from matplotlib.patches import Rectangle
                 patches = list(entry.get("members") or [artist]) if entry else _members(artist)

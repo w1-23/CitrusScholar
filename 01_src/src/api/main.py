@@ -5298,7 +5298,7 @@ async def serve_figures_page(request: Request):
     current_user(request)
     return HTMLResponse("""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <title>Workbench</title><body><main><h1>工作台</h1><p id="workbench-open-status" role="status">正在打开工作台…</p>
-<p><a href="/">返回会话</a></p></main><script src="/assets/workbench-launch.js" defer></script></body></html>""",
+<p><a href="/">返回会话</a></p></main><script src="/assets/workbench-launch.js?v=2" defer></script></body></html>""",
         headers={"Cache-Control": "no-store"})
 
 

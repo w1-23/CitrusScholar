@@ -577,7 +577,7 @@ async def _run(state, identity, ledger):
         notes = await prepare(identity)
         if notes:
             return FinalCheck(False, notes)
-        from src.core.public_delivery import public_answer_text
+        from src.core.public_delivery import public_answer_text, verified_figure_previews
         text = public_answer_text(answer.content)
         if not text.strip() or ops._DSML_PROTOCOL_RE.search(text):
             return FinalCheck(False, ("尚未形成有效答复。需要工具时使用原生工具调用；不要用工具协议文本冒充答案。",))
@@ -594,6 +594,7 @@ async def _run(state, identity, ledger):
                 public_answer += "\n\n" + notice
                 statement = statement.model_copy(update={"answer": public_answer})
         delivery_gaps, artifact_contract = [], None
+        figure_previews = {}
         if requirements:
             from src.core.turn_outcome import _effective_artifact_records, artifact_goal_evidence
             from src.research.tools import validate_artifact_links
@@ -618,11 +619,14 @@ async def _run(state, identity, ledger):
                 return FinalCheck(False, tuple(gap["detail"] for gap in delivery_gaps))
             if delivery_gaps:
                 public_answer += "\n\n" + "\n".join(gap["detail"] for gap in delivery_gaps)
+            elif "[[FIGURE:" in public_answer:
+                figure_previews = await asyncio.to_thread(verified_figure_previews, state["query"], public_answer,
+                    requirements, goals, verified, session_id=identity.session_id, owner_user_id=identity.owner_user_id)
             statement = statement.model_copy(update={"answer": public_answer,
                 "status": "partial" if delivery_gaps else statement.status,
                 "goals": [*statement.goals, *goals], "remaining": [gap["detail"] for gap in delivery_gaps]})
         if "[[FIGURE:" in public_answer:
-            public_answer = figures.expand(public_answer)
+            public_answer = figures.expand(public_answer, verified_previews=figure_previews)
             statement = statement.model_copy(update={"answer": public_answer})
         native_calls = [call for message in history if isinstance(message, AIMessage)
                         for call in message.tool_calls]

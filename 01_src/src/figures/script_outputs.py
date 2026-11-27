@@ -14,6 +14,39 @@ MAX_V2_FILES = 64
 MAX_RECEIPT_BYTES = 64 * 1024
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z", re.ASCII)
 _FORMATS = ("svg", "png", "pdf", "tiff")
+_OUTPUT_VERSION = 2
+_MAX_ENTRIES = 8
+_MAX_PARENTS = 16
+_MAX_TITLE = 1000
+_ENTRY_FIELDS = {"tables": ("name", "parents"),
+                 "figures": ("name", "title", "formats", "parents", "render_script")}
+_CONTRACT_FIELDS = frozenset(("version", *_ENTRY_FIELDS, "input_contract"))
+
+
+def output_contract_schema() -> dict:
+    """Provider shape from the same vocabulary used by the worker validator.
+
+    The validator still owns cross-field, source and byte-size constraints.
+    Omission selects legacy mode; the runtime continues to accept legacy {}.
+    """
+    identifier = {"type": "string", "pattern": _NAME.pattern.removesuffix(r"\Z") + "$"}
+    properties = {
+        "name": identifier,
+        "parents": {"type": "array", "items": identifier, "maxItems": _MAX_PARENTS},
+        "title": {"type": "string", "maxLength": _MAX_TITLE},
+        "formats": {"type": "array", "minItems": 1, "maxItems": len(_FORMATS),
+                    "items": {"type": "string", "enum": list(_FORMATS)}},
+        "render_script": {"type": "string", "description": "Python source, not a script reference. "
+                          "Only this stage receives data mapping frozen output table parents; no emit API."},
+    }
+    return {"type": "object", "additionalProperties": False, "required": ["version"], "properties": {
+        "version": {"type": "integer", "enum": [_OUTPUT_VERSION]},
+        **{kind: {"type": "array", "maxItems": _MAX_ENTRIES, "items": {"type": "object", "required": ["name"],
+                   "additionalProperties": False, "properties": {key: properties[key] for key in keys}}}
+           for kind, keys in _ENTRY_FIELDS.items()},
+        "input_contract": {"type": "object", "description": "Optional typed v1 input namespace. "
+                           "Omit to use input binding names directly in main script."},
+    }}
 # The separated renderer is handed frozen tables only; it is not given the
 # host-owned ``emit`` object. The tag is stable across preflight and runtime.
 RENDER_SCRIPT_EMIT_NOT_AVAILABLE = "render_script_emit_not_available"
@@ -115,6 +148,61 @@ def render_script_emit_line(source: str) -> int | None:
     return _unbound_emit_line(tree)
 
 
+class MainScriptBindingUnavailable(ValueError):
+    def __init__(self, name: str, line: int, bindings: tuple[str, ...]) -> None:
+        self.reason_code = "main_script_emit_not_available" if name == "emit" else "main_script_input_not_bound"
+        if name == "emit":
+            correction = ("旧单图模式不提供 emit。保留旧模式时只构造一个 Figure，不调用 emit；"
+                          "使用 emit.figure/emit.table/emit.report 时请传版本 2 的 outputs_json。")
+        else:
+            names = "、".join(bindings[:8])
+            correction = (f"主脚本当前绑定变量为 {names}。请使用传入的变量名，或把 inputs_json 键改为 data。"
+                          "仅独立 render_script 的 data 是冻结表映射。")
+        super().__init__(f"主 script 第 {line} 行使用了未绑定的 {name}。{correction}")
+
+
+def validate_main_script_bindings(source: str, contract: dict, bindings: dict, *, analysis_input: bool = False) -> None:
+    """Catch two simple module-level namespace mistakes before reserving a run.
+
+    This is not a linter or security check. Ignore nested/conditional scopes,
+    locally bound names and programs with dynamic namespace access or type-only
+    hints, and let the worker handle every uncertain case.
+    """
+    if not source or len(source) > 200_000 or contract.get("input_contract"):
+        return
+    names = tuple(key for key in bindings if isinstance(key, str) and _NAME.fullmatch(key))
+    checks = ({"data"} if names and "data" not in names and not analysis_input else set())
+    if not contract and "emit" not in names:
+        checks.add("emit")
+    if not checks:
+        return
+    try:
+        tree = ast.parse(source)
+    except (ValueError, SyntaxError, RecursionError):
+        return
+    dynamic = {"globals", "locals", "vars", "exec", "eval", "__builtins__", "__import__"}
+    if any((isinstance(node, ast.Name) and node.id in dynamic)
+           or isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+           for node in ast.walk(tree)):
+        return
+    checks -= _bound_names(tree)
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.Expr)):
+            continue
+        expression = statement.value
+        if ("data" in checks and isinstance(expression, ast.Subscript)
+                and isinstance(expression.value, ast.Name) and expression.value.id == "data"):
+            raise MainScriptBindingUnavailable("data", expression.lineno, names)
+        if not isinstance(expression, ast.Call):
+            continue
+        if ("emit" in checks and isinstance(expression.func, ast.Attribute)
+                and isinstance(expression.func.value, ast.Name) and expression.func.value.id == "emit"
+                and expression.func.attr in {"table", "figure", "report"}):
+            raise MainScriptBindingUnavailable("emit", expression.lineno, names)
+        if "data" in checks and any(isinstance(arg, ast.Name) and arg.id == "data" for arg in expression.args):
+            raise MainScriptBindingUnavailable("data", expression.lineno, names)
+
+
 def render_script_emit_message(line: int) -> str:
     """Shortest correction for a renderer that referenced host ``emit``."""
     return (
@@ -155,21 +243,21 @@ def normalize_output_contract(value: Any) -> dict:
     """Normalize v2 only; an absent/empty contract preserves the legacy path."""
     if value is None or value == {}:
         return {}
-    if not isinstance(value, dict) or set(value) - {"version", "tables", "figures", "input_contract"}:
-        raise ValueError("Invalid output contract fields.")
-    if type(value.get("version")) is not int or value["version"] != 2:
+    if not isinstance(value, dict) or set(value) - _CONTRACT_FIELDS:
+        raise ValueError("Invalid output contract fields. Use version, tables, figures and optional input_contract.")
+    if type(value.get("version")) is not int or value["version"] != _OUTPUT_VERSION:
         raise ValueError("Output contract version must be 2.")
-    result = {"version": 2, "tables": [], "figures": []}
+    result = {"version": _OUTPUT_VERSION, "tables": [], "figures": []}
     names = set()
-    for kind in ("tables", "figures"):
+    for kind, allowed in _ENTRY_FIELDS.items():
         entries = value.get(kind, [])
-        if not isinstance(entries, list) or len(entries) > 8:
+        if not isinstance(entries, list) or len(entries) > _MAX_ENTRIES:
             raise ValueError("At most eight tables and eight figures are allowed.")
-        for entry in entries:
-            allowed = {"name", "parents"} if kind == "tables" else {
-                "name", "title", "formats", "parents", "render_script"}
-            if not isinstance(entry, dict) or set(entry) - allowed:
-                raise ValueError("Invalid output entry fields.")
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or set(entry).difference(allowed):
+                correction = "; render_script expects inline source, not render_script_ref" if (
+                    kind == "figures" and isinstance(entry, dict) and "render_script_ref" in entry) else ""
+                raise ValueError(f"Invalid output entry fields at {kind}[{index}]. Allowed: {', '.join(allowed)}{correction}.")
             name = output_name(entry.get("name"))
             if name.casefold() in names:
                 raise ValueError("Output names must be unique, including across kinds and case.")
@@ -177,17 +265,17 @@ def normalize_output_contract(value: Any) -> dict:
             item = {"name": name}
             if kind == "tables" or "parents" in entry:
                 parents = entry.get("parents", [])
-                if not isinstance(parents, list) or len(parents) > 16:
+                if not isinstance(parents, list) or len(parents) > _MAX_PARENTS:
                     raise ValueError("Invalid output parents.")
                 item["parents"] = [output_name(parent) for parent in parents]
                 if len(set(item["parents"])) != len(parents) or name in parents:
                     raise ValueError("Duplicate or self output parent.")
             if kind == "figures":
                 title = entry.get("title", "")
-                if not isinstance(title, str) or len(title) > 1000:
+                if not isinstance(title, str) or len(title) > _MAX_TITLE:
                     raise ValueError("Invalid figure title.")
                 formats = entry.get("formats", ["svg"])
-                if (not isinstance(formats, list) or not formats or len(formats) > 4
+                if (not isinstance(formats, list) or not formats or len(formats) > len(_FORMATS)
                         or any(not isinstance(fmt, str) or fmt not in _FORMATS for fmt in formats)
                         or len(set(formats)) != len(formats)):
                     raise ValueError("Invalid figure formats.")

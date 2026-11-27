@@ -80,6 +80,30 @@ class ScriptRuntimeRejectionTests(unittest.TestCase):
         self.assertFalse(payload["run_reserved"])
         self.assertEqual(payload["script_ref"], saved["script_ref"])
 
+    def test_resolved_script_reference_binding_failure_has_no_worker_or_run(self):
+        executor = Mock()
+        for source, contract, code in (
+                ("frame = data['tidy']", {"version": 2, "figures": [{"name": "plot"}]}, "main_script_input_not_bound"),
+                ("emit.figure('plot', fig)", {}, "main_script_emit_not_available")):
+            with self.subTest(code=code):
+                ref = {"kind": "research_script", "id": "b" * 32, "version": 1, "sha256": "c" * 64}
+                with (patch.object(script_runtime, "_validate_new_script_inputs"),
+                      patch("src.research.script_assets.get_script", return_value={"script_ref": ref, "source": source}) as get,
+                      patch("src.research.script_assets.save_script") as save,
+                      patch("src.research.script_assets.begin_budgeted_run") as begin,
+                      patch("src.research.script_reconciliation.observe_preflight_rejection") as proof):
+                    _, payload = script_runtime.execute_script_request(executor, script_ref_json=ref,
+                        inputs_json={"tidy": {"file_id": "a" * 32}}, outputs_json=contract)
+                get.assert_called_once_with(OWNER, SESSION, ref, touch=True)
+                save.assert_not_called()
+                begin.assert_not_called()
+                executor.assert_not_called()
+                proof.assert_called_once_with(payload)
+                self.assertEqual(payload["error_code"], code)
+                self.assertEqual(payload["script_ref"], ref)
+                self.assertFalse(payload["run_reserved"])
+                self.assertEqual(payload["_tool_outcome"]["status"], "not_run")
+
     def test_succeeded_run_cannot_be_used_as_repair_source(self):
         executor = Mock()
         with (patch("src.research.script_assets.get_run",

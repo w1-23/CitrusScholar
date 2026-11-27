@@ -407,7 +407,8 @@ def _figure_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
         modes=("script",) if "mode" in arguments else (),
         inputs=("本账号授权表（CSV/XLSX/PDF，按工具 schema 绑定 file_id）与完整脚本或 script_ref",),
         artifacts=artifacts, waits=facts.waits_for(tools),
-        hint=("常规单表一次 profile 后使用冻结的文件绑定；outputs_json 等直接传对象。"
+        hint=("常规单表一次 profile 后复用文件绑定。图型和字段明确时，首个绘图调用直接声明所需 figures 和格式，不先做仅冻结运行；"
+              "主脚本按 inputs_json 键名取数据，只有独立 renderer 用 data 映射。"
               "样本量只用实际渲染报告。所需格式齐全时给下载链接，如实说明 QA 范围，不重跑或读全回执。"
               "未明确要求源码时不粘贴 SVG/XML" + forward_note),
         source="tool_specs+available_names")]
@@ -601,7 +602,7 @@ def _literature_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
             hint=(_collector_advice(facts)
                   + "；" + continuing + collecting + "；通用搜索结果不能替代核验回执。"
                   "精确 DOI 登记已确认时，单独说明 identity_registry 和 registry_gaps：补充来源限流不推翻身份，"
-                  "不证明未撤稿，也不为此自动重复查找。仅为用户要求且缺证的具体字段补证。"),
+                  "不证明未撤稿，也不为此自动重复查找。登记库均未命中只说明本轮已查来源无匹配；不代表 DOI 前缀未获分配、文献不存在或造假。仅为用户要求且缺证的具体字段补证。"),
             source="fusion_surface+skill"))
     elif legacy:
         rows.append(CapabilityRow(

@@ -14,6 +14,7 @@ from langchain_core.tools import tool
 
 from src.core.tool_errors import ToolArgumentError
 from src.figures.nature_receipts import current_qa_summary
+from src.figures.script_outputs import output_contract_schema
 
 # The formats a figure project carries. SVG is the primary one because its
 # text stays real text; PNG and PDF are what a journal asks for.
@@ -190,7 +191,11 @@ def _run_research_figure_script(
     emit.table的单元格须为标量（字符串、数值、布尔或空），dict/list应拆列或显式编码为JSON字符串。
     用户要求图件时声明至少一张图，实际导出并登记后才有交付凭据。
     纯探索/整理可声明空figures，emit.report返回有界观察；中间表不作默认附件，
-    下一执行使用返回的dataset_ref；一次执行也可整理并绘图，不机械分步。
+    下一执行可用 dataset_ref。图型与字段已经明确时，第一次调用就声明用户所需的真实 figures 和导出格式，
+    同一调用内读表、整理、渲染、QA、导出；不要先单独做只冻结表或只统计的运行。
+    主 script 使用 inputs_json 的实际键名（绑 tidy 就用 tidy），不默认有 data 字典；
+    只有独立 render_script 的 data 才是冻结表映射。图件条目不接受 render_script_ref。
+    没有 outputs_json 时为旧单图模式，仅构造一个 Figure，不可调用 emit。
     用户已指定 Python 或图型时直接沿用，只有影响科学含义的未知选择才询问。
     有匹配的内置模板时优先按引用和参数执行，仅传必要参数。
     需要样本量时由绘图脚本 emit.report 记录 rows_read、rows_plotted、rows_excluded、n_per_group。
@@ -708,7 +713,7 @@ class FigureScriptArgs(BaseModel):
     inputs_json: _FigureObject = Field(default_factory=str)
     qa_profile_json: _FigureObject = Field(default_factory=str)
     analysis_result_ref_json: _FigureObject = Field(default_factory=str)
-    outputs_json: _FigureObject = Field(default_factory=str)
+    outputs_json: Annotated[dict | str, WithJsonSchema(output_contract_schema())] = Field(default_factory=str)
     script_ref_json: _FigureObject = Field(default_factory=str)
     parameters_json: _FigureObject = Field(default_factory=str)
     repair_from_run_id: str = ""
@@ -730,8 +735,8 @@ def run_research_figure_script(
     # Repair options are inherited from a retained run by script_runtime and
     # checked again by the execution adapter before snapshotting or dispatch.
     from src.figures.spec import parse_qa_profile
-    from src.figures.script_outputs import (RenderScriptEmitUnavailable,
-                                            normalize_output_contract)
+    from src.figures.script_outputs import (MainScriptBindingUnavailable, RenderScriptEmitUnavailable,
+                                            normalize_output_contract, validate_main_script_bindings)
     mode_value = str(mode or "script").strip().lower()
     compiled = None
     if mode_value not in {"script", "template"}:
@@ -764,8 +769,12 @@ def run_research_figure_script(
         title = str(title or "").strip() or compiled.template_id
     try:
         parse_qa_profile(_json_arg(qa_profile_json, "qa_profile_json"))
-        normalize_output_contract(_json_arg(outputs_json, "outputs_json"))
+        contract = normalize_output_contract(_json_arg(outputs_json, "outputs_json"))
         _requested_formats(formats_json)
+        if script and not repair_from_run_id and not script_ref_json:
+            bindings = _json_arg(inputs_json, "inputs_json") or {}
+            if isinstance(bindings, dict):
+                validate_main_script_bindings(script, contract, bindings, analysis_input=bool(analysis_result_ref_json))
     except (ValueError, TypeError) as exc:
         if isinstance(exc, RenderScriptEmitUnavailable):
             # Pure, repeatable rejection: no script save, run reservation or
@@ -778,6 +787,8 @@ def run_research_figure_script(
         else:
             payload = {"error": f"绘图参数未通过执行前校验：{exc}", "_tool_outcome": {
                 "status": "not_run", "reason_code": "script_execution_rejected", "artifacts": []}}
+        if isinstance(exc, MainScriptBindingUnavailable):
+            payload["error_code"] = exc.reason_code
         from src.research.script_reconciliation import observe_preflight_rejection
         observe_preflight_rejection(payload)
         return json.dumps(payload, ensure_ascii=False), payload

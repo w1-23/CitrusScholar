@@ -277,12 +277,14 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                     name = 'analysis_' + name
                 saved = assets.save_script(owner, session, name=name, source=script)
             phase = "source_persisted"
-            from src.figures.script_outputs import normalize_output_contract
+            from src.figures.script_outputs import MainScriptBindingUnavailable, normalize_output_contract, validate_main_script_bindings
             try:
                 contract = _object(kwargs.get("outputs_json"), "outputs_json")
                 if not contract and preset:
                     contract = preset["outputs"]
                 contract = normalize_output_contract(contract)
+                validate_main_script_bindings(saved["source"], contract, bindings,
+                    analysis_input=bool(kwargs.get("analysis_result_ref_json")))
             except ValueError as exc:
                 # Source persistence above has an acknowledged exact ref. This
                 # pure validation cannot have reserved a run, executed code or
@@ -295,6 +297,8 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                 if getattr(exc, "reason_code", "") == "render_script_emit_not_available":
                     payload["error"] = f"[RENDER_SCRIPT_EMIT_NOT_AVAILABLE] {exc}"
                     payload["error_code"] = "render_script_emit_not_available"
+                if isinstance(exc, MainScriptBindingUnavailable):
+                    payload["error_code"] = exc.reason_code
                 content, payload = receipt(str(exc), payload)
                 from src.research.script_reconciliation import observe_preflight_rejection
                 observe_preflight_rejection(payload)

@@ -13,7 +13,8 @@ again ("每次绘图SVG都需要反复安全校验").
 With this registry the tool result is a handful of tokens: it stores the
 sanitized markup and returns a ``[[FIGURE:n]]`` placeholder.  The graph expands
 the placeholder once, after the answer is complete, so the browser receives
-exactly the markup that passed validation and the model never retypes it.
+exactly the markup that passed validation and the model never retypes it. Verified downloadable figures can instead use the existing
+protected File Library preview without pasting SVG into chat history.
 
 Concurrency
 -----------
@@ -161,8 +162,8 @@ def reserve_legacy_indices(texts) -> None:
         registry.attempts = max(registry.attempts, occupied)
 
 
-def expand(text: str) -> str:
-    """Replace every placeholder with the fenced SVG block it stands for."""
+def expand(text: str, *, verified_previews: dict[int, str] | None = None) -> str:
+    """Expand placeholders, using a protected preview when proven by the caller."""
     if not text or "[[" not in text:
         return text
     store = snapshot()
@@ -181,7 +182,13 @@ def expand(text: str) -> str:
             url = figure[key]
             if url and re.fullmatch(pattern, url):
                 links.append(f"[{label}]({url})")
-        markdown = f"```svg\n{figure['svg']}\n```"
+        preview = (verified_previews or {}).get(int(match.group(1)), "")
+        if re.fullmatch(r"/api/v2/files/[a-f0-9]{32}/preview", preview):
+            alt = re.sub(r"[\x00-\x1f\x7f]", " ", figure["alt"][:160]).strip() or "图示"
+            alt = re.sub(r"([\\\[\]`*_<>!])", r"\\\1", alt)
+            markdown = f"![{alt}]({preview})"
+        else:
+            markdown = f"```svg\n{figure['svg']}\n```"
         return markdown + ("\n\n" + " · ".join(links) if links else "")
 
     return PLACEHOLDER_RE.sub(_sub, text)

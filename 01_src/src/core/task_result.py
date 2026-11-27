@@ -108,10 +108,9 @@ def _acceptance(status: str, failures: tuple[str, ...],
     return TaskAcceptance("not_evaluated", "no_explicit_acceptance_criteria")
 
 
-def _operation_identity(row):
-    name = str(row.get("name") or row.get("tool_name") or "tool")
-    key = str(row.get("logical_key") or "")
-    receipt = row.get("op_receipt") or {}
+def _script_repair_receipt(row):
+    name = row.get("name") or row.get("tool_name")
+    receipt = row.get("op_receipt")
     repair = receipt.get("repair_identity") if isinstance(receipt, dict) else None
     if (name == "run_research_figure_script" and isinstance(repair, str)
             and len(repair) == 64 and all(c in "0123456789abcdef" for c in repair)
@@ -121,8 +120,61 @@ def _operation_identity(row):
             and receipt.get("status") == row.get("status")
             and row.get("status") in {"failed", "partial", "complete"}
             and receipt.get("reason_code") == (row.get("reason") or row.get("reason_code"))):
-        key = "script_repair:" + repair
+        return receipt
+    return None
+
+
+def _operation_identity(row):
+    name = str(row.get("name") or row.get("tool_name") or "tool")
+    key = str(row.get("logical_key") or "")
+    if receipt := _script_repair_receipt(row):
+        key = "script_repair:" + receipt["repair_identity"]
     return (name, key) if key and key != name else None
+
+
+def _figure_output_repair_resolutions(rows, effective):
+    """Link an attested undeclared table to a later independently verified repair."""
+    effective_calls = {row.get("tool_call_id") for row in effective}
+    missing, repaired = {}, {}
+    for row in rows:
+        cid = row.get("tool_call_id")
+        receipt = _script_repair_receipt(row)
+        if not cid or receipt is None:
+            continue
+        identity = receipt["repair_identity"]
+        projection = receipt.get("figure_output_repair")
+        if not isinstance(projection, dict):
+            continue
+        run, status, reason = receipt["run_id"], receipt["status"], receipt.get("reason_code")
+        if (status == "failed" and reason == "SCRIPT_ERROR" and set(projection) == {"missing"}
+                and not any(row.get(key) for key in ("artifact_count", "artifact_links", "artifact_validations"))):
+            entry = projection["missing"]
+            if isinstance(entry, dict) and len(entry) == 1:
+                name, key = next(iter(entry.items()))
+                if isinstance(name, str) and isinstance(key, str):
+                    missing.setdefault((name, key), []).append((cid, run, identity))
+        elif (cid in effective_calls and status == "complete" and reason == "figure_published"
+              and set(projection) == {"added"} and isinstance(projection["added"], dict)):
+            validations = row.get("artifact_validations") or ()
+            coverage = receipt.get("coverage")
+            outcome = coverage.get("_tool_outcome") if isinstance(coverage, dict) else None
+            artifacts = outcome.get("artifacts") if isinstance(outcome, dict) else None
+            if (not isinstance(artifacts, (list, tuple)) or not artifacts
+                    or not all(isinstance(link, str) and link for link in artifacts)
+                    or len(artifacts) != row.get("artifact_count")
+                    or len(validations) != len(artifacts)
+                    or not all(isinstance(item, dict) and item.get("valid") is True
+                               and item.get("request_matches") is True and item.get("link")
+                               for item in validations)
+                    or {item["link"] for item in validations} != set(artifacts)):
+                continue
+            for name, key in projection["added"].items():
+                if not isinstance(name, str) or not isinstance(key, str):
+                    continue
+                for old_cid, old_run, old_identity in missing.get((name, key), ()):
+                    if old_cid != cid and old_run != run and old_identity != identity:
+                        repaired[old_cid] = cid
+    return repaired
 
 
 def _browse_retry_resolutions(rows):
@@ -199,7 +251,8 @@ def resolved_tool_attempts(rows: Iterable[dict], turn_outcome=None) -> list[dict
     current = {_operation_identity(row): row for row in effective
                if _operation_identity(row) is not None}
     links = {cid: {'tool_call_id': cid, 'resolved_by_tool_call_id': target, 'resolution': 'repaired'}
-             for cid, target in (_browse_retry_resolutions(attempts) | _literature_coverage_resolutions(attempts)).items()}
+             for cid, target in (_browse_retry_resolutions(attempts) | _literature_coverage_resolutions(attempts)
+                                 | _figure_output_repair_resolutions(attempts, effective)).items()}
     for row in attempts:
         cid = row.get("tool_call_id")
         replacement = current.get(_operation_identity(row), {})
@@ -258,29 +311,37 @@ def effective_tool_records(rows: Iterable[dict]) -> list[dict]:
     }
     executed_keys = {identity(row) for row in rows
                      if identity(row) is not None and row.get("status") in executed_statuses}
-    effective: list[dict] = []
-    positions: dict[tuple[str, str], int] = {}
+
+    def latest(excluded):
+        effective: list[dict] = []
+        positions: dict[tuple[str, str], int] = {}
+        for row in rows:
+            if row.get('tool_call_id') in excluded:
+                continue
+            key = identity(row)
+            reason = str(row.get("reason") or row.get("reason_code") or "")
+            reused = (str(row.get("name") or row.get("tool_name") or "tool"),
+                      str(row.get("reused_from_tool_call_id") or ""))
+            if (row.get("status") == "skipped" and reason == "duplicate_request"
+                    and (reused in executed_ids or key in executed_keys)):
+                continue
+            if key is None:
+                effective.append(row)
+                continue
+            position = positions.get(key)
+            if position is None:
+                positions[key] = len(effective)
+                effective.append(row)
+            elif attempt(row) >= attempt(effective[position]):
+                effective[position] = row
+        return effective
+
     resolved = _browse_retry_resolutions(rows) | _literature_coverage_resolutions(rows)
-    for row in rows:
-        if row.get('tool_call_id') in resolved:
-            continue
-        key = identity(row)
-        reason = str(row.get("reason") or row.get("reason_code") or "")
-        reused = (str(row.get("name") or row.get("tool_name") or "tool"),
-                  str(row.get("reused_from_tool_call_id") or ""))
-        if (row.get("status") == "skipped" and reason == "duplicate_request"
-                and (reused in executed_ids or key in executed_keys)):
-            continue
-        if key is None:
-            effective.append(row)
-            continue
-        position = positions.get(key)
-        if position is None:
-            positions[key] = len(effective)
-            effective.append(row)
-        elif attempt(row) >= attempt(effective[position]):
-            effective[position] = row
-    return effective
+    effective = latest(resolved)
+    output_repairs = _figure_output_repair_resolutions(rows, effective)
+    # Remove only attested failures, then reselect the latest remaining
+    # attempt so an unrelated error on the same exact key cannot disappear.
+    return latest(resolved | output_repairs) if output_repairs else effective
 
 
 def incidental_partial_candidate(row: dict) -> bool:

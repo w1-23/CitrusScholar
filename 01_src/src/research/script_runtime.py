@@ -218,8 +218,10 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
         if warning:
             payload['run_record'] = warning
             content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-        from src.research.script_reconciliation import finalize_failed_worker
+        from src.research.script_reconciliation import finalize_failed_worker, finalize_output_contract
         finalize_failed_worker(owner, session, run, payload, warning)
+        finalize_output_contract(owner, session, run, payload, warning,
+            snapshots=context.get("input_snapshots"), environment=environment)
         return content, payload
 
     try:

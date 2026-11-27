@@ -441,3 +441,50 @@ def test_signed_workbench_machine_reads_and_browser_guard_are_separate(host):
         assert local.get(asset_path, headers=assertion(key, asset_path)).status_code == 401
     with TestClient(app, base_url=f"http://{authority}", client=("192.0.2.55", 5000)) as remote:
         assert remote.get(asset_path, headers=assertion(key, asset_path)).status_code == 400
+
+
+
+def test_styled_frozen_response_is_version_bound(host, monkeypatch):
+    from src.figures import workbench_source as source
+
+    client, key, _, _, _ = host
+    ref = "2" * 32
+    base = f"{wire.FROZEN_BUNDLE_PATH}/{ref}"
+    path = base + "/v2/2"
+    monkeypatch.delenv("CITRUS_WORKBENCH_STYLED_IMPORT", raising=False)
+    assert client.get(path, headers=assertion(key, path)).status_code == 404
+    monkeypatch.setenv("CITRUS_WORKBENCH_STYLED_IMPORT", "1")
+    script, data, style = b"fig = None\n", b"{}", b'{"fixture":"style"}'
+    sha = lambda body: hashlib.sha256(body).hexdigest()
+    prepared = []
+
+    def prepare(*, figure_id, owner, session, render_version=1):
+        prepared.append((figure_id, owner, session, render_version))
+        return source.FrozenScriptBundle(script.decode(), sha(script),
+            (source.FrozenInput("tidy", "input_0.json", sha(data), data),), render_version,
+            style if render_version > 1 else None)
+
+    monkeypatch.setattr(source, "prepare_frozen_bundle", prepare)
+    assert client.get(path, headers=assertion(key, base + "/1")).status_code == 401
+    assert client.get(path, headers=assertion(key, base + "/v2/3")).status_code == 401
+    invalid = base + "/v2/02"
+    assert client.get(invalid, headers=assertion(key, invalid)).status_code == 404
+    assert prepared == []
+    for uri, version, media in ((base + "/1", 1, wire.FROZEN_BUNDLE_MEDIA), (path, 2, wire.FROZEN_STYLE_MEDIA)):
+        response = client.get(uri, headers=assertion(key, uri))
+        assert response.status_code == 200 and response.headers["content-type"] == media
+        length = int.from_bytes(response.content[:4], "big")
+        info = json.loads(response.content[4:4+length])
+        assert info["version"] == version
+        if version == 2:
+            assert info["render_version"] == 2 and info["style"] == {"size": len(style), "sha256": sha(style)}
+        else:
+            assert set(info) == {"version", "language", "renderer", "inputs"}
+        assert response.content[4+length:] == script + data + (style if version == 2 else b"")
+    assert prepared == [(ref, OWNER, SESSION, 1), (ref, OWNER, SESSION, 2)]
+    opened = client.post(LAUNCH, cookies={"citrus_auth": "test-browser-session"},
+                         json={"session_ref": SESSION, "frozen_project": ref, "frozen_render_version": 2})
+    assert opened.status_code == 200
+    claims = json.loads(_unb64(opened.json()["launch_ticket"].split(".", 1)[0]))
+    assert claims["frozen_render_version"] == 2 and claims["frozen_project"] == ref
+    assert prepared[-1] == (ref, OWNER, SESSION, 2)

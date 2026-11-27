@@ -3942,15 +3942,20 @@ function attachTurnFileDownload(card, url) {
 
 function attachTurnWorkbench(card, asset, session, seen) {
   var ref = asset && asset.workbench_project_ref;
+  var version = asset && asset.workbench_render_version !== undefined ? asset.workbench_render_version : 1;
+  var key = ref + ':' + version;
   if (!asset || !safeProductUrl(asset.url, true) || !/^[a-f0-9]{32}$/.test(ref || '') ||
-      !/^[A-Za-z0-9_-]{8,128}$/.test(session || '') || seen.has(ref)) return;
+      !/^[A-Za-z0-9_-]{8,128}$/.test(session || '') || !Number.isInteger(version) ||
+      version < 1 || version > 999999999 || seen.has(key)) return;
   var link = document.createElement('a');
   link.className = 'turn-file-workbench';
   link.dataset.project = ref;
-  link.href = '/figures?session_ref=' + encodeURIComponent(session) + '&frozen_project=' + ref;
+  link.dataset.renderVersion = String(version);
+  link.href = '/figures?session_ref=' + encodeURIComponent(session) + '&frozen_project=' + ref +
+    (version === 1 ? '' : '&frozen_render_version=' + version);
   link.textContent = '在工作台打开';
   card.appendChild(link);
-  seen.add(ref);
+  seen.add(key);
 }
 
 function appendTurnGeneratedFiles(content, files) {
@@ -3984,7 +3989,7 @@ function appendTurnGeneratedFiles(content, files) {
   }
   var added = 0;
   var seen = new Map();
-  var workbenchProjects = new Set(Array.from(section.querySelectorAll('.turn-file-workbench'), function (link) { return link.dataset.project; }));
+  var workbenchProjects = new Set(Array.from(section.querySelectorAll('.turn-file-workbench'), function (link) { return link.dataset.project + ':' + (link.dataset.renderVersion || '1'); }));
   host.querySelectorAll('.turn-file-card').forEach(function(existing) {
     seen.set(String(existing.dataset.fileId || ''), existing);
   });

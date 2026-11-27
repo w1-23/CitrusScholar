@@ -118,3 +118,23 @@ test('verified formats expose one exact Workbench action for their common render
   assert.equal(links.length,1);
   assert.equal(links[0].href,`/figures?session_ref=${sid}&frozen_project=${project}`);
 });
+
+test('verified edited formats expose one exact and versioned Workbench action', () => {
+  const b = browser();
+  const content = b.ctx.addMessage('bot','');
+  const sid = 'session-one', project = 'c'.repeat(32);
+  content.dataset.sessionId = sid;
+  content.dataset.requestId = 'turn';
+  const files = ['png','pdf'].map((fmt, i) => ({file_id:'out-'+i, artifact_id:String(i+1).repeat(32),
+    filename:'plot.'+fmt, source_session_id:sid, turn_request_id:'turn'}));
+  b.ctx.appendTurnGeneratedFiles(content,files);
+  assert.equal(assistant(b)[0].querySelector('.turn-file-workbench'), null);
+  b.ctx.renderArtifactDelivery(content,{schema_version:'artifact-delivery/1',status:'verified',
+    artifacts:files.map(file=>({asset_ref:file.artifact_id,
+      url:`/api/v2/session/${sid}/artifacts/${file.artifact_id}`, workbench_project_ref:project, workbench_render_version:2}))});
+  b.ctx.appendTurnGeneratedFiles(content,files);
+  b.ctx.appendTurnGeneratedFiles(content,files);
+  const links = assistant(b)[0].querySelectorAll('.turn-file-workbench');
+  assert.equal(links.length,1);
+  assert.equal(links[0].href,`/figures?session_ref=${sid}&frozen_project=${project}&frozen_render_version=2`);
+});

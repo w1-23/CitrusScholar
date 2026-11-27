@@ -16,7 +16,9 @@ _SHA = re.compile(r"[0-9a-f]{64}")
 def _render_receipts(rows, messages):
     """Never infer a render from filenames or merge assets across tool calls."""
     for row in rows:
-        if row.get("name") != _FIGURE_TOOL or row.get("inherited_from_job_id"):
+        edited = (row.get("name") == "research_workspace" and row.get("status") == "complete"
+                  and row.get("reason") == "figure_edit_saved")
+        if (row.get("name") != _FIGURE_TOOL and not edited) or row.get("inherited_from_job_id"):
             continue
         artifact = getattr(messages.get(row.get("tool_call_id")), "artifact", None)
         if not isinstance(artifact, dict):
@@ -35,10 +37,11 @@ def _render_receipts(rows, messages):
             tested = "failed" if qa_failed else "passed" if qa and row.get("status") == "complete" else "not_verified"
             for export in figure.get("exports") or ():
                 if isinstance(export, dict) and export.get("artifact_id"):
-                    yield export["artifact_id"], figure.get("figure_id"), export, tested
+                    yield export["artifact_id"], figure.get("figure_id"), export, tested, (
+                        figure.get("render_version") if edited else 1)
 
 
-def _render_metadata(owner, session, project_id, export, checksum, lookup):
+def _render_metadata(owner, session, project_id, export, checksum, lookup, revision=1):
     if not isinstance(project_id, str) or not _ID.fullmatch(project_id):
         return {}
     try:
@@ -54,9 +57,25 @@ def _render_metadata(owner, session, project_id, export, checksum, lookup):
             or registered.get("sha256") != checksum):
         return {}
     result = {"render_id": key} if isinstance(key, str) and _ID.fullmatch(key) else {}
+    frozen = (project.get("source_json") or {}).get("frozen_render")
     if (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1" and project.get("session_id") == session
-            and project.get("source_kind") == "script" and project.get("render_version") == 1
-            and isinstance((project.get("source_json") or {}).get("frozen_render"), dict)):
+            and project.get("source_kind") == "script" and type(revision) is int
+            and 1 <= revision <= 999_999_999 and project.get("render_version") == revision
+            and isinstance(frozen, dict)):
+        if revision > 1:
+            if os.getenv("CITRUS_WORKBENCH_STYLED_IMPORT") != "1":
+                return result
+            from src.figures.projects import ProjectError
+            from src.figures.workbench_source import _saved_style
+
+            receipt = frozen.get("receipt")
+            if not isinstance(receipt, dict):
+                return result
+            try:
+                _saved_style(project, receipt)
+            except ProjectError:
+                return result
+            result["workbench_render_version"] = revision
         result["workbench_project_ref"] = project_id
     return result
 
@@ -71,7 +90,8 @@ def build_delivery(*, identity, request_id, rows, messages, requirements=(), sel
         for item in row.get("artifact_validations", ()) if item.get("link") and item.get("request_matches") is True))
     result = verified if verified is not None else (validate(links, session_id=identity.session_id,
              owner_user_id=identity.owner_user_id, request_id=request_id) if links else [])
-    receipts = {asset_id: (project_id, export, qa) for asset_id, project_id, export, qa in _render_receipts(rows, messages)}
+    receipts = {asset_id: (project_id, export, qa, revision)
+                for asset_id, project_id, export, qa, revision in _render_receipts(rows, messages)}
     selected = set(select_links) if select_links is not None else None
     assets, unavailable, seen = [], 0, set()
     for ref in result:
@@ -90,10 +110,11 @@ def build_delivery(*, identity, request_id, rows, messages, requirements=(), sel
                  "sha256": checksum, "size_bytes": ref["size_bytes"], "url": link,
                  "validation": {"status": "passed", "checks": ["stored_bytes", "sha256", "format", "owner", "turn"]}}
         if asset_id in receipts:
-            project_id, export, qa = receipts[asset_id]
+            project_id, export, qa, revision = receipts[asset_id]
             asset["qa_status"] = qa
             asset["render_id"] = None
-            asset.update(_render_metadata(identity.owner_user_id, identity.session_id, project_id, export, checksum, project_lookup))
+            asset.update(_render_metadata(identity.owner_user_id, identity.session_id, project_id, export,
+                                          checksum, project_lookup, revision))
         assets.append(asset)
     if not assets and not unavailable and not requirements and not delivery_uncertain:
         return {"status": "none", "verified_file_ids": [], "unavailable_count": 0}

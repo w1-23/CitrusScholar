@@ -10,6 +10,11 @@
   const post = (url, value) => fetch(url, {method: 'POST', credentials: 'same-origin',
     redirect: 'error', cache: 'no-store', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(value)});
   try {
+    const revision = params.get('frozen_render_version');
+    if (revision !== null) {
+      if (!input.frozen_project || !/^[1-9][0-9]{0,8}$/.test(revision)) throw new Error('version');
+      input.frozen_render_version = Number(revision);
+    }
     const opened = await post('/api/internal/workbench/open', input);
     if (!opened.ok) throw new Error('open');
     const data = await opened.json();

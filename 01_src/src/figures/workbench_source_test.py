@@ -58,6 +58,42 @@ def test_workbench_bundle_reads_only_the_frozen_source_and_exact_registered_tabl
         with pytest.raises(ProjectError) as error:
             prepare_frozen_bundle(figure_id=key, owner=wrong_owner, session=wrong_sid)
         assert error.value.status == 404
+    # The stored script reproduces the initial render, not subsequent style edits.
+    initial = store.get_project(key, owner)
+    with monkeypatch.context() as changed:
+        changed.setattr(store, "get_project", lambda *args: {
+            **initial, "render_version": 2,
+            "overrides_json": [{"gid": "fixture-title", "prop": "text", "value": "Changed"}],
+        })
+        with pytest.raises(ProjectError) as error:
+            prepare_frozen_bundle(figure_id=key, owner=owner, session=sid)
+        assert error.value.status == 409
+    from citrus_figures.style_replay import typed_payload_sha256
+    baseline = {"version": 1, "baseline_sha256": "1" * 64,
+                "coordinates_sha256": "2" * 64, "targets_sha256": "3" * 64}
+    overrides = [{"gid": "axes_0.title", "prop": "text", "value": "New"}]
+    proof = {"coordinates_sha256": "2" * 64, "overrides_sha256": typed_payload_sha256(overrides)}
+    edited_source = {**initial["source_json"], "frozen_render": {
+        **frozen, "receipt": {**frozen["receipt"], "style_replay": baseline}}}
+    edited = {**initial, "render_version": 2, "source_json": edited_source,
+              "overrides_json": overrides, "manifest_json": {"style_replay_proof": proof}}
+    with monkeypatch.context() as change:
+        change.setattr(store, "get_project", lambda *args: edited)
+        versioned = prepare_frozen_bundle(figure_id=key, owner=owner, session=sid, render_version=2)
+        assert versioned.render_version == 2 and versioned.renderer == text
+        assert json.loads(versioned.style_json) == {"baseline": baseline, "overrides": overrides,
+                                                    "overrides_sha256": proof["overrides_sha256"]}
+        assert versioned.inputs == bundle.inputs
+        for current, requested in ((edited, 1), (edited, 3), ({**edited, "overrides_json": [
+                {**overrides[0], "value": "tampered"}]}, 2)):
+            change.setattr(store, "get_project", lambda *args: current)
+            with pytest.raises(ProjectError) as error:
+                prepare_frozen_bundle(figure_id=key, owner=owner, session=sid, render_version=requested)
+            assert error.value.status == 409
+        snapshots = iter((edited, {**edited, "render_version": 3}))
+        change.setattr(store, "get_project", lambda *args: next(snapshots))
+        with pytest.raises(ProjectError, match="重新打开"):
+            prepare_frozen_bundle(figure_id=key, owner=owner, session=sid, render_version=2)
     ref = frozen["input_snapshots"][0]["file_id"]
     stored = files.get_account_file(ref, owner, allow_internal=True, touch=False)
     Path(stored["path"]).write_bytes(b"!" + payload[1:])

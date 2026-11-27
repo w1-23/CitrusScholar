@@ -5,6 +5,7 @@ import base64
 import binascii
 import hmac
 import json
+import os
 import re
 import time
 from uuid import uuid4
@@ -15,11 +16,17 @@ ASSET_LIMIT = 12 * 1024 * 1024
 ASSETS_PATH = "/_internal/workbench/assets"
 FROZEN_BUNDLE_PATH = "/_internal/workbench/frozen-bundles"
 FROZEN_BUNDLE_MEDIA = "application/vnd.citrus.frozen-script-v1"
+FROZEN_STYLE_MEDIA = "application/vnd.citrus.frozen-script-v2"
+FROZEN_REVISION = r"[1-9][0-9]{0,8}"
 FROZEN_BUNDLE_HEADER_LIMIT = 8192
 _LAUNCH = "citrus-workbench-launch"
 _RESOURCE = "workbench-resource"
 _RESOURCE_AUDIENCE = "citrus-resource-api"
 _COMPONENT = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def styled_import_enabled() -> bool:
+    return os.getenv("CITRUS_WORKBENCH_STYLED_IMPORT") == "1"
 
 
 def _encode(data: bytes) -> str:
@@ -36,7 +43,7 @@ def _mac(key: bytes, purpose: str, payload: str) -> bytes:
 
 
 def launch_ticket(key: bytes, audience: str, owner: int, session: str,
-                  assets: list[str], *, frozen_project: str = "") -> str:
+                  assets: list[str], *, frozen_project: str = "", frozen_render_version: int = 1) -> str:
     claims = {
         "iss": _LAUNCH,
         "aud": audience,
@@ -49,6 +56,8 @@ def launch_ticket(key: bytes, audience: str, owner: int, session: str,
     }
     if frozen_project:
         claims["frozen_project"] = frozen_project
+        if frozen_render_version > 1:
+            claims["frozen_render_version"] = frozen_render_version
     payload = _encode(json.dumps(claims, separators=(",", ":")).encode())
     return f"{payload}.{_encode(_mac(key, _LAUNCH, payload))}"
 

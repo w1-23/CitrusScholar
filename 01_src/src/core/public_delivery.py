@@ -344,8 +344,12 @@ def project_artifact_delivery(value):
             return {}
         validation = _object(item.get("validation"))
         ref = item.get("workbench_project_ref")
-        if isinstance(ref, str) and re.fullmatch(r"[a-f0-9]{32}", ref) and validation.get("status") == "passed":
+        version = item.get("workbench_render_version", 1)
+        if (isinstance(ref, str) and re.fullmatch(r"[a-f0-9]{32}", ref) and validation.get("status") == "passed"
+                and type(version) is int and 1 <= version <= 999_999_999):
             fields["workbench_project_ref"] = ref
+            if version > 1:
+                fields["workbench_render_version"] = version
         fields.update(url=url, validation={"status": project_fields(validation, ids="status").get("status", ""),
                                            "checks": _ids(validation.get("checks"))})
         return fields

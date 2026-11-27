@@ -5349,7 +5349,9 @@ def _runtime_snapshot(state):
 
 
 def _readiness_requirements():
-    return {"full": os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1",
+    from src.corpus_integration.settings import unified_enabled
+
+    return {"external_corpus": unified_enabled(), "full": os.getenv("CITRUS_LOCAL_FULL_STARTUP") == "1",
             "worker_required": os.getenv("CITRUS_REQUIRE_FIGURE_WORKER", "0").strip().lower()
             in {"1", "true", "yes", "on"}}
 

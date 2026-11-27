@@ -297,3 +297,17 @@ def test_web_figure_selection_recovers_and_skips_redundant_pinned_probe(monkeypa
         main.app.state.worker_evidence.publish({"backend": "apptainer", "verified": False})
         assert not script_sandbox_available()
         assert sandbox.select_backend(**options) is None
+
+
+def test_unified_readiness_does_not_require_legacy_host_models_or_corpus():
+    from src.runtime_status import public_readiness, required_capabilities_ready
+
+    evidence = dict(stores=True, retrieval=False, models=main._UNVERIFIED_MODELS,
+                    worker={"verified": True}, agent={"ready": True}, figure_skill={"prompt_loaded": True},
+                    full=True, worker_required=True, external_corpus=True)
+    assert required_capabilities_ready(**evidence)
+    diag = public_readiness(**evidence, model_configured=True)
+    assert not diag['capabilities']['local_retrieval']['ready']
+    assert public_readiness(**{**evidence, "retrieval": True}, model_configured=True)['capabilities']['local_retrieval']['ready']
+    assert not required_capabilities_ready(**{**evidence, "external_corpus": False})
+    assert not required_capabilities_ready(**{**evidence, "worker": {"verified": False}})

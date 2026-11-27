@@ -107,31 +107,32 @@ def complete_model_evidence(status):
 
 
 def required_capabilities_ready(*, stores, retrieval, models, worker, agent, figure_skill,
-                                full=False, worker_required=False):
+                                full=False, worker_required=False, external_corpus=False):
     if not stores or not agent.get("ready"):
         return False
-    if full and not (retrieval and models.get("ready") and complete_model_evidence(models)
-                     and figure_skill.get("prompt_loaded")):
+    if full and not external_corpus and not (retrieval and models.get("ready") and complete_model_evidence(models)
+                                             and figure_skill.get("prompt_loaded")):
         return False
     return not worker_required or bool(worker.get("verified") and figure_skill.get("prompt_loaded"))
 
 
 def public_readiness(*, stores, retrieval, models, worker, agent, figure_skill,
-                     model_configured, full=False, worker_required=False, version=""):
+                     model_configured, full=False, worker_required=False, external_corpus=False, version=""):
     """Optional capabilities do not determine basic service availability."""
     model_ready = bool(models.get("ready"))
     if full:
         model_ready = model_ready and complete_model_evidence(models)
+    retrieval_ready = bool(retrieval and (external_corpus or model_ready))
     worker_ready = bool(worker.get("verified"))
     figure_ready = bool(figure_skill.get("prompt_loaded"))
     ready = required_capabilities_ready(stores=stores, retrieval=retrieval, models=models, worker=worker,
                                         agent=agent, figure_skill=figure_skill, full=full,
-                                        worker_required=worker_required)
+                                        worker_required=worker_required, external_corpus=external_corpus)
     capabilities = {
         "chat": {"ready": bool(agent.get("ready") and model_configured),
                  "reason_code": "ready" if model_configured else "model_credential_unconfigured"},
-        "local_retrieval": {"ready": bool(retrieval and model_ready),
-                            "reason_code": "ready" if retrieval and model_ready else "retrieval_unavailable"},
+        "local_retrieval": {"ready": retrieval_ready,
+                            "reason_code": "ready" if retrieval_ready else "retrieval_unavailable"},
         "figure_worker": {"ready": worker_ready, "required": worker_required,
                           "reason_code": "ready" if worker_ready else "worker_unavailable"},
     }

@@ -386,6 +386,7 @@ _DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\]\[<>\"']+", re.I)
 
 _RACE_PARALLEL = 2
 _RACE_DEADLINE_SECONDS = 20.0
+_OFFICIAL_PROOF_GRACE_SECONDS = 0.75
 _RACE_VALID_MIN_CHARS = 1500
 _RACE_ABSTRACT_MIN_CHARS = 200
 _SECTION_MARKERS = re.compile(
@@ -696,13 +697,16 @@ async def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
     from citrus_refcheck.providers import norm_title
     from src.core.cancel import ToolCancelled, current_token, raise_if_cancelled
     from src.core.corpus_review import MAX_ARCHIVE_BYTES, MIN_CONTENT_CHARS
+    from src.corpus_integration.selfcorpus_intake import eligible
     from src.shared_corpus.pmc import licensed_full_text_async, source_identity
 
     queue: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     inflight: dict[asyncio.Task, tuple[str, str, float]] = {}
     metadata: dict = {}
-    winner = official = None
+    winner = official = foreground_winner = None
+    grace_until = deadline
+    prefer_proof = bool(target_doi or target_pmid) and eligible()
     bound_token = current_token()
 
     def enqueue(routes: list[tuple[str, str]], *, front: bool = False) -> None:
@@ -747,19 +751,22 @@ async def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
         try:
             while (inflight or queue) and winner is None:
                 raise_if_cancelled("fetch_paper_sources")
-                while queue and len(inflight) < _RACE_PARALLEL and time.monotonic() < deadline:
+                while (foreground_winner is None and queue and len(inflight) < _RACE_PARALLEL
+                       and time.monotonic() < deadline):
                     url, kind = queue.pop(0)
                     task = asyncio.create_task(fetch_one(client, url, kind))
                     inflight[task] = (url, kind, time.monotonic())
-                remaining = deadline - time.monotonic()
-                if not inflight or remaining <= 0:
+                waiting = [task for task, (_, kind, _) in inflight.items()
+                           if foreground_winner is None or kind == "pmc_cloud"]
+                remaining = grace_until - time.monotonic()
+                if not waiting or remaining <= 0:
                     break
                 # The registry may signal its shared token from another thread.
                 # Revisit that token even if every socket is still waiting.
                 wait_for = min(remaining, 0.05) if bound_token is not None else remaining
-                done, _ = await asyncio.wait(inflight, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(waiting, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
                 raise_if_cancelled("fetch_paper_sources")
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= grace_until:
                     break
                 if not done:
                     continue
@@ -806,9 +813,17 @@ async def _race_candidates(candidates: list[tuple[str, str]], deadline: float,
                             result, "" if pmcid_confirmed else doi, "" if pmcid_confirmed else target_title)
                     result.update(validity=status, validity_reason=reason)
                     if status == "valid":
-                        winner = result
+                        if prefer_proof and any(kind == "pmc_cloud" for _, kind, _ in inflight.values()):
+                            # Keep the completed vendor result, launch nothing new and let only
+                            # an already-running official proof replace it under the same deadline.
+                            foreground_winner = result
+                            grace_until = min(deadline, time.monotonic() + _OFFICIAL_PROOF_GRACE_SECONDS)
+                        else:
+                            winner = result
                         break
         finally:
+            if winner is None:
+                winner = foreground_winner
             # This runs on a winner, shared deadline, and host cancellation. In-flight
             # httpx operations are cancelled and cleaned up before returning.
             error = "cancelled_after_winner" if winner is not None else "race_deadline_exceeded"
@@ -836,6 +851,7 @@ def _fetch_attempt_line(index: int, item: dict) -> str:
 def _paper_fetch_bookkeeping(winner, official, attempts, candidates, abstract_only, doi_value, pmid_value, title):
     """Run local diagnostics and retention outside the async transport loop."""
     from src.core.cancel import raise_if_cancelled
+    from src.corpus_integration import selfcorpus_intake
     from src.shared_corpus.pmc import source_identity
 
     raise_if_cancelled("fetch_paper_record_result")
@@ -843,8 +859,10 @@ def _paper_fetch_bookkeeping(winner, official, attempts, candidates, abstract_on
     record_fetch_failures([item for item in attempts if not str(item.get("error", "")).startswith(
         ("cancelled_after_winner", "not_started_"))], doi=doi_value, title=title)
     metadata = _matched_paper_metadata(attempts, doi_value, pmid_value, title)
-    review_candidate = None
-    if not _legacy_corpus_enabled():
+    review_candidate = corpus_intake = None
+    if selfcorpus_intake.enabled():
+        corpus_intake = selfcorpus_intake.submit(official, doi=doi_value, pmid=pmid_value)
+    elif not _legacy_corpus_enabled():
         # A provider-rendered body is foreground evidence, never an original work for ingestion.
         original = official[0] if official else {}
         doi_key = doi_value or metadata.get("doi", "") or original.get("doi", "")
@@ -869,7 +887,7 @@ def _paper_fetch_bookkeeping(winner, official, attempts, candidates, abstract_on
             doi=metadata.get("doi") or doi_value, pmid=metadata.get("pmid") or pmid_value,
             title=metadata.get("title") or title or str(partial.get("title") or ""),
             url=source_url or str(metadata.get("url") or ""))
-    return review_candidate
+    return review_candidate, corpus_intake
 
 
 async def _paper_bookkeeping_in_thread(*args):
@@ -884,7 +902,9 @@ async def _paper_bookkeeping_in_thread(*args):
         return await asyncio.wrap_future(TOOL_EXECUTOR.submit(copy_context().run, _paper_fetch_bookkeeping, *args))
     except ExecutorSaturatedError:
         logger.warning("Paper Fetch local bookkeeping unavailable: tool_executor_saturated")
-        return None
+        from src.corpus_integration.selfcorpus_intake import enabled
+
+        return None, ({"status": "unavailable", "reason": "tool_executor_saturated"} if enabled() else None)
 
 
 @tool(response_format="content_and_artifact")
@@ -894,6 +914,7 @@ async def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
     if not _enabled("web_fetch"):
         return _disabled("web_fetch")
     from citrus_refcheck.providers import normalize_doi
+    from src.corpus_integration.selfcorpus_intake import eligible
     from src.shared_corpus.pmc import source_identity
 
     started = time.monotonic()
@@ -920,13 +941,24 @@ async def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
     if not candidates:
         return "[WEB_FETCH_ERROR] Provide at least one valid URL, DOI, PMID, or title.", {"web_results": []}
 
+    if (doi_value or pmid_value) and eligible():
+        # Start one known official route immediately instead of waiting for a
+        # vendor-rendered copy to advertise it. The same deadline still applies.
+        for url, kind in candidates:
+            if kind != "search_result":
+                continue
+            pmcid, version = source_identity(url)
+            if pmcid:
+                edition = f"{pmcid}.{version}" if version else pmcid
+                candidates.insert(0, (f"https://pmc.ncbi.nlm.nih.gov/articles/{edition}/", "pmc_cloud"))
+                break
     winner, official = await _race_candidates(candidates, deadline, doi_value, pmid_value, title, attempts)
     elapsed_ms = round((time.monotonic() - started) * 1000)
     if attempts and all(str(item.get("error", "")).startswith("blocked: ") for item in attempts):
         return ("[WEB_FETCH_BLOCKED] No candidate URL passed the public-target check.",
                 {"web_results": [], "fetch_attempts": attempts})
     abstract_only = [a for a in attempts if a.get("validity") == "abstract_only"]
-    review_candidate = await _paper_bookkeeping_in_thread(
+    review_candidate, corpus_intake = await _paper_bookkeeping_in_thread(
         winner, official, attempts, candidates, abstract_only, doi_value, pmid_value, title)
     lines: list[str] = []
     evidence = winner or (abstract_only[0] if abstract_only else None)
@@ -983,10 +1015,12 @@ async def deepseek_fetch_paper(doi: str = "", pmid: str = "", title: str = "",
              "attempts": len(attempts),
              "won": (winner or {}).get("url") or "",
              "chars_returned": len(str(body_item.get("content") or ""))}
-    return "\n".join(lines), {"web_results": web_rows, "fetch_status": fetch_status,
-                               "fetch_attempts": [{k: v for k, v in a.items() if k != "content"}
-                                                  for a in attempts],
-                               "fetch_stats": stats, "review_candidate": review_candidate}
+    artifact = {"web_results": web_rows, "fetch_status": fetch_status,
+                "fetch_attempts": [{k: v for k, v in a.items() if k != "content"} for a in attempts],
+                "fetch_stats": stats, "review_candidate": review_candidate}
+    if corpus_intake is not None:
+        artifact["corpus_intake"] = corpus_intake
+    return "\n".join(lines), artifact
 
 
 def _web_citation_ref() -> str:

@@ -605,9 +605,10 @@ def search_literature(query: str = "", doi: str = "", arxiv_id: str = "",
 
 def _submit_public_match(records, *, query, doi, arxiv_id, claimed_title):
     """Hand off only a positive registry match, never the user's query or claim."""
+    from src.corpus_integration.selfcorpus_search import enabled as selfcorpus_enabled
     from src.corpus_integration.settings import durable_intake_enabled
 
-    if not durable_intake_enabled() or arxiv_id or _LOOKUP_CONTEXT.get() is not None:
+    if selfcorpus_enabled() or not durable_intake_enabled() or arxiv_id or _LOOKUP_CONTEXT.get() is not None:
         return
     supplied = norm_title(claimed_title or query)
     matches = [record for record in records if not record["field_conflicts"] and

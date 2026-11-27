@@ -137,7 +137,9 @@ def external_module_bindings(config, binds):
     if not isinstance(values, dict) or set(values) != {'selfcorpus', 'workbench'}:
         raise ValueError('Invalid external modules')
     corpus, workbench = values['selfcorpus'], values['workbench']
-    if (not isinstance(corpus, dict) or set(corpus) != {'client_path', 'client_sha256', 'secret_file'}
+    keys = {'client_path', 'client_sha256', 'secret_file'}
+    if (not isinstance(corpus, dict) or not keys <= set(corpus) <= keys | {'auto_intake'}
+            or type(corpus.get('auto_intake', False)) is not bool
             or not isinstance(workbench, dict) or set(workbench) != {'secret_file'}):
         raise ValueError('Invalid external module configuration')
     client = Path(absolute(corpus['client_path']))
@@ -177,6 +179,8 @@ def external_module_bindings(config, binds):
            f'WORKBENCH_HOST_KEY_FILE={secrets[1]}', 'CITRUS_WORKBENCH_UPSTREAM=http://127.0.0.1:8062',
            'CITRUS_WORKBENCH_PUBLIC_URL=/workbench/workbench/',
            'CITRUS_WORKBENCH_LAUNCH_ENDPOINT=/workbench/api/v1/launch']
+    if corpus.get('auto_intake'):
+        env.append('CITRUS_SELFCORPUS_AUTO_INTAKE=1')
     return [(str(path), 'ro') for path in mounts], [arg for value in env for arg in ('--env', value)], [str(client)]
 
 

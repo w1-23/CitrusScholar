@@ -85,28 +85,32 @@ def _invalid_constant(_name):
     raise ValueError
 
 
-async def _post(origin, body, headers):
+async def _post(origin, body, headers, *, route=_ROUTE, accepted=(200,),
+                deadline=None, response_limit=None, include_status=False):
+    deadline = _DEADLINE if deadline is None else deadline
+    response_limit = _MAX_RESPONSE if response_limit is None else response_limit
     try:
-        async with asyncio.timeout(_DEADLINE), httpx.AsyncClient(
-            timeout=httpx.Timeout(_DEADLINE, connect=2.0), trust_env=False, follow_redirects=False,
+        async with asyncio.timeout(deadline), httpx.AsyncClient(
+            timeout=httpx.Timeout(deadline, connect=2.0), trust_env=False, follow_redirects=False,
         ) as client:
-            async with client.stream("POST", origin + _ROUTE, content=body, headers=headers) as response:
+            async with client.stream("POST", origin + route, content=body, headers=headers) as response:
                 if response.status_code in (401, 403):
                     raise SearchUnavailable("selfcorpus_access_denied")
-                if response.status_code != 200:
+                if response.status_code not in accepted:
                     raise SearchUnavailable("selfcorpus_unavailable")
                 if (response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                         != "application/json" or response.headers.get("Content-Encoding", "identity") != "identity"):
                     raise ValueError
                 length = response.headers.get("Content-Length")
-                if length is not None and (not length.isdecimal() or int(length) > _MAX_RESPONSE):
+                if length is not None and (not length.isdecimal() or int(length) > response_limit):
                     raise ValueError
                 raw = bytearray()
                 async for chunk in response.aiter_raw():
-                    if len(raw) + len(chunk) > _MAX_RESPONSE:
+                    if len(raw) + len(chunk) > response_limit:
                         raise ValueError
                     raw.extend(chunk)
-                return json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_fields, parse_constant=_invalid_constant)
+                data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_fields, parse_constant=_invalid_constant)
+                return (response.status_code, data) if include_status else data
     except (httpx.HTTPError, httpx.StreamError, TimeoutError):
         raise SearchUnavailable("selfcorpus_unavailable") from None
     except (ValueError, RecursionError):

@@ -48,6 +48,15 @@ def workbench_gateway(current_user):
         if not (resource == "workbench" or resource.startswith(("workbench/", "api/v1/")) and resource != "api/v1/standalone"):
             raise HTTPException(404, "Unknown Workbench route")
         headers = {key: request.headers[key] for key in ("accept", "content-type", "origin") if key in request.headers}
+        request_field = {"api/v1/assets": ("x-filename", 1024),
+                         "api/v1/preview-runs": ("idempotency-key", 128)}.get(resource)
+        if request.method == "POST" and request_field:
+            name, maximum = request_field
+            values = request.headers.getlist(name)
+            if len(values) > 1 or (values and not 1 <= len(values[0]) <= maximum):
+                raise HTTPException(400, "Invalid Workbench request metadata")
+            if values:
+                headers[name] = values[0]
         token = request.cookies.get(_WORKBENCH_COOKIE)
         proof = request.cookies.get(_BINDING_COOKIE, "")
         if (token and re.fullmatch(r"[a-zA-Z0-9_.~-]{1,8192}", token)

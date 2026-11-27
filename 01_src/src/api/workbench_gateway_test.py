@@ -17,9 +17,11 @@ def test_workbench_gateway_binds_issued_cookie_to_host_actor(monkeypatch, tmp_pa
     monkeypatch.setenv("WORKBENCH_HOST_KEY_FILE", str(keyfile))
     monkeypatch.setenv("CITRUS_WORKBENCH_UPSTREAM", "http://127.0.0.1:8062")
     seen = []
+    metadata = []
 
     def wire(request):
         seen.append((request.url.path, request.headers.get("cookie")))
+        metadata.append((request.headers.get("x-filename"), request.headers.get("idempotency-key")))
         if request.url.path == "/api/v1/launch":
             return httpx.Response(200, json={"ready": True}, headers={
                 "set-cookie": "workbench_session=issued-token; Path=/; Secure; HttpOnly; SameSite=Strict"})
@@ -41,6 +43,16 @@ def test_workbench_gateway_binds_issued_cookie_to_host_actor(monkeypatch, tmp_pa
         assert seen[-1] == ("/api/v1/launch", None)
         assert client.get("/workbench/api/v1/session").status_code == 200
         assert seen[-1] == ("/api/v1/session", "workbench_session=issued-token")
+        assert client.post("/workbench/api/v1/assets", content=b"print(1)",
+                           headers={"X-Filename": "drawing.py", "Idempotency-Key": "not-forwarded"}).status_code == 200
+        assert metadata[-1] == ("drawing.py", None)
+        assert client.post("/workbench/api/v1/preview-runs", json={},
+                           headers={"Idempotency-Key": "preview-test-key", "X-Filename": "not-forwarded"}).status_code == 200
+        assert metadata[-1] == (None, "preview-test-key")
+        before = len(seen)
+        assert client.post("/workbench/api/v1/preview-runs", json={},
+                           headers=[("idempotency-key", "key-one"), ("idempotency-key", "key-two")]).status_code == 400
+        assert len(seen) == before
         actor["user_id"] = 42
         assert client.get("/workbench/api/v1/session").status_code == 403
         assert seen[-1] == ("/api/v1/session", None)

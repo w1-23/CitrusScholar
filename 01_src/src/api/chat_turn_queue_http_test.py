@@ -126,6 +126,7 @@ def runtime(monkeypatch, tmp_path):
     for path, handler, method in (
         ("/api/v2/sessions", main.list_sessions, "GET"),
         (root + "/messages", main.session_messages, "GET"),
+        (root + "/continuation/{request_id}", main.session_continuation_inputs, "GET"),
         (root + "/artifacts/{artifact_id}", main.download_research_artifact, "GET"),
         ("/api/v1/session/{session_id}/clear", main.clear_session_endpoint, "POST"),
         ("/sessions/{session_id}/jobs", main.list_session_jobs, "GET"),
@@ -820,6 +821,11 @@ def test_only_explicit_visible_executed_baseline_contributes_attachments(runtime
         return runtime.client.post(runtime.path, json={"query": "follow up", "client_request_id": cid,
                                                      "continue_from": baseline})
 
+    def available(baseline="baseline"):
+        return runtime.client.get(f"/api/v2/session/{runtime.sid}/continuation/{baseline}")
+
+    assert available().status_code == 409
+    assert available("not-a-turn").status_code == 404
     assert continue_from("too-early").status_code == 409
     assert continue_from("missing", "not-a-turn").status_code == 404
     runtime.released.add("baseline")
@@ -836,8 +842,14 @@ def test_only_explicit_visible_executed_baseline_contributes_attachments(runtime
     assert inherited["file_id"] == source_file["file_id"]
     assert inherited["sha256"] == source_file["sha256"]
     assert inherited["source"] == "previous_turn"
+    candidates = available()
+    assert candidates.status_code == 200 and candidates.headers["Cache-Control"] == "private, no-store"
+    assert candidates.json() == {"attachments": [{"file_id": source_file["file_id"],
+        "filename": "only-source.txt", "mime_type": "text/plain; charset=utf-8", "size_bytes": 9}]}
     runtime.released.update({"ordinary", "explicit"})
     wait_for(lambda: state(runtime, "explicit") == "terminal")
+    assert available("explicit").json() == candidates.json()
+    assert available("ordinary").json() == {"attachments": []}
     clear = runtime.client.post(f"/api/v1/session/{runtime.sid}/clear")
     assert clear.status_code == 200, clear.text
     assert continue_from("hidden").status_code == 404

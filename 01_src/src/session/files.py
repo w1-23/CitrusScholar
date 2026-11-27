@@ -1176,6 +1176,19 @@ def migrate_legacy_files_for_account(owner_user_id: int) -> int:
     return migrated
 
 
+def verified_public_file(info: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Resolve the previously authorized byte identity for browser delivery."""
+    if not info or not re.fullmatch(r"[a-f0-9]{64}", str(info.get("sha256") or "")):
+        return None
+    path = info.get("path")
+    try:
+        if path and path.stat().st_size == info.get("size_bytes") and _sha256_file(path) == info["sha256"]:
+            return info
+    except OSError:
+        pass
+    return None
+
+
 def get_account_file(file_id: str, owner_user_id: int, *, touch: bool = False,
                      allow_internal: bool = False
                      ) -> dict[str, Any] | None:

@@ -648,16 +648,12 @@ async def _run(state, identity, ledger):
             artifact_contract = {"schema_version": 1, "request_version": update_version,
                                  "requirements": requirements, "verified_links": verified_links,
                                  "single_render_receipt": True, "answer_render_refs": answer_render_refs}
-            from src.research.artifact_delivery import build_delivery, missing_answer_links
+            from src.research.artifact_delivery import build_delivery
             selected_delivery_links = {link for goal in goals for link in goal.artifact_links}
             delivery_manifest = await asyncio.to_thread(build_delivery, identity=identity,
                 request_id=host._result_request_id(), rows=effective, messages=host.messages,
                 requirements=requirements, select_links=selected_delivery_links if not delivery_gaps or uses_single_render_delivery(requirements) else None,
                 gaps=delivery_gaps, verified=verified)
-            delivery_links = missing_answer_links(delivery_manifest, public_answer)
-            if delivery_links:
-                public_answer += "\n\n已核验的交付文件\n" + "\n".join(
-                    f"- [下载文件 {index}]({link})" for index, link in enumerate(delivery_links, start=1))
             if (delivery_gaps and not verified_links and not allow_delivery_gaps
                     and claims_file_delivery(statement.answer)):
                 return FinalCheck(False, tuple(gap["detail"] for gap in delivery_gaps))
@@ -1314,13 +1310,6 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
         delivery = await asyncio.to_thread(build_delivery, identity=identity, request_id=host._result_request_id(),
             rows=_effective_artifact_records(host.records), messages=host.messages, requirements=requirements,
             gaps=gaps, delivery_uncertain=uncertain)
-    if result.status != "complete" and status in {"partial", "failed", "cancelled"}:
-        from src.research.artifact_delivery import missing_answer_links
-        links = [f"- [下载文件 {i}]({link})" for i, link in enumerate(missing_answer_links(delivery, answer), 1)]
-        if links and (result.reason != "model_length" or verified is None or length_gaps):
-            answer += "\n\n已生成并核对文件完整性的产物（不表示整项任务已完成或已通过 QA）：\n" + "\n".join(links)
-        if delivery["status"] in {"partial", "unavailable"}:
-            answer += "\n\n部分或全部已登记文件当前无法核验；未提供未经核验的链接。"
     if delivery.get("status") != "none":
         emit_encoded("artifact_delivery", delivery)
     ledger.close(status="unknown" if uncertain else

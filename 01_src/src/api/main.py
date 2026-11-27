@@ -6848,8 +6848,9 @@ def _original_file_download(info: dict):
 async def preview_account_file(file_id: str, request: Request, library_tile: bool = False):
     user = current_user(request)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_account_file, file_id,
-                                   int(user["user_id"]), touch=not library_tile)
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_account_file(file_id,
+                                   int(user["user_id"]), touch=not library_tile)))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
     return _protected_file_preview(info, library_tile=library_tile)
@@ -6859,8 +6860,9 @@ async def preview_account_file(file_id: str, request: Request, library_tile: boo
 async def download_account_file(file_id: str, request: Request):
     user = current_user(request)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_account_file, file_id,
-                                   int(user["user_id"]), touch=True)
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_account_file(file_id,
+                                   int(user["user_id"]), touch=True)))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
     return _original_file_download(info)
@@ -6904,8 +6906,9 @@ async def preview_session_file(session_id: str, file_id: str, request: Request):
     from src.core.resource_access import PRIVATE_FILE
     require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_file, session_id, file_id,
-                                   touch=True, owner_user_id=int(user["user_id"]))
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_file(session_id, file_id,
+                                   touch=True, owner_user_id=int(user["user_id"]))))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于此会话")
 
@@ -6919,8 +6922,9 @@ async def download_session_file(session_id: str, file_id: str, request: Request)
     from src.core.resource_access import PRIVATE_FILE
     require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_file, session_id, file_id,
-                                   touch=True, owner_user_id=int(user["user_id"]))
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_file(session_id, file_id,
+                                   touch=True, owner_user_id=int(user["user_id"]))))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于此会话")
     return _original_file_download(info)
@@ -7032,6 +7036,23 @@ def _turn_producer_job(session_id: str, owner: int, request_id: str, producer_jo
 
 def _producer_request_id(job: dict) -> str:
     return str(job.get("client_request_id") or job.get("request_id") or "")
+
+
+@app.get("/api/v2/session/{session_id}/continuation/{request_id}")
+async def session_continuation_inputs(session_id: str, request_id: str, request: Request):
+    """List only persisted inputs eligible for explicit reuse in this session."""
+    from src.api.turn_envelope import _continued_inputs
+    from src.core.resource_access import PRIVATE_FILE
+
+    user = current_user(request)
+    require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", request_id):
+        raise HTTPException(400, "无效的附件继承来源。")
+    items = await asyncio.to_thread(_continued_inputs, int(user["user_id"]), session_id,
+                                    request_id, verify_bytes=True)
+    return JSONResponse({"attachments": [{"file_id": item["file_id"], "filename": item["name"],
+        "mime_type": item["type"], "size_bytes": item["size_bytes"]} for item in items]},
+        headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/v2/session/{session_id}/turn-artifacts")

@@ -517,8 +517,10 @@ def test_submit_boundary_distinguishes_not_run_from_unknown(worker, view, monkey
     else:
         monkeypatch.setattr(service, "status", unavailable)
 
-    result = run(service, view)
+    accepted = []
+    result = run(service, view, on_accept=accepted.append)
     assert result.exit_code is None
+    assert accepted == ([service.execution_id] if stage == "status" else [])
     if stage == "prepare":
         assert not service.submissions
         assert result.not_run_reason == "workspace_preparation_failed"

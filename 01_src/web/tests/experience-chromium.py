@@ -134,7 +134,7 @@ def until(check, description, timeout=12):
     raise AssertionError(description)
 
 
-def run(browser, origin, output, *, observation_only=False):
+def run(browser, origin, output, *, observation_only=False, delivery_only=False):
     script = Path(__file__).with_name('experience-fixture.js').read_text(encoding='utf-8')
     browser.call('Runtime.enable')
     browser.call('Page.enable')
@@ -197,6 +197,28 @@ def run(browser, origin, output, *, observation_only=False):
               "&& !document.querySelector('.turn-queue-cancel, [data-state=waiting]') "
               "&& !document.querySelector('#chat-container').innerText.includes('第 3 位')",
               timeout=30)
+        if delivery_only:
+            phase('done')
+            browser.call('Page.reload', ignoreCache=True)
+            check('One saved answer, its two citations, its artifact and eligible source',
+                  "!!document.querySelector('.turn-answer[data-display-status=completed]') && "
+                  "document.querySelectorAll('.turn-citation-bubbles .turn-citation-bubble').length === 2 && "
+                  "document.querySelectorAll('.turn-file-card').length === 1 && "
+                  "document.querySelector('.turn-files-heading')?.textContent === '本轮产出' && "
+                  "document.querySelectorAll('.turn-explicit-continuation').length === 1")
+            browser.click('.turn-explicit-continuation')
+            check('Verified input becomes a named attachment chip',
+                  "document.querySelector('.continuation-attachment-reference')?.textContent === 'Measurements.csv'")
+            capture('delivery-and-attachment')
+            browser.click('#clear-composer-continuation')
+            check('Clearing inheritance removes the reference chip',
+                  "document.querySelector('#composer-continuation').hidden && !document.querySelector('.continuation-attachment-reference')")
+            fill('继续核对表头')
+            browser.click('.turn-explicit-continuation')
+            browser.click('#send-btn')
+            check('The next submission sends the exact verified prior turn',
+                  "experienceRequests().posts.length === 1 && experienceRequests().posts[0].continue_from === 'browser-fixture-request'")
+            return
         capture('queued')
         phase('start')
         check('One indicator shown at execution start', "document.querySelectorAll('[data-state=waiting]').length === 1 && document.querySelectorAll('.research-task-orbit i').length === 3 && !document.querySelector('.turn-user-queue-state, .turn-awaiting-dispatch')")
@@ -351,8 +373,15 @@ def run(browser, origin, output, *, observation_only=False):
                   f"document.querySelector('.turn-answer[data-display-status=completed]')?.innerHTML === {json.dumps(before)} "
                   "&& document.querySelectorAll('.turn-citation-bubbles .turn-citation-bubble').length === 2 "
                   "&& document.querySelectorAll('.turn-file-card').length === 1")
+            check('Reopened history offers only verified attachment inheritance',
+                  "document.querySelectorAll('.turn-explicit-continuation').length === 1")
+            browser.click('.turn-explicit-continuation')
+            check('Verified restored input appears as an attachment reference',
+                  "!document.querySelector('#composer-continuation').hidden && document.querySelector('#composer-continuation').textContent.includes('Measurements.csv')")
             capture('history-reopened')
             return
+        browser.call('Page.reload', ignoreCache=True)
+        check('Completed input is eligible after reload', "!!document.querySelector('.turn-explicit-continuation')")
         browser.click('.turn-explicit-continuation')
         check('Selecting a completed turn makes attachment inheritance explicit', "!document.querySelector('#composer-continuation').hidden")
         browser.click('#clear-composer-continuation')
@@ -475,6 +504,7 @@ def main():
     parser.add_argument('--origin', default='http://citrus-experience.test')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--task-observation-only', action='store_true', help='Stop after chat observation and terminal history recovery.')
+    parser.add_argument('--phase1-delivery-only', action='store_true', help='Exercise restored artifact and verified attachment inheritance only.')
     args = parser.parse_args()
     origin = args.origin.rstrip('/')
     assert origin == 'http://citrus-experience.test', 'Only use the isolated virtual fixture origin'
@@ -492,7 +522,8 @@ def main():
                 target = next(item for item in json.load(response) if item['type'] == 'page')
             ws = websocket.create_connection(target['webSocketDebuggerUrl'], timeout=15, suppress_origin=True, http_no_proxy=['127.0.0.1'])
             try:
-                run(Browser(ws), origin, args.output, observation_only=args.task_observation_only)
+                run(Browser(ws), origin, args.output, observation_only=args.task_observation_only,
+                    delivery_only=args.phase1_delivery_only)
             finally:
                 ws.close()
         finally:

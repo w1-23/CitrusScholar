@@ -80,3 +80,89 @@ test('history replaces its summary with ordered, generation-scoped action cards'
   assert.match(answer.innerHTML, /accepted result/);
   assert.doesNotMatch(answer.innerHTML, /superseded/);
 });
+
+
+const publicFailure = '主模型暂时无法连接，请稍后重试。';
+const failedSnapshot = {display_status:'failed', notices:[{private:true, message:'private reason'}, publicFailure]};
+function assertNotice(bot) {
+  assert.equal(bot.querySelector('.turn-terminal-notice')?.textContent, publicFailure);
+  assert.equal(bot.querySelectorAll('.turn-terminal-notice').length, 1);
+  assert.equal(bot.querySelector('.turn-answer').textContent, '');
+  assert.equal(bot.querySelector('.assistant-actions'), null);
+  assert.doesNotMatch(bot.textContent, /private reason|private traceback/);
+}
+
+for (const source of ['error frame', 'terminal snapshot']) {
+  test(`an accepted turn renders the same public notice from ${source} and reloaded history`, async () => {
+    const b = browser();
+    b.get('user-input').value = '测试公开失败说明';
+    assert.equal(await b.ctx.sendMsg(), true);
+    await flush();
+    const admission = b.requests.find(r => r.opts.method === 'POST' && r.url.endsWith('/turn-queue'));
+    const rid = JSON.parse(admission.opts.body).client_request_id;
+    const job = 'failed-job';
+    b.reply(admission, {client_request_id:rid, job_id:job, state:'running', dispatch_at:'started'}, 202);
+    await flush();
+    const replay = b.requests.find(r => r.url.startsWith(`/jobs/${job}/events?`));
+    const events = source === 'error frame' ? [
+      {seq:1, event:'error', data:{notice:publicFailure, detail:'private traceback', turn_envelope:{display_status:'failed'}}}
+    ] : [];
+    b.reply(replay, {job_id:job, protocol:'citrus-task/1', events, next_cursor:events.length, has_more:false,
+      ...(events.length ? {} : {status:'failed', terminal_snapshot:failedSnapshot})});
+    await flush();
+    assertNotice(b.get('chat-container').querySelector('.bot'));
+
+    const restored = browser();
+    restored.ctx.renderHistoryMessages([], restored.ctx.normalizeHistoryTurns([
+      {turn_request_id:rid, job_id:job, user:{content:'测试公开失败说明'}, terminal_snapshot:failedSnapshot}
+    ]));
+    assertNotice(restored.get('chat-container').querySelector('.bot'));
+    assert.equal(restored.requests.length, 0, 'settled history needs no replay to show its public explanation');
+  });
+}
+
+test('saved answers stay answers and a neighboring failed turn keeps its own notice', () => {
+  const b = browser();
+  b.ctx.renderHistoryMessages([], b.ctx.normalizeHistoryTurns([
+    {turn_request_id:'failed', job_id:'failed', user:{content:'First'}, terminal_snapshot:failedSnapshot},
+    {turn_request_id:'partial', job_id:'partial', user:{content:'Second'},
+      answer:{content:'Accepted partial answer'}, terminal_snapshot:{...failedSnapshot, display_status:'partial'}}
+  ]));
+  const [failed, partial] = b.get('chat-container').querySelectorAll('.bot');
+  assertNotice(failed);
+  assert.match(partial.querySelector('.turn-answer').innerHTML, /Accepted partial answer/);
+  assert.equal(partial.querySelector('.turn-terminal-notice'), null);
+});
+
+
+test('the exact stored stop marker is a notice, not copied or rated as an answer', () => {
+  const b = browser();
+  const marker = '已按你的停止请求中止本轮：上面已完成的步骤与其结果保留；被停止的步骤没有采用结果，也没有登记任何成果。';
+  b.ctx.renderHistoryMessages([], b.ctx.normalizeHistoryTurns([
+    {turn_request_id:'stopped', job_id:'stopped', user:{content:'Stop example'},
+      answer:{content:marker}, terminal_snapshot:{display_status:'cancelled', notices:['本轮已停止']}},
+    {turn_request_id:'ordinary', job_id:'ordinary', user:{content:'Quote example'},
+      answer:{content:marker}, terminal_snapshot:{display_status:'completed'}}
+  ]));
+  const [stopped, ordinary] = b.get('chat-container').querySelectorAll('.bot');
+  assert.equal(stopped.querySelector('.turn-terminal-notice').textContent, '本轮已停止');
+  assert.equal(stopped.querySelector('.turn-answer').textContent, '');
+  assert.equal(stopped.querySelector('.assistant-actions'), null);
+  assert.equal(ordinary.querySelector('.turn-terminal-notice'), null);
+  assert.match(ordinary.querySelector('.turn-answer').innerHTML, /已按你的停止请求中止本轮/);
+});
+
+test('an answer from the original segment cannot hide the latest continuation failure', () => {
+  const b = browser();
+  const turns = b.ctx.normalizeHistoryTurns([
+    {turn_request_id:'root', job_id:'root-job', user:{content:'Root'}, answer:{content:'Prior segment answer'}},
+    {turn_request_id:'child', job_id:'child-job', parent_job_id:'root-job', terminal_snapshot:failedSnapshot}
+  ]);
+  const merged = b.ctx.mergeQueuedHistory(turns, [{client_request_id:'root', job_id:'root-job',
+    active_child_job_id:'child-job', state:'terminal', dispatch_at:'started'}]);
+  b.ctx.renderHistoryMessages([], merged);
+  const bots = b.get('chat-container').querySelectorAll('.bot');
+  assert.equal(bots.length, 1);
+  assertNotice(bots[0]);
+  assert.doesNotMatch(bots[0].textContent, /Prior segment answer/);
+});

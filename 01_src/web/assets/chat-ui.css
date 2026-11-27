@@ -24,6 +24,9 @@
 .composer-admission-recovery[hidden] { display:none; }
 .composer-admission-recovery .history-retry { margin:0 0 5px; }
 .composer-controls { display:flex; gap:6px; margin-inline-start:auto; align-items:center; }
+.continuation-attachment-references { display:inline-flex; flex-wrap:wrap; gap:4px; max-width:100%; }
+.continuation-attachment-reference { display:inline-block; max-width:18em; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; vertical-align:middle; padding:2px 8px; border:1px solid var(--border-hover); border-radius:999px; }
 .chat-panel .input-box .send-btn {
   width:36px; height:36px; flex-shrink:0; border-radius:11px; font-size:17px;
   color:var(--ui-on-control); background:var(--ui-control); box-shadow:none;

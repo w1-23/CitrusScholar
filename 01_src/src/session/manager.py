@@ -43,6 +43,18 @@ class SessionHistoryBusy(RuntimeError):
     """Live or unresolved work must settle before history can be cleared."""
 
 
+def _task_snapshot_for_context(snapshot):
+    """Keep history metadata without reusing the saver's private protocol key."""
+    runtime = snapshot.get("capability_runtime") if isinstance(snapshot, dict) else None
+    if isinstance(runtime, dict) and runtime.get("provider_protocol") in ("deepseek", "openai"):
+        # This exact slot contains an application-generated display label, not
+        # provider continuation state. Leave unexpected shapes for the saver
+        # to reject, and keep the original snapshot for display and storage.
+        return {**snapshot, "capability_runtime": {
+            key: value for key, value in runtime.items() if key != "provider_protocol"}}
+    return snapshot
+
+
 # ── v10.6（分离输出架构）：跨轮历史通道不得携带联网条目 ─────────────────────
 #   历史证据账本会被渲染成 `[历史检索证据]` 注入**下一轮**的模型上下文，并成为
 #   可引用的 H1..Hn —— 若不拦，联网内容就从这条**第五条通道**重回"本地答案"。
@@ -620,7 +632,10 @@ class SessionManager:
                     continue
                 for key in ("citrus_capability_history", "citrus_task_snapshot", "citrus_citation_bubbles"):
                     if key in context_meta:
-                        messages[-1].response_metadata[key] = context_meta.pop(key)
+                        value = context_meta.pop(key)
+                        if key == "citrus_task_snapshot" and not for_display:
+                            value = _task_snapshot_for_context(value)
+                        messages[-1].response_metadata[key] = value
                 messages[-1].additional_kwargs = context_meta
                 messages[-1].additional_kwargs["source_id"] = str(row["id"])
                 row_ids.append(row["id"])

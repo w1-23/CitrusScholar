@@ -11,14 +11,15 @@
 <script src="/assets/vendor/marked-4.3.0.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/assets/app.css?v=45">
+<link rel="stylesheet" href="/assets/app.css?v=46">
 <link rel="stylesheet" href="/assets/skill-picker.css?v=6">
-<link rel="stylesheet" href="/assets/guide.css?v=6">
+<link rel="stylesheet" href="/assets/guide.css?v=7">
 <link rel="stylesheet" href="/assets/loading-sprout.css?v=5">
-<link rel="stylesheet" href="/assets/session_files.css?v=8">
+<link rel="stylesheet" href="/assets/session_files.css?v=9">
 <link rel="stylesheet" href="/assets/corpus_reader.css?v=9">
-<link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
-<link rel="stylesheet" href="/assets/chat-ui.css?v=6">
+<link rel="stylesheet" href="/assets/citrus-theme.css?v=3">
+<link rel="stylesheet" href="/assets/app-icon.css?v=1">
+<link rel="stylesheet" href="/assets/chat-ui.css?v=7">
 <link rel="stylesheet" href="/assets/context-view.css?v=4">
 </head>
 <body data-page="chat">
@@ -60,7 +61,8 @@
     <button class="api-save" type="submit">继续</button>
     <button class="auth-forgot" type="button" onclick="openRecoverPane()">忘记密码？使用恢复码重置</button>
     <p>对话与附件可能发送至所配置的模型和联网服务。</p>
-    <details class="auth-data-note"><summary>数据与隐私</summary><p>账号数据彼此隔离。问题、回答和工具执行摘要供管理员排障，保留一年。上传文件保存在账号资料库，默认 30 天未使用后清理，不进入共享语料库。</p></details>
+    <p class="auth-icon-attribution">Icons: <a href="https://github.com/480-Design/Solar-icon-set" target="_blank" rel="noopener noreferrer">Solar Icon Set by 480 Design</a> &middot; <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">CC BY 4.0</a></p>
+    <details class="auth-data-note icon-disclosure"><summary><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-chevron-right"></use></svg>数据与隐私</summary><p>账号数据彼此隔离。问题、回答和工具执行摘要供管理员排障，保留一年。上传文件保存在账号资料库，默认 30 天未使用后清理，不进入共享语料库。</p></details>
   </form>
   <form class="auth-card" id="authRecoverCard" hidden onsubmit="event.preventDefault();submitPasswordRecovery()">
     <div class="auth-brand"><img src="/assets/citrus-mark.svg" alt=""> CitrusScholar</div>
@@ -80,7 +82,7 @@
 <!-- v8.5.0 开源版：首次启动 API Key 引导（未配置时全屏遮罩，配置后隐藏） -->
 <div class="api-setup-overlay" id="apiSetupOverlay" style="display:none">
   <div class="api-setup-card">
-    <div class="api-heading"><div class="api-logo"><img src="/assets/citrus-mark.svg" alt=""> <span>CitrusScholar</span></div><button class="api-close" id="settingsCloseBtn" onclick="closeSettingsModal()" style="display:none" title="关闭">✕</button></div>
+    <div class="api-heading"><div class="api-logo"><img src="/assets/citrus-mark.svg" alt=""> <span>CitrusScholar</span></div><button class="api-close" id="settingsCloseBtn" onclick="closeSettingsModal()" style="display:none" title="关闭" aria-label="关闭"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button></div>
     <div class="api-title">模型设置</div>
 
     <div class="configured-providers" id="configuredProvidersList" hidden></div>
@@ -107,8 +109,8 @@
       <option value="">先填写 Key 并获取模型列表</option>
     </select>
     <div class="api-warn">“免费”按官方模型目录标注；免费政策可能调整。</div>
-    <details class="api-advanced">
-      <summary>高级设置</summary>
+    <details class="api-advanced icon-disclosure">
+      <summary><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-chevron-right"></use></svg>高级设置</summary>
       <label for="modelContextWindowInput">上下文窗口（token）</label>
       <input type="number" id="modelContextWindowInput" min="4096" max="1000000" step="1024" placeholder="默认">
     </details>
@@ -116,8 +118,8 @@
     <div class="api-actions">
       <button class="api-save" id="modelConfigSave" onclick="saveProviderConfig()">保存</button>
     </div>
-    <details class="api-advanced web-search-settings">
-      <summary>联网搜索</summary>
+    <details class="api-advanced web-search-settings icon-disclosure">
+      <summary><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-chevron-right"></use></svg>联网搜索</summary>
       <label for="webSearchProviderSelect">搜索服务商</label>
       <select id="webSearchProviderSelect" onchange="onWebSearchProviderChange()">
         <option value="deepseek_search_fetch">DeepSeek Search/Fetch</option>
@@ -139,29 +141,29 @@
 <div class="main-container" id="mainContainer" style="visibility:hidden">
   <nav class="left-rail" aria-label="主导航">
     <button class="rail-button sidebar-toggle-btn" id="sidebarToggleBtn" type="button" aria-controls="appSidebar" onclick="toggleSidebar()" title="隐藏会话侧栏" aria-label="隐藏会话侧栏" aria-expanded="true">
-      <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="14" rx="2.2"></rect><path d="M7 3.5v13"></path></svg>
+      <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-sidebar"></use></svg>
     </button>
     <span class="rail-divider"></span>
     <button class="rail-button" type="button" onclick="newSession()" title="新建会话" aria-label="新建会话">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+      <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-plus"></use></svg>
     </button>
     <button class="rail-button" id="sessionFilesRailBtn" type="button" onclick="toggleSessionFiles()" title="资料库" aria-label="资料库" aria-expanded="false">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v10a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"></path><path d="M3.5 9h17"></path></svg>
+      <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-folder"></use></svg>
     </button>
     <a class="rail-button" id="figureRailBtn" href="/figures" title="工作台" aria-label="工作台">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-canvas"></use></svg>
+      <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-canvas"></use></svg>
     </a>
     <div class="rail-spacer"></div>
     <!-- P1-4: 常用工作台功能从账户菜单拆出来，固定在左侧栏下半部 -->
     <div class="rail-quick" role="group" aria-label="工作台快捷功能">
       <button type="button" class="rail-button" id="guideRailBtn" onclick="openOnboardingGuide()" title="使用指南" aria-label="使用指南">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6.6C10.2 5.3 7.6 4.7 4.5 4.8v13.2c3.1-.1 5.7.5 7.5 1.8 1.8-1.3 4.4-1.9 7.5-1.8V4.8c-3.1-.1-5.7.5-7.5 1.8z"></path><path d="M12 6.6v13.2"></path></svg>
+        <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-book"></use></svg>
       </button>
       <button type="button" class="rail-button" id="memoryRailBtn" onclick="openMemorySettings()" title="个人偏好" aria-label="个人偏好">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-sliders"></use></svg>
+        <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-sliders"></use></svg>
       </button>
       <button type="button" class="rail-button" id="themeRailBtn" onclick="toggleThemeMenu()" title="显示设置" aria-label="显示设置" aria-controls="themeMenu" aria-expanded="false">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-palette"></use></svg>
+        <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-palette"></use></svg>
       </button>
     </div>
     <div class="display-menu theme-menu" id="themeMenu" role="group" aria-label="显示设置" hidden>
@@ -188,21 +190,21 @@
           <span class="account-menu-name" id="accountMenuName"></span>
           <span class="account-menu-role" id="accountMenuRole"></span>
         </div>
-        <a id="adminUsersBtn" class="account-menu-item" href="/admin" hidden><span aria-hidden="true">▦</span> 管理后台</a>
-        <button id="modelSettingsBtn" class="account-menu-item" onclick="setAccountMenuOpen(false); openSettingsModal()" hidden><span aria-hidden="true">⚙</span> 模型与服务设置</button>
-        <button class="account-menu-item" onclick="setAccountMenuOpen(false); openMemorySettings()"><span aria-hidden="true">☷</span> 个人偏好</button>
-        <button class="account-menu-item" onclick="setAccountMenuOpen(false); openAvatarSettings()"><span aria-hidden="true">☺</span> 更换头像</button>
-        <button class="account-menu-item" onclick="setAccountMenuOpen(false); openSecuritySettings('password')"><span aria-hidden="true">✎</span> 修改密码</button>
-        <button class="account-menu-item" onclick="setAccountMenuOpen(false); openSecuritySettings('recovery')"><span aria-hidden="true">❖</span> 恢复码</button>
-        <button id="reviewConsentBtn" class="account-menu-item" onclick="setAccountMenuOpen(false); toggleReviewConsent()"><span aria-hidden="true">⇪</span> 文献共享授权：未授权</button>
+        <a id="adminUsersBtn" class="account-menu-item" href="/admin" hidden><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-table"></use></svg> 管理后台</a>
+        <button id="modelSettingsBtn" class="account-menu-item" onclick="setAccountMenuOpen(false); openSettingsModal()" hidden><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-settings"></use></svg> 模型与服务设置</button>
+        <button class="account-menu-item" onclick="setAccountMenuOpen(false); openMemorySettings()"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-sliders"></use></svg> 个人偏好</button>
+        <button class="account-menu-item" onclick="setAccountMenuOpen(false); openAvatarSettings()"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-user"></use></svg> 更换头像</button>
+        <button class="account-menu-item" onclick="setAccountMenuOpen(false); openSecuritySettings('password')"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-edit"></use></svg> 修改密码</button>
+        <button class="account-menu-item" onclick="setAccountMenuOpen(false); openSecuritySettings('recovery')"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-key"></use></svg> 恢复码</button>
+        <button id="reviewConsentBtn" class="account-menu-item" onclick="setAccountMenuOpen(false); toggleReviewConsent()"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-shield"></use></svg><span class="account-menu-item-label">文献共享授权：未授权</span></button>
         <div class="account-menu-divider"></div>
-        <button id="logoutBtn" class="account-menu-item danger" onclick="logoutAccount()"><span aria-hidden="true">↪</span> 退出登录</button>
+        <button id="logoutBtn" class="account-menu-item danger" onclick="logoutAccount()"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-logout"></use></svg> 退出登录</button>
       </div>
       <button class="account-trigger" id="accountTrigger" onclick="toggleAccountMenu()" aria-haspopup="menu" aria-expanded="false" aria-label="账户与设置" title="账户与设置">
         <span class="account-avatar" id="accountAvatar">?</span>
         <span class="account-trigger-name" id="accountLabel"></span>
         <span class="account-trigger-role" id="accountRole"></span>
-        <span class="account-trigger-chevron" aria-hidden="true">⌃</span>
+        <span class="account-trigger-chevron"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-chevron-up"></use></svg></span>
       </button>
     </div>
   </nav>
@@ -214,7 +216,7 @@
       <button class="sidebar-header" id="session-section-toggle" type="button" aria-controls="session-list" aria-expanded="true" onclick="toggleSection('session')">
         <span>会话</span>
         <span class="sidebar-count" id="session-count">0</span>
-        <span class="toggle-icon" id="session-toggle" aria-hidden="true">▼</span>
+        <span class="toggle-icon" id="session-toggle"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-chevron-down"></use></svg></span>
       </button>
       <div class="sidebar-content" id="session-list">
         <div class="empty-sidebar">加载中...</div>
@@ -251,15 +253,15 @@
             <input id="attachment-input" type="file" accept=".pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb" multiple hidden onchange="handleAttachmentSelection(this.files, this)">
             <input id="image-attachment-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple hidden onchange="handleAttachmentSelection(this.files, this)">
             <details class="input-tools" id="input-tools-menu">
-              <summary class="attach-btn composer-plus" aria-label="添加附件" aria-controls="attachment-options" title="添加附件"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-plus"></use></svg></summary>
+              <summary class="attach-btn composer-plus" aria-label="添加附件" aria-controls="attachment-options" title="添加附件"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-plus"></use></svg></summary>
               <div class="input-tools-panel attachment-options" id="attachment-options" aria-label="添加附件">
-                <button type="button" id="attachment-btn" data-composer-source="file"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-clip"></use></svg> 上传文件</button>
-                <button type="button" id="attachment-library-btn" data-composer-source="library" aria-controls="sessionFilesPanel"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-folder"></use></svg> 从资料库选择</button>
-                <button type="button" id="attachment-image-btn" data-composer-source="image"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-image"></use></svg> 上传图片</button>
+                <button type="button" id="attachment-btn" data-composer-source="file"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-clip"></use></svg> 上传文件</button>
+                <button type="button" id="attachment-library-btn" data-composer-source="library" aria-controls="sessionFilesPanel"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-folder"></use></svg> 从资料库选择</button>
+                <button type="button" id="attachment-image-btn" data-composer-source="image"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-image"></use></svg> 上传图片</button>
               </div>
             </details>
             <details class="input-tools" id="skill-picker-menu">
-              <summary class="attach-btn composer-scenes" aria-label="本轮场景" aria-controls="skill-picker-panel" title="选择本轮场景"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-sliders"></use></svg><span>场景</span></summary>
+              <summary class="attach-btn composer-scenes" aria-label="本轮场景" aria-controls="skill-picker-panel" title="选择本轮场景"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-sliders"></use></svg><span>场景</span></summary>
               <div class="input-tools-panel" id="skill-picker-panel">
                 <h3 id="skill-picker-heading">本轮场景（可选）</h3>
                 <p id="skill-picker-status" role="status">选择适合本轮任务的场景。</p>
@@ -268,7 +270,7 @@
               </div>
             </details>
             <div class="composer-controls">
-              <button type="button" class="send-btn" id="send-btn" onclick="activateComposer()" aria-disabled="true" aria-label="发送消息" title="发送 (Enter)"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-send"></use></svg></button>
+              <button type="button" class="send-btn" id="send-btn" onclick="activateComposer()" aria-disabled="true" aria-label="发送消息" title="发送 (Enter)"><svg class="ui-icon app-icon app-icon-inverse" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-send"></use></svg></button>
             </div>
           </div>
         </div>
@@ -286,24 +288,24 @@
        aria-valuemin="300" aria-valuenow="468" tabindex="0"
        title="拖动调整资料库宽度，双击复位"></div>
   <header class="session-files-head">
-    <span class="library-heading-icon"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-folder"></use></svg></span>
+    <span class="library-heading-icon"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-folder"></use></svg></span>
     <div><h2 id="sessionFilesTitle">资料库</h2><p id="sessionFilesStats" aria-live="polite"></p></div>
-    <button class="session-files-close" type="button" onclick="toggleSessionFiles(false)" title="收起资料库" aria-label="收起资料库">×</button>
+    <button class="session-files-close" type="button" onclick="toggleSessionFiles(false)" title="收起资料库" aria-label="收起资料库"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
   </header>
   <div class="session-files-body" id="sessionFilesBody">
     <section class="library-upload-zone" id="libraryUploadZone" aria-labelledby="libraryUploadLabel">
-      <span class="library-heading-icon"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-upload"></use></svg></span>
+      <span class="library-heading-icon"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-upload"></use></svg></span>
       <div class="library-upload-copy">
         <strong id="libraryUploadLabel">上传资料</strong>
         <p>拖放表格、图片、PDF 或 Word，单个文件最多 20 MB</p>
       </div>
       <input type="file" id="libraryUploadInput" hidden multiple accept="image/jpeg,image/png,image/webp,image/gif,.pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb,.svg">
-      <button type="button" id="libraryUploadButton"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-plus"></use></svg> 上传资料</button>
+      <button type="button" id="libraryUploadButton"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-plus"></use></svg> 上传资料</button>
       <span id="libraryUploadStatus" role="status" hidden></span>
     </section>
     <div class="library-filters">
       <label class="library-search">
-        <svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-search"></use></svg>
+        <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-search"></use></svg>
         <input type="search" id="librarySearch" placeholder="搜索资料名称" aria-label="搜索资料名称">
       </label>
       <select id="libraryKind" aria-label="文件类型">
@@ -337,10 +339,10 @@
     <header class="session-file-preview-head">
       <h2 id="sessionFilePreviewTitle">文件预览</h2>
       <div class="session-file-preview-actions">
-        <a id="sessionFilePreviewDownload" class="api-secondary" href="#" download>下载原件</a>
+        <a id="sessionFilePreviewDownload" class="api-secondary" href="#" download><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-download"></use></svg><span data-icon-label>下载原件</span></a>
         <button class="api-secondary" type="button" id="sessionFilePreviewCopySvg" hidden
-                title="复制这份 SVG 的源码文本">复制 SVG 源码</button>
-        <button class="overlay-close" type="button" onclick="closeSessionFilePreview()" aria-label="关闭预览">×</button>
+                title="复制这份 SVG 的源码文本"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-copy"></use></svg><span data-icon-label>复制 SVG 源码</span></button>
+        <button class="overlay-close" type="button" onclick="closeSessionFilePreview()" aria-label="关闭预览"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
       </div>
     </header>
     <div class="session-file-preview-meta" id="sessionFilePreviewMeta"></div>
@@ -350,7 +352,7 @@
 
 <div class="avatar-settings-overlay" id="avatarSettingsOverlay" hidden role="dialog" aria-modal="true" aria-labelledby="avatarSettingsTitle" onclick="if(event.target===this)closeAvatarSettings()">
   <section class="avatar-settings-card">
-    <button class="overlay-close" type="button" onclick="closeAvatarSettings()" aria-label="关闭">×</button>
+    <button class="overlay-close" type="button" onclick="closeAvatarSettings()" aria-label="关闭"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
     <div class="overlay-eyebrow">CitrusScholar 账户</div>
     <h2 id="avatarSettingsTitle">更换头像</h2>
     <p class="overlay-subtitle">选一枚柑橘伙伴，或上传 JPG、PNG、WebP（不超过 5 MB）。</p>
@@ -369,7 +371,7 @@
 
 <div class="memory-settings-overlay" id="memorySettingsOverlay" hidden role="dialog" aria-modal="true" aria-labelledby="memorySettingsTitle" onclick="if(event.target===this)closeMemorySettings()">
   <section class="memory-settings-card preferences-settings-card">
-    <button class="overlay-close" type="button" onclick="closeMemorySettings()" aria-label="关闭">×</button>
+    <button class="overlay-close" type="button" onclick="closeMemorySettings()" aria-label="关闭"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
     <div class="overlay-eyebrow">CitrusScholar 账户</div>
     <h2 id="memorySettingsTitle">个人偏好</h2>
     <p class="overlay-subtitle">偏好由你直接设置，仅对当前账号生效。自动记忆已停用；项目资料请使用科研笔记保存。</p>
@@ -443,7 +445,7 @@
 
 <div class="memory-settings-overlay" id="securitySettingsOverlay" hidden role="dialog" aria-modal="true" aria-labelledby="securitySettingsTitle" onclick="if(event.target===this)closeSecuritySettings()">
   <section class="memory-settings-card preferences-settings-card">
-    <button class="overlay-close" type="button" onclick="closeSecuritySettings()" aria-label="关闭">×</button>
+    <button class="overlay-close" type="button" onclick="closeSecuritySettings()" aria-label="关闭"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
     <div class="overlay-eyebrow">CitrusScholar 账户</div>
     <h2 id="securitySettingsTitle">账户安全</h2>
     <p class="overlay-subtitle">修改密码或生成一次性恢复码。两项操作都需要重新输入当前密码。修改密码后，所有设备都会退出登录。</p>
@@ -492,13 +494,13 @@
     <h2 class="ctx-drawer-title">上下文窗口</h2>
     <div class="ctx-view-picker" role="group" aria-label="上下文显示方式">
       <label title="矩形树图"><input type="radio" id="ctxViewTreemap" name="ctx-view" aria-label="矩形树图" checked>
-        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor" stroke="none"><path fill="currentColor" stroke="none" d="M4 4h9v16H4zm11 0h5v7h-5zm0 9h5v7h-5z"/></svg>
+        <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-context-segments"></use></svg>
       </label>
       <label title="网格"><input type="radio" id="ctxViewGrid" name="ctx-view" aria-label="网格">
-        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor" stroke="none"><path fill="currentColor" stroke="none" d="M4 4h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 10h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4zM4 16h4v4H4zm6 0h4v4h-4zm6 0h4v4h-4z"/></svg>
+        <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-context-dots"></use></svg>
       </label>
     </div>
-    <button class="ctx-drawer-close" id="ctxClose" type="button" onclick="toggleCtxDrawer()" aria-label="关闭上下文窗口"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
+    <button class="ctx-drawer-close" id="ctxClose" type="button" onclick="toggleCtxDrawer()" aria-label="关闭上下文窗口"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
   </div>
   <div class="ctx-drawer-body">
     <div class="context-amount">
@@ -511,8 +513,8 @@
     <p class="context-meta" id="ctxChartNote" hidden></p>
     <div class="context-legend" id="ctxLegend" role="group" aria-label="令牌分类和估算值" hidden></div>
     <p class="context-category-detail" id="ctxCategoryDetail" hidden></p>
-    <details class="ctx-disclosure context-provider" id="ctxUsage" hidden>
-      <summary>服务商回报（本次调用）</summary>
+    <details class="ctx-disclosure context-provider icon-disclosure" id="ctxUsage" hidden>
+      <summary><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-chevron-right"></use></svg>服务商回报（本次调用）</summary>
       <dl class="context-usage-rows" id="ctxUsageRows"></dl>
     </details>
   </div>
@@ -537,17 +539,19 @@
     <span class="load-sprout-text">小橘正在回答您的问题<span class="load-sprout-dots" aria-hidden="true"><i>.</i><i>.</i><i>.</i></span></span>
   </div>
 </template>
-<script src="/assets/guide.js?v=6"></script>
+<script src="/assets/app-icon-names.js?v=1"></script>
+<script src="/assets/app-icon.js?v=1"></script>
+<script src="/assets/guide.js?v=7"></script>
 <script src="/assets/task-state.js?v=15"></script>
 <script src="/assets/context-view.js?v=5"></script>
 <script src="/assets/task-transport.js?v=10"></script>
 <script src="/assets/task-cards.js?v=14"></script>
 <script src="/assets/task-controls.js?v=6"></script>
 <script src="/assets/skill-picker.js?v=11"></script>
-<script src="/assets/app.js?v=79"></script>
-<script src="/assets/turn_rail.js?v=2"></script>
-<script src="/assets/corpus_reader.js?v=12"></script>
+<script src="/assets/app.js?v=80"></script>
+<script src="/assets/turn_rail.js?v=3"></script>
+<script src="/assets/corpus_reader.js?v=13"></script>
 <script src="/assets/xlsx.full.min.js?v=1"></script>
-<script src="/assets/session_files.js?v=15"></script>
+<script src="/assets/session_files.js?v=16"></script>
 </body>
 </html>

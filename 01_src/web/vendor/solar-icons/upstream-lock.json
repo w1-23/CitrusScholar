@@ -1,0 +1,10 @@
+{
+  "source_package": "@solar-icons/static",
+  "source_version": "2.7.0",
+  "source_commit": "ab241e1bf578dcfe45b0197aee59bd9a08b5fe68",
+  "archive_sha256": "9619c702ed637506e0493400e11be96879bb9221af1cf89b6e6ed9f1861bf5bf",
+  "license": "CC BY 4.0",
+  "packaging_license": "MIT",
+  "source_url": "https://registry.npmjs.org/@solar-icons/static/-/static-2.7.0.tgz",
+  "design_url": "https://github.com/480-Design/Solar-icon-set"
+}

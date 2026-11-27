@@ -31,6 +31,15 @@
     );
   }
 
+  function readerIcon(name) {
+    return window.AppIcon ? window.AppIcon.html(name, {size: 16}) : '';
+  }
+
+  function readerLabel(id) {
+    var button = document.getElementById(id);
+    return button.querySelector('[data-reader-label]') || button;
+  }
+
   function ensureMask() {
     var mask = document.getElementById(MASK_ID);
     if (mask) return mask;
@@ -44,11 +53,11 @@
         '<div class="cr-body" id="crBody" tabindex="0"></div>' +
         '<footer class="cr-foot" id="crFoot">' +
           '<div class="cr-actions">' +
-            '<button type="button" class="cr-btn" id="crPreviousBtn" hidden>上一页</button>' +
-            '<button type="button" class="cr-btn" id="crNextBtn" hidden>下一页</button>' +
-            '<button type="button" class="cr-btn" id="crViewBtn" title="切换渲染/原始 Markdown">原始 Markdown</button>' +
-            '<button type="button" class="cr-btn" id="crCopyBtn" title="复制原文">复制原文</button>' +
-            '<button type="button" class="cr-close" id="crCloseBtn" aria-label="关闭">×</button>' +
+            '<button type="button" class="cr-btn" id="crPreviousBtn" hidden>' + readerIcon('chevron-left') + '<span>上一页</span></button>' +
+            '<button type="button" class="cr-btn" id="crNextBtn" hidden><span>下一页</span>' + readerIcon('chevron-right') + '</button>' +
+            '<button type="button" class="cr-btn" id="crViewBtn" title="切换渲染/原始 Markdown">' + readerIcon('code') + '<span data-reader-label>原始 Markdown</span></button>' +
+            '<button type="button" class="cr-btn" id="crCopyBtn" title="复制原文">' + readerIcon('copy') + '<span data-reader-label>复制原文</span></button>' +
+            '<button type="button" class="cr-close" id="crCloseBtn" aria-label="关闭">' + readerIcon('close') + '</button>' +
           '</div>' +
           '<div class="cr-foot-note" id="crFootNote"></div>' +
         '</footer>' +
@@ -105,7 +114,7 @@
     if (!d) return;
     var body = document.getElementById('crBody');
     if (state.citation) { paintCitation(d, body); return; }
-    var viewBtn = document.getElementById('crViewBtn');
+    var viewBtn = readerLabel('crViewBtn');
 
     if (state.view === 'raw') {
       body.innerHTML = '<pre class="cr-raw">' + esc(d.markdown || '') + '</pre>';
@@ -174,7 +183,7 @@
     var heading = document.getElementById('crHeading');
     heading.textContent = data.title || '文献阅读';
     heading.hidden = false;
-    document.getElementById('crViewBtn').textContent = raw ? '渲染视图' : '原始 Markdown';
+    readerLabel('crViewBtn').textContent = raw ? '渲染视图' : '原始 Markdown';
     if (raw) {
       body.innerHTML = '<pre class="cr-raw">' + (range
         ? esc(text.slice(0, range[0])) + '<mark class="cr-hit cr-citation-focus">' +
@@ -195,7 +204,7 @@
       humanNum(data.start + 1) + '–' + humanNum(data.end) + ' / ' + humanNum(data.total_chars);
     document.getElementById('crPreviousBtn').hidden = data.previous_start == null;
     document.getElementById('crNextBtn').hidden = data.next_start == null;
-    document.getElementById('crCopyBtn').textContent = data.chars < data.total_chars ? '复制本页' :
+    readerLabel('crCopyBtn').textContent = data.chars < data.total_chars ? '复制本页' :
       (data.kind === 'stored_evidence' ? '复制片段' : '复制 Markdown');
     body.scrollTop = 0;
     var hit = body.querySelector('.cr-citation-focus');
@@ -242,7 +251,7 @@
     if (!d) return;
     var text = d.markdown || '';
     var done = function (ok) {
-      var btn = document.getElementById('crCopyBtn');
+      var btn = readerLabel('crCopyBtn');
       if (!btn) return;
       var old = btn.textContent;
       btn.textContent = ok ? '已复制' : '复制失败';
@@ -295,8 +304,8 @@
     state.focus = focus;
     document.getElementById('crFootNote').textContent = '';
     document.getElementById('crHeading').hidden = true;
-    document.getElementById('crCopyBtn').textContent = '复制原文';
-    document.getElementById('crViewBtn').textContent = '原始 Markdown';
+    readerLabel('crCopyBtn').textContent = '复制原文';
+    readerLabel('crViewBtn').textContent = '原始 Markdown';
     document.getElementById('crPreviousBtn').hidden = true;
     document.getElementById('crNextBtn').hidden = true;
   }

@@ -103,7 +103,6 @@ export class CanvasView {
       this.renderStatus();
     });
     new ResizeObserver(() => this.layout()).observe(this.canvas);
-    window.addEventListener('citrus:scalechange', () => this.layout());
   }
 
   show(asset, project, reset = false) {

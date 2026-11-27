@@ -86,7 +86,6 @@ def geometry(page, obj, *, min_hits=1, expected=None):
       const image = document.querySelector('#preview');
       const canvas = document.querySelector('#canvas');
       const view = canvas.getBoundingClientRect();
-      const ui = window.CitrusTheme.scale.effective();
       const vp = (p, ctm) => new DOMPoint(p.x,p.y).matrixTransform(ctm);
       function visible(point) {
         return point.x > view.left && point.x < view.right && point.y > view.top && point.y < view.bottom &&
@@ -109,8 +108,8 @@ def geometry(page, obj, *, min_hits=1, expected=None):
         for (const shape of shapes) {
           const box = shape.getBBox();
           const origin = vp({x:box.x+box.width/2, y:box.y+box.height/2}, shape.getScreenCTM());
-          canvas.scrollLeft += (origin.x-(view.left+view.right)/2)/ui;
-          canvas.scrollTop += (origin.y-(view.top+view.bottom)/2)/ui;
+          canvas.scrollLeft += origin.x-(view.left+view.right)/2;
+          canvas.scrollTop += origin.y-(view.top+view.bottom)/2;
           const ctm = shape.getScreenCTM();
           const points = shape.getPointAtLength ? [...Array(32)].map((_,i)=>shape.getPointAtLength(shape.getTotalLength()*(i+.5)/32)) : grid(shape);
           points.push(...grid(shape));
@@ -211,12 +210,14 @@ def run(browser, api, output):
     expect(page.locator('#picking')).to_be_enabled()
     assert not page.evaluate('Boolean(globalThis.crypto?.subtle)')
     verify_geometry(page)
+    expect(page.locator('[data-ui-scale-pick]')).to_have_count(0)
+    page.evaluate('window.CitrusTheme.scale.set(150)')
+    expect(page.locator('html')).to_have_css('zoom', '1')
     for zoom in [125, 150, 190]:
-        if zoom != 190:
-            page.locator(f'[data-ui-scale-pick="{zoom}"]').click()
         field = page.get_by_label('自定义画布缩放百分比')
         field.fill(str(zoom))
         page.get_by_role('button', name='应用画布缩放').click()
+        expect(page.locator('#zoomLevel')).to_have_text(f'{zoom}%')
         point = geometry(page, lines[-1], min_hits=2)
         for _ in range(4):
             page.evaluate('''() => {
@@ -403,9 +404,12 @@ def run(browser, api, output):
         mark = geometry(page, binding, expected=group_id)
         page.mouse.click(mark['x'], mark['y'])
         assert chosen(page) == group_id
+        icon = 'arrow-right' if mark_groups[group_id]['kind'] == 'arrow' else 'vector'
+        expect(tree(page, group_id).locator(':scope > .tree-row > .tree-kind use')).to_have_attribute(
+            'href', f'/assets/citrus-icons.svg#ui-{icon}')
         expect(page.get_by_role('button', name='应用到此组')).to_have_count(1)
     page.screenshot(path=str(output / 'native-arrow-patch.png'))
-    expect(page.get_by_role('link', name='← 返回会话')).to_have_attribute(
+    expect(page.get_by_role('link', name='返回会话', exact=True)).to_have_attribute(
         'href', '/?figure_session=ca7d045c-04d3-4b2f-b6f8-5e07b26d8f22')
     patch = next(g for g in mark_groups.values() if g['kind'] == 'patch')
     point = geometry(page, mark_objects[patch['id']], expected=patch['id'])

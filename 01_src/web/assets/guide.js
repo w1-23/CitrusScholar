@@ -8,87 +8,51 @@
   ];
   var aliases = {upload: 'conversation', account: 'conversation', research: 'conversation',
     data: 'features', sources: 'features', delivery: 'features', figures: 'workbench'};
-  var dialog, opener, onClose, current = 0;
+  var dialog, opener, onClose;
+
+  function guideSections() {
+    return pages.map(function (page) {
+      return '<figure class="cg-section" id="' + page.id + '">' +
+        '<figcaption>' + page.title + '</figcaption>' +
+        '<img src="/assets/guide-' + page.image + '.png" width="1672" height="941" alt="' + page.title + '">' +
+        '</figure>';
+    }).join('');
+  }
+
+  function resolveSection(page) {
+    if (typeof page === 'number') page = pages[page - 1] && pages[page - 1].id;
+    page = Object.prototype.hasOwnProperty.call(aliases, page) ? aliases[page] : page;
+    return pages.some(function (item) { return item.id === page; }) ? page : pages[0].id;
+  }
+
   function mount() {
     if (dialog) return;
     dialog = document.createElement('dialog');
     dialog.id = 'citrusGuideDialog';
     dialog.className = 'cg-dialog';
     dialog.setAttribute('aria-labelledby', 'citrusGuideTitle');
-    dialog.innerHTML = '<header class="cg-header"><h1 id="citrusGuideTitle">使用指南</h1><div>' +
-      '<button type="button" data-guide-zoom aria-label="放大图片" aria-pressed="false" title="放大图片">⊕</button>' +
-      '<button type="button" data-guide-close aria-label="关闭使用指南" title="关闭">×</button></div></header>' +
-      '<article id="citrusGuidePage" class="cg-page" tabindex="-1" aria-label="指南图示"></article>' +
-      '<footer class="cg-footer"><button type="button" data-guide-prev aria-label="上一页" title="上一页">‹</button>' +
-      '<nav class="cg-nav" aria-label="选择指南页">' + pages.map(function (page, index) {
-        return '<button type="button" data-guide-page="' + index + '" aria-label="' + page.title + '" title="' + page.title + '"></button>';
-      }).join('') + '</nav><span id="citrusGuideIndex" role="status"></span>' +
-      '<button type="button" data-guide-next aria-label="下一页" title="下一页">›</button></footer>';
+    var closeIcon = window.AppIcon ? window.AppIcon.html('close') :
+      '<svg class="ui-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-close"/></svg>';
+    dialog.innerHTML = '<header class="cg-header"><h1 id="citrusGuideTitle">使用指南</h1>' +
+      '<button type="button" data-guide-close aria-label="关闭使用指南" title="关闭">' + closeIcon + '</button></header>' +
+      '<div class="cg-pages" tabindex="0" role="region" aria-label="全部指南图示">' + guideSections() + '</div>';
     document.body.appendChild(dialog);
-    dialog.addEventListener('click', function (event) {
-      var target = event.target.closest('button');
-      if (!target || !dialog.contains(target)) return;
-      if (target.hasAttribute('data-guide-close')) close();
-      else if (target.hasAttribute('data-guide-zoom')) zoom(target.getAttribute('aria-pressed') !== 'true');
-      else if (target.hasAttribute('data-guide-page')) go(Number(target.getAttribute('data-guide-page')));
-      else if (target.hasAttribute('data-guide-prev')) go(current - 1);
-      else if (target.hasAttribute('data-guide-next')) go(current + 1);
-    });
+    dialog.querySelector('[data-guide-close]').addEventListener('click', function () { close(); });
     dialog.addEventListener('cancel', function (event) { event.preventDefault(); close(); });
-    dialog.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
-      else if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
-        if (event.target.closest('.cg-page[data-zoom="true"]')) return;
-        event.preventDefault(); event.stopPropagation(); go(current + (event.key === 'ArrowRight' ? 1 : -1));
-      }
-    });
   }
-  function zoom(expanded) {
-    var page = dialog.querySelector('.cg-page');
-    var button = dialog.querySelector('[data-guide-zoom]');
-    page.dataset.zoom = String(expanded);
-    button.setAttribute('aria-pressed', String(expanded));
-    button.setAttribute('aria-label', expanded ? '适应窗口' : '放大图片');
-    button.title = button.getAttribute('aria-label');
-    button.textContent = expanded ? '⊖' : '⊕';
-    if (expanded) page.focus();
-    else page.scrollTo(0, 0);
-  }
-  function go(index) {
-    index = Math.max(0, Math.min(pages.length - 1, Number(index) || 0));
-    var page = pages[index], article = dialog.querySelector('.cg-page');
-    if (dialog.open && article.dataset.page === page.id) return;
-    var direction = index < current ? 'back' : 'forward';
-    current = index;
-    zoom(false);
-    article.dataset.page = page.id;
-    article.dataset.direction = direction;
-    var image = new Image(1672, 941);
-    image.alt = page.title;
-    image.src = '/assets/guide-' + page.image + '.png';
-    article.replaceChildren(image);
-    dialog.querySelectorAll('[data-guide-page]').forEach(function (button, i) {
-      button.setAttribute('aria-current', i === current ? 'page' : 'false');
-    });
-    var prev = dialog.querySelector('[data-guide-prev]'), next = dialog.querySelector('[data-guide-next]');
-    prev.disabled = current === 0;
-    next.disabled = current === pages.length - 1;
-    if (document.activeElement === prev && prev.disabled) next.focus();
-    if (document.activeElement === next && next.disabled) prev.focus();
-    var status = dialog.querySelector('#citrusGuideIndex');
-    status.textContent = (current + 1) + ' / ' + pages.length;
-    status.setAttribute('aria-label', status.textContent + ' · ' + page.title);
-  }
+
   function open(page, options) {
     mount();
     options = options || {};
-    if (!dialog.open) opener = document.activeElement;
-    onClose = typeof options.onClose === 'function' ? options.onClose : null;
-    page = Object.prototype.hasOwnProperty.call(aliases, page) ? aliases[page] : page;
-    var index = typeof page === 'number' ? page - 1 : pages.findIndex(function (item) { return item.id === page; });
-    go(index < 0 ? 0 : index);
-    if (!dialog.open) dialog.showModal();
-    dialog.querySelector('[data-guide-close]').focus();
+    if (!dialog.open) {
+      opener = document.activeElement;
+      dialog.showModal();
+    }
+    if (typeof options.onClose === 'function') onClose = options.onClose;
+    dialog.querySelector('[data-guide-close]').focus({preventScroll: true});
+    var content = dialog.querySelector('.cg-pages');
+    var section = content.querySelector('#' + resolveSection(page));
+    content.scrollTop = section.offsetTop;
   }
   function close(notify) {
     if (!dialog || !dialog.open) return;
@@ -107,14 +71,16 @@
     opener = null;
     if (notify !== false && callback) callback();
   }
-  window.CitrusGuide = {open: open, close: close, pageCount: pages.length, version: 5};
+  window.CitrusGuide = {open: open, close: close, pageCount: pages.length, version: 7};
   document.addEventListener('click', function (event) {
     var target = event.target.closest('[data-citrus-guide]');
     if (!target) return;
     event.preventDefault();
     open(target.getAttribute('data-citrus-guide') || 'conversation');
   });
-  if (document.body && document.body.classList.contains('guide-page')) {
-    open(location.hash.slice(1) || 'conversation');
+  var landing = document.getElementById('citrusGuideSections');
+  if (landing) {
+    landing.innerHTML = guideSections();
+    if (location.hash) landing.querySelector('#' + resolveSection(location.hash.slice(1))).scrollIntoView();
   }
 }());

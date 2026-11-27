@@ -60,8 +60,6 @@ body {
 .tool-trace { margin: 0 0 9px; border-bottom: 1px solid var(--border-hairline); color: var(--text-muted); }
 .tool-trace-summary { display: flex; align-items: center; gap: 7px; min-height: 29px; padding: 3px 1px 6px; cursor: pointer; list-style: none; user-select: none; font-size: 11px; }
 .tool-trace-summary::-webkit-details-marker { display: none; }
-.tool-trace-summary::after { content: '⌄'; margin-left: auto; font-size: 12px; transition: transform .16s ease; }
-.tool-trace[open] > .tool-trace-summary::after { transform: rotate(180deg); }
 .tool-trace-indicator { width: 15px; color: var(--success); text-align: center; font-size: 13px; }
 .tool-trace.is-running .tool-trace-indicator { animation: tracePulse 1.15s ease-in-out infinite; }
 /* 收尾时按真实行状态着色：有失败步骤不再显示为成功态 */
@@ -1013,8 +1011,6 @@ footer {
 .session-group:last-child { border-bottom: 0; }
 .session-group summary { display: flex; align-items: center; gap: 7px; padding: 7px 6px; color: var(--text-muted); font-size: 10px; font-weight: 600; cursor: pointer; list-style: none; user-select: none; }
 .session-group summary::-webkit-details-marker { display: none; }
-.session-group summary::before { content: '›'; width: 10px; color: var(--text-muted); font-size: 14px; line-height: 1; transition: transform .16s ease; }
-.session-group[open] summary::before { transform: rotate(90deg); }
 .session-group-count { margin-left: auto; font-family: var(--font-mono); font-size: 9px; font-weight: 400; }
 .session-group-content { padding: 1px 0 5px; animation: sessionGroupIn .18s var(--ease-out-quint) both; }
 @keyframes sessionGroupIn { from { opacity: .55; transform: translateY(-3px); } to { opacity: 1; transform: translateY(0); } }
@@ -2133,16 +2129,6 @@ html[data-reduce-motion="1"]:not([data-force-motion="1"]) .citrus-mascot-frame {
   --motion-slow: .28s;
 }
 /* 折叠/展开指示：纯 CSS 三角，方向与内容显隐一致（折叠→右，展开→下） */
-.sidebar-header::before {
-  content: ""; flex: 0 0 auto; width: 0; height: 0;
-  border-left: 4.5px solid currentColor;
-  border-top: 3.5px solid transparent;
-  border-bottom: 3.5px solid transparent;
-  opacity: .5; transform: rotate(0deg);
-  transition: transform var(--motion-fast) var(--ease-out-quint), opacity var(--motion-fast) ease;
-}
-.sidebar-section.expanded > .sidebar-header::before { transform: rotate(90deg); opacity: .85; }
-.sidebar-header:hover::before { opacity: .9; }
 /* 键盘可达性：统一焦点环，不改变布局 */
 .rail-button:focus-visible,
 .rail-quick .rail-button:focus-visible,

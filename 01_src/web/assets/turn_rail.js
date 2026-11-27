@@ -58,7 +58,7 @@
     tipEl.setAttribute('role', 'tooltip');
     latestEl = document.createElement('button');
     latestEl.type = 'button'; latestEl.className = 'turn-return-latest'; latestEl.hidden = true;
-    latestEl.textContent = '↓ 返回最新';
+    latestEl.innerHTML = (window.AppIcon ? window.AppIcon.html('arrow-down', {size: 16}) : '') + '<span>返回最新</span>';
     latestEl.addEventListener('click', function () {
       follow(true);
       chatBox().focus({preventScroll: true});
@@ -150,7 +150,7 @@
       var more = document.createElement('button');
       more.type = 'button';
       more.className = 'turn-rail-more';
-      more.textContent = '⋮';
+      more.innerHTML = window.AppIcon ? window.AppIcon.html('more-vertical', {size: 16}) : '';
       more.title = '还有更早的提问未列出，点击继续加载';
       more.setAttribute('aria-label', '继续加载更早的提问');
       more.addEventListener('click', function () {

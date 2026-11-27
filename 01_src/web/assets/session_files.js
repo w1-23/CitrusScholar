@@ -49,6 +49,27 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  var PRIMARY_FILE_ACTIONS = {
+    preview: ['eye', '预览', '预览'], export: ['export', '导出', '导出已有成果'],
+    download: ['download', '原件', '下载原件']
+  };
+
+  function fileIcon(name, size) {
+    return window.AppIcon ? window.AppIcon.html(name, {size: size || 16}) : '';
+  }
+
+  function fileActionContent(icon, label) {
+    return fileIcon(icon) + '<span>' + esc(label) + '</span>';
+  }
+
+  function filePrimaryActionHtml(action, file, ariaLabel) {
+    var spec = PRIMARY_FILE_ACTIONS[action];
+    return '<button type="button" class="file-primary-action' + (action === 'preview' ? ' session-file-preview-btn' : '') +
+      '" data-file-act="' + action + '" data-file-id="' + esc(file.file_id) +
+      '" title="' + esc(ariaLabel) + '" aria-label="' + esc(ariaLabel) + '"' +
+      (action === 'download' ? '' : ' aria-haspopup="dialog"') + '>' + fileActionContent(spec[0], spec[1]) + '</button>';
+  }
+
   function fmtSize(n) {
     n = Number(n || 0);
     if (!n) return '0 B';
@@ -96,13 +117,12 @@
       Number(f.size_bytes) <= 2*1024*1024 && safePreviewUrl(f.preview_url);
     var tableTile = kind === 'table' && /^[a-f0-9]{32}$/i.test(String(f.file_id || ''));
     var thumbnailHtml = '<span class="session-file-thumb-fallback">' +
-      window.uiIcon(kind === 'table' ? 'table' : kind === 'svg' ? 'canvas' : 'file') +
+      fileIcon(kind === 'table' ? 'table' : kind === 'svg' ? 'canvas' : kind === 'image' ? 'image' : 'file', 24) +
       (ext ? '<small>' + esc(ext) + '</small>' : '') + '</span>' + (thumbnail
       ? '<img src="' + esc(thumbnail + (thumbnail.includes('?') ? '&' : '?') + 'library_tile=1') +
         '" alt="" loading="lazy" decoding="async">' : '');
-    // Card content is not itself a button: preview is an explicit, labelled
-    // action, and every secondary operation lives in the ⋯ menu. This keeps a
-    // single tab stop per action and gives touch/pointer users a 44px target.
+    // Keep the primary actions in the same order as on generated chat cards.
+    // File-specific secondary operations retain their existing menu semantics.
     return '' +
       '<div class="session-file-item" data-file-id="' + esc(f.file_id) + '"' +
       '     data-kind="' + esc(kind) + '" data-filename="' + esc(f.filename) + '">' +
@@ -114,35 +134,34 @@
       '      <span class="session-file-badge k-' + esc(kind) + '">' + esc(label) + '</span> ' + esc(fmtSize(f.size_bytes)) + '</div>' +
       '  </div>' +
       '  <div class="session-file-actions">' +
-      '    <button type="button" class="session-file-preview-btn" data-file-act="preview" data-file-id="' +
-           esc(f.file_id) + '" title="预览 ' + esc(f.filename) + '" aria-label="预览 ' +
-           esc(f.filename) + '" aria-haspopup="dialog">' + window.uiIcon('eye') + ' <span>预览</span></button>' +
+      '    <div class="file-primary-actions">' +
+             filePrimaryActionHtml('preview', f, '预览 ' + f.filename) +
+             filePrimaryActionHtml('export', f, '导出已有成果 ' + f.filename) +
+             filePrimaryActionHtml('download', f, '下载原件 ' + f.filename) + '</div>' +
       '    <button type="button" class="session-file-ref-pill" data-file-act="reference" data-file-id="' +
            esc(f.file_id) + '" title="在当前对话中引用" aria-label="引用 ' +
-           esc(f.filename) + '">' + window.uiIcon('plus') + ' <span>引用</span></button>' +
+           esc(f.filename) + '">' + fileActionContent('plus', '引用') + '</button>' +
       '    <button type="button" class="session-file-act session-file-more-btn" data-file-act="more" data-file-id="' +
            esc(f.file_id) + '" title="更多操作" aria-label="更多操作（' + esc(f.filename) +
-           '）" aria-haspopup="menu" aria-controls="' + esc(menuId) + '" aria-expanded="false">⋯</button>' +
+           '）" aria-haspopup="menu" aria-controls="' + esc(menuId) + '" aria-expanded="false">' + fileIcon('more') + '</button>' +
       '  </div>' +
       '  <div class="session-file-more" id="' + esc(menuId) + '" data-file-menu="' + esc(f.file_id) +
       '" role="menu" aria-label="更多操作" hidden>' +
-      '    <button type="button" role="menuitem" data-file-act="info" data-file-id="' + esc(f.file_id) + '">文件信息</button>' +
-      '    <button type="button" role="menuitem" data-file-act="download" data-file-id="' + esc(f.file_id) + '">下载原件</button>' +
-      '    <button type="button" role="menuitem" data-file-act="export" data-file-id="' + esc(f.file_id) + '">导出已有成果</button>' +
+      '    <button type="button" role="menuitem" data-file-act="info" data-file-id="' + esc(f.file_id) + '">' + fileActionContent('info', '文件信息') + '</button>' +
       (svg
-        ? '    <button type="button" role="menuitem" data-file-act="copy-svg" data-file-id="' + esc(f.file_id) + '">复制 SVG 源码</button>'
+        ? '    <button type="button" role="menuitem" data-file-act="copy-svg" data-file-id="' + esc(f.file_id) + '">' + fileActionContent('copy', '复制 SVG 源码') + '</button>'
         : '') +
       (canImportSvg(f)
-        ? '    <button type="button" role="menuitem" data-file-act="edit-svg-copy" data-file-id="' + esc(f.file_id) + '">尝试创建可编辑 SVG 副本</button>'
+        ? '    <button type="button" role="menuitem" data-file-act="edit-svg-copy" data-file-id="' + esc(f.file_id) + '">' + fileActionContent('edit', '尝试创建可编辑 SVG 副本') + '</button>'
         : '') +
       (jump
-        ? '    <button type="button" role="menuitem" data-file-act="jump" data-file-id="' + esc(f.file_id) + '">定位到来源会话</button>'
+        ? '    <button type="button" role="menuitem" data-file-act="jump" data-file-id="' + esc(f.file_id) + '">' + fileActionContent('external', '定位到来源会话') + '</button>'
         : '') +
       // Generated deliverables are owned by the research pipeline: the library
       // never offers deletion for them. Uploaded files may be removed here.
       (deletable
         ? '    <button type="button" role="menuitem" class="danger" data-file-act="delete" data-file-id="' +
-          esc(f.file_id) + '">删除此上传文件</button>'
+          esc(f.file_id) + '">' + fileActionContent('trash', '删除此上传文件') + '</button>'
         : '') +
       '  </div>' +
       '</div>';
@@ -1558,7 +1577,10 @@
       var node = document.createElement('button');
       node.type = 'button';
       node.className = 'api-secondary';
-      node.textContent = text;
+      var icon = {out: 'minus', fit: 'fit', in: 'plus', edit: 'edit'}[key];
+      if (icon && (key === 'in' || key === 'out')) node.innerHTML = fileIcon(icon);
+      else if (icon) node.innerHTML = fileActionContent(icon, text);
+      else node.textContent = text;
       node.setAttribute('aria-label', label);
       node.addEventListener('click', action);
       controls[key] = node;
@@ -2173,8 +2195,10 @@
     overlay.hidden = false;
     el('sessionFilePreviewTitle').textContent = '导出已有成果';
     el('sessionFilePreviewMeta').textContent = '资料库文件';
-    el('sessionFilePreviewDownload').href = fileDownloadUrl(id);
-    el('sessionFilePreviewDownload').hidden = false;
+    var download = el('sessionFilePreviewDownload');
+    download.href = fileDownloadUrl(id);
+    download.setAttribute('download', '');
+    download.hidden = false;
     var copy = el('sessionFilePreviewCopySvg');
     if (copy) copy.hidden = true;
     stage.textContent = '正在核对已生成格式…';
@@ -2199,12 +2223,16 @@
           return option.mode === 'existing' && /^[a-f0-9]{32}$/.test(option.file_id || '') && option.target_format;
         });
         if (!options.length) throw new Error('没有可导出的已生成格式。');
+        var formats = document.createElement('div');
+        formats.className = 'sf-export-formats';
+        formats.setAttribute('role', 'group');
+        formats.setAttribute('aria-label', '已生成格式');
         options.forEach(function (option) {
           var button = document.createElement('button');
           button.type = 'button';
           button.className = 'api-secondary';
-          button.textContent = String(option.target_format).toUpperCase() +
-            (option.file_id === id ? '（原件）' : '（已生成）');
+          button.innerHTML = fileActionContent('download', String(option.target_format).toUpperCase() +
+            (option.file_id === id ? '（原件）' : '（已生成）'));
           button.title = option.filename || '';
           button.onclick = function () {
             if (button.disabled) return;
@@ -2223,8 +2251,9 @@
               if (active()) toast(error.message || '导出失败，请重试。');
             }).finally(function () { button.disabled = false; });
           };
-          stage.appendChild(button);
+          formats.appendChild(button);
         });
+        stage.appendChild(formats);
       }).catch(function (error) {
         if (active()) stage.textContent = error.message || '导出暂时不可用，请重试。';
       });
@@ -2451,10 +2480,9 @@
     }
   }
 
-  // 聊天里的"本轮生成文件"卡片由 app.js 渲染（只给了预览按钮）。这里按
-  // data-file-id 追加同样的下载/复制源码/定位/信息入口，复用同一套资料库，
-  // 不另建一套文件库，也不改 app.js。
-  function turnCardAction(action, fileId, glyph, label) {
+  // 复用 app.js 的生成文件卡片及其原有链接，与资料库统一主要控件布局。
+  // 保留已登记文件的复制源码、定位和信息等次要操作。
+  function turnCardAction(action, fileId, icon, label) {
     var button = document.createElement('button');
     button.type = 'button';
     button.className = 'turn-file-act';
@@ -2462,19 +2490,47 @@
     button.setAttribute('data-file-id', fileId);
     button.title = label;
     button.setAttribute('aria-label', label);
-    button.textContent = glyph;
+    button.innerHTML = fileIcon(icon);
     return button;
   }
 
   function syncTurnSourceActions(box, file, fileId) {
     var jump = box.querySelector('[data-file-act="jump"]');
     if (file?.turn_request_id && file.source_session_id) {
-      if (!jump) box.appendChild(turnCardAction('jump', fileId, '↗', '定位到生成它的会话'));
+      if (!jump) box.appendChild(turnCardAction('jump', fileId, 'external', '定位到生成它的会话'));
     } else if (jump) jump.remove();
     var edit = box.querySelector('[data-file-act="edit-svg-copy"]');
     if (canImportSvg(file)) {
-      if (!edit) box.appendChild(turnCardAction('edit-svg-copy', fileId, '副本', '尝试创建可编辑 SVG 副本'));
+      if (!edit) box.appendChild(turnCardAction('edit-svg-copy', fileId, 'edit', '尝试创建可编辑 SVG 副本'));
     } else if (edit) edit.remove();
+  }
+
+  function arrangeTurnPrimaryActions(card, fileId, filename) {
+    if (!FILE_ID.test(fileId)) return;
+    var preview = card.querySelector('button.turn-file-open');
+    if (!preview) return;
+    var original = card.querySelector('a.turn-file-open');
+    var row = document.createElement('div');
+    row.className = 'file-primary-actions';
+    ['preview', 'export', 'download'].forEach(function (action) {
+      // Keep existing preview listeners and SVG original links. Other files
+      // use the same registered download action as library cards.
+      var button = action === 'preview' ? preview : action === 'download' ? original : null;
+      if (!button) {
+        button = document.createElement('button');
+        button.type = 'button';
+        button.setAttribute('data-file-act', action);
+        button.setAttribute('data-file-id', fileId);
+      }
+      var spec = PRIMARY_FILE_ACTIONS[action];
+      button.classList.add('file-primary-action');
+      button.title = spec[2] + ' ' + filename;
+      button.setAttribute('aria-label', button.title);
+      if (action !== 'download') button.setAttribute('aria-haspopup', 'dialog');
+      button.innerHTML = fileActionContent(spec[0], spec[1]);
+      row.appendChild(button);
+    });
+    card.appendChild(row);
   }
 
   function decorateTurnCards(root) {
@@ -2500,10 +2556,10 @@
       var box = document.createElement('div');
       box.className = 'turn-file-extra';
       box.dataset.fileId = fileId;
-      if (svg) box.appendChild(turnCardAction('copy-svg', fileId, '⧉', '复制 SVG 源码'));
-      box.appendChild(turnCardAction('export', fileId, '导出', '导出已有成果'));
+      if (svg) box.appendChild(turnCardAction('copy-svg', fileId, 'copy', '复制 SVG 源码'));
+      arrangeTurnPrimaryActions(card, fileId, name || '生成文件');
       syncTurnSourceActions(box, cached, fileId);
-      if (svg) box.appendChild(turnCardAction('info', fileId, 'ⓘ', '文件信息'));
+      if (svg) box.appendChild(turnCardAction('info', fileId, 'info', '文件信息'));
       card.appendChild(box);
     });
     if (cards.length && !listLoaded) {

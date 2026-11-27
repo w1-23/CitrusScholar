@@ -112,7 +112,7 @@ function browser() {
     fetch: (url, opts) => { const req = {url, opts: opts || {}, settled: false, ...deferred()}; requests.push(req); return req.promise; }};
   context.window = context;
   vm.createContext(context);
-  for (const file of ['task-state.js', 'task-transport.js', 'task-cards.js', 'task-controls.js', 'app.js', 'corpus_reader.js']) {
+  for (const file of ['app-icon-names.js', 'app-icon.js', 'task-state.js', 'task-transport.js', 'task-cards.js', 'task-controls.js', 'app.js', 'corpus_reader.js']) {
     vm.runInContext(readFileSync(join(__dirname, '../assets', file), 'utf8'), context, {filename: file});
   }
   context.currentAccount = {user_id: 'test', username: 'test'};

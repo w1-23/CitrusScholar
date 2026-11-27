@@ -297,7 +297,8 @@ async function refreshReviewConsent() {
 function renderReviewConsent() {
   const btn = document.getElementById("reviewConsentBtn");
   if (!btn) return;
-  btn.textContent = "\u21ea 文献共享授权：" + (reviewConsentEnabled ? "已授权" : "未授权");
+  const label = btn.querySelector('.account-menu-item-label');
+  if (label) label.textContent = "文献共享授权：" + (reviewConsentEnabled ? "已授权" : "未授权");
   btn.setAttribute("aria-pressed", reviewConsentEnabled ? "true" : "false");
 }
 
@@ -1572,7 +1573,7 @@ function renderAttachmentSelection() {
     remove.className = 'attachment-preview-remove';
     remove.setAttribute('aria-label', '移除 ' + file.name);
     remove.title = '移除附件';
-    remove.textContent = '×';
+    remove.innerHTML = uiIcon('close');
     remove.onclick = function() { _selectedAttachments.splice(index, 1); renderAttachmentSelection(); if (userInput) { try { userInput.focus({preventScroll: true}); } catch (_) { userInput.focus(); } } };
     card.appendChild(remove);
     host.appendChild(card);
@@ -1592,7 +1593,7 @@ function renderAttachmentSelection() {
     var remove = document.createElement('button');
     remove.type = 'button'; remove.className = 'attachment-preview-remove';
     remove.setAttribute('aria-label', '移除 ' + (file.filename || '资料库文件'));
-    remove.textContent = '×';
+    remove.innerHTML = uiIcon('close');
     remove.onclick = function() { window._selectedAccountFileRefs.splice(index, 1); renderAttachmentSelection(); if (userInput) { try { userInput.focus({preventScroll: true}); } catch (_) { userInput.focus(); } } };
     card.appendChild(remove); host.appendChild(card);
   });
@@ -2335,7 +2336,8 @@ function renderConfiguredProviders() {
     name.textContent = provider.name;
     var status = document.createElement('span');
     status.className = 'configured-provider-state';
-    status.textContent = provider.id === ((_runtimeConfig || {}).model || {}).provider_id ? '● 当前使用' : '● 已保存';
+    var isCurrent = provider.id === ((_runtimeConfig || {}).model || {}).provider_id;
+    status.innerHTML = uiIcon(isCurrent ? 'check' : 'archive') + (isCurrent ? ' 当前使用' : ' 已保存');
     var edit = document.createElement('button');
     edit.type = 'button'; edit.className = 'configured-provider-edit'; edit.textContent = '编辑';
     edit.onclick = function() {
@@ -2920,10 +2922,11 @@ function refreshTaskComposer() {
     button.title = executing ? label + '。按 Enter 可将新消息加入队列' : label + ' (Enter)';
     button.setAttribute('aria-label', label);
     button.setAttribute('aria-disabled', String(button.disabled || (!executing && !hasText)));
+    if (button.classList.contains('is-stop-mode') !== executing) {
+      button.innerHTML = uiIcon(executing ? 'stop' : 'send', {tone: 'inverse'});
+    }
     button.classList.toggle('is-stop-mode', executing);
     button.classList.toggle('is-stopping', !!(executing && stopping));
-    var icon = button.querySelector('use');
-    if (icon) icon.setAttribute('href', executing ? '/assets/citrus-icons.svg#ui-stop' : '/assets/citrus-icons.svg#ui-send');
   }
   var continuation = document.getElementById('composer-continuation');
   if (continuation) continuation.hidden = !(composerContinuation && composerContinuation.session === sessionId);
@@ -3209,7 +3212,7 @@ function renderSessions() {
       '<button type="button" class="session-title" onclick="switchSession(\'' + s.session_id + '\')" title="' + title + '">' + title + '</button>' +
       '<span class="session-time">' + fmtSessionTime(s.updated_at) + '</span>' +
       '<div class="session-ops">' +
-      '<button class="session-op" onclick="sessionMenu(event,\'' + s.session_id + '\')" title="更多">⋯</button>' +
+      '<button type="button" class="session-op" onclick="sessionMenu(event,\'' + s.session_id + '\')" title="更多" aria-label="更多会话操作">' + uiIcon('more') + '</button>' +
       '</div></div>';
   }
   var savedOpenGroups = ['today'];
@@ -3219,14 +3222,14 @@ function renderSessions() {
   } catch (_) {}
   var html = '';
   if (!visible.length && !_sessionsRead && !_sessionsError) {
-    html = '<div class="empty-sidebar">' + (_sessionsBefore ? '此页暂无会话，可继续加载。' : '暂无会话，点击左侧 ＋ 新建') + '</div>';
+    html = '<div class="empty-sidebar">' + (_sessionsBefore ? '此页暂无会话，可继续加载。' : '暂无会话，点击左侧“新建会话”') + '</div>';
   }
   buckets.forEach(function(bucket) {
     if (!bucket.items.length) return;
     var containsActive = bucket.items.some(function(s) { return s.session_id === sessionId; });
     var open = containsActive || savedOpenGroups.indexOf(bucket.key) >= 0;
     html += '<details class="session-group" data-session-group="' + bucket.key + '"' + (open ? ' open' : '') + '>' +
-      '<summary>' + bucket.label + '<span class="session-group-count">' + bucket.items.length + '</span></summary>' +
+      '<summary>' + uiIcon('chevron-right') + bucket.label + '<span class="session-group-count">' + bucket.items.length + '</span></summary>' +
       '<div class="session-group-content">' + bucket.items.map(sessionItemHtml).join('') + '</div></details>';
   });
   if (_sessionsRead) html += '<div class="empty-sidebar" role="status">正在读取会话…</div>';
@@ -3270,12 +3273,20 @@ function sessionMenu(ev, sid) {
   var item = ev.currentTarget.closest('.session-item');
   var menu = document.createElement('div');
   menu.className = 'session-menu';
-  menu.innerHTML = '<div class="session-menu-item" onclick="sessionMenuAction(\'rename\',\'' + sid + '\')">✎ 重命名</div>' +
-                   '<div class="session-menu-item danger" onclick="sessionMenuAction(\'delete\',\'' + sid + '\')">🗑 删除</div>';
+  menu.innerHTML = '<button type="button" class="session-menu-item" onclick="sessionMenuAction(\'rename\',\'' + sid + '\')">' + uiIcon('edit') + '重命名</button>' +
+                   '<button type="button" class="session-menu-item danger" onclick="sessionMenuAction(\'delete\',\'' + sid + '\')">' + uiIcon('trash') + '删除</button>';
   var rect = item ? item.getBoundingClientRect() : { bottom: 80, right: 160 };
   menu.style.top = (rect.bottom + 4) + 'px';
   menu.style.left = Math.max(8, rect.right - 130) + 'px';
   document.body.appendChild(menu);
+  var trigger = ev.currentTarget;
+  if (ev.detail === 0) menu.querySelector('button').focus();
+  menu.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape') return;
+    event.stopPropagation();
+    closeSessionMenu();
+    trigger.focus();
+  });
   setTimeout(function () {
     document.addEventListener('click', function once() {
       closeSessionMenu();
@@ -3383,7 +3394,7 @@ function loadWorkspaceFiles() {
         // v8.10i: 路径分段编码（整体 encodeURIComponent 会把 / 编成 %2F 导致 404）
         var enc = f.path.split('/').map(encodeURIComponent).join('/');
         html += '<a class="workspace-file" href="/api/v2/session/' + encodeURIComponent(reqSid) + '/workspace-file?path=' + enc +
-          '" target="_blank" title="' + escapeHtml(f.path) + '">📄 ' + escapeHtml(f.name) + '</a>';
+          '" target="_blank" title="' + escapeHtml(f.path) + '">' + uiIcon('file') + ' ' + escapeHtml(f.name) + '</a>';
       }
       box.innerHTML = html;
     }).catch(function () { if (epoch !== authEpoch) return;
@@ -3713,8 +3724,8 @@ function addMessage(role, html, before, fresh) {
   return div.querySelector('.content');
 }
 
-function uiIcon(name) {
-  return '<svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-' + name + '"></use></svg>';
+function uiIcon(name, options) {
+  return window.AppIcon.html(name, options);
 }
 
 function appendMessageActions(content, role, text) {
@@ -3737,7 +3748,7 @@ function appendMessageActions(content, role, text) {
     var hasAttachments = !!content.querySelector('.sent-attachment-gallery');
     edit.title = hasAttachments ? '修改问题后重新发送；附件需重新添加' : '将问题放回输入框修改后重新发送';
     edit.setAttribute('aria-label', '编辑问题');
-    edit.textContent = '✎ 编辑';
+    edit.innerHTML = uiIcon('edit') + '<span>编辑</span>';
     edit.addEventListener('click', function() {
       userInput.value = String(text || '');
       setComposerContinuation(null);
@@ -5303,7 +5314,7 @@ async function sendMsg(paperVerification, continueFrom) {
     h += '<span class="cite-title">' + escapeHtml(_title) + '</span>';
     if (_turl) {
       h += '<a href="' + escapeHtml(_turl) + '" target="_blank" class="cite-link"'
-        + ' onclick="event.stopPropagation()" title="' + escapeHtml(_turl) + '">🔗</a>';
+        + ' onclick="event.stopPropagation()" aria-label="打开文献：' + escapeHtml(_title) + '" title="' + escapeHtml(_turl) + '">' + uiIcon('link') + '</a>';
     }
     h += '</div>';
     h += '<div class="citation-text citation-evidence">' + escapeHtml(sourceEvidenceText(item)) + '</div>';
@@ -5392,7 +5403,7 @@ async function sendMsg(paperVerification, continueFrom) {
       firstOpen = false;
       html += '<div class="src-group">';
       html += '<div class="src-group-header" onclick="toggleSrcGroup(\'' + gid + '\')">';
-      html += '<span class="toggle-icon' + (gOpen ? '' : ' collapsed') + '">▶</span>';
+      html += '<span class="toggle-icon' + (gOpen ? '' : ' collapsed') + '">' + uiIcon('chevron-down') + '</span>';
       html += '<span class="src-badge ' + sm2.cls + '">' + escapeHtml(sm2.tag) + ':</span>';
       html += '<span class="round-title" style="font-size:11px">' + escapeHtml(sm2.name) + '</span>';
       html += '<span class="round-count">' + items.length + '</span></div>';
@@ -5445,7 +5456,7 @@ async function sendMsg(paperVerification, continueFrom) {
       var open = i === roundHistory.length - 1;
       html += '<div class="round-group">';
       html += '<div class="round-header" onclick="toggleRound(\'round-' + round.roundId + '\')">';
-      html += '<span class="toggle-icon" id="round-' + round.roundId + '-icon">▶</span>';
+      html += '<span class="toggle-icon' + (open ? '' : ' collapsed') + '" id="round-' + round.roundId + '-icon">' + uiIcon('chevron-down') + '</span>';
       html += '<span class="round-title">Round ' + escapeHtml(String(round.roundId)) + ': ' + escapeHtml(qp) + '</span>';
       html += '<span class="round-count">' + all.length + '</span></div>';
       html += '<div class="round-body" id="round-' + round.roundId + '"' + (open ? '' : ' style="display:none"') + '>';
@@ -5479,7 +5490,7 @@ async function sendMsg(paperVerification, continueFrom) {
         firstOpen = false;
         html += '<div class="src-group">';
         html += '<div class="src-group-header" onclick="toggleSrcGroup(\'' + gid + '\')">';
-        html += '<span class="toggle-icon' + (gOpen ? '' : ' collapsed') + '">▶</span>';
+        html += '<span class="toggle-icon' + (gOpen ? '' : ' collapsed') + '">' + uiIcon('chevron-down') + '</span>';
         html += '<span class="src-badge ' + sm2.cls + '">' + escapeHtml(sm2.tag) + ':</span>';
         html += '<span class="round-title" style="font-size:11px">' + escapeHtml(sm2.name) + '</span>';
         html += '<span class="round-count">' + groups[gk].length + '</span></div>';

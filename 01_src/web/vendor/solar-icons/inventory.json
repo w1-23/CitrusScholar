@@ -1,0 +1,198 @@
+{
+  "baseline": "88f78e53f2ef31c80b333806f193b3eee6516c48",
+  "counts_are_static_text_not_rendered_totals": true,
+  "files": [
+    {
+      "path": "admin.html",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 0
+      },
+      "after": {
+        "sprite_references": 4,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 4
+      }
+    },
+    {
+      "path": "assets/app.js",
+      "before": {
+        "sprite_references": 3,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 3,
+        "inline_svg_openings": 2
+      },
+      "after": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 1
+      }
+    },
+    {
+      "path": "assets/figures.js",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 1,
+        "inline_svg_openings": 3
+      },
+      "after": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 3
+      }
+    },
+    {
+      "path": "assets/guide.js",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 0
+      },
+      "after": {
+        "sprite_references": 1,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 1
+      }
+    },
+    {
+      "path": "assets/session_files.js",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 1
+      },
+      "after": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 1
+      }
+    },
+    {
+      "path": "assets/workbench/controls.js",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 1,
+        "inline_svg_openings": 0
+      },
+      "after": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 0
+      }
+    },
+    {
+      "path": "figure-workbench.html",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 1
+      },
+      "after": {
+        "sprite_references": 14,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 14
+      }
+    },
+    {
+      "path": "figures.html",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 11,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 16
+      },
+      "after": {
+        "sprite_references": 21,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 21
+      }
+    },
+    {
+      "path": "index.html",
+      "before": {
+        "sprite_references": 14,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 3,
+        "inline_svg_openings": 22
+      },
+      "after": {
+        "sprite_references": 42,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 44
+      }
+    },
+    {
+      "path": "integrity-review.html",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 0
+      },
+      "after": {
+        "sprite_references": 3,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 3
+      }
+    },
+    {
+      "path": "assets/mascot.css",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 2,
+        "inline_svg_openings": 0
+      },
+      "after": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 2,
+        "inline_svg_openings": 0
+      }
+    },
+    {
+      "path": "assets/app.css",
+      "before": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 1,
+        "inline_svg_openings": 0
+      },
+      "after": {
+        "sprite_references": 0,
+        "local_symbol_definitions": 0,
+        "literal_glyphs": 0,
+        "inline_svg_openings": 0
+      }
+    }
+  ],
+  "retained_non_icon_svg": [
+    "context usage meter",
+    "loading sprout",
+    "scientific marker and dash previews",
+    "brand and guide artwork"
+  ],
+  "not_exactly_named_in_solar": {
+    "external link": "arrow-right-up",
+    "scientific axis-x": "sort-horizontal",
+    "scientific axis-y": "sort-vertical",
+    "scientific error bar": "chart-candlestick"
+  }
+}

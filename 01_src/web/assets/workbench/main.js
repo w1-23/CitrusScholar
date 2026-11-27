@@ -1,6 +1,6 @@
 import { byId, element } from './dom.js';
-import { renderInspector, renderTree } from './controls.js?v=6';
-import { CanvasView, imageAsset, untilAborted } from './canvas.js?v=7';
+import { renderInspector, renderTree } from './controls.js?v=7';
+import { CanvasView, imageAsset, untilAborted } from './canvas.js?v=8';
 import { hexDigest } from './sha256.js?v=1';
 import { initializeLibrary } from './library.js?v=4';
 import { legacyEditorUrl, sessionReturnUrl } from './navigation.js?v=2';

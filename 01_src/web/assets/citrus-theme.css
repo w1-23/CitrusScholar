@@ -5,7 +5,8 @@
   --ui-sidebar:#EFEBE4; --ui-rail:var(--ui-sidebar); --ui-popover:#FFFEFC; --ui-canvas:#F5F3EF;
   --text-primary:#252A31; --text-secondary:#737984; --text-muted:#737984;
   --border-hairline:#E6E1D9; --border-hover:#CFC6B9;
-  --accent:#D97736; --accent-hover:#BD6128; --accent-muted:#FCEBDD; --accent-glow:#D9773629;
+  --accent:var(--cs-brand-orange, #DF762F); --accent-hover:var(--cs-brand-orange-hover, #D96C28);
+  --accent-muted:var(--cs-brand-orange-surface, #F7EDE4); --accent-glow:var(--cs-brand-orange-ring, #DF762F3D);
   --ui-ink:#252A31; --ui-control:var(--accent); --ui-on-control:#252A31; --ui-focus:#BD6128;
   --success:#27845D; --warning:#D99528; --error:#D9534F; --overlay:#252A3166;
   --ui-shadow:0 5px 18px #252A3110,0 1px 3px #252A310d;

@@ -55,14 +55,15 @@ def _local(row: Mapping, generation: str | None) -> dict | None:
     bound_generation = _string(locator.get("index_generation"))
     # A raw retrieval row (e.g. from a failed storage operation) is not a
     # scoped citation. Only mirror stable refs minted by the evidence adapter.
-    if (not ref or not ref.startswith("ev:") or not corpus or not bound_generation
+    if (not ref or not ref.startswith(("ev:", "ce1:")) or not corpus or not bound_generation
             or read_entry.get("ref") != ref or not read_entry.get("turn_id")
             or read_entry.get("generation") != bound_generation
             or (generation is not None and generation != bound_generation)):
         return None
     return {
         "origin": "local", "title": _string(row.get("title"), 240),
-        "scope": "shared_published", "corpus_ref": corpus, "generation": bound_generation,
+        "scope": "authorized_corpus" if ref.startswith("ce1:") else "shared_published",
+        "corpus_ref": corpus, "generation": bound_generation,
         "document_ref": _string(locator.get("paper_id")),
         "chunk_ref": _string(locator.get("chunk_id")),
         "source_hash": _string(locator.get("source_hash")),
@@ -126,7 +127,8 @@ def evidence_contract(tool_name: str, artifact, *, provider: str = "", status: s
     if not isinstance(artifact, Mapping):
         return None
     if tool_name in _LOCAL and "main_results" in artifact:
-        origin, provider_name, field = "local", "local_index", "main_results"
+        origin, field = "local", "main_results"
+        provider_name = "unified_corpus" if artifact.get("corpus_contract") == 1 else "local_index"
     elif tool_name in _WEB and (
             tool_name != "browse_web" or "web_results" in artifact
             or (artifact.get("error") and artifact.get("action") not in {"close", "close_tab", "list_tabs", "download"})):

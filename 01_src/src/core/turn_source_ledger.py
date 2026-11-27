@@ -209,7 +209,7 @@ def local_read_reference(ref: object) -> dict | None:
         return None
     value, turn, generation = (ref.get(key) for key in ("ref", "turn_id", "generation"))
     start, end = ref.get("start"), ref.get("end")
-    if (not isinstance(value, str) or not re.fullmatch(r"ev:[a-f0-9]{32}", value)
+    if (not isinstance(value, str) or not re.fullmatch(r"(?:ev:[a-f0-9]{32}|ce1:[a-f0-9]{64})", value)
             or not isinstance(turn, str) or not 1 <= len(turn) <= 160
             or not isinstance(generation, str) or not 1 <= len(generation) <= 240
             or type(start) is not int or type(end) is not int or not 0 <= start < end

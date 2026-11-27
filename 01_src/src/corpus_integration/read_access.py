@@ -7,11 +7,15 @@ from .settings import isolated_enabled, isolated_search_configured, legacy_enabl
 
 
 def shared_search_available():
+    from .settings import unified_enabled
+
+    if unified_enabled():
+        return False
     from .selfcorpus_search import enabled
 
     if enabled():
-        # Advertise the selected route even if misconfigured, so that failures
-        # are explicit and never make the previous index a fallback.
+        # The shared-only tool addresses Selfcorpus when enabled. Its failure
+        # never substitutes the historical shared reader.
         return True
     if isolated_enabled():
         return isolated_search_configured()

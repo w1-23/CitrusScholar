@@ -804,3 +804,34 @@ test('return jumps only to the exact pair revalidated in the current account cat
     assert.equal(b.get('sessionFilesPanel').hidden, scenario === 'match', scenario);
   }
 });
+
+
+test('library can upload Python and R source without offering inline preview', async () => {
+  const b = makeBrowser();
+  const rows = ['python_plot.py', 'r_plot.R'].map((filename, index) => fileRecord({
+    filename, mime_type: 'text/plain; charset=utf-8', kind: 'download', file_id: String(index + 1).repeat(32)
+  }));
+  const uploaded = [];
+  b.context.currentSessionId = () => 'session-fixture';
+  b.fetchHandler = (url, opt) => {
+    if (opt.method === 'POST') {
+      assert.equal(url, '/api/v2/session/session-fixture/files/upload?filename=' + opt.body.name);
+      uploaded.push(opt.body.name);
+      return jsonResponse({file_id: rows[uploaded.length - 1].file_id}, 201);
+    }
+    assert.equal(url, '/api/v2/files');
+    return jsonResponse({uploaded: rows, generated: []});
+  };
+  b.document.listeners.DOMContentLoaded[0]();
+  const input = b.get('libraryUploadInput');
+  input.files = rows.map(file => ({name: file.filename, size: 22, type: ''}));
+  input.listeners.change[0]();
+  await flush();
+  assert.deepEqual(uploaded, rows.map(row => row.filename));
+  assert.match(b.get('libraryUploadStatus').textContent, /已上传 2 份/);
+  const list = b.get('sessionFilesUploaded');
+  assert.equal(list.querySelectorAll('[data-kind="script"]').length, 2);
+  assert.equal(list.querySelectorAll('[data-file-act="download"]').length, 2);
+  assert.equal(list.querySelector('[data-file-act="preview"]'), null);
+  assert.equal(list.querySelector('[data-file-act="reference"]'), null);
+});

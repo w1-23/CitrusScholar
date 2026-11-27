@@ -498,12 +498,16 @@ def _safe_persisted_trace(messages: list) -> list:
         if isinstance(message, ToolMessage) and getattr(message, "name", "") in {
                 "local_bm25_search", "local_dense_search", "local_hybrid_search"}:
             rows = ((getattr(message, "artifact", None) or {}).get("main_results") or [])
-            if rows:
+            if isinstance(artifact, dict) and artifact.get("corpus_contract") == 1:
+                body = "本地检索已执行；可用片段仅供当轮使用。具体覆盖状态见执行记录。"
+            elif rows:
                 digest = _evidence_digest(rows)
                 kept = min(len(rows), _EVIDENCE_DIGEST_ROWS)
                 body = (f"本地检索已执行，命中 {len(rows)} 条去重候选"
                         f"（会话历史保留前 {kept} 条摘要，供后续轮次直接引用，避免重复检索）。"
                         + (f"\n{digest}" if digest else ""))
+            elif isinstance(artifact, dict) and artifact.get("selected_result_count"):
+                body = "本地检索已执行并匹配到候选，片段仅供当轮使用。"
             else:
                 _status = str((execution_trace or {}).get("status") or "")
                 if _status in {"failed", "skipped", "not_run", "unavailable", "unknown", "cancelled"}:
@@ -553,7 +557,7 @@ def _safe_persisted_trace(messages: list) -> list:
                 content=body,
                 tool_call_id=message.tool_call_id, name=message.name, artifact=safe_artifact,
                 status=message.status, additional_kwargs=dict(message.additional_kwargs)))
-        elif isinstance(message, ToolMessage) and getattr(message, "name", "") == "read_candidate":
+        elif isinstance(message, ToolMessage) and getattr(message, "name", "") in {"read_candidate", "read_local_evidence"}:
             # The read slice is request-scoped evidence; the history records
             # that a candidate was read, never the slice itself.
             safe.append(ToolMessage(
@@ -1008,7 +1012,7 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
             })
         summary = step["summary"] or _fallback_summary(name, content)
         if name == "local_hybrid_search" and isinstance(artifact, dict):
-            rows = artifact.get("main_results") or []
+            count = artifact.get("selected_result_count", len(artifact.get("main_results") or []))
             cache_status = str(artifact.get("rag_cache_status") or "")
             if cache_status in {"hit", "miss", "disabled"}:
                 from src.core.progress_bus import emit_progress
@@ -1016,12 +1020,12 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
             if step["status"] == "partial":
                 errors = artifact.get("errors") or {}
                 failed_channels = ", ".join(str(key).upper() for key in errors)
-                summary = (f"找到 {len(rows)} 条候选资料；部分检索步骤未完成"
+                summary = (f"找到 {count} 条候选资料；部分检索步骤未完成"
                            + (f"（{failed_channels}）" if failed_channels else ""))
             elif step["status"] == "no_results":
                 summary = "本地资料检索已完成，没有找到候选资料"
             elif step["status"] == "complete":
-                summary = f"本地资料检索已完成，找到 {len(rows)} 条候选资料"
+                summary = f"本地资料检索已完成，找到 {count} 条候选资料"
         from src.core.progress_bus import emit_encoded, emit_tool_result, tool_action_hint
         action_hint = tool_action_hint(name, call.get("args") or {})
         trace_record = emit_tool_result(

@@ -89,7 +89,7 @@
 
   var KIND_LABEL = {
     pdf: 'PDF', image: '图片', html: 'HTML 报告', table: '表格',
-    docx: 'Word', text: '文本', download: '文件', svg: 'SVG'
+    docx: 'Word', text: '文本', download: '文件', svg: 'SVG', script: '绘图脚本'
   };
 
   function previewMetaText(file) {
@@ -130,9 +130,9 @@
       '      <span class="session-file-badge k-' + esc(kind) + '">' + esc(label) + '</span> ' + esc(fmtSize(f.size_bytes)) + '</div>' +
       '  </div>' +
       '  <div class="session-file-actions file-primary-actions">' +
-           filePrimaryActionHtml('preview', f, '预览 ' + f.filename) +
+           (kind === 'script' ? '' : filePrimaryActionHtml('preview', f, '预览 ' + f.filename)) +
            filePrimaryActionHtml('download', f, '下载原件 ' + f.filename) +
-           filePrimaryActionHtml('reference', f, '引用 ' + f.filename) +
+           (kind === 'script' ? '' : filePrimaryActionHtml('reference', f, '引用 ' + f.filename)) +
            (jump ? filePrimaryActionHtml('jump', f, '定位到来源会话 ' + f.filename) : '') +
       '  </div>' +
       '</div>';
@@ -313,7 +313,7 @@
   function bindLibraryUpload() {
     var input = el('libraryUploadInput'), button = el('libraryUploadButton');
     var zone = el('libraryUploadZone'), status = el('libraryUploadStatus');
-    var formats = /\.(?:csv|tsv|xlsx|xls|xlsm|xlsb|pdf|docx|jpe?g|png|webp|gif|svg|txt|md)$/i;
+    var formats = /\.(?:csv|tsv|xlsx|xls|xlsm|xlsb|pdf|docx|jpe?g|png|webp|gif|svg|txt|md|json|parquet|npy|py|r)$/i;
     button.addEventListener('click', function () { input.click(); });
     input.addEventListener('change', function () {
       upload(Array.from(input.files)); input.value = '';
@@ -339,7 +339,7 @@
         for (var index = 0; index < files.length && scope === catalogScope; index++) {
           var file = files[index];
           status.textContent = '正在上传 ' + (index+1) + ' / ' + files.length;
-          if (!formats.test(file.name) || file.size > 20*1024*1024 || !file.size) {
+          if (!formats.test(file.name) || file.size > (/\.(?:py|r)$/i.test(file.name) ? 12 : 20)*1024*1024 || !file.size) {
             failures.push(file.name + '：格式或大小不符');
             continue;
           }
@@ -1896,6 +1896,7 @@
   }
 
   function displayKind(file) {
+    if (/\.(?:py|r)$/i.test(String(file && file.filename || ''))) return 'script';
     return isSvgFile(file) ? 'svg' : ((file && file.kind) || 'download');
   }
 

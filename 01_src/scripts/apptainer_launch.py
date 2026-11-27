@@ -138,8 +138,9 @@ def external_module_bindings(config, binds):
         raise ValueError('Invalid external modules')
     corpus, workbench = values['selfcorpus'], values['workbench']
     keys = {'client_path', 'client_sha256', 'secret_file'}
-    if (not isinstance(corpus, dict) or not keys <= set(corpus) <= keys | {'auto_intake'}
+    if (not isinstance(corpus, dict) or not keys <= set(corpus) <= keys | {'auto_intake', 'unified_retrieval'}
             or type(corpus.get('auto_intake', False)) is not bool
+            or type(corpus.get('unified_retrieval', False)) is not bool
             or not isinstance(workbench, dict) or set(workbench) != {'secret_file'}):
         raise ValueError('Invalid external module configuration')
     client = Path(absolute(corpus['client_path']))
@@ -181,6 +182,8 @@ def external_module_bindings(config, binds):
            'CITRUS_WORKBENCH_LAUNCH_ENDPOINT=/workbench/api/v1/launch']
     if corpus.get('auto_intake'):
         env.append('CITRUS_SELFCORPUS_AUTO_INTAKE=1')
+    if corpus.get('unified_retrieval'):
+        env.append('CITRUS_CORPUS_UNIFIED_RETRIEVAL=1')
     return [(str(path), 'ro') for path in mounts], [arg for value in env for arg in ('--env', value)], [str(client)]
 
 

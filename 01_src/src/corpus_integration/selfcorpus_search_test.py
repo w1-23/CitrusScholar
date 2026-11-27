@@ -1,4 +1,4 @@
-"""Regression coverage of the Selfcorpus search cutover boundary."""
+"""Regression coverage of the additive Selfcorpus retrieval boundary."""
 from __future__ import annotations
 
 import asyncio
@@ -87,7 +87,7 @@ def test_signed_hybrid_request_uses_verified_subject_and_never_mints_legacy_refe
 
     _transport(monkeypatch, response)
     monkeypatch.setattr(fetch, "_base_hybrid_search", lambda *a, **k: pytest.fail("legacy fallback"))
-    content, artifact = fetch.local_hybrid_search.func("中文检索", ["agent_literature"])
+    content, artifact = fetch.local_hybrid_search.func("中文检索", [adapter.FAMILY_ID])
     row = json.loads(content)["candidates"][0]
     assert row == artifact["shared_results"][0]
     assert artifact["main_results"] == []
@@ -155,7 +155,7 @@ def test_bad_http_replies_never_run_legacy(monkeypatch, configured, response, re
 
     _transport(monkeypatch, lambda _: response)
     monkeypatch.setattr(fetch, "_base_hybrid_search", lambda *a, **k: pytest.fail("legacy fallback"))
-    result = fetch.local_hybrid_search.func("q", ["agent_literature"])[1]
+    result = fetch.local_hybrid_search.func("q", [adapter.FAMILY_ID])[1]
     assert result["_tool_outcome"]["status"] == "failed"
     assert result["_tool_outcome"]["reason_code"] == reason and result["shared_results"] == []
 
@@ -169,26 +169,113 @@ def test_total_deadline_and_no_default_fallback(monkeypatch, configured):
 
     monkeypatch.setattr(adapter, "_DEADLINE", 0.02)
     _transport(monkeypatch, response)
-    monkeypatch.setattr(fetch, "_base_hybrid_search", lambda *a, **k: pytest.fail("legacy fallback"))
+    calls = []
+
+    def legacy(*args, **kwargs):
+        calls.append(args)
+        return "legacy", {"local_status": "hit", "main_results": [{"text": "legacy"}]}
+
+    monkeypatch.setattr(fetch, "_base_hybrid_search", legacy)
+    result = fetch.local_hybrid_search.func("q", [adapter.FAMILY_ID])[1]
+    assert result["error"] == "selfcorpus_unavailable" and not calls
+    content, result = fetch.local_hybrid_search.func("q", ["literature"])
+    assert content == "legacy" and result["local_status"] == "hit"
+    assert calls == [("q", ["literature"], 5, None)]
     result = fetch.local_hybrid_search.func("q", ["agent_literature"])[1]
-    assert result["error"] == "selfcorpus_unavailable"
-    result = fetch.local_hybrid_search.func("q", ["literature"])[1]
-    assert result["_tool_outcome"]["reason_code"] == "selfcorpus_family_required"
-    result = fetch.local_hybrid_search.func("q", ["agent_literature"], l1_categories=["pests"])[1]
+    assert result["local_status"] == "invalid_family" and len(calls) == 1
+    result = fetch.local_hybrid_search.func("q", [adapter.FAMILY_ID], l1_categories=["pests"])[1]
     assert result["_tool_outcome"]["reason_code"] == "selfcorpus_topic_filter_unsupported"
 
 
 def test_opt_in_changes_discovery_but_keeps_legacy_read_metadata(monkeypatch, configured):
-    from src.corpus_integration import read_access
-    from src.graph.tool_availability import runtime_env
+    from src.corpus_integration import read_access, settings
+    from src.graph.tool_availability import available_tool_names, runtime_env
     from src.retrieval.corpus_registry import load_corpus_registry
 
     registry = load_corpus_registry()
     baseline_families = registry.family_ids
-    assert registry.search_family_ids == {"agent_literature"} and baseline_families
-    env = runtime_env(script_sandbox=False)
+    assert len(registry.approved_public_base_ids) == 5
+    assert registry.search_family_ids == baseline_families | {adapter.FAMILY_ID}
+    assert "`selfcorpus`" in registry.describe_families()
+    assert "`agent_literature`" not in registry.describe_families()
+    env = runtime_env(script_sandbox=False, candidate_pool=True)
     assert read_access.shared_search_available() and env.shared_corpus
-    assert {"propose_document_ingest", "prepare_document", "commit_document_index", "search_candidates"} <= env.denied
-    assert "read_candidate" not in env.denied
+    assert {"propose_document_ingest", "prepare_document", "commit_document_index"} <= env.denied
+    assert {"search_candidates", "read_candidate"} <= set(available_tool_names(env))
+    env = runtime_env(script_sandbox=False, local_corpus=False, candidate_pool=True)
+    assert "local_hybrid_search" in available_tool_names(env)
+    assert "search_candidates" not in available_tool_names(env)
+    env = runtime_env(script_sandbox=False, local_corpus=False, source_scope="web")
+    assert "local_hybrid_search" not in available_tool_names(env)
+    monkeypatch.setenv("CITRUS_CORPUS_MODE", "legacy")
+    assert not settings.legacy_enabled()
+    monkeypatch.setenv("CITRUS_CORPUS_MODE", "isolated")
+    monkeypatch.setenv("CITRUS_CORPUS_FETCH_GROWTH", "1")
+    assert not settings.growth_enabled()
     monkeypatch.delenv("CITRUS_SELFCORPUS_RETRIEVAL")
     assert registry.family_ids == baseline_families and baseline_families <= registry.search_family_ids
+
+
+@pytest.mark.parametrize("failure", [None, "legacy", "selfcorpus", "topics", "stale_legacy"])
+def test_independent_mixed_routes_keep_surviving_evidence(monkeypatch, configured, failure):
+    from src.research.result_tools import _shared_result_accessible
+    from src.retrieval import runtime
+    from src.tools import deepseek_search_fetch as fetch
+    from src.tools.outcome import normalize_tool_outcome
+
+    calls = []
+    legacy_row = {"title": "legacy title", "chunk_id": "base-chunk", "text": "legacy exact evidence"}
+    topics = ["genomics/evolution"] if failure == "topics" else None
+
+    def legacy(query, families, limit, selected_topics, **kwargs):
+        assert families == ["literature"] and selected_topics == topics
+        assert not kwargs["project"]
+        calls.append("legacy")
+        if failure == "legacy":
+            return "", {"local_status": "unavailable", "main_results": []}
+        return "", {"local_status": "hit", "main_results": [legacy_row], "base_generation": "base-gen"}
+
+    def response(request):
+        calls.append("selfcorpus")
+        assert failure != "topics"
+        assert json.loads(request.content)["scope"]["personal"] is True
+        return (httpx.Response(503, json={}) if failure == "selfcorpus"
+                else httpx.Response(200, json=_data()))
+
+    _transport(monkeypatch, response)
+    monkeypatch.setattr(fetch, "_base_hybrid_search", legacy)
+    monkeypatch.setattr(runtime, "get_rag", lambda: SimpleNamespace(
+        index_generation="different" if failure == "stale_legacy" else "base-gen"))
+    content, result = fetch.local_hybrid_search.func("芽变 bud sport", ["literature", adapter.FAMILY_ID],
+                                                     l1_categories=topics)
+    observation = json.loads(content)
+    assert calls == (["legacy"] if failure == "topics" else ["legacy", "selfcorpus"])
+    assert result["local_status"] == "hit"
+    assert result["selected_result_count"] == observation["count"] == (1 if failure else 2)
+    assert len(result["main_results"]) == (failure not in {"legacy", "stale_legacy"})
+    assert len(result["shared_results"]) == (failure not in {"selfcorpus", "topics"})
+    if result["main_results"]:
+        assert result["main_results"][0]["text"] == legacy_row["text"]
+        assert result["main_results"][0]["citation_ref"] == "L1"
+    if result["shared_results"]:
+        assert not {"read_ref", "read_entry", "citation_ref"} & result["shared_results"][0].keys()
+        assert not _shared_result_accessible({"tool_name": "local_hybrid_search"}, content, None)
+    assert set(observation) == {"local_status", "count", "candidates", "notice"}
+    assert normalize_tool_outcome("local_hybrid_search", content, result).status == (
+        "partial" if failure else "complete")
+
+
+def test_registry_allowlist_excludes_new_public_table():
+    from src.retrieval.corpus_registry import _validate_registry, default_registry_payload, deterministic_id
+
+    payload = default_registry_payload()
+    payload["corpora"].pop("cqa_literature")
+    payload["corpora"]["unapproved_public"] = {"family_id": "literature", "access_level": "public",
+                                                "source_batch": "cqa_literature"}
+    generated = "corpus_" + deterministic_id("literature", "cqa_literature", length=24)
+    payload["corpora"][generated] = {"family_id": "literature", "source_batch": "cqa_literature"}
+    registry = _validate_registry(payload)
+    assert registry.access_level_for_corpus("unapproved_public") == "public"
+    assert len(registry.approved_public_base_ids) == 5
+    assert "unapproved_public" not in registry.approved_public_base_ids
+    assert generated in registry.approved_public_base_ids

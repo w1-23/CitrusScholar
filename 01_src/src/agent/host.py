@@ -306,8 +306,18 @@ async def _run(state, identity, ledger):
                    "figure_published 且所需格式均已出具时直接交付；缺少统计摘要不能作为重复渲染的理由。")
     if "local_hybrid_search" in host.allowed_names:
         try:
-            from src.retrieval.corpus_registry import load_corpus_registry
-            prompt += "\n已登记的本地资料类别（选择工具时使用真实 family id）：\n" + load_corpus_registry().describe_families()
+            from src.corpus_integration.settings import unified_enabled
+            if unified_enabled():
+                from src.corpus_integration.evidence_client import SOURCE_IDS
+
+                prompt += ("\n本地资料统一用 local_hybrid_search。未限定来源时传 corpus_types=[]，"
+                           "明确限定时只选对应来源。evolution 是有权读取的增量资料，"
+                           "l1_categories 仅用于明确指定的既有库主题。保留原查询。\n已登记来源："
+                           + ", ".join(sorted(SOURCE_IDS)))
+            else:
+                from src.retrieval.corpus_registry import load_corpus_registry
+
+                prompt += "\n已登记的本地资料类别（选择工具时使用真实 family id）：\n" + load_corpus_registry().describe_families()
         except (OSError, ValueError, ImportError):
             prompt += "\n本地资料类别目录暂不可用；不得猜测 family id。"
     # Keep the brief public introduction after the internal tool directories.

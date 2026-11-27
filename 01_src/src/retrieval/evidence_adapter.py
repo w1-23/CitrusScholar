@@ -103,13 +103,15 @@ def _authorize_corpus(corpus_id: str, *, user: dict | None = None) -> None:
     from src.core.resource_access import PUBLIC_CORPUS, authorize_resource
     from src.core import tracing
     from src.retrieval.corpus_registry import load_corpus_registry, CorpusAccessScope
+    from src.corpus_integration.selfcorpus_search import enabled as selfcorpus_enabled
     try:
         registry = load_corpus_registry()
         scope = CorpusAccessScope.from_registry(registry)
         level = registry.access_level_for_corpus(corpus_id)
     except (OSError, ValueError) as exc:
         raise PermissionError("evidence_corpus_unavailable") from exc
-    if not scope.permits(corpus_id):
+    if (not scope.permits(corpus_id)
+            or (selfcorpus_enabled() and corpus_id not in registry.approved_public_base_ids)):
         raise PermissionError("evidence_corpus_unavailable")
     if user is None:
         user = {"user_id": tracing.get_user_id(), "role": tracing.get_user_role()}
@@ -165,10 +167,39 @@ def persist_local_rows(rows: list[dict], *, query: str, generation: str) -> tupl
     return result, {"status": "stored", "candidates": observations}
 
 
+def _unified_root(owner, session, turn):
+    path = _session_root(owner, session) / _component(turn) / "corpus-v1"
+    _no_links(path)
+    return path
+
+
+def bind_unified_row(row, snapshot):
+    from .unified_evidence import bind
+    from src.core.cancel import raise_if_cancelled
+
+    raise_if_cancelled("bind_corpus_evidence")
+    owner, session, turn = _scope(writing=True)
+    result = bind(row, snapshot, _unified_root(owner, session, turn), owner, session, turn)
+    _scope(turn, writing=True)
+    return result
+
+
 def read_evidence(ref: str, *, turn_id: str, generation: str,
                   offset: int = 0, max_chars: int = 4000,
                   user: dict | None = None, session_id: str = "") -> dict:
     """Read stored evidence under the authenticated tool or API principal."""
+    if isinstance(ref, str) and ref.startswith("ce1:"):
+        from .unified_evidence import HOST_REF, read
+
+        if not HOST_REF.fullmatch(ref):
+            raise ValueError("invalid_evidence_reference")
+        owner, session, turn = _scope(turn_id, user=user, session_id=session_id)
+        path = _unified_root(owner, session, turn) / ref[4:]
+        _no_links(path)
+        result = read(ref, path, owner, session, turn, generation=generation, offset=offset,
+                      max_chars=max_chars, user=user)
+        _scope(turn, user=user, session_id=session_id)
+        return result
     if not isinstance(ref, str) or not ref.startswith("ev:"):
         raise ValueError("invalid_evidence_reference")
     store = _store(generation, turn_id=turn_id, user=user, session_id=session_id)

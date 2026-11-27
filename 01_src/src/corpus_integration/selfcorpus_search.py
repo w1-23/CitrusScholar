@@ -11,7 +11,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
-FAMILY_ID = "agent_literature"
+from .settings import selfcorpus_enabled as enabled
+
+FAMILY_ID = "selfcorpus"
 _ROUTE = "/api/v1/retrieval/search"
 _DEADLINE = 8.0
 _MAX_RESPONSE = 512 * 1024
@@ -22,10 +24,6 @@ _CITATION_STATUS = "host_exact_span_unavailable"
 
 class SearchUnavailable(RuntimeError):
     """A stable, non-sensitive reason describing an unavailable search."""
-
-
-def enabled() -> bool:
-    return os.getenv("CITRUS_SELFCORPUS_RETRIEVAL") == "1"
 
 
 def _owner() -> int:

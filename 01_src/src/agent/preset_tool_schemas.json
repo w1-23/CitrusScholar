@@ -285,7 +285,7 @@
       "type": "function",
       "function": {
         "name": "local_hybrid_search",
-        "description": "Search selected authorized local corpus families for passages relevant to a concise query. English is preferred. Chinese queries are translated before search.",
+        "description": "Search authorized local sources for relevant evidence. Select only explicit source IDs from the runtime catalog, or pass an empty list to search the authorized default scope when unified retrieval is enabled.",
         "parameters": {
           "properties": {
             "query": {

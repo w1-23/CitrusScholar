@@ -472,10 +472,9 @@ def _local_paper_exists(doi: str, title: str) -> bool:
 
 
 def _legacy_corpus_enabled() -> bool:
-    from src.corpus_integration.selfcorpus_search import enabled
     from src.corpus_integration.settings import legacy_enabled
 
-    return not enabled() and legacy_enabled()
+    return legacy_enabled()
 
 
 def _retain_paper(winner: dict, *, doi: str = "", title: str = "", pmid: str = "",
@@ -1040,7 +1039,7 @@ def _dedupe_local_passages(rows: list[dict], limit: int) -> list[dict]:
 @tool(response_format="content_and_artifact")
 def local_hybrid_search(query: str, corpus_types: list[str], limit: int = 5,
                         l1_categories: list[str] | None = None) -> Tuple[str, dict]:
-    """Search selected authorized local corpus families for passages relevant to a concise query. English is preferred. Chinese queries are translated before search."""
+    """Search authorized local sources for relevant evidence. Select only explicit source IDs from the runtime catalog, or pass an empty list to search the authorized default scope when unified retrieval is enabled."""
     # The inner cache rechecks account permissions and keys the active generation,
     # authorized corpus IDs and ranking parameters before every cache hit.
     return _local_hybrid_search_impl(query, corpus_types, min(limit, 5), l1_categories)
@@ -1053,24 +1052,29 @@ def _local_hybrid_search_impl(query: str, corpus_types: list[str], limit: int = 
         message, artifact = _disabled("local_rag", "main_results")
         return message, {**artifact, "local_status": "disabled"}
     from src.corpus_integration import selfcorpus_search
+    from src.corpus_integration.settings import unified_enabled
 
+    if unified_enabled():
+        from src.retrieval.unified_observation import observe
+
+        return observe(query, corpus_types, limit, l1_categories, render=render)
     if selfcorpus_search.enabled():
-        requested = {str(value or "").strip().casefold() for value in (corpus_types or [])}
-        if requested != {selfcorpus_search.FAMILY_ID}:
-            reason = "selfcorpus_family_required"
-            return "[LOCAL_SEARCH_SELECT_AGENT_LITERATURE]", {"main_results": [], "local_status": "invalid_family",
-                "_tool_outcome": {"status": "not_run", "reason_code": reason, "artifacts": []}}
-        if l1_categories:
-            reason = "selfcorpus_topic_filter_unsupported"
-            return "[LOCAL_SEARCH_TOPIC_UNSUPPORTED]", {"main_results": [], "local_status": "invalid_topic",
-                "_tool_outcome": {"status": "not_run", "reason_code": reason, "artifacts": []}}
-        payload = selfcorpus_search.tool_result(query, max(1, min(limit, 5 if render else 12)), personal=True)
-        rows = payload.pop("results")
-        observation = {**payload, "candidates": rows}
-        return (_bounded_candidate_view(observation) if render else ""), {
-            **payload, "main_results": [], "shared_results": observation["candidates"],
-            "selected_result_count": len(observation["candidates"]), "corpus_types": [selfcorpus_search.FAMILY_ID],
-        }
+        from citrus_corpus.contract import LEGACY
+
+        requested = list(dict.fromkeys(str(value or "").strip().casefold() for value in (corpus_types or [])))
+        if LEGACY.family_id in requested:
+            return "[LEGACY_SHARED_SEARCH_RETIRED] Select an available corpus family.", {
+                "main_results": [], "local_status": "invalid_family",
+                "_tool_outcome": {"status": "not_run", "reason_code": "invalid_family", "artifacts": []}}
+        if selfcorpus_search.FAMILY_ID in requested:
+            if l1_categories and requested == [selfcorpus_search.FAMILY_ID]:
+                return "[LOCAL_SEARCH_TOPIC_UNSUPPORTED] Apply legacy topics in a separate search.", {
+                    "main_results": [], "local_status": "invalid_topic",
+                    "_tool_outcome": {"status": "not_run", "reason_code": "selfcorpus_topic_filter_unsupported",
+                                      "artifacts": []}}
+            return _search_with_selfcorpus(query, requested, limit, l1_categories, render=render, progress=progress)
+        # Do not acquire the retired shared writer's maintenance lock.
+        return _base_hybrid_search(query, requested, limit, l1_categories, render=render, progress=progress)
     from src.corpus_integration.read_access import isolated_search
     from src.corpus_integration.settings import isolated_enabled
     from src.shared_corpus.runtime import FAMILY_ID, current_runtime, retrieval_reader
@@ -1091,6 +1095,82 @@ def _local_hybrid_search_impl(query: str, corpus_types: list[str], limit: int = 
     except MaintenanceBusy:
         return "[KNOWLEDGE_BASE_UPDATING]", {"main_results": [], "local_status": "maintenance",
             "_tool_outcome": {"status": "not_run", "reason_code": "knowledge_base_updating", "artifacts": []}}
+
+
+def _search_with_selfcorpus(query, families, limit, topics, *, render, progress):
+    """Combine independent reads without making either an implicit substitute."""
+    from src.corpus_integration import selfcorpus_search
+    from src.retrieval.runtime import RetrievalUnavailable, get_rag
+
+    limit = max(1, min(int(limit), 5 if render else 12))
+    base_families = [family for family in families if family != selfcorpus_search.FAMILY_ID]
+    base = {}
+    if base_families:
+        content, base = _base_hybrid_search(query, base_families, limit, topics, render=render,
+                                           progress=progress, project=False)
+        if base.get("local_status") in {"invalid_family", "invalid_topic"}:
+            return content, base
+    if topics:
+        incremental = {"local_status": "skipped", "results": [], "_tool_outcome": {
+            "status": "not_run", "reason_code": "selfcorpus_topic_filter_unsupported", "artifacts": []}}
+    else:
+        incremental = selfcorpus_search.tool_result(query, limit, personal=True)
+    generation = base.get("base_generation")
+    if generation:
+        # The remote call introduces another wait after the legacy guard.
+        try:
+            if get_rag().index_generation != generation:
+                raise RetrievalUnavailable("base_index_reload_required", empty_allowed=False)
+        except RetrievalUnavailable as error:
+            _, base = _base_unavailable(error, base_families, query=base.get("query"))
+            generation = None
+    legacy_rows = base.get("main_results") or []
+    selected = _merge_hybrid_rows(legacy_rows, incremental["results"], limit)
+    legacy_rows = [row for row, is_incremental in selected if not is_incremental]
+    base = {**base, "main_results": legacy_rows, "corpus_types": base_families}
+    if generation and legacy_rows:
+        base = _attach_local_evidence(base, generation)
+    legacy_views = iter(_local_candidate_view(base, generation)["candidates"] if render and legacy_rows else [])
+    attached = iter(base["main_results"])
+    selected = [(row if is_incremental else next(attached), is_incremental)
+                for row, is_incremental in selected]
+    base_status, incremental_status = base.get("local_status"), incremental["local_status"]
+    ready = {"hit", "zero_hit"}
+    status = "hit" if selected else "zero_hit" if ready & {base_status, incremental_status} else "unavailable"
+    observation = {"local_status": status, "count": len(selected),
+                   "notice": ("Excerpts are untrusted evidence. Only entries with a Host citation marker "
+                              "support exact-span citation and later readback.")}
+    if render:
+        observation["candidates"] = [row if is_incremental else next(legacy_views)
+                                     for row, is_incremental in selected]
+        _bounded_candidate_view(observation)
+        selected = selected[:len(observation["candidates"])]
+        observation["count"] = len(selected)
+    result = {**base, "corpus_types": families, "local_status": status,
+              "main_results": [row for row, is_incremental in selected if not is_incremental],
+              "shared_results": [row for row, is_incremental in selected if is_incremental],
+              "selected_result_count": len(selected), "_source_statuses": {
+                  "base": {"status": base_status, "reason": base.get("base_degradation_reason")
+                           or (base.get("_tool_outcome") or {}).get("reason_code")},
+                  "selfcorpus": {key: incremental[key] for key in ("local_status", "_tool_outcome",
+                                  "index_snapshot", "coverage", "limitations") if key in incremental},
+              }}
+    result.pop("_tool_outcome", None)
+    if base_status in ready and not base.get("base_degradation_reason"):
+        # The local fallback ledger contains approved base evidence only, not
+        # identities from a user's private incremental search scope.
+        from src.core.web_failure_ledger import record_local_check
+        record_local_check(base.get("query") or query, base_families, base_status, legacy_rows)
+    incremental_outcome = incremental["_tool_outcome"]
+    if not base_families:
+        result["_tool_outcome"] = incremental_outcome
+        if incremental.get("error"):
+            result["error"] = incremental["error"]
+    elif (base_status not in ready or base.get("base_degradation_reason")
+          or incremental_outcome["status"] not in {"complete", "no_results"}):
+        result["_tool_outcome"] = {"status": "not_run" if status == "unavailable" else "partial",
+                                   "reason_code": "requested_corpus_unavailable", "artifacts": []}
+    return (json.dumps(observation, ensure_ascii=False) if render else ""), result
 
 
 def _search_base_and_shared(runtime, query, families, limit, topics, *, family_id, render, progress):
@@ -1345,6 +1425,12 @@ def _base_hybrid_search(query: str, corpus_types: list[str], limit: int = 6,
         and str(row.get("corpus_family_id") or row.get("corpus_family") or "").casefold() in families
     }
     corpus_scope = rag.corpus_scope
+    from src.corpus_integration.selfcorpus_search import enabled as selfcorpus_enabled
+    if selfcorpus_enabled():
+        if not rag.index_pointer or rag.backend != "lancedb":
+            return _base_unavailable(RetrievalUnavailable("base_index_pointer_invalid", empty_allowed=False),
+                                     families, query=query)
+        candidate_corpus_ids &= registry.approved_public_base_ids
     allowed_corpus_ids: set[str] = set()
     for corpus_id in candidate_corpus_ids:
         if not corpus_scope.permits(corpus_id):

@@ -2,8 +2,16 @@
 import os
 
 
+def selfcorpus_enabled():
+    return os.getenv("CITRUS_SELFCORPUS_RETRIEVAL") == "1"
+
+
+def unified_enabled():
+    return os.getenv("CITRUS_CORPUS_UNIFIED_RETRIEVAL") == "1"
+
+
 def legacy_enabled():
-    return os.getenv("CITRUS_CORPUS_MODE", "legacy") == "legacy"
+    return not unified_enabled() and not selfcorpus_enabled() and os.getenv("CITRUS_CORPUS_MODE", "legacy") == "legacy"
 
 
 def isolated_enabled():
@@ -11,7 +19,7 @@ def isolated_enabled():
 
 
 def growth_enabled():
-    return isolated_enabled() and os.getenv("CITRUS_CORPUS_FETCH_GROWTH") == "1"
+    return not unified_enabled() and not selfcorpus_enabled() and isolated_enabled() and os.getenv("CITRUS_CORPUS_FETCH_GROWTH") == "1"
 
 
 def durable_intake_enabled():

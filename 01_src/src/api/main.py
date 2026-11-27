@@ -153,16 +153,25 @@ def _retrieval_not_ready(state):
 
 
 async def _serve_model_runtime(state):
-    from src.retrieval.runtime import RetrievalUnavailable
+    from src.corpus_integration.settings import unified_enabled
 
-    try:
-        state.rag_runtime = await optional_call("rag-warmup", _warm_retrieval)
-        state.retrieval_ready = True
-        logger.info("[Lifespan] RAG engine warmed up")
-    except Exception as exc:
-        state.retrieval_error = ((exc.reason_code, exc.empty_allowed) if isinstance(exc, RetrievalUnavailable)
-                                 else ("retrieval_unavailable", False))
-        logger.error("[Lifespan] RAG warm-up failed: %s", type(exc).__name__)
+    if unified_enabled():
+        from src.corpus_integration.evidence_client import service_available
+
+        state.retrieval_ready = bool(await optional_call("corpus-service-check", service_available))
+        if not state.retrieval_ready:
+            state.retrieval_error = ("corpus_unavailable", False)
+    else:
+        from src.retrieval.runtime import RetrievalUnavailable
+
+        try:
+            state.rag_runtime = await optional_call("rag-warmup", _warm_retrieval)
+            state.retrieval_ready = True
+            logger.info("[Lifespan] RAG engine warmed up")
+        except Exception as exc:
+            state.retrieval_error = ((exc.reason_code, exc.empty_allowed) if isinstance(exc, RetrievalUnavailable)
+                                     else ("retrieval_unavailable", False))
+            logger.error("[Lifespan] RAG warm-up failed: %s", type(exc).__name__)
     await observe_runtime("model-evidence", state.model_evidence.publish, _read_model_evidence,
                           _UNVERIFIED_MODELS)
 
@@ -514,7 +523,8 @@ async def account_auth_guard(request: Request, call_next):
         # may reconcile publication, so do not expose them as read-only routes.
         return JSONResponse({"detail": {"code": "legacy_workbench_retired"}}, status_code=410,
                             headers={"Cache-Control": "no-store"})
-    if (os.getenv("CITRUS_SELFCORPUS_RETRIEVAL") == "1" and request.method not in {"GET", "HEAD", "OPTIONS"}
+    from src.corpus_integration.settings import selfcorpus_enabled, unified_enabled
+    if ((selfcorpus_enabled() or unified_enabled()) and request.method not in {"GET", "HEAD", "OPTIONS"}
             and (path.startswith(("/api/v2/isolated-corpus/", "/api/v2/shared-corpus/", "/api/v2/admin/corpus/")))):
         return JSONResponse({"detail": {"code": "legacy_corpus_read_only"}}, status_code=410,
                             headers={"Cache-Control": "no-store"})
@@ -6746,30 +6756,36 @@ async def list_account_file_library(request: Request, session_id: str = ""):
 async def upload_account_library_file(session_id: str, request: Request, filename: str):
     """Store a private library file without starting a chat turn."""
     from mimetypes import guess_type
+    from src.api.workbench_bridge import BUNDLE_FILE_FORMATS, SCRIPT_FORMATS, SCRIPT_MIME, valid_bundle_name, valid_script_bytes
+    from src.api.workbench_bridge_protocol import ASSET_LIMIT
     from src.api.turn_envelope import MAX_NAME_CHARS, MAX_UPLOAD_BYTES, _ALLOWED_UPLOAD_SUFFIXES, _register_upload
 
     user = current_user(request)
     _require_active_turn_session(session_id, user)
     name = filename.strip()
-    # SVG is a private library original, not an inline chat attachment.
-    allowed_suffixes = _ALLOWED_UPLOAD_SUFFIXES | {"svg"}
+    # SVG and plotting source are private library originals, not inline chat attachments.
+    suffix = Path(name).suffix.lower().lstrip(".")
+    script = suffix in SCRIPT_FORMATS
+    allowed_suffixes = _ALLOWED_UPLOAD_SUFFIXES | {"svg", "parquet", "npy"} | SCRIPT_FORMATS
     if (not name or len(name) > MAX_NAME_CHARS or any(c in name for c in ("/", "\\"))
             or any(ord(c) < 32 for c in name)
-            or Path(name).suffix.lower().lstrip(".") not in allowed_suffixes):
+            or suffix not in allowed_suffixes or (suffix in BUNDLE_FILE_FORMATS and not valid_bundle_name(name))):
         raise HTTPException(400, "文件名或文件格式不受支持。")
     content = bytearray()
     async for block in request.stream():
-        if len(content) + len(block) > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, "单个文件不能超过 20 MB。")
+        if len(content) + len(block) > (ASSET_LIMIT if script else MAX_UPLOAD_BYTES):
+            raise HTTPException(413, "绘图源文件超过 Workbench 导入限制。" if script else "单个文件不能超过 20 MB。")
         content.extend(block)
     if not content:
         raise HTTPException(400, "无法上传空文件。")
+    if script and not valid_script_bytes(bytes(content)):
+        raise HTTPException(400, "绘图源文件必须是非空 UTF-8 文本。")
     owner = int(user["user_id"])
 
     def store():
         _require_active_turn_session(session_id, user)
         return _register_upload(session_id=session_id, owner_user_id=owner, name=name,
-                                mime=guess_type(name)[0] or "application/octet-stream",
+                                mime=SCRIPT_MIME if script else (guess_type(name)[0] or "application/octet-stream"),
                                 content=bytes(content), client_request_id="")
 
     async with _turn_session_lock(session_id):
@@ -6836,11 +6852,15 @@ _ISOLATED_FILE_POLICY = "default-src 'none'; base-uri 'none'; form-action 'none'
 
 def _protected_file_preview(info: dict, *, library_tile: bool = False):
     """Shared response policy for the account and historical session URLs."""
+    from src.api.workbench_bridge import SCRIPT_FORMATS
     from src.session.files import _canonical_mime, kind_for
 
     filename = info["filename"]
     mime = _canonical_mime(filename, info.get("mime_type", ""))
     kind = kind_for(filename, mime)
+    # A script is downloadable by its owner, never rendered in a browser preview.
+    if Path(filename).suffix.lower().lstrip(".") in SCRIPT_FORMATS:
+        raise HTTPException(404, "绘图源文件仅支持下载或导入 Workbench。")
     if library_tile and (kind not in {"image", "svg"} or info["size_bytes"] > 2 * 1024 * 1024):
         raise HTTPException(404, "该文件没有资料库缩略图。")
     if kind in {"html", "svg"}:

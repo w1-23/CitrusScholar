@@ -320,6 +320,10 @@ def commit_document_index() -> str:
 @tool
 def search_agent_corpus(query: str, limit: int = 6) -> str:
     """Search the shared literature corpus published by administrators. Returns bounded excerpts with document and version read references. Only published, non-revoked content is visible; the query is plain text."""
+    from src.corpus_integration.settings import unified_enabled
+
+    if unified_enabled():
+        return _not_run("corpus_use_unified", "请使用统一的本地资料检索。")
     text = str(query or "").strip()
     if not text:
         return _not_run("query_empty", "请提供检索词。")

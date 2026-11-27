@@ -185,7 +185,12 @@ test('narrated timeline shows ordered public labels, never raw tool metadata', t
     ['execution_narration', mark('check','接下来检查数据质量。',6)],
     ['execution_narration', mark('read','我先查看表格。',3)]
   ];
-  for (const [type,data] of frames) panel.receive(type,data);
+  for (const [type,data] of frames.slice(0,3)) panel.receive(type,data);
+  const pending = panel.body.querySelector('.research-process-timeline');
+  assert.equal(pending.children.length, 1);
+  assert.equal(pending.children[0].textContent, frames[2][1].text);
+  assert.equal(pending.querySelector('.research-action-group'), null);
+  for (const [type,data] of frames.slice(3)) panel.receive(type,data);
   const entries = frames.slice(0,6).map(([event,data],i)=>({seq:i+1,event,data}));
   b.ctx.projectHistoryTrace(replay,entries.reverse());
   for (const view of [panel, replay]) {

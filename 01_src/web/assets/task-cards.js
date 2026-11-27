@@ -299,8 +299,8 @@
         heading.classList.toggle('is-running', !!tool);
         heading.textContent = tool ? '执行中 · ' + tool + ' · ' + text : text;
         if (!inline) place(host, disclosure, hostIndex);
-        else disclosure.remove();
       }
+      if (inline || !attempts) disclosure.remove();
       rows.forEach(function (row, id) {
         if (!activeRows.has(id)) {
           if (row._toolDetails) row._toolDetails.element.remove();

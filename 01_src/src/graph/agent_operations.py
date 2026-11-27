@@ -987,7 +987,12 @@ def _emit_completed_tool_step(call: dict, message: ToolMessage,
         step["attempt"] = attempt
         if tool_status_sink is not None:
             from copy import deepcopy
+            from src.core.task_result import literature_coverage_stage
+
+            stage = literature_coverage_stage(name, step["status"], step["reason_code"], artifact,
+                                              call.get("args") or {})
             tool_status_sink.append({
+                **({"literature_coverage_stage": stage} if stage else {}),
                 "name": name,
                 "tool_call_id": str(call.get("id") or ""),
                 "logical_key": logical_key,

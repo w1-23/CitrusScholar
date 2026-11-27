@@ -144,6 +144,48 @@ def _browse_retry_resolutions(rows):
     return repaired
 
 
+def literature_coverage_stage(name, status, reason, artifact, args):
+    """Project only verified collect outcomes, not model prose or workspace files."""
+    if (name != "collect_external_skill" or reason != "external_skill_report"
+            or args.get("skill_id") != "literature-verification" or args.get("findings_offset", 0)):
+        return None
+    cov = artifact.get("registry_coverage")
+    if not isinstance(cov, dict) or artifact.get("historical_report"):
+        return None
+    original, current = cov.get("original_execution_id"), args.get("execution_id")
+    if (not all(isinstance(v, str) and len(v) == 32 and all(c in "0123456789abcdef" for c in v)
+                for v in (original, current)) or current != artifact.get("execution_id")):
+        return None
+    total, counts = cov.get("total"), cov.get("counts")
+    if type(total) is not int or total <= 0 or not isinstance(counts, dict):
+        return None
+    if (status == "partial" and cov.get("stop_reason") == "observations_not_started"
+            and original == current and counts == {"not_queried": total}):
+        return {"original": original, "total": total, "stage": "extracted"}
+    if (status == "complete" and cov.get("stop_reason") == "batch_completed" and original != current
+            and set(counts) <= {"queried", "previously_observed"}
+            and all(type(n) is int and n >= 0 for n in counts.values()) and sum(counts.values()) == total):
+        return {"original": original, "total": total, "stage": "verified"}
+    return None
+
+
+def _literature_coverage_resolutions(rows):
+    pending, resolved = {}, {}
+    for row in rows:
+        stage = row.get("literature_coverage_stage")
+        cid = row.get("tool_call_id")
+        if (not stage or not cid or row.get("artifact_count") or row.get("artifact_validations")
+                or (row.get("name") or row.get("tool_name")) != "collect_external_skill"
+                or (row.get("reason") or row.get("reason_code")) != "external_skill_report"):
+            continue
+        key = stage.get("original"), stage.get("total")
+        if row.get("status") == "partial" and stage.get("stage") == "extracted":
+            pending.setdefault(key, []).append(cid)
+        elif row.get("status") == "complete" and stage.get("stage") == "verified":
+            resolved.update(dict.fromkeys(pending.pop(key, ()), cid))
+    return resolved
+
+
 def resolved_tool_attempts(rows: Iterable[dict], turn_outcome=None) -> list[dict]:
     """Public reconciliation links; original attempts and errors remain intact.
 
@@ -157,7 +199,7 @@ def resolved_tool_attempts(rows: Iterable[dict], turn_outcome=None) -> list[dict
     current = {_operation_identity(row): row for row in effective
                if _operation_identity(row) is not None}
     links = {cid: {'tool_call_id': cid, 'resolved_by_tool_call_id': target, 'resolution': 'repaired'}
-             for cid, target in _browse_retry_resolutions(attempts).items()}
+             for cid, target in (_browse_retry_resolutions(attempts) | _literature_coverage_resolutions(attempts)).items()}
     for row in attempts:
         cid = row.get("tool_call_id")
         replacement = current.get(_operation_identity(row), {})
@@ -218,7 +260,7 @@ def effective_tool_records(rows: Iterable[dict]) -> list[dict]:
                      if identity(row) is not None and row.get("status") in executed_statuses}
     effective: list[dict] = []
     positions: dict[tuple[str, str], int] = {}
-    resolved = _browse_retry_resolutions(rows)
+    resolved = _browse_retry_resolutions(rows) | _literature_coverage_resolutions(rows)
     for row in rows:
         if row.get('tool_call_id') in resolved:
             continue

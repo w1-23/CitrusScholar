@@ -343,3 +343,24 @@ def test_svg_correction_requires_same_label_and_verified_current_file():
     assert not _same_repair_target(rejected, corrected | {"args": {"alt_text": "another plot"}}, records=[row])
     assert not _same_repair_target(rejected, corrected, records=[row | {"status": "unknown"}])
     assert not _same_repair_target(rejected, corrected, records=[row | {"artifact_validations": []}])
+
+
+
+def test_literature_extraction_resolves_only_with_exact_full_registry_coverage():
+    from src.core.task_result import effective_tool_records, literature_coverage_stage
+
+    def receipt(cid, execution, status, reason, counts, original="a" * 32):
+        args = {"skill_id": "literature-verification", "execution_id": execution}
+        data = {"execution_id": execution, "registry_coverage": {"original_execution_id": original,
+                "total": 2, "stop_reason": reason, "counts": counts}}
+        return {"name": "collect_external_skill", "status": status, "tool_call_id": cid,
+                "reason": "external_skill_report", "literature_coverage_stage":
+                literature_coverage_stage("collect_external_skill", status, "external_skill_report", data, args)}
+
+    extraction = receipt("initial", "a" * 32, "partial", "observations_not_started", {"not_queried": 2})
+    complete = receipt("later", "b" * 32, "complete", "batch_completed", {"queried": 2})
+    wrong = receipt("wrong", "b" * 32, "complete", "batch_completed", {"queried": 2}, "c" * 32)
+    short = receipt("short", "b" * 32, "complete", "batch_completed", {"queried": 1})
+    assert effective_tool_records([extraction, complete]) == [complete]
+    for replacement in (wrong, short, complete | {"status": "unknown"}, complete | {"artifact_count": 1}):
+        assert effective_tool_records([extraction, replacement]) == [extraction, replacement]

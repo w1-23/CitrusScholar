@@ -28,7 +28,8 @@ _CONTROL_PRIORITY = (
 
 _SCRIPT_PRIORITY = (
     "_tool_outcome", "deliverable_stage", "execution_stage", "figure_delivery_notice",
-    "script_ref", "run_id", "failure_phase", "error_code", "figure_stages", "dataset_refs", "error",
+    "render_data_summary", "exports", "figure_stages", "script_ref", "run_id", "failure_phase",
+    "error_code", "dataset_refs", "error",
 )
 
 
@@ -51,6 +52,25 @@ def _asset_ref(value):
 
 
 def _script_controls(value):
+    report = value.get("script_report")
+    if isinstance(report, str) and len(report) <= 8_192:
+        try:
+            report = json.loads(report)
+        except (ValueError, TypeError, RecursionError):
+            report = None
+    if isinstance(report, dict):
+        def count(item):
+            return type(item) is int and 0 <= item <= 1_000_000_000
+
+        summary = {key: report[key] for key in ("rows_read", "rows_plotted", "rows_excluded")
+                   if count(report.get(key))}
+        groups = report.get("n_per_group")
+        if isinstance(groups, dict) and len(groups) <= 12 and all(
+                isinstance(key, str) and 0 < len(key) <= 60 and key.isprintable() and count(item)
+                for key, item in groups.items()):
+            summary["n_per_group"] = groups
+        if summary:
+            value["render_data_summary"] = summary
     value["script_ref"] = _asset_ref(value.get("script_ref"))
     if isinstance(value.get("dataset_refs"), list):
         value["dataset_refs"] = [ref for item in value["dataset_refs"] if (ref := _asset_ref(item))]

@@ -673,3 +673,14 @@ class TaskDeliveryContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             WriteArgs(task_id="task", workspace_id="0" * 32, expected_revision=1,
                       path="../escape.py", content="x")
+
+
+
+def test_script_receipt_projects_bounded_counts_instead_of_preview_inference():
+    from src.core.tool_result_view import _script_controls
+
+    content = {"script_report": '{"rows_read":12,"rows_plotted":12,"rows_excluded":0,"n_per_group":{"A":6,"B":6},"arbitrary":"not projected"}'}
+    assert _script_controls(content)["render_data_summary"] == {
+        "rows_read": 12, "rows_plotted": 12, "rows_excluded": 0, "n_per_group": {"A": 6, "B": 6},
+    }
+    assert "render_data_summary" not in _script_controls({"script_report": '{"rows_read":true,"n_per_group":{"bad":-1}}'})

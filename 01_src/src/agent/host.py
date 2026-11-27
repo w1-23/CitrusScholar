@@ -281,7 +281,10 @@ async def _run(state, identity, ledger):
     if "nature-figure" in method_scope and "run_research_figure_script" in allowed:
         prompt += ("\n绘图平台合同：本轮统一科研绘图工具运行 Python/Matplotlib。"
                    "未指定语言而且没有既定任务语言时，直接使用这个后端，不询问 Python/R，不读取或写入默认偏好。"
-                   "明确指定 R 时保留该约束，不静默改用 Python；没有可用的 R 执行入口就说明限制。")
+                   "明确指定 R 时保留该约束，不静默改用 Python；没有可用的 R 执行入口就说明限制。"
+                   "要报告样本量时，让脚本输出 rows_read、rows_plotted、rows_excluded 和 n_per_group。"
+                   "只用渲染回执的 render_data_summary 或 script_report 样本量；读表预览不是全量数据。"
+                   "figure_published 且所需格式均已出具时直接交付；缺少统计摘要不能作为重复渲染的理由。")
     if "local_hybrid_search" in host.allowed_names:
         try:
             from src.retrieval.corpus_registry import load_corpus_registry

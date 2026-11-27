@@ -2,7 +2,7 @@
   "INTERFACE_CONTRACT.md": [
     [
       "`workbook` 接受 XLSX。",
-      "`workbook` 接受 XLSX 和标准 XLSM。XLSM 的普通 VBA 项目仅为不透明输入，不执行、不审查，不支持签名、旧式宏工作表、ActiveX、嵌入对象或加密。公式仅使用原缓存与静态分析，不重算。申请标注时仅交付清楚标明的无宏 XLSX 副本，保留原件不变。"
+      "`workbook` 接受 XLSX 和标准 XLSM。XLSM 的普通 VBA 项目仅为不透明输入，不执行、不审查，不支持签名、旧式宏工作表、ActiveX、嵌入对象或加密。公式仅使用原缓存与静态分析，不重算。申请标注时仅交付清楚标明的无宏 XLSX 副本，保留原件不变。 8043 宿主还可对单表 CSV 使用 `csv_table`，不指定工作表或 A1 区域。同步返回 `collect_required=false` 时可据实答复；`review_id` 不可用来收集 Worker 执行。只有用户要求文件时才按宿主文件合同交付。"
     ]
   ],
   "contract.py": [
@@ -185,6 +185,32 @@
     [
       "    observed = json.loads(inputs[\"observations\"].read_bytes()) if \"observations\" in inputs else {}\n    cassette = observed.get(\"http\", {})",
       "    if \"observations\" not in inputs:\n        return batch_report(response, rows, None)\n    observed = json.loads(inputs[\"observations\"].read_bytes())\n    if \"reference_batch\" in observed:\n        return batch_report(response, rows, observed[\"reference_batch\"])\n    cassette = observed.get(\"http\", {})"
+    ]
+  ],
+  "research-integrity/SKILL.md": [
+    [
+      "返回实际覆盖、证据与未检查事项。",
+      "返回实际覆盖、证据与未检查事项。重复区段筛查仅覆盖指定非共享对照列中的连续有限数值，最短长度按 `coverage.minimum` 报告。零发现不排除更短的重复，也不能据此推断数据无问题。 用户只要求检查重复数值区段时，选 `checks=[\"numeric\"]` 并保持 `digit_screen=false`。末位数字分布是独立检查，只在明确要求时启用；不能把未要求的筛查计为本轮覆盖缺口。"
+    ]
+  ],
+  "research-integrity/manifest.json": [
+    [
+      "\"version\": \"0.1.0\"",
+      "\"version\": \"0.1.1\""
+    ]
+  ],
+  "research-integrity/scripts/adapter.py": [
+    [
+      "from contract import UPSTREAM, digest, finding, location, module, result\n",
+      "from contract import UPSTREAM, digest, finding, location, module, result\n\nMIN_DUPLICATE_BLOCK = 4\n"
+    ],
+    [
+      "    for item in engine.check_duplicate_blocks(list(series.items()), min_block=4):",
+      "    lengths = [len(run) for run in series.values()]\n    eligible = sum(length >= MIN_DUPLICATE_BLOCK for length in lengths)\n    for item in engine.check_duplicate_blocks(list(series.items()), min_block=MIN_DUPLICATE_BLOCK):"
+    ],
+    [
+      "    response[\"coverage\"].append(dict(check=\"duplicate_numeric_block\", status=\"checked\",\n                                    n_rows=len(rows)-1))",
+      "    response[\"coverage\"].append(dict(check=\"duplicate_numeric_block\",\n        status=\"checked\" if eligible else \"not_checked\",\n        n_rows=len(rows)-1, minimum=MIN_DUPLICATE_BLOCK,\n        scope=\"contiguous finite numeric values in declared non-control CSV columns\",\n        reason=\"no eligible contiguous numeric run\" if not eligible else \"shorter blocks not screened\",\n        limits=[\"gaps break runs; constant windows are excluded\",\n                \"zero findings do not rule out shorter repeats or establish absence of problems\"]))"
     ]
   ],
   "run.py": [

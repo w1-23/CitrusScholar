@@ -319,3 +319,24 @@ test('status recovers the identified committed payload after replay lacked the f
   await transport.refresh(job.job_id, false);
   assert.deepEqual(received, ['Final answer']);
 });
+
+
+test('a busy event endpoint observes Retry-After and resumes the same cursor without resending', async t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  const busy = {...reply({}, 503), json: async () => { throw new SyntaxError('non-JSON 503'); },
+    headers: {get: key => key === 'Retry-After' ? '4' : null}};
+  const responses = [busy, page([running, output, terminal], 3), reply(job)];
+  const {transport, requests, store, frames} = observation(responses);
+  t.after(() => transport.stop());
+  await transport.follow(job.job_id);
+  assert.equal(store.state.cursor, 0);
+  t.mock.timers.tick(3999);
+  assert.equal(requests.length, 1);
+  t.mock.timers.tick(1);
+  for (let n = 0; n < 40; n++) { await Promise.resolve(); }
+  assert.equal(store.state.status, 'completed');
+  assert.equal(frames.filter(frame => frame.type === 'done').length, 1);
+  assert.deepEqual(requests.slice(0, 2), [['/jobs/job-1/events?after=0&limit=200', 'GET'],
+    ['/jobs/job-1/events?after=0&limit=200', 'GET']]);
+  assert.ok(requests.every(entry => entry[1] === 'GET'));
+});

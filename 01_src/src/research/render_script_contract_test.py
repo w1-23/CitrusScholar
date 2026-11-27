@@ -283,6 +283,25 @@ class PresetRendererContractTests(unittest.TestCase):
                     self.assertIsNone(render_script_emit_line(source), figure["name"])
                     normalize_output_contract(full["outputs"])
 
+    def test_provider_advertises_native_json_and_accepts_legacy_strings_at_ingress(self):
+        from inspect import signature
+        from src.agent.preset_catalog import canonical_tool_schema
+        tool = figure_tools.run_research_figure_script
+        schema = canonical_tool_schema(tool)['function']['parameters']['properties']
+        self.assertEqual(set(schema), set(signature(tool.func).parameters))
+        self.assertEqual(schema['outputs_json']['type'], 'object')
+        self.assertEqual(schema['inputs_json']['type'], 'object')
+        self.assertEqual(schema['qa_profile_json']['type'], 'object')
+        self.assertEqual(schema['formats_json']['type'], 'array')
+        for field in ('outputs_json', 'inputs_json', 'qa_profile_json', 'formats_json'):
+            self.assertNotIn('default', schema[field])
+            self.assertNotIn('anyOf', schema[field])
+        contract = _contract(GOOD_RENDERER)
+        self.assertEqual(tool.args_schema(outputs_json=contract).outputs_json, contract)
+        self.assertEqual(tool.args_schema(outputs_json=json.dumps(contract)).outputs_json, json.dumps(contract))
+        self.assertEqual(normalize_output_contract(figure_tools._json_arg(json.dumps(contract), 'outputs_json')),
+                         normalize_output_contract(contract))
+
     def test_help_and_presets_describe_read_only_inspection_and_environments(self):
         help_text = _tool_help()
         self.assertIn("inspect_uploaded_table", help_text)

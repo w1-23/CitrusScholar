@@ -407,7 +407,9 @@ def _figure_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
         modes=("script",) if "mode" in arguments else (),
         inputs=("本账号授权表（CSV/XLSX/PDF，按工具 schema 绑定 file_id）与完整脚本或 script_ref",),
         artifacts=artifacts, waits=facts.waits_for(tools),
-        hint="渲染和 QA 由 Worker 完成；分析不等于出图，只交付回执已确认的文件，不重复运行成功步骤" + forward_note,
+        hint=("常规单表一次 profile 后使用冻结的文件绑定；outputs_json 等直接传对象。"
+              "样本量只用实际渲染报告。所需格式齐全时给下载链接，如实说明 QA 范围，不重跑或读全回执。"
+              "未明确要求源码时不粘贴 SVG/XML" + forward_note),
         source="tool_specs+available_names")]
     template_hint = ("固定图型 " + "/".join(FIGURE_TEMPLATES)
                      + " 与脚本模式共用同一冻结输入、Worker、超时、输出合同、QA 与工作台项目")
@@ -643,7 +645,8 @@ def _integrity_rows(facts: _Facts) -> tuple[CapabilityRow, ...]:
             task="research.integrity", label="科研诚信核查", status=RUNNABLE, tools=tools,
             inputs=("授权图像/数据/报告文件（按 file_id+sha256 绑定对应角色）",),
             artifacts=artifacts, waits=facts.waits_for(tools),
-            hint=_collector_advice(facts) + "；结论以回执证据为准",
+            hint=(_collector_advice(facts) + "；结论以实际覆盖为准。重复数值区段应说明回执中的最短长度和未检查范围，"
+                  "零发现不等于没有低于门槛的重复，也不能推断数据无问题"),
             source="fusion_surface+skill"),)
     if tools:
         return (_closed("research.integrity", "科研诚信核查",

@@ -112,7 +112,8 @@ class CandidatePreparation(unittest.TestCase):
         self.assertEqual(inventory, {p.relative_to(release).as_posix(): _sha(p.read_bytes())
                                     for p in release.rglob("*") if p.is_file() and p.name != "inventory.json"})
         bundle = payload("fusion/bundle.json")
-        self.assertEqual(bundle["skills"], dict.fromkeys(FUSION_IDS, "0.1.0") | {"data-audit": "0.1.3", "literature-verification": "0.1.2"})
+        self.assertEqual(bundle["skills"], {"research-integrity": "0.1.1", "data-audit": "0.1.3",
+                                            "literature-verification": "0.1.2"})
         self.assertLessEqual(len(bundle["files"]), 94)
         for name, digest in bundle["files"].items():
             self.assertEqual(logical_path("/input/fusion/" + name), "/input/fusion/" + name)
@@ -201,6 +202,63 @@ with tempfile.TemporaryDirectory() as workspace:
                                    capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("标准 XLSM", (self.active / "skills/data-audit/INTERFACE_CONTRACT.md").read_text())
+
+    def test_integrity_numeric_scope_and_boundary_in_staged_runner(self):
+        sys.path[:0] = [str(ROOT / "01_src"), str(ROOT / "packages")]
+        self.addCleanup(lambda: sys.path.__delitem__(slice(0, 2)))
+        from src.agent.fusion_worker_contract import load_bundle
+        from src.research.fusion_delivery import summary
+
+        bundle = load_bundle(self.active, "research-integrity")
+        self.assertEqual(bundle.version, "0.1.1")
+        staged = self.active / "fusion/03_skill_fusion"
+        staged_skill = staged / "research-integrity/SKILL.md"
+        self.assertEqual(staged_skill.read_bytes(), (self.active / "skills/research-integrity/SKILL.md").read_bytes())
+        self.assertIn("零发现不排除更短的重复", staged_skill.read_text())
+        cases = {
+            "short_repeat": (["1", "2", "3"] * 2, "complete", "checked", []),
+            "boundary_repeat": (["1", "2", "3", "4"] * 2, "complete", "checked", [(2, 5), (6, 9)]),
+            "gap_breaks_run": (["1", "2", "3", "", "4"], "unsupported", "not_checked", []),
+        }
+        for name, (rows, expected, coverage_status, positions) in cases.items():
+            with self.subTest(name=name):
+                root = self.root / name
+                inputs, output = root / "inputs", root / "output"
+                inputs.mkdir(parents=True)
+                output.mkdir()
+                table = inputs / "table.csv"
+                table.write_text("value,fixture\n" + "".join(f"{v},x\n" for v in rows))
+                request = root / "request.json"
+                request.write_text(json.dumps({"interface_version": 1,
+                    "inputs": [{"role": "table", "path": table.name, "sha256": _sha(table.read_bytes())}],
+                    "options": {"checks": ["numeric"], "numeric_columns": ["value"]}}))
+                run = subprocess.run([sys.executable, "-B", str(staged / "run.py"), "research-integrity",
+                    "--input", str(inputs), "--output", str(output), "--request", str(request)],
+                    capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                report = json.loads((output / "result.json").read_bytes())
+                self.assertEqual(report["execution"]["version"], "0.1.1")
+                self.assertEqual(report["status"], expected)
+                coverage, = summary(report)["coverage"]
+                self.assertEqual((coverage["status"], coverage["minimum"], coverage["n_rows"]),
+                                 (coverage_status, 4, len(rows)))
+                self.assertIn("shorter repeats", coverage["limits"][1])
+                self.assertEqual([(loc["row_index"], loc["end_row_index"]) for f in report["findings"]
+                                  for loc in f["locations"]], positions)
+
+    @unittest.skipUnless(os.getenv("CITRUS_TEST_PREVIOUS_FUSION_RELEASE"), "requires sealed previous release")
+    def test_old_integrity_bundle_is_still_loadable_with_its_original_identity(self):
+        sys.path[:0] = [str(ROOT / "01_src"), str(ROOT / "packages")]
+        self.addCleanup(lambda: sys.path.__delitem__(slice(0, 2)))
+        from src.agent.fusion_worker_contract import load_bundle
+
+        previous = Path(os.environ["CITRUS_TEST_PREVIOUS_FUSION_RELEASE"])
+        old = load_bundle(previous, "research-integrity")
+        new = load_bundle(self.active, "research-integrity")
+        self.assertEqual(old.version, "0.1.0")
+        self.assertEqual(old.release_sha256, _sha((previous / "inventory.json").read_bytes()))
+        self.assertNotEqual(old.release_sha256, new.release_sha256)
+        self.assertNotEqual(old.installed_version, new.installed_version)
 
     def test_empty_enable_and_determinism(self):
         empty = self.stage("empty", "--include-runtime", "--enable")

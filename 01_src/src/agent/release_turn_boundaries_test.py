@@ -364,3 +364,91 @@ def test_literature_extraction_resolves_only_with_exact_full_registry_coverage()
     assert effective_tool_records([extraction, complete]) == [complete]
     for replacement in (wrong, short, complete | {"status": "unknown"}, complete | {"artifact_count": 1}):
         assert effective_tool_records([extraction, replacement]) == [extraction, replacement]
+
+
+def _published_figure(call_id, figure_id, formats):
+    name = "run_research_figure_script"
+    mimes = {"svg": "image/svg+xml", "png": "image/png", "pdf": "application/pdf"}
+    prefix = "/api/v2/session/fixture-session/artifacts/"
+    exports, validations = [], []
+    for fmt in formats:
+        import hashlib
+        aid = hashlib.sha256(f"{call_id}:{figure_id}:{fmt}".encode()).hexdigest()[:32]
+        exports.append({"format": fmt, "artifact_id": aid, "artifact_url": prefix + aid})
+        validations.append({"link": prefix + aid, "artifact_id": aid, "valid": True,
+                            "request_matches": True, "filename": f"{figure_id}.{fmt}",
+                            "mime": mimes[fmt], "producer_tool": name})
+    return {"name": name, "tool_call_id": call_id, "status": "complete", "reason": "figure_published",
+            "artifact_validations": validations, "op_receipt": {"schema_version": 1,
+                "tool_name": name, "tool_call_id": call_id, "status": "complete",
+                "reason_code": "figure_published", "run_id": f"run-{call_id}",
+                "coverage": {"figures": [{"figure_id": figure_id, "status": "complete", "exports": exports}]}}}
+
+
+def test_ordinary_figure_final_evidence_uses_one_current_render_and_keeps_data_failure():
+    from src.core.turn_outcome import completion_digest, completion_errors, completion_from_answer, reviewed_completion_valid, reviewed_turn_outcome
+
+    current = _published_figure("new", "current-figure", ("svg", "png", "pdf"))
+    old = _published_figure("old", "previous-figure", ("svg", "png", "pdf"))
+    unrelated = _published_figure("new", "other-figure", ("pdf",))
+    current["artifact_validations"].extend(unrelated["artifact_validations"])
+    rows = [old, {"name": "inspect_uploaded_table", "tool_call_id": "range-error", "status": "failed"}, current]
+    links = {v["link"] for row in (old, current) for v in row["artifact_validations"]}
+    query = "绘制这个图"
+    requirements = contract_for_turn(query, has_tables=True).deliverables
+    assert [r["formats"] for r in requirements] == [["svg"]]
+    goals, gaps = artifact_goal_evidence(requirements, rows, links, single_render_receipt=True)
+    assert not gaps
+    assert goals[0].evidence_call_ids == ["new"]
+    assert goals[0].artifact_links == [v["link"] for v in current["artifact_validations"][:3]]
+    assert unrelated["artifact_validations"][0]["link"] not in goals[0].artifact_links
+    later_unconfirmed = _published_figure("maybe", "unconfirmed-figure", ("svg", "png", "pdf")) | {"status": "unknown"}
+    rows.append(later_unconfirmed)
+    links.update(v["link"] for v in later_unconfirmed["artifact_validations"])
+    assert artifact_goal_evidence(requirements, rows, links, single_render_receipt=True) == (goals, gaps)
+
+    # Format completion never repairs a failed source read or an unknown operation.
+    statement = completion_from_answer("\n".join(goals[0].artifact_links), rows)
+    statement = statement.model_copy(update={"goals": [*statement.goals, *goals]})
+    errors = completion_errors(statement, rows)
+    assert errors == ("execution_blocker:range-error", "execution_blocker:maybe")
+    partial = statement.model_copy(update={"status": "partial", "remaining": list(errors)})
+    proof = reviewed_turn_outcome(partial, rows, identity={"run_id": "fixture"}, request_version=1,
+        request_hash=completion_digest(query), artifact_contract={"schema_version": 1, "request_version": 1,
+        "requirements": requirements, "verified_links": sorted(links), "single_render_receipt": True})
+    assert reviewed_completion_valid(proof, rows)
+    assert proof.status == "partial"
+
+
+def test_explicit_three_formats_cannot_be_filled_by_a_different_render():
+    query = "用这份工作簿按 group 做箱线图叠加原始数据点，使用 Nature 科研风格，交付可下载 SVG、PNG 和 PDF。只使用附件，不联网。"
+    requirements = contract_for_turn(query, has_tables=True).deliverables
+    assert len(requirements) == 1 and set(requirements[0]["formats"]) == {"svg", "png", "pdf"}
+    older = _published_figure("earlier", "old-figure", ("svg", "png", "pdf"))
+    later = _published_figure("later", "new-figure", ("svg", "png", "pdf"))
+    verified = {v["link"] for row in (older, later) for v in row["artifact_validations"]}
+    goals, gaps = artifact_goal_evidence(requirements, [older, later], verified, single_render_receipt=True)
+    assert not gaps and set(goals[0].artifact_links) == {v["link"] for v in later["artifact_validations"]}
+    assert goals[0].evidence_call_ids == ["later"]
+    verified.remove(later["artifact_validations"][2]["link"])
+    goals, gaps = artifact_goal_evidence(requirements, [older, later], verified, single_render_receipt=True)
+    assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
+    implicit = contract_for_turn("绘制这个图", has_tables=True).deliverables
+    goals, gaps = artifact_goal_evidence(implicit, [older, later], verified, single_render_receipt=True)
+    assert not gaps and goals[0].artifact_links == [v["link"] for v in later["artifact_validations"][:2]]
+
+
+def test_separate_figures_in_the_same_receipt_cannot_fill_one_format_set():
+    requirement = contract_for_turn("画箱线图，交付可下载 SVG、PNG 和 PDF。", has_tables=True).deliverables
+    latest = _published_figure("same-call", "svg-figure", ("svg", "png"))
+    pdf = _published_figure("same-call", "separate-pdf-figure", ("pdf",))
+    latest["op_receipt"]["coverage"]["figures"].extend(pdf["op_receipt"]["coverage"]["figures"])
+    latest["artifact_validations"].extend(pdf["artifact_validations"])
+    verified = {v["link"] for v in latest["artifact_validations"]}
+    goals, gaps = artifact_goal_evidence(requirement, [latest], verified, single_render_receipt=True)
+    assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
+
+
+def test_format_only_figure_continuation_does_not_absorb_separate_pdf():
+    requirements = contract_for_turn("画箱线图，交付可下载 SVG、PNG。另做一份 PDF 报告。", has_tables=True).deliverables
+    assert [frozenset(r["formats"]) for r in requirements] == [frozenset({"svg", "png"}), frozenset({"pdf"})]

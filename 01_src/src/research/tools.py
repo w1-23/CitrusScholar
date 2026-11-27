@@ -1595,7 +1595,8 @@ def inspect_uploaded_table(file_index: int = 0, sheet_name: str = "", header_row
     空ID列表保留原本轮附件file_index逻辑。账号来源校验owner、实际SHA-256与大小，合计最多20MB/20文件。
     XLSX/XLSM 默认 layout，返回工作表、可见性、合并格和已发现区域。查看 detection 的扫描范围和完整性；同一文件版本和读法可复用已存结构。
     inspection=cells、cell_range="A1:F40" 按原坐标读取公式或值，默认10行，宽页也按单元格数和字节缩小。
-    续读使用相同工作表和范围及 next_cursor；来源字节变化后游标失效。需要原字段统计时使用 inspection=profile。
+    常规单表绘图优先一次 inspection="profile"，取得字段、表头、行数与 inputs_binding；结构不明确才做 layout 或 cells。
+    cells 是坐标样例，不是全表或样本量。只有确需核对特定坐标才续读，原样使用相同工作表、范围与 next_cursor。
     header_row 选择表头，header_rows_json=[2,3] 指定多层表头。新规则审查用audit_uploaded_data；
     已有review_id仅需导出时用deliver_research_artifact，不重新扫描。
     """
@@ -1655,7 +1656,7 @@ def inspect_uploaded_table(file_index: int = 0, sheet_name: str = "", header_row
         source = {**meta["source_ref"], "columns": [str(c) for c in frame.columns]}
         profile["source_ref"] = source
         profile["source_refs"] = [source]
-        profile["inputs_binding"] = {"data": {"file_id": source["file_id"]}}
+        profile["inputs_binding"] = {"data": {"file_id": source["file_id"], "sha256": profile["source_sha256"]}}
     if isinstance(profile.get("raw_preview"), list):
         profile["raw_preview"] = [
             [str(value)[:120] for value in row] if isinstance(row, (list, tuple))

@@ -128,19 +128,80 @@ def claims_file_delivery(answer: str) -> bool:
     return False
 
 
-def artifact_goal_evidence(requirements, rows, verified_links):
+def _single_render_assets(requirements, rows, assets):
+    """Prefer one exact final render for an ordinary single-figure request."""
+    from src.graph.export_contract import deliverable_match_groups
+    from src.graph.task_contract import FIGURE_KINDS
+
+    if len(requirements) != 1:
+        return None
+    requirement = requirements[0]
+    if (not set(requirement.get("kinds") or ()).intersection(FIGURE_KINDS)
+            or requirement.get("phase", "initial") != "initial" or requirement.get("figure_id")):
+        return None
+    name = "run_research_figure_script"
+    mime_by_format = {"svg": "image/svg+xml", "png": "image/png", "pdf": "application/pdf", "tiff": "image/tiff"}
+    if set(requirement.get("formats") or ()) - mime_by_format.keys():
+        return None
+    for row in reversed(rows):
+        if row.get("status") != "complete" or (row.get("name") or row.get("tool_name")) != name:
+            continue
+        if (row.get("reason") or row.get("reason_code")) != "figure_published":
+            continue
+        cid, receipt = row.get("tool_call_id"), row.get("op_receipt") or {}
+        if (not cid or not isinstance(receipt, dict) or receipt.get("schema_version") != 1
+                or not receipt.get("run_id")
+                or (receipt.get("tool_call_id"), receipt.get("tool_name"), receipt.get("status"),
+                    receipt.get("reason_code")) != (cid, name, "complete", "figure_published")):
+            return None
+        figures = (receipt.get("coverage") or {}).get("figures")
+        if not isinstance(figures, list) or not figures:
+            return None  # Keep legacy receipts on the existing matcher.
+        current = [(owner, asset) for owner, asset in assets if owner == cid and asset.get("producer_tool") == name]
+        matches = []
+        for figure in figures:
+            if not isinstance(figure, dict) or not figure.get("figure_id") or figure.get("status") != "complete":
+                continue
+            exports = {(item.get("artifact_url"), item.get("artifact_id"), mime_by_format[item["format"]])
+                       for item in figure.get("exports") or ()
+                       if isinstance(item, dict) and item.get("format") in mime_by_format}
+            group = [(owner, asset) for owner, asset in current
+                     if (asset.get("link"), asset.get("artifact_id"), asset.get("mime")) in exports]
+            if deliverable_match_groups([asset for _, asset in group], requirements):
+                matches.append(group)
+        # Never combine two figures or backfill a missing format from a stale run.
+        return matches[0] if len(matches) == 1 else []
+    return None
+
+
+def _effective_artifact_records(records):
+    """Keep effective operations in the order they appeared in the journal."""
+    from src.core.task_result import effective_tool_records
+
+    positions = {row.get("tool_call_id"): i for i, row in enumerate(records)}
+    return sorted(effective_tool_records(records), key=lambda row: positions[row.get("tool_call_id")])
+
+
+def artifact_goal_evidence(requirements, rows, verified_links, *, single_render_receipt=False):
     from src.graph.export_contract import deliverable_match_groups
     assets = [(row["tool_call_id"], item) for row in rows
               if row.get("tool_call_id") and row.get("status") in {"complete", "partial"}
               for item in row.get("artifact_validations", ())
               if (item.get("valid") and item.get("request_matches") is True
                   and item.get("link") in verified_links)]
+    render_assets = _single_render_assets(requirements, rows, assets) if single_render_receipt else None
+    if render_assets is not None:
+        assets = render_assets
     matches = deliverable_match_groups([item for _, item in assets], requirements)
     goals, gaps = [], []
     for index, requirement in enumerate(requirements):
         label = str(requirement.get("label") or f"交付件 {index + 1}")
         members = matches.get(index)
         if members:
+            if render_assets is not None and not requirement.get("all_formats"):
+                # For an implicit drawing request, provide the other verified
+                # formats from the same render without making them obligations.
+                members = tuple(dict.fromkeys((*members, *range(len(assets)))))
             goals.append(CompletionGoal(goal=label, kind="deliverable",
                 evidence_call_ids=list(dict.fromkeys(assets[member][0] for member in members)),
                 artifact_links=list(dict.fromkeys(assets[member][1]["link"] for member in members))))
@@ -286,8 +347,10 @@ def reviewed_completion_valid(outcome, records, *, answer=None) -> bool:
                     or contract.get("request_version") != proof.get("request_version")):
                 return False
             from src.core.task_result import effective_tool_records
-            goals, gaps = artifact_goal_evidence(contract["requirements"],
-                effective_tool_records(records), set(contract["verified_links"]))
+            single_render_receipt = contract.get("single_render_receipt") is True
+            rows = _effective_artifact_records(records) if single_render_receipt else effective_tool_records(records)
+            goals, gaps = artifact_goal_evidence(contract["requirements"], rows, set(contract["verified_links"]),
+                single_render_receipt=single_render_receipt)
             if (goals != [goal for goal in statement.goals if goal.kind == "deliverable"]
                     or (gaps and statement.status == "completed")
                     or tuple(gaps) != tuple(gap for gap in data.get("gaps", ())

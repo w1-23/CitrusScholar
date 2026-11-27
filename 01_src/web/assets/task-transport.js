@@ -36,11 +36,19 @@
       var scope = reads;
       var response = await options.fetch(url, settings || {signal: scope.signal, cache: 'no-store'});
       if (!owns() || scope !== reads) return null;
-      var data = await response.json();
+      var data;
+      try { data = await response.json(); }
+      catch (error) { if (response.ok) throw error; data = {}; }
       if (!owns() || scope !== reads) return null;
       if (!response.ok) {
         var error = new Error(response.status === 409 ? '任务已更新，请核对最新状态后重试。' : '请求未完成，请稍后重试。');
-        error.status = response.status; error.detail = data.detail; throw error;
+        error.status = response.status; error.detail = data.detail;
+        if (response.status === 503 && response.headers && response.headers.get) {
+          var retry = response.headers.get('Retry-After');
+          if (retry && /^\d+$/.test(retry)) error.retryAfterMs = Number(retry) * 1000;
+          else if (retry) error.retryAfterMs = Date.parse(retry) - Date.now();
+        }
+        throw error;
       }
       return data;
     }
@@ -133,15 +141,25 @@
     }
     function follow(jobId) {
       if (timer) clearTimeout(timer);
-      var version = ++followVersion;
+      var version = ++followVersion, busyReads = 0;
       async function poll() {
         if (!owns() || version !== followVersion) return;
+        var delay = 2000;
         try {
           await replay(jobId);
           if (owns() && version === followVersion) await refresh(jobId, false);
+          busyReads = 0;
           if (root.CitrusTaskState.isTerminal(store.state)) return;
-        } catch (error) { if (owns() && version === followVersion && options.onError) options.onError(error); }
-        if (owns() && version === followVersion) timer = setTimeout(poll, 2000);
+        } catch (error) {
+          if (!owns() || version !== followVersion) return;
+          if (error.status === 503) {
+            busyReads = Math.min(4, busyReads + 1);
+            var hint = Number.isFinite(error.retryAfterMs) ? error.retryAfterMs : 0;
+            delay = Math.min(30000, Math.max(delay * 2 ** (busyReads - 1), hint));
+          } else busyReads = 0;
+          if (options.onError) options.onError(error);
+        }
+        if (owns() && version === followVersion) timer = setTimeout(poll, delay);
       }
       return poll();
     }

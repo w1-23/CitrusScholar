@@ -101,7 +101,8 @@ class WorkerContractTests(unittest.TestCase):
               patch("src.core.account_leases.account_lease", return_value=nullcontext()),
               patch.object(code_tools, "observe_code_rejection")):
             for action in ("status", "log", "read", "deliver", "wait", "cancel"):
-                _, result = code_tools._dispatch(action, execution_id="e" * 32)
+                args = {"path": "/outputs/analysis.json"} if action in {"read", "deliver"} else {}
+                _, result = code_tools._dispatch(action, execution_id="e" * 32, **args)
                 self.assertEqual(result["error"], "workspace_scope_denied")
             for action in ("workspace", "execute", "bind_skill_script", "bind_input", "write"):
                 _, result = code_tools._dispatch(action, workspace_id="e" * 32)

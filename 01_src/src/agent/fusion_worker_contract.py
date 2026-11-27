@@ -124,7 +124,7 @@ def load_bundle(release: Path, skill: str) -> Bundle:
             or any(version not in {
                 "data-audit": {"0.1.0", "0.1.1", "0.1.2", "0.1.3"},
                 "literature-verification": {"0.1.0", "0.1.1", "0.1.2"},
-                "research-integrity": {"0.1.0"},
+                "research-integrity": {"0.1.0", "0.1.1"},
             }[name] for name, version in manifest["skills"].items())
             or skill not in manifest["skills"]):
         raise ValueError("fusion_bundle_schema_mismatch")

@@ -595,18 +595,19 @@ async def _run(state, identity, ledger):
                 statement = statement.model_copy(update={"answer": public_answer})
         delivery_gaps, artifact_contract = [], None
         if requirements:
-            from src.core.task_result import effective_tool_records
-            from src.core.turn_outcome import artifact_goal_evidence
+            from src.core.turn_outcome import _effective_artifact_records, artifact_goal_evidence
             from src.research.tools import validate_artifact_links
-            effective = effective_tool_records(host.records)
+            effective = _effective_artifact_records(host.records)
             links = list(dict.fromkeys(item["link"] for row in effective
                 for item in row.get("artifact_validations", []) if item.get("valid") and item.get("link")))
             verified = await asyncio.to_thread(validate_artifact_links, links, session_id=identity.session_id,
                          owner_user_id=identity.owner_user_id, request_id=host._result_request_id()) if links else []
             verified_links = sorted(item["link"] for item in verified if item.get("valid"))
-            goals, delivery_gaps = artifact_goal_evidence(requirements, effective, set(verified_links))
+            goals, delivery_gaps = artifact_goal_evidence(requirements, effective, set(verified_links),
+                                                         single_render_receipt=True)
             artifact_contract = {"schema_version": 1, "request_version": update_version,
-                                 "requirements": requirements, "verified_links": verified_links}
+                                 "requirements": requirements, "verified_links": verified_links,
+                                 "single_render_receipt": True}
             delivery_links = list(dict.fromkeys(link for goal in goals for link in goal.artifact_links
                                                 if link not in public_answer))
             if delivery_links:

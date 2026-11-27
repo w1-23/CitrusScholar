@@ -443,7 +443,7 @@ def deliverable_contract(query: str) -> list[dict[str, Any]]:
                         if not ("figure" in requirement["kinds"]
                                 and not requirement.get("_explicit_formats")
                                 and set(requirement["formats"] or ()) == {"svg"})]
-    requirements = _consolidate_figure_restatements(requirements)
+    requirements = _consolidate_figure_restatements(requirements, separate_products=separate_products)
     for requirement in requirements:
         requirement.pop("_explicit_formats", None)
     return _expand_product_identity(
@@ -709,14 +709,15 @@ def deliverable_export_requested(query: str) -> bool:
 
 def _format_only_label(label: str) -> bool:
     """True when a segment names only formats/filenames, not a new product."""
-    text = _FORMAT_TOKEN_RE.sub("", str(label or ""))
+    text = _FORMAT_TOKEN_RE.sub("", re.sub(r"^(?:可直接下载|可供下载|可下载)\s*", "", str(label or "")))
     text = re.sub("[A-Za-z0-9_./()（） :：,，、-]+", "", text)
     for word in ("文件名", "文件", "两个", "个"):
         text = text.replace(word, "")
     return not text.strip()
 
 
-def _consolidate_figure_restatements(requirements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _consolidate_figure_restatements(requirements: list[dict[str, Any]], *,
+                                    separate_products=False) -> list[dict[str, Any]]:
     """One figure delivered in several formats is one product, not many.
 
     The legacy parser splits "输出 PNG 与 PDF 两个文件" into per-format
@@ -727,6 +728,16 @@ def _consolidate_figure_restatements(requirements: list[dict[str, Any]]) -> list
     figures = [r for r in requirements if "figure" in (r.get("kinds") or ())]
     if len(figures) < 2 or not all(_format_only_label(r.get("label")) for r in figures):
         return requirements
+    # PDF by itself carries no figure keyword. Join a bare format continuation
+    # in the same clause only, never an independently requested report or file.
+    clause_ids = {r["product_id"].rsplit("_", 1)[0] for r in figures}
+    if len(clause_ids) == 1 and not separate_products:
+        clause = next(iter(clause_ids))
+        figures.extend(r for r in requirements if not r.get("kinds")
+            and r["product_id"].rsplit("_", 1)[0] == clause
+            and len(r.get("formats") or ()) == 1 and r.get("quantity") == 1
+            and r["formats"][0] in _KIND_FORMATS["figure_package"]
+            and re.fullmatch(r"(?:pdf|tiff?)\s*(?:格式)?", r["label"], re.I))
     formats: list[str] = []
     for requirement in figures:
         for fmt in requirement.get("formats") or ():

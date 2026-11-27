@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 from contextvars import copy_context
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,30 @@ def test_csv_shape_snapshot_and_actual_figure_receipts(runtime, monkeypatch):
     asyncio.run(session_store.get_or_create_session(SESSION, OWNER))
     assert session_store.get_session_owner(SESSION) == OWNER
     copy_context().run(_exercise_real_figure)
+
+
+def test_workbook_profile_confirms_twelve_rows_without_paging(runtime, monkeypatch):
+    from openpyxl import Workbook
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(['condition', 'measurement'])
+    for index in range(12):
+        sheet.append(['A' if index < 6 else 'B', index])
+    output = BytesIO()
+    workbook.save(output)
+    data = output.getvalue()
+    digest = hashlib.sha256(data).hexdigest()
+    monkeypatch.setattr(tools, '_audit_source_tables', lambda *_args, **_kwargs: [
+        {'name': 'fixture.xlsx', 'data': data, 'source_ref': {'file_id': 'a' * 32, 'sha256': digest}}])
+    profile = json.loads(inspect_uploaded_table.invoke({'file_ids_json': ['a' * 32], 'inspection': 'profile'}))
+    assert (profile['rows'], profile['source_rows'], profile['columns']) == (12, 12, 2)
+    assert profile['source_rows_exact'] is True and profile['truncated'] is False
+    assert len(profile['sample_rows']) == 5
+    assert profile['inputs_binding'] == {'data': {'file_id': 'a' * 32, 'sha256': digest}}
+    preview = json.loads(inspect_uploaded_table.invoke({'file_ids_json': ['a' * 32], 'inspection': 'cells',
+                                                       'cell_range': 'A1:B13'}))
+    assert len(preview['cells']) == 20 and preview['next_cursor']
+    assert 'rows' not in preview and 'source_rows_exact' not in preview
 
 
 def _exercise_real_figure():

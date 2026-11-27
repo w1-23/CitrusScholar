@@ -6,7 +6,9 @@ import inspect
 import json
 import logging
 from time import monotonic
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import BaseModel, Field, WithJsonSchema
 
 from langchain_core.tools import tool
 
@@ -147,8 +149,9 @@ def _run_research_figure_script(
     首选的科研绘图路径，配合 figure-export 的 nature-figure 工作流。
     仅在服务端已配置隔离沙箱时可用；未配置时本工具不会出现。
     三种隔离环境：Docker、WSL-Docker、Apptainer；脚本仍不联网、不建子进程。
-    工作簿请先只读探查：用 inspect_uploaded_table 查看工作表、列名、类型和少量样例，
-    不要把整本工作簿、全表或分页内容写进脚本字面量；预览截短不代表源数据截短。
+    常规单表绘图用 inspect_uploaded_table(inspection="profile") 一次确认表头、列名、类型与来源绑定。
+    已知字段和绑定时直接复用。仅遇真实工作簿结构歧义才用 layout/cells，不分页搜集绘图数据。
+    预览和单元格样例不能用于推算样本量；勿把全表或分页内容写进脚本字面量。
     Matplotlib 和产生 Matplotlib Artist 的 Seaborn 均支持，不承诺其他后端。
     先按已加载的 figure-export/nature-figure 工作流确定问题、变量与单位；
     高唯一率编号不默认作处理组，不能默取第一数值列或截前 N 行。多指标按
@@ -156,7 +159,7 @@ def _run_research_figure_script(
     单套底部/左侧刻度，实际 draw 后验证标签密度及固定画布边界；布局不合格
     会返回可修正错误，不能以文件生成代替科学表达与视觉检查。
     inputs_json、outputs_json、qa_profile_json 直接传 JSON 对象；formats_json 直接传数组。
-    render_script 是 outputs_json 对象中的源码字符串，不要再把整个对象编码成字符串。
+    render_script 是 outputs_json 对象中的源码字符串，只有 Python 源码需要字符串；不要把 JSON 对象再次编码。
     inputs_json 是变量名到当前账号文件的映射，优先照用 inspect 返回的 inputs_binding。
     例如 {"data":{"file_id":"..."}}，也接受同一文件的 {"file_id":"...","sha256":"..."}；
     提供 sha256 时必须与当前授权文件的真实字节完全匹配。脚本中 pd.read_csv(data) 或 pd.read_excel(data,
@@ -190,8 +193,11 @@ def _run_research_figure_script(
     下一执行使用返回的dataset_ref；一次执行也可整理并绘图，不机械分步。
     用户已指定 Python 或图型时直接沿用，只有影响科学含义的未知选择才询问。
     有匹配的内置模板时优先按引用和参数执行，仅传必要参数。
-    修复失败时先读取已保存run_id/tool_call_id的具体审核失败项，并复用真实输入与脚本版本；
-    不用演示数据、占位图或降低字号/审核要求替代用户要的图件，不把调试图当正式成果。
+    需要样本量时由绘图脚本 emit.report 记录 rows_read、rows_plotted、rows_excluded、n_per_group。
+    figure_published 且所需格式齐全时直接给 exports 下载链接和已有 QA 摘要，不因视觉审查未执行、摘要缺字段而重绘。
+    不打开或粘贴 SVG/XML 源码，除非用户明确要求源码。
+    只有缺必要细节时才按原文 JSON Pointer 读取，例如 /script_report、/exports、/figures/0/qa_receipt、/figures/0/current_qa。
+    修复真实失败才读取已有 run_id 或明确失败字段，复用真实输入与脚本版本；不要以演示数据或放宽 QA 替代正式成果。
     图件parents只引用输入绑定名或命名中间表；未声明时保守依赖全部输入与表。
     outputs_json省略时兼容旧协议，最后恰好保留一张Figure。所有脚本必须使用Agg、
     不联网、不创建子进程、不访问沙箱以外文件；类型不明或关键设计不明先探索/必要提问。
@@ -687,6 +693,30 @@ def _compile_template_request(*, template_id: str, template_parameters_json: Any
                            binding_kind=kind, title=title, formats=formats)
 
 
+# Present one canonical shape to the model while retaining inbound JSON
+# strings for legacy callers. A factory keeps the legacy empty sentinel out
+# of the provider schema, where it would be an invalid object/array default.
+_FigureObject = Annotated[dict | str, WithJsonSchema({"type": "object", "additionalProperties": True})]
+_FigureFormats = Annotated[list[str] | str, WithJsonSchema({"type": "array", "items": {"type": "string"}})]
+
+
+class FigureScriptArgs(BaseModel):
+    script: str = ""
+    title: str = ""
+    formats_json: _FigureFormats = Field(default_factory=str)
+    output_name: str = ""
+    inputs_json: _FigureObject = Field(default_factory=str)
+    qa_profile_json: _FigureObject = Field(default_factory=str)
+    analysis_result_ref_json: _FigureObject = Field(default_factory=str)
+    outputs_json: _FigureObject = Field(default_factory=str)
+    script_ref_json: _FigureObject = Field(default_factory=str)
+    parameters_json: _FigureObject = Field(default_factory=str)
+    repair_from_run_id: str = ""
+    mode: str = "script"
+    template_id: str = ""
+    template_parameters_json: _FigureObject = Field(default_factory=str)
+
+
 def run_research_figure_script(
     script: str = "", title: str = "", formats_json: list[str] | str = "",
     output_name: str = "", inputs_json: dict | str = "", qa_profile_json: dict | str = "",
@@ -801,6 +831,6 @@ template_parameters_json + 单张表绑定 inputs_json（或 analysis_result_ref
 返回 not_run。旧工具 run_nature_plot/collect_nature_plot 已弃用并只转发到这里，
 不得同时使用两套入口。
 """
-run_research_figure_script = tool(response_format="content_and_artifact")(run_research_figure_script)
+run_research_figure_script = tool(args_schema=FigureScriptArgs, response_format="content_and_artifact")(run_research_figure_script)
 
 __all__ = ["run_research_figure_script"]

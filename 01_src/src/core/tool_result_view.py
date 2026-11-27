@@ -28,7 +28,7 @@ _CONTROL_PRIORITY = (
 
 _SCRIPT_PRIORITY = (
     "_tool_outcome", "deliverable_stage", "execution_stage", "figure_delivery_notice",
-    "render_data_summary", "exports", "figure_stages", "script_ref", "run_id", "failure_phase",
+    "render_data_summary", "exports", "figure_qa_summary", "figure_stages", "script_ref", "run_id", "failure_phase",
     "error_code", "dataset_refs", "error",
 )
 
@@ -51,7 +51,67 @@ def _asset_ref(value):
     return {**value, "version": int(version)}
 
 
+def _figure_qa_summary(figure):
+    """Separate verified publication from QA coverage, not a new verdict."""
+    token = re.compile(r"[a-z][a-z0-9_]{0,49}")
+
+    def statuses(source, keys):
+        return {key: source[key] for key in keys if isinstance(source.get(key), str) and token.fullmatch(source[key])}
+
+    def check_statuses(source, keys):
+        checks = source.get("checks")
+        if not isinstance(checks, dict):
+            return {}
+        return {key: state["status"] for key in keys if isinstance((check := checks.get(key)), dict)
+                and (state := statuses(check, ("status",)))}
+
+    result = {}
+    for key in ("qa_receipt", "current_qa", "nature_skill_receipt"):
+        record = figure.get(key)
+        if not isinstance(record, dict):
+            continue
+        if key == "current_qa":
+            overall = record.get("overall")
+            if not isinstance(overall, dict):
+                continue
+            section = statuses(overall, ("execution", "conclusion"))
+            for name in ("blocking", "advisory", "unexecuted"):
+                items = overall.get(name)
+                if isinstance(items, list):
+                    section[name] = [item for item in items[:5] if isinstance(item, str) and token.fullmatch(item)]
+        else:
+            section = statuses(record, ("status",))
+            keys = ("dimensions", "fonts", "linewidth", "canvas_text_bounds") if key == "qa_receipt" else (
+                "source_preflight", "pdf_text", "pdf_collisions")
+            checks = check_statuses(record, keys)
+            if checks:
+                section["checks"] = checks
+        if section:
+            result[key] = section
+    return result
+
+
+def _script_downloads(exports):
+    """Fold repeated IDs/digests out of the model view, never out of evidence."""
+    if not isinstance(exports, list):
+        return None
+    result = []
+    for row in exports[:24]:
+        if not isinstance(row, dict) or row.get("format") not in ("svg", "png", "pdf", "tiff"):
+            continue
+        link = row.get("download_url")
+        if not isinstance(link, str) or not re.fullmatch(r"/api/v2/files/[a-f0-9]{32}/download", link):
+            continue
+        # Distinguish several figures with the same requested format.
+        filename = row.get("filename")
+        result.append({"format": row["format"], "download_url": link,
+                       **({"filename": filename} if isinstance(filename, str) and len(filename) <= 90 else {})})
+    return result
+
+
 def _script_controls(value):
+    if downloads := _script_downloads(value.get("exports")):
+        value["exports"] = downloads
     report = value.get("script_report")
     if isinstance(report, str) and len(report) <= 8_192:
         try:
@@ -75,6 +135,11 @@ def _script_controls(value):
     if isinstance(value.get("dataset_refs"), list):
         value["dataset_refs"] = [ref for item in value["dataset_refs"] if (ref := _asset_ref(item))]
     if isinstance(value.get("figures"), list) and value["figures"]:
+        # First figure covers the common single-plot delivery. Additional
+        # figures retain their bounded stage and references to original QA.
+        first = value["figures"][0]
+        if isinstance(first, dict) and (summary := _figure_qa_summary(first)):
+            value["figure_qa_summary"] = {"figure_index": 0, **summary}
         value["figure_stages"] = [
             {key: item[key] for key in ("name", "status", "delivery_stage", "reason_code")
              if isinstance(item.get(key), str)}
@@ -213,16 +278,24 @@ def _table_overview(value):
     if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
         summary["source_sha256"] = digest
     if isinstance(value.get("inputs_binding"), dict) and source.get("file_id"):
-        summary["inputs_binding"] = {"data": {"file_id": source["file_id"]}}
+        summary["inputs_binding"] = {"data": {"file_id": source["file_id"],
+                                              **({"sha256": digest} if "source_sha256" in summary else {})}}
     for key in ("source_rows", "source_columns", "source_rows_exact", "truncated", "truncation_reasons",
                 "scan_complete", "header_rows", "sheet"):
         info = value.get(key)
         if isinstance(info, (bool, str, list)) and content_wire_bytes(info) <= 160:
             summary[key] = info
+    sheets = value.get("sheets")
+    if isinstance(sheets, list) and sheets:
+        summary["sheet_count"] = len(sheets)
+        samples = [item[:40] for item in sheets[:5] if isinstance(item, str)]
+        if content_wire_bytes(samples) <= 160:
+            summary["sheet_names_preview"] = samples
     # Keep identities, dimensions and field counts before optional samples.
     while descriptors and content_wire_bytes(_json(summary)) > 1500:
         descriptors.pop()
     summary["fields_omitted"] = max(0, len(fields) - len(descriptors))
+    summary["samples_are_not_row_counts"] = True
     return summary
 
 
@@ -255,6 +328,7 @@ def first_delivery(message, *, call: dict, reader_available: bool):
     control = {}
     total_controls = 0
     table_overview = workspace_overview = None
+    figure_read_fields = []
     try:
         # Keep the original spelling of numbers; the reference, not this view,
         # is authoritative evidence for scientific quantities and units.
@@ -271,6 +345,11 @@ def first_delivery(message, *, call: dict, reader_available: bool):
                 index = []
             priority = _CONTROL_PRIORITY
             if message.name == "run_research_figure_script":
+                figure_read_fields = [f"/{key}" for key in ("script_report", "exports") if key in value]
+                figures = value.get("figures")
+                if isinstance(figures, list) and figures and isinstance(figures[0], dict):
+                    figure_read_fields += [f"/figures/0/{key}" for key in ("exports", "qa_receipt", "current_qa", "nature_skill_receipt")
+                                           if key in figures[0]]
                 value = _script_controls(value)
                 priority = tuple(dict.fromkeys((*_SCRIPT_PRIORITY, *_CONTROL_PRIORITY)))
             elif message.name == "research_workspace" and (call.get("args") or {}).get("operation", "list") == "list":
@@ -312,6 +391,13 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         payload["delivery"] = "stored_table_overview"
         payload["table_overview"] = table_overview
         payload.pop("previews")
+        payload["notice"] = "样例不是全量。绘图应复用已绑定的源文件，不需要为填满预览而分页或重读。"
+
+    if figure_read_fields:
+        payload["read_with"]["available_fields"] = figure_read_fields
+        payload.pop("previews")
+        payload["notice"] = ("已登记且格式齐全时给下载链接，不粘贴 SVG 源码；如实说明 QA 未覆盖项。"
+                             "仅缺必要证据时从 available_fields 选字段。control_observation 是摘要，不是原文 JSON 路径。")
 
     if workspace_overview:
         payload["delivery"] = "stored_result_reference"
@@ -331,7 +417,7 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         payload["delivery"] = "stored_result_reference"
         payload.pop("previews")
         rendered = render()
-    for field in ("field_index", "notice"):
+    for field in (("field_index",) if figure_read_fields else ("field_index", "notice")):
         if content_wire_bytes(rendered) <= FIRST_DELIVERY_BYTES:
             break
         payload.pop(field)
@@ -345,6 +431,9 @@ def first_delivery(message, *, call: dict, reader_available: bool):
                 workspace_overview[group].pop()
                 workspace_overview[group + "_omitted"] += 1
                 rendered = render()
+    if content_wire_bytes(rendered) > FIRST_DELIVERY_BYTES and figure_read_fields:
+        payload.pop("notice", None)
+        rendered = render()
     if content_wire_bytes(rendered) > FIRST_DELIVERY_BYTES:
         return _failure(message, "result_reference_too_large", verified=True)
     metadata = {**message.additional_kwargs, "first_delivery_reference": True}

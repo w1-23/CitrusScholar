@@ -79,6 +79,41 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def serialized(self, text):
         return len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
 
+    async def test_plot_success_summary_points_only_to_existing_original_fields(self):
+        from src.core.tool_result_view import content_wire_bytes
+        exports = [{"format": fmt, "file_id": digit * 32,
+                    "download_url": f"/api/v2/files/{digit * 32}/download",
+                    "artifact_url": f"/api/v2/session/fixture/artifacts/{digit * 32}",
+                    "sha256": digit * 64, "size": 1000, "filename": f"figure.{fmt}",
+                    "artifact_id": digit * 32} for fmt, digit in zip(("svg", "png", "pdf"), "123")]
+        original = {"deliverable_stage": "figure_published", "exports": exports,
+                    "_tool_outcome": {"status": "complete", "reason_code": "figure_published",
+                                      "artifacts": [row["artifact_url"] for row in exports]},
+                    "figures": [{"name": "plot", "status": "complete", "delivery_stage": "figure_published",
+                                 "exports": exports,
+                                 "qa_receipt": {"status": "measured_checks_pass", "checks": {"fonts": {"status": "pass"}}},
+                                 "current_qa": {"overall": {"execution": "partial", "conclusion": "incomplete",
+                                                            "blocking": [], "advisory": ["source_preflight"],
+                                                            "unexecuted": ["visual"]}},
+                                 "nature_skill_receipt": {"status": "review_required", "checks": {
+                                     "pdf_collisions": {"status": "pass"}, "pdf_text": {"status": "pass"}}}}],
+                    "script_report": '{"rows_read":12,"rows_plotted":12,"rows_excluded":0,"n_per_group":{"A":6,"B":6}}',
+                    "stdout": "unused giant details " * 1000}
+        raw = json.dumps(original, ensure_ascii=False)
+        message = self.delivery("plot-qa", raw, tool_name="run_research_figure_script")
+        self.assertLessEqual(content_wire_bytes(message.content), FIRST_DELIVERY_BYTES)
+        view = json.loads(message.content)
+        control = view["control_observation"]
+        self.assertEqual(control["render_data_summary"]["n_per_group"], {"A": 6, "B": 6})
+        self.assertEqual(control["render_data_summary"]["rows_plotted"], 12)
+        self.assertEqual(control["figure_qa_summary"]["current_qa"]["unexecuted"], ["visual"])
+        self.assertEqual(control["figure_qa_summary"]["nature_skill_receipt"]["checks"]["pdf_text"], "pass")
+        self.assertEqual([row["download_url"] for row in control["exports"]],
+                         [row["download_url"] for row in exports])
+        self.assertEqual(view["read_with"]["available_fields"], ["/script_report", "/exports", "/figures/0/exports",
+                         "/figures/0/qa_receipt", "/figures/0/current_qa", "/figures/0/nature_skill_receipt"])
+        self.assertEqual(tool_results.fetch_for_current_request(message.tool_call_id)["result_text"], raw)
+
     async def test_combined_controls_keep_bounded_verified_reference(self):
         original = oversized_controls()
         self.assertEqual(len(original), 104_846)

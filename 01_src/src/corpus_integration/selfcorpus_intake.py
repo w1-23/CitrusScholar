@@ -1,4 +1,4 @@
-"""Submit official Fetch originals to the independent personal corpus queue."""
+"""Submit official public Fetch originals to the independent shared corpus queue."""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +13,7 @@ import sqlite3
 from . import selfcorpus_search as wire
 
 logger = logging.getLogger(__name__)
+_VERIFIED_SHARED_TARGET = "/api/v1/ingestion/verified-shared"
 _RECEIPT = re.compile(r"req_[0-9a-f]{32}")
 _STATES = frozenset({"queued", "fetching", "fetched", "parsing", "parsed", "chunking",
                     "embedding", "indexing", "validating", "published", "already_present",
@@ -82,11 +83,10 @@ def submit(official, *, doi: str, pmid: str) -> dict:
         principal = _principal()
         if principal is None:
             return {"status": "not_run", "reason": "selfcorpus_intake_not_authorized"}
-        from corpus.auth import Actor, INGEST_TARGET, MAX_INGEST_BODY_BYTES, signed_headers
+        from corpus.auth import Actor, MAX_INGEST_BODY_BYTES, signed_headers
 
         origin, secret = wire._config()
-        actor = Actor(str(principal[0]), projects={}, shared=False, governor=False)
-        scope = f"personal:{actor.subject}"
+        actor = Actor(str(principal[0]), projects={}, shared=True, governor=False)
         metadata = official[0]["metadata_raw"]
         identity = (proof.doi, proof.evidence_url, proof.text_url, proof.sha256, sha256(metadata).hexdigest())
         key = "fetch-pmc-v1:" + sha256(json.dumps(identity, separators=(",", ":")).encode("ascii")).hexdigest()
@@ -95,21 +95,22 @@ def submit(official, *, doi: str, pmid: str) -> dict:
                 "text_url": proof.text_url, "sha256": proof.sha256,
                 "content_b64": b64encode(proof.raw).decode("ascii"),
                 "metadata_b64": b64encode(metadata).decode("ascii")}
-        body = json.dumps({"spec": spec, "scope_ref": scope, "idempotency_key": key}, ensure_ascii=False,
+        body = json.dumps({"spec": spec, "idempotency_key": key}, ensure_ascii=False,
                           separators=(",", ":")).encode("utf-8")
         if len(body) > MAX_INGEST_BODY_BYTES:
             return {"status": "not_run", "reason": "selfcorpus_request_too_large"}
         headers = {"Accept": "application/json", "Accept-Encoding": "identity", "Content-Type": "application/json"}
-        headers.update(signed_headers(secret, "POST", INGEST_TARGET, body, actor))
+        headers.update(signed_headers(secret, "POST", _VERIFIED_SHARED_TARGET, body, actor))
         raise_if_cancelled("selfcorpus_intake_enqueue")
         if _principal() != principal:
             return {"status": "not_run", "reason": "selfcorpus_intake_not_authorized"}
-        http_status, data = asyncio.run(wire._post(origin, body, headers, route=INGEST_TARGET, accepted=(202, 409),
-                                                   deadline=4.0, response_limit=64 * 1024, include_status=True))
+        http_status, data = asyncio.run(wire._post(origin, body, headers, route=_VERIFIED_SHARED_TARGET,
+                                                   accepted=(202, 409), deadline=4.0,
+                                                   response_limit=64 * 1024, include_status=True))
         raise_if_cancelled("selfcorpus_intake_complete")
         if _principal() != principal:
             return {"status": "unavailable", "reason": "selfcorpus_intake_access_changed"}
-        result = _receipt(http_status, data, scope)
+        result = _receipt(http_status, data, "shared")
     except wire.SearchUnavailable as exc:
         result = {"status": "unavailable", "reason": str(exc)}
     except (ImportError, sqlite3.Error, UnicodeError):

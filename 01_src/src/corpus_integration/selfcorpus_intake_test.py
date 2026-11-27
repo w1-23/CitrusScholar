@@ -28,6 +28,7 @@ _META = json.dumps({"doi": _DOI, "pmid": 7, "pmcid": "PMC123", "version": 1,
                     }).encode()
 _SECRET = b"synthetic-selfcorpus-test-key-only-42"
 _REF = "req_" + "a" * 32
+_TARGET = "/api/v1/ingestion/verified-shared"
 
 
 @pytest.fixture
@@ -76,23 +77,23 @@ def _official(raw=_RAW):
     return {"url": pmc._BASE + _TEXT_PATH, "raw_bytes": raw, "metadata_raw": _META}, "cc-by", pmc._BASE + _META_PATH
 
 
-def _queued(scope="personal:42"):
+def _queued(scope="shared"):
     return {"scope_ref": scope, "request_ref": _REF, "operation_id": _REF, "status": "queued",
             "output": {"private": "not projected"}}
 
 
-def test_only_exact_signed_personal_proof_and_stable_doi_idempotency(monkeypatch, fixture):
-    from corpus.auth import INGEST_TARGET, verify_signed_actor
+def test_only_exact_signed_public_proof_and_stable_doi_idempotency(monkeypatch, fixture):
+    from corpus.auth import verify_signed_actor
 
     requests = []
 
     def respond(request):
-        assert request.url.host == "127.0.0.1" and request.url.path == INGEST_TARGET
+        assert request.url.host == "127.0.0.1" and request.url.path == _TARGET
         assert request.method == "POST"
-        owner = verify_signed_actor(_SECRET, "POST", INGEST_TARGET, request.content, request.headers)
-        assert owner.subject == "42" and not owner.shared and not owner.governor and not owner.projects
+        owner = verify_signed_actor(_SECRET, "POST", _TARGET, request.content, request.headers)
+        assert owner.subject == "42" and owner.shared and not owner.governor and not owner.projects
         payload = json.loads(request.content)
-        assert payload["scope_ref"] == "personal:42"
+        assert set(payload) == {"spec", "idempotency_key"}
         spec = payload["spec"]
         assert spec == {"kind": "verified_text", "doi": _DOI, "pmid": "7", "pmcid": "PMC123",
                         "title": "Verified source", "license_id": "cc-by", "sha256": sha256(_RAW).hexdigest(),
@@ -197,7 +198,7 @@ def test_fast_vendor_leaves_short_grace_for_inflight_official_proof(monkeypatch,
     if official_finishes:
         assert "Verified PMC Cloud source" in message
         assert artifact["corpus_intake"] == {"status": "queued", "request_ref": _REF}
-        assert calls.count(_TEXT_PATH) == calls.count("/api/v1/ingestion/requests") == 1
+        assert calls.count(_TEXT_PATH) == calls.count(_TARGET) == 1
     else:
         assert "Vendor-rendered evidence" in message
         assert artifact["corpus_intake"] == {"status": "not_run", "reason": "selfcorpus_verified_source_required"}

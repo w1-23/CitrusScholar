@@ -254,7 +254,7 @@ def command(config, role):
         if methods_only and role == 'web' and (skill_release / 'host-python').is_dir():
             python_path.insert(0, f'{skill_release}/host-python')
     historical = config.get('historical_skill_releases', [])
-    if not isinstance(historical, list) or len(historical) > 32:
+    if not isinstance(historical, list) or len(historical) > 64:
         raise ValueError('Invalid historical Skill release registry')
     if role == 'web':
         used = {Path(path) for path, _mode in binds}

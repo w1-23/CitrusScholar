@@ -151,7 +151,7 @@ class ReleaseGateTest(unittest.TestCase):
         rows = gate.history(config)
         self.assertEqual(rows[:-1], config['historical_skill_releases'])
         self.assertEqual(rows[-1]['mount_path'], config['skill_release'])
-        config['historical_skill_releases'] *= 2
+        config['historical_skill_releases'] *= 4
         with self.assertRaisesRegex(ValueError, 'Too many historical releases'):
             gate.history(config)
 

@@ -8,7 +8,7 @@ from src.graph.intent_text import mask_literal_payload
 _RANGE = re.compile(r"(?<![\w$])\$?[A-Za-z]{1,3}\$?[1-9]\d{0,6}\s*:\s*\$?[A-Za-z]{1,3}\$?[1-9]\d{0,6}(?!\w)")
 _NARROW = re.compile(r"(?:(?:仅|只)(?:检查|审查|核查|看|读取)?[^，。！？\n]{0,48}(?:表|区|行|列)|"
                      r"\b(?:sheet\s*\d+|worksheet\s+['\"`]?[\w-]+|(?:rows?|columns?)\s+\d+|"
-                     r"only\b[^,;.!?\n]{0,48}(?:sheet|range|rows?|columns?))|"
+                     r"only\s+(?:(?:audit|read|scan|inspect|check|use)\s+)?(?:the\s+)?(?:selected\s+|specified\s+)?(?:sheet\b|range\b|(?:rows?|columns?)\s+\d+))|"
                      r"第\s*\d+\s*(?:张表|行|列)|工作表\s*[:：]|(?:工作表|sheet)\s+[A-Za-z0-9_]|(?:工作表|sheet)\s*[`'\"])", re.I)
 _NEGATIVE = re.compile(r"排除|除外|不(?:要|检查|审查|核查|读取|使用)|示例|例如|候选|还是|"
                        r"\b(?:not|exclude|except|example|candidate|or)\b", re.I)

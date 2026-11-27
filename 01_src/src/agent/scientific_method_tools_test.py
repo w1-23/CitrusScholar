@@ -41,6 +41,9 @@ def test_explicit_coordinates_or_sheet_are_never_replaced_by_default():
     assert exact.sheet == 'data' and exact.bounds == 'A1:C52'
     assert authorized_scope({'sheet': 'data'}, '仅审查工作表 data').bounds is None
     assert authorized_scope(None, '审查一下这个数据表') is None
+    assert authorized_scope(None, 'Report only missing cells and exact duplicate rows, with source locations.') is None
+    with pytest.raises(ValueError):
+        authorized_scope(None, 'Audit only rows 3 to 8')
 
 
 def test_delivery_outputs_one_verified_asset_and_one_render():

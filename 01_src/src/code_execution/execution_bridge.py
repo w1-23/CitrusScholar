@@ -36,7 +36,7 @@ from .native_execute_wrapper import (
     MANIFEST_SCHEMA, MARKER, MAX_RETURNED_FILES, MAX_TRANSFER_BYTES,
     MAX_TRANSFER_FILE_BYTES, build_wrapper, parse_marker, strip_marker,
 )
-from .protocol import ExecutionLimits, TERMINAL, logical_path
+from .protocol import ExecutionLimits, ExecutionRequest, TERMINAL, identifier, logical_path
 
 __all__ = ["ExecuteResult", "MAX_COMMAND_BYTES", "build_wrapper", "effective_timeout",
            "enabled", "execute", "identify", "parse_marker", "sandbox_ready"]
@@ -326,6 +326,7 @@ def _prepare(identity, service, view, command, timeout, nonce, run_token):
         "task_id": task_id,
         "revision": result["revision"],
         "script_path": script_path,
+        "script_ref": (record["file_id"], record["sha256"]),
         "manifest_path": manifest_path,
         "inputs": tuple(path for path in bound + bound_inputs if path != script_path),
         "refs": refs,
@@ -333,11 +334,12 @@ def _prepare(identity, service, view, command, timeout, nonce, run_token):
     }
 
 
-def _accepted_manifest(service, status, prepared):
+def _accepted_manifest(service, status, prepared, fingerprint):
     """Read the accepted manifest bytes through the existing workspace contract."""
     receipt = status.get("receipt")
     if (not isinstance(receipt, dict) or receipt.get("execution_id") != status["execution_id"]
             or receipt.get("fence") != status.get("fence")
+            or fingerprint is not None and receipt.get("request_fingerprint") != fingerprint
             or type(receipt.get("files")) is not list):
         raise LookupError("execute_receipt_unavailable")
     matches = [item for item in receipt["files"]
@@ -462,7 +464,37 @@ def _wait(service, execution_id, budget):
         time.sleep(POLL_INTERVAL_SEC)
 
 
-def execute(owner, session, run_id, command, *, timeout=None, service=None, view=None):
+def _find_accepted_submission(service, identity, submit, script_ref, input_refs):
+    """Observe an exact committed Worker request after a lost submit response."""
+    from src.core.account_leases import account_lease
+
+    with account_lease(identity.owner_user_id) as lease:
+        row = service.repository.find_submission(owner=identity.owner_user_id, session=identity.session_id,
+            workspace_id=submit["workspace_id"], operation_id=submit["operation_id"],
+            idempotency_key=submit["idempotency_key"])
+        if row is None:
+            return None
+        request = ExecutionRequest.parse(row["request"])
+        deadline = submit["absolute_deadline"]
+        expected_inputs = tuple((path, input_refs[path]["file_id"], input_refs[path]["sha256"])
+                                for path in submit["inputs"])
+        exact = (request.identity == identity and request.account_epoch == lease.epoch
+            and request.workspace_id == submit["workspace_id"] and request.task_id == submit["task_id"]
+            and request.operation_id == submit["operation_id"] and request.idempotency_key == submit["idempotency_key"]
+            and request.workspace_revision == submit["expected_revision"]
+            and request.script.path == submit["script_path"]
+            and (request.script.file_id, request.script.sha256) == script_ref
+            and tuple((ref.path, ref.file_id, ref.sha256) for ref in request.inputs) == expected_inputs
+            and request.outputs == submit["outputs"] and request.limits == submit["limits"]
+            and request.network_policy == "offline" and not request.arguments
+            and (request.environment_id, request.environment_revision) == ("base", 1)
+            and row["fingerprint"] == request.fingerprint
+            and row["run_deadline"] == (0.0 if deadline is None or deadline == math.inf else deadline))
+        return row if exact else None
+
+
+def execute(owner, session, run_id, command, *, timeout=None, service=None, view=None,
+            host_operation=None, on_accept=None):
     """Run one command in the offline Worker and return its bounded result."""
     if not enabled():
         return _not_run("code_execution_disabled")
@@ -504,7 +536,19 @@ def execute(owner, session, run_id, command, *, timeout=None, service=None, view
     except ValueError as exc:
         return _not_run(_reason(exc))
 
-    run_token, nonce = uuid.uuid4().hex, uuid.uuid4().hex
+    # SDK calls are already fenced by the host operation ledger. The opaque
+    # ledger id supplies this call's Worker identity, not its command text.
+    try:
+        if host_operation is None:
+            run_token = uuid.uuid4().hex  # Non-SDK internal callers have no paired host operation.
+        else:
+            host_identity, operation_id = host_operation
+            if host_identity != identity:
+                return _not_run("execution_scope_unavailable")
+            run_token = identifier(operation_id)
+    except ValueError:
+        return _not_run("execution_scope_unavailable")
+    nonce = uuid.uuid4().hex
     try:
         prepared = _prepare(identity, service, view, command, budget, nonce, run_token)
     except Exception as exc:
@@ -522,24 +566,28 @@ def execute(owner, session, run_id, command, *, timeout=None, service=None, view
         return _not_run("execution_scope_unavailable")
     if deadline is not None and deadline - time.time() < MIN_TIMEOUT_SEC + ACCEPTANCE_HEADROOM_SEC:
         return _not_run("execute_run_deadline_exhausted")
+    key = "exec_" + run_token
+    submit = dict(task_id=prepared["task_id"], workspace_id=prepared["workspace_id"],
+        expected_revision=prepared["revision"], script_path=prepared["script_path"],
+        inputs=prepared["inputs"], outputs=(prepared["manifest_path"],), operation_id=key,
+        idempotency_key=key, limits=ExecutionLimits(timeout_sec=sandbox_budget),
+        network_policy="offline", absolute_deadline=deadline)
     try:
-        # submit may raise after committing a queue row. An exception is no
-        # longer evidence that a command was never dispatched.
-        row = service.submit(task_id=prepared["task_id"],
-                             workspace_id=prepared["workspace_id"],
-                             expected_revision=prepared["revision"],
-                             script_path=prepared["script_path"],
-                             inputs=prepared["inputs"],
-                             outputs=(prepared["manifest_path"],),
-                             operation_id="exec_" + run_token,
-                             idempotency_key="exec_" + run_token,
-                             limits=ExecutionLimits(timeout_sec=sandbox_budget),
-                             network_policy="offline", absolute_deadline=deadline)
+        row = service.submit(**submit)
     except Exception as exc:
-        return _unconfirmed("submission_unconfirmed", _reason(exc))
+        # A queue commit can precede an exception. Lookup is read-only and
+        # a missing/mismatched row never authorizes another submit.
+        try:
+            row = _find_accepted_submission(service, identity, submit, prepared["script_ref"], prepared["refs"])
+        except Exception:
+            row = None
+        if row is None:
+            return _unconfirmed("submission_unconfirmed", _reason(exc))
 
     try:
-        execution_id = row["execution_id"]
+        execution_id = identifier(row["execution_id"])
+        if on_accept is not None:
+            on_accept(execution_id)
         status, expired = _wait(service, execution_id, sandbox_budget)
     except Exception as exc:
         return _unconfirmed("status_unavailable", _reason(exc))
@@ -565,7 +613,7 @@ def execute(owner, session, run_id, command, *, timeout=None, service=None, view
     files, rejected, dropped, manifest = [], [], [], {}
     if state == "succeeded":
         try:
-            raw = _accepted_manifest(service, status, prepared)
+            raw = _accepted_manifest(service, status, prepared, row.get("fingerprint"))
             files, rejected, dropped, manifest = _manifest_files(
                 raw, nonce=nonce, manifest_path=prepared["manifest_path"],
                 script_path=prepared["script_path"])

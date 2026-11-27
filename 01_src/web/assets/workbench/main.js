@@ -1,6 +1,6 @@
 import { byId, element } from './dom.js';
-import { renderInspector, renderTree } from './controls.js?v=5';
-import { CanvasView, imageAsset } from './canvas.js?v=6';
+import { renderInspector, renderTree } from './controls.js?v=6';
+import { CanvasView, imageAsset, untilAborted } from './canvas.js?v=7';
 import { hexDigest } from './sha256.js?v=1';
 import { initializeLibrary } from './library.js?v=4';
 import { legacyEditorUrl, sessionReturnUrl } from './navigation.js?v=2';
@@ -8,7 +8,8 @@ import { categoryValues, displayGroups } from './categories.js?v=1';
 
 const api = '/api/v2/figure-workbench';
 const state = { project: null, groups: [], selected: null, expanded: new Set(), snapshots: [[]], cursor: 0,
-  epoch: 0, draft: 0, timer: null, flight: null, saving: false, previewOk: true, conflict: false };
+  epoch: 0, draft: 0, timer: null, flight: null, previewWork: null, saving: false, previewOk: true, conflict: false };
+const TREE_STYLES = new Set(['label', 'facecolor', 'color', 'edgecolor', 'linestyle', 'visible']);
 const starting = new URLSearchParams(location.search);
 const path = (id) => `${api}/projects/${encodeURIComponent(id)}`;
 const revisionUrl = (project, suffix = '') => `${path(project.figure_id)}${suffix}?revision=${project.render_version}`;
@@ -26,8 +27,18 @@ const canvas = new CanvasView((id, reveal = true) => { showSideTab('objects'); s
     return applyChanges([{ group_id: id, property: 'offset_px', value }]);
   });
 
-async function request(url, init = {}) {
-  const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', ...init });
+async function request(url, init = {}, previewSignal) {
+  // The preview routes return a complete render before sending headers.
+  // Only connect cancellation after the worker has returned. This lets us
+  // discard a stale body without starting another worker render in parallel.
+  const delivery = previewSignal && new AbortController();
+  const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', ...init,
+    ...(delivery ? { signal: delivery.signal } : {}) });
+  if (previewSignal?.aborted) {
+    delivery.abort();
+    previewSignal.throwIfAborted();
+  }
+  previewSignal?.addEventListener('abort', () => delivery.abort(), { once: true });
   if (response.ok) return response;
   const payload = await response.json().catch(() => ({}));
   const detail = payload.detail;
@@ -97,7 +108,7 @@ function selectGroup(id, focus, reveal) {
   const showMobileProperties = reveal && matchMedia('(max-width: 920px)').matches;
   if (showMobileProperties) openDrawer('right', true);
   renderGroups(focus && !showMobileProperties);
-  renderProperties();
+  if (changedGroup) renderProperties();
   if (changedGroup || showMobileProperties) byId('inspector').scrollTop = 0;
   if (showMobileProperties) byId('inspectorTitle').focus({ preventScroll: true });
   canvas.focus(id);
@@ -201,12 +212,12 @@ function renderExports() {
   }
 }
 
-async function loadAsset(project) {
+async function loadAsset(project, signal) {
   let error;
   for (const format of ['svg', 'png']) {
     if (project.format_capabilities[format]?.state !== 'ready') continue;
     try {
-      const response = await request(revisionUrl(project, `/preview/${format}`));
+      const response = await request(revisionUrl(project, `/preview/${format}`), {}, signal);
       const mime = format === 'svg' ? 'image/svg+xml' : 'image/png';
       if (response.headers.get('X-Figure-Revision') !== String(project.render_version) ||
           !/^[a-f0-9]{64}$/.test(response.headers.get('X-Figure-SHA256') || '') ||
@@ -217,10 +228,13 @@ async function loadAsset(project) {
       if (format === 'svg' && project.object_contract?.renderKey && project.object_contract.renderKey !== digest) {
         throw new Error('预览与对象清单的渲染摘要不一致。');
       }
-      const asset = await imageAsset(response, format, digest);
+      const asset = await imageAsset(response, format, digest, signal);
       if (error) asset.warning = `${error.message} 已显示此版本的 ${format.toUpperCase()}。`;
       return asset;
-    } catch (failure) { error = failure; }
+    } catch (failure) {
+      signal?.throwIfAborted();
+      error = failure;
+    }
   }
   throw error || new Error(project.format_capabilities.svg?.reason || project.read_only_reason || '图件没有可读取的 SVG 或 PNG 预览。');
 }
@@ -232,6 +246,7 @@ function clearPreviewTimer() {
 
 function activate(project, asset, { preserveFocus = false } = {}) {
   clearPreviewTimer();
+  state.previewWork?.abort();
   state.draft += 1;
   state.epoch += 1;
   state.project = project;
@@ -266,18 +281,25 @@ function applyChanges(entries) {
   if (before.size > 200) { status('最多可以提交 200 项修改。', true); return false; }
   const next = [...before.values()];
   if (JSON.stringify(next) === JSON.stringify(commands())) return false;
+  const previous = commands();
   state.snapshots = [...state.snapshots.slice(0, state.cursor + 1), next];
   state.cursor += 1;
-  updateDraft();
+  updateDraft(previous);
   return true;
 }
 
-function updateDraft() {
+function updateDraft(previous) {
   canvas.finishDrag(null, true);
   state.previewOk = false;
   state.draft += 1;
-  canvas.setOffsets(commands(), state.project);
-  renderGroups();
+  state.previewWork?.abort();
+  const next = commands();
+  canvas.setOffsets(next, state.project);
+  const treeChanged = (from, to) => {
+    const remaining = new Set(to);
+    return from.some((entry) => TREE_STYLES.has(entry.property) && !remaining.has(entry));
+  };
+  if (treeChanged(previous, next) || treeChanged(next, previous)) renderGroups();
   renderProperties();
   renderToolbar();
   clearPreviewTimer();
@@ -298,27 +320,36 @@ async function preview(epoch, draft) {
   if (!current() || state.saving) return;
   const project = state.project;
   const batch = commands();
+  const work = new AbortController();
+  const { signal } = work;
+  state.previewWork = work;
   const flight = (async () => {
+    let asset;
     try {
       let result = project;
-      let asset;
       if (batch.length) {
         const response = await request(editUrl(project, 'preview'), post({ expected_revision: project.render_version,
-          source_sha256: project.source_sha256, draft_revision: draft, commands: batch }));
+          source_sha256: project.source_sha256, draft_revision: draft, commands: batch }), signal);
+        signal.throwIfAborted();
         result = await response.json();
+        signal.throwIfAborted();
         if (result.figure_id !== project.figure_id || result.render_version !== project.render_version ||
             result.source_sha256 !== project.source_sha256 || result.draft_revision !== draft ||
             result.object_contract?.draftRevision !== draft || result.object_contract.revision !== project.render_version ||
             !/^[a-f0-9]{64}$/.test(result.object_contract.renderKey || '')) {
           throw new Error('草稿预览返回了无法确认的版本。');
         }
-        asset = await imageAsset(new Response(new Blob([result.svg], { type: 'image/svg+xml' })), 'svg', result.object_contract.renderKey);
-      } else asset = await loadAsset(project);
-      await canvas.idle;
-      if (!current()) { URL.revokeObjectURL(asset.url); return; }
-      state.previewOk = true;
+        await untilAborted(canvas.idle, signal);
+        signal.throwIfAborted();
+        asset = await imageAsset(new Response(new Blob([result.svg], { type: 'image/svg+xml' })),
+          'svg', result.object_contract.renderKey, signal);
+      } else asset = await loadAsset(project, signal);
+      await untilAborted(canvas.idle, signal);
+      if (!current()) return;
       canvas.show(asset, result);
+      asset = null; // Canvas owns the object URL from this point on.
       canvas.focus(state.selected);
+      state.previewOk = true;
       status(batch.length ? '草稿预览已更新。' : '已恢复保存的图件。');
     } catch (error) {
       if (current()) {
@@ -326,6 +357,8 @@ async function preview(epoch, draft) {
         status(`预览失败，草稿仍在本页。${error.message}`, true);
       }
     } finally {
+      if (asset) URL.revokeObjectURL(asset.url);
+      if (state.previewWork === work) state.previewWork = null;
       if (current()) renderToolbar();
     }
   })();
@@ -417,8 +450,9 @@ for (const [button, side] of [['toggleGroups', 'left'], ['toggleInspector', 'rig
 for (const [id, offset] of [['undo', -1], ['redo', 1]]) {
   byId(id).addEventListener('click', () => {
     if (byId(id).disabled) return;
+    const previous = commands();
     state.cursor += offset;
-    updateDraft();
+    updateDraft(previous);
   });
 }
 byId('save').addEventListener('click', save);

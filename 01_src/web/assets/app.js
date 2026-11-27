@@ -3498,7 +3498,8 @@ function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
   var settled = false, activeMilestone = '', progressSeq = 0;
   var panel = document.createElement('div'); panel.className = 'research-process';
-  var body = document.createElement('div'); body.className = 'research-process-body'; panel.appendChild(body);
+  var body = document.createElement('div'); body.className = 'research-process-body';
+  body.setAttribute('role', 'group'); body.setAttribute('aria-label', '公开执行说明'); panel.appendChild(body);
   var label = document.createElement('span'); label.className = 'research-task-status';
   label.setAttribute('role', 'status'); label.setAttribute('aria-live', 'polite');
   var line = document.createElement('div'); line.className = 'research-task-line';
@@ -3631,6 +3632,7 @@ function createResearchProcessPanel(goal) {
   function receive(type, data) {
     data = data || {};
     if (data.internal === true || data.private === true || data.is_draft === true || data.draft === true || ['private', 'internal'].indexOf(data.visibility) >= 0) return;
+    if (type !== 'job' && knownJobId && data.job_id && data.job_id !== knownJobId) return;
     receiveNativeStreamEvent(type, data);
     var savedResolutions = (data.turn_envelope || data.terminal_snapshot || data).tool_resolutions;
     if (Array.isArray(savedResolutions)) view.resolution({resolutions: savedResolutions});
@@ -6077,6 +6079,15 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
   var epoch = authEpoch, sid = sessionId, round = currentRoundId, armed = false, streamedAnswer = '', closed = false;
   var binding = null, entry = turn.queueEntry, unwatchQueue = null, observed = '', queueStatus, disconnected = false;
   var hasSavedAnswer = !!String(turn.answer && turn.answer.content || '').trim(), finalAnswerReceived = false;
+  var answerRenderPending = false;
+  function renderStreamedAnswer() {
+    if (answerRenderPending || hasSavedAnswer || finalAnswerReceived) return;
+    answerRenderPending = true;
+    requestAnimationFrame(function () {
+      answerRenderPending = false;
+      if (owns() && !hasSavedAnswer && !finalAnswerReceived) answer.innerHTML = renderMarkdownSafe(streamedAnswer);
+    });
+  }
   var citationContainer = content.querySelector('.turn-citation-bubbles');
   function syncWaiting() {
     process.syncTask(store.state, entry, {hasAnswer: hasSavedAnswer || !!streamedAnswer.trim(),
@@ -6161,16 +6172,16 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       if (type === 'answer_start') armed = true;
       if (type === 'text' && armed && data.delivery === 'committed' && typeof data.content === 'string') {
         streamedAnswer += data.content;
-        if (!hasSavedAnswer) answer.innerHTML = renderMarkdownSafe(streamedAnswer);
+        renderStreamedAnswer();
       }
       if (type === 'text_reset') {
         armed = false; streamedAnswer = '';
         if (!hasSavedAnswer) answer.replaceChildren();
       }
     }
-    if ((type === 'done' || type === 'error') && data.answer) {
-      answer.innerHTML = renderMarkdownSafe(data.answer);
-      if (String(data.answer).trim()) process.answerVisible();
+    if (type === 'done' || type === 'error') {
+      var text = data.answer || (!hasSavedAnswer && CitrusTaskState.displayStatus(data) && streamedAnswer);
+      if (text) { answer.innerHTML = renderMarkdownSafe(text); process.answerVisible(); }
     }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
       renderTurnTimings(content, data);

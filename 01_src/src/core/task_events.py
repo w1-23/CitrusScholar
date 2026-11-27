@@ -816,7 +816,13 @@ async def run_model_attempt(model, messages, invoke, *, purpose="supervisor", ou
         attempt_id = reserve_attempt(get_job_id(), purpose, estimate["estimated_total_tokens"],
                                      finalization_tokens=finalization_tokens)
     except TaskConflict as exc:
-        publish_context(status="not_admitted", error=str(exc))
+        reason = str(exc)
+        code = reason.split(" (", 1)[0]
+        # Budget exceptions may append counters for internal callers. Keep the
+        # typed reason in the public diagnostic, where prose is not admitted.
+        if code in {"model_budget_exhausted:calls", "model_budget_exhausted:tokens"}:
+            reason = code
+        publish_context(status="not_admitted", error=reason)
         raise
     scope["attempt_id"] = attempt_id or uuid.uuid4().hex
     scope["reservation_id"] = attempt_id

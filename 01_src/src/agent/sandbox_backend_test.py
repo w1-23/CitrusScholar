@@ -395,3 +395,144 @@ def test_the_graph_registers_execute_only_with_the_sandbox_backend(scope):
                             tools=["read_file", "ls", "execute"])
     middleware = FilesystemMiddleware(backend=composite, tools=["read_file", "ls", "execute"])
     assert "execute" in {tool.name for tool in middleware.tools}
+
+
+@pytest.mark.parametrize("scenario", ["lost_submit_response", "missing_lookup", "wrong_scope", "wrong_command",
+                                       "wrong_config", "wrong_epoch", "lookup_error", "lost_status", "lost_sdk_reply"])
+def test_native_execute_disconnect_uses_only_the_exact_original_worker_row(scope, worker, tmp_path, monkeypatch, scenario):
+    """Real host/Worker SQLite reservations, with a synthetic fenced terminal worker."""
+    import asyncio
+    from dataclasses import replace
+    from unittest.mock import Mock
+
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    from src.agent.native_execute_receipt import dispatch_once
+    from src.agent.runtime import AdmissionStopped
+    from src.code_execution.protocol import ExecutionRequest
+    from src.code_execution.repository import ExecutionRepository
+    from src.code_execution.service import ExecutionService
+
+    repo = ExecutionRepository(tmp_path / "queue.sqlite3")
+    engine = ExecutionService(scope, repository=repo)
+    synthetic = worker(files=[("/outputs/recovered.txt", b"accepted once\n")])
+    original_submit, original_status, original_find = engine.submit, engine.status, repo.find_submission
+    command = "echo TEST-NATIVE-DISCONNECT"
+    accepted = None
+    submitted_args = None
+
+    def submit(**kwargs):
+        nonlocal accepted, submitted_args
+        submitted_args = kwargs
+        if scenario == "missing_lookup":
+            raise OSError("submission response lost with no visible row")
+        accepted = original_submit(**kwargs)
+        raise OSError("accepted response disconnected")
+
+    def find(**kwargs):
+        if accepted is None:
+            return original_find(**kwargs)
+        if scenario == "lookup_error":
+            raise OSError("lookup unavailable")
+        row = original_find(**kwargs)
+        if scenario not in {"wrong_scope", "wrong_command", "wrong_config", "wrong_epoch"}:
+            return row
+        request = ExecutionRequest.parse(row["request"])
+        if scenario == "wrong_scope":
+            fake = replace(request, identity=replace(scope, user_turn_id="another-turn"))
+        elif scenario == "wrong_command":
+            fake = replace(request, script=replace(request.script, sha256="f" * 64))
+        elif scenario == "wrong_config":
+            fake = replace(request, limits=replace(request.limits, timeout_sec=request.limits.timeout_sec + 1))
+        else:
+            fake = replace(request, account_epoch=request.account_epoch + 1)
+        return {**row, "request": fake.serialize(), "fingerprint": fake.fingerprint}
+
+    def worker_completes(execution_id):
+        # Our first status read simulates the independently scheduled Worker
+        # accepting the same run. No command or local shell is started here.
+        current = repo.get(execution_id, owner=OWNER, session=SESSION)
+        if current["status"] == "queued":
+            claimed = repo.claim("fixture-worker")
+            assert claimed["execution_id"] == execution_id
+            fence = claimed["fence"]
+            for phase in ("running", "collecting"):
+                repo.transition(execution_id, "fixture-worker", fence, phase)
+            request = ExecutionRequest.parse(claimed["request"])
+            wrapper = synthetic._wrapper(request.workspace_id, request.script.path)
+            assert wrapper["COMMAND"] == command
+            synthetic._accept(request.workspace_id, request.outputs[0], wrapper)
+            receipt = {**synthetic.receipt, "execution_id": execution_id, "fence": fence,
+                       "request_fingerprint": request.fingerprint}
+            repo.finish(execution_id, "fixture-worker", fence, status="succeeded", receipt=receipt,
+                        process_stopped=True)
+        return original_status(execution_id)
+
+    def status(execution_id):
+        if scenario == "lost_status":
+            raise OSError("accepted status unavailable")
+        return worker_completes(execution_id)
+
+    submit_spy, find_spy, status_spy = Mock(side_effect=submit), Mock(side_effect=find), Mock(side_effect=status)
+    monkeypatch.setattr(engine, "submit", submit_spy)
+    monkeypatch.setattr(engine, "status", status_spy)
+    monkeypatch.setattr(engine, "read_log", synthetic.read_log)
+    monkeypatch.setattr(repo, "find_submission", find_spy)
+    monkeypatch.setattr("src.code_execution.service.ExecutionService", lambda _identity: engine)
+    monkeypatch.setattr(execution_bridge, "sandbox_ready", lambda: True)
+    tool = next(tool for tool in FilesystemMiddleware(backend=backend_for(scope)).tools if tool.name == "execute")
+    call = {"id": "native-disconnection", "args": {"command": command, "timeout": 15}}
+
+    async def invoke():
+        message = await tool.coroutine(**call["args"], runtime=SimpleNamespace(tool_call_id=call["id"]))
+        if scenario == "lost_sdk_reply":
+            raise OSError("lost SDK acknowledgment")
+        return message
+
+    async def run():
+        response = await dispatch_once(scope, call, invoke)
+        # Even a later readiness failure does not convert the original call
+        # into a fresh known-not-run result or dispatch a second command.
+        monkeypatch.setattr(execution_bridge, "sandbox_ready", lambda: False)
+        with pytest.raises(AdmissionStopped, match="recovery_requires_reconciliation"):
+            await dispatch_once(scope, call, invoke)
+        return response
+
+    result = asyncio.run(run())
+    op = result.additional_kwargs["operation_id"]
+    key = "exec_" + op
+    assert submitted_args["operation_id"] == submitted_args["idempotency_key"] == key
+    assert submitted_args["script_path"].endswith(f"/{key}.py")
+    submit_spy.assert_called_once()
+    # ExecutionService.submit observes its replay key before inserting; the
+    # bridge itself performs a single lookup after losing the response.
+    expected_calls = 1 if scenario == "missing_lookup" else 2
+    assert find_spy.call_count == expected_calls
+    assert find_spy.call_args.kwargs == {"owner": OWNER, "session": SESSION,
+        "workspace_id": submitted_args["workspace_id"], "operation_id": key, "idempotency_key": key}
+    operation = task_events.operation_result(scope.run_id, op)
+    assert command not in str(operation)
+    outcome = operation["outcome"]
+    seen = repo.run_executions(scope)
+    if scenario == "missing_lookup":
+        assert seen == []
+    else:
+        [row] = seen
+        assert (row["operation"], row["request_key"]) == (key, key)
+    if scenario == "lost_submit_response":
+        assert outcome["status"] == "complete"
+        assert outcome["facts"] == {"worker_execution_id": accepted["execution_id"], "exit_code": 0}
+        assert session_backend(scope).storage.text("/outputs/recovered.txt")[0] == "accepted once\n"
+        assert row["status"] == "succeeded" and row["fence"] == 1
+    else:
+        assert outcome["status"] == "unknown" and not outcome["retryable"]
+        assert result.additional_kwargs["operation_uncertain"] is True
+        if scenario in {"lost_status", "lost_sdk_reply"}:
+            assert outcome["facts"] == {"worker_execution_id": accepted["execution_id"]}
+            later = worker_completes(accepted["execution_id"])
+            assert later["status"] == "succeeded" and later["receipt"]["fence"] == 1
+            assert task_events.operation_result(scope.run_id, op)["outcome"]["status"] == "unknown"
+        else:
+            assert "facts" not in outcome
+            status_spy.assert_not_called()
+    submit_spy.assert_called_once()

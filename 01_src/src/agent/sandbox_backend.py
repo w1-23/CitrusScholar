@@ -86,7 +86,11 @@ class CitrusSandboxBackend(SandboxBackendProtocol):
         owner, session, run_id = self._scope
         evidence = backend_evidence.get()
         if evidence is not None:
-            evidence.entered = True
+            refusal = evidence.enter(owner, session, run_id)
+            if refusal == "execution_scope_unavailable":
+                return ExecuteResponse(output=f"Error: execute not run ({refusal}).")
+            if refusal:
+                return ExecuteResponse(output="The original command's execution status must be checked.")
         try:
             view = _SessionFiles(self._files.storage)
         except Exception:
@@ -94,8 +98,9 @@ class CitrusSandboxBackend(SandboxBackendProtocol):
                 evidence.not_run_reason = "execution_session_unavailable"
             return ExecuteResponse(output="Error: execute not run (execution_session_unavailable).")
         try:
-            result = execution_bridge.execute(owner, session, run_id, command,
-                                              timeout=timeout, view=view)
+            result = execution_bridge.execute(owner, session, run_id, command, timeout=timeout, view=view,
+                host_operation=(evidence.identity, evidence.operation_id) if evidence is not None else None,
+                on_accept=evidence.accept if evidence is not None else None)
         except Exception:  # an unexpected error may have followed submission
             return ExecuteResponse(output="The command's execution status could not be confirmed.")
         if evidence is not None:

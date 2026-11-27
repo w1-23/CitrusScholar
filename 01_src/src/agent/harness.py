@@ -55,6 +55,7 @@ class HarnessState(DeepAgentState):
     # At most one bounded re-ask after a length-truncated model output. Nothing
     # from the truncated response may have been dispatched.
     length_recovery_used: NotRequired[bool]
+    length_recovery_step: NotRequired[int]
     batch_status: NotRequired[str]
     unknown_operations: NotRequired[list[str]]
     execution_waits: NotRequired[list[str]]
@@ -331,6 +332,7 @@ class HarnessRuntime:
                             "host_state": host_snapshot(), "jump_to": "model"}
                 if (adapter.recover_output and not finalizing and invalid == "model_length"
                         and not state.get("length_recovery_used")
+                        and state.get("model_steps", 0) < adapter.limits.max_model_steps
                         and (adapter.can_recover_output() if adapter.can_recover_output else True)):
                     # The provider hit the single-call output cap. Nothing in
                     # this response was dispatched, so withdraw every proposal,
@@ -371,6 +373,7 @@ class HarnessRuntime:
                         "重新生成完整参数或精简的最终答复，不要把截断文本当成已完成结果。"))
                     await event("model_output_rejected", {**state, "stop_reason": invalid}, ids)
                     return {"messages": additions, "length_recovery_used": True,
+                            "length_recovery_step": state.get("model_steps", 0) + 1,
                             "rejected_responses": [*state.get("rejected_responses", []), response],
                             "host_state": host_snapshot(), "jump_to": "model"}
                 if invalid:
@@ -853,7 +856,8 @@ class HarnessRuntime:
                              if message.additional_kwargs.get("context_origin") != "historical_evidence"]
             initial = {"messages": additions, "model_steps": 0, "host_state": host_snapshot(),
                 "executor_id": EXECUTOR_ID, "active_run_id": identity.run_id, "pinned_skills": list(pinned_skills),
-                "skills_metadata": None, "delivery_followup_used": False, "length_recovery_used": False, "operation_signals": None,
+                "skills_metadata": None, "delivery_followup_used": False, "length_recovery_used": False,
+                "length_recovery_step": 0, "operation_signals": None,
                 "unknown_operations": [], "execution_waits": [], "execution_wake": [], "user_input_wake": {}, "batch_status": "",
                 "stop_status": "", "stop_reason": "", "rejected_responses": []}
         await event("run_started", latest)

@@ -21,6 +21,8 @@ from .runtime import AdmissionStopped
 _TEXT_TERMINALS = frozenset({"stop", "end_turn", "stop_sequence"})
 _TOOL_TERMINALS = frozenset({"tool_calls", "tool_use", "function_call"})
 _LENGTH_TERMINALS = frozenset({"length", "max_tokens", "max_output_tokens"})
+_RECOVERY_ADMISSION_LIMITS = frozenset({"context_budget_exhausted", "context_budget_exhausted:tool_observations",
+                                       "model_budget_exhausted:calls", "model_budget_exhausted:tokens"})
 NON_SUCCESS_TERMINALS = frozenset({"content_filter", "error", "unknown", "aborted",
                                   "refusal", "pause_turn", "incomplete"})
 
@@ -243,6 +245,8 @@ class ModelDriver:
         final_messages = [final_system, *view]
         _, final_estimate = model_request(final_model, final_messages)
         model_response = None
+        recovery_step = request.state.get("length_recovery_step")
+        recovering_length = bool(recovery_step and recovery_step == request.state.get("model_steps"))
 
         async def invoke(*, final=False):
             nonlocal model_response
@@ -266,8 +270,11 @@ class ModelDriver:
                     raise asyncio.CancelledError() from error
                 # The SDK can wrap a transport hook error. Only a denial
                 # recorded before transport can switch to the final-only wire.
-                if not final and scope and scope.get("pre_transport_denial") == "model_budget_reserved:finalization":
-                    raise TaskConflict("model_budget_reserved:finalization") from None
+                denied = (scope or {}).get("pre_transport_denial")
+                if not final and denied == "model_budget_reserved:finalization":
+                    raise TaskConflict(denied) from None
+                if recovering_length and denied in _RECOVERY_ADMISSION_LIMITS:
+                    raise AdmissionStopped("model_length") from None
                 raise
             if len(model_response.result) != 1 or not isinstance(model_response.result[0], AIMessage):
                 raise TypeError("model_must_return_ai_message")
@@ -294,6 +301,10 @@ class ModelDriver:
                     usage_session_id=identity.session_id, streaming=True)
         except TaskConflict as error:
             reason = str(error)
+            # The ledger/context event retains the exact denial. A recovery
+            # request that was never sent does not replace the provider stop.
+            if recovering_length and reason.split(" (", 1)[0] in _RECOVERY_ADMISSION_LIMITS:
+                raise AdmissionStopped("model_length") from None
             if (reason == "context_budget_exhausted:tool_observations" or
                     reason == "context_budget_exhausted" and historical_readback is not None):
                 raise AdmissionStopped(reason) from None

@@ -5,24 +5,42 @@ import { hexDigest } from './sha256.js?v=1';
 const MANUAL_MIN = .5, MANUAL_MAX = 2;
 const MOVABLE = new Set(['title', 'xlabel', 'ylabel', 'legend', 'annot', 'colorbar']);
 
-export async function imageAsset(response, format, expectedDigest) {
+export function untilAborted(pending, signal) {
+  if (!signal) return pending;
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    Promise.resolve(pending).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+export async function imageAsset(response, format, expectedDigest, signal) {
+  signal?.throwIfAborted();
   const blob = await response.blob();
-  const asset = { url: URL.createObjectURL(blob), svg: '', digest: null, width: 0, height: 0 };
+  signal?.throwIfAborted();
+  const asset = { url: null, svg: '', digest: null, width: 0, height: 0 };
+  if (expectedDigest) {
+    const bytes = await blob.arrayBuffer();
+    signal?.throwIfAborted();
+    const digest = await hexDigest(bytes);
+    signal?.throwIfAborted();
+    if (digest !== expectedDigest) throw new Error('预览内容与已登记的摘要不一致。');
+    asset.digest = expectedDigest;
+    if (format === 'svg') asset.svg = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  }
+  const image = new Image();
+  asset.url = URL.createObjectURL(blob);
   try {
-    if (expectedDigest) {
-      const bytes = await blob.arrayBuffer();
-      if (await hexDigest(bytes) !== expectedDigest) throw new Error('预览内容与已登记的摘要不一致。');
-      asset.digest = expectedDigest;
-      if (format === 'svg') asset.svg = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    }
-    const image = new Image();
     image.src = asset.url;
-    await image.decode();
+    await untilAborted(image.decode(), signal);
+    signal?.throwIfAborted();
     asset.width = image.naturalWidth;
     asset.height = image.naturalHeight;
     if (!asset.width || !asset.height) throw new Error('图件没有可读取的画布尺寸。');
     return asset;
   } catch (error) {
+    image.removeAttribute('src');
     URL.revokeObjectURL(asset.url);
     throw error;
   }

@@ -40,7 +40,7 @@ BASE = "https://api.deepseek.com/v1"
 OLD_TEXT = {f"old-{i}": f"evidence {i} " + "Z" * 30_300 for i in range(16)}
 
 
-def _chat_stream(calls=(), *, answer="accepted", finish=None, raw_args=None, completion_tokens=10):
+def _chat_stream(calls=(), *, answer="accepted", finish=None, raw_args=None, completion_tokens=10, prompt_tokens=100):
     if calls:
         delta = {"role": "assistant", "reasoning_content": "private tool reasoning",
                  "tool_calls": [{"index": i, "id": cid, "type": "function",
@@ -52,8 +52,8 @@ def _chat_stream(calls=(), *, answer="accepted", finish=None, raw_args=None, com
     rows = [{**chunk, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
             {**chunk, "choices": [{"index": 0, "delta": {},
                                   "finish_reason": finish or ("tool_calls" if calls else "stop")}]},
-            {**chunk, "choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": completion_tokens,
-                                                "total_tokens": 100 + completion_tokens}}]
+            {**chunk, "choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                                                "total_tokens": prompt_tokens + completion_tokens}}]
     return httpx.Response(200, text="".join(f"data: {json.dumps(row)}\n\n" for row in rows) + "data: [DONE]\n\n",
                           headers={"Content-Type": "text/event-stream"})
 
@@ -500,6 +500,51 @@ class NativeSendBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request_context.estimate_request(payload)["output_tokens"] for payload in wire], [4096])
         self.assertFalse(host.records)
         self.assertFalse(result.pending_tool_calls)
+
+    async def test_length_recovery_uses_exact_admission_and_preserves_unsent_stop(self):
+        self.addCleanup(progress_bus.clear_request_queue)
+        for final_calls, max_calls, max_tokens in ((0, 8, 12_000), (1, 2, 100_000)):
+            with self.subTest(final_calls=final_calls):
+                self.sid = await sessions.session_manager.get_or_create_session(None, 7)
+                tracing.set_session_id(self.sid)
+                identity = self.job(max_calls)
+                task_events.init_budget(identity.run_id, float("inf"), max_calls=max_calls,
+                                        max_tokens=max_tokens, final_calls=final_calls)
+                progress_bus.set_request_queue(task_events.DurableEventQueue(identity.run_id))
+                wire = []
+
+                def transport(request):
+                    payload = json.loads(request.content)
+                    wire.append(payload)
+                    if len(wire) == 1:
+                        # With 104 tokens left the cheap hint still allows
+                        # the graph re-ask, but the real estimate must not.
+                        return _chat_stream([("cut", EVIDENCE, {})], finish="length", completion_tokens=4096,
+                                            prompt_tokens=100 if final_calls else 7800)
+                    self.assertEqual(final_calls, 1, "denied recovery must not reach the provider")
+                    self.assertFalse(payload.get("tools"))
+                    self.assertTrue(any(msg.get("tool_call_id") == "cut" for msg in payload["messages"]))
+                    return _chat_stream(answer="Incomplete, no verified results")
+
+                async with httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(transport)),
+                                             trust_env=False) as client:
+                    model = ChatOpenAI(use_responses_api=False, model=PROVIDER, api_key="fixture", base_url=BASE,
+                        max_retries=0, max_tokens=4096, stream_usage=True, http_async_client=client)
+                    result, host = await self.run_turn(model, identity, "finish what fits", {}, recover_output=True)
+                self.assertEqual((result.status, result.reason),
+                                 ("complete", "answered") if final_calls else ("incomplete", "model_length"))
+                self.assertEqual(len(wire), 1 + final_calls)
+                self.assertFalse(host.messages)
+                self.assertFalse(result.pending_tool_calls)
+                if not final_calls:
+                    snapshot = task_events.latest_context_snapshot(identity.run_id)
+                    self.assertEqual((snapshot["status"], snapshot["attempt_id"]), ("not_admitted", ""))
+                    self.assertEqual(snapshot["error"], "model_budget_exhausted:tokens")
+                    self.assertGreater(snapshot["estimated_total_tokens"], 104)
+                    self.assertTrue(task_events.budget_headroom(identity.run_id))
+                    budget = task_events.projection(identity.run_id)["budget"]
+                    self.assertEqual((budget["calls"], budget["tokens"]), (1, 11_896))
+                jobs.update_job(identity.run_id, status="completed")
 
     async def test_malformed_tool_stream_length_requires_measured_cap_usage(self):
         self.addCleanup(progress_bus.clear_request_queue)

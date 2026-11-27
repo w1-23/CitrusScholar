@@ -182,7 +182,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
   tree.replaceChildren();
   const visible = [];
   const nodes = new Map();
-  function append(parent, key, parentExpanded = true) {
+  function append(parent, key) {
     for (const group of childGroups.get(key) || []) {
       const item = element('li');
       item.setAttribute('role', 'treeitem');
@@ -191,7 +191,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
       item.setAttribute('aria-selected', String(group.id === selected));
       item.tabIndex = group.id === selected ? 0 : -1;
       nodes.set(group.id, item);
-      if (parentExpanded) visible.push(item);
+      visible.push(item);
       const row = element('div', undefined, 'tree-row');
       const branch = childGroups.has(group.id);
       const open = expanded.has(group.id);
@@ -219,7 +219,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
         const list = element('ul');
         list.setAttribute('role', 'group');
         list.hidden = !open;
-        append(list, group.id, parentExpanded && open);
+        if (open) append(list, group.id);
         item.append(list);
       }
       row.addEventListener('click', (event) => {

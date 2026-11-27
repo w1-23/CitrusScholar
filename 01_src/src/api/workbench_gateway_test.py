@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import httpx
@@ -47,3 +45,26 @@ def test_workbench_gateway_binds_issued_cookie_to_host_actor(monkeypatch, tmp_pa
         assert client.get("/workbench/api/v1/session").status_code == 403
         assert seen[-1] == ("/api/v1/session", None)
         assert client.post("/workbench/api/v1/standalone", json={}).status_code == 404
+
+
+def test_new_browser_routes_load_the_real_host_account(monkeypatch):
+    from fastapi import Request
+    from src.api import main
+    from src import auth
+
+    monkeypatch.setenv("CITRUS_WORKBENCH_BRIDGE_ENABLED", "1")
+    monkeypatch.setattr(auth, "user_for_token_readonly", lambda token: {"user_id": 59} if token == "example" else None)
+    app = FastAPI()
+    app.middleware("http")(main.account_auth_guard)
+
+    def expected(request: Request):
+        return main.current_user(request)
+
+    for path in ("/figures", "/workbench/workbench/", "/workbench/api/v1/session"):
+        app.add_api_route(path, expected)
+    with TestClient(app) as client:
+        for path in ("/figures", "/workbench/workbench/", "/workbench/api/v1/session"):
+            assert client.get(path).status_code == 401
+        client.cookies.set("citrus_auth", "example")
+        for path in ("/figures", "/workbench/workbench/", "/workbench/api/v1/session"):
+            assert client.get(path).json() == {"user_id": 59}

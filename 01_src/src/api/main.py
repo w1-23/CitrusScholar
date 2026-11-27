@@ -543,8 +543,10 @@ async def account_auth_guard(request: Request, call_next):
             # Cookie-bearing writes must prove same-origin. Logout remains
             # callable so a stale cookie can always be cleared.
             return JSONResponse({"detail": "缺少同源请求校验信息，请刷新页面后重试。"}, status_code=403)
+    workbench_browser = (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+                         and (path == "/figures" or path == "/workbench" or path.startswith("/workbench/")))
     if (path in _ANONYMOUS_AUTH_PATHS or path == "/health"
-            or (not path.startswith("/api/")
+            or (not workbench_browser and not path.startswith("/api/")
                 and not path.startswith(("/jobs/", "/sessions/")))):
         return await call_next(request)
 

@@ -3355,7 +3355,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             # Frames are projected onto the existing public protocol and stored by
             # the durable event queue; this never rebuilds the Agent Loop and a
             # projection failure can only lose progress detail, never the turn.
-            native_stream = NativeStreamProjector(job_id=job_id, run_id=identity.run_id)
+            native_stream = NativeStreamProjector(job_id=job_id, run_id=identity.run_id, model_preview=False)
 
             def emit_native(frames) -> None:
                 for frame in frames or ():
@@ -3366,7 +3366,8 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
                                        type(exc).__name__)
 
             if recovery_cursor or recovery_state:
-                emit_native(native_stream.resume("recovery"))
+                reason = "answer" if initial_state.get("agent_question_resume") else "recovery"
+                emit_native(native_stream.resume(reason))
 
             pending_supervisor_output = None
             graph_stream = graph.astream(initial_state, stream_mode=list(NATIVE_STREAM_MODES),
@@ -4239,7 +4240,7 @@ async def get_operation_result(job_id: str, operation_id: str, request: Request)
         with jobs.read_transaction() as conn:
             _read_owned_job(conn, job_id, owner)
             try:
-                return task_events.operation_result(job_id, operation_id, conn=conn)
+                return task_events.operation_result(job_id, operation_id, allow_pending_receipt=True, conn=conn)
             except task_events.TaskConflict as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
 

@@ -18,7 +18,7 @@ LOCAL_GROUP = _GROUPS["route_local"]
 _REUSE_CUE = re.compile(
     r"(?:上述|前面|刚才|刚刚|这些|其中|前者|后者|该项|该结果|该文献|它|这个结果|"
     r"上一轮|进一步比较|哪个更重要|继续分析|基于以上|据此|从中|"
-    r"the above|these results?|former|latter|it|compare (?:them|these)|which is more)",
+    r"\b(?:the above|these results?|former|latter|it|compare (?:them|these)|which is more)\b)",
     re.I,
 )
 _NEW_RETRIEVAL_CUE = re.compile(
@@ -30,9 +30,10 @@ _NEW_RETRIEVAL_CUE = re.compile(
     re.I,
 )
 _PURE_TRANSFORM = re.compile(
-    r"(?:请)?(?:改写|润色|翻译|概括|总结一下(?:上面|上述)|压缩|扩写|"
-    r"把上面|基于上文|解释一下(?:上面|上述)|计算|换算|"
-    r"rewrite|proofread|translate|summari[sz]e\s+the\s+above|reformat)",
+    r"^\s*(?:(?:请|帮我|请帮我|please)\s*)?"
+    r"(?:改写|润色|翻译|概括|总结一下(?:上面|上述)|压缩|扩写|"
+    r"把上面|解释一下(?:上面|上述)|计算|换算|"
+    r"\b(?:rewrite|proofread|translate|summari[sz]e\s+the\s+above|reformat)\b)",
     re.I,
 )
 _SOCIAL = re.compile(
@@ -211,7 +212,18 @@ def parse_request_constraints(
     intent = _source_intent(q)
     explicit = bool(_REQUIRED.search(intent.action_text))
     audit = bool(_DATA_AUDIT.search(q))
-    pure = bool(_PURE_TRANSFORM.search(q))
+    pure = bool(_PURE_TRANSFORM.search(intent.action_text))
+    if pure:
+        # A second requested action makes this a mixed turn. Payload text
+        # and explicit bans were already removed by the source parser.
+        explicit = explicit or bool(re.search(
+            rf"(?:同时|并且|然后|之后|并|再|另外|\b(?:and|then)\b)\s*{_ACTION}|"
+            r"重新(?:检索|搜索)|补充(?:检索|搜索)|(?:翻译|translate).{0,35}?https?://",
+            intent.action_text, re.I))
+        # Calculations may depend on newly requested values. Do not suppress
+        # optional retrieval when the calculation explicitly requests current data.
+        if re.match(r"^\s*(?:请)?(?:计算|换算)", intent.action_text) and _LATEST.search(intent.action_text):
+            pure = False
 
     if intent.explanation and intent.requested == "auto" and not explicit:
         return RequestConstraints("deny", "none", (), audit, pure, "retrieval_explanation")
@@ -220,6 +232,8 @@ def parse_request_constraints(
     if len(intent.blocked) == 2 or selected_scope in intent.blocked:
         return RequestConstraints("deny", "none", (), audit, pure, "user_denied_retrieval")
     mode = intent.requested
+    if pure and mode == "auto" and not explicit and selected_scope == "auto":
+        return RequestConstraints("deny", "none", (), audit, True, "transformation_from_context")
     if (mode == "auto" and intent.exclusive != "auto" and not explicit
             and selected_scope in {"auto", intent.exclusive}):
         other = next(iter(intent.blocked))
@@ -330,7 +344,13 @@ def decide_retrieval(
         return RetrievalDecision(mode, tuple(groups), history, reason, policy)
 
     constraints = parse_request_constraints(query, scope)
+    from src.graph.intent_text import mask_literal_payload
+    intent_text = mask_literal_payload(q)
+    new_evidence = bool(_NEW_RETRIEVAL_CUE.search(intent_text))
+    reuse = bool(has_history_evidence and recent and _REUSE_CUE.search(intent_text) and not new_evidence)
     if constraints.source_policy == "deny":
+        if constraints.reason_code == "transformation_from_context" and reuse:
+            return decision("reuse", (), recent, constraints.reason_code, "deny")
         return decision("none", (), (), constraints.reason_code, "deny")
     if constraints.source_policy == "required":
         return decision(
@@ -350,13 +370,9 @@ def decide_retrieval(
     if _MEMORY_COMMAND.search(q):
         return decision("none", (), (), "memory_write_only", policy)
 
-    new_evidence = bool(_NEW_RETRIEVAL_CUE.search(q))
-    if has_history_evidence and recent and _REUSE_CUE.search(q) and not new_evidence:
+    if reuse:
         return decision("reuse", (), recent, "recent_evidence_reuse", policy)
 
-    if _PURE_TRANSFORM.search(q):
-        return decision("none", (), (), "transformation_from_context", policy)
-
-    if _LATEST.search(q) or new_evidence:
+    if _LATEST.search(intent_text) or new_evidence:
         return decision("web", reason="time_sensitive_web", policy=policy)
     return decision("auto", reason="automatic_advice", policy=policy)

@@ -3481,18 +3481,7 @@ function publicTaskStage(value) {
   return text.replace(/\s+/g, ' ').slice(0, 600);
 }
 
-/* F-14: provisional model text is opt-in. The default surface shows only
-   lifecycle rows (tool proposals, sub-agent start/end, interrupt, resume) so a
-   streamed fragment is never mistaken for the delivered answer. Enable with
-   ?native_preview=1 or window.CITRUS_NATIVE_PREVIEW = true (or by setting this
-   binding before the first frame is rendered). */
-var NATIVE_STREAM_PREVIEW = (function () {
-  try {
-    if (typeof location !== 'undefined' && location.search &&
-        /(?:^\?|&)native_preview=1(?:&|$)/.test(location.search)) return true;
-    return typeof window !== 'undefined' && window.CITRUS_NATIVE_PREVIEW === true;
-  } catch (_) { return false; }
-}());
+/* Native lifecycle facts are public. Model drafts never reach this panel. */
 
 function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
@@ -3598,12 +3587,12 @@ function createResearchProcessPanel(goal) {
     if (!ownsDetails()) return;
     CitrusTaskCards.renderNativeStream(nativeHost, CitrusTaskCards.nativeStreamModel(
       nativeStream.view(), {toolName: displayToolName, clean: publicTaskStage,
-        preview: NATIVE_STREAM_PREVIEW}));
+        preview: false}));
   }
   function receiveNativeStreamEvent(type, data) {
     if (!nativeStream) return;
     if (['assistant_progress', 'tool_result', 'operation'].indexOf(type) >= 0) {
-      if (type === 'assistant_progress' && data.kind === 'model_preview' && !NATIVE_STREAM_PREVIEW) return;
+      if (type === 'assistant_progress' && ['model_preview', 'tool_proposed'].indexOf(data.kind) >= 0) return;
       if (!nativeStream.receive(type, data)) return;
     } else if (type === 'text' && data && data.delivery === 'committed') {
       if (!nativeStream.commit()) return;
@@ -3662,7 +3651,14 @@ function createResearchProcessPanel(goal) {
       refreshActiveLabel();
     }
     else if (type === 'request_user_input' || type === 'question') label.textContent = '等待你的选择';
-    else if (type === 'assistant_progress') progress(data);
+    else if (type === 'assistant_progress') {
+      if (data.kind === 'tool_proposed' && !settled && (!nativeStream || !nativeStream.state.closed) &&
+          CitrusTaskState.nativeStreamEvent && CitrusTaskState.nativeStreamEvent(data) &&
+          data.run_id === data.job_id) {
+        view.action({job_id: data.job_id, run_id: data.run_id, tool_call_id: data.tool_call_id,
+          tool_name: data.tool_name, seq: data.seq, status: 'proposed'});
+      } else progress(data);
+    }
     else if (type === 'status' && !settled && data.summary && ['preparing_attachments', 'starting', 'waiting_code'].includes(data.stage)) {
       activeMilestone = publicTaskStage(data.summary); refreshActiveLabel();
     }
@@ -3671,7 +3667,8 @@ function createResearchProcessPanel(goal) {
         (data.tool_call_id || data.operation_id || data.logical_key || Array.isArray(data.aliases) && data.aliases.length) &&
         data.internal !== true && ['private', 'internal'].indexOf(data.visibility) < 0) {
       var actionStatus = data.status || (type === 'tool_result' ? (data.is_error ? 'failed' : 'complete') : 'running');
-      view.action(Object.assign({}, data.outcome || {}, data, {status: actionStatus}));
+      view.action(Object.assign({}, data.outcome || {}, data, {status: actionStatus,
+        run_id: data.run_id || data.job_id || knownJobId}));
       refreshActiveLabel();
     }
     // status/plan/thinking/section/context events are never promoted to prose.
@@ -3687,7 +3684,10 @@ function createResearchProcessPanel(goal) {
   }
   return {element: panel, label: label, elapsed: elapsed, body: body,
     receive: receive, terminal: terminal, answerVisible: answerVisible, projection: view.projection,
-    syncTask: syncTask, stopClock: stopClock, readState: readState};
+    resetDetails: function (jobId) {
+      knownJobId = String(jobId || ''); settled = false; progressSeq = 0; activeMilestone = '';
+      view.reset(); view.begin(knownJobId); resetNativeStreamPanel();
+    }, syncTask: syncTask, stopClock: stopClock, readState: readState};
 }
 
 
@@ -3837,6 +3837,10 @@ function restoreTurnGeneratedFiles(content, sid, requestId, producerJobId, data,
   var artifactIds = Array.isArray(data.artifact_ids) ? data.artifact_ids : envelope.artifact_ids;
   if (Array.isArray(artifactIds)) artifactIds = artifactIds.map(String);
   var verifiedFileIds = delivery && delivery.verified_file_ids;
+  if (delivery && delivery.schema_version === 'artifact-delivery/1') {
+    artifactIds = (Array.isArray(delivery.artifacts) ? delivery.artifacts : []).map(function (asset) { return asset.asset_ref; });
+    verifiedFileIds = null;
+  }
   var key = JSON.stringify([producerJobId, artifactIds, verifiedFileIds]);
   if (content._turnFileRead === key) return;
   content._turnFileRead = key;
@@ -3877,10 +3881,17 @@ function appendTurnGeneratedFiles(content, files, headingText) {
   var host = content.closest('.message') || content;
   var ownerSession = content.dataset.sessionId || sessionId;
   var producerRequests = turnFileScopes(content);
+  var deliveryAssets = content._verifiedDeliveryAssets;
+  var inlineLinks = new Set();
+  if (deliveryAssets && content.querySelectorAll) content.querySelectorAll('.turn-answer a[href]').forEach(function (link) {
+    inlineLinks.add(link.getAttribute('href'));
+  });
   // A canonical turn's file references are authoritative. Conflicting metadata
   // is never allowed to move a file into another session or turn.
   files = files.filter(function(file) {
-    return isPublicTurnFile(file) && file.file_id && (!file.source_session_id || String(file.source_session_id) === ownerSession)
+    var asset = deliveryAssets && deliveryAssets.get(String(file.artifact_id || file.file_id || ''));
+    return (!deliveryAssets || (asset && !inlineLinks.has(asset.url))) &&
+      isPublicTurnFile(file) && file.file_id && (!file.source_session_id || String(file.source_session_id) === ownerSession)
       && (!file.turn_request_id || producerRequests.has(String(file.turn_request_id)));
   });
   if (!files.length) return;
@@ -5848,6 +5859,11 @@ function renderArtifactDelivery(container, delivery) {
     node.setAttribute('role', 'status');
     container.appendChild(node);
   }
+  if (delivery && delivery.schema_version === 'artifact-delivery/1') {
+    container._verifiedDeliveryAssets = new Map((Array.isArray(delivery.artifacts) ? delivery.artifacts : []).map(function (asset) {
+      return [String(asset.asset_ref || ''), asset];
+    }));
+  }
   var text = artifactDeliveryText(delivery);
   node.hidden = !text;
   if (!text) { node.replaceChildren(); return node; }
@@ -6300,50 +6316,41 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
 function bindSettledHistoryDetails(turn, content, answer, process) {
   // Persistent preview is sufficient for the initial history viewport.
   // Fetch full public events only if this specific turn is expanded.
-  var sid = sessionId, epoch = authEpoch, controller = null, done = false;
+  var sid = sessionId, epoch = authEpoch, observer = null, done = false;
   var recoveryAnswer = !String(turn.answer && turn.answer.content || "").trim();
   var button = document.createElement('button');
   button.type = 'button'; button.className = 'research-tool-toggle';
   button.textContent = '查看完整过程';
   process.element.appendChild(button);
   function owns() { return epoch === authEpoch && sid === sessionId && chatContainer.contains(content); }
-  historyTaskDisposers.push(function () { if (controller) controller.abort(); });
+  historyTaskDisposers.push(function () { if (observer) observer.stop(); });
   button.onclick = async function () {
-    if (controller || done || !owns()) return;
-    controller = new AbortController(); button.disabled = true;
+    if (observer || done || !owns()) return;
+    button.disabled = true;
     var jobId = (turn.queueEntry || {}).active_child_job_id || turn.jobId;
+    var applying = false;
+    var store = CitrusTaskState.create({onEvent: function (type, data) {
+      if (!applying) { process.resetDetails(jobId); applying = true; }
+      process.receive(type, data);
+      if (type !== 'done' && type !== 'error') return;
+      renderTurnTimings(content, data);
+      if (recoveryAnswer && typeof data.answer === 'string' && data.answer.trim() && isPublicAnswerEvent(data)) {
+        answer.innerHTML = renderMarkdownSafe(data.answer);
+        appendMessageActions(content, 'assistant', data.answer);
+      }
+    }});
+    store.hydrate({job_id: jobId});
+    observer = CitrusTaskTransport.create({store: store, owns: owns, fetch: accountFetch});
     try {
-      var cursor = 0, previous, page;
-      do {
-        previous = cursor;
-        var response = await accountFetch('/jobs/' + encodeURIComponent(jobId) + '/events?after=' + cursor + '&limit=200',
-                                          {signal: controller.signal});
-        if (!response.ok) throw new Error('history_events_unavailable');
-        page = await response.json();
-        if (!owns()) return;
-        if (page.protocol !== 'citrus-task/1' || page.job_id !== jobId || !Array.isArray(page.events)) throw new Error('history_event_identity_mismatch');
-        page.events.forEach(function (event) {
-          if (!Number.isSafeInteger(event.seq) || event.seq <= cursor) return;
-          cursor = event.seq;
-          var type = event.event, data = Object.assign({}, event.data || {}, {seq: event.seq});
-          process.receive(type, data);
-          if ((type === 'done' || type === 'error') && event.seq >= (page.recovery_cursor || 0)) renderTurnTimings(content, data);
-          if (recoveryAnswer && event.seq >= (page.recovery_cursor || 0) && (type === 'done' || type === 'error') && typeof data.answer === 'string' &&
-              data.answer.trim() && isPublicAnswerEvent(data)) {
-            answer.innerHTML = renderMarkdownSafe(data.answer);
-            appendMessageActions(content, 'assistant', data.answer);
-          }
-        });
-        if (page.next_cursor !== cursor || page.has_more && cursor <= previous) throw new Error('history_event_cursor_invalid');
-      } while (page.has_more && owns());
+      await observer.replay(jobId);
       if (!owns()) return;
       process.terminal(turn.displayStatus);
       done = true;
-      button.textContent = cursor ? '完整过程已加载' : '没有更多过程记录';
+      button.textContent = store.state.cursor ? '完整过程已加载' : '没有更多过程记录';
     } catch (_) {
       if (owns()) button.textContent = '过程记录暂不可用，点击重试';
     } finally {
-      controller = null;
+      observer.stop(); observer = null;
       if (owns()) button.disabled = done;
     }
   };

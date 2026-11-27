@@ -122,12 +122,14 @@ async def _run(state, identity, ledger):
                                register_fusion_tools, verified_report_route)
     from src.graph.task_contract import fusion_delivery_for_turn
     from .nature_skill_tools import NATURE_TOOL_NAMES, installed_nature, register_nature_tools
-    external_release = installed_fusion(release, installed_rows)
+    from .scientific_method_tools import TOOL_SCOPES, method_only_deployment, method_only_release
+    methods_only = method_only_release(release, installed_rows)
+    external_release = not method_only_deployment() and installed_fusion(release, installed_rows)
     external_nature = installed_nature(release, installed_rows)
     legacy_receipt_pins = frozenset(os.getenv("CITRUS_PRE_FUSION_INVENTORY_SHA256", "").split())
     legacy_resume = (resume and release is not None and not (release / "fusion").exists()
                      and state["skill_release_inventory_sha256"] in legacy_receipt_pins)
-    external_required = external_fusion_required() and not legacy_resume
+    external_required = method_only_deployment() or (external_fusion_required() and not legacy_resume)
     previous_report_query = ""
     report_routes = {}
 
@@ -197,6 +199,14 @@ async def _run(state, identity, ledger):
         if fusion_retires_legacy_tools(capability) or capability == CAPABILITY_UNAVAILABLE:
             host.allowed_names.difference_update(REPLACED_TOOLS)
         host.allowed_names.update(fusion_names)
+        scientific_candidates = set().union(*TOOL_SCOPES.values())
+        eligible = host.allowed_names & scientific_candidates
+        host.allowed_names.difference_update(scientific_candidates)
+        if methods_only:
+            fusion_capability["notice"] = ""
+            host.allowed_names.update(name for skill in authorized_methods()
+                for name in TOOL_SCOPES.get(skill, ()) if name in eligible
+                and (name != "run_numeric_integrity" or worker_ready))
         if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
             host.allowed_names.update(CODE_TOOL_NAMES)
             if not worker_ready:
@@ -274,6 +284,15 @@ async def _run(state, identity, ledger):
     if fusion_capability.get("notice") and (not method_scope or method_scope & SKILL_IDS):
         prompt += fusion_capability["notice"]
     prompt += "\n" + runtime_capabilities.prompt_fragment()
+    if "prepare_audit_dataset" in allowed:
+        prompt += ("\n数据质量审查先调用 prepare_audit_dataset，再把原样 DatasetRef 交给 audit_prepared_dataset。"
+                   "明确受限时保持用户给定范围，未知结构才澄清。不要用多次表格预览替代冻结引用。")
+    if "run_numeric_integrity" in allowed:
+        prompt += ("\n仅在用户明确请求数值科研诚信检查时，调用 run_numeric_integrity，"
+                   "恢复后用原 execution_id 调用 collect_numeric_integrity。禁用图像检查；受限范围不能改成全表。")
+    if "verify_literature_references" in allowed:
+        prompt += ("\n普通 DOI 或小批题录的核验用 verify_literature_references 一次调用。"
+                   "区分来源不可用、题录冲突和无匹配，不自动生成报告。")
     if method_scope:
         prompt += ("\n本轮科学方法范围：" + ", ".join(sorted(method_scope)) +
             "。仅用本轮工具完成用户目标；已取得足够的正式结果后直接交付，不重复运行或读取已有结果。"
@@ -400,6 +419,7 @@ async def _run(state, identity, ledger):
                 "query": state["query"], "previous_report_query": previous_report_query,
                 "update_version": update_version, "final_review": deepcopy(final_review),
                 "artifact_requirements": deepcopy(requirements),
+                "retrieval_timer": retrieval_ledger.timer_state(),
                 "records": host.records,
                 "main_results": host.main_results, "web_results": host.web_results,
                 "pending_question": host.pending_question, "workbook_confirmation": workbook_confirmation,
@@ -457,6 +477,7 @@ async def _run(state, identity, ledger):
         if final_review and (final_review.get("request_version") != update_version
                 or final_review.get("request_hash") != completion_digest(state["query"])):
             final_review.clear()
+        retrieval_ledger.restore_timer_state(saved.get("retrieval_timer"))
         host.records[:] = saved.get("records", [])
         host.main_results[:] = saved.get("main_results", [])
         host.web_results[:] = saved.get("web_results", [])
@@ -545,6 +566,8 @@ async def _run(state, identity, ledger):
                     additional_kwargs={"execution_dispatched": False},
                     artifact={"_tool_outcome": {"status": "skipped", "reason_code": "duplicate_request"}})
                 return await host.publish(duplicate, ToolExecution(observation), identity), {}
+            if reason := retrieval_ledger.admit(call["name"], call["id"], normalized_args):
+                return await not_run(call, reason), {}
         scope = nullcontext()
         if call["name"] in {"research_workspace", "run_research_figure_script"}:
             from src.research.script_runtime import bind_task_scope, reset_task_scope
@@ -568,6 +591,15 @@ async def _run(state, identity, ledger):
             retrieval_ledger.settle(call["name"], normalized_args, call["id"],
                                     status=record.get("status", ""), reason=record.get("reason", ""),
                                     uncertain=execution.uncertain)
+            if message.additional_kwargs.get("execution_dispatched") and not execution.uncertain:
+                from src.retrieval.evidence_contract import evidence_contract
+                evidence = evidence_contract(call["name"], execution.message.artifact,
+                    provider=str(getattr(settings, "RESOLVED_WEB_SEARCH_PROVIDER", "") or ""),
+                    status=record.get("status", ""), reason=record.get("reason", ""))
+                if evidence is not None:
+                    message.additional_kwargs["retrieval_evidence"] = evidence
+                retrieval_ledger.observe(call["name"], call["id"], execution.message.artifact,
+                    status=record.get("status", ""), reason=record.get("reason", ""), content=execution.message.content)
         return message, {"uncertain": execution.uncertain, "operation_id": execution.operation_id,
                          "pending_question": {"question_id": host.pending_question["id"],
                               "version": host.pending_question["version"]} if execution.pending_question else None,
@@ -587,13 +619,18 @@ async def _run(state, identity, ledger):
             from src.core.progress_bus import emit_progress
             emit_progress('browse_phase', {'phase': 'organizing'})
         public_answer = statement.answer
+        retrieval_summary = retrieval_ledger.summary()
+        if retrieval_summary.get("stop_reasons"):
+            limitations = ", ".join(retrieval_summary["stop_reasons"])
+            public_answer += "\n\n检索已停止补查（" + limitations + "）。结论以已取得的证据为限。"
+            statement = statement.model_copy(update={"answer": public_answer})
         if settings.RESEARCH_ROUTE_NOTICE_ENABLED:
             from .research_routes import dual_source_notice
             notice = dual_source_notice(state["query"], host.records)
             if notice and notice not in public_answer:
                 public_answer += "\n\n" + notice
                 statement = statement.model_copy(update={"answer": public_answer})
-        delivery_gaps, artifact_contract = [], None
+        delivery_gaps, artifact_contract, delivery_manifest = [], None, None
         figure_previews = {}
         if requirements:
             from src.core.turn_outcome import _effective_artifact_records, artifact_goal_evidence
@@ -609,8 +646,13 @@ async def _run(state, identity, ledger):
             artifact_contract = {"schema_version": 1, "request_version": update_version,
                                  "requirements": requirements, "verified_links": verified_links,
                                  "single_render_receipt": True}
-            delivery_links = list(dict.fromkeys(link for goal in goals for link in goal.artifact_links
-                                                if link not in public_answer))
+            from src.research.artifact_delivery import build_delivery, missing_answer_links
+            selected_delivery_links = {link for goal in goals for link in goal.artifact_links}
+            delivery_manifest = await asyncio.to_thread(build_delivery, identity=identity,
+                request_id=host._result_request_id(), rows=effective, messages=host.messages,
+                requirements=requirements, select_links=selected_delivery_links if not delivery_gaps else None,
+                gaps=delivery_gaps, verified=verified)
+            delivery_links = missing_answer_links(delivery_manifest, public_answer)
             if delivery_links:
                 public_answer += "\n\n已核验的交付文件\n" + "\n".join(
                     f"- [下载文件 {index}]({link})" for index, link in enumerate(delivery_links, start=1))
@@ -741,7 +783,7 @@ async def _run(state, identity, ledger):
 
         pending_results = uncollected_skill_results(host.records, calls, host.messages)
         if pending_results:
-            labels = {"data-audit": "数据审查", "literature-verification": "文献核验"}
+            labels = {"data-audit": "数据审查", "literature-verification": "文献核验", "research-integrity": "科研诚信筛查"}
             gap = "本轮已提交" + "、".join(labels[skill] for skill in sorted(pending_results)) + "，尚未取得执行结果。"
             public_answer += "\n\n" + gap
             statement = statement.model_copy(update={"answer": public_answer,
@@ -759,7 +801,8 @@ async def _run(state, identity, ledger):
             artifact_contract=artifact_contract, delivery_gaps=delivery_gaps)
         host.publish_resolutions(outcome)
         final_review.update(phase="accepted", answer=public_answer, outcome=outcome.as_dict(), references=ref_data,
-            request_version=update_version, request_hash=completion_digest(state["query"]))
+            request_version=update_version, request_hash=completion_digest(state["query"]),
+            artifact_delivery=delivery_manifest)
         return FinalCheck()
 
     from .batch_journal import BatchObservationNotStored, RecoveryRequiresReconciliation
@@ -793,6 +836,9 @@ async def _run(state, identity, ledger):
                 host.validate_observation(message)
                 record = message.additional_kwargs.get("host_publication") or {}
                 retrieval_ledger.restore(message.name, call["args"], message.tool_call_id)
+                retrieval_ledger.restore_admission(message.name, message.tool_call_id, call["args"])
+                retrieval_ledger.observe(message.name, message.tool_call_id, message.artifact,
+                    status=record.get("status", ""), reason=record.get("reason", ""), content=message.content)
                 retrieval_ledger.settle(message.name, call["args"], message.tool_call_id,
                                         status=record.get("status", ""), reason=record.get("reason", ""))
 
@@ -1219,13 +1265,25 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
         if verified is not None:
             figure_summary, length_gaps = verified
             answer = answer + "\n\n" + figure_summary if uncertain else figure_summary
-    delivery = {"status": "not_checked", "verified_file_ids": [], "unavailable_count": 0}
+    delivery = (final_review or {}).get("artifact_delivery") if result.status == "complete" else None
+    if delivery is None:
+        from src.core.turn_outcome import _effective_artifact_records
+        from src.research.artifact_delivery import build_delivery
+
+        stopped = result.status != "complete" and status in {"partial", "failed", "cancelled"}
+        gaps = list(length_gaps) or ([{"reason_code": "required_deliverable_unconfirmed"}]
+                                     if stopped and requirements else [])
+        delivery = await asyncio.to_thread(build_delivery, identity=identity, request_id=host._result_request_id(),
+            rows=_effective_artifact_records(host.records), messages=host.messages, requirements=requirements,
+            gaps=gaps, delivery_uncertain=uncertain)
     if result.status != "complete" and status in {"partial", "failed", "cancelled"}:
-        links, delivery = await asyncio.to_thread(_verified_turn_delivery, host)
+        from src.research.artifact_delivery import missing_answer_links
+        links = [f"- [下载文件 {i}]({link})" for i, link in enumerate(missing_answer_links(delivery, answer), 1)]
         if links and (result.reason != "model_length" or verified is None or length_gaps):
             answer += "\n\n已生成并核对文件完整性的产物（不表示整项任务已完成或已通过 QA）：\n" + "\n".join(links)
         if delivery["status"] in {"partial", "unavailable"}:
             answer += "\n\n部分或全部已登记文件当前无法核验；未提供未经核验的链接。"
+    if delivery.get("status") != "none":
         emit_encoded("artifact_delivery", delivery)
     ledger.close(status="unknown" if uncertain else
                  "cancelled" if status == "cancelled" else "failed", reason_code=result.reason)

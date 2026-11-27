@@ -39,10 +39,12 @@ _EXTERNAL = frozenset({"run_external_skill", "collect_external_skill"})
 _SCOPE_TOOLS = {
     "nature-figure": frozenset({"inspect_uploaded_table", "analyze_research_data",
         "research_workspace", "run_research_figure_script", "draw_svg"}),
-    "data-audit": _EXTERNAL | {"inspect_uploaded_table", "audit_uploaded_data"},
-    "research-integrity": _EXTERNAL | {"inspect_uploaded_table", "audit_research_images"},
+    "data-audit": _EXTERNAL | {"inspect_uploaded_table", "audit_uploaded_data",
+        "prepare_audit_dataset", "audit_prepared_dataset"},
+    "research-integrity": _EXTERNAL | {"inspect_uploaded_table", "audit_research_images",
+        "run_numeric_integrity", "collect_numeric_integrity"},
     "literature-verification": _EXTERNAL | {"continue_external_literature", "verify_uploaded_references",
-        "search_literature", "deepseek_search", "deepseek_fetch", "deepseek_fetch_paper"},
+        "verify_literature_references", "search_literature", "deepseek_search", "deepseek_fetch", "deepseek_fetch_paper"},
 }
 
 
@@ -86,11 +88,21 @@ def accepts_method(tool, args, scope):
 def uncollected_skill_results(records, calls, messages):
     """Only an accepted Worker submission creates a collection obligation."""
     pending = set()
+    numeric_pending = set()
     for row in records:
         if row.get("inherited_from_job_id"):
             continue
         cid = row.get("tool_call_id")
         name = row.get("name") or row.get("tool_name")
+        if name in {"run_numeric_integrity", "collect_numeric_integrity"}:
+            artifact = getattr(messages.get(cid), "artifact", None)
+            if isinstance(artifact, dict) and artifact.get("execution_id"):
+                execution_id = artifact["execution_id"]
+                if name == "run_numeric_integrity" and artifact.get("collect_required") is True:
+                    numeric_pending.add(execution_id)
+                elif name == "collect_numeric_integrity" and row.get("status") in {"complete", "partial", "failed"}:
+                    numeric_pending.discard(execution_id)
+            continue
         if name not in {"run_external_skill", "continue_external_literature", "collect_external_skill"}:
             continue
         reason = row.get("reason") or row.get("reason_code")
@@ -107,4 +119,4 @@ def uncollected_skill_results(records, calls, messages):
               and reason in {"external_skill_report", "external_report_not_published"}
               and artifact.get("execution_id") == args.get("execution_id")):
             pending.discard((skill, args.get("execution_id")))
-    return frozenset(skill for skill, _ in pending)
+    return frozenset(skill for skill, _ in pending) | ({"research-integrity"} if numeric_pending else set())

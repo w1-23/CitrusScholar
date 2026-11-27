@@ -701,6 +701,454 @@
     {
       "type": "function",
       "function": {
+        "name": "prepare_audit_dataset",
+        "description": "读取当前轮已授权 XLSX/XLSM/CSV 附件，返回已冻结的数据引用。默认自动识别，只在用户明示工作表或精确区域时传 scope；没有歧义时不要求用户输入坐标。",
+        "parameters": {
+          "properties": {
+            "file_index": {
+              "default": 0,
+              "maximum": 19,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scope": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "sheet": {
+                      "maxLength": 31,
+                      "minLength": 1,
+                      "title": "Sheet",
+                      "type": "string"
+                    },
+                    "bounds": {
+                      "default": "",
+                      "maxLength": 32,
+                      "title": "Bounds",
+                      "type": "string"
+                    },
+                    "header_rows": {
+                      "items": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "maxItems": 8,
+                      "title": "Header Rows",
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "sheet"
+                  ],
+                  "title": "RequestedWorkbookScope",
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "audit_prepared_dataset",
+        "description": "对 prepare_audit_dataset 返回的 DatasetRef 做确定性数据质量检查。若准备时明确限定 scope，沿用原 scope。只读，不修改原件；仅在用户或明确 schema 提供阈值时使用范围规则。",
+        "parameters": {
+          "properties": {
+            "dataset_ref": {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "dataset_snapshot",
+                  "type": "string"
+                },
+                "id": {
+                  "pattern": "^[a-f0-9]{32}$",
+                  "type": "string"
+                },
+                "version": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "sha256": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "id",
+                "version",
+                "sha256"
+              ],
+              "type": "object"
+            },
+            "checks": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "checks": {
+                      "default": [
+                        "missing",
+                        "duplicate"
+                      ],
+                      "items": {
+                        "enum": [
+                          "missing",
+                          "duplicate",
+                          "type",
+                          "range",
+                          "category",
+                          "outlier"
+                        ],
+                        "type": "string"
+                      },
+                      "maxItems": 6,
+                      "minItems": 1,
+                      "title": "Checks",
+                      "type": "array"
+                    },
+                    "required_fields": {
+                      "default": [],
+                      "items": {
+                        "maxLength": 160,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "maxItems": 256,
+                      "title": "Required Fields",
+                      "type": "array"
+                    },
+                    "unique_fields": {
+                      "default": [],
+                      "items": {
+                        "maxLength": 160,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "maxItems": 256,
+                      "title": "Unique Fields",
+                      "type": "array"
+                    },
+                    "types": {
+                      "additionalProperties": {
+                        "enum": [
+                          "number",
+                          "string",
+                          "boolean",
+                          "date"
+                        ],
+                        "type": "string"
+                      },
+                      "maxProperties": 256,
+                      "propertyNames": {
+                        "maxLength": 160,
+                        "minLength": 1
+                      },
+                      "title": "Types",
+                      "type": "object"
+                    },
+                    "categories": {
+                      "additionalProperties": {
+                        "items": {
+                          "maxLength": 256,
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "maxProperties": 256,
+                      "propertyNames": {
+                        "maxLength": 160,
+                        "minLength": 1
+                      },
+                      "title": "Categories",
+                      "type": "object"
+                    },
+                    "ranges": {
+                      "additionalProperties": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "minimum": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string"
+                              }
+                            ],
+                            "title": "Minimum"
+                          },
+                          "maximum": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "string"
+                              }
+                            ],
+                            "title": "Maximum"
+                          }
+                        },
+                        "required": [
+                          "minimum",
+                          "maximum"
+                        ],
+                        "title": "NumericRange",
+                        "type": "object"
+                      },
+                      "maxProperties": 256,
+                      "propertyNames": {
+                        "maxLength": 160,
+                        "minLength": 1
+                      },
+                      "title": "Ranges",
+                      "type": "object"
+                    },
+                    "outlier_fields": {
+                      "default": [],
+                      "items": {
+                        "maxLength": 160,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "maxItems": 256,
+                      "title": "Outlier Fields",
+                      "type": "array"
+                    }
+                  },
+                  "title": "AuditChecks",
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "scope": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "sheet": {
+                      "maxLength": 31,
+                      "minLength": 1,
+                      "title": "Sheet",
+                      "type": "string"
+                    },
+                    "bounds": {
+                      "default": "",
+                      "maxLength": 32,
+                      "title": "Bounds",
+                      "type": "string"
+                    },
+                    "header_rows": {
+                      "items": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "maxItems": 8,
+                      "title": "Header Rows",
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "sheet"
+                  ],
+                  "title": "RequestedWorkbookScope",
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "dataset_ref"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_numeric_integrity",
+        "description": "仅在用户明确请求数值科研诚信检查时提交离线 Worker。用本轮附件的零基序号选择 CSV/XLSX 原件。禁止图像和超出用户范围，不把运行受理说成检查完成。等待原 execution_id 后调用 collect_numeric_integrity。",
+        "parameters": {
+          "properties": {
+            "inputs": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "file_index": {
+                    "maximum": 19,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "benford_columns": {
+                    "items": {
+                      "maxLength": 500,
+                      "type": "string"
+                    },
+                    "maxItems": 24,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "file_index"
+                ],
+                "type": "object"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "type": "array"
+            },
+            "enable_benford": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "inputs"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "collect_numeric_integrity",
+        "description": "只读读取本轮原数值筛查的已验证回执。用原 execution_id，不重新提交。零发现不是数据真实或不存在问题；图像从不在范围内。",
+        "parameters": {
+          "properties": {
+            "execution_id": {
+              "pattern": "^[a-f0-9]{32}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "execution_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "verify_literature_references",
+        "description": "一次核验 1–10 条用户给出的 DOI 或结构化题录。返回匹配字段、来源覆盖和错误状态。不要发送论文全文或生成报告，不要绕过本地/禁网约束。",
+        "parameters": {
+          "properties": {
+            "references": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "doi": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "arxiv_id": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "pmid": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "title": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "authors": {
+                    "anyOf": [
+                      {
+                        "maxLength": 500,
+                        "type": "string"
+                      },
+                      {
+                        "items": {
+                          "maxLength": 500,
+                          "type": "string"
+                        },
+                        "maxItems": 30,
+                        "type": "array"
+                      }
+                    ],
+                    "default": ""
+                  },
+                  "year": {
+                    "anyOf": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null
+                  },
+                  "journal": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "venue": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "volume": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "issue": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  },
+                  "pages": {
+                    "default": "",
+                    "maxLength": 500,
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "maxItems": 10,
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "references"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
         "name": "audit_uploaded_data",
         "description": "对授权原表的指定工作表或区域执行一次审查并保存快照。\n\nfile_ids_json 选择账号中真实文件，file_indexes_json 指定来源序号。\n先检查 layout。多区块必须确认 checks_json.regions 才能审查。\nsheet_name 用实际表名；checks_json.regions 绑定 file_index、sheet、\n绝对 bounds 和 header_rows。field_roles 映射列角色、键和脚注，\nrequested_checks 限定用户要求的检查，profile 默认 balanced\n（可选 balanced/duplicates/relations/numeric_forensics/custom/on_demand）。\nrequested_checks 中的 duplicates/duplicate_rows 归一为 duplicate_row；\n需要完整重复族时使用 profile=duplicates。\npublish_formats 接受 JSON 字符串或字符串数组，默认 xlsx。\nreported_summaries / reported_p_values 只接受核实后的区域与统计量绑定。\n默认每份原件交付一份 XLSX。再次导出用已有 review_id，无需重扫。\nchecks_json.plot_fields 可指定冻结绘图快照需要的真实列名；后续绘图用\nplot_datasets[].inputs_binding，不再读取整份原表或重跑审查。\n显式旧审查计划保留兼容；工具返回有限摘要和已有成果引用。",
         "parameters": {

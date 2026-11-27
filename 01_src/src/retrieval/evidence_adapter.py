@@ -118,6 +118,15 @@ def _authorize_corpus(corpus_id: str, *, user: dict | None = None) -> None:
         raise PermissionError("evidence_corpus_forbidden")
 
 
+def _declared_source_hash(row: dict) -> str | None:
+    # Missing document provenance stays missing. The chunk-text hash is not
+    # interchangeable with the source object's SHA-256.
+    value = row.get("source_hash") or row.get("source_sha256")
+    if isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value):
+        return value.lower()
+    return None
+
+
 def persist_local_rows(rows: list[dict], *, query: str, generation: str) -> tuple[list[dict], dict]:
     """Persist new rows only with verified host identity; return bounded observations."""
     from src.core import tracing
@@ -141,7 +150,8 @@ def persist_local_rows(rows: list[dict], *, query: str, generation: str) -> tupl
                               "corpus_family_id": row.get("corpus_family_id") or row.get("corpus_family"),
                               "source_type": row.get("source_type"), "_src": row.get("_src"),
                               "doi": row.get("doi"), "year": row.get("year"),
-                              "index_generation": generation, "input_sha256": version}}
+                              "index_generation": generation, "input_sha256": version,
+                              "source_hash": _declared_source_hash(row)}}
         observation = store.put(record, query_ref=query_ref)
         source = store.read(ref=observation["ref"], max_chars=1)["source"]
         read_entry = {"ref": observation["ref"], "candidate_id": observation["ref"],

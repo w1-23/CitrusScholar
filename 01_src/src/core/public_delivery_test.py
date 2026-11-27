@@ -107,6 +107,13 @@ class PublicDeliveryTests(unittest.TestCase):
         task_events.init_schema(conn)
         conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", ("job", 1, "text", json.dumps({"content": "old private preview"}), 102))
         conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", ("job", 2, "text_reset", "{}", 103))
+        model_preview = {"origin": "langgraph", "source": "native_stream", "visibility": "public",
+            "schema_version": 1, "job_id": "job", "run_id": "job", "kind": "model_preview",
+            "status": "streaming", "at_ms": 1700000000000, "note_id": "stream:" + "a" * 64,
+            "call_id": "mdl:" + "a" * 16, "delta_index": 0, "text": "legacy provisional fixture"}
+        conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", ("job", 3, "assistant_progress", json.dumps(model_preview), 103))
+        self.assertIsNone(task_events._append(conn, "job", "assistant_progress", model_preview))
+        self.assertIsNone(task_events._append(conn, "job", "text", {"content": "new unmarked draft"}))
         task_events._append(conn, "job", "task_state", {"schema_version": 1, "system_prompt": "storage fixture"})
         self.assertIsNone(task_events._append(conn, "job", "text", {"content": "new draft", "delivery": "draft"}))
         task_events._append(conn, "job", "answer_start", {})
@@ -125,6 +132,8 @@ class PublicDeliveryTests(unittest.TestCase):
         self.assertNotIn("storage fixture", public)
         self.assertNotIn("hidden fixture", public)
         self.assertIn("public final", public)
+        self.assertNotIn("legacy provisional fixture", public)
+        self.assertEqual(exported["events"][2]["data"], {"seq": 3})
         self.assertEqual(exported["events"][-2]["data"]["turn_timings"]["visible_answer_first_ms"], 8000)
         self.assertEqual(exported["events"][-1]["data"], {
             "seq": exported["events"][-1]["seq"], "status": "compacted", "elapsed_ms": 55})
@@ -165,6 +174,8 @@ class PublicDeliveryTests(unittest.TestCase):
                       json.dumps({"role": "system", "content": "private fixture"}),
                       {"draft": "private fixture", "value": "normal evidence"}]},
                   "authorization": "Bearer protected-credential"}
+        self.assertEqual(module.event_details("assistant_progress", {"visibility": "public",
+            "kind": "model_preview", "text": "uncommitted fixture", "seq": 2}), {"seq": 2})
         safe = module.render(sample)
         for visible in ("LC-MS sample", "peak area", "normal evidence", "[REDACTED]"):
             self.assertIn(visible, safe)

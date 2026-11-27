@@ -1,0 +1,22 @@
+{
+  "schema": "citrus.numeric-integrity-upstreams/1",
+  "platform": "linux-x86_64-cp312",
+  "paperconan": {
+    "repository": "https://github.com/zixixr/paperconan",
+    "commit": "8d116455b23e858651250d8ed23ba41c1a87ab0d",
+    "version": "0.9.0",
+    "license": "MIT",
+    "archive_sha256": "1b165fbe447bd6db842277e681cd6fe769b1d14611f41ccc78430a6f6dbac4a3",
+    "audit_source_sha256": "aab28242395654bd60b8e52e46c81cec07483b4a202cd1639509dd2b2af9a73d",
+    "wheel_sha256": "7229802aca43e88d4bdb97c937cd807e57d935c71417b8d9dc267958bf5edfa3",
+    "build": {"source_date_epoch": 1792335704, "setuptools": "84.2.1", "wheel": "0.48.0"}
+  },
+  "geng": {
+    "repository": "https://github.com/HoneyMeta/geng-skills",
+    "commit": "9610daeddf796a2e80b6feca40cc45987ba108c1",
+    "license": "MIT",
+    "source_path": "scripts/geng_check.py",
+    "source_sha256": "d815335a56bb0cfd103d1e0eff5d272582eca1f3b4cbf1a6276adf73c665eb4e",
+    "scope": "Benford first-digit algorithm adaptation only, no full Geng runtime"
+  }
+}

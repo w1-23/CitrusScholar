@@ -11,11 +11,14 @@ From: public.ecr.aws/docker/library/python@sha256:0f086103b026048cc50cb5da25ec43
     packages /opt/support-build/packages
     01_src/src/figures /opt/support-build/01_src/src/figures
     01_src/src/research /opt/support-build/01_src/src/research
-    01_src/src/prompts/skills/vendor/nature-skills /opt/support-build/01_src/src/prompts/skills/vendor/nature-skills
-    skills/nature-figure/vendor/nature-skills /opt/support-build/skills/nature-figure/vendor/nature-skills
+    01_src/src/prompts/skill_history/vendor/nature-skills /opt/support-build/01_src/src/prompts/skill_history/vendor/nature-skills
+    02_config/skill-history/repository-v3/skills/nature-figure/vendor/nature-skills /opt/support-build/02_config/skill-history/repository-v3/skills/nature-figure/vendor/nature-skills
     04_scripts/build_worker_bundle.py /opt/support-build/04_scripts/build_worker_bundle.py
     01_src/docker/requirements.sandbox.txt /opt/citrusfig/requirements.sandbox.txt
     02_config/skill-fusion-worker.requirements.lock /opt/citrusfig/skill-fusion-worker.requirements.lock
+    01_src/src/research/numeric_integrity /opt/citrus-integrity/numeric_integrity
+    02_config/integrity/worker-addon.requirements.lock /opt/citrus-integrity/worker-addon.requirements.lock
+    02_config/integrity/wheelhouse /opt/citrus-integrity/wheelhouse
 
 %post
     set -eu
@@ -34,7 +37,10 @@ From: public.ecr.aws/docker/library/python@sha256:0f086103b026048cc50cb5da25ec43
     python -I -c 'import sys; sys.path.insert(0, "/opt/citrusfig"); import worker; roots=worker._bootstrap_engine_path(); worker._verify_support_origin(*roots); from citrus_figures.nature_runtime import RELEASE_VENDOR_COMMIT, RELEASE_VENDOR_PATH; assert RELEASE_VENDOR_COMMIT == "c6701dbea29afa7c596d029b957b7edc92130ea5" and RELEASE_VENDOR_PATH == "nature-qa"'
     rm -rf /opt/support-build /tmp/support-wheel /tmp/worker-bundle
     mkdir -p /input /workspace /outputs /work/in /work/out /code-environment /snapshot/input /snapshot/workspace /snapshot/outputs
-    python -m pip check
+    python -I -m pip --isolated --disable-pip-version-check --no-cache-dir install --no-index --no-deps --only-binary=:all: --require-hashes --find-links /opt/citrus-integrity/wheelhouse --target /opt/citrus-integrity/addons -r /opt/citrus-integrity/worker-addon.requirements.lock
+    rm -rf /opt/citrus-integrity/wheelhouse
+    PYTHONPATH=/opt/citrus-integrity/addons python -m pip check
+    python -I -c 'import sys; sys.path[:0]=["/opt/citrus-integrity/addons", "/opt/citrus-integrity"]; from numeric_integrity.scanner import assert_runtime; assert_runtime()'
     python -I -c 'import ctypes; sec=ctypes.CDLL("libseccomp.so.2"); assert sec.seccomp_syscall_resolve_name(b"fchmodat2")>=0; import pypdf, pandera.pandas, PIL, openpyxl'
     python -m pip freeze --all > /opt/citrusfig/installed-requirements.txt
     fc-cache -f

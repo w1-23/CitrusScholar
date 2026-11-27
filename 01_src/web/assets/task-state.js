@@ -88,8 +88,11 @@
       preview: null, tools: [], subagents: [], interrupt: null, resume: null,
       closed: false, committed: false, unrecorded: 0};
     function sameJob(data) {
-      if (!state.job_id && data.job_id) { state.job_id = data.job_id; state.run_id = data.run_id; }
-      return !state.job_id || data.job_id === state.job_id;
+      if (state.job_id && data.job_id !== state.job_id) return false;
+      if (state.run_id && data.run_id !== state.run_id) return false;
+      state.job_id = data.job_id;
+      state.run_id = data.run_id;
+      return true;
     }
     function find(list, key, value) {
       for (var i = 0; i < list.length; i++) if (list[i][key] === value) return i;
@@ -242,8 +245,25 @@
     });
     var unavailable = Number(data.unavailable_count);
     unavailable = Number.isFinite(unavailable) && unavailable > 0 ? Math.floor(unavailable) : 0;
-    return {status: status, verified_file_ids: ids, unavailable_count: unavailable,
+    var result = {status: status, verified_file_ids: ids, unavailable_count: unavailable,
       seq: Number.isSafeInteger(data.seq) ? data.seq : 0};
+    if (data.schema_version !== 'artifact-delivery/1') return result;
+    var assets = [], assetIds = new Set();
+    list(data.artifacts).forEach(function (asset) {
+      if (!asset || typeof asset !== 'object' || !/^[a-f0-9]{32}$/.test(asset.asset_ref || '') ||
+          !/^[a-f0-9]{64}$/.test(asset.sha256 || '') || assetIds.has(asset.asset_ref) ||
+          !Number.isSafeInteger(asset.size_bytes) || asset.size_bytes <= 0 ||
+          !/^\/api\/v2\/session\/[A-Za-z0-9_-]{8,128}\/artifacts\/[a-f0-9]{32}$/.test(asset.url || '') ||
+          asset.url.split('/').pop() !== asset.asset_ref) return;
+      assetIds.add(asset.asset_ref);
+      assets.push({asset_ref: asset.asset_ref, sha256: asset.sha256, url: asset.url,
+        filename: typeof asset.filename === 'string' ? asset.filename : '', size_bytes: asset.size_bytes});
+    });
+    result.schema_version = data.schema_version;
+    result.artifacts = assets;
+    result.delivery_id = String(data.delivery_id || '');
+    result.delivery_status = String(data.delivery_status || '');
+    return result;
   }
   // Event arrival is ordered separately from the public process projection.
   // All aliases identify one logical operation; attempts remain separate facts.
@@ -308,7 +328,11 @@
     function action(data) {
       var keys = [data.logical_key, data.operation_id, data.tool_call_id].concat(list(data.aliases)).filter(Boolean).map(String);
       var attempt = String(data.attempt || data.attempts || 1);
-      var matches = actions.filter(function (item) { return item.generation === generation && item.attempt === attempt && keys.some(function (key) { return item.aliases.indexOf(key) >= 0; }); });
+      var matches = actions.filter(function (item) {
+        return item.generation === generation && item.attempt === attempt &&
+          (!data.run_id || !item.data.run_id || data.run_id === item.data.run_id) &&
+          keys.some(function (key) { return item.aliases.indexOf(key) >= 0; });
+      });
       var item = matches[0];
       if (!item) {
         item = {kind: 'action', id: ++nextId, generation: generation, attempt: attempt, aliases: [], data: {}};
@@ -321,9 +345,12 @@
         entries.splice(entries.indexOf(duplicate), 1); actions.splice(actions.indexOf(duplicate), 1);
       });
       keys.forEach(function (key) { if (item.aliases.indexOf(key) < 0) item.aliases.push(key); });
+      // A late proposal must not change any field of a formal attempt.
+      if (data.status === 'proposed' && item.data.status && item.data.status !== 'proposed') return item;
       var incoming = Object.assign({}, data);
       // An alias start arriving after a result must not erase its outcome.
-      if (['running', 'resuming'].indexOf(incoming.status) >= 0 && item.data.status && ['running', 'resuming'].indexOf(item.data.status) < 0) delete incoming.status;
+      if (['running', 'resuming'].indexOf(incoming.status) >= 0 && item.data.status &&
+          ['proposed', 'running', 'resuming'].indexOf(item.data.status) < 0) delete incoming.status;
       item.data = Object.assign({}, item.data, incoming);
       item.resolution = resolutions.get(item.data.tool_call_id) || null;
       return item;
@@ -332,11 +359,16 @@
       if (!key || key === generation) return false;
       generation = key; currentPlan = null; resolutions.clear();
       actions.forEach(function (item) {
+        if (item.data.status === 'proposed') item.data.status = 'unrecorded';
         if (['running', 'resuming'].indexOf(item.data.status) >= 0) item.data.status = 'interrupted';
       });
       return true;
     }
-    return {begin: begin, entries: entries, note: note, milestone: milestone, action: action, plan: plan, resolution: resolution, currentPlan: function () { return currentPlan; }};
+    function reset() {
+      entries.length = 0; actions.length = 0; seen.clear(); resolutions.clear();
+      generation = ''; currentPlan = null;
+    }
+    return {begin: begin, reset: reset, entries: entries, note: note, milestone: milestone, action: action, plan: plan, resolution: resolution, currentPlan: function () { return currentPlan; }};
   }
   // Presentation only: queue and job state remain authoritative. Time starts at
   // the durable execution stamp, never at submission or observer attachment.
@@ -504,7 +536,8 @@
         if (!next.seq && previous.seq) return false;
         if (!next.seq && !previous.seq && next.status === previous.status &&
             next.unavailable_count === previous.unavailable_count &&
-            next.verified_file_ids.join('\u0000') === previous.verified_file_ids.join('\u0000')) return false;
+            next.verified_file_ids.join('\u0000') === previous.verified_file_ids.join('\u0000') &&
+            next.delivery_id === previous.delivery_id && next.delivery_status === previous.delivery_status) return false;
       }
       state.artifact_delivery = next;
       return true;

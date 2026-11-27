@@ -1,0 +1,22 @@
+{
+  "schema": "citrus.numeric-integrity-detectors/1",
+  "selection_policy": "one owner per scientific method and declared source scope",
+  "default": {
+    "engine": "paperconan",
+    "version": "0.9.0",
+    "commit": "8d116455b23e858651250d8ed23ba41c1a87ab0d",
+    "output_prefix": "paperconan.",
+    "method_families": ["copy_reuse", "exact_or_transformed_relations", "repeated_numeric_blocks", "decimal_patterns", "terminal_digits", "grim_grimmer"],
+    "source_formats": ["csv", "xlsx"]
+  },
+  "optional": [{
+    "id": "numeric.benford_first_digit",
+    "engine": "honey-geng-adapt",
+    "method_version": "geng-benford-adapt/1",
+    "commit": "9610daeddf796a2e80b6feca40cc45987ba108c1",
+    "input_scope": "host-confirmed measured CSV columns only",
+    "default_enabled": false,
+    "excluded_geng_families": ["terminal_digits", "decimal_patterns", "copy_reuse", "repeated_numeric_blocks", "fixed_relations", "grim_grimmer"]
+  }],
+  "image_review": "not_in_scope"
+}

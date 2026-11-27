@@ -229,10 +229,16 @@ def command(config, role):
                    '--env', 'CITRUS_BROWSE_APPTAINER=1']
     skill_release = verified_skill_release(config, binds)
     external_required = config.get('external_fusion_required', False)
-    if type(external_required) is not bool:
-        raise ValueError('Invalid external Skill policy')
+    methods_only = config.get('scientific_methods_only', False)
+    if type(external_required) is not bool or type(methods_only) is not bool or (methods_only and not external_required):
+        raise ValueError('Invalid scientific Skill policy')
+    if methods_only:
+        if (skill_release is None or not (skill_release / 'scientific-methods.json').is_file()
+                or (skill_release / 'fusion').exists() or (skill_release / 'python').exists()):
+            raise ValueError('Pinned method-only release unavailable')
+        result += ['--env', 'CITRUS_SCIENTIFIC_METHODS_ONLY=1']
     if external_required:
-        if skill_release is None or not (skill_release / 'fusion/bundle.json').is_file():
+        if not methods_only and (skill_release is None or not (skill_release / 'fusion/bundle.json').is_file()):
             raise ValueError('Required external Skill bundle unavailable')
         result += ['--env', 'CITRUS_EXTERNAL_FUSION=required']
     # The release source tree is the single authority for both the application
@@ -245,6 +251,8 @@ def command(config, role):
         result += ['--env', 'CITRUS_SKILL_RELEASE=' + str(skill_release)]
         if (skill_release / 'python').is_dir():
             python_path.insert(0, f'{skill_release}/python')
+        if methods_only and role == 'web' and (skill_release / 'host-python').is_dir():
+            python_path.insert(0, f'{skill_release}/host-python')
     historical = config.get('historical_skill_releases', [])
     if not isinstance(historical, list) or len(historical) > 32:
         raise ValueError('Invalid historical Skill release registry')

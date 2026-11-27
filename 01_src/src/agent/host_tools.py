@@ -363,8 +363,9 @@ class HostTools:
             from .fusion_tools import FUSION_TOOL_NAMES, FUSION_WAIT_TOOLS
             from .nature_skill_tools import NATURE_TOOL_NAMES, NATURE_WAIT_TOOLS
             from .installed_skills import TurnSkills, bind_turn_skills
+            from .scientific_method_tools import METHOD_CONTEXT_TOOLS, METHOD_WAIT_TOOLS
             binding = (code_execution_context(identity, call['id'], skill_release=self.skill_release)
-                       if call['name'] in (CODE_TOOL_NAMES | FUSION_TOOL_NAMES | NATURE_TOOL_NAMES) or call['name'] == 'audit_uploaded_data'
+                       if call['name'] in (CODE_TOOL_NAMES | FUSION_TOOL_NAMES | NATURE_TOOL_NAMES | METHOD_CONTEXT_TOOLS) or call['name'] == 'audit_uploaded_data'
                        else nullcontext())
             retry_binding = nullcontext()
             if retry_target:
@@ -386,7 +387,7 @@ class HostTools:
         if call["name"] == "request_user_input" and isinstance(question, dict):
             self.pending_question = question
         execution_waits = ()
-        if (call['name'] in (EXECUTION_WAIT_TOOL_NAMES | FUSION_WAIT_TOOLS | NATURE_WAIT_TOOLS)
+        if (call['name'] in (EXECUTION_WAIT_TOOL_NAMES | FUSION_WAIT_TOOLS | NATURE_WAIT_TOOLS | METHOD_WAIT_TOOLS)
                 and artifact.get('_code_execution_id')
                 and (artifact.get('_tool_outcome') or {}).get('status') == 'complete'):
             import asyncio

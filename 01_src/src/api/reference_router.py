@@ -60,7 +60,9 @@ def external_reference_verification_detail() -> str:
     if external_fusion_required():
         try:
             release = release_path()
-            if release is None or not installed_fusion(release, list_installed(release)):
+            from src.agent.scientific_method_tools import method_only_release
+            rows = list_installed(release) if release is not None else []
+            if release is None or not (installed_fusion(release, rows) or method_only_release(release, rows)):
                 return "当前外部文献核验发行不可用。不会切换为旧核验算法。"
         except (OSError, ValueError, KeyError):
             return "当前外部文献核验发行不可用。不会切换为旧核验算法。"

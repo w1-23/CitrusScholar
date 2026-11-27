@@ -239,7 +239,8 @@
         row.dataset.resolvedBy = resolution ? resolution.resolved_by_tool_call_id : '';
         row.className = 'term-line ' + (['running', 'resuming'].indexOf(status) >= 0 ? 'is-running'
           : ['complete', 'completed', 'no_results'].indexOf(status) >= 0 ? 'is-complete'
-          : status === 'partial' ? 'is-partial' : ['skipped', 'cancelled', 'not_run', 'interrupted'].indexOf(status) >= 0 ? 'is-skipped' : 'is-failed');
+          : status === 'partial' ? 'is-partial' : ['proposed', 'unrecorded'].indexOf(status) >= 0 ? 'is-unconfirmed'
+          : ['skipped', 'cancelled', 'not_run', 'interrupted'].indexOf(status) >= 0 ? 'is-skipped' : 'is-failed');
         var running = ['running', 'resuming'].indexOf(status) >= 0;
         if (resolution) row.className = 'term-line is-resolved';
         if ((settled || paused) && running) row.className = 'term-line is-unconfirmed';
@@ -248,7 +249,9 @@
         row.dataset.attempt = item.attempt; row.dataset.operationId = operationId;
         var title = options.clean(data.display_name || options.toolName(data.tool_name || data.name) || '科研任务');
         var text = title + ' · ' + (resolution ? resolution.resolution === 'repaired' ? '已修复' : '已由后续结果替代'
-          : running ? settled ? '未记录结束状态' : paused ? '当前状态待确认' : '处理中' : options.statusText(status, data.reason_code));
+          : running ? settled ? '未记录结束状态' : paused ? '当前状态待确认' : '处理中'
+            : status === 'proposed' ? settled ? '未记录结束状态' : '已提交'
+            : status === 'unrecorded' ? '未记录结束状态' : options.statusText(status, data.reason_code));
         var rawSummary = data.summary || data.result_summary || (data.outcome || {}).summary;
         var summary = /^\s*[\[{]/.test(rawSummary || '') ? '执行结果已记录' : options.clean(rawSummary);
         var hint = options.clean(data.action_hint);
@@ -282,6 +285,7 @@
     }
     return {element: host, projection: projection, activeTool: activeTool,
       begin: function (generation) { if (projection.begin(generation)) draw(); },
+      reset: function () { projection.reset(); draw(); },
       pause: function (value) { if (paused !== value) { paused = value; draw(); } },
       note: function (data) {
         var item = projection.note(data);

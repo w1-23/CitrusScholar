@@ -95,7 +95,9 @@ def test_one_row_reaches_every_consumer():
 def test_presentation_catalog_matches_the_pre_migration_snapshot():
     """The capability/label catalog is derived now; the values must not move."""
     derived = tool_catalog.TOOL_METADATA
-    assert set(derived) == set(_MIGRATED)
+    new_methods = {'prepare_audit_dataset', 'audit_prepared_dataset', 'run_numeric_integrity',
+                   'collect_numeric_integrity', 'verify_literature_references'}
+    assert set(derived) == set(_MIGRATED) | new_methods
     for name, row in _MIGRATED.items():
         (label, link, capabilities, requires, produces, write_scope,
          concurrency_key, category, authorization, recovery_mode, import_target) = row
@@ -116,7 +118,7 @@ def test_presentation_catalog_matches_the_pre_migration_snapshot():
     # independently either. Spot-check each retrieval family.
     groups = tool_catalog.capability_groups()
     assert groups["network"] == frozenset(
-        name for name, row in _MIGRATED.items() if "network" in row[2])
+        name for name, row in _MIGRATED.items() if "network" in row[2]) | {"verify_literature_references"}
     assert groups["visualization"] == frozenset(
         name for name, row in _MIGRATED.items() if "visualization" in row[2])
     assert groups["shared_corpus"] == frozenset(

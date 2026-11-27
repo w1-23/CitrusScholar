@@ -87,7 +87,7 @@ class NativeStreamSchemaTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 payload = _frame(kind, **extra)
                 self.assertEqual(project_native_stream_event(payload), payload)
-                self.assertEqual(project_native_progress(payload), payload)
+                self.assertEqual(project_native_progress(payload), {} if kind == "model_preview" else payload)
                 self.assertFalse(set(payload) & _FORBIDDEN_KEYS)
                 self.assertEqual(payload["schema_version"], 1)
 
@@ -193,6 +193,17 @@ class NativeStreamProjectorTests(unittest.TestCase):
                           ("tool_proposed", "execute", "call_2")])
         self.assertEqual(projector.feed("updates", output), [])  # Re-observed batch is a fact once.
         self.assertNotIn("private", json.dumps(frames))
+
+    def test_history_updates_cannot_claim_current_tool_proposals(self):
+        projector = _projector(model_preview=False)
+        call = _tool_message(("read_tool_result", "reused_call"))
+        prior = call.model_copy(update={"additional_kwargs": {"run_id": "earlier-run"}})
+        self.assertEqual(projector.feed("updates", {"session_load": {"messages": [call]},
+            "session_save": {"messages": [call]}, "supervisor": {"messages": [prior]}}), [])
+        self.assertEqual(projector.feed("messages", _chunk("uncommitted draft fixture\n", call="lc_run--a")), [])
+        [frame] = projector.feed("updates", {"supervisor": {"messages": [call]}})
+        self.assertEqual(frame["tool_call_id"], "reused_call")
+        self.assertEqual(projector.close(), [])
 
     def test_interrupt_reports_identity_without_checkpoint_payload(self):
         from langgraph.types import Interrupt
@@ -544,23 +555,21 @@ class NativeStreamDurabilityTests(unittest.TestCase):
             asyncio.run(scenario())
 
         rows = self._stored()
-        self.assertEqual([row[2]['kind'] for row in rows],
-                         ['model_preview', 'tool_proposed', 'interrupt'])
-        self.assertEqual([row[0] for row in rows], [1, 2, 3])
+        self.assertEqual([row[2]['kind'] for row in rows], ['tool_proposed', 'interrupt'])
+        self.assertEqual([row[0] for row in rows], [1, 2])
         self.assertEqual(len(notified), len(rows))
         # Durable first: every notified frame already exists in the log.
         self.assertEqual([json.loads(item['data']) for item in notified],
                          [row[2] for row in rows])
         page = self.client.get(f'/jobs/{self.claim.job_id}/events').json()
-        self.assertEqual([row['seq'] for row in page['events']], [1, 2, 3])
-        self.assertEqual([row['data']['kind'] for row in page['events']],
-                         ['model_preview', 'tool_proposed', 'interrupt'])
+        self.assertEqual([row['seq'] for row in page['events']], [1, 2])
+        self.assertEqual([row['data']['kind'] for row in page['events']], ['tool_proposed', 'interrupt'])
         for row in page['events']:
             self.assertFalse(set(row['data']) & _FORBIDDEN_KEYS)
-        # A reconnect resumes at its own cursor: no duplicate, no replay of 1-2.
-        tail = self.client.get(f'/jobs/{self.claim.job_id}/events?after=2').json()
-        self.assertEqual([row['seq'] for row in tail['events']], [3])
-        self.assertEqual(tail['next_cursor'], 3)
+        # A reconnect resumes at its own cursor: no duplicate, no replay of 1.
+        tail = self.client.get(f'/jobs/{self.claim.job_id}/events?after=1').json()
+        self.assertEqual([row['seq'] for row in tail['events']], [2])
+        self.assertEqual(tail['next_cursor'], 2)
         self.assertFalse(tail['has_more'])
 
     def test_reconnecting_reobservation_invents_no_second_row(self):
@@ -575,7 +584,7 @@ class NativeStreamDurabilityTests(unittest.TestCase):
                 await asyncio.sleep(0)
             asyncio.run(scenario())
         rows = self._stored()
-        self.assertEqual([row[2]['kind'] for row in rows], ['model_preview', 'tool_proposed'])
+        self.assertEqual([row[2]['kind'] for row in rows], ['tool_proposed'])
         self.assertTrue(queue.empty() or queue.qsize() <= len(rows))
 
     def test_terminal_frame_fences_late_native_events(self):
@@ -627,11 +636,8 @@ class NativeStreamDurabilityTests(unittest.TestCase):
                 await asyncio.sleep(0)
             asyncio.run(scenario())
         rows = self._stored()
-        # Token fragments coalesce; the committed answer is the only frame that
-        # carries answer text as a delivered fact, and it always comes last.
-        self.assertGreaterEqual(len(rows), 2)
-        self.assertEqual({row[1] for row in rows[:-1]}, {'assistant_progress'})
-        self.assertEqual({row[2]['kind'] for row in rows[:-1]}, {'model_preview'})
+        # The public journal never persists provisional answer text.
+        self.assertEqual(len(rows), 1)
         self.assertEqual(rows[-1][1], 'text')
         self.assertEqual(rows[-1][2]['content'], '最终交付答复')
         self.assertEqual(rows[-1][2]['delivery'], 'committed')

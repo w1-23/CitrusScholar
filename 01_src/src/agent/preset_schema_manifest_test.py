@@ -96,7 +96,7 @@ def test_presentation_catalog_matches_the_pre_migration_snapshot():
     """The capability/label catalog is derived now; the values must not move."""
     derived = tool_catalog.TOOL_METADATA
     new_methods = {'prepare_audit_dataset', 'audit_prepared_dataset', 'run_numeric_integrity',
-                   'collect_numeric_integrity', 'verify_literature_references'}
+                   'collect_numeric_integrity', 'verify_literature_references', 'read_local_evidence'}
     assert set(derived) == set(_MIGRATED) | new_methods
     for name, row in _MIGRATED.items():
         (label, link, capabilities, requires, produces, write_scope,

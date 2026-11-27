@@ -246,7 +246,8 @@ def record_tool_sources(session_id: str, request_id: str, *, artifact: dict | No
     if tool_name in {"local_hybrid_search", "search_local_candidates"}:
         for row in (data.get("main_results") or [])[:limit]:
             entry = row.get("read_entry") or {}
-            width = min(len(str(row.get("text") or "")), 240)
+            limit_chars = 30_000 if data.get("corpus_contract") == 1 and str(entry.get("ref", "")).startswith("ce1:") else 240
+            width = min(len(str(row.get("text") or "")), limit_chars)
             ref = local_read_reference({**entry, "start": 0, "end": width})
             marker = _citation_ref(row.get("citation_ref"))
             if ref and marker:

@@ -225,16 +225,54 @@ def strip_private_text(text):
     return "".join(kept)
 
 
+# Stable codes confirmed to have escaped the internal retrieval/execution view.
+# Do not filter generic words such as "partial", "budget" or "unavailable".
+_ANSWER_TRACE = re.compile(
+    r"(?i)(?<![a-z0-9_])(?:candidate_pool_missing|no_candidate_pool|"
+    r"retrieval_(?:followup|call|token)_budget_exhausted|retrieval_deadline_exhausted|"
+    r"invalid_tool_arguments|result_fields_missing|operation_outcome_unknown|"
+    r"completion_proof_invalid|turn_reconcile_required)(?![a-z0-9_])"
+)
+_ANSWER_TRACE_SENTENCE = re.compile(r"(?<=[。！？；])|(?<=[.!?])(?=\s)|(?<=\n)")
+
+
+_TRACE_PAREN = re.compile(r"\([^()\n]*\)|（[^（）\n]*）")
+
+
+def _clear_answer_trace(text):
+    if not _ANSWER_TRACE.search(text):
+        return text
+    # Parenthetical diagnostics must not erase the conclusion they annotate.
+    text = _TRACE_PAREN.sub(lambda part: "" if _ANSWER_TRACE.search(part[0]) else part[0], text)
+    # Remove whole diagnostic-only code fences, not their delimiters alone.
+    text = _FENCE.sub(lambda part: "" if part["body"].strip() and all(
+        not line.strip() or _ANSWER_TRACE.search(line) for line in part["body"].splitlines()) else part[0], text)
+    # Drop the diagnostic sentence, not an entire paragraph or adjacent citations.
+    # Keep list lines atomic so removing a trace can't leave a dangling bullet.
+    output = []
+    for line in text.splitlines(keepends=True):
+        if _ANSWER_TRACE.search(line):
+            clean = "".join(part for part in _ANSWER_TRACE_SENTENCE.split(line)
+                            if not _ANSWER_TRACE.search(part))
+            if clean.strip() in {"", "-", "*", ">"}:
+                clean = ""
+            elif line.endswith("\n") and not clean.endswith("\n"):
+                clean += "\n"
+            line = clean
+        output.append(line)
+    return "".join(output)
+
+
 def public_answer_text(content):
-    """Read only an answer's opted-in text blocks, never raw provider objects."""
+    """Read only opted-in text, excluding structural and diagnostic spill."""
     if isinstance(content, str):
-        return strip_private_text(content)
+        return _clear_answer_trace(strip_private_text(content))
     if not isinstance(content, (list, tuple)):
         return ""
-    return strip_private_text("".join(
+    return _clear_answer_trace(strip_private_text("".join(
         block if isinstance(block, str) else block["text"] for block in content
         if isinstance(block, str) or (isinstance(block, dict) and not private_record(block)
-            and block.get("type") in ("text", "output_text") and isinstance(block.get("text"), str))))
+            and block.get("type") in ("text", "output_text") and isinstance(block.get("text"), str)))))
 
 
 def _object(value):
@@ -305,6 +343,9 @@ def project_artifact_delivery(value):
         if not isinstance(url, str) or not re.fullmatch(r"/api/v2/session/[A-Za-z0-9_-]{8,128}/artifacts/[a-f0-9]{32}", url):
             return {}
         validation = _object(item.get("validation"))
+        ref = item.get("workbench_project_ref")
+        if isinstance(ref, str) and re.fullmatch(r"[a-f0-9]{32}", ref) and validation.get("status") == "passed":
+            fields["workbench_project_ref"] = ref
         fields.update(url=url, validation={"status": project_fields(validation, ids="status").get("status", ""),
                                            "checks": _ids(validation.get("checks"))})
         return fields
@@ -314,6 +355,8 @@ def project_artifact_delivery(value):
         "schema_version": "artifact-delivery/1", "artifacts": assets,
         "user_links": list(dict.fromkeys(item["url"] for item in assets)),
         "limitations": _ids(row.get("limitations")),
+        "missing_formats": [fmt for fmt in _ids(row.get("missing_formats"))
+                            if fmt in {"svg", "png", "pdf", "tiff"}],
         "obligations": _array(row.get("obligations"), lambda item: project_fields(item, texts="label") | {
             "formats": _ids(_object(item).get("formats"))})}
 
@@ -475,19 +518,34 @@ def _terminal_event(row):
         result["stop_reason"] = public_tool_reason(row["stop_reason"])
     for key in ("question", "pending_question"):
         _set_object(result, row, key, project_public_question)
-    _set_array(result, row, "tools_called", _ids)
     _set_array(result, row, "artifact_ids", _ids)
     _set_object(result, row, "turn_envelope", _public_terminal)
     _set_object(result, row, "turn_timings", timing_fields)
-    _set_object(result, row, "export_gate", lambda item: project_fields(item, ids="status reason"))
-    def retrieval(value):
-        item = project_fields(value, ids="source_scope local_route retrieval_decision retrieval_mode retrieval_reason_code",
-                              bools="retrieval_disabled_simple_query")
-        _set_array(item, value, "local_tool_types", _ids)
-        _set_array(item, value, "history_turn_seqs", lambda rows: [entry for entry in rows if type(entry) is int])
-        return item
-    _set_object(result, row, "retrieval_trace", retrieval)
     return result
+
+
+_NARRATION_STAGES = {
+    "local_search": "我先查找相关的本地资料。",
+    "evidence_read": "我会核对原文，确认找到的资料能支持哪些结论。",
+    "web_search": "我再核对相关的公开来源。",
+    "table_read": "我先检查数据表的结构和可用字段。",
+    "data_check": "接下来检查数据质量，找出会影响判断的问题。",
+    "figure_render": "接下来根据已选数据生成图件并检查可用的输出。",
+}
+
+
+def project_execution_narration(row):
+    # Deterministic mode: trust only a Host-selected stage. Never echo arbitrary prose.
+    stage = row.get("stage")
+    if (not isinstance(stage, str) or stage not in _NARRATION_STAGES or
+            row.get("visibility") != "public" or private_record(row)):
+        return {}
+    result = project_fields(row, ids="event_id run_id job_id thread_id client_request_id", numbers="created_at")
+    if (not all(result.get(k) for k in ("event_id", "run_id", "job_id", "thread_id", "client_request_id"))
+            or result["job_id"] != result["run_id"] or "created_at" not in result):
+        return {}
+    return result | {"type": "execution_narration", "visibility": "public", "stage": stage,
+                     "text": _NARRATION_STAGES[stage]}
 
 
 def project_public_event(event, data):
@@ -500,7 +558,9 @@ def project_public_event(event, data):
     if event in _OLD_PROJECTED:
         from src.core.progress_bus import public_progress_payload
         return public_progress_payload(event, row) | cursor
-    if event == "text":
+    if event == "execution_narration":
+        result = project_execution_narration(row)
+    elif event == "text":
         text = public_answer_text(row.get("content"))
         # Ignore discarded blocks but keep meaningful inter-chunk whitespace.
         result = {"content": text} if text else {}

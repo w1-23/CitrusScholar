@@ -130,12 +130,23 @@
   function createProcessView(options) {
     var projection = root.CitrusTaskState.createProcess(), rows = new Map(), settled = false, paused = false;
     function isRunning(item) { return item.kind === 'action' && ['running', 'resuming'].indexOf(item.data.status) >= 0; }
+    function narrated() { return projection.entries.some(function (entry) { return entry.narration; }); }
+    function actionTitle(data, concise) {
+      if (concise && options.publicToolLabel) return options.publicToolLabel(data.tool_name || data.name);
+      return options.clean(data.display_name || options.toolName(data.tool_name || data.name)) || '科研任务';
+    }
+    function conciseStatus(status) {
+      var labels = {complete:'已完成', completed:'已完成', no_results:'未找到结果', partial:'部分完成',
+        cancelled:'已停止', interrupted:'已中断', skipped:'已跳过', not_run:'未执行',
+        unknown:'状态待确认', unavailable:'暂不可用'};
+      return Object.prototype.hasOwnProperty.call(labels, status) ? labels[status] : '未完成';
+    }
     function activeTool() {
       if (settled || paused) return '';
       var active = projection.entries.filter(isRunning).pop();
       if (!active) return '';
       var data = active.data;
-      return options.clean(data.display_name || options.toolName(data.tool_name || data.name)) || '工具执行中';
+      return actionTitle(data, narrated());
     }
     // Keep milestones readable while preserving every actual attempt under one
     // disclosure. A milestone between retries must not split the operation.
@@ -219,6 +230,8 @@
     }
     function draw() {
       var hostIndex = 0, actionIndex = 0, activeRows = new Set(), operations = new Set(), failed = 0, attempts = 0;
+      var inline = narrated();
+      disclosure.hidden = inline;
       projection.entries.forEach(function (item) {
         var row = rows.get(item.id);
         if (!row) { row = node('div', item.kind === 'note' ? 'research-process-note' : 'term-line'); rows.set(item.id, row); }
@@ -227,9 +240,13 @@
         if (item.kind === 'note') {
           row.textContent = item.text;
           row.dataset.noteId = item.note_id;
+          if (item.narration) row.classList.add('execution-narration');
           place(host, row, hostIndex++); return;
         }
         var data = item.data, status = data.status || 'running';
+        if (inline && status === 'proposed') {
+          row.remove(); rows.delete(item.id); return;
+        }
         var operationId = data.logical_key || data.operation_id || data.tool_call_id || item.id;
         operations.add(operationId);
         attempts++;
@@ -247,26 +264,33 @@
         if (!settled && !paused && running) row.setAttribute('aria-current', 'step');
         row.dataset.toolCallId = data.tool_call_id || ''; row.dataset.stepId = data.step_id || '';
         row.dataset.attempt = item.attempt; row.dataset.operationId = operationId;
-        var title = options.clean(data.display_name || options.toolName(data.tool_name || data.name) || '科研任务');
+        var title = actionTitle(data, inline);
         var text = title + ' · ' + (resolution ? resolution.resolution === 'repaired' ? '已修复' : '已由后续结果替代'
           : running ? settled ? '未记录结束状态' : paused ? '当前状态待确认' : '处理中'
             : status === 'proposed' ? settled ? '未记录结束状态' : '已提交'
-            : status === 'unrecorded' ? '未记录结束状态' : options.statusText(status, data.reason_code));
+            : status === 'unrecorded' ? '未记录结束状态' : inline ? conciseStatus(status) : options.statusText(status, data.reason_code));
         var rawSummary = data.summary || data.result_summary || (data.outcome || {}).summary;
         var summary = /^\s*[\[{]/.test(rawSummary || '') ? '执行结果已记录' : options.clean(rawSummary);
         var hint = options.clean(data.action_hint);
-        if (summary) text += ' · ' + summary;
-        if (hint && hint !== title) text += ' · ' + hint;
-        if (Number(item.attempt) > 1) text += ' · 第 ' + item.attempt + ' 次尝试';
-        if (data.elapsed_ms > 0) text += ' · ' + options.elapsed(data.elapsed_ms);
+        if (!inline) {
+          if (summary) text += ' · ' + summary;
+          if (hint && hint !== title) text += ' · ' + hint;
+          if (Number(item.attempt) > 1) text += ' · 第 ' + item.attempt + ' 次尝试';
+          if (data.elapsed_ms > 0) text += ' · ' + options.elapsed(data.elapsed_ms);
+        }
         var msg = row.querySelector('.term-msg');
         if (!msg) { msg = node('span', 'term-msg'); row.appendChild(msg); }
         msg.textContent = text;
         // Keep actual operations under their disclosure; records load only
         // after the user explicitly expands a tool's parameters/results.
-        place(actionList, row, actionIndex++);
-        details(row, item);
-        if (row._toolDetails) place(actionList, row._toolDetails.element, actionIndex++);
+        if (inline) {
+          place(host, row, hostIndex++);
+          if (row._toolDetails) row._toolDetails.element.remove();
+        } else {
+          place(actionList, row, actionIndex++);
+          details(row, item);
+          if (row._toolDetails) place(actionList, row._toolDetails.element, actionIndex++);
+        }
       });
       if (attempts) {
         var tool = activeTool();
@@ -274,7 +298,8 @@
         if (failed) text += ' · ' + failed + ' 次失败';
         heading.classList.toggle('is-running', !!tool);
         heading.textContent = tool ? '执行中 · ' + tool + ' · ' + text : text;
-        place(host, disclosure, hostIndex);
+        if (!inline) place(host, disclosure, hostIndex);
+        else disclosure.remove();
       }
       rows.forEach(function (row, id) {
         if (!activeRows.has(id)) {
@@ -283,10 +308,11 @@
         }
       });
     }
-    return {element: host, projection: projection, activeTool: activeTool,
+    return {element: host, projection: projection, activeTool: activeTool, narrated: narrated,
       begin: function (generation) { if (projection.begin(generation)) draw(); },
       reset: function () { projection.reset(); draw(); },
       pause: function (value) { if (paused !== value) { paused = value; draw(); } },
+      narration: function (data) { if (projection.narration(data)) draw(); },
       note: function (data) {
         var item = projection.note(data);
         if (item) draw();

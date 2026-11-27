@@ -391,12 +391,12 @@ def first_delivery(message, *, call: dict, reader_available: bool):
         payload["delivery"] = "stored_table_overview"
         payload["table_overview"] = table_overview
         payload.pop("previews")
-        payload["notice"] = "样例不是全量。绘图应复用已绑定的源文件，不需要为填满预览而分页或重读。"
+        payload["notice"] = "table_overview 是合成预览，不是原文 JSON 路径，且不代表全量。回读只用 field_index 中的原文路径。绘图复用已绑定的源文件。"
 
     if figure_read_fields:
         payload["read_with"]["available_fields"] = figure_read_fields
         payload.pop("previews")
-        payload["notice"] = ("已登记且格式齐全时给下载链接，不粘贴 SVG 源码；如实说明 QA 未覆盖项。"
+        payload["notice"] = ("已有可用交付卡片时不重复贴链接或 SVG 源码。只说明对用户目标有影响的验证缺口。"
                              "仅缺必要证据时从 available_fields 选字段。control_observation 是摘要，不是原文 JSON 路径。")
 
     if workspace_overview:

@@ -548,3 +548,134 @@ def test_format_only_figure_continuation_does_not_absorb_separate_pdf():
                                     has_tables=True).deliverables
     assert [r["formats"] for r in same_render] == [["svg", "png", "pdf"], ["pdf"]]
     assert same_render[1]["kinds"] == ["report_html"]
+
+
+
+def test_same_render_partial_assets_survive_without_fulfilling_svg_contract():
+    from types import SimpleNamespace
+
+    from src.core.public_delivery import project_artifact_delivery
+    from src.core.turn_outcome import available_single_render_links
+    from src.research.artifact_delivery import build_delivery
+
+    requirements = contract_for_turn("绘制这个图", has_tables=True).deliverables
+    earlier = _published_figure("prior", "older", ("svg", "png", "pdf"))
+    later = _published_figure("current", "later", ("png", "pdf"))
+    rows = [earlier, later]
+    refs = [ref for row in rows for ref in row["artifact_validations"]]
+    for ref in refs:
+        ref.update(sha256=ref["artifact_id"] * 2, size_bytes=42, reason_code="verified")
+    expected = {ref["link"] for ref in later["artifact_validations"]}
+    links = {ref["link"] for ref in refs}
+    goals, gaps = artifact_goal_evidence(requirements, rows, links, single_render_receipt=True)
+    assert not goals and gaps
+    assert available_single_render_links(requirements, rows, links, ()) == expected
+    mixed = [next(iter(expected)), earlier["artifact_validations"][0]["link"]]
+    assert not available_single_render_links(requirements, rows, links, mixed)
+    identity = SimpleNamespace(run_id="run", session_id="fixture-session", owner_user_id=7)
+    manifest = build_delivery(identity=identity, request_id="request", rows=rows, messages={},
+                              requirements=requirements, select_links=expected, gaps=gaps, verified=refs)
+    assert manifest["status"] == "partial" and set(manifest["user_links"]) == expected
+    assert project_artifact_delivery(manifest)["missing_formats"] == ["svg"]
+    pending = build_delivery(identity=identity, request_id="request", rows=[], messages={},
+                             delivery_uncertain=True, verified=[])
+    assert pending["status"] == pending["delivery_status"] == "unknown"
+    assert not pending["artifacts"]
+
+
+
+def test_frozen_workbench_project_matches_the_verified_render_export(monkeypatch):
+    from src.core.public_delivery import project_artifact_delivery
+    from src.research.artifact_delivery import _render_metadata
+
+    monkeypatch.setenv("CITRUS_WORKBENCH_BRIDGE_ENABLED", "1")
+    ref, fid, sha = "a" * 32, "b" * 32, "c" * 64
+    sid = "session-one"
+    export = dict(format="png", artifact_id=fid, sha256=sha)
+    project = dict(session_id=sid, source_kind="script", render_version=1,
+                   document_json={"render_id": "d" * 32}, exports_json={"png": export},
+                   source_json={"frozen_render": {"version": 1}})
+    lookup = lambda project_id, owner: project if (project_id, owner) == (ref, 7) else None
+    bound = _render_metadata(7, sid, ref, export, sha, lookup)
+    assert bound["workbench_project_ref"] == ref
+    assert "workbench_project_ref" not in _render_metadata(7, "elsewhere", ref, export, sha, lookup)
+    assert _render_metadata(8, sid, ref, export, sha, lookup) == {}
+    assert _render_metadata(7, sid, ref, export, "e" * 64, lookup) == {}
+    asset = bound | dict(asset_ref=fid, sha256=sha, url=f"/api/v2/session/{sid}/artifacts/{fid}",
+                         validation={"status": "passed"})
+    def projected(value):
+        return project_artifact_delivery({"schema_version": "artifact-delivery/1", "artifacts": [value]})["artifacts"][0]
+    assert projected(asset)["workbench_project_ref"] == ref
+    assert "workbench_project_ref" not in projected(asset | {"validation": {"status": "failed"}})
+    assert "workbench_project_ref" not in projected(asset | {"workbench_project_ref": "/arbitrary"})
+
+
+
+def test_workbook_page_size_repair_requires_the_same_validated_cell_request(monkeypatch):
+    from io import BytesIO
+    import json
+    from openpyxl import Workbook
+
+    from src.core.turn_outcome import ProposalRepair, completion_errors, completion_from_answer
+    from src.research import tools
+    from src.tools.argument_check import validate_tool_arguments
+
+    name = "inspect_uploaded_table"
+    args = {"inspection": "cells", "file_ids_json": ["a" * 32],
+            "sheet_name": "Trials", "cell_range": "A1:B55"}
+    rejected = {"id": "bad", "name": name, "args": {**args, "page_rows": 70}}
+    corrected = {"id": "good", "name": name, "args": {**args, "page_rows": 50, "header_row": 1}}
+    bad = {"tool_call_id": "bad", "name": name, "status": "not_run", "reason": "invalid_tool_arguments"}
+    good = {"tool_call_id": "good", "name": name, "status": "complete"}
+    records = [bad, good]
+    assert validate_tool_arguments(tools.inspect_uploaded_table, name, rejected["args"])[0]
+    error, normalized = validate_tool_arguments(tools.inspect_uploaded_table, name, corrected["args"])
+    assert not error
+    workbook = Workbook()
+    workbook.active.title = "Trials"
+    for i in range(55):
+        workbook.active.append([i, i * 2])
+    stream = BytesIO()
+    workbook.save(stream)
+    monkeypatch.setattr(tools, "_audit_source_tables", lambda *a, **kw: [{"name": "trials.xlsx", "data": stream.getvalue()}])
+    result = json.loads(tools.inspect_uploaded_table.func(**normalized))
+    assert result["inspection"] == "cells" and result["next_cursor"]
+    assert _same_repair_target(rejected, corrected, records=records)
+    for change in ({"file_ids_json": ["b" * 32]}, {"file_index": 1}, {"sheet_name": "Different"},
+                   {"header_row": 2}, {"cursor": "next"}, {"cell_range": "A1:A40"}, {"page_rows": 51}):
+        assert not _same_repair_target(rejected, {**corrected, "args": corrected["args"] | change}, records=records)
+    assert not _same_repair_target(rejected, corrected, records=[bad | {"status": "unknown"}, good])
+    assert not _same_repair_target(rejected, corrected, records=[bad, good | {"status": "failed"}])
+    assert not _same_repair_target(rejected, corrected, records=[bad | {"reason": "preparation_required"}, good])
+    statement = completion_from_answer("已检查指定工作表的第一页。", records)
+    statement = statement.model_copy(update={"proposal_repairs": [ProposalRepair(
+        rejected_call_id="bad", corrected_call_id="good", reason="Same workbook page query")]})
+    assert completion_errors(statement, records, verified_repairs=["bad"]) == ()
+    assert "unproven_proposal_repair:bad" in completion_errors(statement, records)
+
+
+
+def test_card_only_completion_revalidates_selected_verified_links_on_replay():
+    from src.core.turn_outcome import (completion_digest, completion_errors, completion_from_answer,
+                                       reviewed_completion_valid, reviewed_turn_outcome)
+
+    query = "绘图，导出 SVG。"
+    rows = [_published_figure("done", "figure-card", ("svg",))]
+    [link] = [item["link"] for item in rows[0]["artifact_validations"]]
+    requirements = contract_for_turn(query, has_tables=True).deliverables
+    goals, gaps = artifact_goal_evidence(requirements, rows, {link}, single_render_receipt=True)
+    assert len(goals) == 1 and not gaps
+    statement = completion_from_answer("图已生成。", rows)
+    statement = statement.model_copy(update={"goals": [*statement.goals, *goals]})
+    assert completion_errors(statement, rows)
+    assert not completion_errors(statement, rows, verified_card_links=[link])
+    contract = dict(schema_version=1, request_version=1, requirements=requirements,
+                    verified_links=[link], single_render_receipt=True, verified_card_links=[link])
+
+    def proof(contract):
+        return reviewed_turn_outcome(statement, rows, identity={"run_id": "fixture"}, request_version=1,
+                                     request_hash=completion_digest(query), artifact_contract=contract)
+
+    assert reviewed_completion_valid(proof(contract), rows)
+    assert not reviewed_completion_valid(proof(contract | {"verified_card_links": [link + "-other"]}), rows)
+    assert not reviewed_completion_valid(proof(contract | {"verified_links": []}), rows)

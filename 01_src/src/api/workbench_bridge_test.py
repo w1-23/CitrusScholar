@@ -336,3 +336,108 @@ figure <- ggplot(records, aes(dose, signal)) + geom_line() + geom_point() +
         exported = browser.post(endpoint + "/export", json={"format": "svg"})
         assert exported.status_code == 200, exported.text
         assert b"<svg" in exported.content
+
+
+
+def test_frozen_bundle_delegation_is_exactly_path_owner_session_and_version_scoped(host, monkeypatch):
+    from src.figures import workbench_source as source
+    from src.figures.projects import ProjectError
+
+    client, key, _, _, _ = host
+    ref = "1" * 32
+    path = f"{wire.FROZEN_BUNDLE_PATH}/{ref}/1"
+    renderer, table = "fig, ax = plt.subplots()\n", b'{"data":[1,2]}'
+    sha = lambda value: hashlib.sha256(value).hexdigest()
+    scopes = []
+
+    def prepare(*, figure_id, owner, session):
+        scopes.append((figure_id, owner, session))
+        if (figure_id, owner, session) != (ref, OWNER, SESSION):
+            raise ProjectError("not_found", "not available", status=404)
+        return source.FrozenScriptBundle(renderer, sha(renderer.encode()),
+            (source.FrozenInput("tidy", "input_0.json", sha(table), table),))
+
+    monkeypatch.setattr(source, "prepare_frozen_bundle", prepare)
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=assertion(key, LIST)).status_code == 401
+    assert client.get(path, headers=assertion(key, path, exp=int(time.time()) - 1)).status_code == 401
+    assert client.get(path, headers=assertion(key, path, project_ref="account")).status_code == 404
+    assert client.get(path, headers=assertion(key, path, user_ref=str(OTHER))).status_code == 404
+    assert client.get(path.removesuffix("1") + "2", headers=assertion(key, path)).status_code == 404
+    assert scopes == []
+    assert client.get(path, headers=assertion(key, path, project_ref=f"session:{SIBLING}")).status_code == 404
+    response = client.get(path, headers=assertion(key, path))
+    assert response.status_code == 200
+    assert response.headers["content-type"] == wire.FROZEN_BUNDLE_MEDIA
+    assert response.headers["cache-control"] == "private, no-store"
+    size = int.from_bytes(response.content[:4], "big")
+    manifest = json.loads(response.content[4:4 + size])
+    assert manifest["inputs"] == [{"binding": "tidy", "name": "input_0.json", "size": len(table), "sha256": sha(table)}]
+    assert response.content[4 + size:] == renderer.encode() + table
+    assert scopes == [(ref, OWNER, SIBLING), (ref, OWNER, SESSION)]
+    client.cookies.set("citrus_auth", "test-browser-session")
+    assert client.post(LAUNCH, json={"frozen_project": ref}).status_code == 404
+    assert client.post(LAUNCH, json={"session_ref": SIBLING, "frozen_project": ref}).status_code == 404
+    opened = client.post(LAUNCH, json={"session_ref": SESSION, "frozen_project": ref})
+    assert opened.status_code == 200
+    claims = json.loads(_unb64(opened.json()["launch_ticket"].split(".")[0]))
+    assert claims["frozen_project"] == ref and claims["project_ref"] == "session:" + SESSION
+
+
+    # Run this cross-repository edge with the independent Workbench on PYTHONPATH.
+    import importlib.util
+    if importlib.util.find_spec("wb") is not None:
+        from wb.auth import Session
+        from wb.library import Library, LibraryMissing
+        from wb.frozen_inputs import decode_frozen_inputs
+        from wb.bundle import InvalidInput
+
+        library = Library("http://localhost", key, client=client)
+        received = library.frozen_inputs(Session(f"host:{OWNER}", f"session:{SESSION}", "/"), ref)
+        assert received.entrypoint.body == renderer.encode()
+        assert received.bindings == ("tidy",)
+        assert received.dependencies[0].body == table
+        with pytest.raises(LibraryMissing):
+            library.frozen_inputs(Session(f"host:{OWNER}", f"session:{SIBLING}", "/"), ref)
+        for bad in (response.content[:-1], response.content[:-1] + b"!", response.content + b"!"):
+            with pytest.raises(InvalidInput):
+                decode_frozen_inputs(bad)
+
+
+
+def test_signed_workbench_machine_reads_and_browser_guard_are_separate(host):
+    from ipaddress import IPv4Network
+    from src.api.lan_ingress import LanIngress
+    from src.api.main import account_auth_guard
+
+    existing, key, put, users, _ = host
+    app = existing.app
+    authority = "127.0.0.1:8060"
+    app.state.lan_ingress = LanIngress("192.0.2.1:8443", authority,
+        b"fixture-lan-token", (IPv4Network("192.0.2.0/24"),))
+    app.state.workbench_bridge_config = bridge.BridgeConfig(key, "citrus-workbench", "/workbench/workbench/",
+        "/workbench/api/v1/launch")
+    app.middleware("http")(account_auth_guard)
+    ref = put(SESSION, OWNER, "input.py", b"print(1)", mime="text/plain")
+    asset_path = f"{LIST}/{ref}/source"
+    frozen_path = f"{wire.FROZEN_BUNDLE_PATH}/{ref}/1"
+    with TestClient(app, base_url=f"http://{authority}", client=("127.0.0.1", 5000)) as local:
+        assert local.get(LIST, params={"type": "figure"}, headers=assertion(key, LIST)).status_code == 200
+        assert local.get(asset_path, headers=assertion(key, asset_path)).content == b"print(1)"
+        # A signed request reaches the resource handler, which still checks
+        # the scoped project, the account, and core readiness.
+        assert local.get(frozen_path, headers=assertion(key, frozen_path)).status_code == 404
+        for path, headers in ((asset_path, {}), (asset_path, assertion(key, LIST)),
+                              (asset_path, assertion(key, asset_path, exp=int(time.time()) - 1)),
+                              (LAUNCH, assertion(key, LAUNCH)), (frozen_path + "/extra", assertion(key, frozen_path + "/extra"))):
+            assert local.get(path, headers=headers).status_code == 400
+        assert local.post(asset_path, headers=assertion(key, asset_path)).status_code == 400
+        token = assertion(key, asset_path)["Authorization"]
+        assert local.get(asset_path, headers=[("authorization", token), ("authorization", token)]).status_code == 400
+        app.state.core_accepting_requests = False
+        assert local.get(asset_path, headers=assertion(key, asset_path)).status_code == 503
+        app.state.core_accepting_requests = True
+        users[OWNER]["active"] = False
+        assert local.get(asset_path, headers=assertion(key, asset_path)).status_code == 401
+    with TestClient(app, base_url=f"http://{authority}", client=("192.0.2.55", 5000)) as remote:
+        assert remote.get(asset_path, headers=assertion(key, asset_path)).status_code == 400

@@ -112,7 +112,19 @@ class RetrievalLedger:
 
     def admit(self, name: str, call_id: str, args: Mapping) -> str | None:
         reason = self.budget.admit(name, call_id, args)
-        if reason and (key := retrieval_key(name, args)) and self._first_calls.get(key) == call_id:
+        if reason:
+            self.release_unexecuted(name, call_id, args)
+        return reason
+
+    def reserve(self, name: str, call_id: str, args: Mapping) -> str | None:
+        reason = self.budget.reserve(name, call_id, args)
+        if reason:
+            self.release_unexecuted(name, call_id, args)
+        return reason
+
+    def release_unexecuted(self, name: str, call_id: str, args: Mapping) -> None:
+        self.budget.release(call_id)
+        if (key := retrieval_key(name, args)) and self._first_calls.get(key) == call_id:
             # The existing claim precedes budget admission. A rejected call
             # has no observation for future duplicate calls to reference.
             if original := self._retry_parents.pop(call_id, None):
@@ -121,7 +133,6 @@ class RetrievalLedger:
                 self._retryable.add(key)
             else:
                 self._first_calls.pop(key)
-        return reason
 
     def restore_admission(self, name: str, call_id: str, args: Mapping) -> None:
         self.budget.restore(name, call_id, args)

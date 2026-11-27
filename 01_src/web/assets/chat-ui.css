@@ -24,9 +24,6 @@
 .composer-admission-recovery[hidden] { display:none; }
 .composer-admission-recovery .history-retry { margin:0 0 5px; }
 .composer-controls { display:flex; gap:6px; margin-inline-start:auto; align-items:center; }
-.continuation-attachment-references { display:inline-flex; flex-wrap:wrap; gap:4px; max-width:100%; }
-.continuation-attachment-reference { display:inline-block; max-width:18em; overflow:hidden; text-overflow:ellipsis;
-  white-space:nowrap; vertical-align:middle; padding:2px 8px; border:1px solid var(--border-hover); border-radius:999px; }
 .chat-panel .input-box .send-btn {
   width:36px; height:36px; flex-shrink:0; border-radius:11px; font-size:17px;
   color:var(--ui-on-control); background:var(--ui-control); box-shadow:none;
@@ -241,10 +238,3 @@ body:is(.session-files-open, :has(#ctxDrawer.open)) .chat-panel :is(.turn-rail,.
 
 /* Queue ownership is exposed on the corresponding user turn, never as a bot reply. */
 .message.turn-awaiting-dispatch { display:none; }
-.message.user .content:has(.turn-user-queue-state) { display:flex; flex-direction:column; gap:5px; }
-.turn-user-queue-state {
-  display:inline-flex; align-items:center; align-self:flex-end; gap:5px;
-  padding:2px 7px; border:1px solid var(--border-hairline); border-radius:999px;
-  color:var(--text-secondary); background:var(--bg-surface); font-size:11px; line-height:1.35;
-}
-.turn-user-queue-state::before { content:""; width:5px; height:5px; flex:none; border-radius:50%; background:var(--accent); }

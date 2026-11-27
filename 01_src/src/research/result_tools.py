@@ -274,6 +274,10 @@ def read_tool_result(tool_call_id: str, start_char: int = 0,
                 selected[path] = _select(data, path)
             except (ValueError, KeyError, IndexError):
                 missing_fields.append(path)
+        if not selected:
+            return _read_rejected("unavailable_fields", "result_fields_missing",
+                                  "请求的字段不在原始回执中。请使用原文的字段索引，或按原文分页读取。",
+                                  tool_result_ref=source, storage=storage, missing_fields=missing_fields)
         try:
             text = _selected_json(selected).encode("utf-8", "backslashreplace").decode("utf-8")
         except RecursionError:

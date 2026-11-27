@@ -13,6 +13,9 @@ FILE_REF = r"[a-f0-9]{32}"
 SESSION_REF = r"[A-Za-z0-9_-]{8,128}"
 ASSET_LIMIT = 12 * 1024 * 1024
 ASSETS_PATH = "/_internal/workbench/assets"
+FROZEN_BUNDLE_PATH = "/_internal/workbench/frozen-bundles"
+FROZEN_BUNDLE_MEDIA = "application/vnd.citrus.frozen-script-v1"
+FROZEN_BUNDLE_HEADER_LIMIT = 8192
 _LAUNCH = "citrus-workbench-launch"
 _RESOURCE = "workbench-resource"
 _RESOURCE_AUDIENCE = "citrus-resource-api"
@@ -33,7 +36,7 @@ def _mac(key: bytes, purpose: str, payload: str) -> bytes:
 
 
 def launch_ticket(key: bytes, audience: str, owner: int, session: str,
-                  assets: list[str]) -> str:
+                  assets: list[str], *, frozen_project: str = "") -> str:
     claims = {
         "iss": _LAUNCH,
         "aud": audience,
@@ -44,6 +47,8 @@ def launch_ticket(key: bytes, audience: str, owner: int, session: str,
         "source_assets": list(dict.fromkeys(assets)),
         "return_to": f"/?figure_session={session}" if session else "/",
     }
+    if frozen_project:
+        claims["frozen_project"] = frozen_project
     payload = _encode(json.dumps(claims, separators=(",", ":")).encode())
     return f"{payload}.{_encode(_mac(key, _LAUNCH, payload))}"
 

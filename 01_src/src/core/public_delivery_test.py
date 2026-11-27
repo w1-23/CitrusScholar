@@ -242,3 +242,33 @@ def test_verified_plot_placeholder_keeps_preview_links_and_prose_without_pasting
     assert not previews(rows=[validated[0] | {"link": f"{link}-old"}])
     entry["sha256"] = "0" * 64
     assert not previews()  # The registered placeholder and owned SVG must be identical bytes.
+
+
+
+def test_public_answer_drops_known_trace_but_keeps_findings_and_natural_limits():
+    text = "找到了两篇相关文献[L1]。内部查询停止：`retrieval_followup_budget_exhausted`。\n目前只读到摘要，不据此判断试验条件。"
+    clean = "找到了两篇相关文献[L1]。\n目前只读到摘要，不据此判断试验条件。"
+    assert public_answer_text(text) == clean
+    assert project_public_event("text", {"content": text, "delivery": "committed"})["content"] == clean
+    assert public_answer_text([{"type": "text", "text": "no_candidate_"},
+                               {"type": "text", "text": "pool。保留的证据[W1]。"}]) == "保留的证据[W1]。"
+    assert public_answer_text("The nominal budget was 1.5 kg; recovery was partial.") == "The nominal budget was 1.5 kg; recovery was partial."
+
+
+
+def test_terminal_diagnostics_do_not_replace_findings_or_escape_in_side_fields():
+    finding = "已核对表 2，处理组的均值为 2.5[L2]。"
+    answer = (finding[:-1] + "（交付诊断 `completion_proof_invalid`）。\n"
+              "```json\n{\"code\": \"turn_reconcile_required\"}\n```\n"
+              "另一个样本缺少原始测量值[W1]。")
+    expected = finding + "\n另一个样本缺少原始测量值[W1]。"
+    row = {"answer": answer, "turn_status": "partial", "artifact_ids": ["verified-file"],
+           "tools_called": ["internal_executor"], "export_gate": {"status": "private_code"},
+           "retrieval_trace": {"retrieval_reason_code": "private_reason"}}
+    terminal = project_public_event("done", row)
+    assert terminal == {"answer": expected, "turn_status": "partial", "artifact_ids": ["verified-file"]}
+    assert project_public_event("done", terminal) == terminal
+    assert project_public_event("text", {"content": answer, "delivery": "committed"})["content"] == expected
+    scientific = ("结论（3 个重复）[L7]。\n```python\n"
+                  "estimate = {'budget': 2.5, 'partial': False}\n```\n")
+    assert public_answer_text(scientific) == scientific

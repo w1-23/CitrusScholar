@@ -164,3 +164,36 @@ test('public figure milestones are deduplicated in live and restored timelines',
     assert.doesNotMatch(view.body.textContent, /untrusted-draft|private-raw/);
   }
 });
+
+
+test('narrated timeline shows ordered public labels, never raw tool metadata', t => {
+  const {b, panel} = mount();
+  const replay = mount().panel;
+  t.after(panel.stopClock);
+  t.after(replay.stopClock);
+  const mark = (stage, text, seq) => ({type:'execution_narration', event_id:stage,
+    visibility:'public', job_id:'job', text, seq});
+  const privateBits = {tool_name:'secret_internal_name', display_name:'raw name',
+    reason_code:'context_budget_exhausted', summary:'private summary',
+    action_hint:'raw hint', attempt:2, elapsed_ms:9183};
+  const frames = [
+    ['job', {job_id:'job'}],
+    ['tool_call_start', {tool_call_id:'t', status:'proposed', ...privateBits}],
+    ['execution_narration', mark('read','我先查看表格。',3)],
+    ['tool_executing', {tool_call_id:'t', status:'running', ...privateBits}],
+    ['tool_result', {tool_call_id:'t', status:'failed', ...privateBits}],
+    ['execution_narration', mark('check','接下来检查数据质量。',6)],
+    ['execution_narration', mark('read','我先查看表格。',3)]
+  ];
+  for (const [type,data] of frames) panel.receive(type,data);
+  const entries = frames.slice(0,6).map(([event,data],i)=>({seq:i+1,event,data}));
+  b.ctx.projectHistoryTrace(replay,entries.reverse());
+  for (const view of [panel, replay]) {
+    const timeline = view.body.querySelector('.research-process-timeline');
+    assert.deepEqual(Array.from(timeline.children, row => row.textContent),
+      ['我先查看表格。', '处理任务 · 未完成', '接下来检查数据质量。']);
+    assert.doesNotMatch(view.body.textContent,
+      /secret_internal_name|raw name|private summary|raw hint|第 2 次|上下文|9\.2 秒/);
+    assert.equal(timeline.querySelector('.research-action-group'), null);
+  }
+});

@@ -172,18 +172,21 @@ test('ordinary send posts once to the durable turn queue and never streams /api/
   assert.match(body.client_request_id, /^crid-/);
   assert.equal(b.requests.filter(r => r.url === '/api/v2/chat').length, 0);
   assert.equal(b.requests.filter(r => r.url.includes('/updates')).length, 0);
+  assert.equal(b.chatContainer.querySelectorAll('.user').length, 1);
+  assert.ok(b.chatContainer.querySelector('.bot').classList.contains('turn-awaiting-dispatch'));
+  assert.equal(b.chatContainer.querySelector('.turn-user-queue-state'), null);
   b.respond(r => r.opts.method === 'POST', turnEntry({client_request_id: body.client_request_id, queue_position: 1}), 202);
   await flush();
   const userBubble = b.chatContainer.querySelector('.user');
   assert.ok(userBubble.textContent.includes('核对资料并生成报告'));
-  assert.equal(userBubble.querySelector('.turn-user-queue-state').textContent, '待发送');
-  assert.equal(b.chatContainer.querySelectorAll('.turn-user-queue-state').length, 1);
+  assert.equal(userBubble.querySelector('.turn-user-queue-state'), null);
+  assert.equal(b.chatContainer.querySelectorAll('.turn-user-queue-state').length, 0);
   assert.ok(b.chatContainer.querySelector('.bot').classList.contains('turn-awaiting-dispatch'));
   assert.equal(b.chatContainer.querySelector('.turn-queue-cancel'), null);
   assert.equal(b.requests.filter(r => r.url.includes('/updates')).length, 0);
 });
 
-test('only the original user bubble shows pending and the observer waits for dispatch', async () => {
+test('only the user is visible while the observer waits for dispatch', async () => {
   const b = browser();
   b.userInput.value = '第三条';
   await b.context.sendMsg();
@@ -192,7 +195,7 @@ test('only the original user bubble shows pending and the observer waits for dis
   const body = JSON.parse(post.opts.body);
   b.respond(r => r.opts.method === 'POST', turnEntry({client_request_id: body.client_request_id, queue_position: 3}), 202);
   await flush();
-  assert.equal(b.chatContainer.querySelector('.turn-user-queue-state').textContent, '待发送');
+  assert.equal(b.chatContainer.querySelector('.turn-user-queue-state'), null);
   assert.doesNotMatch(b.chatContainer.textContent, /第 3 位|排队中/);
   assert.ok(b.chatContainer.querySelector('.bot').classList.contains('turn-awaiting-dispatch'));
   assert.notEqual(b.chatContainer.querySelector('.research-task-line').dataset.state, 'waiting');
@@ -204,7 +207,7 @@ test('only the original user bubble shows pending and the observer waits for dis
   b.respond(r => r === poll, {turns: [turnEntry({
     client_request_id: body.client_request_id, job_id: 'root-2', state: 'claimed'})]});
   await flush();
-  assert.equal(b.chatContainer.querySelector('.turn-user-queue-state').textContent, '待发送');
+  assert.equal(b.chatContainer.querySelector('.turn-user-queue-state'), null);
   assert.ok(b.chatContainer.querySelector('.bot').classList.contains('turn-awaiting-dispatch'));
   assert.equal(b.get('send-btn').getAttribute('aria-label'), '发送消息');
   assert.equal(b.requests.filter(r => r.url.includes('/events?after=0')).length, 0);
@@ -282,7 +285,7 @@ test('the shared button stops the active job while Enter admits exactly one inde
   b.respond(r => r === request, turnEntry({client_request_id: id, job_id: 'follower', queue_position: 2}), 202);
   await flush();
   assert.equal(posts(b).filter(isAdmission).length, 2);
-  assert.equal(b.chatContainer.querySelectorAll('.turn-user-queue-state').length, 1);
+  assert.equal(b.chatContainer.querySelectorAll('.turn-user-queue-state').length, 0);
   assert.equal(b.context.activeTurnComposer, binding);
   assert.equal(b.requests.filter(r => r.url.includes('/jobs/follower/')).length, 0);
   assertNoUpdates(b);
@@ -312,7 +315,7 @@ test('Enter behind an active task freezes attachments and Skills without a Brows
     job_id: 'root-2', state: 'queued', queue_position: 2}), 202);
   await flush();
   const queuedUser = b.chatContainer.querySelectorAll('.user').find(n => n.textContent.includes('第二条'));
-  assert.equal(queuedUser.querySelector('.turn-user-queue-state').textContent, '待发送');
+  assert.equal(queuedUser.querySelector('.turn-user-queue-state'), null);
   assert.equal(acknowledged, skills);
   assert.equal(b.context.activeTurnComposer, binding);
 });
@@ -368,7 +371,7 @@ test('a lost admission response is reconciled by request identity without re-pos
     client_request_id: body.client_request_id, job_id: 'root-9', state: 'queued', queue_position: 1}));
   await flush();
   assert.equal(b.requests.filter(r => r.opts.method === 'POST').length, 1);
-  assert.equal(b.chatContainer.querySelector('.turn-user-queue-state').textContent, '待发送');
+  assert.equal(b.chatContainer.querySelector('.turn-user-queue-state'), null);
 });
 
 test('reloading restores one original queued bubble without rank or a cancellation action', async () => {
@@ -384,7 +387,7 @@ test('reloading restores one original queued bubble without rank or a cancellati
   assert.equal(b.chatContainer.querySelectorAll('.user').length, 1);
   const user = b.chatContainer.querySelector('.user');
   assert.match(user.textContent, /旧的排队消息/);
-  assert.equal(user.querySelector('.turn-user-queue-state').textContent, '待发送');
+  assert.equal(user.querySelector('.turn-user-queue-state'), null);
   assert.ok(b.chatContainer.querySelector('.bot').classList.contains('turn-awaiting-dispatch'));
   assert.equal(b.chatContainer.querySelector('.turn-queue-cancel'), null);
   assert.equal(b.get('send-btn').getAttribute('aria-label'), '发送消息');

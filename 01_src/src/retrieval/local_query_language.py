@@ -31,7 +31,7 @@ def requires_translation(text: object) -> bool:
     return any(char.isalpha() and not char.isascii() for char in str(text or ""))
 
 
-def normalize_search_query(query: object) -> tuple[str | None, dict[str, object]]:
+def normalize_search_query(query: object, *, timeout_s: float | None = None) -> tuple[str | None, dict[str, object]]:
     """Return an English retrieval query or a visible failure; never native fallback."""
     original = str(query or "").strip()
     info: dict[str, object] = {
@@ -52,7 +52,9 @@ def normalize_search_query(query: object) -> tuple[str | None, dict[str, object]
     try:
         # Import lazily to keep query validation independent of model startup.
         from src.retrieval.query_translation import cached_translation
-        translated = str(cached_translation(original) or "").strip()
+        value = (cached_translation(original) if timeout_s is None
+                 else cached_translation(original, timeout_s=timeout_s))
+        translated = str(value or "").strip()
     except Exception as exc:  # noqa: BLE001
         translated = ""
         info["error"] = f"translation failed: {type(exc).__name__}: {exc}"

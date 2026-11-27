@@ -4,7 +4,9 @@
   const params = new URLSearchParams(window.location.search);
   const sid = params.get('session_ref') || params.get('session_id') || '';
   const input = {};
+  const frozen = params.get('frozen_project') || '';
   if (/^[a-zA-Z0-9_-]{1,128}$/.test(sid)) input.session_ref = sid;
+  if (input.session_ref && /^[a-f0-9]{32}$/.test(frozen)) input.frozen_project = frozen;
   const post = (url, value) => fetch(url, {method: 'POST', credentials: 'same-origin',
     redirect: 'error', cache: 'no-store', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(value)});
   try {

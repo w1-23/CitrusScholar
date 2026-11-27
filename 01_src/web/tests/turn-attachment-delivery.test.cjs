@@ -4,7 +4,6 @@ const assert = require('node:assert/strict');
 const {browser, flush} = require('./frontend-harness.cjs');
 
 const input = {file_id:'input-id', filename:'question.pdf'};
-const second = {file_id:'next-input-id', filename:'old-question.pdf'};
 const terminal = {display_status:'completed'};
 const row = (rid, attachments) => ({
   turn_request_id:rid, job_id:'job-'+rid, terminal_snapshot:terminal,
@@ -18,59 +17,26 @@ function history(b, rows) {
   b.ctx.renderHistoryMessages([], b.ctx.normalizeHistoryTurns(rows));
 }
 
-test('only a server-confirmed source exposes an inheritance button and only explicit choice sends it', async () => {
+test('history attachments remain usable without implicit reuse or eligibility probes', async () => {
   const b = browser();
   const previews = [];
   b.ctx.openAccountFilePreview = file => previews.push(file.file_id);
-  history(b, [row('none', []), row('gone', [second]), row('eligible', [input])]);
-  const bots = assistant(b);
-  assert.equal(bots.some(continuation), false);
-  const requests = continuationRequests(b);
-  assert.deepEqual(requests.map(req => req.url), [
-    '/api/v2/session/session/continuation/gone', '/api/v2/session/session/continuation/eligible'
-  ]);
-  b.reply(requests[0], {attachments:[]});
-  b.reply(requests[1], {attachments:[input]});
-  await flush();
-  assert.equal(continuation(bots[0]), null);
-  assert.equal(continuation(bots[1]), null);
-  assert.ok(continuation(bots[2]));
-  b.ctx.confirmTurnAttachmentInheritance(bots[2].querySelector('.content'));
-  assert.equal(continuationRequests(b).length, 2, 'the same mounted turn is not checked twice');
+  history(b, [row('none', []), row('source', [input])]);
+  assert.equal(assistant(b).some(continuation), false);
+  assert.equal(continuationRequests(b).length, 0);
+  const chip = b.get('chat-container').querySelectorAll('.user').at(-1).querySelector('.sent-attachment-reference');
+  assert.equal(chip.querySelector('.sent-attachment-name').textContent, input.filename);
+  chip.onclick();
+  assert.deepEqual(previews, [input.file_id]);
 
   b.get('user-input').value = '独立问题';
   await b.ctx.sendMsg();
   await flush();
-  const first = b.requests.find(r => r.opts.method === 'POST' && r.url.endsWith('/turn-queue'));
-  assert.equal(Object.hasOwn(JSON.parse(first.opts.body), 'continue_from'), false);
-  b.reply(first, {client_request_id:JSON.parse(first.opts.body).client_request_id, state:'queued'}, 202);
-  await flush();
-  continuation(bots[2]).fire('click');
-  b.get('user-input').value = '使用已确认的文件';
-  await b.ctx.sendMsg();
-  await flush();
-  const last = b.requests.filter(r => r.opts.method === 'POST' && r.url.endsWith('/turn-queue')).at(-1);
-  assert.equal(JSON.parse(last.opts.body).continue_from, 'eligible');
-  assert.deepEqual(JSON.parse(last.opts.body).file_refs, [], 'inherited files are resolved by the server');
-  const users = b.get('chat-container').querySelectorAll('.user');
-  const chip = users.at(-1).querySelector('.sent-attachment-reference');
-  assert.equal(chip.querySelector('.sent-attachment-name').textContent, input.filename);
-  assert.equal(users.at(-1).querySelector('.sent-attachment-count'), null);
-  chip.onclick();
-  assert.deepEqual(previews, [input.file_id]);
-});
-
-test('eligibility response from an earlier session generation cannot reveal a control', async () => {
-  const b = browser();
-  history(b, [row('source', [input])]);
-  const [old] = assistant(b);
-  const [probe] = continuationRequests(b);
-  b.ctx.sessionNavigation++;
-  history(b, [row('outside', [])]);
-  b.reply(probe, {attachments:[input]});
-  await flush();
-  assert.equal(continuation(old), null);
-  assert.equal(continuation(assistant(b)[0]), null);
+  const request = b.requests.find(r => r.opts.method === 'POST' && r.url.endsWith('/turn-queue'));
+  const body = JSON.parse(request.opts.body);
+  assert.equal(Object.hasOwn(body, 'continue_from'), false);
+  assert.deepEqual(body.file_refs, []);
+  assert.equal(continuationRequests(b).length, 0);
 });
 
 test('an authorized same-turn card replaces only its duplicate answer link', () => {
@@ -81,17 +47,21 @@ test('an authorized same-turn card replaces only its duplicate answer link', () 
   const answer = b.document.createElement('div');
   answer.className = 'turn-answer';
   content.appendChild(answer);
-  const url = '/api/v2/files/out-id/download';
-  for (const [href, text] of [[url,'分析结果'],['https://doi.org/10.0/example','参考文献'],['/api/v2/files/other/download','其他来源']]) {
+  const url = '/api/v2/session/session/artifacts/art-id';
+  const alias = '/api/v2/files/out-id/download';
+  for (const [href, text] of [[url,'分析结果'],[alias,'原文件'],['https://doi.org/10.0/example','参考文献'],['/api/v2/files/other/download','其他来源'],['https://external.test'+alias,'外站']]) {
     const anchor = b.document.createElement('a');
     anchor.setAttribute('href',href);
     anchor.textContent = text;
     answer.appendChild(anchor);
   }
   const file = {file_id:'out-id', artifact_id:'art-id', filename:'report.pdf', source_session_id:'session', turn_request_id:'card-turn'};
-  b.ctx.renderArtifactDelivery(content,{schema_version:'artifact-delivery/1',status:'verified',artifacts:[{asset_ref:'art-id',url}]});
   b.ctx.appendTurnGeneratedFiles(content,[{...file,turn_request_id:'other-turn'}]);
-  assert.equal(answer.querySelectorAll('a').length,3);
+  assert.equal(answer.querySelectorAll('a').length,5);
+  b.ctx.appendTurnGeneratedFiles(content,[file]);
+  assert.equal(answer.querySelectorAll('a').length,5);
+  assert.equal(assistant(b)[0].querySelector('.turn-file-card').querySelector('a'),null);
+  b.ctx.renderArtifactDelivery(content,{schema_version:'artifact-delivery/1',status:'verified',artifacts:[{asset_ref:'art-id',url}]});
   b.ctx.appendTurnGeneratedFiles(content,[file]);
   b.ctx.appendTurnGeneratedFiles(content,[file]);
   const bot = assistant(b)[0];
@@ -100,25 +70,51 @@ test('an authorized same-turn card replaces only its duplicate answer link', () 
   assert.equal(bot.querySelector('.turn-file-card').querySelector('a').href, url);
   assert.match(answer.textContent,/分析结果/);
   assert.deepEqual(Array.from(answer.querySelectorAll('a'), a => a.getAttribute('href')),
-    ['https://doi.org/10.0/example','/api/v2/files/other/download']);
+    ['https://doi.org/10.0/example','/api/v2/files/other/download','https://external.test'+alias]);
 });
 
 
-test('only a source still settling gets a bounded eligibility retry', async () => {
+test('treats missing formats and uncertain publication as different states', () => {
   const b = browser();
-  history(b, [row('settling', [input]), row('unavailable', [second])]);
-  const [pending, unavailable] = continuationRequests(b);
-  const timersBefore = new Set(b.timers.keys());
-  b.reply(pending, {detail:{code:'turn_baseline_not_ready'}}, 409);
-  b.reply(unavailable, {detail:{code:'turn_baseline_unavailable'}}, 409);
-  await flush();
-  const retries = [...b.timers].filter(([id]) => !timersBefore.has(id));
-  assert.equal(retries.length, 1);
-  retries[0][1]();
-  const retry = continuationRequests(b).at(-1);
-  assert.equal(retry.url, pending.url);
-  b.reply(retry, {attachments:[input]});
-  await flush();
-  assert.ok(continuation(assistant(b)[0]));
-  assert.equal(continuation(assistant(b)[1]), null);
+  assert.equal(b.ctx.artifactDeliveryText({status:'partial',verified_file_ids:['png','pdf'],missing_formats:['svg']}),
+    '部分文件已交付 · 缺少 SVG · 已核实 2 个文件');
+  assert.equal(b.ctx.artifactDeliveryText({status:'unknown',missing_formats:['svg']}),'正在确认交付');
+});
+
+
+test('execution narration interleaves same-turn operation rows and deduplicates replays', () => {
+  const b = browser();
+  const content = b.ctx.addMessage('bot','');
+  const process = b.ctx.CitrusTaskCards.createProcessView({container:content, clean:value=>String(value || ""),
+    toolName:()=> '读取表格', statusText:()=> '已完成', elapsed:String});
+  const note = (event_id,text) => ({type:'execution_narration',visibility:'public',event_id,text});
+  const first = note('narration:table_read','我先查看表格');
+  process.narration(first);
+  process.action({tool_call_id:'read-1', display_name:'读取表格', status:'running'});
+  process.action({tool_call_id:'read-1', display_name:'读取表格', status:'complete'});
+  process.narration(note('narration:data_check','再检查缺失值'));
+  process.narration(first);
+  assert.deepEqual(Array.from(process.element.children).filter(row=>!row.hidden).map(row=>row.textContent),
+    ['我先查看表格','读取表格 · 已完成','再检查缺失值']);
+});
+
+
+test('verified formats expose one exact Workbench action for their common render', () => {
+  const b = browser();
+  const content = b.ctx.addMessage('bot','');
+  const sid = 'session-one', project = 'c'.repeat(32);
+  content.dataset.sessionId = sid;
+  content.dataset.requestId = 'turn';
+  const files = ['png','pdf'].map((fmt, i) => ({file_id:'out-'+i, artifact_id:String(i+1).repeat(32),
+    filename:'plot.'+fmt, source_session_id:sid, turn_request_id:'turn'}));
+  b.ctx.appendTurnGeneratedFiles(content,files);
+  assert.equal(assistant(b)[0].querySelector('.turn-file-workbench'), null);
+  b.ctx.renderArtifactDelivery(content,{schema_version:'artifact-delivery/1',status:'verified',
+    artifacts:files.map(file=>({asset_ref:file.artifact_id,
+      url:`/api/v2/session/${sid}/artifacts/${file.artifact_id}`, workbench_project_ref:project}))});
+  b.ctx.appendTurnGeneratedFiles(content,files);
+  b.ctx.appendTurnGeneratedFiles(content,files);
+  const links = assistant(b)[0].querySelectorAll('.turn-file-workbench');
+  assert.equal(links.length,1);
+  assert.equal(links[0].href,`/figures?session_ref=${sid}&frozen_project=${project}`);
 });

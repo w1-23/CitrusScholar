@@ -1194,9 +1194,12 @@ def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime,
             expected.append(("audit_prepared_dataset", "partial" if partial else "complete"))
         assert [tuple(row) for row in operations] == expected
         if task == "figure":
-            import re
-
-            link, = re.findall(r"\]\((/api/v2/session/[^/]+/artifacts/[a-f0-9]{32})\)", terminal["answer"])
+            delivery = terminal["turn_envelope"]["artifact_delivery"]
+            assert delivery["delivery_status"] == "complete"
+            asset, = delivery["artifacts"]
+            link = asset["url"]
+            assert link not in terminal["answer"]
+            assert asset["validation"]["status"] == "passed"
             download = runtime.client.get(link)
             assert download.status_code == 200, download.text
             assert download.headers["content-type"].startswith("image/svg+xml")
@@ -1390,3 +1393,76 @@ def test_external_scientific_source_chain_accepts_worker_report(runtime, monkeyp
                                                      ("collect_external_skill", "complete")]
     finally:
         runtime.client.portal.call(client.aclose)
+
+
+
+def test_verified_file_is_downloadable_only_to_its_owner(runtime, monkeypatch, tmp_path):
+    import hashlib
+
+    from src.core import tracing
+    from src.research import tools
+    from src.research.artifact_delivery import build_delivery
+
+    for module in (main, tools, files):
+        monkeypatch.setattr(module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(tools, "get_user_id", lambda: runtime.owner)
+    monkeypatch.setattr(tools, "get_session_id", lambda: runtime.sid)
+    monkeypatch.setattr(tracing, "get_user_id", lambda: runtime.owner)
+    monkeypatch.setattr(tracing, "get_client_request_id", lambda: "download-fixture")
+    content = b"sample\nverified receipt\n"
+    url = tools._save_artifact("receipt.txt", content, "text/plain")
+    identity = SimpleNamespace(run_id="download-run", session_id=runtime.sid, owner_user_id=runtime.owner)
+    result = tools.validate_artifact_links([url], session_id=runtime.sid,
+                                          owner_user_id=runtime.owner, request_id="download-fixture")
+    [verified] = result
+    assert verified["valid"] and verified["reason_code"] == "verified"
+    manifest = build_delivery(identity=identity, request_id="download-fixture", rows=[], messages={},
+                              verified=result)
+    [asset] = manifest["artifacts"]
+    assert manifest["status"] == "available"
+    response = runtime.client.get(asset["url"])
+    assert response.status_code == 200 and response.content == content
+    assert response.headers["content-type"].split(";")[0] == asset["mime_type"] == "text/plain"
+    assert int(response.headers["content-length"]) == asset["size_bytes"] == len(content)
+    assert hashlib.sha256(response.content).hexdigest() == asset["sha256"]
+    cookie = runtime.client.cookies.get("citrus_auth")
+    runtime.client.cookies.set("citrus_auth", runtime.other)
+    denied = runtime.client.get(url)
+    assert denied.status_code in (403, 404) and denied.content != content
+    runtime.client.cookies.set("citrus_auth", cookie)
+
+    artifact_id = asset["asset_ref"]
+    stored = tools.resolve_artifact(runtime.sid, artifact_id)["path"]
+    with sqlite3.connect(tools._db_path()) as conn:
+        conn.execute("UPDATE artifacts SET artifact_size_bytes=? WHERE artifact_id=?", (len(content)+1, artifact_id))
+    bad_size, = tools.validate_artifact_links([url], session_id=runtime.sid, owner_user_id=runtime.owner)
+    assert not bad_size["valid"] and bad_size["reason_code"] == "size_mismatch"
+    assert runtime.client.get(url).status_code == 404
+    with sqlite3.connect(tools._db_path()) as conn:
+        conn.execute("UPDATE artifacts SET artifact_size_bytes=? WHERE artifact_id=?", (len(content), artifact_id))
+    stored.write_bytes(b"X" * len(content))
+    tampered, = tools.validate_artifact_links([url], session_id=runtime.sid, owner_user_id=runtime.owner)
+    assert not tampered["valid"] and tampered["reason_code"] == "hash_mismatch"
+    assert runtime.client.get(url).status_code == 404
+    stored.unlink()
+    assert runtime.client.get(url).status_code == 404
+
+
+
+def test_execution_narration_uses_durable_order_and_rejects_untrusted_data(runtime):
+    claim = jobs.claim_job(runtime.sid, "narration-test", owner_user_id=runtime.owner)
+    job = claim.job_id
+    packet = dict(event_id="narration:table_read", job_id=job, run_id=job, thread_id=runtime.sid,
+                  client_request_id="narration-test", created_at=123.0, visibility="public",
+                  stage="table_read", text="untrusted", parameters={"hidden": "data"})
+    assert task_events.append_event(job, "execution_narration", packet | {"thread_id": "wrong"}) is None
+    assert task_events.append_event(job, "execution_narration", packet | {"visibility": "private"}) is None
+    note = task_events.append_event(job, "execution_narration", packet)
+    assert note["data"]["text"] == "我先检查数据表的结构和可用字段。"
+    assert "parameters" not in note["data"]
+    assert task_events.append_event(job, "execution_narration", packet) is None
+    op = task_events.append_event(job, "tool_result", {"tool_name":"inspect_uploaded_table",
+                                "tool_call_id":"inspect-one", "status":"complete"})
+    later = task_events.append_event(job, "execution_narration", packet |
+                                    {"event_id":"narration:data_check", "stage":"data_check"})
+    assert [frame["seq"] for frame in task_events.public_execution_timeline(job)] == [note["seq"], op["seq"], later["seq"]]

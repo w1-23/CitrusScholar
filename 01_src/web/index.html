@@ -241,14 +241,13 @@
       <div id="selected-skills" class="selected-skills" aria-live="polite" hidden></div>
       <div id="composer-admission-recovery" class="composer-admission-recovery" aria-live="polite" hidden></div>
       <!-- 输入区：自然语言请求、附件与发送控件 -->
-      <div id="composer-continuation" class="composer-task-status" hidden><span class="continuation-attachment-references" aria-label="已引用附件"></span> <button type="button" id="clear-composer-continuation" class="history-retry">取消继承</button></div>
       <div class="composer-meta">
         <p id="composer-task-status" class="composer-task-status" role="status" aria-live="polite" hidden></p>
 
       </div>
       <div class="input-box">
         <div id="attachment-list" class="attachment-list" aria-live="polite"></div>
-        <textarea id="user-input" rows="2" aria-label="消息" aria-describedby="composer-task-status composer-continuation" placeholder="向 CitrusScholar 提问，或上传文件进行分析…"></textarea>
+        <textarea id="user-input" rows="2" aria-label="消息" aria-describedby="composer-task-status" placeholder="向 CitrusScholar 提问，或上传文件进行分析…"></textarea>
         <div class="input-bottom">
           <div class="input-actions">
             <input id="attachment-input" type="file" accept=".pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb" multiple hidden onchange="handleAttachmentSelection(this.files, this)">

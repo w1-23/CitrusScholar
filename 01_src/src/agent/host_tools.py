@@ -307,7 +307,7 @@ class HostTools:
         if parent and self._retry_target(parent, original):
             record['retry_resolves_call_id'] = parent.tool_call_id
 
-    async def invoke(self, tool, call, identity):
+    async def invoke(self, tool, call, identity, *, on_dispatch=None):
         if identity != self.identity:
             raise ValueError("operation_identity_mismatch")
         self.assert_context()
@@ -340,10 +340,6 @@ class HostTools:
         if ledger:
             ledger.start(call["id"], call["name"], call["args"], source="provider",
                          logical_key=logical_key, attempt=attempt)
-        emit_tool_call_start(call["name"], call["args"], call["id"],
-                             logical_key=logical_key, attempt=attempt)
-        emit_tool_executing("正在执行所选操作", call["name"], call["id"],
-                            logical_key=logical_key, attempt=attempt)
         token = bind_question_context(self.question_context())
         from src.core import tracing
         from src.graph.retrieval_router import retrieval_denied, source_scope
@@ -356,7 +352,25 @@ class HostTools:
             and source_scope(query, exclusive_only=True) != "local"
             and not retrieval_denied(query, "web"))
         def dispatched():
+            if on_dispatch is not None:
+                on_dispatch()
             self.dispatched[call["id"]] = call["name"]
+            from src.core.progress_bus import emit_progress
+            from time import time
+
+            stage = {"local_hybrid_search": "local_search", "read_local_evidence": "evidence_read",
+                     "deepseek_search": "web_search", "inspect_uploaded_table": "table_read",
+                     "audit_uploaded_data": "data_check", "audit_prepared_dataset": "data_check",
+                     "run_research_figure_script": "figure_render"}.get(call["name"])
+            if stage:
+                emit_progress("execution_narration", {"event_id": "narration:" + stage, "stage": stage,
+                    "visibility": "public", "created_at": time(), "job_id": identity.run_id,
+                    "run_id": identity.run_id, "thread_id": identity.session_id,
+                    "client_request_id": tracing.get_client_request_id() or identity.user_turn_id})
+            emit_tool_call_start(call["name"], call["args"], call["id"],
+                                 logical_key=logical_key, attempt=attempt)
+            emit_tool_executing("正在执行所选操作", call["name"], call["id"],
+                                logical_key=logical_key, attempt=attempt)
         try:
             from contextlib import nullcontext
             from .code_tools import CODE_TOOL_NAMES, EXECUTION_WAIT_TOOL_NAMES, code_execution_context

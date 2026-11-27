@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import threading
+from time import monotonic
 
 from src.config import settings
 
@@ -58,7 +59,7 @@ def parse_translation(raw: str) -> str | None:
     return None
 
 
-def _generate_english_translation(text: str) -> str | None:
+def _generate_english_translation(text: str, *, timeout_s: float | None = None) -> str | None:
     if not text or not str(text).strip():
         return None
     try:
@@ -78,6 +79,7 @@ def _generate_english_translation(text: str) -> str | None:
         # reasoning/thinking 关闭参数——部分网关会以 BadRequestError 拒绝，
         # 反而让每一次本地检索都先失败一次再重试。
         answer = ""
+        deadline = None if timeout_s is None else monotonic() + timeout_s
 
         def invoke_translation(kwargs):
             from src.core import task_events
@@ -87,6 +89,8 @@ def _generate_english_translation(text: str) -> str | None:
             raise_if_cancelled("translation:before_attempt")
             job_id = get_job_id()
             remaining = task_events.remaining_seconds(job_id)
+            if deadline is not None:
+                remaining = min(remaining, deadline - monotonic())
             if remaining <= 0:
                 raise TimeoutError("translation request deadline exhausted")
             estimate = len(_TRANSLATE_PROMPT + text) // 2 + kwargs["max_tokens"]
@@ -131,7 +135,7 @@ def _generate_english_translation(text: str) -> str | None:
         return None
 
 
-def cached_translation(text: str) -> str | None:
+def cached_translation(text: str, *, timeout_s: float | None = None) -> str | None:
     """Translate once per distinct input and keep a bounded process-local LRU-ish cache."""
     normalized = str(text or "").strip()
     if not normalized:
@@ -144,7 +148,8 @@ def cached_translation(text: str) -> str | None:
             if _is_english(value) and not _BAD_TRANSLATION_RE.search(value):
                 _CACHE[key] = value
                 return value
-    value = _generate_english_translation(normalized)
+    value = (_generate_english_translation(normalized) if timeout_s is None
+             else _generate_english_translation(normalized, timeout_s=timeout_s))
     # Validate before admitting to cache; failed/empty/native outputs remain
     # retryable instead of poisoning all later searches for this input.
     if not value or not _is_english(value) or _BAD_TRANSLATION_RE.search(value):

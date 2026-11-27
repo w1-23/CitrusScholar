@@ -237,7 +237,9 @@ def runtime_env(*, source_scope: str = SCOPE_AUTO, attachments: int = 0,
     if isolated_enabled() or selfcorpus_enabled() or unified:
         denied |= {"propose_document_ingest", "prepare_document", "commit_document_index"}
     if unified:
-        denied |= {"search_candidates", "search_agent_corpus"}
+        denied |= {"inspect_candidates", "read_candidate", "search_candidates", "search_agent_corpus"}
+    else:
+        denied |= {"read_local_evidence"}
     return Env(
         network=bool(network),
         local_corpus=bool(local_corpus),

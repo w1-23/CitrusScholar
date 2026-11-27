@@ -189,9 +189,9 @@ for (const [status, error] of [[502, null], [500, {detail: {code: 'internal_erro
     await flush();
     assert.equal(posts(b).length, 1, 'reconciliation never re-posts the turn');
     assert.deepEqual(messages(b), [optimisticUser, optimisticBot]);
-    assert.equal(optimisticUser.querySelector('.turn-user-queue-state').textContent, '待发送');
+    assert.equal(optimisticUser.querySelector('.turn-user-queue-state'), null);
     assert.ok(optimisticBot.classList.contains('turn-awaiting-dispatch'));
-    assert.equal(b.get('chat-container').querySelectorAll('.turn-user-queue-state').length, 1);
+    assert.equal(b.get('chat-container').querySelectorAll('.turn-user-queue-state').length, 0);
     assert.equal(b.get('chat-container').querySelector('.turn-queue-cancel'), null);
   });
 

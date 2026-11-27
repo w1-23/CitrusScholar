@@ -67,6 +67,9 @@ def read(ref, path, owner, session, turn, *, generation, offset, max_chars, user
                "chunk_id": binding["passage_ref"], "corpus_family_id": binding["source_id"],
                "index_generation": generation, "input_sha256": binding["passage_hash"],
                "source_hash": binding.get("source_hash")}
+    document_id = json.dumps([binding[key] for key in ("source_id", "document_ref", "version_ref", "generation_ref")],
+                             ensure_ascii=True, separators=(",", ":")).encode()
+    document_key = "corpus-document:" + hashlib.sha256(document_id).hexdigest()
     return {"status": "ok", "ref": ref, "text": text, "next_offset": next_offset, "total_chars": total,
             "range": {"start": offset, "end": offset + len(text)},
-            "source": {"source_ref": ref, "title": binding["title"], "locator": locator}}
+            "source": {"source_ref": ref, "document_key": document_key, "title": binding["title"], "locator": locator}}

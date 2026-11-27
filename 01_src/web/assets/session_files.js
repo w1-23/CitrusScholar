@@ -1,4 +1,4 @@
-// 会话文件（session files）前端：列表、预览、下载、删除。
+// 会话文件（session files）前端：列表、预览、下载、引用与来源定位。
 //
 // 边界（与本轮改造范围一致）：
 //  - 账号私有资料库：列表、预览、下载与当前轮引用；不写入共享知识库。
@@ -12,9 +12,7 @@
   var apiBase = '';
   var fileCache = Object.create(null);
   var libraryRows = [];
-  var retentionIdleDays = 0;
   var FILE_ID = /^[a-f0-9]{32}$/;
-  var SHA256 = /^[a-f0-9]{64}$/;
   var FIGURE_SOURCE_KEY = 'citrus:figure-source';
   var catalogScope = 0;
   var catalogRequestSerial = 0, latestCatalogRequest = null;
@@ -27,7 +25,6 @@
     latestCatalogRequest = null;
     referenceLimits = defaultReferenceLimits;
     clearTableTiles();
-    closeMoreMenus(null);
     fileCache = Object.create(null);
     libraryRows = [];
     if (el("librarySearch")) el("librarySearch").value = "";
@@ -36,8 +33,6 @@
     ['sessionFilesUploaded', 'sessionFilesGenerated'].forEach(function (id) {
       if (el(id)) el(id).replaceChildren();
     });
-    retentionIdleDays = 0;
-    listLoaded = false;
     closeSessionFilePreview();
   }
 
@@ -50,8 +45,10 @@
   }
 
   var PRIMARY_FILE_ACTIONS = {
-    preview: ['eye', '预览', '预览'], export: ['export', '导出', '导出已有成果'],
-    download: ['download', '原件', '下载原件']
+    preview: ['eye', '预览', '预览'],
+    download: ['download', '下载原件', '下载原件'],
+    reference: ['plus', '引用', '引用'],
+    jump: ['external', '来源', '定位到来源会话']
   };
 
   function fileIcon(name, size) {
@@ -59,7 +56,10 @@
   }
 
   function fileActionContent(icon, label) {
-    return fileIcon(icon) + '<span>' + esc(label) + '</span>';
+    var text = icon === 'download'
+      ? '<span class="file-download-verb">下载</span>原件'
+      : esc(label);
+    return fileIcon(icon) + '<span>' + text + '</span>';
   }
 
   function filePrimaryActionHtml(action, file, ariaLabel) {
@@ -67,7 +67,7 @@
     return '<button type="button" class="file-primary-action' + (action === 'preview' ? ' session-file-preview-btn' : '') +
       '" data-file-act="' + action + '" data-file-id="' + esc(file.file_id) +
       '" title="' + esc(ariaLabel) + '" aria-label="' + esc(ariaLabel) + '"' +
-      (action === 'download' ? '' : ' aria-haspopup="dialog"') + '>' + fileActionContent(spec[0], spec[1]) + '</button>';
+      (action === 'preview' ? ' aria-haspopup="dialog"' : '') + '>' + fileActionContent(spec[0], spec[1]) + '</button>';
   }
 
   function fmtSize(n) {
@@ -107,10 +107,7 @@
   function itemHtml(f) {
     var kind = displayKind(f);
     var label = KIND_LABEL[kind] || '文件';
-    var deletable = f.origin === 'uploaded';
-    var svg = isSvgFile(f);
     var jump = (f.turn_request_id && f.source_session_id);
-    var menuId = 'session-file-menu-' + String(f.file_id || '');
     var lastAccess = fmtTime(f.last_accessed_at);
     var ext = (String(f.filename || '').match(/\.([^.]+)$/) || ['', ''])[1].toUpperCase().slice(0, 5);
     var thumbnail = (kind === 'image' || kind === 'svg') &&
@@ -122,7 +119,6 @@
       ? '<img src="' + esc(thumbnail + (thumbnail.includes('?') ? '&' : '?') + 'library_tile=1') +
         '" alt="" loading="lazy" decoding="async">' : '');
     // Keep the primary actions in the same order as on generated chat cards.
-    // File-specific secondary operations retain their existing menu semantics.
     return '' +
       '<div class="session-file-item" data-file-id="' + esc(f.file_id) + '"' +
       '     data-kind="' + esc(kind) + '" data-filename="' + esc(f.filename) + '">' +
@@ -133,36 +129,11 @@
       '    <div class="session-file-sub" title="' + esc((lastAccess ? '最近使用 ' + lastAccess : fmtTime(f.created_at))) + '">' +
       '      <span class="session-file-badge k-' + esc(kind) + '">' + esc(label) + '</span> ' + esc(fmtSize(f.size_bytes)) + '</div>' +
       '  </div>' +
-      '  <div class="session-file-actions">' +
-      '    <div class="file-primary-actions">' +
-             filePrimaryActionHtml('preview', f, '预览 ' + f.filename) +
-             filePrimaryActionHtml('export', f, '导出已有成果 ' + f.filename) +
-             filePrimaryActionHtml('download', f, '下载原件 ' + f.filename) + '</div>' +
-      '    <button type="button" class="session-file-ref-pill" data-file-act="reference" data-file-id="' +
-           esc(f.file_id) + '" title="在当前对话中引用" aria-label="引用 ' +
-           esc(f.filename) + '">' + fileActionContent('plus', '引用') + '</button>' +
-      '    <button type="button" class="session-file-act session-file-more-btn" data-file-act="more" data-file-id="' +
-           esc(f.file_id) + '" title="更多操作" aria-label="更多操作（' + esc(f.filename) +
-           '）" aria-haspopup="menu" aria-controls="' + esc(menuId) + '" aria-expanded="false">' + fileIcon('more') + '</button>' +
-      '  </div>' +
-      '  <div class="session-file-more" id="' + esc(menuId) + '" data-file-menu="' + esc(f.file_id) +
-      '" role="menu" aria-label="更多操作" hidden>' +
-      '    <button type="button" role="menuitem" data-file-act="info" data-file-id="' + esc(f.file_id) + '">' + fileActionContent('info', '文件信息') + '</button>' +
-      (svg
-        ? '    <button type="button" role="menuitem" data-file-act="copy-svg" data-file-id="' + esc(f.file_id) + '">' + fileActionContent('copy', '复制 SVG 源码') + '</button>'
-        : '') +
-      (canImportSvg(f)
-        ? '    <button type="button" role="menuitem" data-file-act="edit-svg-copy" data-file-id="' + esc(f.file_id) + '">' + fileActionContent('edit', '尝试创建可编辑 SVG 副本') + '</button>'
-        : '') +
-      (jump
-        ? '    <button type="button" role="menuitem" data-file-act="jump" data-file-id="' + esc(f.file_id) + '">' + fileActionContent('external', '定位到来源会话') + '</button>'
-        : '') +
-      // Generated deliverables are owned by the research pipeline: the library
-      // never offers deletion for them. Uploaded files may be removed here.
-      (deletable
-        ? '    <button type="button" role="menuitem" class="danger" data-file-act="delete" data-file-id="' +
-          esc(f.file_id) + '">' + fileActionContent('trash', '删除此上传文件') + '</button>'
-        : '') +
+      '  <div class="session-file-actions file-primary-actions">' +
+           filePrimaryActionHtml('preview', f, '预览 ' + f.filename) +
+           filePrimaryActionHtml('download', f, '下载原件 ' + f.filename) +
+           filePrimaryActionHtml('reference', f, '引用 ' + f.filename) +
+           (jump ? filePrimaryActionHtml('jump', f, '定位到来源会话 ' + f.filename) : '') +
       '  </div>' +
       '</div>';
   }
@@ -300,7 +271,6 @@
 
   function renderFilteredLibrary() {
     clearTableTiles();
-    closeMoreMenus(null);
     var empty = el('sessionFilesEmpty');
     var query = String(el('librarySearch').value || '').trim().toLowerCase();
     var kind = el('libraryKind').value;
@@ -327,7 +297,6 @@
     libraryRows = (payload.uploaded || []).concat(payload.generated || []).filter(function (f) {
       return f.visibility !== 'internal';
     });
-    retentionIdleDays = Math.max(0, Math.floor(Number(payload.retention_idle_days) || 0));
     var limits = payload.reference_limits;
     referenceLimits = limits && Number.isSafeInteger(limits.max_turn_files) && limits.max_turn_files > 0 &&
       Number.isSafeInteger(limits.max_reference_bytes) && limits.max_reference_bytes > 0
@@ -416,7 +385,6 @@
       .then(function (d) {
         if (!ownsList()) return scope === catalogScope ? latestCatalogRequest : undefined;
         renderList(d || {});
-        listLoaded = true;
         decorateTurnCards();
         var empty = el('sessionFilesEmpty');
         if (empty) empty.classList.remove('session-files-error');
@@ -458,17 +426,14 @@
       return request;
     } else {
       clearTableTiles();
-      closeMoreMenus(null);
       if (toggle && restoreFocus) toggle.focus();
     }
   }
 
   // P1-3: 打开前记住焦点，关闭后还回去（键盘用户不会掉到页面顶部）
   var previewReturnFocus = null;
-  var exportViewSerial = 0;
 
   function closeSessionFilePreview() {
-    exportViewSerial++;
     releasePreviewResources();
     var o = el('sessionFilePreviewOverlay');
     if (!o || o.hidden) return;
@@ -488,7 +453,7 @@
     if (kind === 'svg') {
       if (!url) return unsafePreviewHtml(dl);
       // 安全边界：SVG 只以 <img> 载入（图片上下文里脚本、外链、事件处理器都不
-      // 执行），绝不把源码 innerHTML 注入聊天页；要看源码请用「复制 SVG 源码」。
+      // 执行），绝不把源码 innerHTML 注入聊天页。
       return '<div class="sf-image-wrap"><img class="sf-preview-image" src="' +
              esc(url) + '" alt="' + esc(file.filename) + '"></div>' +
              '<div class="sf-preview-note" data-preview-error hidden></div>';
@@ -1497,7 +1462,6 @@
   }
 
   function openAccountFilePreview(fileOrId) {
-    exportViewSerial++;
     var file = (fileOrId && typeof fileOrId === 'object')
       ? fileOrId : fileCache[String(fileOrId || '')];
     if (!file) {
@@ -1512,17 +1476,11 @@
     previewReturnFocus = document.activeElement;
     overlay.hidden = false;
     el('sessionFilePreviewTitle').textContent = file.filename || '文件预览';
-    previewFileId = String(file.file_id || '');
     var download = el('sessionFilePreviewDownload');
     var downloadUrl = safePreviewUrl(file.download_url);
     download.hidden = !downloadUrl;
     download.href = downloadUrl || '#';
     download.setAttribute('download', '');
-    var copySvgBtn = el('sessionFilePreviewCopySvg');
-    if (copySvgBtn) {
-      copySvgBtn.hidden = !isSvgFile(file);
-      copySvgBtn.setAttribute('data-file-id', previewFileId);
-    }
     el('sessionFilePreviewMeta').textContent = previewMetaText(file);
     var stage = el('sessionFilePreviewStage');
     stage.dataset.previewKind = displayKind(file);
@@ -1535,7 +1493,7 @@
     if (gnode) loadTablePreview(gnode);
     bindDirectPreview(stage);
     var image = stage.querySelector('.sf-preview-image');
-    if (image) enableImageZoom(image, file);
+    if (image) enableImageZoom(image);
     // 打开后把焦点交给关闭按钮：Tab 顺序从弹窗开始，Esc 随时可退
     var closeBtn = overlay.querySelector('.overlay-close');
     if (closeBtn && typeof closeBtn.focus === 'function') {
@@ -1565,7 +1523,7 @@
     el('sessionFilePreviewDownload').hidden = false;
   }
 
-  function enableImageZoom(image, file) {
+  function enableImageZoom(image) {
     var wrap = image.parentElement;
     var toolbar = document.createElement('div');
     toolbar.className = 'sf-image-toolbar';
@@ -1577,7 +1535,7 @@
       var node = document.createElement('button');
       node.type = 'button';
       node.className = 'api-secondary';
-      var icon = {out: 'minus', fit: 'fit', in: 'plus', edit: 'edit'}[key];
+      var icon = {out: 'minus', fit: 'fit', in: 'plus'}[key];
       if (icon && (key === 'in' || key === 'out')) node.innerHTML = fileIcon(icon);
       else if (icon) node.innerHTML = fileActionContent(icon, text);
       else node.textContent = text;
@@ -1620,10 +1578,6 @@
     var output = document.createElement('output');
     output.setAttribute('aria-label', '预览缩放');
     toolbar.appendChild(output);
-    if (canImportSvg(fileCache[file && file.file_id])) {
-      var edit = button('edit', '尝试创建可编辑副本', '尝试创建可编辑 SVG 副本', function () { createSvgCopy(file.file_id); });
-      edit.classList.add('sf-create-copy');
-    }
     wrap.before(toolbar);
     image.addEventListener('load', render);
     image.addEventListener('error', render);
@@ -1934,9 +1888,6 @@
      这里只补四件事——预览（隔离渲染）、下载原件、复制源码、定位来源。
      归属仍用后端已有的 turn_request_id / source_session_id，前端不自己猜。 */
   var SVG_EXT_RE = /\.svg$/i;
-  var listLoaded = false;
-  var previewFileId = '';
-  var lastCopiedSvg = '';
 
   function isSvgFile(file) {
     if (!file) return false;
@@ -1960,203 +1911,9 @@
     return loadSessionFiles().then(function () { return fileCache[id] || null; });
   }
 
-  function legacyCopy(value) {
-    var area = document.createElement('textarea');
-    area.value = value;
-    area.setAttribute('readonly', 'readonly');
-    area.style.position = 'fixed';
-    area.style.top = '-1000px';
-    area.style.left = '-1000px';
-    document.body.appendChild(area);
-    area.select();
-    var ok = false;
-    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
-    document.body.removeChild(area);
-    if (!ok) throw new Error('clipboard-blocked');
-    return true;
-  }
-
-  function copyText(value) {
-    var text = String(value || '');
-    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
-      return navigator.clipboard.writeText(text)
-        .catch(function () { return legacyCopy(text); });
-    }
-    return Promise.resolve(legacyCopy(text));
-  }
-
   function toast(message) {
     if (typeof window.showBanner === 'function') { window.showBanner(message); return; }
     console.info('[资料库]', message);
-  }
-
-  function fetchSvgSource(fileId) {
-    return fetch(fileDownloadUrl(fileId), { credentials: 'same-origin' })
-      .then(function (r) {
-        if (!r.ok) {
-          var err = new Error('HTTP ' + r.status);
-          err.status = r.status;
-          throw err;
-        }
-        return r.text();
-      })
-      .then(function (text) {
-        var source = String(text || '');
-        if (!/<svg[\s>]/i.test(source)) throw new Error('not-svg');
-        return source;
-      });
-  }
-
-  // 复制的是**源码文本**（从带鉴权的下载接口取回后原样写入剪贴板），
-  // 不是文件名；取不到 / 不是 SVG 一律不写剪贴板。
-  function copySvgSource(fileId) {
-    return resolveFile(fileId)
-      .then(function () { return fetchSvgSource(fileId); })
-      .then(function (source) { return copyText(source).then(function () { return source; }); })
-      .then(function (source) {
-        lastCopiedSvg = source;
-        window.lastCopiedSvgSource = source;   // 验收探针据此断言"复制到的是源码"
-        toast('已复制 SVG 源码（' + source.length + ' 字符）。');
-        return source;
-      })
-      .catch(function (err) {
-        var reason = String((err && err.message) || err);
-        if (reason === 'clipboard-blocked') toast('浏览器拒绝了剪贴板写入，请允许后重试。');
-        else if (reason === 'not-svg') toast('这个文件的内容不是 SVG 源码，未复制。');
-        else if (err && err.status === 401) toast('登录后才能复制文件内容。');
-        else toast('复制 SVG 源码失败，请重试。');
-        throw err;
-      });
-  }
-
-  function fileInfoHtml(file) {
-    var rows = [
-      ['文件名', file.filename || '—'],
-      ['类型', (KIND_LABEL[displayKind(file)] || '文件') +
-               (file.mime_type ? '（' + file.mime_type + '）' : '')],
-      ['大小', fmtSize(file.size_bytes)],
-      ['创建时间', fmtTime(file.created_at) || '—'],
-      ['最近访问', fmtTime(file.last_accessed_at) || '—'],
-      ['保留策略', retentionIdleDays
-        ? '连续 ' + retentionIdleDays + ' 天未使用时自动清理；打开、预览、下载或引用会重新计时'
-        : '长期未使用时自动清理；打开、预览、下载或引用会重新计时'],
-      ['来源', file.origin === 'generated' ? 'Agent 生成（科研产物）' : '用户上传'],
-      ['生成工具', file.producer_tool || '—'],
-      ['来源会话', file.source_session_id || '—'],
-      ['来源轮次', file.turn_request_id || '—'],
-      ['校验值', file.sha256 ? (String(file.sha256).slice(0, 16) + '…') : '—']
-    ];
-    var html = '<dl class="sf-fileinfo">';
-    rows.forEach(function (row) {
-      html += '<dt>' + esc(row[0]) + '</dt><dd>' + esc(row[1]) + '</dd>';
-    });
-    html += '</dl>';
-    var actions = '<div class="sf-fileinfo-actions">' +
-      '<a class="api-secondary" href="' + esc(file.download_url || '#') + '" download>下载原件</a>';
-    if (isSvgFile(file)) {
-      actions += '<button type="button" class="api-secondary" data-file-act="copy-svg" data-file-id="' +
-                 esc(file.file_id) + '">复制 SVG 源码</button>';
-    }
-    if (file.turn_request_id && file.source_session_id) {
-      actions += '<button type="button" class="api-secondary" data-file-act="jump" data-file-id="' +
-                 esc(file.file_id) + '">定位到来源会话</button>';
-    }
-    actions += '</div>';
-    return html + actions;
-  }
-
-  function showFileInfo(fileId) {
-    exportViewSerial++;
-    return resolveFile(fileId).then(function (file) {
-      if (!file) { toast('文件信息暂不可用，请刷新资料库后重试。'); return; }
-      releasePreviewResources();
-      var overlay = el('sessionFilePreviewOverlay');
-      if (!overlay) return;
-      previewReturnFocus = document.activeElement;
-      overlay.hidden = false;
-      previewFileId = String(file.file_id || '');
-      el('sessionFilePreviewTitle').textContent = '文件信息 · ' + (file.filename || '');
-      var download = el('sessionFilePreviewDownload');
-      if (download) {
-        var url = safePreviewUrl(file.download_url);
-        download.href = url || '#';
-        download.hidden = !url;
-      }
-      var copySvgBtn = el('sessionFilePreviewCopySvg');
-      if (copySvgBtn) {
-        copySvgBtn.hidden = !isSvgFile(file);
-        copySvgBtn.setAttribute('data-file-id', previewFileId);
-      }
-      el('sessionFilePreviewMeta').textContent = previewMetaText(file);
-      var stage = el('sessionFilePreviewStage');
-      delete stage.dataset.previewKind;
-      stage.innerHTML = fileInfoHtml(file);
-      var closeBtn = overlay.querySelector('.overlay-close');
-      if (closeBtn && typeof closeBtn.focus === 'function') {
-        try { closeBtn.focus({ preventScroll: true }); } catch (err) { closeBtn.focus(); }
-      }
-    });
-  }
-
-  // 面板有 transform 动画（会成为 fixed 的包含块）、面板与文件项又都是
-  // overflow:hidden，菜单挂进 item 里会被裁切/错位。打开时临时挂到 body，
-  // 关闭时放回原位，保证下次渲染和 DOM 结构一致。
-  function closeMoreMenus(except, returnFocus) {
-    document.querySelectorAll('.session-file-more').forEach(function (menu) {
-      if (except && menu === except) return;
-      var opener = menu.__opener;
-      menu.hidden = true;
-      menu.__opener = null;
-      if (menu.__homeParent && menu.parentElement === document.body) {
-        menu.__homeParent.appendChild(menu);
-      }
-      menu.__homeParent = null;
-      var host = menu.parentElement;
-      var trigger = host && host.querySelector('[data-file-act="more"]');
-      if (trigger) trigger.setAttribute('aria-expanded', 'false');
-      if (returnFocus && opener && document.contains(opener) &&
-          typeof opener.focus === 'function') {
-        try { opener.focus({ preventScroll: true }); } catch (err) { opener.focus(); }
-      }
-    });
-  }
-
-  // 资料库面板与文件项都是 overflow:hidden（为了圆角和内部滚动），下拉菜单直接
-  // 绝对定位会被裁掉。这里改成 position:fixed 按按钮位置摆放，并夹在视口内。
-  function placeMoreMenu(button, menu) {
-    var rect = button.getBoundingClientRect();
-    if (menu.parentElement !== document.body) {
-      menu.__homeParent = menu.parentElement;
-      document.body.appendChild(menu);
-    }
-    menu.style.position = 'fixed';
-    menu.style.zIndex = '90';
-    menu.style.right = 'auto';
-    menu.style.bottom = 'auto';
-    var width = menu.offsetWidth || 152;
-    var height = menu.offsetHeight || 150;
-    var scale = uiScale();
-    var left = Math.max(8, Math.min(rect.right / scale - width, window.innerWidth / scale - width - 8));
-    var top = rect.bottom / scale + 4;
-    if (top + height > window.innerHeight / scale - 8) top = Math.max(8, rect.top / scale - height - 4);
-    menu.style.left = Math.round(left) + 'px';
-    menu.style.top = Math.round(top) + 'px';
-  }
-
-  function toggleMoreMenu(button) {
-    var item = button.closest('.session-file-item');
-    var menu = item && item.querySelector('.session-file-more');
-    if (!menu) return;
-    var willOpen = menu.hidden;
-    closeMoreMenus(menu);
-    menu.hidden = !willOpen;
-    menu.__opener = willOpen ? button : null;
-    button.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
-    if (willOpen) {
-      placeMoreMenu(button, menu);
-      var first = menu.querySelector('button');
-      if (first) { try { first.focus({ preventScroll: true }); } catch (err) { /* 忽略 */ } }
-    }
   }
 
   function triggerDownload(fileId) {
@@ -2167,101 +1924,6 @@
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-  }
-
-  function exportJson(response) {
-    return response.json().then(function (body) {
-      if (!response.ok) {
-        var detail = body && body.detail;
-        throw new Error((detail && detail.message) || (typeof detail === 'string' ? detail : '导出暂时不可用，请重试。'));
-      }
-      return body;
-    });
-  }
-
-  // The same entry serves library rows and chat cards. Only the server's saved
-  // formats are shown; there is no model call, guessed converter or script run.
-  function openAccountFileExport(fileId) {
-    var id = String(fileId || '');
-    if (!/^[a-f0-9]{32}$/.test(id)) return Promise.resolve();
-    var overlay = el('sessionFilePreviewOverlay');
-    var stage = el('sessionFilePreviewStage');
-    if (!overlay || !stage) return Promise.resolve();
-    delete stage.dataset.previewKind;
-    var serial = ++exportViewSerial;
-    releasePreviewResources();
-    previewReturnFocus = document.activeElement;
-    previewFileId = id;
-    overlay.hidden = false;
-    el('sessionFilePreviewTitle').textContent = '导出已有成果';
-    el('sessionFilePreviewMeta').textContent = '资料库文件';
-    var download = el('sessionFilePreviewDownload');
-    download.href = fileDownloadUrl(id);
-    download.setAttribute('download', '');
-    download.hidden = false;
-    var copy = el('sessionFilePreviewCopySvg');
-    if (copy) copy.hidden = true;
-    stage.textContent = '正在核对已生成格式…';
-    var close = overlay.querySelector('.overlay-close');
-    if (close) close.focus();
-    function active() { return serial === exportViewSerial && !overlay.hidden; }
-    return fetch(apiBase + '/api/v2/files/' + encodeURIComponent(id) + '/export-options',
-      { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
-      .then(exportJson)
-      .then(function (payload) {
-        if (!active()) return;
-        if (payload.file_id !== id || !/^[a-f0-9]{64}$/.test(payload.source_sha256 || '')) {
-          throw new Error('无法确认成果版本，请刷新资料库。');
-        }
-        stage.textContent = '';
-        el('sessionFilePreviewTitle').textContent = '导出 · ' + (payload.filename || '已有成果');
-        var note = document.createElement('p');
-        note.className = 'sf-preview-note';
-        note.textContent = payload.note || '仅提供已经生成并入库的格式。';
-        stage.appendChild(note);
-        var options = (payload.options || []).filter(function (option) {
-          return option.mode === 'existing' && /^[a-f0-9]{32}$/.test(option.file_id || '') && option.target_format;
-        });
-        if (!options.length) throw new Error('没有可导出的已生成格式。');
-        var formats = document.createElement('div');
-        formats.className = 'sf-export-formats';
-        formats.setAttribute('role', 'group');
-        formats.setAttribute('aria-label', '已生成格式');
-        options.forEach(function (option) {
-          var button = document.createElement('button');
-          button.type = 'button';
-          button.className = 'api-secondary';
-          button.innerHTML = fileActionContent('download', String(option.target_format).toUpperCase() +
-            (option.file_id === id ? '（原件）' : '（已生成）'));
-          button.title = option.filename || '';
-          button.onclick = function () {
-            if (button.disabled) return;
-            button.disabled = true;
-            return fetch(apiBase + '/api/v2/files/' + encodeURIComponent(id) + '/export', {
-              method: 'POST', credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-              body: JSON.stringify({ target_format: option.target_format, source_sha256: payload.source_sha256,
-                target_file_id: option.file_id, target_sha256: option.sha256 || '' })
-            }).then(exportJson).then(function (result) {
-              if (!active()) return;
-              if (result.status !== 'complete' || result.file_id !== option.file_id ||
-                  result.source_sha256 !== payload.source_sha256) throw new Error('成果版本已改变，请重新打开导出。');
-              triggerDownload(result.file_id);
-            }).catch(function (error) {
-              if (active()) toast(error.message || '导出失败，请重试。');
-            }).finally(function () { button.disabled = false; });
-          };
-          formats.appendChild(button);
-        });
-        stage.appendChild(formats);
-      }).catch(function (error) {
-        if (active()) stage.textContent = error.message || '导出暂时不可用，请重试。';
-      });
-  }
-
-  function canImportSvg(file) {
-    return !!file && file.visibility !== 'internal' && registeredSvgUrl(file) &&
-      (file.origin === 'uploaded' || file.origin === 'generated' && file.producer_tool === 'code_deliver' && SHA256.test(file.sha256));
   }
 
   function currentAccountKey() {
@@ -2311,100 +1973,34 @@
     enter();
   }
 
-  var svgCopyPending = new Set();
-  function createSvgCopy(fileId) {
-    var file = fileCache[fileId];
-    if (!canImportSvg(file) || svgCopyPending.has(fileId)) return;
-    var scope = catalogScope;
-    var account = currentAccountKey();
-    svgCopyPending.add(fileId);
-    toast('正在检查 SVG 是否可以安全创建样式副本…');
-    var input = { file_id: fileId };
-    if (SHA256.test(file.sha256)) input.expected_sha256 = file.sha256;
-    return (window.accountFetch || fetch)(apiBase + '/api/v2/figure-workbench/import-svg', {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(input)
-    }).then(exportJson).then(function (result) {
-      if (scope !== catalogScope || account !== currentAccountKey()) return;
-      var original = Object.values(result.original_exports || {}).find(function (item) {
-        return item && item.file_id === fileId && SHA256.test(item.sha256) && (!input.expected_sha256 || item.sha256 === input.expected_sha256);
-      });
-      if (!original || result.editable !== true || result.publication_state !== 'ready' ||
-          result.origin !== (file.origin === 'generated' ? 'code_output' : 'uploaded') ||
-          !FILE_ID.test(result.figure_id) || result.workbench_url !== '/figure-workbench?project=' + result.figure_id) {
-        toast(result.edit_limitation || '此文件不可创建可编辑副本，仍可预览或下载原件。');
-        return;
-      }
-      var handoff = { project: result.figure_id, file: fileId, sha: original.sha256, account: account,
-        session: file.source_session_id, turn: file.turn_request_id };
-      if (account && sourceMatches(file, handoff)) {
-        try { window.sessionStorage.setItem(FIGURE_SOURCE_KEY, JSON.stringify(handoff)); } catch (_) {}
-      }
-      window.location.assign(result.workbench_url);
-    }).catch(function (error) {
-      if (scope === catalogScope) toast(error.message || '无法创建 SVG 样式副本，请重试。');
-    }).finally(function () { svgCopyPending.delete(fileId); });
-  }
-
   function onFileActionClick(event) {
     var target = event.target;
     if (!target || typeof target.closest !== 'function') return;
     var button = target.closest('[data-file-act]');
-    if (!button) { closeMoreMenus(null); return; }
+    if (!button) return;
     var action = button.getAttribute('data-file-act');
     var fileId = String(button.getAttribute('data-file-id') || '');
-    if (action === 'more') {
-      event.preventDefault();
-      toggleMoreMenu(button);
-      return;
-    }
-    if (action === 'info') {
-      event.preventDefault();
-      showFileInfo(fileId);
-      closeMoreMenus(null);
-      return;
-    }
-    if (action === 'copy-svg') {
-      event.preventDefault();
-      copySvgSource(fileId);
-      closeMoreMenus(null);
-      return;
-    }
-    if (action === 'edit-svg-copy') {
-      event.preventDefault();
-      closeMoreMenus(null);
-      createSvgCopy(fileId);
-      return;
-    }
-    if (action === 'export') {
-      event.preventDefault();
-      closeMoreMenus(null);
-      openAccountFileExport(fileId);
-      return;
-    }
     if (action === 'download') {
       event.preventDefault();
       triggerDownload(fileId);
-      closeMoreMenus(null);
       return;
     }
     if (action === 'preview') {
       event.preventDefault();
       openAccountFilePreview(fileId);
-      closeMoreMenus(null);
       return;
     }
     if (action === 'reference') {
       event.preventDefault();
-      queueAccountFileReference(fileId);
-      closeMoreMenus(null);
-      return;
-    }
-    if (action === 'delete') {
-      event.preventDefault();
-      closeMoreMenus(null);
-      deleteSessionFile(fileId);
+      if (fileCache[fileId]) queueAccountFileReference(fileId);
+      else {
+        var scope = catalogScope, session = currentSessionId();
+        resolveFile(fileId).then(function (file) {
+          if (scope !== catalogScope || session !== currentSessionId() || !document.contains(button)) return;
+          if (file) queueAccountFileReference(fileId);
+          else toast('文件暂不可引用，请刷新资料库后重试。');
+        });
+      }
       return;
     }
     if (action === 'jump') {
@@ -2426,93 +2022,30 @@
           toast('定位到来源会话失败。');
         });
       });
-      closeMoreMenus(null);
     }
   }
 
   function bindFileActions() {
     document.addEventListener('click', onFileActionClick, false);
     document.addEventListener('keydown', function (event) {
-      var target = event.target;
-      var menu = (target && typeof target.closest === 'function')
-        ? target.closest('.session-file-more') : null;
-      if (menu && !menu.hidden) {
-        var items = Array.prototype.slice.call(menu.querySelectorAll('[role="menuitem"]'));
-        var current = items.indexOf(document.activeElement);
-        if (event.key === 'Escape') {
-          event.preventDefault();
-          closeMoreMenus(null, true);
-          return;
-        }
-        if (event.key === 'ArrowDown' || event.key === 'ArrowUp' ||
-            event.key === 'Home' || event.key === 'End') {
-          if (!items.length) return;
-          event.preventDefault();
-          var next = 0;
-          if (event.key === 'End') next = items.length - 1;
-          else if (event.key === 'ArrowDown') next = current < 0 ? 0 : (current + 1) % items.length;
-          else if (event.key === 'ArrowUp') next = current <= 0 ? items.length - 1 : current - 1;
-          try { items[next].focus({ preventScroll: true }); } catch (err) { items[next].focus(); }
-          return;
-        }
-        if (event.key === 'Tab') { closeMoreMenus(null); return; }
-      }
-      if (event.key === 'Escape') {
-        closeMoreMenus(null);
-        var panel = el('sessionFilesPanel');
-        if (!event.defaultPrevented && panel && !panel.hidden && panel.contains(target)) {
-          event.preventDefault();
-          toggleSessionFiles(false);
-        }
+      if (event.key !== 'Escape') return;
+      var panel = el('sessionFilesPanel');
+      if (!event.defaultPrevented && panel && !panel.hidden && panel.contains(event.target)) {
+        event.preventDefault();
+        toggleSessionFiles(false);
       }
     });
-    // 菜单是 position:fixed，面板滚动/窗口尺寸变化后位置会失效，直接关掉。
-    var bodyEl = el('sessionFilesBody');
-    if (bodyEl) bodyEl.addEventListener('scroll', function () { closeMoreMenus(null); }, { passive: true });
-    window.addEventListener('resize', function () { closeMoreMenus(null); });
-    window.addEventListener('citrus:scalechange', function () { closeMoreMenus(null); syncLibraryBounds(); });
-    var copySvgBtn = el('sessionFilePreviewCopySvg');
-    if (copySvgBtn) {
-      copySvgBtn.addEventListener('click', function () {
-        var id = String(copySvgBtn.getAttribute('data-file-id') || previewFileId || '');
-        if (id) copySvgSource(id);
-      });
-    }
-  }
-
-  // 复用 app.js 的生成文件卡片及其原有链接，与资料库统一主要控件布局。
-  // 保留已登记文件的复制源码、定位和信息等次要操作。
-  function turnCardAction(action, fileId, icon, label) {
-    var button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'turn-file-act';
-    button.setAttribute('data-file-act', action);
-    button.setAttribute('data-file-id', fileId);
-    button.title = label;
-    button.setAttribute('aria-label', label);
-    button.innerHTML = fileIcon(icon);
-    return button;
-  }
-
-  function syncTurnSourceActions(box, file, fileId) {
-    var jump = box.querySelector('[data-file-act="jump"]');
-    if (file?.turn_request_id && file.source_session_id) {
-      if (!jump) box.appendChild(turnCardAction('jump', fileId, 'external', '定位到生成它的会话'));
-    } else if (jump) jump.remove();
-    var edit = box.querySelector('[data-file-act="edit-svg-copy"]');
-    if (canImportSvg(file)) {
-      if (!edit) box.appendChild(turnCardAction('edit-svg-copy', fileId, 'edit', '尝试创建可编辑 SVG 副本'));
-    } else if (edit) edit.remove();
+    window.addEventListener('citrus:scalechange', syncLibraryBounds);
   }
 
   function arrangeTurnPrimaryActions(card, fileId, filename) {
-    if (!FILE_ID.test(fileId)) return;
     var preview = card.querySelector('button.turn-file-open');
     if (!preview) return;
     var original = card.querySelector('a.turn-file-open');
     var row = document.createElement('div');
     row.className = 'file-primary-actions';
-    ['preview', 'export', 'download'].forEach(function (action) {
+    var actions = FILE_ID.test(fileId) ? ['preview', 'download', 'reference'] : original ? ['preview', 'download'] : ['preview'];
+    actions.forEach(function (action) {
       // Keep existing preview listeners and SVG original links. Other files
       // use the same registered download action as library cards.
       var button = action === 'preview' ? preview : action === 'download' ? original : null;
@@ -2526,7 +2059,7 @@
       button.classList.add('file-primary-action');
       button.title = spec[2] + ' ' + filename;
       button.setAttribute('aria-label', button.title);
-      if (action !== 'download') button.setAttribute('aria-haspopup', 'dialog');
+      if (action === 'preview') button.setAttribute('aria-haspopup', 'dialog');
       button.innerHTML = fileActionContent(spec[0], spec[1]);
       row.appendChild(button);
     });
@@ -2542,8 +2075,6 @@
       var nameEl = card.querySelector('.turn-file-name');
       var name = nameEl ? String(nameEl.textContent || '') : '';
       var cached = fileCache[fileId];
-      var existing = card.querySelector('.turn-file-extra');
-      if (existing) { syncTurnSourceActions(existing, cached, fileId); return; }
       var svg = SVG_EXT_RE.test(name) || isSvgFile(cached);
       // Normalize the badge for attachment cards restored from before `kind: svg`.
       if (svg) {
@@ -2553,19 +2084,8 @@
           typeEl.setAttribute('title', 'SVG 矢量图');
         }
       }
-      var box = document.createElement('div');
-      box.className = 'turn-file-extra';
-      box.dataset.fileId = fileId;
-      if (svg) box.appendChild(turnCardAction('copy-svg', fileId, 'copy', '复制 SVG 源码'));
-      arrangeTurnPrimaryActions(card, fileId, name || '生成文件');
-      syncTurnSourceActions(box, cached, fileId);
-      if (svg) box.appendChild(turnCardAction('info', fileId, 'info', '文件信息'));
-      card.appendChild(box);
+      if (!card.querySelector('.file-primary-actions')) arrangeTurnPrimaryActions(card, fileId, name || '生成文件');
     });
-    if (cards.length && !listLoaded) {
-      // 元数据到位后才知道 turn_request_id / source_session_id，据此补"定位"
-      loadSessionFiles().then(function () { decorateTurnCards(); });
-    }
   }
 
   function observeTurnCards() {
@@ -2590,13 +2110,9 @@
   window.openSessionFilePreview = openAccountFilePreview;
   window.openAccountFilePreview = openAccountFilePreview;
   window.openSentImagePreview = openSentImagePreview;
-  window.openAccountFileExport = openAccountFileExport;
   window.queueAccountFileReference = queueAccountFileReference;
   window.closeSessionFilePreview = closeSessionFilePreview;
   window.deleteSessionFile = deleteSessionFile;
-  // P1-E：这两个入口也对外暴露，方便探针/其它面板复用同一套操作
-  window.copySvgSource = copySvgSource;
-  window.showSessionFileInfo = showFileInfo;
   window.decorateTurnCards = decorateTurnCards;
 
   if (document.readyState === 'loading') {

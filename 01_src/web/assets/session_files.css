@@ -124,23 +124,14 @@
   text-overflow: ellipsis;
 }
 
-/* U3: explicit Preview and a Reference pill are the only row-level actions;
-   every secondary operation (info, download, export, copy SVG, jump, delete
-   uploaded files) lives in the ⋯ menu. Interactive targets are 44px so touch
-   and keyboard users hit the intended control. */
-body .session-files-panel .session-file-actions {
-  gap: 4px;
-  padding: 4px 6px 4px 0;
-}
-.session-file-preview-btn,
-.session-file-ref-pill {
+.session-file-preview-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-height: 44px;
   padding: 0 12px;
   border: 1px solid var(--border-hairline, #e2e6ea);
-  border-radius: 999px;
+  border-radius: 9px;
   background: var(--bg-surface, #fff);
   color: var(--text-primary, #26352c);
   font: inherit;
@@ -149,57 +140,13 @@ body .session-files-panel .session-file-actions {
   white-space: nowrap;
   cursor: pointer;
 }
-.session-file-preview-btn { border-radius: 9px; }
-.session-file-preview-btn:hover,
-.session-file-ref-pill:hover {
-  border-color: color-mix(in srgb, var(--success, #4f8d5e) 44%, var(--border-hairline, #e2e6ea));
-}
-.session-file-ref-pill {
-  border-color: color-mix(in srgb, var(--success, #4f8d5e) 36%, var(--border-hairline, #e2e6ea));
-  background: color-mix(in srgb, var(--success, #4f8d5e) 9%, var(--bg-surface, #fff));
-  color: var(--text-primary, #26352c);
-  font-weight: 500;
-}
+.session-file-preview-btn:hover { border-color: var(--border-hover); }
 .session-file-preview-btn:focus-visible,
-.session-file-ref-pill:focus-visible,
-body .session-files-panel .session-file-act:focus-visible,
 .sf-load-more:focus-visible,
 .sf-sheet-tab:focus-visible {
   outline: 2px solid var(--accent, #d97706);
   outline-offset: 2px;
 }
-body .session-files-panel .session-file-act {
-  min-width: 44px;
-  min-height: 44px;
-}
-.session-file-more button {
-  min-height: 44px;
-  padding: 10px 12px;
-  white-space: nowrap;
-}
-.session-file-more button.danger { color: var(--error, #c76b4b); }
-.session-file-actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding-right: 6px;
-}
-.session-file-act {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--muted-text, #6b7684);
-  text-decoration: none;
-  font-size: 14px;
-  cursor: pointer;
-}
-.session-file-act:hover { background: rgba(0, 0, 0, 0.06); color: inherit; }
-.session-file-act.danger:hover { background: var(--error-glow, rgba(199,107,75,.13)); color: var(--error, #c76b4b); }
 
 .session-files-foot {
   flex: 0 0 auto;
@@ -647,13 +594,6 @@ body .session-files-panel .session-file-name {
 body .session-files-panel .session-file-actions {
   grid-area:actions; flex-wrap:wrap; justify-content:flex-start; width:100%; align-self:end; align-items:center; padding:5px 7px 7px; margin:0; gap:4px; border-top:1px solid var(--border-hairline);
 }
-body .session-files-panel .session-file-actions :is(.session-file-ref-pill,.session-file-more-btn) {
-  display:inline-flex; align-items:center; justify-content:center; gap:3px; min-height:30px; min-width:30px;
-  padding:0 4px; border-radius:6px; color:var(--ui-ink); font-size:10px;
-}
-body .session-files-panel .session-file-actions .session-file-more-btn { font-size:14px; margin-inline-start:auto; }
-.session-file-actions .session-file-ref-pill { background:var(--bg-elevated); border-color:var(--border-hairline); }
-.session-file-actions :is(.session-file-preview-btn,.session-file-ref-pill,.session-file-more-btn):hover { background:var(--bg-hover); border-color:var(--border-hover); }
 .session-files-panel :is(.session-files-close,#libraryUploadButton,select):focus-visible { outline:2px solid var(--ui-control); outline-offset:2px; }
 .session-files-foot { padding:7px 11px 9px; color:var(--text-muted); background:var(--ui-sidebar); font-size:10px; }
 .session-file-list-more { grid-column:1/-1; }
@@ -665,7 +605,6 @@ body .session-files-panel .session-file-actions .session-file-more-btn { font-si
   body .session-files-panel { top:0; height:100dvh; }
 }
 @media (pointer:coarse) {
-  body .session-files-panel .session-file-actions :is(.session-file-ref-pill,.session-file-more-btn),
   .session-files-head .session-files-close, #libraryUploadButton, .session-file-preview-actions .overlay-close { min-width:44px; min-height:44px; }
   .library-search,.library-filters select { min-height:44px; }
 }
@@ -702,7 +641,6 @@ body .session-files-panel .session-file-actions .session-file-more-btn { font-si
 .sf-image-toolbar button:is(:hover,[aria-pressed=true]):not(:disabled) { background:var(--accent-muted); }
 .sf-image-toolbar button:disabled { opacity:.5; }
 .sf-image-toolbar output { padding:0 5px; color:var(--text-secondary); font-size:.83em; }
-.sf-image-toolbar .sf-create-copy { margin-inline-start:auto; }
 .session-file-preview-stage .sf-image-wrap { display:flex; width:100%; height:100%; box-sizing:border-box; min-width:0; min-height:0; }
 .sf-image-wrap.is-scaled .sf-preview-image { max-width:none; max-height:none; flex:none; margin:auto; }
 .sf-image-wrap.is-scaled { align-items:flex-start; justify-content:flex-start; }
@@ -711,10 +649,8 @@ body .session-files-panel .session-file-actions .session-file-more-btn { font-si
 .session-file-preview-card :focus-visible, .session-files-panel :focus-visible { outline:1px solid var(--ui-focus, #d97736); outline-offset:2px; }
 
 /* The catalog and chat deliveries share the same primary control strip. */
-.file-primary-actions { display:flex; align-items:center; gap:4px; }
-.session-file-actions .file-primary-actions { width:100%; }
+.file-primary-actions { display:flex; flex-wrap:wrap; align-items:center; gap:4px; }
 .turn-file-card .file-primary-actions { margin-inline-start:auto; }
-.turn-file-extra:empty { display:none; }
 .file-primary-actions .file-primary-action {
   display:inline-flex; align-items:center; justify-content:center; gap:3px;
   width:auto; min-width:30px; min-height:30px; padding:0 5px;
@@ -726,14 +662,12 @@ body .session-files-panel .session-file-actions .session-file-more-btn { font-si
   background:var(--bg-hover); border-color:var(--border-hover); color:var(--text-primary);
 }
 .file-primary-actions .file-primary-action:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-.session-file-more button { display:flex; align-items:center; gap:6px; }
-.session-file-preview-actions > .api-secondary:not([hidden]), .sf-export-formats button, .sf-image-toolbar button {
+.session-file-preview-actions > .api-secondary:not([hidden]), .sf-image-toolbar button {
   display:inline-flex; align-items:center; justify-content:center; gap:5px;
 }
-.sf-export-formats { display:flex; flex-wrap:wrap; gap:6px; margin:8px 12px 12px; }
 @media (pointer:coarse) {
   .file-primary-actions .file-primary-action { min-height:44px; min-width:44px; }
 }
 @container library (max-width:190px) {
-  .session-file-actions .file-primary-action > span { position:absolute; inline-size:1px; block-size:1px; overflow:hidden; clip-path:inset(50%); }
+  .session-file-actions [data-file-act="download"] .file-download-verb { display:none; }
 }

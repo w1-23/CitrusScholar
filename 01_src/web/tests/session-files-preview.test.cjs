@@ -306,7 +306,7 @@ async function openTablePreview(browser, file, buffer, headers) {
   return browser.get('sessionFilePreviewStage').querySelector('.sf-preview-table');
 }
 
-test('library item exposes explicit Preview, a Reference pill and a secondary menu', async () => {
+test('library cards expose only preview, original, reference and conditional source', async () => {
   const b = makeBrowser();
   const uploaded = fileRecord({});
   const generated = fileRecord({
@@ -329,15 +329,18 @@ test('library item exposes explicit Preview, a Reference pill and a secondary me
   assert.equal(cards.length, 2, 'one searchable catalog contains both kinds of files');
   const uploadedCard = cards.find(card => card.dataset.fileId === uploaded.file_id);
   const generatedCard = cards.find(card => card.dataset.fileId === generated.file_id);
-  assert.equal(uploadedCard.querySelector('[data-file-act="preview"]').textContent.trim(), '预览');
-  assert.equal(uploadedCard.querySelector('.session-file-ref-pill').textContent.trim(), '引用');
-  assert.ok(uploadedCard.querySelector('[aria-haspopup="menu"]'));
-  assert.equal(uploadedCard.querySelector('[data-file-act="info"]').getAttribute('role'), 'menuitem');
-  assert.ok(uploadedCard.querySelector('[data-file-act="delete"]'));
+  const actions = card => card.querySelectorAll('[data-file-act]').map(button => button.getAttribute('data-file-act'));
+  assert.deepEqual(actions(uploadedCard), ['preview', 'download', 'reference']);
+  assert.deepEqual(actions(generatedCard), ['preview', 'download', 'reference', 'jump']);
+  assert.equal(uploadedCard.querySelector('[data-file-act="download"]').getAttribute('aria-label'), '下载原件 raw data.csv');
+  assert.equal(uploadedCard.querySelector('[aria-haspopup="menu"]'), null);
   assert.match(uploadedCard.querySelector('.session-file-sub').title, /最近使用/);
-  assert.equal(generatedCard.querySelector('[data-file-act="delete"]'), null);
-  assert.doesNotMatch(generatedCard.textContent, /删除/);
-  assert.ok(generatedCard.querySelector('[data-file-act="jump"]'));
+  b.document.listeners.DOMContentLoaded[0]();
+  const jumps = [];
+  b.context.jumpToFileTurn = (...pair) => { jumps.push(pair); return true; };
+  libraryDocumentAction(b, generatedCard.querySelector('[data-file-act="jump"]'));
+  await flush();
+  assert.deepEqual(jumps, [['session-a', 'crid-1']]);
 
   const retention = b.get('sessionFilesRetention').textContent;
   assert.match(retention, /连续 14 天/);
@@ -345,10 +348,8 @@ test('library item exposes explicit Preview, a Reference pill and a secondary me
   assert.match(retention, /只刷新所用文件的保留期限/);
   assert.doesNotMatch(retention, /保留 30 天/);
 
-  await b.context.showSessionFileInfo(uploaded.file_id);
-  const info = b.get('sessionFilePreviewStage').innerHTML;
-  assert.match(info, /最近访问/);
-  assert.match(info, /连续 14 天未使用时自动清理/);
+  assert.equal(typeof b.context.showSessionFileInfo, 'undefined');
+  assert.equal(typeof b.context.openAccountFileExport, 'undefined');
 });
 
 test('table thumbnails are visible-only, account-scoped, bounded and rendered as text', async () => {
@@ -736,48 +737,45 @@ function libraryDocumentAction(browser, button) {
   browser.document.listeners.click[0]({target: button, preventDefault() {}});
 }
 
-test('generated SVG uses a server-gated import and binds only the exact verified receipt', async () => {
+test('SVG library preview retains direct viewing without copy or edit actions', async () => {
   const b = makeBrowser();
-  const navigations = [];
-  b.context.location = {pathname: '/', origin: 'https://fixture.invalid', assign: url => navigations.push(url)};
-  b.context.currentAccount = {user_id: 17};
-  const other = fileRecord({file_id: 'e'.repeat(32), filename: 'legacy.svg', kind: 'svg', origin: 'generated',
-    mime_type: 'image/svg+xml', producer_tool: 'not_code', sha256: 'd'.repeat(64),
-    download_url: '/api/v2/files/' + 'e'.repeat(32) + '/download'});
-  let receipt = {origin: 'code_output', editable: true, publication_state: 'ready', figure_id: importedFigure,
-    workbench_url: '/figure-workbench?project=' + importedFigure,
-    original_exports: {'output.svg': {file_id: producerSvg.file_id, sha256: 'f'.repeat(64)}}};
-  b.fetchHandler = (url, opt) => {
-    if (url === '/api/v2/files') return jsonResponse({generated: [producerSvg, other]});
-    assert.equal(url, '/api/v2/figure-workbench/import-svg');
-    assert.equal(opt.method, 'POST');
-    assert.deepEqual(JSON.parse(opt.body), {file_id: producerSvg.file_id, expected_sha256: producerSvg.sha256});
-    return jsonResponse(receipt);
+  b.fetchHandler = url => {
+    assert.equal(url, '/api/v2/files');
+    return jsonResponse({generated: [producerSvg]});
   };
-  b.document.listeners.DOMContentLoaded[0]();
   await b.context.loadSessionFiles();
-  const list = b.get('sessionFilesUploaded');
-  const original = list.querySelector('[data-file-id="' + producerSvg.file_id + '"]');
-  assert.equal(original.children[0].classList.contains('session-file-thumb'), true);
-  assert.equal(original.children[2].classList.contains('session-file-actions'), true);
-  assert.equal(list.querySelectorAll('[data-file-act="edit-svg-copy"]').length, 1);
-  const edit = original.querySelector('[data-file-act="edit-svg-copy"]');
-  libraryDocumentAction(b, edit);
-  libraryDocumentAction(b, edit);
+  const item = b.get('sessionFilesUploaded').querySelector('.session-file-item');
+  assert.equal(item.children[0].classList.contains('session-file-thumb'), true);
+  assert.equal(item.children[2].classList.contains('session-file-actions'), true);
+  assert.deepEqual(item.querySelectorAll('[data-file-act]').map(btn => btn.getAttribute('data-file-act')),
+    ['preview', 'download', 'reference', 'jump']);
+  b.context.openAccountFilePreview(producerSvg.file_id);
+  const stage = b.get('sessionFilePreviewStage');
+  assert.ok(stage.querySelector('.sf-preview-image'));
+  assert.ok(stage.querySelector('.sf-image-toolbar'));
+  assert.equal(stage.querySelector('.sf-create-copy'), null);
+  assert.equal(typeof b.context.copySvgSource, 'undefined');
+});
+
+test('an uncached generated-file citation cannot land in a different session', async () => {
+  const b = makeBrowser();
+  let sid = 'first-session';
+  b.context.currentSessionId = () => sid;
+  b.document.listeners.DOMContentLoaded[0]();
+  const action = b.document.createElement('button');
+  action.setAttribute('data-file-act', 'reference');
+  action.setAttribute('data-file-id', producerSvg.file_id);
+  b.document.body.appendChild(action);
+  let release;
+  b.fetchHandler = () => new Promise(resolve => { release = resolve; });
+  libraryDocumentAction(b, action);
   await flush();
-  assert.equal(b.requests.filter(r => r.options.method === 'POST').length, 1);
-  assert.deepEqual(navigations, []);
-  assert.equal(b.context.sessionStorage.getItem('citrus:figure-source'), null);
-  receipt.original_exports['output.svg'].sha256 = producerSvg.sha256;
-  receipt.workbench_url = '//example.invalid/figure-workbench?project=' + importedFigure;
-  libraryDocumentAction(b, edit);
+  sid = 'other-session';
+  release(jsonResponse({generated: [producerSvg]}));
   await flush();
-  assert.deepEqual(navigations, []);
-  receipt.workbench_url = '/figure-workbench?project=' + importedFigure;
-  libraryDocumentAction(b, edit);
-  await flush();
-  assert.deepEqual(navigations, [receipt.workbench_url]);
-  assert.deepEqual(JSON.parse(b.context.sessionStorage.getItem('citrus:figure-source')), sourceHandoff());
+  assert.equal(b.context._selectedAccountFileRefs, undefined);
+  libraryDocumentAction(b, action);
+  assert.equal(b.context._selectedAccountFileRefs[0].file_id, producerSvg.file_id);
 });
 
 test('return jumps only to the exact pair revalidated in the current account catalog', async () => {

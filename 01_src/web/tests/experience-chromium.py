@@ -205,8 +205,8 @@ def run(browser, origin, output, *, observation_only=False):
         browser.call('Page.reload', ignoreCache=True)
         check('Refresh preserves durable clock', "document.querySelector('[data-state=waiting]') && Number((document.querySelector('.research-task-elapsed')?.innerText||'').replace(/\\D/g,'')) >= " + ''.join(filter(str.isdigit, elapsed)))
         browser.click('#ctxCircleBtn')
-        check('Unknown model window uses the explicitly labelled application input limit',
-              f"({text('#ctxUsed')}) === '9.2K / 86K' && ({text('#ctxValueNote')}).includes('应用单次输入上限') "
+        check('Chart uses the application input limit when model capacity is unknown',
+              f"({text('#ctxLegend [data-category=free] .ctx-item-value')}) === '76.8K' "
               "&& !document.querySelector('#ctxViewGrid').disabled")
         capture('context-missing')
         browser.click('#ctxClose')
@@ -261,10 +261,10 @@ def run(browser, origin, output, *, observation_only=False):
               })()''')
         browser.click('#ctxCircleBtn')
         check('Provider reporting does not overwrite context occupancy',
-              f"({text('#ctxUsed')}) === '9.2K / 86K' && !({text('#ctxUsageRows')}).includes('缓存覆盖率')")
+              f"({text('#ctxLegend [data-category=free] .ctx-item-value')}) === '76.8K' && !({text('#ctxUsageRows')}).includes('缓存覆盖率')")
         capture('context-zero')
         phase('usage')
-        check('Known capacity is displayed with the estimate', f"({text('#ctxUsed')}) === '10.4K / 131K' && ({text('#ctxTriggerPct')}) === '13%'")
+        check('Chart uses known model capacity while the header reports app occupancy', f"({text('#ctxLegend [data-category=free] .ctx-item-value')}) === '121K' && ({text('#ctxTriggerPct')}) === '13%'")
         capture('context-reported')
         evaluate("setReduceMotion(true)")
         check('Reduced motion in Porcelain theme', "document.documentElement.dataset.theme === 'porcelain' && getComputedStyle(document.querySelector('.research-task-orbit')).animationName === 'none'")
@@ -272,7 +272,7 @@ def run(browser, origin, output, *, observation_only=False):
         browser.click('#ctxClose')
         phase('whitespace')
         check('Thirty completed tools preserve metrics and whitespace keeps waiting',
-              f"({text('.research-process-body')}).includes('共 30 条尝试记录') && ({text('#ctxUsed')}) === '10.4K / 131K' && document.querySelector('[data-state=waiting]')")
+              f"({text('.research-process-body')}).includes('共 30 条尝试记录') && ({text('#ctxLegend [data-category=free] .ctx-item-value')}) === '121K' && document.querySelector('[data-state=waiting]')")
         check('Thirty attempts remain in one collapsed disclosure', "document.querySelectorAll('.research-action-group').length === 1 && !document.querySelector('.research-action-group').open && document.querySelectorAll('.research-action-group .term-line').length === 30")
         phase('answer')
         check('First visible answer stops dots', f"([...document.querySelectorAll('.turn-answer')].some(node => node.textContent.includes('表格核对结果'))) && !document.querySelector('[data-state=waiting]')")

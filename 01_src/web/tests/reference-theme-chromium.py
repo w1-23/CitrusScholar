@@ -35,7 +35,7 @@ FILES = [file_record(TABLE_ID, '样品温度与实验得率.csv', 'table', 1860,
          file_record(IMAGE_ID, '植物样本照片.webp', 'image', 24398, 1719000000),
          file_record(PDF_ID, '植物生理实验报告.pdf', 'pdf', 153486, 1718000000, 'generated'),
          file_record('4' * 32, '长期实验观察计划.docx', 'docx', 17382, 1717000000)]
-SNAPSHOT = {'estimate_scope': 'full_request_estimate', 'estimated_tokens': 4300, 'model_window': 10000}
+SNAPSHOT = {'estimate_scope': 'full_request_estimate', 'estimated_tokens': 4300, 'model_window': 10000, 'input_limit': 10000}
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -144,10 +144,10 @@ def verify(page, output, origin, image_bytes):
         page.evaluate('snapshot => renderContextPanel(snapshot)', SNAPSHOT)
         collapsed = page.locator('#ctxCircleBtn')
         assert collapsed.inner_text() == '43%'
-        assert page.locator('#ctxUsed').is_hidden()
+        assert page.locator('#ctxDrawer').is_hidden()
         assert collapsed.locator('#ctxBtnFg').evaluate('el => getComputedStyle(el).stroke') == 'rgb(217, 119, 54)'
         collapsed.click()
-        assert page.locator('#ctxUsed').text_content() == '4.3K / 10K'
+        assert page.locator('#ctxLegend [data-category=free] .ctx-item-value').text_content() == '5.7K'
         assert page.locator('#ctxBackdrop').is_hidden()
         page.locator('#ctxViewGrid').check()
         assert page.locator('#ctxGrid').is_visible() and not page.locator('#ctxTreemap').is_visible()
@@ -269,7 +269,7 @@ def verify(page, output, origin, image_bytes):
     assert page.locator('#sessionFilesRailBtn').evaluate('el => el === document.activeElement')
     page.evaluate('snapshot => renderContextPanel(snapshot)', SNAPSHOT)
     page.locator('#ctxCircleBtn').click()
-    page.locator('#ctxUsed').wait_for()
+    page.locator('#ctxLegend').wait_for()
     assert page.locator('#ctxBackdrop').is_visible()
     geometry = page.locator('#ctxDrawer').bounding_box()
     assert geometry and geometry['x'] >= 0 and geometry['x'] + geometry['width'] <= 390

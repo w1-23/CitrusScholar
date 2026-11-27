@@ -15,44 +15,26 @@
     dialog.id = 'citrusGuideDialog';
     dialog.className = 'cg-dialog';
     dialog.setAttribute('aria-labelledby', 'citrusGuideTitle');
-    dialog.innerHTML = '<header class="cg-header"><h1 id="citrusGuideTitle">使用指南</h1><div>' +
-      '<button type="button" data-guide-zoom aria-label="放大图片" aria-pressed="false" title="放大图片">⊕</button>' +
-      '<button type="button" data-guide-close aria-label="关闭使用指南" title="关闭">×</button></div></header>' +
+    dialog.innerHTML = '<header class="cg-header"><h1 id="citrusGuideTitle">使用指南</h1>' +
+      '<button type="button" data-guide-close aria-label="关闭使用指南" title="关闭">×</button></header>' +
       '<article id="citrusGuidePage" class="cg-page" tabindex="-1" aria-label="指南图示"></article>' +
-      '<footer class="cg-footer"><button type="button" data-guide-prev aria-label="上一页" title="上一页">‹</button>' +
-      '<nav class="cg-nav" aria-label="选择指南页">' + pages.map(function (page, index) {
+      '<footer class="cg-footer"><nav class="cg-nav" aria-label="选择指南页">' + pages.map(function (page, index) {
         return '<button type="button" data-guide-page="' + index + '" aria-label="' + page.title + '" title="' + page.title + '"></button>';
-      }).join('') + '</nav><span id="citrusGuideIndex" role="status"></span>' +
-      '<button type="button" data-guide-next aria-label="下一页" title="下一页">›</button></footer>';
+      }).join('') + '</nav><span id="citrusGuideIndex" role="status"></span></footer>';
     document.body.appendChild(dialog);
     dialog.addEventListener('click', function (event) {
       var target = event.target.closest('button');
       if (!target || !dialog.contains(target)) return;
       if (target.hasAttribute('data-guide-close')) close();
-      else if (target.hasAttribute('data-guide-zoom')) zoom(target.getAttribute('aria-pressed') !== 'true');
       else if (target.hasAttribute('data-guide-page')) go(Number(target.getAttribute('data-guide-page')));
-      else if (target.hasAttribute('data-guide-prev')) go(current - 1);
-      else if (target.hasAttribute('data-guide-next')) go(current + 1);
     });
     dialog.addEventListener('cancel', function (event) { event.preventDefault(); close(); });
     dialog.addEventListener('keydown', function (event) {
       if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
       else if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
-        if (event.target.closest('.cg-page[data-zoom="true"]')) return;
         event.preventDefault(); event.stopPropagation(); go(current + (event.key === 'ArrowRight' ? 1 : -1));
       }
     });
-  }
-  function zoom(expanded) {
-    var page = dialog.querySelector('.cg-page');
-    var button = dialog.querySelector('[data-guide-zoom]');
-    page.dataset.zoom = String(expanded);
-    button.setAttribute('aria-pressed', String(expanded));
-    button.setAttribute('aria-label', expanded ? '适应窗口' : '放大图片');
-    button.title = button.getAttribute('aria-label');
-    button.textContent = expanded ? '⊖' : '⊕';
-    if (expanded) page.focus();
-    else page.scrollTo(0, 0);
   }
   function go(index) {
     index = Math.max(0, Math.min(pages.length - 1, Number(index) || 0));
@@ -60,7 +42,7 @@
     if (dialog.open && article.dataset.page === page.id) return;
     var direction = index < current ? 'back' : 'forward';
     current = index;
-    zoom(false);
+    article.scrollTo(0, 0);
     article.dataset.page = page.id;
     article.dataset.direction = direction;
     var image = new Image(1672, 941);
@@ -70,11 +52,6 @@
     dialog.querySelectorAll('[data-guide-page]').forEach(function (button, i) {
       button.setAttribute('aria-current', i === current ? 'page' : 'false');
     });
-    var prev = dialog.querySelector('[data-guide-prev]'), next = dialog.querySelector('[data-guide-next]');
-    prev.disabled = current === 0;
-    next.disabled = current === pages.length - 1;
-    if (document.activeElement === prev && prev.disabled) next.focus();
-    if (document.activeElement === next && next.disabled) prev.focus();
     var status = dialog.querySelector('#citrusGuideIndex');
     status.textContent = (current + 1) + ' / ' + pages.length;
     status.setAttribute('aria-label', status.textContent + ' · ' + page.title);

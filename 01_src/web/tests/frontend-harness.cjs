@@ -123,9 +123,6 @@ function browser(script, {localMarkdown = false} = {}) {
       vm.runInContext(readFileSync(join(__dirname, '../assets', module), 'utf8'), ctx, {filename: module});
     }
   }
-  for (const module of ['app-icon-names.js', 'app-icon.js']) {
-    vm.runInContext(readFileSync(join(__dirname, '../assets', module), 'utf8'), ctx, {filename: module});
-  }
   vm.runInContext(readFileSync(join(__dirname, '../assets', script), 'utf8'), ctx, {filename: script});
   return {ctx, get, document, requests, readers, revoked, navigations, timers,
     reply(req, data, status = 200) { req.resolve({ok: status < 400, status, json: async () => data}); },

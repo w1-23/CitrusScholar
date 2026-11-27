@@ -111,7 +111,7 @@ def verify(page, output, origin, image_bytes):
     assert page.locator('#send-btn').count() == 1 and page.locator('#stop-btn').count() == 0
     for control, icon in [('themeRailBtn', 'palette'), ('memoryRailBtn', 'sliders'), ('figureRailBtn', 'canvas'), ('send-btn', 'send')]:
         assert page.locator(f'#{control} use').get_attribute('href') == SPRITE + icon
-    assert page.locator('#send-btn .ui-icon').evaluate('el => getComputedStyle(el).transform') == 'none'
+    assert page.locator('#send-btn .ui-icon').evaluate('el => getComputedStyle(el).transform').startswith('matrix(0.707107, -0.707107')
     assert page.locator('.input-box').evaluate('(box) => parseFloat(getComputedStyle(box).borderRadius) >= 12')
     assert page.locator('.turn-tick').count() == len(history)
     assert page.locator('.turn-return-latest').is_hidden()
@@ -145,7 +145,7 @@ def verify(page, output, origin, image_bytes):
         collapsed = page.locator('#ctxCircleBtn')
         assert collapsed.inner_text() == '43%'
         assert page.locator('#ctxUsed').is_hidden()
-        assert collapsed.locator('#ctxBtnFg').evaluate('el => getComputedStyle(el).stroke') == 'rgb(223, 118, 47)'
+        assert collapsed.locator('#ctxBtnFg').evaluate('el => getComputedStyle(el).stroke') == 'rgb(217, 119, 54)'
         collapsed.click()
         assert page.locator('#ctxUsed').text_content() == '4.3K / 10K'
         assert page.locator('#ctxBackdrop').is_hidden()

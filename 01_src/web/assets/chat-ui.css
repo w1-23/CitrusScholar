@@ -25,27 +25,15 @@
 .composer-admission-recovery .history-retry { margin:0 0 5px; }
 .composer-controls { display:flex; gap:6px; margin-inline-start:auto; align-items:center; }
 .chat-panel .input-box .send-btn {
-  width:44px; height:44px; flex:0 0 44px; border:0; border-radius:50%;
-  color:#fff; background:var(--cs-brand-orange); box-shadow:0 2px 5px var(--cs-brand-orange-ring); transform:none;
+  width:36px; height:36px; flex-shrink:0; border-radius:11px; font-size:17px;
+  color:var(--ui-on-control); background:var(--ui-control); box-shadow:none;
 }
-@media (hover:hover) and (prefers-reduced-motion:no-preference) {
-  .chat-panel .input-box .send-btn:not([aria-disabled="true"]):hover { transform:translateY(-1px); }
-  .chat-panel .input-box .send-btn:not([aria-disabled="true"]):active { transform:translateY(1px); }
-}
-.chat-panel .input-box .send-btn:not([aria-disabled="true"]):hover { box-shadow:0 0 0 3px var(--cs-brand-orange-ring); }
-.chat-panel .input-box .send-btn:is(:disabled,[aria-disabled="true"]) { pointer-events:auto; opacity:1; cursor:default; }
+.chat-panel .input-box .send-btn:not([aria-disabled="true"],.is-stop-mode):hover { color:white; background:var(--accent-hover); }
+.chat-panel .input-box .send-btn:is(:disabled,[aria-disabled="true"]) { pointer-events:auto; opacity:.53; cursor:default; }
+.chat-panel .input-box .send-btn.is-stop-mode { color:var(--text-primary); background:var(--bg-elevated); border:1px solid var(--border-hover); }
 .chat-panel .input-box .send-btn.is-stopping { cursor:wait; }
-.chat-panel .input-box .send-btn .app-icon { --solar-size:20px; }
-body[data-page="chat"] :is(.account-menu-item,.attachment-options,.api-close,.overlay-close,.session-files-close,.ctx-view-picker,.ctx-drawer-close) .app-icon { --solar-size:17px; }
-body[data-page="chat"] :is(.session-op,.session-menu-item,.message-action,.fb-btn,.cite-link,.workspace-file,.attachment-preview-remove,.session-file-preview-actions) .app-icon { --solar-size:14px; }
-body[data-page="chat"] :is(.session-group > summary,.icon-disclosure > summary,.toggle-icon,.account-trigger-chevron) .app-icon { --solar-size:12px; }
-.account-menu-item > .account-menu-item-label { width:auto; color:inherit; text-align:start; }
-.session-menu-item { display:flex; align-items:center; gap:6px; width:100%; border:0; background:none; text-align:start; }
-.icon-disclosure > summary { display:flex; align-items:center; gap:6px; list-style:none; }
-.icon-disclosure > summary::-webkit-details-marker { display:none; }
-:is(.session-group,.icon-disclosure) > summary > .app-icon { transition:transform .16s ease; }
-:is(.session-group,.icon-disclosure)[open] > summary > .app-icon { transform:rotate(90deg); }
-@media (prefers-reduced-motion: reduce) { :is(.session-group,.icon-disclosure) > summary > .app-icon { transition:none; } }
+.chat-panel .input-box .send-btn.is-stop-mode .ui-icon { fill:currentColor; }
+.chat-panel .input-box .send-btn:not(.is-stop-mode) .ui-icon { transform:rotate(-45deg); }
 .composer-meta { min-height:22px; flex:none; display:flex; align-items:center; gap:6px; justify-content:flex-end; }
 .composer-meta .composer-task-status { margin:0 auto 0 3px; text-align:left; font-size:11px; color:var(--text-muted); }
 .composer-meta .composer-task-status { overflow-wrap:anywhere; }
@@ -80,8 +68,8 @@ body[data-page="chat"] :is(.session-group > summary,.icon-disclosure > summary,.
 .skill-choice strong { font-size:13px; display:block; }
 .skill-choice-icon { display:grid; place-items:center; width:32px; height:32px; flex:0 0 32px; font-size:17px; color:var(--ui-ink); background:var(--bg-surface); border:1px solid var(--border-hairline); border-radius:9px; }
 @media (pointer:coarse) {
-  .input-box .input-tools > summary, .attachment-options button { min-height:44px; }
-  .input-box .input-tools > .composer-plus { min-width:44px; }
+  .input-box .input-tools > summary, .attachment-options button, .input-box .send-btn { min-height:44px; }
+  .input-box .input-tools > .composer-plus, .input-box .send-btn { min-width:44px; }
 }
 
 .message.bot > .assistant-actions {
@@ -120,6 +108,7 @@ body[data-page="chat"] { --rail-w:60px; --app-header-h:54px; --context-w:clamp(2
 }
 #session-section-toggle:hover { background:var(--bg-hover); }
 #session-section-toggle:focus-visible { outline-offset:-3px; }
+#session-section-toggle .toggle-icon { display:none; }
 #session-list { padding:7px 9px; }
 #session-list .session-group { border:0; }
 #session-list .session-item {

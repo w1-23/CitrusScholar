@@ -13,7 +13,7 @@
       return {'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[char];
     }) + '"' : ' aria-hidden="true"';
     return '<svg class="ui-icon app-icon' + (inverse ? ' app-icon-inverse' : '') + '"' + a11y +
-      (size ? ' data-icon-size="' + size + '"' : '') + ' focusable="false"><use href="/assets/citrus-icons.svg#ui-' +
+      (size ? ' data-icon-size="' + size + '"' : '') + ' focusable="false"><use href="/assets/file-solar-icons.svg#ui-' +
       name + '"></use></svg>';
   }
   root.AppIcon = Object.freeze({html: html});

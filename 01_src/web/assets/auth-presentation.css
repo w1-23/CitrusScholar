@@ -1,0 +1,22 @@
+/* Preserve the responsive login presentation without recoloring the workspace. */
+#authGate {
+  --accent: #DF762F;
+  --accent-hover: #D96C28;
+  --accent-muted: #F7EDE4;
+  --accent-glow: rgba(223,118,47,.24);
+  grid-template-columns: minmax(0,1fr);
+}
+#authGate .auth-card > :is(input,select):not([hidden]) { display: block; min-width: 0; }
+#authGate .auth-icon-attribution a { color: var(--ui-focus); }
+#authGate .icon-disclosure > summary { display: flex; align-items: center; gap: 6px; list-style: none; }
+#authGate .icon-disclosure > summary::-webkit-details-marker { display: none; }
+#authGate .icon-disclosure > summary > .app-icon {
+  color: var(--accent); fill: none; stroke: none;
+  --solar-secondary-color: #F5C9A9; --solar-secondary-opacity: .65;
+  inline-size: 12px; block-size: 12px; flex: none;
+  transition: transform .16s ease;
+}
+#authGate .icon-disclosure[open] > summary > .app-icon { transform: rotate(90deg); }
+@media (prefers-reduced-motion: reduce) {
+  #authGate .icon-disclosure > summary > .app-icon { transition: none; }
+}

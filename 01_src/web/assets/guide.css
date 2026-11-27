@@ -1,28 +1,42 @@
-/* One reading surface for all three illustrations, including bookmarked guides. */
+/* Shared illustrated guide for chat, workbench and bookmarked links. */
 .cg-dialog {
   color: var(--text-primary); background: var(--bg-surface);
   border: 1px solid var(--border-hover); border-radius: 16px;
-  width: min(1180px, calc(100% - 28px)); max-width: none;
-  max-height: calc(var(--ui-viewport-height, 100dvh) - 24px);
-  margin: auto; padding: 0; overflow: hidden;
+  width: min(1320px, calc(100% - 28px), calc((var(--ui-viewport-height, 100dvh) - 126px) * 1.78));
+  min-width: min(420px, calc(100% - 28px)); max-width: none;
+  max-height: calc(var(--ui-viewport-height, 100dvh) - 24px); margin: auto; padding: 0; overflow: hidden;
   box-shadow: 0 24px 90px rgba(0,0,0,.22);
 }
-.cg-dialog[open] { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.cg-dialog[open] { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
 .cg-dialog::backdrop { background: var(--overlay, rgba(0,0,0,.4)); }
-.cg-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 14px; border-bottom: 1px solid var(--border-hairline); }
+.cg-header, .cg-footer { display: flex; align-items: center; gap: 10px; padding: 6px 14px; }
+.cg-header { justify-content: space-between; border-bottom: 1px solid var(--border-hairline); }
 .cg-header h1 { margin: 0; font-size: 15px; font-weight: 600; }
-.cg-header button {
-  display: grid; place-items: center; width: 38px; height: 38px; padding: 0;
+.cg-header > div, .cg-nav { display: flex; align-items: center; gap: 6px; }
+.cg-dialog button {
+  display: grid; place-items: center; width: 38px; height: 38px;
+  padding: 0; font: inherit; font-size: 24px; line-height: 1;
   color: var(--text-primary); background: transparent;
   border: 1px solid transparent; border-radius: 9px; cursor: pointer;
 }
-.cg-header button:hover { background: var(--accent-muted); }
+.cg-dialog button:disabled { opacity: .32; cursor: default; }
+.cg-dialog button:not(:disabled):hover, .cg-dialog [aria-pressed="true"] { background: var(--accent-muted); }
 .cg-dialog :focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
-.cg-pages { position: relative; min-width: 0; }
-.cg-dialog .cg-pages { overflow: auto; overscroll-behavior: contain; background: var(--bg-deep); }
-.cg-section { margin: 0; padding: 10px clamp(6px, 2vw, 20px) 16px; }
-.cg-section + .cg-section { border-top: 1px solid var(--border-hairline); }
-.cg-section figcaption { margin-bottom: 8px; color: var(--text-primary); font-size: 14px; font-weight: 600; }
-.cg-section img { display: block; width: 100%; height: auto; }
-.guide-landing { max-width: 1180px; margin: auto; padding: 16px clamp(6px, 2vw, 20px); color: var(--text-primary); }
-.guide-landing h1 { margin: 0 0 14px; font-size: 20px; }
+.cg-page { min-width: 0; overflow: auto; overscroll-behavior: contain; background: var(--bg-deep); }
+.cg-page img { display: block; width: 100%; height: auto; animation: cg-turn 240ms ease-out both; }
+.cg-page[data-direction="back"] img { --cg-shift: -22px; --cg-tilt: -7deg; }
+.cg-page[data-zoom="true"] img { width: max(100%, min(1672px, 240vw)); min-width: 960px; }
+@keyframes cg-turn {
+  from { opacity: .35; transform: perspective(900px) translateX(var(--cg-shift, 22px)) rotateY(var(--cg-tilt, 7deg)); }
+  to { opacity: 1; transform: none; }
+}
+.cg-footer { flex-direction: row; justify-content: center; border-top: 1px solid var(--border-hairline); }
+.cg-footer span { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.cg-nav { gap: 0; }
+.cg-nav button { width: 29px; }
+.cg-nav button::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--text-secondary); opacity: .45; }
+.cg-nav button[aria-current="page"]::before { width: 15px; border-radius: 9px; background: var(--accent); opacity: 1; }
+.guide-page { display: grid; place-items: center; min-height: var(--ui-viewport-height, 100dvh); }
+.guide-landing { padding: 24px; text-align: center; }
+.guide-landing button { padding: 10px 16px; border: 1px solid var(--border-hover); border-radius: 9px; background: var(--accent-muted); color: var(--text-primary); cursor: pointer; }
+@media (prefers-reduced-motion: reduce) { .cg-page img { animation: none; } }

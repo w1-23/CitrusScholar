@@ -172,23 +172,6 @@ export function renderInspector(container, snapshot, group, values, update) {
   container.append(form, ...form.querySelectorAll('dialog'));
 }
 
-const groupIcons = {
-  figure: 'document', panel: 'chart', series: 'layers', sync: 'legend', vector: 'vector',
-  title: 'text', xlabel: 'axis-x', ylabel: 'axis-y', annot: 'notes', ticks: 'ruler', spine: 'axis',
-  grid: 'grid', legend: 'legend', colorbar: 'colorbar', errorbar: 'error-bar', arrow: 'arrow-right', patch: 'vector',
-};
-const categoryIcons = { series: 'layers', sync: 'legend', vector: 'vector', text: 'text', axis: 'axis', guide: 'legend' };
-
-function groupIcon(group) {
-  if (group.kind === 'category') return categoryIcons[group.styleKind] || 'layers';
-  if (group.kind === 'vector' && group.native_tag === 'text') return 'tag';
-  if (group.kind === 'ticks') {
-    const axis = /^([XY]) 轴/.exec(group.label);
-    if (axis) return `axis-${axis[1].toLowerCase()}`;
-  }
-  return Object.hasOwn(groupIcons, group.kind) ? groupIcons[group.kind] : 'layers';
-}
-
 export function renderTree(tree, groups, selected, expanded, choose, values) {
   const childGroups = new Map();
   for (const group of groups) {
@@ -213,12 +196,9 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
       const branch = childGroups.has(group.id);
       const open = expanded.has(group.id);
       if (branch) item.setAttribute('aria-expanded', String(open));
-      const arrow = element('span', undefined, 'tree-arrow');
+      const arrow = element('span', branch ? open ? '▾' : '▸' : '', 'tree-arrow');
       arrow.setAttribute('aria-hidden', 'true');
-      if (branch) arrow.innerHTML = window.AppIcon.html(open ? 'chevron-down' : 'chevron-right');
-      const kind = element('span', undefined, 'tree-kind');
-      kind.innerHTML = window.AppIcon.html(groupIcon(group));
-      row.append(arrow, kind);
+      row.append(arrow);
       const style = values(group);
       const caption = style.label || group.label;
       const paint = [style.facecolor, style.color, style.edgecolor].find(color);
@@ -243,7 +223,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
         item.append(list);
       }
       row.addEventListener('click', (event) => {
-        const expand = branch && arrow.contains(event.target);
+        const expand = event.target === arrow && branch;
         if (expand) {
           if (open) expanded.delete(group.id);
           else expanded.add(group.id);

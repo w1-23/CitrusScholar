@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html class="figure-editor" lang="zh-CN" data-theme="porcelain">
+<html lang="zh-CN" data-theme="porcelain">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,20 +7,33 @@
   <title>图表工作台 · CitrusScholar</title>
   <script src="/assets/citrus-theme.js?v=2"></script>
   <link rel="stylesheet" href="/assets/app.css?v=44">
-  <link rel="stylesheet" href="/assets/app-icon.css?v=1">
-  <link rel="stylesheet" href="/assets/figures.css?v=16">
-  <link rel="stylesheet" href="/assets/guide.css?v=7">
-  <link rel="stylesheet" href="/assets/citrus-theme.css?v=3">
-  <script src="/assets/app-icon-names.js?v=1" defer></script>
-  <script src="/assets/app-icon.js?v=1" defer></script>
+  <link rel="stylesheet" href="/assets/figures.css?v=15">
+  <link rel="stylesheet" href="/assets/guide.css?v=6">
+  <link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
   <script src="/assets/figures/edit_model.js?v=2" defer></script>
   <script src="/assets/figures/scene_projection.js?v=2" defer></script>
   <script src="/assets/figures/hit_geometry.js?v=1" defer></script>
   <script src="/assets/xlsx.full.min.js?v=1" defer></script>
-  <script src="/assets/figures.js?v=21" defer></script>
-  <script src="/assets/guide.js?v=7" defer></script>
+  <script src="/assets/figures.js?v=20" defer></script>
+  <script src="/assets/guide.js?v=6" defer></script>
 </head>
 <body class="figure-app">
+  <svg class="icon-definitions" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M5.5 8h1M5.5 12h1"/></symbol>
+      <symbol id="i-undo" viewBox="0 0 24 24"><path d="m8 5-5 5 5 5M3 10h10a7 7 0 0 1 7 7v2"/></symbol>
+      <symbol id="i-redo" viewBox="0 0 24 24"><path d="m16 5 5 5-5 5M21 10h-10a7 7 0 0 0-7 7v2"/></symbol>
+      <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 3h12l4 4v14H3V3h2Z"/><path d="M7 3v6h9V3M7 21v-8h10v8"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+      <symbol id="i-pointer" viewBox="0 0 24 24"><path d="m5 3 14 9-7 2-3 7-4-18Z"/></symbol>
+      <symbol id="i-hand" viewBox="0 0 24 24"><path d="M8 12V5a2 2 0 0 1 4 0v7-8a2 2 0 0 1 4 0v8-5a2 2 0 0 1 4 0v8c0 4-3 7-7 7h-1c-3 0-4-2-6-5l-3-5a2 2 0 0 1 3-2l2 2Z"/></symbol>
+      <symbol id="i-fit" viewBox="0 0 24 24"><path d="M3 9V3h6m6 0h6v6M3 15v6h6m6 0h6v-6"/><rect x="7" y="7" width="10" height="10" rx="1"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 10a8 8 0 1 0-2 8M20 4v6h-6"/></symbol>
+    </defs>
+  </svg>
+
   <header class="workbench-toolbar">
     <div class="workspace-identity">
       <a class="brand" href="/" aria-label="CitrusScholar 问答首页"><span class="brand-mark">C</span><strong>CitrusScholar</strong></a>
@@ -29,15 +42,15 @@
       <h1 id="projectTitle">未打开图件</h1>
     </div>
     <div class="toolbar-actions" aria-label="工作台操作">
-      <button class="icon-button" id="toggleLeft" aria-label="打开或收起图件抽屉" aria-controls="leftSidebar" aria-expanded="false" title="图件与对象"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-sidebar-left"/></svg></button>
+      <button class="icon-button" id="toggleLeft" aria-label="打开或收起图件抽屉" aria-controls="leftSidebar" aria-expanded="false" title="图件与对象"><svg class="icon"><use href="#i-sidebar"/></svg></button>
       <span class="tool-divider" aria-hidden="true"></span>
-      <button class="icon-button" id="undoButton" disabled title="撤销本地修改（Ctrl/⌘ + Z）" aria-label="撤销"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-undo"/></svg></button>
-      <button class="icon-button" id="redoButton" disabled title="重做本地修改（Ctrl/⌘ + Shift + Z）" aria-label="重做"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-redo"/></svg></button>
+      <button class="icon-button" id="undoButton" disabled title="撤销本地修改（Ctrl/⌘ + Z）" aria-label="撤销"><svg class="icon"><use href="#i-undo"/></svg></button>
+      <button class="icon-button" id="redoButton" disabled title="重做本地修改（Ctrl/⌘ + Shift + Z）" aria-label="重做"><svg class="icon"><use href="#i-redo"/></svg></button>
       <span class="tool-divider" aria-hidden="true"></span>
-      <button class="button secondary" id="checkPreviewButton" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-check"/></svg> 检查预览</button>
-      <button class="button primary" id="saveButton" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-save"/></svg>保存修改</button>
+      <button class="button secondary" id="checkPreviewButton" disabled>检查预览</button>
+      <button class="button primary" id="saveButton" disabled><svg class="icon"><use href="#i-save"/></svg>保存修改</button>
       <details class="export-menu" id="exportMenu">
-        <summary class="button secondary"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-download"/></svg>导出</summary>
+        <summary class="button secondary"><svg class="icon"><use href="#i-download"/></svg>导出</summary>
         <div class="export-options">
           <p class="hint">下载当前已保存图件</p>
           <p class="hint export-status" id="exportStatus" role="status" hidden></p>
@@ -47,16 +60,16 @@
           <a id="downloadTiff" aria-disabled="true" download>TIFF <span>图像</span></a>
         </div>
       </details>
-      <button class="icon-button" id="toggleRight" aria-label="打开或收起上下文检查面板" aria-controls="rightSidebar" aria-expanded="false" title="属性与画布"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-sidebar-right"/></svg></button>
-      <a class="back-link" href="/"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-arrow-left"/></svg> 返回问答</a>
+      <button class="icon-button" id="toggleRight" aria-label="打开或收起上下文检查面板" aria-controls="rightSidebar" aria-expanded="false" title="属性与画布"><svg class="icon flipped"><use href="#i-sidebar"/></svg></button>
+      <a class="back-link" href="/">返回问答</a>
     </div>
   </header>
 
   <main class="workbench" id="workbench">
     <aside class="asset-sidebar" id="leftSidebar" aria-label="图件与对象" hidden>
       <section class="project-section">
-        <div class="sidebar-heading"><h2>图件<span class="count" id="figureCount"></span></h2><button class="icon-button small" id="refreshButton" title="刷新图件" aria-label="刷新图件"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-refresh"/></svg></button></div>
-        <button class="button import-toggle" id="importToggle" aria-expanded="true" aria-controls="importPanel"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-plus"/></svg>从资料库导入</button>
+        <div class="sidebar-heading"><h2>图件<span class="count" id="figureCount"></span></h2><button class="icon-button small" id="refreshButton" title="刷新图件" aria-label="刷新图件"><svg class="icon"><use href="#i-refresh"/></svg></button></div>
+        <button class="button import-toggle" id="importToggle" aria-expanded="true" aria-controls="importPanel"><svg class="icon"><use href="#i-plus"/></svg>从资料库导入</button>
         <div id="importPanel" class="import-panel">
           <div class="import-source">
             <label class="import-field" for="dataFileSelect"><span>数据表格</span><select id="dataFileSelect" aria-describedby="schemaStatus"></select></label>
@@ -112,10 +125,10 @@
       <p id="scienceNotice" class="hint stage-notice" role="status" aria-live="polite" hidden></p>
       <div class="viewport" id="viewport" tabindex="0" aria-label="画板视口；平移模式下可用方向键平移">
         <div class="empty-workspace" id="emptyState">
-          <svg class="ui-icon app-icon empty-page" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-document"/></svg>
+          <svg class="empty-page" viewBox="0 0 100 120" fill="none" aria-hidden="true"><rect x="18" y="8" width="64" height="96" rx="3"/><path d="M30 28h40M30 37h24M30 70h40M30 80h40M30 90h26"/><rect x="30" y="48" width="40" height="13" rx="2"/></svg>
           <h2>为研究结果留出画布</h2>
           <p>打开已有图件，或从资料库导入数据。</p>
-          <button class="button secondary" id="openProjects"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-folder-open"/></svg> 浏览图件</button>
+          <button class="button secondary" id="openProjects">浏览图件</button>
         </div>
         <div class="workspace" id="workspace" hidden>
           <div class="ruler ruler-top" id="rulerTop" aria-hidden="true" hidden></div>
@@ -127,17 +140,17 @@
           </div>
         </div>
       </div>
-      <div class="view-toolbar" aria-label="画布视图操作">
+      <div class="view-toolbar" aria-label="视图操作">
         <div class="view-modes">
-          <button class="icon-button is-active" id="selectMode" aria-label="选择对象" title="选择对象" aria-pressed="true"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-cursor"/></svg></button>
-          <button class="icon-button" id="panMode" aria-label="平移画板" title="平移画板；也可按住鼠标中键拖动" aria-pressed="false"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-hand"/></svg></button>
+          <button class="icon-button is-active" id="selectMode" aria-label="选择对象" title="选择对象" aria-pressed="true"><svg class="icon"><use href="#i-pointer"/></svg></button>
+          <button class="icon-button" id="panMode" aria-label="平移画板" title="平移画板；也可按住鼠标中键拖动" aria-pressed="false"><svg class="icon"><use href="#i-hand"/></svg></button>
         </div>
         <span class="tool-divider" aria-hidden="true"></span>
-        <button class="icon-button" id="zoomOut" aria-label="缩小画布" title="缩小画布"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-minus"/></svg></button>
-        <label class="zoom-control"><input id="zoomPercent" type="number" min="10" max="800" step="10" value="100" aria-label="画布缩放百分比"><span>%</span></label>
-        <button class="icon-button" id="zoomIn" aria-label="放大画布" title="放大画布"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-plus"/></svg></button>
+        <button class="icon-button" id="zoomOut" aria-label="缩小" title="缩小"><svg class="icon"><use href="#i-minus"/></svg></button>
+        <label class="zoom-control"><input id="zoomPercent" type="number" min="10" max="800" step="10" value="100" aria-label="缩放百分比"><span>%</span></label>
+        <button class="icon-button" id="zoomIn" aria-label="放大" title="放大"><svg class="icon"><use href="#i-plus"/></svg></button>
         <span class="tool-divider" aria-hidden="true"></span>
-        <button class="button fit-button" id="fitView"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-fit"/></svg>适应窗口</button>
+        <button class="button fit-button" id="fitView"><svg class="icon"><use href="#i-fit"/></svg>适应窗口</button>
       </div>
       <footer class="stage-status"><p class="edit-status" id="editStatus" role="status" aria-live="polite">未打开图件</p><span class="view-note" id="hitStatus" role="status">Alt 点击切换重叠对象 · 滚轮平移</span></footer>
     </section>
@@ -148,11 +161,11 @@
         <button role="tab" id="canvasTab" aria-selected="false" aria-controls="canvasSection" tabindex="-1">画布</button>
       </div>
       <section class="inspector-section" id="propertiesSection" role="tabpanel" aria-labelledby="propertiesTab">
-        <div class="inspector-heading"><span class="object-symbol" id="inspectorObjectIcon"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-cursor"/></svg></span><div><h2 id="objectName">未选择对象</h2></div></div>
+        <div class="inspector-heading"><span class="object-symbol"><svg class="icon"><use href="#i-pointer"/></svg></span><div><h2 id="objectName">未选择对象</h2></div></div>
         <div id="propertyScope" class="property-scope" aria-live="polite" hidden></div>
         <div id="propertyPanel" class="property-panel"><p class="property-empty">在画板或左侧列表中选择对象。</p></div>
         <section id="propertyDraftControls" class="property-drafts" aria-label="恢复未保存的属性" hidden></section>
-        <button class="editor-guide" id="figureGuideButton" type="button" data-citrus-guide="figures" data-guide-focus-fallback="#toggleRight"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-help"/></svg> 使用指南</button>
+        <button class="editor-guide" id="figureGuideButton" type="button" data-citrus-guide="figures" data-guide-focus-fallback="#toggleRight">使用指南</button>
       </section>
       <section class="inspector-section" id="canvasSection" role="tabpanel" aria-labelledby="canvasTab" hidden>
         <h2 class="section-title">画布信息</h2>
@@ -167,8 +180,8 @@
           <p class="hint">检查当前已保存文件。默认报告排版和可读性提示。</p>
           <label class="setting-row"><span>期刊严格检查</span><input type="checkbox" id="figureJournalStrict"></label>
           <div class="figure-qa-actions">
-            <button class="button secondary" id="verifyFigureButton" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-check"/></svg> 检查图件</button>
-            <button class="button secondary" id="bundleFigureButton" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-download"/></svg> 导出证据包</button>
+            <button class="button secondary" id="verifyFigureButton" disabled>检查图件</button>
+            <button class="button secondary" id="bundleFigureButton" disabled>导出证据包</button>
           </div>
           <div id="figureQaStatus" class="hint" role="status" aria-live="polite">未打开图件</div>
           <div id="figureQaChecks"></div>

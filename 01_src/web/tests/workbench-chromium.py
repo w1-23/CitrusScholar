@@ -50,12 +50,13 @@ def pick_geometry(page, target):
       const [vx,vy,vw,vh] = geometry.viewBox;
       const available = viewport.getBoundingClientRect();
       const rows = project.hit_manifest.objects.filter(x => wanted.pick_ids.includes(x.gid) && x.bbox);
+      const uiScale = window.CitrusTheme.scale.effective();
       for (const row of rows) {
         const {x0,x1,y0,y1} = row.bbox;
         const aimX = box.left + ((x0+x1)/2-vx)*box.width/vw;
         const aimY = box.top + ((y0+y1)/2-vy)*box.height/vh;
-        viewport.scrollLeft += aimX - (available.left+available.right)/2;
-        viewport.scrollTop += aimY - (available.top+available.bottom)/2;
+        viewport.scrollLeft += (aimX - (available.left+available.right)/2) / uiScale;
+        viewport.scrollTop += (aimY - (available.top+available.bottom)/2) / uiScale;
         box = image.getBoundingClientRect();
         for (let py=y0;py<=y1;py+=0.7) for (let px=x0;px<=x1;px+=0.7) {
           const x=Math.round(box.left+(px-vx)*box.width/vw), y=Math.round(box.top+(py-vy)*box.height/vh);
@@ -176,10 +177,9 @@ def run(browser, origin, output):
     zoom.fill("150")
     page.get_by_role("button", name="应用画布缩放").click()
     expect(page.locator("#zoomLevel")).to_have_text("150%")
-    expect(page.locator('[data-ui-scale-pick]')).to_have_count(0)
-    page.evaluate("window.CitrusTheme.scale.set(150)")
+    expect(page.locator("html")).to_have_attribute("data-ui-scale", "125")
+    page.locator('[data-ui-scale-pick="150"]').click()
     expect(page.locator("html")).to_have_attribute("data-ui-scale", "150")
-    expect(page.locator("html")).to_have_css("zoom", "1")
     expect(page.locator("#zoomLevel")).to_have_text("150%")
     expect(page.get_by_role("button", name="画布选取")).to_have_attribute("aria-pressed", "true")
     point = pick_geometry(page, "X 轴刻度文字")
@@ -257,7 +257,6 @@ def run(browser, origin, output):
     expect(page.get_by_role("heading", name="Five independent groups")).to_be_visible(timeout=15000)
     expect(page.locator("html")).to_have_attribute("data-ui-scale", "150")
     expect(page.get_by_role("button", name="适合窗口")).to_have_attribute("aria-pressed", "true")
-    expect(page.locator("html")).to_have_css("zoom", "1")
     assert page.viewport_size["width"] == 1360
     expect(zoom).to_have_value("")
     expect(zoom).to_have_attribute("placeholder", "缩放 %")
@@ -285,13 +284,14 @@ def run(browser, origin, output):
         assert not metrics["overlap"] and not metrics["outside"], metrics
 
     check_zoom_layout()
-    page.screenshot(path=str(output / "workbench-canvas-fit.png"))
+    page.screenshot(path=str(output / "workbench-150.png"))
     zoom.fill("200")
     page.get_by_role("button", name="应用画布缩放").click()
     expect(zoom).to_have_value("200")
     expect(page.locator("#zoomLevel")).to_have_text("200%")
     check_zoom_layout()
-    page.screenshot(path=str(output / "workbench-canvas-200.png"))
+    page.screenshot(path=str(output / "workbench-150-value.png"))
+    page.locator('[data-ui-scale-pick="125"]').click()
 
     choose(page, "Native two-panel figure")
     expect(page.get_by_role("heading", name="Native two-panel figure")).to_be_visible(timeout=15000)

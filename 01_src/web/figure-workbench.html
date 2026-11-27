@@ -1,38 +1,40 @@
 <!doctype html>
-<html class="figure-editor" lang="zh-CN">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
   <title>图件工作台 · CitrusScholar</title>
   <script src="/assets/citrus-theme.js?v=2"></script>
-  <link rel="stylesheet" href="/assets/app-icon.css?v=1">
-  <link rel="stylesheet" href="/assets/workbench/workbench.css?v=6">
-  <link rel="stylesheet" href="/assets/guide.css?v=7">
-  <link rel="stylesheet" href="/assets/citrus-theme.css?v=3">
-  <script src="/assets/app-icon-names.js?v=1" defer></script>
-  <script src="/assets/app-icon.js?v=1" defer></script>
+  <link rel="stylesheet" href="/assets/workbench/workbench.css?v=5">
+  <link rel="stylesheet" href="/assets/guide.css?v=6">
+  <link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
   <script src="/assets/figures/hit_geometry.js?v=1" defer></script>
-  <script type="module" src="/assets/workbench/main.js?v=10"></script>
-  <script src="/assets/guide.js?v=7" defer></script>
+  <script type="module" src="/assets/workbench/main.js?v=9"></script>
+  <script src="/assets/guide.js?v=6" defer></script>
 </head>
 <body class="figure-workbench">
   <header class="toolbar">
     <div class="workspace-name">
-      <a class="back-link" id="returnSession" href="/"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-arrow-left"/></svg>返回会话</a>
+      <a class="back-link" id="returnSession" href="/">← 返回会话</a>
       <h1>图件工作台</h1>
     </div>
     <nav aria-label="工作台操作">
-      <button id="workbenchGuideButton" type="button" data-citrus-guide="workbench" title="使用指南" aria-label="使用指南"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-help"/></svg></button>
-      <button id="openLibrary"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-folder-open"/></svg> 打开图件</button>
-      <button id="toggleGroups" class="drawer-button" aria-controls="groups" aria-expanded="false"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-sidebar-left"/></svg> 对象组</button>
-      <button id="toggleInspector" class="drawer-button" aria-controls="inspector" aria-expanded="false"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-sidebar-right"/></svg> 属性</button>
-      <button id="undo" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-undo"/></svg> 撤销</button>
-      <button id="redo" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-redo"/></svg> 重做</button>
+      <button id="workbenchGuideButton" type="button" data-citrus-guide="workbench" title="使用指南" aria-label="使用指南">?</button>
+      <button id="openLibrary">打开图件</button>
+      <button id="toggleGroups" class="drawer-button" aria-controls="groups" aria-expanded="false">对象组</button>
+      <button id="toggleInspector" class="drawer-button" aria-controls="inspector" aria-expanded="false">属性</button>
+      <div class="scale-controls" role="group" aria-label="界面缩放">
+        <span>界面</span>
+        <button type="button" data-ui-scale-pick="125">125%</button>
+        <button type="button" data-ui-scale-pick="150">150%</button>
+      </div>
+      <button id="undo" disabled>撤销</button>
+      <button id="redo" disabled>重做</button>
       <button id="recoverDraft" type="button" hidden>载入最新版并恢复草稿</button>
-      <button id="save" class="primary" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-save"/></svg> 保存图件</button>
+      <button id="save" class="primary" disabled>保存图件</button>
       <details id="exports" class="exports">
-        <summary><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-download"/></svg> 导出</summary>
+        <summary>导出</summary>
         <div class="export-menu" id="exportMenu"></div>
       </details>
     </nav>
@@ -63,21 +65,21 @@
       <div class="canvas-toolbar">
         <div class="figure-name"><h2 id="figureTitle">未打开图件</h2><span id="revision"></span><a id="legacyEditor" class="back-link" hidden>旧版 SVG 编辑器</a></div>
         <div class="view-controls" aria-label="画布控制">
-          <button id="zoomOut" aria-label="缩小画布" title="缩小画布" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-minus"/></svg></button>
-          <button id="fit" aria-label="适合窗口" aria-pressed="true" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-fit"/></svg> 适应</button>
+          <button id="zoomOut" aria-label="缩小" disabled>−</button>
+          <button id="fit" aria-label="适合窗口" aria-pressed="true" disabled>适应</button>
           <button id="actualSize" aria-label="实际大小 100%" aria-pressed="false" disabled>100%</button>
-          <button id="zoomIn" aria-label="放大画布" title="放大画布" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-plus"/></svg></button>
+          <button id="zoomIn" aria-label="放大" disabled>＋</button>
           <form id="canvasZoomForm" class="canvas-zoom-form" aria-label="手动画布缩放">
             <input id="canvasZoom" type="number" min="50" max="200" step="1" required inputmode="numeric" aria-label="自定义画布缩放百分比" aria-describedby="canvasZoomRange" placeholder="缩放 %" disabled>
             <span id="canvasZoomRange" class="sr-only">输入 50 至 200 之间的整数。</span>
             <button id="setCanvasZoom" type="submit" aria-label="应用画布缩放" disabled>应用</button>
           </form>
           <output id="zoomLevel" aria-label="当前缩放"></output>
-          <button id="picking" aria-pressed="true" disabled><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-cursor"/></svg> 画布选取</button>
+          <button id="picking" aria-pressed="true" disabled>画布选取</button>
         </div>
       </div>
       <div id="canvas" class="canvas" tabindex="0" aria-label="图件画布">
-        <div id="canvasEmpty" class="canvas-empty"><div><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-chart"/></svg><strong>图件画布</strong><span>从图件库打开图件，也可将图件拖到画布。</span></div></div>
+        <div id="canvasEmpty" class="canvas-empty"><div><svg aria-hidden="true" viewBox="0 0 48 48" fill="none"><rect x="7" y="7" width="34" height="34" rx="7"/><path d="M15 32V22m9 10V16m9 16V25"/></svg><strong>图件画布</strong><span>从图件库打开图件，也可将图件拖到画布。</span></div></div>
         <div id="canvasSheet" class="canvas-sheet" hidden>
           <div id="frame" class="frame">
             <div id="inkScene" class="ink-scene" aria-hidden="true"></div>

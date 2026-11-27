@@ -60,6 +60,8 @@ body {
 .tool-trace { margin: 0 0 9px; border-bottom: 1px solid var(--border-hairline); color: var(--text-muted); }
 .tool-trace-summary { display: flex; align-items: center; gap: 7px; min-height: 29px; padding: 3px 1px 6px; cursor: pointer; list-style: none; user-select: none; font-size: 11px; }
 .tool-trace-summary::-webkit-details-marker { display: none; }
+.tool-trace-summary::after { content: '⌄'; margin-left: auto; font-size: 12px; transition: transform .16s ease; }
+.tool-trace[open] > .tool-trace-summary::after { transform: rotate(180deg); }
 .tool-trace-indicator { width: 15px; color: var(--success); text-align: center; font-size: 13px; }
 .tool-trace.is-running .tool-trace-indicator { animation: tracePulse 1.15s ease-in-out infinite; }
 /* 收尾时按真实行状态着色：有失败步骤不再显示为成功态 */
@@ -1011,6 +1013,8 @@ footer {
 .session-group:last-child { border-bottom: 0; }
 .session-group summary { display: flex; align-items: center; gap: 7px; padding: 7px 6px; color: var(--text-muted); font-size: 10px; font-weight: 600; cursor: pointer; list-style: none; user-select: none; }
 .session-group summary::-webkit-details-marker { display: none; }
+.session-group summary::before { content: '›'; width: 10px; color: var(--text-muted); font-size: 14px; line-height: 1; transition: transform .16s ease; }
+.session-group[open] summary::before { transform: rotate(90deg); }
 .session-group-count { margin-left: auto; font-family: var(--font-mono); font-size: 9px; font-weight: 400; }
 .session-group-content { padding: 1px 0 5px; animation: sessionGroupIn .18s var(--ease-out-quint) both; }
 @keyframes sessionGroupIn { from { opacity: .55; transform: translateY(-3px); } to { opacity: 1; transform: translateY(0); } }
@@ -1507,14 +1511,12 @@ footer {
 
 
 .account-label { color: var(--text-muted); font-size: 12px; }
-.auth-gate { position: fixed; inset: 0; z-index: 10000; display: grid; grid-template-columns:minmax(0,1fr); place-items: center; overflow-y:auto; padding: max(14px,env(safe-area-inset-top)) 18px max(14px,env(safe-area-inset-bottom)); background: color-mix(in srgb, var(--bg-app) 86%, #000 14%); }
+.auth-gate { position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center; overflow-y:auto; padding: max(14px,env(safe-area-inset-top)) 18px max(14px,env(safe-area-inset-bottom)); background: color-mix(in srgb, var(--bg-app) 86%, #000 14%); }
 .auth-gate[hidden] { display: none; }
 .auth-card { width: min(420px, 100%); max-height:min(92vh,760px); max-height:min(92dvh,760px); margin:auto; padding:24px; overflow-y:auto; overscroll-behavior:contain; border:1px solid var(--border-hairline); border-radius:18px; background:var(--bg-surface); box-shadow:0 20px 70px #0002; }
 .auth-brand { color: var(--accent); font-weight: 700; font-size: 20px; }
 .auth-title { margin: 18px 0 14px; font-size: 16px; font-weight: 600; }
 .auth-card input, .auth-card select { box-sizing: border-box; width: 100%; margin: 6px 0; padding: 11px 12px; border: 1px solid var(--border-hairline); border-radius: 10px; background: var(--bg-app); color: var(--text-primary); font: inherit; }
-.auth-card > :is(input,select):not([hidden]) { display:block; min-width:0; }
-.auth-icon-attribution a { color:var(--ui-focus); }
 .auth-card .api-save { width:100%; min-height:42px; margin-top:12px; border:0; border-radius:10px; background:var(--accent); color:#fff; font:inherit; font-size:13px; font-weight:650; cursor:pointer; box-shadow:0 5px 14px var(--accent-glow); transition:transform .16s ease,background .16s ease,box-shadow .16s ease; }
 .auth-card .api-save:hover { background:var(--accent-hover); transform:translateY(-1px); box-shadow:0 8px 18px var(--accent-glow); }
 .auth-card .api-save:active { transform:translateY(0); }
@@ -2131,6 +2133,16 @@ html[data-reduce-motion="1"]:not([data-force-motion="1"]) .citrus-mascot-frame {
   --motion-slow: .28s;
 }
 /* 折叠/展开指示：纯 CSS 三角，方向与内容显隐一致（折叠→右，展开→下） */
+.sidebar-header::before {
+  content: ""; flex: 0 0 auto; width: 0; height: 0;
+  border-left: 4.5px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  opacity: .5; transform: rotate(0deg);
+  transition: transform var(--motion-fast) var(--ease-out-quint), opacity var(--motion-fast) ease;
+}
+.sidebar-section.expanded > .sidebar-header::before { transform: rotate(90deg); opacity: .85; }
+.sidebar-header:hover::before { opacity: .9; }
 /* 键盘可达性：统一焦点环，不改变布局 */
 .rail-button:focus-visible,
 .rail-quick .rail-button:focus-visible,

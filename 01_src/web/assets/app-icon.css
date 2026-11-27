@@ -5,7 +5,7 @@
   --cs-brand-orange-surface: #F7EDE4;
   --cs-brand-orange-ring: rgba(223, 118, 47, .24);
 }
-:is(.ui-icon, .app-icon):has(> use[href^="/assets/citrus-icons.svg#ui-"]) {
+:is(.ui-icon, .app-icon):has(> use[href^="/assets/file-solar-icons.svg#ui-"]) {
   --solar-color: var(--cs-brand-orange);
   --solar-secondary-color: var(--cs-brand-orange-soft);
   --solar-secondary-opacity: .65;
@@ -21,7 +21,7 @@
 .app-icon[data-icon-size="16"] { --solar-size: 16px; }
 .app-icon[data-icon-size="18"] { --solar-size: 18px; }
 .app-icon[data-icon-size="24"] { --solar-size: 24px; }
-:is(.app-icon.app-icon-inverse, .send-btn .ui-icon):has(> use[href^="/assets/citrus-icons.svg#ui-"]) {
+:is(.app-icon.app-icon-inverse, .send-btn .ui-icon):has(> use[href^="/assets/file-solar-icons.svg#ui-"]) {
   --solar-color: white;
   --solar-secondary-color: white;
   --solar-secondary-opacity: 1;

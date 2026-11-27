@@ -7,13 +7,13 @@
   <title>CitrusScholar 管理后台</title>
   <script src="/assets/citrus-theme.js?v=2"></script>
   <link rel="stylesheet" href="/assets/admin.css?v=5">
-  <link rel="stylesheet" href="/assets/citrus-theme.css?v=3">
+  <link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
   <script src="/assets/admin.js?v=7" defer></script>
-<link rel="stylesheet" href="/assets/app-icon.css?v=1"></head>
+</head>
 <body data-page="admin">
   <header class="topbar">
     <div class="brand"><span class="brand-mark">C</span><div><strong>CitrusScholar</strong><small>管理员后台</small></div></div>
-    <div class="top-actions"><span id="adminName"></span><a class="button secondary" href="/"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-home"/></svg> 返回问答</a><button class="button secondary" id="logoutButton"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-logout"/></svg> 退出登录</button></div>
+    <div class="top-actions"><span id="adminName"></span><a class="button secondary" href="/">返回问答</a><button class="button secondary" id="logoutButton">退出登录</button></div>
   </header>
   <main class="layout">
     <section class="welcome"><div><p class="eyebrow">ADMINISTRATION</p><h1>服务管理</h1><p>账号、使用情况、请求记录与运行状态</p></div><button class="button primary" id="refreshButton">刷新数据</button></section>
@@ -153,8 +153,8 @@
     <p class="muted" id="corpusOriginalStatus" role="status"></p>
     <pre id="corpusOriginalText" aria-label="原件正文" tabindex="0" hidden></pre>
     <div class="actions admin-modal-actions">
-      <a class="button secondary" id="corpusOriginalPdf" target="_blank" rel="noopener noreferrer" hidden><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-external"/></svg> 在新标签页打开 PDF</a>
-      <a class="button secondary" id="corpusOriginalDownload" hidden><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/citrus-icons.svg#ui-download"/></svg> 下载原件</a>
+      <a class="button secondary" id="corpusOriginalPdf" target="_blank" rel="noopener noreferrer" hidden>在新标签页打开 PDF</a>
+      <a class="button secondary" id="corpusOriginalDownload" hidden>下载原件</a>
       <button class="button primary" id="corpusOriginalClose" type="button" autofocus>关闭</button>
     </div>
   </dialog>

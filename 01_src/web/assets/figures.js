@@ -101,7 +101,6 @@
     el('projectTitle').textContent = '未打开图件';
     el('projectMeta').textContent = '在左侧打开图件开始编辑';
     el('objectName').textContent = '未选择对象';
-    el('inspectorObjectIcon').innerHTML = window.AppIcon.html('cursor');
     el('objectCount').textContent = '';
     el('objectSearch').value = '';
     el('objectSearch').disabled = true;
@@ -845,9 +844,9 @@
   // Categories are selection scopes; disclosure never changes the selection.
   function objectGroups() {
     var objects = manifestObjects();
-    function leaf(object) { return { id: object.gid, object: object, label: objectLabel(object), icon: objectTypeIcon(object), members: [object], children: [] }; }
-    function group(id, label, children, collapsed, icon) {
-      return { id: id, label: label, icon: icon || GROUP_ICONS[id] || 'layers', children: children, collapsed: !!collapsed,
+    function leaf(object) { return { id: object.gid, object: object, label: objectLabel(object), members: [object], children: [] }; }
+    function group(id, label, children, collapsed) {
+      return { id: id, label: label, children: children, collapsed: !!collapsed,
         members: children.reduce(function (all, child) { return all.concat(child.members); }, []) };
     }
     var series = objects.filter(function (o) { return o.role === 'series'; });
@@ -863,10 +862,10 @@
     var ticks = {};
     objects.filter(function (o) { return o.role === 'ticklabel'; }).forEach(function (object) {
       var locator = object.locator || {};
-      var axis = objectAxis(object);
+      var axis = locator.axis || (/tick_y/.test(object.gid) ? 'y' : 'x');
       var index = locator.axes_index === undefined ? 0 : locator.axes_index;
       var key = 'ticks:' + index + ':' + axis;
-      if (!ticks[key]) ticks[key] = group(key, '子图 ' + (Number(index) + 1) + ' · ' + (axis ? axis.toUpperCase() + ' 轴' : '') + '刻度', [], true, axis ? 'axis-' + axis : 'axis');
+      if (!ticks[key]) ticks[key] = group(key, '子图 ' + (Number(index) + 1) + ' · ' + axis.toUpperCase() + ' 轴刻度', [], true);
       ticks[key].children.push(leaf(object)); ticks[key].members.push(object);
     });
     return [
@@ -875,7 +874,7 @@
       group('legend', '图例', objects.filter(function (o) { return o.role === 'legend'; }).map(leaf)),
       group('grid', '网格线', objects.filter(function (o) { return o.role === 'grid'; }).map(leaf)),
       group('colorbar', '色条', objects.filter(function (o) { return o.role === 'colorbar'; }).map(leaf)),
-      group('axes', '画布与坐标轴', objects.filter(function (o) { return ['axes', 'spine', 'figure'].indexOf(o.role) >= 0; }).map(leaf).concat(Object.keys(ticks).map(function (key) { return ticks[key]; })))
+      group('axes', '坐标轴', objects.filter(function (o) { return ['axes', 'spine', 'figure'].indexOf(o.role) >= 0; }).map(leaf).concat(Object.keys(ticks).map(function (key) { return ticks[key]; })))
     ].filter(function (node) { return node.members.length; });
   }
 
@@ -915,8 +914,7 @@
           var disclosure = document.createElement('button'); disclosure.type = 'button'; disclosure.className = 'object-disclosure';
           disclosure.setAttribute('data-expand', key); disclosure.setAttribute('data-tree-key', 'expand:' + key);
           disclosure.setAttribute('aria-label', (expanded ? '收起' : '展开') + node.label);
-          disclosure.setAttribute('aria-expanded', String(expanded));
-          disclosure.innerHTML = window.AppIcon.html(expanded ? 'chevron-down' : 'chevron-right');
+          disclosure.setAttribute('aria-expanded', String(expanded)); disclosure.textContent = expanded ? '▾' : '▸';
           disclosure.disabled = !!filtering;
           if (filtering) disclosure.title = '筛选期间展开匹配对象的上级分组';
           row.appendChild(disclosure);
@@ -929,10 +927,7 @@
         button.classList.toggle('is-selected', selected);
         button.classList.toggle('is-context', !!filtering && !!node.object && !selfMatch);
         var hidden = node.object && currentValue(node.id, 'visible', true) === false;
-        button.innerHTML = window.AppIcon.html(node.icon);
-        var caption = document.createElement('span'); caption.className = 'object-tree-label';
-        caption.textContent = node.label + (hidden ? '（已移除）' : '') + (!node.object ? '（' + node.members.length + '）' : '');
-        button.appendChild(caption);
+        button.textContent = node.label + (hidden ? '（已移除）' : '') + (!node.object ? '（' + node.members.length + '）' : '');
         button.title = node.object ? node.id : '批量修改组内 ' + node.members.length + ' 个对象的共同样式';
         row.appendChild(button); item.appendChild(row); container.appendChild(item);
         state.treeNodes.push({ id: node.id, key: key, parent: parent, button: button, expanded: expanded, filtering: filtering, children: node.children.length });
@@ -1024,27 +1019,6 @@
     point: '数据点', bar: '柱形', spine: '轴线', ticklabel: '刻度标签',
     grid: '网格线', errorbar: '误差棒', colorbar: '色条'
   };
-
-  var GROUP_ICONS = { text: 'text', series: 'layers', legend: 'legend', grid: 'grid', colorbar: 'colorbar', axes: 'axis' };
-  var ROLE_ICONS = {
-    title: 'text', xlabel: 'axis-x', ylabel: 'axis-y', legend: 'legend', annot: 'text',
-    series: 'layers', axes: 'chart', figure: 'document', point: 'point', bar: 'bar-chart',
-    spine: 'axis', ticklabel: 'axis', grid: 'grid', errorbar: 'error-bar', colorbar: 'colorbar',
-    arrow: 'arrow-right', patch: 'vector'
-  };
-
-  function objectAxis(object) {
-    var axis = object.locator && object.locator.axis;
-    if (axis === 'x' || axis === 'y') return axis;
-    var inferred = /tick_([xy])(?:_|\d|$)/.exec(object.gid);
-    return inferred ? inferred[1] : '';
-  }
-
-  function objectTypeIcon(object) {
-    var axis = ['ticklabel', 'spine'].indexOf(object.role) >= 0 && objectAxis(object);
-    if (axis) return 'axis-' + axis;
-    return Object.hasOwn(ROLE_ICONS, object.role) ? ROLE_ICONS[object.role] : 'layers';
-  }
 
   function objectLabel(object) {
     var label = String(currentValue(object.gid, ['title', 'xlabel', 'ylabel', 'annot'].indexOf(object.role) >= 0 ? 'text' : 'label', object.label || '') || '').trim();
@@ -1166,7 +1140,6 @@
     panel.replaceChildren();
     var project = state.current, targets = project.svg_targets || [];
     el('objectName').textContent = '示意图对象';
-    el('inspectorObjectIcon').innerHTML = window.AppIcon.html('vector');
     if (!targets.length) {
       panel.textContent = '没有带唯一 ID 的可编辑对象。可以预览和下载此图。';
       return;
@@ -1250,7 +1223,6 @@
     }
     var selected = selectedObject();
     el('objectName').textContent = state.selectedGroup ? '批量编辑 · ' + selectedMembers().length + ' 个对象' : selected ? objectLabel(selected) : '未选择对象';
-    el('inspectorObjectIcon').innerHTML = window.AppIcon.html(state.selectedGroup ? 'layers' : selected ? objectTypeIcon(selected) : 'cursor');
     if (state.current && state.current.editable === false) {
       if (state.current.edit_requires_preparation) {
         panel.innerHTML = '<p class="property-empty">当前显示已保存图件的静态预览。点击画布上方的“加载编辑对象”可尝试恢复编辑；' +

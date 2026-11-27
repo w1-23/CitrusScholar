@@ -273,7 +273,7 @@ def authorize_fusion_code(identity, release):
 
 
 def _host_private_workspace(workspace):
-    return workspace.get("metadata", {}).get("code_scope") in {FUSION_CODE_SCOPE, "citrus.nature-plot/1"}
+    return workspace.get("metadata", {}).get("code_scope") in {FUSION_CODE_SCOPE, "citrus.nature-plot/1", "citrus.numeric-integrity/1"}
 
 
 def _key(*values):
@@ -372,7 +372,80 @@ def _accepted_file(service, identity, execution_id, path, *, max_bytes=None):
         lease.release()
 
 
+def _delivery_result(status, reason, data=None):
+    from src.research.delivery_reconciliation import delivery_outcome
+
+    receipts = [{"url": data["artifact_url"]}] if data is not None else []
+    outcome = delivery_outcome(status, reason, receipts)
+    if data is not None and outcome["status"] != "complete":
+        # Do not expose a claimed URL if it disagrees with captured evidence.
+        data = None
+        outcome = delivery_outcome("unknown", "write_requires_reconciliation", [])
+    payload = {**(data if data is not None else {"error": outcome["reason_code"]}),
+               "_tool_outcome": outcome}
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False), payload
+
+
+def _deliver(execution_id, path):
+    from src.core.account_leases import account_lease
+    from src.core.cancel import ToolCancelled
+    from src.core.deliverable_check import DeliverableRejected
+    from src.core.tracing import get_client_request_id
+    from src.research.delivery_reconciliation import before_publication, publication_confirmed
+
+    publishing = False
+    try:
+        from src.research.artifacts import publish_artifact
+        from src.research.tools import validate_artifact_links
+
+        identity, _ = _identity()
+        with account_lease(identity.owner_user_id):
+            service = _service(identity)
+            execution = service.status(execution_id)
+            if _host_private_workspace(service.workspace.open(execution["workspace_id"])):
+                return _delivery_result("not_run", "workspace_scope_denied")
+            with _accepted_file(service, identity, execution_id, path) as (_, ref, data):
+                request_id = get_client_request_id() or identity.user_turn_id
+                source_key = delivery_key(execution_id, ref["path"], ref["sha256"])
+                filename = ref["path"].rsplit("/", 1)[-1]
+                publishing = True
+                try:
+                    published = publish_artifact(owner=identity.owner_user_id, session_id=identity.session_id,
+                        producer_tool="code_deliver", request_id=request_id, filename=filename,
+                        content=data, mime=ref["mime_type"], source_file_id=ref["file_id"],
+                        source_sha256=ref["sha256"], logical_task_id=source_key)
+                except DeliverableRejected as exc:
+                    # Typed format refusals precede the publisher's write boundary.
+                    # A failed registration is never evidence of zero publication.
+                    if exc.code != "artifact_registration_failed" and before_publication():
+                        return _delivery_result("not_run", "deliverable_rejected")
+                    raise
+                link = published["artifact_url"]
+                if not re.fullmatch(r"/api/v2/session/[A-Za-z0-9_-]{8,128}/artifacts/[a-f0-9]{32}", link):
+                    raise ValueError("code_artifact_url_unverified")
+                checked = validate_artifact_links([link], session_id=identity.session_id,
+                    owner_user_id=identity.owner_user_id, request_id=request_id)
+                if len(checked) != 1 or not checked[0]["valid"]:
+                    raise ValueError("code_artifact_url_unverified")
+                result = {"execution_id": execution_id, "path": ref["path"],
+                    "filename": checked[0]["filename"], "mime": checked[0]["mime"],
+                    "artifact_url": link, "file_id": published["file_id"], "source_sha256": ref["sha256"],
+                    "source_size_bytes": ref["size_bytes"]}
+        publication_confirmed(link, sha256=published["sha256"], verified_by_caller=True)
+        return _delivery_result("complete", "code_output_delivered", result)
+    except ToolCancelled:
+        raise
+    except Exception:
+        # A source/admission refusal cannot publish. Once the publisher is called,
+        # an unexpected failure stays uncertain even if its stage was not recorded.
+        if not publishing:
+            return _delivery_result("not_run", "code_delivery_preflight_rejected")
+        return _delivery_result("unknown", "write_requires_reconciliation")
+
+
 def _dispatch(operation, **args):
+    if operation == "deliver":
+        return _deliver(**args)
     from src.core.account_leases import account_lease
     from src.workspaces import WorkspaceConflict
     from src.code_execution.repository import ExecutionConflict, QueueFull
@@ -635,39 +708,19 @@ def _dispatch(operation, **args):
             execution = service.status(execution_id)
             if _host_private_workspace(workspace.open(execution["workspace_id"])):
                 return reject("workspace_scope_denied")
-            if operation in {"read", "deliver"}:
+            if operation == "read":
                 with _accepted_file(service, identity, execution_id, args["path"]) as (request, ref, data):
-                    if operation == "read":
-                        start = args["start_byte"]
-                        if start > len(data):
-                            raise ValueError("code_output_offset_out_of_range")
-                        chunk = data[start:start + args["max_bytes"]]
-                        end = start + len(chunk)
-                        return _result({"execution_id": execution_id, "path": ref["path"], "version": ref["version"],
-                            "sha256": ref["sha256"], "size_bytes": len(data), "start_byte": start,
-                            "returned_bytes": len(chunk), "next_start_byte": end if end < len(data) else None,
-                            "eof": end == len(data), "data_base64": base64.b64encode(chunk).decode("ascii"),
-                            "text_preview": chunk.decode("utf-8", errors="replace"),
-                            "text_preview_encoding": "utf-8-replace"}, reason="code_output_read")
-                    from src.core.tracing import get_client_request_id
-                    from src.research.artifacts import publish_artifact
-                    from src.research.tools import validate_artifact_links
-                    published = publish_artifact(owner=identity.owner_user_id, session_id=identity.session_id,
-                        producer_tool="code_deliver", request_id=get_client_request_id() or identity.user_turn_id,
-                        filename=ref["path"].rsplit("/", 1)[-1], content=data, mime=ref["mime_type"],
-                        source_file_id=ref["file_id"], source_sha256=ref["sha256"],
-                        logical_task_id=delivery_key(execution_id, ref["path"], ref["sha256"]))
-                    link = published["artifact_url"]
-                    if not re.fullmatch(r"/api/v2/session/[A-Za-z0-9_-]{8,128}/artifacts/[a-f0-9]{32}", link):
-                        raise ValueError("code_artifact_url_unverified")
-                    checked = validate_artifact_links([link], session_id=identity.session_id,
-                                                       owner_user_id=identity.owner_user_id)
-                    if len(checked) != 1 or not checked[0]["valid"]:
-                        raise ValueError("code_artifact_url_unverified")
-                    return _result({"execution_id": execution_id, "path": ref["path"],
-                        "filename": checked[0]["filename"], "mime": checked[0]["mime"],
-                        "artifact_url": link, "file_id": published["file_id"], "source_sha256": ref["sha256"],
-                        "source_size_bytes": ref["size_bytes"]}, reason="code_output_delivered", artifacts=[link])
+                    start = args["start_byte"]
+                    if start > len(data):
+                        raise ValueError("code_output_offset_out_of_range")
+                    chunk = data[start:start + args["max_bytes"]]
+                    end = start + len(chunk)
+                    return _result({"execution_id": execution_id, "path": ref["path"], "version": ref["version"],
+                        "sha256": ref["sha256"], "size_bytes": len(data), "start_byte": start,
+                        "returned_bytes": len(chunk), "next_start_byte": end if end < len(data) else None,
+                        "eof": end == len(data), "data_base64": base64.b64encode(chunk).decode("ascii"),
+                        "text_preview": chunk.decode("utf-8", errors="replace"),
+                        "text_preview_encoding": "utf-8-replace"}, reason="code_output_read")
             if operation == "log":
                 return _result(service.read_log(execution_id, **args))
             if operation == "cancel":
@@ -768,7 +821,7 @@ def code_read(execution_id: str, path: str, start_byte: int = 0, max_bytes: int 
 
 @tool(args_schema=OutputArgs, response_format="content_and_artifact")
 def code_deliver(execution_id: str, path: str):
-    """Publish one declared, accepted output from a succeeded execution through the existing artifact registry. Rechecks original account epoch, task binding, owner/session and file bytes/hash. Return a verified /api/v2/session/.../artifacts/... URL, the public File Library file_id, and bounded source metadata. Repeated delivery of the same accepted source within this turn reuses publication; accepted private file IDs are never download URLs. Delivery does not certify scientific correctness or register a wait."""
+    """Publish one declared, accepted output from a succeeded execution through the existing artifact registry. Rechecks original account epoch, task binding, owner/session and file bytes/hash. Return a verified /api/v2/session/.../artifacts/... URL, the public File Library file_id, and bounded source metadata. Repeated delivery of the same accepted source within this turn reuses publication. An unknown result requires checking the saved operation and publication records before any further action; do not resubmit it. Accepted private file IDs are never download URLs. Delivery does not certify scientific correctness or register a wait."""
     return _dispatch("deliver", execution_id=execution_id, path=path)
 
 

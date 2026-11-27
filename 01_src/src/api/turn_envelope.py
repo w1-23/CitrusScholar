@@ -486,7 +486,7 @@ def reconcile_staged_turn_inputs():
                 logger.warning("staged turn input reconciliation deferred: %s", type(exc).__name__)
 
 
-def _continued_inputs(owner_user_id: int, session_id: str, baseline: str) -> list[dict]:
+def _continued_inputs(owner_user_id: int, session_id: str, baseline: str, *, verify_bytes=False) -> list[dict]:
     try:
         previous = chat_turn_queue.continuation_baseline(owner_user_id=owner_user_id, session_id=session_id,
                                                         client_request_id=baseline)
@@ -513,7 +513,10 @@ def _continued_inputs(owner_user_id: int, session_id: str, baseline: str) -> lis
             info["size_bytes"] = Path(info["path"]).stat().st_size
         except OSError as exc:
             raise unavailable from exc
-        # The transactional pin verifies actual bytes against this exact hash.
+        # Submission separately pins and verifies the actual bytes, even if the
+        # optional UI lookup already verified them.
+        if verify_bytes and not session_files.verified_public_file(info):
+            raise unavailable
         inherited.append(_input_metadata(info, source="previous_turn"))
     return inherited
 

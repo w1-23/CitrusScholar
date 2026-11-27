@@ -79,6 +79,41 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def serialized(self, text):
         return len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
 
+    async def test_plot_success_summary_points_only_to_existing_original_fields(self):
+        from src.core.tool_result_view import content_wire_bytes
+        exports = [{"format": fmt, "file_id": digit * 32,
+                    "download_url": f"/api/v2/files/{digit * 32}/download",
+                    "artifact_url": f"/api/v2/session/fixture/artifacts/{digit * 32}",
+                    "sha256": digit * 64, "size": 1000, "filename": f"figure.{fmt}",
+                    "artifact_id": digit * 32} for fmt, digit in zip(("svg", "png", "pdf"), "123")]
+        original = {"deliverable_stage": "figure_published", "exports": exports,
+                    "_tool_outcome": {"status": "complete", "reason_code": "figure_published",
+                                      "artifacts": [row["artifact_url"] for row in exports]},
+                    "figures": [{"name": "plot", "status": "complete", "delivery_stage": "figure_published",
+                                 "exports": exports,
+                                 "qa_receipt": {"status": "measured_checks_pass", "checks": {"fonts": {"status": "pass"}}},
+                                 "current_qa": {"overall": {"execution": "partial", "conclusion": "incomplete",
+                                                            "blocking": [], "advisory": ["source_preflight"],
+                                                            "unexecuted": ["visual"]}},
+                                 "nature_skill_receipt": {"status": "review_required", "checks": {
+                                     "pdf_collisions": {"status": "pass"}, "pdf_text": {"status": "pass"}}}}],
+                    "script_report": '{"rows_read":12,"rows_plotted":12,"rows_excluded":0,"n_per_group":{"A":6,"B":6}}',
+                    "stdout": "unused giant details " * 1000}
+        raw = json.dumps(original, ensure_ascii=False)
+        message = self.delivery("plot-qa", raw, tool_name="run_research_figure_script")
+        self.assertLessEqual(content_wire_bytes(message.content), FIRST_DELIVERY_BYTES)
+        view = json.loads(message.content)
+        control = view["control_observation"]
+        self.assertEqual(control["render_data_summary"]["n_per_group"], {"A": 6, "B": 6})
+        self.assertEqual(control["render_data_summary"]["rows_plotted"], 12)
+        self.assertEqual(control["figure_qa_summary"]["current_qa"]["unexecuted"], ["visual"])
+        self.assertEqual(control["figure_qa_summary"]["nature_skill_receipt"]["checks"]["pdf_text"], "pass")
+        self.assertEqual([row["download_url"] for row in control["exports"]],
+                         [row["download_url"] for row in exports])
+        self.assertEqual(view["read_with"]["available_fields"], ["/script_report", "/exports", "/figures/0/exports",
+                         "/figures/0/qa_receipt", "/figures/0/current_qa", "/figures/0/nature_skill_receipt"])
+        self.assertEqual(tool_results.fetch_for_current_request(message.tool_call_id)["result_text"], raw)
+
     async def test_combined_controls_keep_bounded_verified_reference(self):
         original = oversized_controls()
         self.assertEqual(len(original), 104_846)
@@ -324,6 +359,7 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["selected_values"]["/qa/nullable"])
         self.assertIn("0.12345678901234567890", result["result_text"])
         self.assertIsNone(result["page"]["next_start_char"])
+        self.assertIsNone(result["page"]["next_args"])
 
     async def test_readback_rejections_and_corruption_do_not_count_as_execution_failures(self):
         from src.tools.outcome import safe_tool_step
@@ -396,8 +432,10 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         original, reference = await page("first", start_char=25)
         self.assertEqual(original["result_text"], raw[25:75])
+        next_args = original["page"]["next_args"]
         cursor = original["page"]["next_cursor"]
-        second, _ = await page("second", cursor=cursor)
+        self.assertEqual(next_args, {"tool_call_id": "source", "cursor": cursor, "max_chars": 50})
+        second, _ = await page("second", **next_args)
         self.assertEqual(second["result_text"], raw[75:125])
         repeated, _ = await page("repeat", start_char=25)
         self.assertEqual(repeated["status"], "reused")
@@ -409,6 +447,16 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         retried_cursor, _ = await page("cursor-retry", cursor=cursor)
         self.assertEqual((retried_cursor["status"], retried_cursor["page"]), ("reused", second["page"]))
         self.assertFalse(host._prepare_result_readback({"tool_call_id": "source", "cursor": "forged"}, "forged"))
+
+        selected, _ = await page("selected", fields=["field"])
+        next_selected = selected["page"]["next_args"]
+        self.assertFalse(host._prepare_result_readback({**next_selected, "fields": ["/other"]}, "wrong-fields"))
+        self.assertFalse(host._prepare_result_readback({**next_selected, "start_char": 51}, "wrong-offset"))
+        continued, _ = await page("selected-next", **next_selected)
+        self.assertEqual(continued["selected_fields"], ["/field"])
+        self.assertEqual(continued["page"]["start_char"], selected["page"]["end_char"])
+        projected = json.dumps({"/field": "éλ字" * 3000}, ensure_ascii=False)
+        self.assertEqual(selected["result_text"] + continued["result_text"], projected[:100])
         next_job = jobs.claim_job(self.sid, "next", owner_user_id=7, client_request_id="different", payload={})
         tracing.set_job_id(next_job.job_id)
         fresh = json.loads(read_tool_result.invoke({"tool_call_id": "source", "start_char": 25, "max_chars": 50}))
@@ -673,3 +721,14 @@ class TaskDeliveryContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             WriteArgs(task_id="task", workspace_id="0" * 32, expected_revision=1,
                       path="../escape.py", content="x")
+
+
+
+def test_script_receipt_projects_bounded_counts_instead_of_preview_inference():
+    from src.core.tool_result_view import _script_controls
+
+    content = {"script_report": '{"rows_read":12,"rows_plotted":12,"rows_excluded":0,"n_per_group":{"A":6,"B":6},"arbitrary":"not projected"}'}
+    assert _script_controls(content)["render_data_summary"] == {
+        "rows_read": 12, "rows_plotted": 12, "rows_excluded": 0, "n_per_group": {"A": 6, "B": 6},
+    }
+    assert "render_data_summary" not in _script_controls({"script_report": '{"rows_read":true,"n_per_group":{"bad":-1}}'})

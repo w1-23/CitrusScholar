@@ -35,6 +35,22 @@ _KNOWN_STATUSES = {"complete", "partial", "no_results", "failed", "not_run", "sk
 # internal_error is our own defect; the others are normal conditions of a
 # research turn (missing input, unreachable source, a stated scope limit).
 _REASON_CLASS = {
+    "invalid_tool_arguments": "input_missing",
+    "svg_input_missing": "input_missing",
+    "svg_format_error": "input_missing",
+    "svg_attempt_limit": "scope_limited",
+    "native_execute_rejected": "input_missing",
+    "empty_command": "input_missing",
+    "command_too_long": "input_missing",
+    "invalid_command_encoding": "input_missing",
+    "invalid_execute_timeout": "input_missing",
+    "code_worker_unavailable": "source_unavailable",
+    "code_execution_disabled": "source_unavailable",
+    "execution_session_unavailable": "source_unavailable",
+    "execution_service_unavailable": "source_unavailable",
+    "execution_scope_unavailable": "scope_limited",
+    "execution_deadline_unavailable": "transient",
+    "execute_run_deadline_exhausted": "transient",
     "no_selected_attachment": "input_missing",
     "no_processable_table": "input_missing",
     "no_reference_identifiers": "input_missing",
@@ -255,6 +271,13 @@ def _normalize_tool_outcome(tool_name: str, content: str, artifact: dict | None 
     if text.startswith("[DELIVERABLE_REJECTED"):
         return ToolOutcome("failed", "deliverable_rejected", artifacts=links,
                            reason_class="internal_error")
+
+    if tool_name == "draw_svg":
+        for prefix, reason in (("[SVG_INPUT_MISSING]", "svg_input_missing"),
+                               ("[SVG_FORMAT_ERROR]", "svg_format_error"),
+                               ("[SVG_ATTEMPT_LIMIT]", "svg_attempt_limit")):
+            if text.startswith(prefix):
+                return ToolOutcome("not_run", reason, artifacts=links)
 
     if text.startswith(("[SVG_INPUT_MISSING]", "[SVG_FORMAT_ERROR]", "[SVG_ATTEMPT_LIMIT]")):
         reason = "svg_attempt_limit" if text.startswith("[SVG_ATTEMPT_LIMIT]") else "invalid_arguments"

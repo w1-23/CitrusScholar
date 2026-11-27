@@ -28,7 +28,12 @@ OVERLAYS = {
     ),
     Path('citrus_audit/workbook.py'): (
         '93aa851610d0ce557917eaec298374bd98cedc311c5b7b456ab824144c093070',
-        '67514b1f021f4869e1c4b850a93a4d5d5ea4ee05b214ba674da1004d19541df9',
+        '348b009ce6badb094ccdd1e5888c8c7ab869d7937df8b17afbd80c063422b858',
+    ),
+    # The audited host baseline preserves a checked, macro-free workbook export.
+    Path('citrus_audit/_zip_safety.py'): (
+        '05948433912499ec34282f2be3ecf811e367ce48161122a4eb4fc5cf8377cc4b',
+        '24a3bcc31007d5d23578c7a04613d376ba016b22cfa00f72a97683f42d9c612d',
     ),
     Path('citrus_refcheck/lookup.py'): (
         '917d509f299b62b3ef67dbe3139f2ec7a466fc6aa179f49089cee31ec4d8cbdd',

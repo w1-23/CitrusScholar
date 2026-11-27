@@ -704,7 +704,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
     from src.core.cancel import raise_if_cancelled
     from src.core.tracing import get_client_request_id, get_current_tool_name
     from src.core.publication_reconcile import enqueue_publication, register_publication
-    from src.research.delivery_reconciliation import publication_started, publication_confirmed
+    from src.research.delivery_reconciliation import publication_committed, publication_confirmed, publication_started
 
     owner_user_id = int(get_user_id() or 0)
     session_id = str(get_session_id() or "")
@@ -814,6 +814,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
         if not exact_existing:
             existing = None
 
+    receipt = None
     if existing is not None:
         artifact_id = str(existing["artifact_id"])
         path = Path(str(existing["path"])).resolve()
@@ -865,7 +866,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                     published_existing = None
             if published_existing is None:
                 raise_if_cancelled("artifact:before_commit")
-                publication_started()
+                receipt = publication_started(safe)
                 os.replace(part, path)
                 if str(logical_task_id).startswith("figure:"):
                     # One logical figure keeps one version chain even when a
@@ -918,7 +919,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
             if published_existing is not None:
                 artifact_id = str(published_existing["artifact_id"])
                 path = Path(str(published_existing["path"])).resolve()
-                publication_started()
+                receipt = publication_started(safe)
                 try:
                     part.unlink(missing_ok=True)
                 except OSError:
@@ -942,7 +943,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
 
     try:
         if existing is not None:
-            publication_started()
+            receipt = publication_started(safe)
             # Legacy/exact retry: the immutable artifact already exists. Only
             # this authorized live path may bind an old ownerless row.
             with closing(sqlite3.connect(str(db))) as conn, conn:
@@ -953,6 +954,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
                 if append_key:
                     conn.execute("INSERT OR REPLACE INTO artifact_append_batches VALUES(?,?)",
                                  (append_key, artifact_id))
+        publication_committed(sha256=output_sha256, receipt=receipt, artifact_id=artifact_id)
         registered = register_publication(db_path=db, artifact_id=artifact_id,
                              project_root=PROJECT_ROOT, client_request_id=request_id,
                              allow_ownerless=owner_user_id == 0)
@@ -965,7 +967,7 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
         ledger.clear(logical)
         raise DeliverableRejected("artifact_registration_failed", "文件已保存，但资料库登记失败；可重试发布。") from exc
     url = f"/api/v2/session/{session_id}/artifacts/{artifact_id}"
-    publication_confirmed(url)
+    publication_confirmed(url, sha256=output_sha256, receipt=receipt)
     ledger.clear(logical)
     return url
 
@@ -1121,6 +1123,12 @@ def validate_artifact_links(
                         except OSError:
                             actual_sha = ""
                         base["hash_matches"] = actual_sha == expected_sha
+                        if base["hash_matches"]:
+                            try:
+                                base["sha256"] = expected_sha
+                                base["size_bytes"] = path.stat().st_size
+                            except OSError:
+                                base["hash_matches"] = False
                     else:
                         # Legacy rows had no stored hash. They remain readable
                         # after the path/ownership checks, but are labelled so
@@ -1593,7 +1601,8 @@ def inspect_uploaded_table(file_index: int = 0, sheet_name: str = "", header_row
     空ID列表保留原本轮附件file_index逻辑。账号来源校验owner、实际SHA-256与大小，合计最多20MB/20文件。
     XLSX/XLSM 默认 layout，返回工作表、可见性、合并格和已发现区域。查看 detection 的扫描范围和完整性；同一文件版本和读法可复用已存结构。
     inspection=cells、cell_range="A1:F40" 按原坐标读取公式或值，默认10行，宽页也按单元格数和字节缩小。
-    续读使用相同工作表和范围及 next_cursor；来源字节变化后游标失效。需要原字段统计时使用 inspection=profile。
+    常规单表绘图优先一次 inspection="profile"，取得字段、表头、行数与 inputs_binding；结构不明确才做 layout 或 cells。
+    cells 是坐标样例，不是全表或样本量。只有确需核对特定坐标才续读，原样使用相同工作表、范围与 next_cursor。
     header_row 选择表头，header_rows_json=[2,3] 指定多层表头。新规则审查用audit_uploaded_data；
     已有review_id仅需导出时用deliver_research_artifact，不重新扫描。
     """
@@ -1653,7 +1662,7 @@ def inspect_uploaded_table(file_index: int = 0, sheet_name: str = "", header_row
         source = {**meta["source_ref"], "columns": [str(c) for c in frame.columns]}
         profile["source_ref"] = source
         profile["source_refs"] = [source]
-        profile["inputs_binding"] = {"data": {"file_id": source["file_id"]}}
+        profile["inputs_binding"] = {"data": {"file_id": source["file_id"], "sha256": profile["source_sha256"]}}
     if isinstance(profile.get("raw_preview"), list):
         profile["raw_preview"] = [
             [str(value)[:120] for value in row] if isinstance(row, (list, tuple))
@@ -2439,7 +2448,7 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
                         'groups', 'values', 'column_mapping', 'integer_data_confirmed', 'sd_kind',
                         'mean_decimals', 'sd_decimals', 'reported_summaries', 'reported_p_values', 'composite_keys',
                         'pattern_checks', 'expected_structure', 'selected_checks', 'audit_plan', 'custom_findings',
-                        'regions', 'field_roles', 'requested_checks', 'profile'}
+                        'regions', 'field_roles', 'requested_checks', 'profile', 'plot_fields'}
     from citrus_audit.review import PROFILES
     allowed_profiles = (*PROFILES, "on_demand")
     if ("field_roles" in checks and not isinstance(checks["field_roles"], dict)
@@ -2449,6 +2458,12 @@ def validate_audit_request(*, checks_json: str | dict = "", publish: bool = Fals
         raise ToolArgumentError(
             "field_roles 必须为对象，requested_checks 必须为字符串数组，"
             f"profile 必须为 {'/'.join(allowed_profiles)} 之一。")
+    if "plot_fields" in checks:
+        fields = checks["plot_fields"]
+        if (not isinstance(fields, list) or not 1 <= len(fields) <= 32
+                or any(not isinstance(name, str) or not 1 <= len(name) <= 512 for name in fields)
+                or len(set(fields)) != len(fields)):
+            raise ToolArgumentError("plot_fields 必须是 1–32 个不同的真实列名。")
     if 'selected_checks' in checks:
         from citrus_audit.data_audit_rules import RULES
         selected = checks['selected_checks']
@@ -2602,6 +2617,8 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
     publish_formats 接受 JSON 字符串或字符串数组，默认 xlsx。
     reported_summaries / reported_p_values 只接受核实后的区域与统计量绑定。
     默认每份原件交付一份 XLSX。再次导出用已有 review_id，无需重扫。
+    checks_json.plot_fields 可指定冻结绘图快照需要的真实列名；后续绘图用
+    plot_datasets[].inputs_binding，不再读取整份原表或重跑审查。
     显式旧审查计划保留兼容；工具返回有限摘要和已有成果引用。
     """
     def summarize_findings(targets, digest):
@@ -2637,7 +2654,7 @@ def audit_uploaded_data(file_indexes_json: str | list[int] = "",
         return text, artifact
     from src.core.tracing import original_query
     query = original_query()
-    modern_options = {"field_roles", "requested_checks", "profile", "reported_p_values"}
+    modern_options = {"field_roles", "requested_checks", "profile", "reported_p_values", "plot_fields"}
     current_chat = bool(query) and not (validated["plan"] or validated["custom_findings"])
     if current_chat or modern_options.intersection(validated["checks"]):
         from .audit_review_adapter import run_review

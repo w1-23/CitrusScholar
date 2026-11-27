@@ -108,6 +108,18 @@ def test_library_svg_selection_returns_isolated_previews_and_exact_download(libr
     assert thumb.headers["Content-Security-Policy"] == preview.headers["Content-Security-Policy"]
 
 
+def test_byte_mismatch_rejects_all_browser_file_read_routes(library):
+    client, session_id, *_ = library
+    row = files.register_file(session_id=session_id, owner_user_id=31, filename="bound.txt",
+                              content=b"checked", mime="text/plain", origin=files.ORIGIN_UPLOADED)
+    file_id = row["file_id"]
+    info = files.get_account_file(file_id, 31)
+    info["path"].write_bytes(b"changed")  # Same length: the SHA, not stat, rejects it.
+    for prefix in (f"/api/v2/files/{file_id}", f"/api/v2/session/{session_id}/files/{file_id}"):
+        for action in ("preview", "download"):
+            assert client.get(f"{prefix}/{action}", headers=OWNER).status_code == 404
+
+
 def test_legacy_svg_rows_and_html_report_sandbox_stay_compatible(library):
     client, session_id, *_ = library
     for filename, content, mime, frame in (("historic.svg", SVG, "image/svg+xml", "'none'"),

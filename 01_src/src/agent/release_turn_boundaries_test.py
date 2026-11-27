@@ -134,6 +134,34 @@ def test_failed_renderer_and_rejected_repair_can_be_replaced_by_same_goal_svg():
     assert not _same_repair_target(rejected, corrected, records=[failed | {"status": "unknown"}, success])
 
 
+def test_already_succeeded_render_repair_requires_earlier_same_source_receipt():
+    from types import SimpleNamespace
+    from src.agent.host import _already_succeeded_render_repair
+
+    name = "run_research_figure_script"
+    parent = "a" * 32
+    rejected = {"name": name, "id": "denied", "args": {"repair_from_run_id": parent}}
+    corrected = {"name": name, "id": "selected", "args": {}}
+    snapshot = [{"file_id": "b" * 32, "sha256": "c" * 64}]
+    published = {"status": "complete", "reason_code": "figure_published"}
+    messages = {
+        "parent": SimpleNamespace(name=name, artifact={"run_id": parent, "input_snapshots": snapshot,
+                                                    "_tool_outcome": published}),
+        "denied": SimpleNamespace(name=name, artifact={"error_code": "repair_target_already_succeeded",
+                                                     "repair_from_run_id": parent}),
+        "selected": SimpleNamespace(name=name, artifact={"input_snapshots": snapshot, "_tool_outcome": published}),
+    }
+    order = {"parent": 0, "denied": 1, "selected": 2}
+    assert _already_succeeded_render_repair(rejected, corrected, messages, order)
+    assert not _already_succeeded_render_repair(rejected, corrected, messages, order | {"parent": 3})
+    for cid, changes in (("selected", {"input_snapshots": [{"file_id": "d" * 32}]}),
+                         ("parent", {"_tool_outcome": {"status": "partial"}}),
+                         ("denied", {"error_code": "other"}),
+                         ("denied", {"repair_from_run_id": "e" * 32})):
+        message = SimpleNamespace(name=name, artifact=messages[cid].artifact | changes)
+        assert not _already_succeeded_render_repair(rejected, corrected, messages | {cid: message}, order)
+
+
 def test_saved_identity_report_separates_rate_limit_from_unprocessed(monkeypatch):
     from src.research import reference_audit, reference_tools
 
@@ -325,3 +353,198 @@ def test_live_research_prompt_and_stable_schemas_reach_actual_model_body():
     assert "source_routing_examples" not in prompt
     assert all(len(row["function"]["description"]) <= 230 for row in body["tools"])
     assert size > 0 and metrics["components"]["system"] > 0 and metrics["components"]["tool_schemas"] > 0
+
+
+
+def test_svg_correction_requires_same_label_and_verified_current_file():
+    from src.core.turn_outcome import repairable_proposal_reason
+
+    rejected = {"id": "bad-svg", "name": "draw_svg", "args": {"svg": "<svg>", "alt_text": "same plot"}}
+    corrected = {"id": "good-svg", "name": "draw_svg", "args": {"svg": "<svg/>", "alt_text": "same plot"}}
+    artifact = {"valid": True, "request_matches": True, "filename": "chart.svg",
+                "mime": "image/svg+xml", "producer_tool": "draw_svg", "link": "/verified-fixture"}
+    row = {"name": "draw_svg", "tool_call_id": "good-svg", "status": "complete",
+           "artifact_validations": [artifact]}
+    assert repairable_proposal_reason("svg_input_missing") and repairable_proposal_reason("svg_format_error")
+    assert not repairable_proposal_reason("svg_attempt_limit")
+    assert _same_repair_target(rejected, corrected, records=[row])
+    assert not _same_repair_target(rejected, corrected | {"args": {"alt_text": "another plot"}}, records=[row])
+    assert not _same_repair_target(rejected, corrected, records=[row | {"status": "unknown"}])
+    assert not _same_repair_target(rejected, corrected, records=[row | {"artifact_validations": []}])
+
+
+
+def test_literature_extraction_resolves_only_with_exact_full_registry_coverage():
+    from src.core.task_result import effective_tool_records, literature_coverage_stage
+
+    def receipt(cid, execution, status, reason, counts, original="a" * 32):
+        args = {"skill_id": "literature-verification", "execution_id": execution}
+        data = {"execution_id": execution, "registry_coverage": {"original_execution_id": original,
+                "total": 2, "stop_reason": reason, "counts": counts}}
+        return {"name": "collect_external_skill", "status": status, "tool_call_id": cid,
+                "reason": "external_skill_report", "literature_coverage_stage":
+                literature_coverage_stage("collect_external_skill", status, "external_skill_report", data, args)}
+
+    extraction = receipt("initial", "a" * 32, "partial", "observations_not_started", {"not_queried": 2})
+    complete = receipt("later", "b" * 32, "complete", "batch_completed", {"queried": 2})
+    wrong = receipt("wrong", "b" * 32, "complete", "batch_completed", {"queried": 2}, "c" * 32)
+    short = receipt("short", "b" * 32, "complete", "batch_completed", {"queried": 1})
+    assert effective_tool_records([extraction, complete]) == [complete]
+    for replacement in (wrong, short, complete | {"status": "unknown"}, complete | {"artifact_count": 1}):
+        assert effective_tool_records([extraction, replacement]) == [extraction, replacement]
+
+
+def _published_figure(call_id, figure_id, formats):
+    name = "run_research_figure_script"
+    mimes = {"svg": "image/svg+xml", "png": "image/png", "pdf": "application/pdf"}
+    prefix = "/api/v2/session/fixture-session/artifacts/"
+    exports, validations = [], []
+    for fmt in formats:
+        import hashlib
+        aid = hashlib.sha256(f"{call_id}:{figure_id}:{fmt}".encode()).hexdigest()[:32]
+        exports.append({"format": fmt, "artifact_id": aid, "artifact_url": prefix + aid})
+        validations.append({"link": prefix + aid, "artifact_id": aid, "valid": True,
+                            "request_matches": True, "filename": f"{figure_id}.{fmt}",
+                            "mime": mimes[fmt], "producer_tool": name})
+    return {"name": name, "tool_call_id": call_id, "status": "complete", "reason": "figure_published",
+            "artifact_validations": validations, "op_receipt": {"schema_version": 1,
+                "tool_name": name, "tool_call_id": call_id, "status": "complete",
+                "reason_code": "figure_published", "run_id": f"run-{call_id}",
+                "coverage": {"figures": [{"figure_id": figure_id, "status": "complete", "exports": exports}]}}}
+
+
+def test_ordinary_figure_final_evidence_uses_one_current_render_and_keeps_data_failure():
+    from src.core.turn_outcome import completion_digest, completion_errors, completion_from_answer, reviewed_completion_valid, reviewed_turn_outcome
+
+    current = _published_figure("new", "current-figure", ("svg", "png", "pdf"))
+    old = _published_figure("old", "previous-figure", ("svg", "png", "pdf"))
+    unrelated = _published_figure("new", "other-figure", ("pdf",))
+    current["artifact_validations"].extend(unrelated["artifact_validations"])
+    rows = [old, {"name": "inspect_uploaded_table", "tool_call_id": "range-error", "status": "failed"}, current]
+    links = {v["link"] for row in (old, current) for v in row["artifact_validations"]}
+    query = "绘制这个图"
+    requirements = contract_for_turn(query, has_tables=True).deliverables
+    assert [r["formats"] for r in requirements] == [["svg"]]
+    goals, gaps = artifact_goal_evidence(requirements, rows, links, single_render_receipt=True)
+    assert not gaps
+    assert goals[0].evidence_call_ids == ["new"]
+    assert goals[0].artifact_links == [v["link"] for v in current["artifact_validations"][:3]]
+    assert unrelated["artifact_validations"][0]["link"] not in goals[0].artifact_links
+    later_unconfirmed = _published_figure("maybe", "unconfirmed-figure", ("svg", "png", "pdf")) | {"status": "unknown"}
+    rows.append(later_unconfirmed)
+    links.update(v["link"] for v in later_unconfirmed["artifact_validations"])
+    assert artifact_goal_evidence(requirements, rows, links, single_render_receipt=True) == (goals, gaps)
+
+    # Format completion never repairs a failed source read or an unknown operation.
+    statement = completion_from_answer("\n".join(goals[0].artifact_links), rows)
+    statement = statement.model_copy(update={"goals": [*statement.goals, *goals]})
+    errors = completion_errors(statement, rows)
+    assert errors == ("execution_blocker:range-error", "execution_blocker:maybe")
+    partial = statement.model_copy(update={"status": "partial", "remaining": list(errors)})
+    proof = reviewed_turn_outcome(partial, rows, identity={"run_id": "fixture"}, request_version=1,
+        request_hash=completion_digest(query), artifact_contract={"schema_version": 1, "request_version": 1,
+        "requirements": requirements, "verified_links": sorted(links), "single_render_receipt": True})
+    assert reviewed_completion_valid(proof, rows)
+    assert proof.status == "partial"
+
+
+def test_explicit_three_formats_cannot_be_filled_by_a_different_render():
+    query = "用这份工作簿按 group 做箱线图叠加原始数据点，使用 Nature 科研风格，交付可下载 SVG、PNG 和 PDF。只使用附件，不联网。"
+    requirements = contract_for_turn(query, has_tables=True).deliverables
+    assert len(requirements) == 1 and set(requirements[0]["formats"]) == {"svg", "png", "pdf"}
+    older = _published_figure("earlier", "old-figure", ("svg", "png", "pdf"))
+    later = _published_figure("later", "new-figure", ("svg", "png", "pdf"))
+    verified = {v["link"] for row in (older, later) for v in row["artifact_validations"]}
+    goals, gaps = artifact_goal_evidence(requirements, [older, later], verified, single_render_receipt=True)
+    assert not gaps and set(goals[0].artifact_links) == {v["link"] for v in later["artifact_validations"]}
+    assert goals[0].evidence_call_ids == ["later"]
+    verified.remove(later["artifact_validations"][2]["link"])
+    goals, gaps = artifact_goal_evidence(requirements, [older, later], verified, single_render_receipt=True)
+    assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
+    implicit = contract_for_turn("绘制这个图", has_tables=True).deliverables
+    goals, gaps = artifact_goal_evidence(implicit, [older, later], verified, single_render_receipt=True)
+    assert not gaps and goals[0].artifact_links == [v["link"] for v in later["artifact_validations"][:2]]
+
+
+def test_final_answer_file_alias_binds_delivery_and_review_to_the_same_render():
+    from types import SimpleNamespace
+
+    from src.core.turn_outcome import (completion_digest, completion_from_answer, figure_answer_refs,
+                                       reviewed_completion_valid, reviewed_turn_outcome)
+    from src.research.artifact_delivery import build_delivery, missing_answer_links
+
+    query = ("只用附带的合成 CSV，不联网。以 sample 为横轴、signal_a 为纵轴绘制散点图，按 cohort 区分；"
+             "排除 cohort 缺失的记录，保留重复观测。不做统计检验。"
+             "交付同一次渲染的可下载 SVG、PNG、PDF，用简短中文说明纳入记录数。")
+    requirements = contract_for_turn(query, has_tables=True).deliverables
+    assert len(requirements) == 1 and requirements[0]["all_formats"] is True
+    assert requirements[0]["formats"] == ["svg", "png", "pdf"]
+    first = _published_figure("first", "a" * 32, ("svg", "png", "pdf"))
+    second = _published_figure("second", "b" * 32, ("svg", "png", "pdf"))
+    messages, projects, verified = {}, {}, []
+    aliases = [f"/api/v2/files/{i:032x}/download" for i in range(1, 7)]
+    for row, downloads, render_id in ((first, aliases[:3], "c" * 32), (second, aliases[3:], "d" * 32)):
+        [figure] = row["op_receipt"]["coverage"]["figures"]
+        for item, ref, download in zip(figure["exports"], row["artifact_validations"], downloads):
+            item.update(download_url=download, sha256=ref["artifact_id"] * 2)
+            ref.update(sha256=item["sha256"], size_bytes=42, reason_code="verified")
+            verified.append(ref)
+        messages[row["tool_call_id"]] = SimpleNamespace(artifact={"figures": [figure | {"qa_receipt": {"status": "pass"}}]})
+        projects[figure["figure_id"]] = {"exports_json": {item["format"]: item for item in figure["exports"]},
+                                         "document_json": {"render_id": render_id}}
+
+    # Exercise retained records whose traversal puts the stale receipt first.
+    rows = [second, first]
+    external = "/api/v2/files/" + "f" * 32 + "/download"
+    answer = "已完成配图。\n" + "\n".join(f"- `{link}`" for link in [*aliases[3:], external])
+    refs = figure_answer_refs(answer)
+    assert refs == [*aliases[3:], external]
+    links = {ref["link"] for ref in verified}
+    expected = [ref["link"] for ref in second["artifact_validations"]]
+    goals, gaps = artifact_goal_evidence(requirements, rows, links, single_render_receipt=True,
+                                         answer_render_refs=refs)
+    assert not gaps and len(goals) == 1
+    assert goals[0].evidence_call_ids == ["second"] and goals[0].artifact_links == expected
+
+    identity = SimpleNamespace(run_id="run", session_id="fixture-session", owner_user_id=7)
+    manifest = build_delivery(identity=identity, request_id="request", rows=rows, messages=messages,
+        requirements=requirements, select_links=goals[0].artifact_links, verified=verified,
+        project_lookup=lambda figure_id, _: projects.get(figure_id))
+    assert manifest["delivery_status"] == "complete"
+    assert manifest["render_id"] == "d" * 32
+    assert manifest["user_links"] == expected
+    answer += "\n" + "\n".join(missing_answer_links(manifest, answer))
+    assert not any(ref["link"] in answer for ref in first["artifact_validations"])
+    statement = completion_from_answer(answer, rows)
+    statement = statement.model_copy(update={"goals": [*statement.goals, *goals]})
+    proof = reviewed_turn_outcome(statement, rows, identity={"run_id": "run"}, request_version=1,
+        request_hash=completion_digest(query), artifact_contract={"schema_version": 1, "request_version": 1,
+        "requirements": requirements, "verified_links": sorted(links), "single_render_receipt": True,
+        "answer_render_refs": refs})
+    assert reviewed_completion_valid(proof, rows, answer=answer)
+
+    # A missing format on the named render stays missing even when the other render has it.
+    for selected, checked in ((refs, links - {expected[-1]}), (refs + [aliases[0]], links)):
+        goals, gaps = artifact_goal_evidence(requirements, rows, checked, single_render_receipt=True,
+                                             answer_render_refs=selected)
+        assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
+
+
+def test_separate_figures_in_the_same_receipt_cannot_fill_one_format_set():
+    requirement = contract_for_turn("画箱线图，交付可下载 SVG、PNG 和 PDF。", has_tables=True).deliverables
+    latest = _published_figure("same-call", "svg-figure", ("svg", "png"))
+    pdf = _published_figure("same-call", "separate-pdf-figure", ("pdf",))
+    latest["op_receipt"]["coverage"]["figures"].extend(pdf["op_receipt"]["coverage"]["figures"])
+    latest["artifact_validations"].extend(pdf["artifact_validations"])
+    verified = {v["link"] for v in latest["artifact_validations"]}
+    goals, gaps = artifact_goal_evidence(requirement, [latest], verified, single_render_receipt=True)
+    assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
+
+
+def test_format_only_figure_continuation_does_not_absorb_separate_pdf():
+    requirements = contract_for_turn("画箱线图，交付可下载 SVG、PNG。另做一份 PDF 报告。", has_tables=True).deliverables
+    assert [frozenset(r["formats"]) for r in requirements] == [frozenset({"svg", "png"}), frozenset({"pdf"})]
+    same_render = contract_for_turn("画箱线图，交付同一次渲染的可下载 SVG、PNG、PDF。另做一份 PDF 报告。",
+                                    has_tables=True).deliverables
+    assert [r["formats"] for r in same_render] == [["svg", "png", "pdf"], ["pdf"]]
+    assert same_render[1]["kinds"] == ["report_html"]

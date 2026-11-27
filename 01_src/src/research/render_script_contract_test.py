@@ -27,6 +27,8 @@ from src.figures.script_outputs import (RenderScriptEmitUnavailable,
                                         classify_render_script_error,
                                         normalize_output_contract,
                                         render_script_emit_line, output_slots)
+import pytest
+
 from src.research import figure_tools
 from src.research.script_presets import get_preset, list_presets
 
@@ -200,6 +202,19 @@ class RealCaptureContractTests(unittest.TestCase):
             "line": 1,
         }, result.message)
 
+    def test_legacy_single_figure_reads_a_frozen_dataset(self):
+        from src.figures.dataset_codec import encode_frame
+
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "dataset.json"
+            source.write_text(json.dumps(encode_frame(_frame())), encoding="utf-8")
+            result = LocalBackend().run(SandboxJob(job_id="legacy-dataset-fixture",
+                script="frame = load_dataset(tidy)\nfig, ax = plt.subplots()\nax.plot(frame['x'], frame['y'])\n",
+                inputs={"tidy": "dataset.json"}, sources={"tidy": str(source)},
+                outputs={"svg": "figure.svg"}))
+        self.assertTrue(result.ok, result.message)
+        self.assertIn(b"<svg", result.outputs["svg"])
+
     def test_legacy_v2_emit_figure_still_works(self):
         contract = normalize_output_contract({
             "version": 2, "tables": [], "figures": [
@@ -270,6 +285,39 @@ class PresetRendererContractTests(unittest.TestCase):
                     self.assertIsNone(render_script_emit_line(source), figure["name"])
                     normalize_output_contract(full["outputs"])
 
+    def test_provider_advertises_native_json_and_accepts_legacy_strings_at_ingress(self):
+        from inspect import signature
+        from src.agent.preset_catalog import canonical_tool_schema
+        tool = figure_tools.run_research_figure_script
+        schema = canonical_tool_schema(tool)['function']['parameters']['properties']
+        self.assertEqual(set(schema), set(signature(tool.func).parameters))
+        self.assertEqual(schema['outputs_json']['type'], 'object')
+        self.assertEqual(schema['inputs_json']['type'], 'object')
+        self.assertEqual(schema['qa_profile_json']['type'], 'object')
+        self.assertEqual(schema['formats_json']['type'], 'array')
+        for field in ('outputs_json', 'inputs_json', 'qa_profile_json', 'formats_json'):
+            self.assertNotIn('default', schema[field])
+            self.assertNotIn('anyOf', schema[field])
+        outputs = schema['outputs_json']
+        self.assertFalse(outputs['additionalProperties'])
+        self.assertEqual(outputs['required'], ['version'])
+        self.assertEqual(outputs['properties']['version']['enum'], [2])
+        table = outputs['properties']['tables']['items']
+        figure = outputs['properties']['figures']['items']
+        self.assertFalse(table['additionalProperties'])
+        self.assertFalse(figure['additionalProperties'])
+        self.assertEqual(set(table['properties']), {'name', 'parents'})
+        self.assertEqual(set(figure['properties']), {'name', 'title', 'formats', 'parents', 'render_script'})
+        contract = _contract(GOOD_RENDERER)
+        misplaced = _contract(GOOD_RENDERER)
+        misplaced['figures'][0]['render_script_ref'] = 'ref'
+        with self.assertRaisesRegex(ValueError, r'figures\[0\].*inline source'):
+            normalize_output_contract(misplaced)
+        self.assertEqual(tool.args_schema(outputs_json=contract).outputs_json, contract)
+        self.assertEqual(tool.args_schema(outputs_json=json.dumps(contract)).outputs_json, json.dumps(contract))
+        self.assertEqual(normalize_output_contract(figure_tools._json_arg(json.dumps(contract), 'outputs_json')),
+                         normalize_output_contract(contract))
+
     def test_help_and_presets_describe_read_only_inspection_and_environments(self):
         help_text = _tool_help()
         self.assertIn("inspect_uploaded_table", help_text)
@@ -280,6 +328,35 @@ class PresetRendererContractTests(unittest.TestCase):
             self.assertIn("inspect_uploaded_table", preset["description"])
             self.assertIn("Docker", preset["description"])
             self.assertIn("Apptainer", preset["description"])
+
+
+@pytest.mark.parametrize('source, contract, expected', [
+    ("frame = data['tidy']", {'version': 2, 'figures': [{'name': 'plot'}]}, 'main_script_input_not_bound'),
+    ("frame = load_dataset(data)", {'version': 2}, 'main_script_input_not_bound'),
+    ("emit.figure('plot', fig)", {}, 'main_script_emit_not_available'),
+])
+def test_provably_missing_main_stage_binding_rejected_before_worker(source, contract, expected):
+    with mock.patch.object(figure_tools, '_select_script_runner') as runner:
+        _, result = _call_tool(script=source, inputs_json={'tidy': {'file_id': 'a' * 32}}, outputs_json=contract)
+    runner.assert_not_called()
+    assert result['error_code'] == expected
+    assert result['_tool_outcome']['status'] == 'not_run'
+
+
+@pytest.mark.parametrize('source, contract', [
+    ("data = tidy\nframe = data['tidy']", {}),
+    ("from something import *\nframe = data['tidy']", {}),
+    ("globals()['data'] = tidy\nframe = data['tidy']", {}),
+    ("if check:\n    frame = data['tidy']", {}),
+    ("def helper(data):\n    return data['tidy']", {}),
+    ("emit.figure('plot', fig)", {'version': 2, 'figures': [{'name': 'plot'}]}),
+    ("from package import emit\nemit.figure('plot', fig)", {}),
+    ("frame = load_dataset(tidy)", {}),
+    ("frame = data['tidy']", {'input_contract': {'raw': ['tidy']}}),
+])
+def test_main_preflight_leaves_bound_or_uncertain_sources_to_worker(source, contract):
+    from src.figures.script_outputs import validate_main_script_bindings
+    validate_main_script_bindings(source, contract, {'tidy': {'file_id': 'a' * 32}})
 
 
 if __name__ == "__main__":

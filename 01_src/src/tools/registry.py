@@ -1,4 +1,12 @@
-"""Tool Registry — tool classification, partitioned concurrency, offload"""
+"""Tool Registry — tool classification, partitioned concurrency, offload.
+
+This module holds the *runtime* projection of a tool: the callable plus the
+policy that was declared for it in ``src.tools.tool_specs``. Policy is never
+authored here — ``register_declared_tool`` is the single place a declarative
+``ToolSpec`` row becomes a registered tool, so the lazy agent path
+(``src.agent.preset_catalog``) and the compatibility reader
+(``src.tools.legacy_registry``) cannot register the same tool differently.
+"""
 import asyncio
 import json
 import contextvars
@@ -53,6 +61,8 @@ def signal_legacy_permission(session_id: str, tool_name: str, decision: str) -> 
 
 @dataclass
 class ToolSpec:
+    """Runtime projection of one ``src.tools.tool_specs.ToolSpec`` declaration."""
+
     func: Callable
     category: str = "general"
     is_readonly: bool = True
@@ -60,7 +70,7 @@ class ToolSpec:
     write_scope: Optional[str] = None
     authorization: str = ""
     recovery_mode: str = "never"
-    # Code-owned pure validation, never supplied by model arguments or Skills.
+    # Code-owned preparation without persistent effects, never authored by a model.
     preflight: Optional[Callable] = None
 
 
@@ -81,8 +91,6 @@ def register_tool(tool: BaseTool, category: str = "general", is_readonly: bool =
         raise ValueError("unsupported recovery_mode")
     if recovery_mode != "never" and not is_readonly:
         raise ValueError("only local read/computation tools may be resumed")
-    if tool.name == "read_account_file" and is_readonly:
-        recovery_mode = "local_read"
     if write_scope not in {None, "session_artifact", "account_record"}:
         raise ValueError(f"unsupported write scope for {tool.name}: {write_scope}")
     if authorization not in {"", "explicit_user_request"}:
@@ -95,6 +103,25 @@ def register_tool(tool: BaseTool, category: str = "general", is_readonly: bool =
         func=tool, category=category, is_readonly=is_readonly,
         concurrency_key=concurrency_key, write_scope=write_scope,
         authorization=authorization, recovery_mode=recovery_mode, preflight=preflight)
+
+
+def register_declared_tool(declaration, tool: BaseTool | None = None) -> BaseTool:
+    """Register one declarative ``ToolSpec`` row; the only row -> registry mapping.
+
+    ``recovery_mode`` is a declared fact, not a tool-name special case: a tool
+    whose local read can be safely resumed says so in its row. Both the lazy
+    capability path and the compatibility reader go through here, so the same
+    row cannot register two different policies.
+    """
+    target = declaration.resolve() if tool is None else tool
+    if getattr(target, "name", None) != declaration.name:
+        raise ValueError("declared_tool_name_mismatch:" + declaration.name)
+    register_tool(
+        target, category=declaration.category, is_readonly=declaration.is_readonly,
+        concurrency_key=declaration.concurrency_key, write_scope=declaration.write_scope,
+        authorization=declaration.authorization, recovery_mode=declaration.recovery_mode,
+        preflight=declaration.preflight())
+    return target
 
 
 def get_tool_spec(name: str) -> Optional[ToolSpec]:
@@ -482,9 +509,9 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
             from src.research.script_reconciliation import capture_script_failure
             reconciliation_scope = capture_script_failure(owner, job["session_id"])
         elif name in {"deliver_research_artifact", "audit_uploaded_data", "collect_external_skill", "collect_nature_plot",
-                      "resolve_external_report"}:
+                      "resolve_external_report", "code_deliver"}:
             from src.research.delivery_reconciliation import capture_delivery
-            reconciliation_scope = capture_delivery(name, tool_call["id"])
+            reconciliation_scope = capture_delivery(name, tool_call["id"], defer_confirmation=name == "code_deliver")
         elif name in ZERO_WRITE_TOOL_NAMES:
             reconciliation_scope = capture_zero_write(owner, job["session_id"], job_id, name, tool_call["id"])
         with reconciliation_scope as reconciliation:
@@ -506,7 +533,7 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
             if (not readonly
                     and message.additional_kwargs.get("execution_dispatched")
                     and (outcome["status"] in {"failed", "cancelled", "unknown"}
-                         or (outcome["status"] == "not_run" and name in ZERO_WRITE_TOOL_NAMES)
+                         or (outcome["status"] == "not_run" and (name in ZERO_WRITE_TOOL_NAMES or name == "code_deliver"))
                          or (name == "deliver_research_artifact" and outcome["status"] in {"not_run", "partial"})
                          or outcome.get("reason_code") in {"timeout", "network", "request_deadline"})
                     and not (outcome["status"] in {"failed", "not_run", "partial"} and reconciled)):
@@ -517,6 +544,9 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
                 artifact["_tool_outcome"] = {
                     "status": "unknown", "reason_code": "write_requires_reconciliation",
                     "artifacts": outcome.get("artifacts", [])}
+                from src.research.delivery_reconciliation import observed_publication_files
+                if published_files := observed_publication_files(reconciliation):
+                    artifact["_tool_outcome"]["files"] = published_files
                 from src.core.op_receipt import make_receipt
                 artifact["op_receipt"] = make_receipt(name, tool_call["id"], message.content, artifact)
                 message = message.model_copy(update={"artifact": artifact, "status": "error"})
@@ -530,6 +560,16 @@ async def run_tool_operation(tool: BaseTool, tool_call: dict, *, require_durable
                 cancelled.additional_kwargs["operation_uncertain"] = bool(
                     message.additional_kwargs.get("execution_dispatched"))
             return cancelled
+        if name == "run_research_figure_script" and reconciliation is not None:
+            artifact = dict(message.artifact or {})
+            receipt = dict(artifact.get("op_receipt") or {})
+            receipt.pop("figure_output_repair", None)
+            projection = reconciliation.output_contract_repair(message, reconciled=reconciled)
+            if projection:
+                receipt["figure_output_repair"] = projection
+            if receipt:
+                artifact["op_receipt"] = receipt
+                message = message.model_copy(update={"artifact": artifact})
         # Recheck inputs before committing the local result checkpoint.
         if mode != "never" and _recovery_inputs(name, args, owner) != (mode, refs):
             raise task_events.TaskConflict("checkpoint_input_changed")
@@ -663,14 +703,14 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
     args = normalized_args
     tool_call = {**tool_call, "args": args}
 
-    # Pure, code-owned extension validation belongs before dispatch as well.
-    # This handles JSON configuration semantics that the outer type schema
-    # cannot express; never infer no-side-effects from an arbitrary error text.
+    # Code-owned preparation runs before persistent effects and only in this
+    # invocation's context; it may carry validated data into the worker.
+    ctx = contextvars.copy_context()
     spec = get_tool_spec(tool_name)
     if spec is not None and spec.preflight is not None:
         from src.core.tool_errors import ToolArgumentError
         try:
-            spec.preflight(**args)
+            ctx.run(spec.preflight, **args)
         except ToolArgumentError as exc:
             return ToolMessage(content=f"[ERR_ARG] {exc}；本次未执行。请修正配置后重新提议。",
                 tool_call_id=tool_call["id"], name=tool_name, status="error",
@@ -686,7 +726,6 @@ async def _invoke_single_tool(tool: BaseTool, tool_call: dict, *, recovering=Fal
         token.set_deadline(exec_timeout)
 
     response_format = getattr(tool, "response_format", None)
-    ctx = contextvars.copy_context()
     # 记下真正在执行的工具名（写进 ctx，随 ctx.run 传入工具线程）。工具内部的
     # 成果登记用它记录生产者，使"文件由谁产出"可核查。
     from src.core.tracing import set_current_tool_name

@@ -23,6 +23,8 @@ class Interception:
         self.responses = responses
         self.posts = []
         self.mutate = None
+        self.hold = None
+        self.pending = None
 
     def call(self, method, url, data=None, headers=None):
         if data is not None and not isinstance(data, str):
@@ -41,6 +43,15 @@ class Interception:
         url = request.url.removeprefix(ORIGIN)
         if request.method == 'POST':
             self.posts.append((url, request.post_data_json))
+        if self.hold == url:
+            self.hold = None
+            self.pending = route
+            return
+        self.fulfill(route)
+
+    def fulfill(self, route):
+        request = route.request
+        url = request.url.removeprefix(ORIGIN)
         result = self.call(request.method, url, request.post_data, dict(request.headers))
         if self.mutate:
             self.mutate(url, result)
@@ -329,7 +340,8 @@ def run(browser, api, output):
     dialog.get_by_role('button', name='使用此颜色').click()
     picker.click()
     expect(dialog.get_by_role('button', name='#1d557a')).to_be_visible()
-    dialog.press('Escape')
+    page.keyboard.press('Escape')
+    expect(dialog).to_be_hidden()
     page.get_by_role('radio', name='菱形', exact=True).press('Space')
     page.get_by_role('radio', name='虚线', exact=True).press('Space')
     page.get_by_label('填充方式', exact=True).select_option('none')
@@ -381,26 +393,77 @@ def run(browser, api, output):
     marks = json.loads(api.call('GET', marks_path)['body'])
     mark_objects = marks['object_contract']['objects']
     mark_groups = {g['id']: g for g in marks['groups'] if g['kind'] in ('arrow', 'patch')}
+    assert page.locator('[role=treeitem][data-kind=patch]').count() == 0
     assert sorted(g['kind'] for g in mark_groups.values()) == ['arrow', 'arrow', 'patch']
     assert {mark_objects[g['parent']]['role'] for g in mark_groups.values()} == {'annot', 'panel'}
     for group_id in mark_groups:
         binding = mark_objects[group_id]
-        assert not binding['capabilities'] and binding['readonlyReason']
+        assert binding['capabilities']
         assert len(binding['geometry']['svgIds']) == 1
         mark = geometry(page, binding, expected=group_id)
         page.mouse.click(mark['x'], mark['y'])
         assert chosen(page) == group_id
-        expect(page.get_by_role('button', name='应用到此组')).to_have_count(0)
+        expect(page.get_by_role('button', name='应用到此组')).to_have_count(1)
     page.screenshot(path=str(output / 'native-arrow-patch.png'))
-    mark_series = next(g for g in marks['groups'] if g['kind'] == 'series')
-    edit_mark_project = {'expected_revision': 1, 'draft_revision': 19, 'source_sha256': marks['source_sha256'],
-                         'commands': [{'group_id': mark_series['id'], 'property': 'color', 'value': '#6b4a25'}]}
-    saved_marks = api.call('POST', marks_path + '/save', edit_mark_project)
-    assert saved_marks['status'] == 200, saved_marks['body']
-    after_marks = json.loads(saved_marks['body'])
+    expect(page.get_by_role('link', name='← 返回会话')).to_have_attribute(
+        'href', '/?figure_session=ca7d045c-04d3-4b2f-b6f8-5e07b26d8f22')
+    patch = next(g for g in mark_groups.values() if g['kind'] == 'patch')
+    point = geometry(page, mark_objects[patch['id']], expected=patch['id'])
+    page.mouse.click(point['x'], point['y'])
+    assert chosen(page) == patch['id']
+    page.get_by_label('填充颜色', exact=True).fill('#6b4a25')
+    page.get_by_role('button', name='应用到此组').click()
+    expect(page.locator('#status')).to_have_text('草稿预览已更新。', timeout=20000)
+    page.locator('#save').click()
+    expect(page.locator('#revision')).to_have_text('版本 2', timeout=20000)
+    after_marks = json.loads(api.call('GET', marks_path + '?revision=2')['body'])
+    reopened = next(g for g in after_marks['groups'] if g['id'] == patch['id'])
+    assert reopened['values']['facecolor'] == '#6b4a25'
+    exported = api.call('GET', marks_path + '/export/svg?revision=2')
+    assert exported['status'] == 200 and b'fill="#6b4a25"' in exported['body']
     assert after_marks['source_sha256'] == marks['source_sha256']
     assert {gid: after_marks['object_contract']['objects'][gid]['geometry'] for gid in mark_groups} == {
         gid: mark_objects[gid]['geometry'] for gid in mark_groups}
+
+    # Hold the first request as though its worker were busy. The inspector is
+    # still usable, while only the newest draft may render after this response.
+    page.evaluate('''() => {
+      window.draftDecodes = 0;
+      const decode = HTMLImageElement.prototype.decode;
+      HTMLImageElement.prototype.decode = function () {
+        ++window.draftDecodes;
+        return decode.call(this);
+      };
+      window.patchTreeBefore = document.querySelector('[data-kind=patch]');
+    }''')
+    preview_path = marks_path + '/preview'
+    api.hold = preview_path
+    posts = len(api.posts)
+    with page.expect_request(ORIGIN + preview_path):
+        page.get_by_label('线宽', exact=True).fill('2.4')
+        page.get_by_role('button', name='应用到此组').click()
+    assert page.evaluate("window.patchTreeBefore === document.querySelector('[data-kind=patch]')")
+    expect(page.locator('#save')).to_be_disabled()
+    for paint in ('#204485', '#347239'):
+        page.get_by_label('填充颜色', exact=True).fill(paint)
+        page.get_by_role('button', name='应用到此组').click()
+    # Allow debounce to expire while the first POST is still in flight.
+    page.wait_for_timeout(250)
+    assert len(api.posts) == posts + 1 and api.pending is not None
+    api.fulfill(api.pending)
+    api.pending = None
+    expect(page.locator('#status')).to_have_text('草稿预览已更新。', timeout=20000)
+    assert len(api.posts) == posts + 2
+    assert api.posts[-1][1]['commands'] == [
+        {'group_id': patch['id'], 'property': 'linewidth', 'value': 2.4},
+        {'group_id': patch['id'], 'property': 'facecolor', 'value': '#347239'},
+    ]
+    assert page.evaluate('window.draftDecodes') == 1
+    expect(page.locator('#save')).to_be_enabled()
+    assert page.evaluate("id => document.querySelector('#inkScene').shadowRoot.getElementById(id)"
+                         ".querySelector('path').getAttribute('fill')", reopened['pick_ids'][0]) == '#347239'
+    page.locator('#save').click()
+    expect(page.locator('#revision')).to_have_text('版本 3', timeout=20000)
 
     r_path = project(api, 'Pinned ggplot2')
     for _ in range(5):

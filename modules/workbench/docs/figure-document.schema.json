@@ -1,0 +1,299 @@
+{
+  "$defs": {
+    "FigureObject": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "panel_id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Panel Id"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Properties"
+        },
+        "editable": {
+          "items": {
+            "const": "text",
+            "type": "string"
+          },
+          "title": "Editable",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "label",
+        "properties",
+        "editable"
+      ],
+      "title": "FigureObject",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "Panel": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "title": "Panel",
+      "type": "object"
+    },
+    "Renderer": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "title": "Renderer",
+      "type": "object"
+    },
+    "SourceInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "language": {
+          "enum": [
+            "python",
+            "r",
+            "vector",
+            "raster"
+          ],
+          "title": "Language",
+          "type": "string"
+        },
+        "source_ref": {
+          "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+          "title": "Source Ref",
+          "type": "string"
+        },
+        "source_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Source Hash",
+          "type": "string"
+        },
+        "library_asset_ref": {
+          "anyOf": [
+            {
+              "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Library Asset Ref"
+        },
+        "library_version": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Library Version"
+        }
+      },
+      "required": [
+        "language",
+        "source_ref",
+        "source_hash"
+      ],
+      "title": "SourceInfo",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "renderer": {
+      "$ref": "#/$defs/Renderer"
+    },
+    "editability": {
+      "enum": [
+        "semantic",
+        "partial",
+        "layout_only",
+        "preview_only"
+      ],
+      "title": "Editability",
+      "type": "string"
+    },
+    "panels": {
+      "items": {
+        "$ref": "#/$defs/Panel"
+      },
+      "maxItems": 100,
+      "title": "Panels",
+      "type": "array"
+    },
+    "objects": {
+      "items": {
+        "$ref": "#/$defs/FigureObject"
+      },
+      "maxItems": 1200,
+      "title": "Objects",
+      "type": "array"
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 100,
+      "title": "Limitations",
+      "type": "array"
+    },
+    "native_manifest": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Native Manifest"
+    },
+    "native_editability": {
+      "anyOf": [
+        {
+          "enum": [
+            "semantic",
+            "partial",
+            "layout_only",
+            "preview_only"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Native Editability"
+    },
+    "schema_version": {
+      "const": "figure-document/1",
+      "default": "figure-document/1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "figure_id": {
+      "pattern": "^[a-zA-Z0-9_:.-]{1,160}$",
+      "title": "Figure Id",
+      "type": "string"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "revision": {
+      "title": "Revision",
+      "type": "integer"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceInfo"
+    },
+    "layout": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Layout",
+      "type": "object"
+    },
+    "preview_format": {
+      "default": "png",
+      "enum": [
+        "png",
+        "svg",
+        "pdf"
+      ],
+      "title": "Preview Format",
+      "type": "string"
+    }
+  },
+  "required": [
+    "renderer",
+    "editability",
+    "panels",
+    "objects",
+    "limitations",
+    "figure_id",
+    "name",
+    "revision",
+    "source"
+  ],
+  "title": "FigureDocument",
+  "type": "object"
+}

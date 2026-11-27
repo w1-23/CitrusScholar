@@ -52,6 +52,10 @@ class HarnessState(DeepAgentState):
     model_steps: NotRequired[int]
     host_state: NotRequired[dict]
     delivery_followup_used: NotRequired[bool]
+    # At most one bounded re-ask after a length-truncated model output. Nothing
+    # from the truncated response may have been dispatched.
+    length_recovery_used: NotRequired[bool]
+    length_recovery_step: NotRequired[int]
     batch_status: NotRequired[str]
     unknown_operations: NotRequired[list[str]]
     execution_waits: NotRequired[list[str]]
@@ -131,6 +135,15 @@ class HarnessRuntime:
     acknowledge_user_input: Any = None
     check_retired_question: Any = None
     model_call: Any = None
+    # Whether one more bounded model attempt fits the job budget. A recovery
+    # re-ask costs a real call, so it may not overdraw the same ledger.
+    can_recover_output: Any = None
+    guard_native_execute: Any = None
+    # Trusted host opt-in. The waiter signals availability only; decisions
+    # always come from the job database after re-reading the checkpoint.
+    native_approval_tools: tuple[str, ...] = ()
+    wait_native_approval: Any = None
+    approval_restart_checkpoint: str = ""
     diagnostic_checkpoint: str = ""
 
     async def run(self, identity, messages, *, saver, resume=False, checkpoint_config=None,
@@ -163,7 +176,26 @@ class HarnessRuntime:
         update_lock = asyncio.Lock()
         prepared = {}
         published_todos = set()
+        active_delegations = set()
+        accepted_delegations = set()
+        published_delegations = set()
         operation_blocked = False
+
+        def delegate_progress(call_id, status):
+            from src.core.public_progress import write_subagent_progress
+
+            write_subagent_progress(identity.run_id, tool_call_id=call_id, status=status)
+
+        def publish_settled_delegations(state):
+            # The SDK graph uses synchronous persistence. Only observations in
+            # the next graph state (never a proposal or SDK refusal) are final.
+            for message in state.get("messages", ()):
+                if (isinstance(message, ToolMessage) and message.name == "task"
+                        and message.tool_call_id in accepted_delegations
+                        and message.tool_call_id not in published_delegations):
+                    published_delegations.add(message.tool_call_id)
+                    delegate_progress(message.tool_call_id,
+                                      "completed" if message.status == "success" else "failed")
 
         def related_round(state):
             return next(m for m in reversed(state["messages"]) if isinstance(m, AIMessage))
@@ -240,6 +272,9 @@ class HarnessRuntime:
                 invalid = "invalid_tool_call" if response.invalid_tool_calls else ""
                 if reason == "length" or reason in NON_SUCCESS_TERMINALS:
                     invalid = "model_" + reason
+                finalizing = response.response_metadata.get("citrus_budget_finalization") is True
+                if finalizing and response.tool_calls and not invalid:
+                    invalid = "invalid_tool_call"
                 ids = [call.get("id") for call in response.tool_calls]
                 previous = {call.get("id") for message in state["messages"][:-1]
                     if isinstance(message, AIMessage)
@@ -257,7 +292,7 @@ class HarnessRuntime:
                     return {"messages": [RemoveMessage(id=response.id)],
                             "rejected_responses": [*state.get("rejected_responses", []), response],
                             "stop_status": "incomplete", "stop_reason": "model_stream_unconfirmed", "jump_to": "end"}
-                if adapter.recover_output and invalid == "invalid_tool_call":
+                if adapter.recover_output and not finalizing and invalid == "invalid_tool_call":
                     # No tool in this response has been dispatched. Preserve raw
                     # arguments privately, and pair every valid native call with
                     # an explicit not_run result before asking the SAME model.
@@ -295,17 +330,69 @@ class HarnessRuntime:
                     await event("model_output_rejected", {**state, "stop_reason": invalid}, ids)
                     return {"messages": additions, "rejected_responses": [*state.get("rejected_responses", []), response],
                             "host_state": host_snapshot(), "jump_to": "model"}
+                if (adapter.recover_output and not finalizing and invalid == "model_length"
+                        and not state.get("length_recovery_used")
+                        and state.get("model_steps", 0) < adapter.limits.max_model_steps
+                        and (adapter.can_recover_output() if adapter.can_recover_output else True)):
+                    # The provider hit the single-call output cap. Nothing in
+                    # this response was dispatched, so withdraw every proposal,
+                    # pair it with an explicit not_run receipt, and ask the same
+                    # model once to shorten or split the work. A second
+                    # truncation is final: never loop or dispatch half a batch.
+                    cleaned = response.model_copy(deep=True)
+                    cleaned.invalid_tool_calls = []
+                    cleaned.additional_kwargs.pop("tool_calls", None)
+                    feedback_reason = "model_length"
+                    feedback = "输出在生成阶段达到单次上限，被截断"
+                    additions = [cleaned]
+                    if adapter.record_rejected is not None and cleaned.tool_calls:
+                        batch = await adapter.record_rejected(cleaned, feedback_reason)
+                        if (batch.unknown_operations or batch.pending_question or batch.execution_waits
+                                or len(batch.messages) != len(cleaned.tool_calls)):
+                            raise ValueError("length_rejected_batch_observation")
+                        for call, observation in zip(cleaned.tool_calls, batch.messages):
+                            artifact = observation.artifact or {}
+                            outcome = artifact.get("_tool_outcome", {})
+                            if (observation.status != "error" or observation.tool_call_id != call["id"]
+                                    or observation.name != call["name"]
+                                    or observation.additional_kwargs.get("execution_dispatched") is not False
+                                    or observation.additional_kwargs.get("operation_uncertain")
+                                    or outcome.get("status") != "not_run"
+                                    or outcome.get("reason_code") != feedback_reason):
+                                raise ValueError("length_rejected_tool_observation")
+                            additions.append(observation.model_copy(update={"additional_kwargs": {
+                                **observation.additional_kwargs, **identity.message_metadata("tool")}}))
+                    else:
+                        additions.extend(ToolMessage(content=f"调用未执行：{feedback}。请缩短参数并重新生成。",
+                            tool_call_id=call["id"], name=call["name"], status="error",
+                            additional_kwargs={**identity.message_metadata("tool"), "execution_dispatched": False},
+                            artifact={"_tool_outcome": {"status": "not_run", "reason_code": feedback_reason}})
+                            for call in cleaned.tool_calls)
+                    additions.append(control(f"上一条输出被截断（{feedback}），所有提议调用均未执行。"
+                        "请缩短说明，把长脚本或大参数先写入工作区文件再引用，或拆成更小的调用；"
+                        "重新生成完整参数或精简的最终答复，不要把截断文本当成已完成结果。"))
+                    await event("model_output_rejected", {**state, "stop_reason": invalid}, ids)
+                    return {"messages": additions, "length_recovery_used": True,
+                            "length_recovery_step": state.get("model_steps", 0) + 1,
+                            "rejected_responses": [*state.get("rejected_responses", []), response],
+                            "host_state": host_snapshot(), "jump_to": "model"}
                 if invalid:
                     await event("model_output_rejected", {**state, "stop_reason": invalid}, ids)
                     return {"messages": [RemoveMessage(id=response.id)],
                             "rejected_responses": [*state.get("rejected_responses", []), response],
                             "stop_status": "incomplete", "stop_reason": invalid, "jump_to": "end"}
+                if len(response.tool_calls) != 1 and any(
+                        item["name"] in approval_tools for item in response.tool_calls):
+                    # Never pause a ToolNode which can execute sibling effects.
+                    return {"messages": [RemoveMessage(id=response.id)],
+                            "stop_status": "incomplete", "stop_reason": "approval_requires_single_call",
+                            "host_state": host_snapshot(), "jump_to": "end"}
                 if not response.tool_calls:
                     followup_used = state.get("delivery_followup_used", False)
                     check_final = (adapter.check_final_after_followup if followup_used else None) or adapter.check_final
                     check = await check_final(response, tuple(state["messages"]), identity)
                     if not check.accepted:
-                        if followup_used:
+                        if followup_used or finalizing:
                             return {"stop_status": "incomplete", "stop_reason": "final_validation_failed",
                                     "host_state": host_snapshot(), "jump_to": "end"}
                         return {"messages": [control(delivery_feedback(check))], "delivery_followup_used": True,
@@ -352,9 +439,29 @@ class HarnessRuntime:
                     else:
                         await observed(request.state, "tools")
                         await event("batch_started", request.state, (cid,))
-                        result = await handler(request)
+                        if name == "task":
+                            from .subagent_runtime import GENERAL_PURPOSE_NAME
+
+                            if (call["args"].get("subagent_type") == GENERAL_PURPOSE_NAME
+                                    and isinstance(call["args"].get("description"), str)
+                                    and cid not in active_delegations):
+                                active_delegations.add(cid)
+                                delegate_progress(cid, "started")
+                        if name == "execute" and adapter.guard_native_execute is not None:
+                            result = await adapter.guard_native_execute(identity, call, lambda: handler(request))
+                        else:
+                            result = await handler(request)
                         signal = {}
-                        if name in host_tools:
+                        if name == "execute" and isinstance(result, ToolMessage):
+                            if result.additional_kwargs.get("operation_uncertain") is True:
+                                signal = {"uncertain": True,
+                                          "operation_id": result.additional_kwargs["operation_id"]}
+                        if (name in approval_tools and cid in denied_approval_calls
+                                and isinstance(result, ToolMessage) and result.status == "error"):
+                            message = result.model_copy(update={
+                                "additional_kwargs": {"execution_dispatched": False},
+                                "artifact": {"_tool_outcome": {"status": "not_run", "reason_code": "approval_rejected"}}})
+                        elif name in host_tools:
                             update = result.update if isinstance(result, Command) else None
                             if (not isinstance(update, dict) or set(update) != {"messages", "operation_signals"}
                                     or not isinstance(update["messages"], list) or len(update["messages"]) != 1
@@ -370,6 +477,14 @@ class HarnessRuntime:
                                     or not isinstance(update["messages"], list) or len(update["messages"]) != 1):
                                 raise ValueError("native_todo_command_invalid")
                             message, todos = update["messages"][0], update["todos"]
+                        elif name == "task" and isinstance(result, Command):
+                            # Pinned SDK returns the child's paired ToolMessage in a Command.
+                            # Child checkpoints are private; no child may update parent state.
+                            from .subagent_runtime import delegated_observation
+
+                            message = delegated_observation(result, cid)
+                            if cid in active_delegations:
+                                accepted_delegations.add(cid)
                         else:
                             message = result
                         if signal.get("uncertain"):
@@ -457,6 +572,7 @@ class HarnessRuntime:
                 return "ModelRefusalMiddleware"
 
             async def awrap_model_call(self, request, handler):
+                publish_settled_delegations(request.state)
                 async def stamped(req):
                     req = req.override(model=adapter.model)
                     try:
@@ -479,8 +595,35 @@ class HarnessRuntime:
         tools = [framework_tool(item["function"]) for item in self.schemas]
         host_tools = frozenset(tool.name for tool in tools)
         run_context = _RunContext(identity)
-        graph = create_framework_agent(self.model, tools, [Suspension(), Policy(), ProviderPolicy()], saver,
-                                       HarnessState, context_schema=_RunContext, **(agent_options or {}))
+        # The native file tools operate on this run's authenticated Workspace
+        # scope. The scope comes from the server-side identity, never a tool
+        # argument or model-provided value.
+        options = dict(agent_options or {})
+        options.setdefault("workspace_scope",
+                           (identity.owner_user_id, identity.session_id, identity.run_id))
+        options.setdefault("identity", identity)
+        if "task_subagent" not in options:
+            from src.config import settings as runtime_settings
+            options["task_subagent"] = bool(getattr(runtime_settings, "AGENT_ENABLE_TASK_SUBAGENT", True))
+        middleware = [Suspension(), Policy(), ProviderPolicy()]
+        from src.config import settings as project_rule_settings
+
+        bindings = project_rule_settings.AGENT_PROJECT_RULE_BINDINGS
+        if bindings:
+            from .project_memory import configured_project_memory
+
+            if project_memory := configured_project_memory(identity, bindings):
+                middleware.append(project_memory)
+        approval_tools = adapter.native_approval_tools
+        denied_approval_calls = set()
+        if approval_tools:
+            from .native_approval import native_approval_middleware
+
+            if not set(approval_tools) <= host_tools or not callable(adapter.wait_native_approval):
+                raise ValueError("native_approval_policy_unavailable")
+            middleware.append(native_approval_middleware(approval_tools))
+        graph = create_framework_agent(self.model, tools, middleware, saver,
+                                       HarnessState, context_schema=_RunContext, **options)
         config = {"configurable": checkpoint_config or {"thread_id": identity.run_id},
                   "recursion_limit": max(64, self.limits.max_model_steps * 6 + 20)}
         snapshot = await graph.aget_state(config)
@@ -570,6 +713,9 @@ class HarnessRuntime:
                     not (closed or orphan_closed) or has_unsettled_work(prior) or snapshot.interrupts))):
                 raise AdmissionStopped("native_thread_requires_reconciliation")
         initial = None
+        approval_restart = False
+        if adapter.approval_restart_checkpoint and (not resume or not approval_tools or not prior or continuing_thread):
+            raise AdmissionStopped("recovery_requires_reconciliation")
         if prior and not continuing_thread:
             if not resume:
                 raise ValueError("existing_turn_requires_explicit_resume")
@@ -603,7 +749,22 @@ class HarnessRuntime:
                                 and message.additional_kwargs.get("run_id") == identity.run_id
                                 and message.additional_kwargs.get("host_publication")):
                             adapter.restore_tool_observation(message, proposed.get(message.tool_call_id))
-            if _pending_calls(prior["messages"]):
+            if adapter.approval_restart_checkpoint:
+                from .native_approval import InvalidNativeApproval, restart_approval_command
+
+                if (prior.get("stop_status") or prior.get("unknown_operations") or prior.get("execution_wake")
+                        or adapter.user_input is not None or len(tool_nodes) != 1 or snapshot.next != tool_nodes
+                        or len(_pending_calls(prior["messages"])) != 1):
+                    raise AdmissionStopped("recovery_requires_reconciliation")
+                try:
+                    initial, denied = await asyncio.to_thread(restart_approval_command, snapshot, identity,
+                        scope=config["configurable"], tool_names=approval_tools,
+                        checkpoint_ref=adapter.approval_restart_checkpoint)
+                except InvalidNativeApproval as exc:
+                    raise AdmissionStopped("recovery_requires_reconciliation") from exc
+                denied_approval_calls.update(denied)
+                approval_restart = True
+            if not approval_restart and _pending_calls(prior["messages"]):
                 from .recovery import committed_tool_receipts
                 if (not adapter.restore_tool_observation or len(tool_nodes) != 1
                         or snapshot.next != tool_nodes or snapshot.interrupts):
@@ -632,9 +793,11 @@ class HarnessRuntime:
             await observed(prior)
             if self.validate_resume:
                 self.validate_resume()
-            if _pending_calls(prior["messages"]) or set(snapshot.next) - pre_model_nodes:
+            if not approval_restart and (_pending_calls(prior["messages"]) or set(snapshot.next) - pre_model_nodes):
                 raise AdmissionStopped("recovery_requires_reconciliation")
-            if snapshot.interrupts:
+            if approval_restart:
+                pass  # The exact native ToolNode resume runs inside the bounded invoke below.
+            elif snapshot.interrupts:
                 waiting = _interruption(snapshot)
                 await observed(waiting)
                 if waiting["stop_status"] == "waiting":
@@ -693,11 +856,12 @@ class HarnessRuntime:
                              if message.additional_kwargs.get("context_origin") != "historical_evidence"]
             initial = {"messages": additions, "model_steps": 0, "host_state": host_snapshot(),
                 "executor_id": EXECUTOR_ID, "active_run_id": identity.run_id, "pinned_skills": list(pinned_skills),
-                "skills_metadata": None, "delivery_followup_used": False, "operation_signals": None,
+                "skills_metadata": None, "delivery_followup_used": False, "length_recovery_used": False,
+                "length_recovery_step": 0, "operation_signals": None,
                 "unknown_operations": [], "execution_waits": [], "execution_wake": [], "user_input_wake": {}, "batch_status": "",
                 "stop_status": "", "stop_reason": "", "rejected_responses": []}
         await event("run_started", latest)
-        if isinstance(initial, Command):
+        if isinstance(initial, Command) and not approval_restart:
             # Only the Suspension middleware can run through this breakpoint.
             # Commit the paired observation before acknowledging its durable
             # notification, independently of any remaining model budget.
@@ -731,6 +895,23 @@ class HarnessRuntime:
 
                 result = await invoke_with_public_progress(graph, initial, config,
                     context=run_context, job_id=identity.run_id)
+                while approval_tools and result.interrupts and all(
+                        isinstance(item.value, dict) and item.value.get("type") == "tool_approval"
+                        for item in result.interrupts):
+                    from .native_approval import approval_resume, durable_approvals
+
+                    policy = {"scope": config["configurable"], "tool_names": approval_tools}
+                    parked = await graph.aget_state(config)
+                    requested = await asyncio.to_thread(durable_approvals, parked, identity, register=True, **policy)
+                    await adapter.wait_native_approval(identity, tuple(row.approval_id for row in requested))
+                    current = await graph.aget_state(config)
+                    records = await asyncio.to_thread(durable_approvals, current, identity, **policy)
+                    if tuple(row.binding for row in records) != tuple(row.binding for row in requested):
+                        raise AdmissionStopped("recovery_requires_reconciliation")
+                    next_input = approval_resume(current, identity, records=records, **policy)
+                    denied_approval_calls.update(row.binding.tool_call_id for row in records if row.status != "granted")
+                    result = await invoke_with_public_progress(graph, next_input, config,
+                        context=run_context, job_id=identity.run_id)
                 state = _interruption(await graph.aget_state(config)) if result.interrupts else result.value
             if timer.expired():
                 state = {**latest, "stop_status": "incomplete", "stop_reason": "deadline"}
@@ -742,6 +923,7 @@ class HarnessRuntime:
             if not timer.expired():
                 raise
             state = {**latest, "stop_status": "incomplete", "stop_reason": "deadline"}
+        publish_settled_delegations(state)
         state = {**state, "host_state": host_snapshot()}
         if (state.get("stop_status") in {"incomplete", "cancelled"}
                 and state.get("stop_reason") in {"cancelled", "deadline"}):

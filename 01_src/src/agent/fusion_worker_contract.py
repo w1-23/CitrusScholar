@@ -1,6 +1,7 @@
 """Immutable v1 release and bytes-only protocol for host-owned fusion jobs."""
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 import hashlib
 import json
@@ -26,16 +27,36 @@ MAX_MEMBERS = 94
 REPORT_KEYS = frozenset({"findings", "evidence", "locations", "coverage", "limitations", "artifacts"})
 OPTION_KEYS = {
     "literature-verification": frozenset({"references", "strict"}),
-    "data-audit": frozenset({"regions", "experimental_design"}),
+    "data-audit": frozenset({"regions", "experimental_design", "csv_table"}),
     "research-integrity": frozenset({"checks", "numeric_columns", "shared_control_columns", "digit_screen",
                                      "shared_image_pairs", "tolerance", "gel_lanes"}),
 }
 IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff"})
 WORKBOOK_EXTENSIONS = frozenset({".xlsx", ".xlsm"})
+CSV_TABLE_EXTENSIONS = frozenset({".csv"})
+CSV_TABLE_ROLE = "csv_table"
+WORKBOOK_ROLE = "workbook"
+# The two formal data-audit input protocols. A CSV source is described as a
+# table with logical records and fields; it never invents a worksheet name and
+# is never wrapped into a workbook to satisfy a workbook-only contract.
+DATA_AUDIT_INPUT_KINDS = {"excel_workbook": WORKBOOK_ROLE, "csv_table": CSV_TABLE_ROLE}
+# A pinned data-audit analyzer version accepts the csv_table role only when the
+# release actually ships that adapter. Empty means "not installed": the host
+# must route the exact table contract to the generic audit path instead of
+# starting a Worker job the analyzer cannot read.
+CSV_TABLE_ANALYZER_VERSIONS = {"data-audit": frozenset()}
+CSV_DELIMITERS = (",", "\t", ";", "|")
+MAX_CSV_RECORDS = 5001
+MAX_CSV_CELLS = 250_000
+EXCEL_WORKBOOK_FORMULA_POLICY = {"formula_values": "cached", "recalculate": False,
+                                 "missing_cache": "coverage_finding",
+                                 "macro_safety": "reject_signed_activex_embedded"}
 EXTENSIONS = {"bibliography": {".pdf", ".bib"}, "workbook": WORKBOOK_EXTENSIONS,
+              CSV_TABLE_ROLE: CSV_TABLE_EXTENSIONS,
               "table": {".csv"}, "source": {".csv", ".tsv", ".xlsx"},
               "reported": {".csv", ".tsv", ".xlsx"}, "gel": IMAGE_EXTS}
-ROLES = {"literature-verification": {"bibliography"}, "data-audit": {"workbook"},
+ROLES = {"literature-verification": {"bibliography"},
+         "data-audit": {WORKBOOK_ROLE, CSV_TABLE_ROLE},
          "research-integrity": {"table", "source", "reported", "gel"}}
 
 
@@ -103,7 +124,7 @@ def load_bundle(release: Path, skill: str) -> Bundle:
             or any(version not in {
                 "data-audit": {"0.1.0", "0.1.1", "0.1.2", "0.1.3"},
                 "literature-verification": {"0.1.0", "0.1.1", "0.1.2"},
-                "research-integrity": {"0.1.0"},
+                "research-integrity": {"0.1.0", "0.1.1"},
             }[name] for name, version in manifest["skills"].items())
             or skill not in manifest["skills"]):
         raise ValueError("fusion_bundle_schema_mismatch")
@@ -151,6 +172,157 @@ def input_path(skill, role, filename):
     if ext not in allowed:
         raise ValueError("fusion_input_format_invalid")
     return INPUT_ROOT + role + ext
+
+
+def data_audit_input_kind(filename):
+    """The formal data-audit protocol this authorized file belongs to.
+
+    ``None`` means neither protocol: the caller must report an unsupported
+    format instead of guessing a worksheet or wrapping the file.
+    """
+    suffix = Path(str(filename)).suffix.lower()
+    if suffix in WORKBOOK_EXTENSIONS:
+        return "excel_workbook"
+    if suffix in CSV_TABLE_EXTENSIONS:
+        return "csv_table"
+    return None
+
+
+def _csv_records(data):
+    """Deterministic, bounded parse of one logical CSV table."""
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("fusion_csv_table_encoding_invalid") from exc
+    if "\x00" in text:
+        raise ValueError("fusion_csv_table_binary_content")
+    lines = text.splitlines()
+    best = None
+    for delimiter in CSV_DELIMITERS:
+        try:
+            rows = [row for row in csv.reader(lines, delimiter=delimiter, strict=True) if row]
+        except csv.Error:
+            continue
+        if not rows:
+            continue
+        widths = [len(row) for row in rows[:20]]
+        # The widest consistent table wins: a single-column file cannot outbid
+        # the delimiter that actually splits its header.
+        modal = max(sorted(set(widths)), key=lambda width: (widths.count(width), width))
+        score = (modal, widths.count(modal))
+        if best is None or score > best[0]:
+            best = (score, delimiter, rows)
+    if best is None:
+        raise ValueError("fusion_csv_table_invalid")
+    return best[1], best[2]
+
+
+def csv_table_contract(data, filename):
+    """Describe one authorized CSV source as a single table, never a workbook.
+
+    Columns, record positions and the source hash are reported exactly as they
+    appear. Blank or duplicate header fields are recorded as defects; none of
+    them is renamed and no worksheet name is manufactured.
+    """
+    from .research_skill_catalog import _MAX_RESOURCE_BYTES
+
+    if not isinstance(data, bytes) or not data.strip():
+        raise ValueError("fusion_csv_table_empty")
+    if Path(str(filename)).suffix.lower() not in CSV_TABLE_EXTENSIONS:
+        raise ValueError("fusion_csv_table_format_invalid")
+    if data[:2] == b"PK":
+        raise ValueError("fusion_csv_table_is_a_workbook")
+    if len(data) > _MAX_RESOURCE_BYTES:
+        raise ValueError("fusion_csv_table_size_limit")
+    delimiter, records = _csv_records(data)
+    header, body = records[0], records[1:]
+    if len(body) > MAX_CSV_RECORDS:
+        raise ValueError("fusion_csv_table_record_limit")
+    width = max([len(header), *(len(row) for row in body)])
+    if width < 1 or width > 16384 or (len(body) + 1) * width > MAX_CSV_CELLS:
+        raise ValueError("fusion_csv_table_cell_limit")
+    columns = [str(name) for name in header]
+    return {
+        "kind": "csv_table",
+        "source_sha256": sha(data),
+        "filename": Path(str(filename)).name,
+        "table": "single",
+        "encoding": "utf-8-sig",
+        "delimiter": "tab" if delimiter == "\t" else delimiter,
+        "header_rows": [1],
+        "column_count": len(columns),
+        "column_names": columns,
+        "record_count": len(body),
+        "data_range": {"first_row": 2, "last_row": len(body) + 1,
+                       "first_field": 1, "last_field": len(columns)},
+        "positions": "logical records and fields",
+        "sheet_name": None,
+        "header_defects": {"blank_fields": [index + 1 for index, name in enumerate(columns) if not name.strip()],
+                           "duplicate_names": sorted({name for name in columns
+                                                      if name.strip() and columns.count(name) > 1})},
+        "ragged_records": sum(1 for row in body if len(row) != len(columns)),
+    }
+
+
+def excel_workbook_contract(sheet_names, regions):
+    """Describe an authorized workbook's reviewed A1 rectangles.
+
+    Only the confirmed rectangles are read; every other sheet and every cell
+    outside them is named as unreviewed instead of being claimed as checked.
+    """
+    names = [str(name) for name in sheet_names]
+    reviewed = {}
+    for region in regions:
+        reviewed.setdefault(region["sheet"], []).append({"range": region["bounds"],
+                                                         "header_rows": list(region["header_rows"])})
+    return {"kind": "excel_workbook", "sheets": names, "coordinates": "A1",
+            "reviewed_sheets": [name for name in names if name in reviewed],
+            "unreviewed_sheets": [name for name in names if name not in reviewed],
+            "regions": [{"sheet": name, "range": item["range"], "header_rows": item["header_rows"]}
+                        for name in names for item in reviewed.get(name, [])],
+            "unreviewed_scope": "以确认矩形之外的单元格和未列出的工作表均未审查",
+            "formula_policy": dict(EXCEL_WORKBOOK_FORMULA_POLICY)}
+
+
+def analyzer_version(release, skill):
+    """Read the pinned analyzer version of one installed Skill release."""
+    from .research_skill_catalog import _MAX_RESOURCE_BYTES, _bytes, _path
+
+    raw = decode(_bytes(_path(Path(release), "fusion/bundle.json"), _MAX_RESOURCE_BYTES))
+    if type(raw) is not dict or type(raw.get("skills")) is not dict or type(raw["skills"].get(skill)) is not str:
+        raise ValueError("fusion_bundle_schema_mismatch")
+    return raw["skills"][skill]
+
+
+def csv_table_supported(skill, version):
+    """Whether the pinned analyzer accepts the formal csv_table input role."""
+    return str(version) in CSV_TABLE_ANALYZER_VERSIONS.get(skill, frozenset())
+
+
+def csv_data_audit_route(skill, release):
+    """One contract for both the tool dispatch and the runtime capability table."""
+    if skill != "data-audit" or not release:
+        return "unavailable"
+    return "worker" if csv_table_supported(skill, analyzer_version(Path(release), skill)) else "generic"
+
+
+def csv_table_options(options, refs):
+    """Validate csv_table options and bind them to the authorized file hash."""
+    table = options.get("csv_table")
+    if type(table) is not dict or not table.keys() <= {"header_rows", "column_names", "source_sha256"}:
+        raise ValueError("fusion_csv_table_options_invalid")
+    if "regions" in options:
+        raise ValueError("fusion_csv_table_regions_not_allowed")
+    if table.get("header_rows") not in (None, [1]):
+        raise ValueError("fusion_csv_table_header_invalid")
+    names = table.get("column_names")
+    if names is not None and (type(names) is not list or not 1 <= len(names) <= 16384
+                              or any(type(name) is not str for name in names)):
+        raise ValueError("fusion_csv_table_columns_invalid")
+    digest = table.get("source_sha256")
+    if digest is not None and (not is_hash(digest) or digest != refs[CSV_TABLE_ROLE]["sha256"]):
+        raise ValueError("fusion_csv_table_source_mismatch")
+    return table
 
 
 def validate_reference(ref):
@@ -225,9 +397,13 @@ def make_request(skill, refs, options, observations):
     if type(options) is not dict or not options.keys() <= OPTION_KEYS[skill] or "observations" in options:
         raise ValueError("fusion_options_invalid")
     if skill == "data-audit":
-        if set(refs) != {"workbook"}:
+        roles = set(refs)
+        if roles == {WORKBOOK_ROLE}:
+            workbook_regions(options.get("regions"))
+        elif roles == {CSV_TABLE_ROLE}:
+            csv_table_options(options, refs)
+        else:
             raise ValueError("fusion_workbook_input_required")
-        workbook_regions(options.get("regions"))
     if len(refs) + (observations is not None) > 32:
         raise ValueError("fusion_input_count_limit")
     cassette = None

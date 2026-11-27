@@ -23,7 +23,7 @@ const selections = {
     'lower center': '底部居中', 'upper center': '顶部居中', center: '居中' },
 };
 const numeric = {
-  linewidth: [.2, 8, .1], markersize: [1, 24, .1], markeredgewidth: [0, 8, .1],
+  linewidth: [.2, 8, 'any'], markersize: [1, 24, .1], markeredgewidth: [0, 8, .1],
   fontsize: [5, 24, .1], alpha: [0, 1, .05], ncols: [1, 6, 1], capsize: [0, 24, .1],
 };
 const color = (value) => typeof value === 'string' && /^#[\da-f]{6}$/i.test(value);
@@ -182,7 +182,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
   tree.replaceChildren();
   const visible = [];
   const nodes = new Map();
-  function append(parent, key, parentExpanded = true) {
+  function append(parent, key) {
     for (const group of childGroups.get(key) || []) {
       const item = element('li');
       item.setAttribute('role', 'treeitem');
@@ -191,7 +191,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
       item.setAttribute('aria-selected', String(group.id === selected));
       item.tabIndex = group.id === selected ? 0 : -1;
       nodes.set(group.id, item);
-      if (parentExpanded) visible.push(item);
+      visible.push(item);
       const row = element('div', undefined, 'tree-row');
       const branch = childGroups.has(group.id);
       const open = expanded.has(group.id);
@@ -201,10 +201,11 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
       row.append(arrow);
       const style = values(group);
       const caption = style.label || group.label;
-      if (['series', 'sync'].includes(group.kind)) {
+      const paint = [style.facecolor, style.color, style.edgecolor].find(color);
+      if (paint) {
         const swatch = element('span', undefined, 'series-swatch');
         swatch.setAttribute('aria-hidden', 'true');
-        if (color(style.color || style.facecolor)) swatch.style.color = style.facecolor || style.color;
+        swatch.style.color = paint;
         if (style.linestyle === '--') swatch.style.borderTopStyle = 'dashed';
         if (style.linestyle === ':') swatch.style.borderTopStyle = 'dotted';
         if (style.visible === false) swatch.style.opacity = '.35';
@@ -218,7 +219,7 @@ export function renderTree(tree, groups, selected, expanded, choose, values) {
         const list = element('ul');
         list.setAttribute('role', 'group');
         list.hidden = !open;
-        append(list, group.id, parentExpanded && open);
+        if (open) append(list, group.id);
         item.append(list);
       }
       row.addEventListener('click', (event) => {

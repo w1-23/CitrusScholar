@@ -148,6 +148,19 @@ def pinned_template(release: Path, installed_version: str) -> PinnedTemplate:
     return PinnedTemplate(candidate, expected, RELEASE_VENDOR_COMMIT, digest(raw), root)
 
 
+def template_request(spec: RunArgs) -> tuple[str, dict]:
+    """Registry template id and typed parameters for one fixed-plot request.
+
+    The deprecated Agent tools use this to forward into the unified figure
+    execution. Nothing is executed here: the registry re-validates every field
+    before dispatch, so an unknown or inconsistent mapping fails as ``not_run``
+    instead of becoming an uncertain worker call.
+    """
+    payload = {key: value for key, value in spec.plot.model_dump().items()
+               if key != "template" and value is not None and value != ""}
+    return spec.plot.template, payload
+
+
 def output_names(template, operation):
     stem = f"nature-{template}-{operation[-12:]}"
     return stem, tuple(f"/outputs/{stem}.{suffix}" for suffix in (*EXPORTS, "qa.json"))

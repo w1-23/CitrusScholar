@@ -186,7 +186,7 @@ def observe_provider_request(request):
     def blocked(reason):
         if not scope.get("provider_request_admitted"):
             scope["pre_transport_denial"] = reason
-        if scope["purpose"] == "main_loop":
+        if scope["purpose"] in {"main_loop", "final_synthesis"}:
             raise AdmissionStopped(reason)
         raise TaskConflict(reason)
 
@@ -201,9 +201,11 @@ def observe_provider_request(request):
         prepared = estimate_request(payload, model_window=scope["estimate"].get("model_window"))
     except (TypeError, ValueError):
         blocked("model_request_body_unavailable")
-    if (scope["purpose"] == "main_loop"
+    if (scope["purpose"] in {"main_loop", "final_synthesis"}
             and prepared["output_tokens"] != scope["estimate"]["output_tokens"]):
         blocked("model_output_budget_mismatch")
+    if scope["purpose"] == "final_synthesis" and (payload.get("tools") or payload.get("functions")):
+        blocked("unexpected_finalization_tools")
     if prepared["estimated_input_tokens"] > model_input_limit(prepared["output_tokens"]):
         blocked("context_budget_exhausted")
     if prepared["estimated_total_tokens"] > scope["estimate"]["estimated_total_tokens"]:

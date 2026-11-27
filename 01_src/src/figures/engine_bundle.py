@@ -9,6 +9,7 @@ import base64
 import hashlib
 from importlib import metadata
 import json
+import os
 import sysconfig
 from pathlib import Path, PurePosixPath
 
@@ -25,12 +26,50 @@ SUPPORT_VERSION = "2.0.0"
 SUPPORT_PACKAGES = frozenset({"citrus_audit", "citrus_figures"})
 
 
+def _sealed_support_files(root: Path, packages, commit: str) -> dict[str, bytes] | None:
+    """Use the verified Git archive instead of the app SIF's stale wheel."""
+    inventory = root / "LINUX-SOURCE-MANIFEST.json"
+    if not commit or not inventory.is_file():
+        return None
+    raw = inventory.read_bytes()
+    receipt = json.loads(raw)
+    if receipt.get("inventory_scope") != "All archived regular members except this manifest":
+        return None  # Legacy image deployments retain the wheel-based contract.
+    if (receipt.get("schema") != "citrusscholar.linux-source/1"
+            or receipt.get("integrated_branch_commit") != commit
+            or inventory.is_symlink() or inventory.stat().st_mode & 0o222 or root.stat().st_mode & 0o222):
+        raise ValueError("Worker sealed source identity mismatch")
+    result = {}
+    for name, pin in receipt["members"].items():
+        parts = PurePosixPath(name).parts
+        if len(parts) < 3 or parts[0] != "packages" or parts[1] not in packages or not name.endswith(".py"):
+            continue
+        if any(x in {"..", "tests", "__pycache__"} or x.endswith("_test.py") for x in parts):
+            continue
+        path = root.joinpath(*parts)
+        if path.resolve(strict=True) != path or not path.is_file() or path.stat().st_mode & 0o222:
+            raise ValueError("Invalid Worker sealed support member: " + name)
+        data = path.read_bytes()
+        if len(data) != pin["bytes"] or hashlib.sha256(data).hexdigest() != pin["sha256"]:
+            raise ValueError("Worker sealed support integrity mismatch: " + name)
+        result["/".join(parts[1:])] = data
+    if any(package + "/__init__.py" not in result for package in packages):
+        raise ValueError("Worker sealed support package missing")
+    result["support-manifest.json"] = json.dumps({"schema": "citrus.worker-support/1", "source_commit": commit,
+        "source_manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "members": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(result.items())}}, sort_keys=True).encode()
+    return result
+
+
 def _support_files(packages=SUPPORT_PACKAGES) -> dict[str, bytes]:
     """Stage the installed, non-editable wheel and verify every RECORD hash.
 
     This is the common source for Docker, image refresh and Apptainer. Never
     recursively copy a checkout, site-packages, an environment, or runtime data.
     """
+    sealed = _sealed_support_files(Path(__file__).resolve().parents[3], packages, os.environ.get("CITRUS_SOURCE_COMMIT", ""))
+    if sealed is not None:
+        return sealed
     # A source-tree *.egg-info generated while building must not shadow the
     # installed wheel when this function is called from a developer checkout.
     installed = [dist for dist in metadata.distributions(

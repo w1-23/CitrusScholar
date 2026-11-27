@@ -246,7 +246,8 @@ def _discover_question_pause(identity, saved, values, pending_interrupts):
 
 async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                               provider_scope: tuple[str, str], *, execution_wait: dict | None = None,
-                              discover_execution_wait=False, question_resume=None, discover_question=False) -> dict:
+                              discover_execution_wait=False, question_resume=None, discover_question=False,
+                              native_approval_tools: tuple[str, ...] = ()) -> dict:
     """Read the exact committed framework state. Legacy executors are never resumed."""
     from src.core.jobs import get_job
     from .deep_agent_runtime import EXECUTOR_ID
@@ -276,7 +277,8 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                 raise TaskConflict("executor_checkpoint_incompatible")
             if raw.get("active_run_id") != identity.run_id:
                 raise TaskConflict("recovery_identity_mismatch")
-            values = (await _checkpoint_reader(saver).aget_state(saved.config)).values
+            stored_snapshot = await _checkpoint_reader(saver).aget_state(saved.config)
+            values = stored_snapshot.values
             pending_interrupts = [value for _, channel, value in saved.pending_writes or () if channel == INTERRUPT]
     if not isinstance(values, dict) or not values.get("messages"):
         raise TaskConflict("recovery_checkpoint_invalid")
@@ -298,7 +300,27 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
             raise TaskConflict("recovery_execution_wait_invalid")
         execution_wait = {"checkpoint_ref": saved.config["configurable"]["checkpoint_id"],
                           "wait_ids": discovered}
-    if has_pending:
+    approval_checkpoint = ""
+    if native_approval_tools and pending_interrupts and has_pending and not (question_resume or execution_wait
+            or discover_execution_wait or status or values.get("execution_wake") or values.get("execution_waits")
+            or any(item.get("execution_waits") for item in signals)):
+        from dataclasses import asdict
+        from .native_approval import InvalidNativeApproval, approval_resume, durable_approvals
+
+        interrupts = tuple(pause for group in pending_interrupts for pause in group)
+        if len(interrupts) == 1 and isinstance(interrupts[0].value, dict) and interrupts[0].value.get("type") == "tool_approval":
+            if len(_pending_calls(values["messages"])) != 1 or (values.get("host_state") or {}).get("identity") != asdict(identity):
+                raise TaskConflict("recovery_requires_reconciliation")
+            parked = stored_snapshot._replace(interrupts=interrupts)
+            policy = {"scope": framework_checkpoint_scope(identity, provider_scope, **options),
+                      "tool_names": native_approval_tools}
+            try:
+                records = await asyncio.to_thread(durable_approvals, parked, identity, **policy)
+                approval_resume(parked, identity, records=records, **policy)  # Validate only; no graph invocation.
+            except InvalidNativeApproval as exc:
+                raise TaskConflict("recovery_requires_reconciliation") from exc
+            approval_checkpoint = saved.checkpoint["id"]
+    if has_pending and not approval_checkpoint:
         if status or execution_wait is not None or pending_interrupts or values.get("execution_waits"):
             raise TaskConflict("recovery_requires_reconciliation")
         await committed_tool_receipts(identity, values["messages"])
@@ -334,7 +356,8 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
                     or interrupts[0].value != {"kind": "execution_wait", "wait_ids": list(waits)}))
                 or (wake and (wake != expected["wait_ids"] or pending_interrupts))):
             raise TaskConflict("recovery_execution_wait_invalid")
-    elif (status and not answered) or pending_interrupts or (not has_pending and has_unsettled_work(values)):
+    elif not approval_checkpoint and ((status and not answered) or pending_interrupts
+                                       or (not has_pending and has_unsettled_work(values))):
         raise TaskConflict("recovery_checkpoint_terminal")
     host_state = values.get("host_state")
     if not isinstance(host_state, dict):
@@ -366,6 +389,8 @@ async def load_recovery_state(root: Path, identity: ExecutionIdentity,
         state["agent_question_resume"] = question_resume
     if discover_execution_wait:
         state["agent_recovery_execution_wait"] = execution_wait
+    if approval_checkpoint:
+        state["agent_approval_restart_checkpoint"] = approval_checkpoint
     state["agent_recovery_wake_committed"] = bool(execution_wait and values.get("execution_wake"))
     state["agent_resume"] = True
     state["messages"] = []  # Harness resumes with None; no new HumanMessage.

@@ -8,6 +8,8 @@ import json
 import math
 
 from citrus_figures.manifest import EDITABLE_BY_ROLE
+from citrus_figures.style_replay import valid_baseline
+from citrus_figures.svg_projection import MARK_ROLES
 from citrus_figures.workbench_styles import properties as workbench_properties
 from src.figures.projects import ProjectError
 from src.figures.workbench.identities import DeclarativeIdentity, verified_panels
@@ -22,7 +24,13 @@ _ALLOWED = {
     "axes": {"offset_px"}, "ticklabel": _TEXT - {"horizontalalignment"},
     "grid": set(EDITABLE_BY_ROLE["grid"]), "spine": set(EDITABLE_BY_ROLE["spine"]),
     "errorbar": set(EDITABLE_BY_ROLE["errorbar"]), "colorbar": {"label", "offset_px", "visible"},
+    **{role: set(EDITABLE_BY_ROLE[role]) for role in MARK_ROLES},
 }
+MARK_LABELS = {"arrow": "箭头", "patch": "独立形状"}
+_PAINT_LIMITATIONS = {"no_fill": "没有可编辑的实色填充。", "no_stroke": "没有可编辑的描边。",
+                      "unverified_paint": "复杂绘制效果不能安全重放。",
+                      "geometry_width": "线宽参与箭头几何计算，保持锁定。",
+                      "unsupported_width": "原线宽超出可编辑范围。"}
 _LABELS = {"title": "标题", "xlabel": "X 轴标题", "ylabel": "Y 轴标题", "legend": "图例",
            "annot": "注释", "grid": "网格线", "spine": "坐标轴线", "errorbar": "误差棒", "colorbar": "色标"}
 _ARTISTS = {"Line2D": "曲线", "Rectangle": "柱形", "PathCollection": "散点", "PolyCollection": "填充带",
@@ -91,6 +99,9 @@ class Inventory:
         self.saved = {}
         self.declarative = DeclarativeIdentity(frozen) if self.source_kind == "spec" else None
         self.native = native
+        source = project.get("source_json") or {}
+        self.mark_receipt = ((source.get("frozen_render") or {}).get("receipt")
+                             if self.source_kind == "script" else None)
         self.svg_targets = svg_targets
         self._build(manifest, project.get("overrides_json") or [])
 
@@ -162,7 +173,7 @@ class Inventory:
             role, locator = row["role"], row["locator"]
             index = locator.get("axes_index")
             panel = panels.get(index) if type(index) is int else None
-            if role in {"axes", "figure", "point", "bar"}:
+            if role in {"axes", "figure", "point", "bar"} or role in MARK_ROLES:
                 continue
             if role == "ticklabel":
                 if panel and locator.get("axis") in ("x", "y"):
@@ -227,10 +238,38 @@ class Inventory:
             elif len(members) > 200:
                 group.props.clear()
                 group.reason = "刻度成员数超出一次渲染的样式限额。"
+        self._add_marks(manifest, rows, panels)
         self._add_shared(root, series_by_gid, manifest.get("shared_legend_groups", {}))
         for group in self.groups.values():
             if self.disabled:
                 group.props.clear()
+
+    def _add_marks(self, manifest, rows, panels):
+        if not self.svg_targets:
+            return
+        editable = (isinstance(self.mark_receipt, dict) and self.mark_receipt == manifest.get("frozen_render_receipt")
+                    and valid_baseline(self.mark_receipt.get("style_replay")))
+        annotations = {group.rows[0]["gid"]: group for group in self.groups.values() if group.kind == "annot"}
+        for row in rows:
+            role, gid = row["role"], row["gid"]
+            if role not in MARK_ROLES:
+                continue
+            locator = row["locator"]
+            index, parent_gid = locator.get("axes_index"), locator.get("parent_gid")
+            if type(index) is not int or index not in panels or parent_gid is not None and not isinstance(parent_gid, str):
+                continue
+            annotation = annotations.get(parent_gid)
+            node = self.svg_targets.mark_node(row, annotation.rows[0] if annotation else None)
+            if node is None:
+                continue
+            group = self._add(("visual_mark", gid), role, MARK_LABELS[role], annotation or panels[index], [row])
+            group.props = {prop for prop in group.props if editable
+                           and self.svg_targets.mark_paint(node, prop, row.get(prop))}
+            limits = row.get("paint_limitations")
+            if not editable or row.get("editing_limitation"):
+                group.reason = "没有可验证的原生样式重放，形状保持只读。"
+            elif isinstance(limits, list):
+                group.reason = "".join(_PAINT_LIMITATIONS.get(code, "") for code in limits if isinstance(code, str))
 
     def _add_shared(self, root, series_by_gid, relations):
         if not isinstance(relations, dict):
@@ -305,6 +344,13 @@ class Inventory:
                 ids = tuple(node.get("id") for node in self.svg_targets.drawn_nodes(before))
                 if ids and not self._confirms_drawn_nodes(after, ids, values, svg_targets):
                     raise invalid("group_members_changed", "重绘时所选对象的 SVG 标识无法确认。", 409)
+            if after["role"] in MARK_ROLES:
+                parent = actual.get(after["locator"].get("parent_gid"))
+                node = svg_targets.mark_node(after, parent)
+                original = self.svg_targets.mark_node(before, self.rows.get(before["locator"].get("parent_gid")))
+                if (node is None or original is None or svg_targets.mark_geometry(node) != self.svg_targets.mark_geometry(original)
+                        or not svg_targets.mark_paint(node, prop, values[gid, prop])):
+                    raise invalid("group_edit_unconfirmed", "重绘未确认此原生形状的样式。", 409)
             if prop not in (set(actual[gid].get("editable", [])) | workbench_properties(actual[gid])):
                 raise invalid("group_property_unavailable", "重绘未确认所选组的样式。", 409)
             if prop not in _OBSERVED_STYLES:

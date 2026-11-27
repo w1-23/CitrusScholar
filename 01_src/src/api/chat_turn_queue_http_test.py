@@ -126,9 +126,15 @@ def runtime(monkeypatch, tmp_path):
     for path, handler, method in (
         ("/api/v2/sessions", main.list_sessions, "GET"),
         (root + "/messages", main.session_messages, "GET"),
+        (root + "/continuation/{request_id}", main.session_continuation_inputs, "GET"),
+        (root + "/artifacts/{artifact_id}", main.download_research_artifact, "GET"),
         ("/api/v1/session/{session_id}/clear", main.clear_session_endpoint, "POST"),
         ("/sessions/{session_id}/jobs", main.list_session_jobs, "GET"),
+        (root + "/turn-queue/{client_request_id}/reconcile/publications", main.list_chat_turn_publications, "GET"),
+        (root + "/turn-queue/{client_request_id}/reconcile/publications/{operation_id}/{file_index}",
+         main.restore_chat_turn_publication, "POST"),
         (root + "/turn-queue/{client_request_id}/reconcile", main.reconcile_chat_turn, "POST"),
+        ("/api/v2/chat/jobs/{job_id}/approvals/{approval_id}", main.decide_task_approval, "POST"),
         ("/api/v2/chat/jobs/{job_id}/recover-agent", main.recover_chat_agent, "POST"),
         (root + "/turn-queue", main.enqueue_chat_turn, "POST"),
         (root + "/turn-queue", main.list_chat_turns, "GET"),
@@ -158,7 +164,14 @@ def runtime(monkeypatch, tmp_path):
 
 def wait_for(predicate):
     deadline = monotonic() + 6
-    while not predicate():
+    while True:
+        try:
+            if predicate():
+                return
+        except sqlite3.OperationalError as exc:
+            # The live consumer may briefly own the database during an observation.
+            if getattr(exc, "sqlite_errorcode", 0) & 0xff not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                raise
         if monotonic() >= deadline:
             pytest.fail("expected queue transition did not happen")
         sleep(0.025)
@@ -197,6 +210,11 @@ def test_background_fifo_cancel_and_replay(runtime):
         terminal = [row for row in events if row["event"] == "done"]
         assert len(terminal) == 1
         assert terminal[0]["data"]["history_saved"] is True
+        job_url = f'/jobs/{turn["job_id"]}'
+        delivery = runtime.client.get(job_url).json()["terminal_delivery"]
+        assert delivery == terminal[0]["data"] | {"job_id": turn["job_id"]}
+        assert delivery["answer"]
+        assert runtime.client.get(job_url + "/events", params={"after": delivery["seq"]}).json()["terminal_delivery"] == delivery
 
 
 def test_rediscovery_idempotency_and_owner_scope(runtime):
@@ -210,6 +228,7 @@ def test_rediscovery_idempotency_and_owner_scope(runtime):
     assert runtime.client.get(discover).status_code == 404
     assert runtime.client.get(runtime.path).status_code in {403, 404}
     assert runtime.client.get(f'/jobs/{first["job_id"]}/events').status_code == 404
+    assert runtime.client.get(f'/jobs/{first["job_id"]}').status_code == 404
 
 
 def test_legacy_stream_observes_one_persistent_job(runtime):
@@ -321,14 +340,7 @@ def test_native_question_complete_http_and_protected_graph(runtime, monkeypatch,
         max_tokens=kwargs["max_tokens"], stream_usage=True, http_async_client=client))
 
     def wait_native(*expected):
-        def observed():
-            try:
-                return state(runtime, "native-http") in expected
-            except sqlite3.OperationalError as exc:
-                if exc.sqlite_errorcode not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
-                    raise
-                return False
-        wait_for(observed)
+        wait_for(lambda: state(runtime, "native-http") in expected)
 
     class SimulatedProcessLoss(BaseException):
         pass
@@ -809,6 +821,11 @@ def test_only_explicit_visible_executed_baseline_contributes_attachments(runtime
         return runtime.client.post(runtime.path, json={"query": "follow up", "client_request_id": cid,
                                                      "continue_from": baseline})
 
+    def available(baseline="baseline"):
+        return runtime.client.get(f"/api/v2/session/{runtime.sid}/continuation/{baseline}")
+
+    assert available().status_code == 409
+    assert available("not-a-turn").status_code == 404
     assert continue_from("too-early").status_code == 409
     assert continue_from("missing", "not-a-turn").status_code == 404
     runtime.released.add("baseline")
@@ -825,8 +842,14 @@ def test_only_explicit_visible_executed_baseline_contributes_attachments(runtime
     assert inherited["file_id"] == source_file["file_id"]
     assert inherited["sha256"] == source_file["sha256"]
     assert inherited["source"] == "previous_turn"
+    candidates = available()
+    assert candidates.status_code == 200 and candidates.headers["Cache-Control"] == "private, no-store"
+    assert candidates.json() == {"attachments": [{"file_id": source_file["file_id"],
+        "filename": "only-source.txt", "mime_type": "text/plain; charset=utf-8", "size_bytes": 9}]}
     runtime.released.update({"ordinary", "explicit"})
     wait_for(lambda: state(runtime, "explicit") == "terminal")
+    assert available("explicit").json() == candidates.json()
+    assert available("ordinary").json() == {"attachments": []}
     clear = runtime.client.post(f"/api/v1/session/{runtime.sid}/clear")
     assert clear.status_code == 200, clear.text
     assert continue_from("hidden").status_code == 404
@@ -903,3 +926,467 @@ def test_update_status_observes_exact_committed_receipt_under_writer(runtime):
         reply = runtime.client.get(base + "version-one")
         assert reply.status_code == 200 and reply.json() == update
         assert runtime.client.get(base + "unknown").status_code == 404
+
+
+
+def test_publication_reconciliation_only_registers_owned_committed_bytes(runtime, monkeypatch, tmp_path):
+    from langchain_core.messages import ToolMessage
+
+    from src.core import publication_reconcile, tracing
+    from src.research import tools
+    from src.research.delivery_reconciliation import capture_delivery, delivery_outcome
+
+    for module in (main, tools, files):
+        monkeypatch.setattr(module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(tools, "get_user_id", lambda: runtime.owner)
+    monkeypatch.setattr(tools, "get_session_id", lambda: runtime.sid)
+    monkeypatch.setattr(tracing, "get_user_id", lambda: runtime.owner)
+    monkeypatch.setattr(tracing, "get_client_request_id", lambda: "file-turn")
+    monkeypatch.setattr(tracing, "get_current_tool_name", lambda: "deliver_research_artifact")
+    root = send(runtime, "file-turn", "publication only")
+    wait_for(lambda: "file-turn" in runtime.started)
+    job_id = root["job_id"]
+    op, lease = task_events.start_operation(job_id, runtime.owner, "deliver_research_artifact", {},
+                                            tool_call_id="fixture-publication")
+    with capture_delivery("deliver_research_artifact", "fixture-publication"):
+        existing = tools._save_artifact("one.txt", b"previously confirmed", "text/plain")
+        with monkeypatch.context() as patch:
+            def fail(**kwargs):
+                raise OSError("simulated outbox interruption")
+            patch.setattr(publication_reconcile, "register_publication", fail)
+            with pytest.raises(ValueError, match="artifact_registration_failed"):
+                tools._save_artifact("two.txt", b"only register these bytes", "text/plain")
+        outcome = delivery_outcome("partial", "", [{"url": existing}])
+    task_events.finish_operation(op, lease, ToolMessage(content="{}", tool_call_id="fixture-publication",
+        name="deliver_research_artifact", artifact={"_tool_outcome": outcome}))
+    endpoint = runtime.path + "/file-turn/reconcile/publications"
+    assert runtime.client.get(endpoint).status_code == 409
+    runtime.released.add("file-turn")
+    wait_for(lambda: state(runtime, "file-turn") == "reconcile_required")
+    cookie = runtime.client.cookies.get("citrus_auth")
+    runtime.client.cookies.set("citrus_auth", runtime.other)
+    assert runtime.client.get(endpoint).status_code in (403, 404)
+    assert runtime.client.post(f"{endpoint}/{op}/2").status_code in (403, 404)
+    runtime.client.cookies.set("citrus_auth", cookie)
+    response = runtime.client.get(endpoint)
+    assert response.status_code == 200, response.text
+    one, two = response.json()["files"]
+    assert one["stage"] == "confirmed" and one["url"] == existing and not one["can_restore"]
+    assert two["stage"] == "committed" and two["can_restore"]
+    assert "sha256" not in two and "artifact_id" not in two
+    assert runtime.client.post(f"{endpoint}/{op}/1").status_code == 409
+    restored = runtime.client.post(f"{endpoint}/{op}/2")
+    assert restored.status_code == 200, restored.text
+    assert runtime.client.post(f"{endpoint}/{op}/2").json() == restored.json()
+    assert {row["filename"] for row in files.list_files(runtime.sid, runtime.owner)} == {"one.txt", "two.txt"}
+    assert runtime.started.count("file-turn") == 1
+    assert task_events.operation_result(job_id, op)["outcome"]["status"] == "unknown"
+
+
+
+@pytest.mark.parametrize("decision", ["granted", "rejected"])
+def test_owned_http_approval_resumes_only_the_original_native_call(runtime, decision):
+    from functools import partial
+    from langchain_core.messages import ToolMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    from src.agent.framework_test_support import ScriptedModel
+    from src.agent.harness import HarnessRuntime
+    from src.agent.identity import ExecutionIdentity
+    from src.agent.native_approval import wait_for_approval_decisions
+    from src.agent.runtime import FinalCheck, RunLimits
+    from src.core.progress_bus import set_request_queue
+
+    rid = "fixture-http-approval"
+    run = jobs.claim_job(runtime.sid, rid, owner_user_id=runtime.owner).job_id
+    identity = ExecutionIdentity(runtime.owner, runtime.sid, rid, run)
+    effects = []
+    tool = "commit_document_index"
+
+    async def model(messages, identity, **_):
+        if isinstance(messages[-1], ToolMessage):
+            return AIMessage("done")
+        return AIMessage("", tool_calls=[{"name": tool, "args": {}, "id": "fixture-guarded-call"}])
+
+    async def execute(call, who):
+        assert who == identity
+        effects.append(call["id"])
+        return ToolMessage("done", name=tool, tool_call_id=call["id"]), {}
+
+    async def admit(*_):
+        return None
+
+    async def accept(*_):
+        return FinalCheck()
+
+    async def invoke():
+        events = task_events.DurableEventQueue(run)
+        set_request_queue(events)
+        agent = HarnessRuntime(ScriptedModel(script=model), execute, admit, accept, RunLimits(3),
+            [{"type": "function", "function": {"name": tool, "description": "fixture",
+                                               "parameters": {"type": "object", "properties": {}}}}],
+            native_approval_tools=(tool,),
+            wait_native_approval=partial(wait_for_approval_decisions, timeout=10, poll_interval=0.01))
+        return await agent.run(identity, [HumanMessage("fixture")], saver=InMemorySaver(),
+                               agent_options={"task_subagent": False})
+
+    future = runtime.client.portal.start_task_soon(invoke)
+    owner_cookie = runtime.client.cookies.get("citrus_auth")
+    try:
+        def request_events():
+            with task_events.read_transaction() as conn:
+                return conn.execute("SELECT data FROM task_events WHERE job_id=? AND event='permission_request'",
+                                    (run,)).fetchall()
+
+        wait_for(lambda: bool(request_events()) or future.done())
+        if future.done():
+            pytest.fail(f"graph stopped before approval: {future.result()}")
+        import json
+        event, = request_events()
+        aid = json.loads(event[0])["approval_id"]
+        path = f"/api/v2/chat/jobs/{run}/approvals/{aid}"
+        runtime.client.cookies.set("citrus_auth", runtime.other)
+        assert runtime.client.post(path, json={"decision": "granted"}).status_code in (403, 404)
+        assert not effects and task_events.approval_status(aid) == "pending"
+        runtime.client.cookies.set("citrus_auth", owner_cookie)
+        response = runtime.client.post(path, json={"decision": decision})
+        assert response.status_code == 200 and response.json()["status"] == decision
+        result = future.result(timeout=5)
+        assert result.status == "complete"
+        assert effects == (["fixture-guarded-call"] if decision == "granted" else [])
+        assert len(request_events()) == 1
+    finally:
+        runtime.client.cookies.set("citrus_auth", owner_cookie)
+        if not future.done():
+            future.cancel()
+
+
+
+@pytest.mark.parametrize(("task", "retry_svg"), [
+    ("figure", False), ("figure", True), ("data-audit", False), ("dataset-audit", False), ("dataset-audit-partial", False), ("question-answering", False),
+], ids=["figure", "figure-after-preflight-rejection", "data-audit", "dataset-audit", "dataset-audit-partial", "question-answering"])
+def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime, monkeypatch, tmp_path, task, retry_svg):
+    """Real HTTP handlers, official graph and operations; only the LLM wire is a fixture."""
+    import json
+    import httpx
+    from langchain_openai import ChatOpenAI
+    from src.agent.native_send_budget_test import BASE, PROVIDER, _chat_stream
+    from src.config import ModelTransport, settings
+    from src.core.provider_transport import AsyncDeepSeekTransport
+    from src.graph.general_agent_graph import build_general_agent_graph
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.config.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.research.tools.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.figures.store._STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(type(settings), "model_transport",
+        lambda *_args, **_kwargs: ModelTransport("deepseek", PROVIDER, BASE, "fixture", {}))
+    monkeypatch.setattr("src.core.tool_results._schema_ready", False)
+    monkeypatch.setattr(graph, "build_graph", lambda _: build_general_agent_graph())
+    dataset_case = task.startswith("dataset-audit")
+    partial = task == "dataset-audit-partial"
+    if dataset_case:
+        pytest.importorskip("pandera.pandas")
+        from src.agent.scientific_method_tools import METHOD_IDS
+
+        release = tmp_path / "fixture-methods"
+        inventory = {}
+        for method in METHOD_IDS:
+            directory = release / "skills" / method
+            directory.mkdir(parents=True)
+            resource = directory / "SKILL.md"
+            resource.write_text(f"---\nname: {method}\ndescription: Fixture method\n---\nFixture\n")
+            from hashlib import sha256
+            inventory[resource.relative_to(release).as_posix()] = sha256(resource.read_bytes()).hexdigest()
+        (release / "release.json").write_text(json.dumps(dict.fromkeys(METHOD_IDS, "a" * 40)))
+        (release / "inventory.json").write_text(json.dumps(inventory))
+        (release / "scientific-methods.json").write_text("{}")
+        monkeypatch.setenv("CITRUS_SKILL_RELEASE", str(release))
+        monkeypatch.setenv("CITRUS_SCIENTIFIC_METHODS_ONLY", "1")
+        monkeypatch.setenv("CITRUS_EXTERNAL_FUSION", "required")
+        monkeypatch.setenv("CITRUS_CODE_EXECUTION", "offline-development")
+    wire = []
+    fixture = b"sample,value\nA,1\nA,1\nB,2\n"
+    query, tool, args, answer = {
+        "figure": ("把这个数据绘制成图，导出 SVG。", "draw_svg", {
+            "svg": '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80"><rect x="10" y="20" width="30" height="50" fill="blue"/><rect x="50" y="10" width="30" height="60" fill="green"/></svg>',
+            "alt_text": "合成绘图用例"}, "图已生成。"),
+        "data-audit": ("审查这个数据有没有异常，只要文字结论。", "audit_uploaded_data", {
+            "file_indexes_json": [0]}, "数据审查结果已返回。"),
+        "question-answering": ("转座子是什么？", "", {}, "转座子是能在基因组中改变位置的 DNA 序列。"),
+        "dataset-audit": ("Audit the attached CSV for data quality. Report only missing cells and exact duplicate rows, with source locations. Use only the attachment. No web, generated files, or source edits.",
+            "prepare_audit_dataset", {"file_index": 0}, "The duplicate rows are 2 and 3."),
+        "dataset-audit-partial": ("Audit this CSV for data quality. Check numeric ranges. No network.",
+            "prepare_audit_dataset", {"file_index": 0}, "No range bounds were supplied."),
+    }[task]
+
+    def receive(request):
+        body = json.loads(request.content)
+        wire.append(body)
+        assert len(wire) <= (3 if dataset_case else 2 + int(retry_svg) if tool else 1)
+        names = {entry["function"]["name"] for entry in body.get("tools", ())}
+        if task == "figure":
+            assert not names & {"audit_uploaded_data", "run_external_skill", "execute", "task", "deepseek_search"}
+        if task == "data-audit":
+            assert not names & {"draw_svg", "run_research_figure_script", "execute", "task", "deepseek_search"}
+        if not tool:
+            return _chat_stream(answer=answer)
+        assert tool in names
+        if dataset_case:
+            prompt = "\n".join(str(row.get("content", "")) for row in body["messages"] if row["role"] == "system")
+            assert "不可执行 · 数据审查（CSV 单表）" not in prompt
+            assert "不传 scope、工作表或 A1 坐标" in prompt
+            if len(wire) == 1:
+                return _chat_stream([("source-chain-tool", tool, args)])
+            if len(wire) == 2:
+                content, = [row["content"] for row in body["messages"] if row.get("tool_call_id") == "source-chain-tool"]
+                ref = json.loads(content)["dataset_ref"]
+                checks = {"checks": ["range"] if partial else ["missing", "duplicate"]}
+                return _chat_stream([("dataset-check", "audit_prepared_dataset", {"dataset_ref": ref, "checks": checks})])
+            content, = [row["content"] for row in body["messages"] if row.get("tool_call_id") == "dataset-check"]
+            assert content.startswith("{"), repr(content)[:3500]
+            report = json.loads(content)
+            assert report["status"] == ("partial" if partial else "complete")
+            assert ("inspect_uploaded_table" in names) == partial
+            if not partial:
+                assert [row["row"] for row in report["findings"]] == [2, 3]
+            return _chat_stream(answer=answer)
+        if retry_svg and len(wire) == 1:
+            return _chat_stream([("rejected-svg", tool, {**args, "svg": "<svg>"})])
+        if len(wire) == 1 + int(retry_svg):
+            if retry_svg:
+                rejection, = [row["content"] for row in body["messages"] if row.get("tool_call_id") == "rejected-svg"]
+                assert "SVG_FORMAT_ERROR" in rejection
+            return _chat_stream([("source-chain-tool", tool, args)])
+        assert any(row.get("tool_call_id") == "source-chain-tool" for row in body["messages"])
+        return _chat_stream(answer=answer)
+
+    client = httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(receive)), trust_env=False)
+    monkeypatch.setattr("src.core.llm_pool.get_llm", lambda **kwargs: ChatOpenAI(use_responses_api=False,
+        model=PROVIDER, api_key="fixture", base_url=BASE, max_retries=0,
+        max_tokens=kwargs["max_tokens"], stream_usage=True, http_async_client=client))
+    try:
+        # Real chat explicitly enables visualization; the API default is off.
+        payload = {"query": query, "client_request_id": "scientific-source-chain",
+                   "visualization_enabled": task == "figure"}
+        if tool:
+            payload["attachments"] = [{"name": "example.csv", "type": "text/csv",
+                                      "data": base64.b64encode(fixture).decode()}]
+        admitted = runtime.client.post(runtime.path, json=payload)
+        assert admitted.status_code == 202, admitted.text
+        run = admitted.json()["job_id"]
+        wait_for(lambda: state(runtime, "scientific-source-chain") == "terminal")
+        events = runtime.client.get(f"/jobs/{run}/events").json()["events"]
+        terminal, = [item["data"] for item in events if item["event"] == "done"]
+        assert terminal.get("history_saved"), terminal
+        if partial:
+            assert terminal["turn_envelope"]["display_status"] == "partial", terminal
+        else:
+            assert terminal["turn_status"] == "completed", (terminal.get("answer"), terminal.get("turn_envelope"))
+        assert answer in terminal["answer"]
+        with task_events.read_transaction() as conn:
+            operations = conn.execute("SELECT tool_name,status FROM task_operations WHERE job_id=? ORDER BY rowid",
+                                      (run,)).fetchall()
+        expected = [(tool, "not_run")] if retry_svg else []
+        if tool:
+            expected.append((tool, "complete"))
+        if dataset_case:
+            expected.append(("audit_prepared_dataset", "partial" if partial else "complete"))
+        assert [tuple(row) for row in operations] == expected
+        if task == "figure":
+            import re
+
+            link, = re.findall(r"\]\((/api/v2/session/[^/]+/artifacts/[a-f0-9]{32})\)", terminal["answer"])
+            download = runtime.client.get(link)
+            assert download.status_code == 200, download.text
+            assert download.headers["content-type"].startswith("image/svg+xml")
+            assert b"<svg" in download.content and b"<rect" in download.content
+            runtime.client.cookies.set("citrus_auth", runtime.other)
+            assert runtime.client.get(link).status_code in {403, 404}
+    finally:
+        runtime.client.portal.call(client.aclose)
+
+
+def _settle_scientific_fixture_worker(identity, execution_id, release, skill, root, expected_input):
+    """Supply stopped-worker bytes to the real repository and output acceptance."""
+    from src.agent import fusion_worker_contract as contract
+    from src.code_execution.protocol import ExecutionRequest
+    from src.code_execution.results import accept_outputs, collect_outputs
+    from src.code_execution.service import ExecutionService
+
+    service = ExecutionService(identity)
+    worker = "http-fusion-fixture"
+    claimed = service.repository.claim(worker)
+    assert claimed["execution_id"] == execution_id
+    fence = claimed["fence"]
+    request = ExecutionRequest.parse(claimed["request"])
+    assert request.identity == identity and request.network_policy == "offline"
+    bind = {item.path: item for item in request.inputs}
+    source, = [item for path, item in bind.items() if path.startswith(contract.INPUT_ROOT)]
+    assert source.sha256 == contract.sha(expected_input)
+    assert service.workspace.read_bytes(request.workspace_id, path=source.path,
+        version=source.version, expected_sha256=source.sha256) == expected_input
+    snap = bind[contract.REQUEST]
+    manifest = contract.decode(service.workspace.read_bytes(request.workspace_id, path=snap.path,
+        version=snap.version, expected_sha256=snap.sha256))
+    bundle = contract.load_bundle(release, skill)
+    report = {key: [] for key in contract.REPORT_KEYS}
+    report.update(status="complete", execution={"skill": skill, "version": bundle.version,
+        "python": "3.12.16", "inputs": manifest["inputs"], "options": manifest["options"]}, worker={
+            "schema": contract.SCOPE, "request_sha256": snap.sha256, "bundle_sha256": bundle.sha256,
+            "environment": {"python": "3.12.16", "platform": "linux-x86_64",
+                "libseccomp_fchmodat2": True, "dependencies": bundle.pins, "lock_sha256": bundle.lock_sha256}})
+    if skill == "research-integrity":
+        report["coverage"] = [{"check": "duplicate_numeric_block", "status": "checked"}]
+    else:
+        report["records"] = [{"record_index": 0, "status": "verified", "submitted": {"doi": "10.5555/fixture"},
+                              "attempts": [{"provider": "crossref", "status": 200,
+                                            "queried_at": "2026-01-01T00:00:00Z"}]}]
+    output = root / contract.OUTPUT.lstrip("/")
+    output.parent.mkdir(parents=True)
+    output.write_bytes(contract.encode(report))
+    service.repository.transition(execution_id, worker, fence, "running")
+    service.repository.transition(execution_id, worker, fence, "collecting")
+
+    def accept():
+        return {**accept_outputs(request, execution_id=execution_id, fence=fence,
+            blobs=collect_outputs(root, request), workspace_repository=service.workspace.repository),
+            "process_stopped": True, "network_policy": "offline", "request_fingerprint": request.fingerprint}
+
+    return service.repository.complete_success(execution_id, worker, fence,
+        accept_result=accept, process_stopped=True)
+
+
+@pytest.mark.parametrize("skill, name, mime, role, source, query, answer", [
+    ("research-integrity", "synthetic.csv", "text/csv", "table", b"x,y\n1,2\n1,2\n",
+     "请对附件做科研诚信审查，检查重复数值，只给文字，不联网，不导出。", "已收集本轮科研诚信审查报告。"),
+    ("literature-verification", "synthetic.pdf", "application/pdf", "bibliography", None,
+     "请对附件中的参考文献做文献核验，只给文字，不联网，不导出。", "已收集本轮文献核验报告。"),
+], ids=["research-integrity", "literature-verification"])
+def test_external_scientific_source_chain_accepts_worker_report(runtime, monkeypatch, tmp_path,
+        skill, name, mime, role, source, query, answer):
+    """Authenticated queue, selected release, official graph and host report acceptance."""
+    import json
+    import os
+
+    import httpx
+    from langchain_openai import ChatOpenAI
+    from src import admin_audit
+    from src.agent import fusion_worker, installed_skills
+    from src.agent.native_send_budget_test import BASE, PROVIDER, _chat_stream
+    from src.config import ModelTransport, settings
+    from src.code_execution.presence import worker_presence
+    from src.core.provider_transport import AsyncDeepSeekTransport
+    from src.graph.general_agent_graph import build_general_agent_graph
+
+    release = os.environ.get("CITRUS_HTTP_ACCEPTANCE_SKILLS_RELEASE")
+    if not release:
+        pytest.skip("requires the read-only official inventory and fusion bundle")
+    monkeypatch.setenv("CITRUS_SKILL_RELEASE", release)
+    monkeypatch.setenv("CITRUS_EXTERNAL_FUSION", "required")
+    monkeypatch.setenv("CITRUS_CODE_EXECUTION", "offline-development")
+    monkeypatch.setattr("src.agent.recovery.load_recovery_state", runtime.real_checkpoint_loader)
+    from src.agent.execution_coordinator import ExecutionCompletionCoordinator
+
+    monkeypatch.setattr("src.agent.execution_coordinator.load_recovery_state", runtime.real_checkpoint_loader)
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.config.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.research.tools.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(files, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("src.core.tool_results._schema_ready", False)
+    monkeypatch.setattr(graph, "build_graph", lambda _: build_general_agent_graph())
+    monkeypatch.setattr(type(settings), "model_transport",
+        lambda *_args, **_kwargs: ModelTransport("deepseek", PROVIDER, BASE, "fixture", {}))
+    selected = next(row for row in installed_skills.active_skills(installed_skills.release_path()) if row["id"] == skill)
+    selected = {key: selected[key] for key in ("id", "version", "sha256")}
+    if source is None:
+        import fitz
+
+        with fitz.open() as doc:
+            doc.new_page().insert_text((72, 72), "References\nExample 2026. doi:10.5555/fixture")
+            source = doc.tobytes()
+    worker_receipts, wire = [], []
+    schedule = fusion_worker.schedule_fusion
+
+    def schedule_and_settle(identity, **values):
+        receipt = schedule(identity, **values)
+        assert receipt["status"] == "queued" and receipt["completion_scope"] == "submission_only"
+        worker_receipts.append(_settle_scientific_fixture_worker(identity, receipt["execution_id"],
+            values["skill_release"], skill, tmp_path / "worker-output", source))
+        return receipt
+
+    monkeypatch.setattr(fusion_worker, "schedule_fusion", schedule_and_settle)
+
+    def receive(request):
+        body = json.loads(request.content)
+        wire.append(body)
+        assert len(wire) <= 3
+        names = {entry["function"]["name"] for entry in body.get("tools", ())}
+        assert {"run_external_skill", "collect_external_skill"} <= names
+        assert not names & {"draw_svg", "audit_uploaded_data", "verify_uploaded_references", "execute", "task",
+                            "deepseek_search", "local_hybrid_search"}
+        if skill == "research-integrity":
+            assert "continue_external_literature" not in names
+        else:
+            assert "inspect_uploaded_table" not in names
+        observations = {row["tool_call_id"]: row["content"] for row in body["messages"] if row["role"] == "tool"}
+        if len(wire) == 1:
+            attached, = files.list_files(runtime.sid, runtime.owner)
+            assert attached["filename"] == name
+            reference = {key: attached[key] for key in ("file_id", "sha256")}
+            return _chat_stream([("fixture-submit", "run_external_skill", {"skill_id": skill,
+                "inputs": {role: reference}})])
+        if len(wire) == 2:
+            submission = json.loads(observations["fixture-submit"])
+            assert submission["completion_scope"] == "submission_only" and submission["collect_required"]
+            return _chat_stream([("fixture-collect", "collect_external_skill", {"skill_id": skill,
+                "execution_id": submission["execution_id"]})])
+        report = json.loads(observations["fixture-collect"])
+        assert report["status"] == "complete" and report["execution"]["skill"] == skill
+        if skill == "research-integrity":
+            assert report["result_lifecycle"] == "external_worker_report"
+            assert report["coverage"] == [{"check": "duplicate_numeric_block", "status": "checked"}]
+        else:
+            assert report["registry_coverage"]["counts"] == {"queried": 1}
+            assert report["records"][0]["submitted"]["doi"] == "10.5555/fixture"
+        return _chat_stream(answer=answer)
+
+    client = httpx.AsyncClient(transport=AsyncDeepSeekTransport(BASE, httpx.MockTransport(receive)), trust_env=False)
+    monkeypatch.setattr("src.core.llm_pool.get_llm", lambda **kwargs: ChatOpenAI(use_responses_api=False,
+        model=PROVIDER, api_key="fixture", base_url=BASE, max_retries=0,
+        max_tokens=kwargs["max_tokens"], stream_usage=True, http_async_client=client))
+    path = tmp_path / "state" / "code_executions.sqlite3"
+    path.parent.mkdir(exist_ok=True)
+    monkeypatch.setattr(admin_audit, "DB_PATH", path.parent / "admin_audit.sqlite3")
+    admin_audit.init_store()
+    coordinator = ExecutionCompletionCoordinator(path.parent, (BASE, PROVIDER),
+        dispatch=main._resume_execution_segment, settle=main._settle_coordinator_turn,
+        busy=main._turn_execution_busy)
+    cid = "external-scientific-acceptance"
+    try:
+        with worker_presence(path):
+            admitted = runtime.client.post(runtime.path, json={"query": query, "client_request_id": cid,
+                "selected_skills": [selected], "web_search_enabled": False, "visualization_enabled": False,
+                "attachments": [{"name": name, "type": mime, "data": base64.b64encode(source).decode()}]})
+            assert admitted.status_code == 202, admitted.text
+            run = admitted.json()["job_id"]
+            wait_for(lambda: state(runtime, cid) == "terminal" or (bool(worker_receipts)
+                and main._turn_segment_phase(jobs.get_job(run)) == "parked"
+                and not main._turn_execution_busy(run)))
+            runtime.client.portal.call(coordinator.tick)
+            wait_for(lambda: state(runtime, cid) == "terminal")
+        response = runtime.client.get(f"/jobs/{run}/events")
+        assert response.status_code == 200, response.text
+        events = response.json()["events"]
+        terminal, = [item["data"] for item in events if item["event"] == "done"]
+        assert terminal.get("history_saved") and terminal["turn_status"] == "completed", terminal
+        assert answer in terminal["answer"] and len(wire) == 3
+        receipt, = worker_receipts
+        assert receipt["process_stopped"] and len(receipt["files"]) == 1
+        with task_events.read_transaction() as conn:
+            operations = conn.execute("SELECT tool_name,status FROM task_operations WHERE job_id=? ORDER BY rowid",
+                                      (run,)).fetchall()
+        assert [tuple(row) for row in operations] == [("run_external_skill", "complete"),
+                                                     ("collect_external_skill", "complete")]
+    finally:
+        runtime.client.portal.call(client.aclose)

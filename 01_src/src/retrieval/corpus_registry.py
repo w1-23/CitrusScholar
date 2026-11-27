@@ -74,7 +74,10 @@ class CorpusRegistry:
     def search_family_ids(self) -> set[str]:
         """Base index families plus the separate, enabled shared search family."""
         from src.corpus_integration.read_access import shared_search_available
+        from src.corpus_integration.selfcorpus_search import enabled
 
+        if enabled():
+            return {LEGACY.family_id}
         families = self.family_ids
         if shared_search_available():
             families.add(LEGACY.family_id)
@@ -82,8 +85,14 @@ class CorpusRegistry:
 
     def family(self, family_id: str) -> dict[str, Any] | None:
         key = str(family_id or "").strip().casefold()
-        if key == LEGACY.family_id and key not in self.families:
-            return dict(_SHARED_SEARCH_FAMILY)
+        if key == LEGACY.family_id:
+            from src.corpus_integration.selfcorpus_search import enabled
+
+            if enabled():
+                return {"display_name": "Selfcorpus 文献库",
+                        "description": "检索当前账号有权读取的个人与共享语料，返回当轮可用片段。"}
+            if key not in self.families:
+                return dict(_SHARED_SEARCH_FAMILY)
         return self.families.get(key)
 
     def display_name(self, family_id: str) -> str:

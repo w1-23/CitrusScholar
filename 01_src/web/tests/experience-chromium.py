@@ -134,7 +134,7 @@ def until(check, description, timeout=12):
     raise AssertionError(description)
 
 
-def run(browser, origin, output, *, observation_only=False):
+def run(browser, origin, output, *, observation_only=False, delivery_only=False):
     script = Path(__file__).with_name('experience-fixture.js').read_text(encoding='utf-8')
     browser.call('Runtime.enable')
     browser.call('Page.enable')
@@ -197,6 +197,28 @@ def run(browser, origin, output, *, observation_only=False):
               "&& !document.querySelector('.turn-queue-cancel, [data-state=waiting]') "
               "&& !document.querySelector('#chat-container').innerText.includes('第 3 位')",
               timeout=30)
+        if delivery_only:
+            phase('done')
+            browser.call('Page.reload', ignoreCache=True)
+            check('One saved answer, its two citations, its artifact and eligible source',
+                  "!!document.querySelector('.turn-answer[data-display-status=completed]') && "
+                  "document.querySelectorAll('.turn-citation-bubbles .turn-citation-bubble').length === 2 && "
+                  "document.querySelectorAll('.turn-file-card').length === 1 && "
+                  "document.querySelector('.turn-files-heading')?.textContent === '本轮产出' && "
+                  "document.querySelectorAll('.turn-explicit-continuation').length === 1")
+            browser.click('.turn-explicit-continuation')
+            check('Verified input becomes a named attachment chip',
+                  "document.querySelector('.continuation-attachment-reference')?.textContent === 'Measurements.csv'")
+            capture('delivery-and-attachment')
+            browser.click('#clear-composer-continuation')
+            check('Clearing inheritance removes the reference chip',
+                  "document.querySelector('#composer-continuation').hidden && !document.querySelector('.continuation-attachment-reference')")
+            fill('继续核对表头')
+            browser.click('.turn-explicit-continuation')
+            browser.click('#send-btn')
+            check('The next submission sends the exact verified prior turn',
+                  "experienceRequests().posts.length === 1 && experienceRequests().posts[0].continue_from === 'browser-fixture-request'")
+            return
         capture('queued')
         phase('start')
         check('One indicator shown at execution start', "document.querySelectorAll('[data-state=waiting]').length === 1 && document.querySelectorAll('.research-task-orbit i').length === 3 && !document.querySelector('.turn-user-queue-state, .turn-awaiting-dispatch')")
@@ -205,8 +227,8 @@ def run(browser, origin, output, *, observation_only=False):
         browser.call('Page.reload', ignoreCache=True)
         check('Refresh preserves durable clock', "document.querySelector('[data-state=waiting]') && Number((document.querySelector('.research-task-elapsed')?.innerText||'').replace(/\\D/g,'')) >= " + ''.join(filter(str.isdigit, elapsed)))
         browser.click('#ctxCircleBtn')
-        check('Unknown model window uses the explicitly labelled application input limit',
-              f"({text('#ctxUsed')}) === '9.2K / 86K' && ({text('#ctxValueNote')}).includes('应用单次输入上限') "
+        check('Chart uses the application input limit when model capacity is unknown',
+              f"({text('#ctxLegend [data-category=free] .ctx-item-value')}) === '76.8K' "
               "&& !document.querySelector('#ctxViewGrid').disabled")
         capture('context-missing')
         browser.click('#ctxClose')
@@ -261,10 +283,10 @@ def run(browser, origin, output, *, observation_only=False):
               })()''')
         browser.click('#ctxCircleBtn')
         check('Provider reporting does not overwrite context occupancy',
-              f"({text('#ctxUsed')}) === '9.2K / 86K' && !({text('#ctxUsageRows')}).includes('缓存覆盖率')")
+              f"({text('#ctxLegend [data-category=free] .ctx-item-value')}) === '76.8K' && !({text('#ctxUsageRows')}).includes('缓存覆盖率')")
         capture('context-zero')
         phase('usage')
-        check('Known capacity is displayed with the estimate', f"({text('#ctxUsed')}) === '10.4K / 131K' && ({text('#ctxTriggerPct')}) === '13%'")
+        check('Chart uses known model capacity while the header reports app occupancy', f"({text('#ctxLegend [data-category=free] .ctx-item-value')}) === '121K' && ({text('#ctxTriggerPct')}) === '13%'")
         capture('context-reported')
         evaluate("setReduceMotion(true)")
         check('Reduced motion in Porcelain theme', "document.documentElement.dataset.theme === 'porcelain' && getComputedStyle(document.querySelector('.research-task-orbit')).animationName === 'none'")
@@ -272,7 +294,7 @@ def run(browser, origin, output, *, observation_only=False):
         browser.click('#ctxClose')
         phase('whitespace')
         check('Thirty completed tools preserve metrics and whitespace keeps waiting',
-              f"({text('.research-process-body')}).includes('共 30 条尝试记录') && ({text('#ctxUsed')}) === '10.4K / 131K' && document.querySelector('[data-state=waiting]')")
+              f"({text('.research-process-body')}).includes('共 30 条尝试记录') && ({text('#ctxLegend [data-category=free] .ctx-item-value')}) === '121K' && document.querySelector('[data-state=waiting]')")
         check('Thirty attempts remain in one collapsed disclosure', "document.querySelectorAll('.research-action-group').length === 1 && !document.querySelector('.research-action-group').open && document.querySelectorAll('.research-action-group .term-line').length === 30")
         phase('answer')
         check('First visible answer stops dots', f"([...document.querySelectorAll('.turn-answer')].some(node => node.textContent.includes('表格核对结果'))) && !document.querySelector('[data-state=waiting]')")
@@ -351,8 +373,15 @@ def run(browser, origin, output, *, observation_only=False):
                   f"document.querySelector('.turn-answer[data-display-status=completed]')?.innerHTML === {json.dumps(before)} "
                   "&& document.querySelectorAll('.turn-citation-bubbles .turn-citation-bubble').length === 2 "
                   "&& document.querySelectorAll('.turn-file-card').length === 1")
+            check('Reopened history offers only verified attachment inheritance',
+                  "document.querySelectorAll('.turn-explicit-continuation').length === 1")
+            browser.click('.turn-explicit-continuation')
+            check('Verified restored input appears as an attachment reference',
+                  "!document.querySelector('#composer-continuation').hidden && document.querySelector('#composer-continuation').textContent.includes('Measurements.csv')")
             capture('history-reopened')
             return
+        browser.call('Page.reload', ignoreCache=True)
+        check('Completed input is eligible after reload', "!!document.querySelector('.turn-explicit-continuation')")
         browser.click('.turn-explicit-continuation')
         check('Selecting a completed turn makes attachment inheritance explicit', "!document.querySelector('#composer-continuation').hidden")
         browser.click('#clear-composer-continuation')
@@ -475,6 +504,7 @@ def main():
     parser.add_argument('--origin', default='http://citrus-experience.test')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--task-observation-only', action='store_true', help='Stop after chat observation and terminal history recovery.')
+    parser.add_argument('--phase1-delivery-only', action='store_true', help='Exercise restored artifact and verified attachment inheritance only.')
     args = parser.parse_args()
     origin = args.origin.rstrip('/')
     assert origin == 'http://citrus-experience.test', 'Only use the isolated virtual fixture origin'
@@ -492,7 +522,8 @@ def main():
                 target = next(item for item in json.load(response) if item['type'] == 'page')
             ws = websocket.create_connection(target['webSocketDebuggerUrl'], timeout=15, suppress_origin=True, http_no_proxy=['127.0.0.1'])
             try:
-                run(Browser(ws), origin, args.output, observation_only=args.task_observation_only)
+                run(Browser(ws), origin, args.output, observation_only=args.task_observation_only,
+                    delivery_only=args.phase1_delivery_only)
             finally:
                 ws.close()
         finally:

@@ -86,9 +86,15 @@ def _snapshot(project, owner, new_svg=None, *, draft_revision=None, frozen_sha=N
         geometry[group_id] = (role, pick_ids, sorted(clips), order)
         if pick_ids:
             hits.append({"gid": ident, "role": "vector", "artist": tag})
+        fill = nodes[ident][1].get("fill", "")
+        paint_note = "原始数据、几何和字体保持锁定。"
+        if fill == "none":
+            paint_note = "没有填充。" + paint_note
+        elif fill.startswith("url("):
+            paint_note = "渐变或引用填充保持锁定。" + paint_note
         groups.append({"id": group_id, "kind": "vector", "label": f"{label} · {ident}" if label else ident,
                        "parent": None, "pick_ids": pick_ids, "properties": [] if source_reason else sorted(values), "values": values,
-                       "reason": source_reason, "line_marker_fill": False, "native_tag": tag})
+                       "reason": source_reason or paint_note, "line_marker_fill": False, "native_tag": tag})
     note = "仅可调整原生文字的颜色，以及受支持形状的颜色和线宽。数据、几何、文字内容、字体和原件保持冻结。"
     if provenance.get("backend") == "r":
         note = "R / svglite 原生对象。文字样式从对象树选择。" + note
@@ -98,6 +104,7 @@ def _snapshot(project, owner, new_svg=None, *, draft_revision=None, frozen_sha=N
         note = "来自已验收的代码 SVG 输出。平台未验证原始分析。" + note
     return {"figure_id": project["figure_id"], "title": project.get("title") or "科研图件",
             "render_version": project["render_version"], "read_only_reason": source_reason or ("" if groups else "未发现可编辑的原生对象。"),
+            "return_session_id": project.get("session_id"),
             "groups": groups, "format_capabilities": artifacts.capabilities(project, owner, replayable=False),
             **contract(groups, project["render_version"], svg=text.encode("utf-8"), draft_revision=draft_revision,
                        source_sha256=frozen_sha, geometry=geometry),

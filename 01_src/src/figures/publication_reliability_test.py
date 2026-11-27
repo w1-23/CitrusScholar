@@ -452,3 +452,67 @@ def test_ordinary_editable_svg_has_exact_editor_link_in_workbench(runtime):
     [editable] = service.list_assets(OWNER, limit=5, offset=0, kind="svg", access="editable")["projects"]
     assert editable["figure_id"] == fid and editable["editor_url"] == url
     assert service.list_assets(OWNER, limit=5, offset=0, kind="svg", access="read_only")["projects"] == []
+
+
+
+@pytest.mark.parametrize("failure_first", [False, True])
+def test_shared_publisher_receipts_bind_partial_writes_to_exact_files(runtime, monkeypatch, failure_first):
+    from contextlib import closing
+    import sqlite3
+
+    from src.core import publication_reconcile, tracing
+    from src.research.delivery_reconciliation import capture_delivery, delivery_outcome
+
+    monkeypatch.setattr(tools, "get_user_id", lambda: OWNER)
+    monkeypatch.setattr(tools, "get_session_id", lambda: SESSION)
+    monkeypatch.setattr(tracing, "get_client_request_id", lambda: REQUEST)
+    monkeypatch.setattr(tracing, "get_current_tool_name", lambda: "fixture_delivery")
+    real = publication_reconcile.register_publication
+    first, second = b"a successful report", b"a committed but unregistered report"
+
+    def commit_without_registration():
+        with monkeypatch.context() as patch:
+            def interrupted(**kwargs):
+                raise OSError("registration interrupted")
+            patch.setattr(publication_reconcile, "register_publication", interrupted)
+            with pytest.raises(ValueError, match="artifact_registration_failed"):
+                tools._save_artifact("two.txt", second, "text/plain")
+
+    with capture_delivery("fixture_delivery", "fixture-call"):
+        if failure_first:
+            commit_without_registration()
+        url = tools._save_artifact("one.txt", first, "text/plain")
+        if not failure_first:
+            commit_without_registration()
+        outcome = delivery_outcome("partial", "", [{"url": url}])
+    assert outcome["status"] == "unknown"
+    one, two = sorted(outcome["files"], key=lambda row: row["filename"])
+    assert (one["file_index"], one["filename"], one["status"], one["url"], one["sha256"]) == (
+        1 + failure_first, "one.txt", "confirmed", url, hashlib.sha256(first).hexdigest())
+    assert (two["file_index"], two["filename"], two["status"], two["url"], two["sha256"]) == (
+        2 - failure_first, "two.txt", "committed", "", hashlib.sha256(second).hexdigest())
+    with closing(sqlite3.connect(tools._db_path())) as conn:
+        pending, = conn.execute("SELECT artifact_id FROM publication_outbox WHERE state='pending'").fetchall()
+    from src.core.op_receipt import make_receipt
+
+    receipt = make_receipt("fixture_delivery", "fixture-call", "", {"_tool_outcome": outcome})
+    durable_one, durable_two = sorted(receipt["coverage"]["publication"], key=lambda row: row["filename"])
+    assert durable_one["artifact_id"] == url.rsplit("/", 1)[-1]
+    assert durable_two["artifact_id"] == two["artifact_id"] == pending[0]
+    ref = {"db_path": tools._db_path(), "artifact_id": durable_two["artifact_id"], "project_root": runtime}
+    scope = (OWNER, SESSION, REQUEST, durable_two["sha256"])
+    for wrong in ((OTHER, *scope[1:]), (OWNER, "another-session", *scope[2:]),
+                  (*scope[:2], "another-request", scope[3]), (*scope[:3], "f" * 64)):
+        with pytest.raises(publication_reconcile.PublicationRejected, match="publication_recovery_scope_mismatch"):
+            real(**ref, expected_scope=wrong)
+    assert files.list_files(SESSION, OWNER)[0]["artifact_id"] == durable_one["artifact_id"]
+    with pytest.raises(publication_reconcile.PublicationRejected, match="publication_recovery_scope_mismatch"):
+        real(**ref, expected_scope=scope, client_request_id="another-request")
+    restored = real(**ref, expected_scope=scope)
+    with monkeypatch.context() as patch:
+        def cannot_reregister(**kwargs):
+            pytest.fail("confirmed publication must be reused without registration")
+        patch.setattr(files, "register_file", cannot_reregister)
+        assert real(**ref, expected_scope=scope)["file_id"] == restored["file_id"]
+    assert restored["sha256"] == two["sha256"]
+    assert outcome["status"] == "unknown"  # historical operation stays unchanged

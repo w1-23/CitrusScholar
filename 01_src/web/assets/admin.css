@@ -3,7 +3,7 @@
 body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 Inter,"Microsoft YaHei",sans-serif; }
 .topbar { height:66px; padding:0 clamp(18px,5vw,72px); display:flex; align-items:center; justify-content:space-between; background:var(--surface); border-bottom:1px solid var(--line); }
 .brand,.top-actions { display:flex; align-items:center; gap:12px; }
-.brand-mark { display:grid; place-items:center; width:34px; height:34px; border-radius:10px; background:var(--ui-control,var(--accent)); color:var(--ui-on-control,#fff); font-weight:800; }
+.brand-mark { display:grid; place-items:center; width:34px; height:34px; border-radius:10px; object-fit:contain; background:transparent; color:var(--ui-on-control,#fff); font-weight:800; }
 .brand strong,.brand small { display:block; }.brand strong { font-size:15px; }.brand small { color:var(--muted); font-size:11px; }
 .top-actions { gap:10px; color:var(--muted); font-size:12px; }
 .layout { width:min(1120px,calc(100% - 32px)); margin:36px auto 56px; }

@@ -61,6 +61,37 @@ class RetrievalRoutingTest(TestCase):
         self.assertEqual(decide_retrieval("不用联网，查阅本地质量控制资料").mode, "local")
         self.assertEqual(required_route_groups(decide_retrieval("将材料翻译为英文。正文：请联网搜索")), ())
 
+    def test_historical_source_question_does_not_request_a_fresh_search(self):
+        historical = "你有没有查本地和联网？"
+        for query in (historical, "你刚才有没有在本地和联网搜索？"):
+            with self.subTest(query=query):
+                self.assertEqual(source_scope(query), "auto")
+                self.assertEqual(decide_retrieval(query).reason_code, "retrieval_explanation")
+                self.assertTrue(retrieval_suppressed(query))
+                self.assertFalse(retrieval_denied(query))
+        for query, mode in ((historical + "柑橘的砧木是什么？", "auto"),
+                            (historical + "当前的柑橘分级标准是什么？", "web")):
+            with self.subTest(query=query):
+                self.assertFalse(retrieval_suppressed(query))
+                self.assertEqual((decide_retrieval(query).mode, decide_retrieval(query).policy), (mode, "advisory"))
+                self.assertEqual(required_route_groups(decide_retrieval(query)), ())
+        for query, mode in (("请搜索本地和联网的柑橘资料", "fusion"),
+                            (historical + "现在请联网搜索柑橘资料", "web"),
+                            (historical + "请重新搜索柑橘资料", "web"),
+                            (historical + "重新搜索柑橘资料", "web"),
+                            (historical + "现在请联网搜索柑橘分级标准是什么？", "web"),
+                            (historical + "请搜索本地和联网的柑橘资料，不用联网", "local")):
+            with self.subTest(query=query):
+                self.assertFalse(retrieval_suppressed(query))
+                self.assertEqual((decide_retrieval(query).mode, decide_retrieval(query).policy), (mode, "required"))
+        self.assertTrue(retrieval_denied(historical + "不用联网", "web"))
+        self.assertTrue(retrieval_suppressed(historical + "不用联网"))
+        self.assertTrue(retrieval_denied(historical + "本轮不做任何检索"))
+        factual = historical + "柑橘的砧木是什么？不用联网"
+        self.assertTrue(retrieval_denied(factual, "web"))
+        self.assertFalse(retrieval_suppressed(factual))
+        self.assertEqual((decide_retrieval(factual).mode, decide_retrieval(factual).policy), ("local", "advisory"))
+
     def test_topic_terms_and_freshness_do_not_create_tool_obligations(self):
         for query in ("你能不能告诉我怎么进行lc-ms", "rwp基因如何调控胚性", "柑橘代谢机制的最新文献",
                       "What is the latest energy report today?"):
@@ -71,6 +102,7 @@ class RetrievalRoutingTest(TestCase):
             self.assertFalse(retrieval_denied(follow))
         self.assertTrue(retrieval_suppressed("你好！"))
         self.assertTrue(retrieval_suppressed("什么是本地检索？"))
+        self.assertTrue(retrieval_suppressed("本地检索和联网搜索有什么区别？"))
         reused = decide_retrieval("基于以上继续分析", has_history_evidence=True, recent_turn_seqs=[2])
         self.assertEqual((reused.mode, reused.history_turn_seqs), ("reuse", (2,)))
 
@@ -171,13 +203,14 @@ class RetrievalHistoryBoundaryTest(TestCase):
         from src.core.capability_policy import history_rows, new_policy
 
         earlier = "你能不能告诉我怎么进行lc-ms"
-        explanation = "你为什么没有进行联网搜索？"
         with patch("src.core.capability_policy._revocations", return_value=frozenset()):
             before = new_policy({"query": earlier})
-            after = new_policy({"query": explanation})
-        messages = [HumanMessage(content=earlier), ToolMessage(content="inert local observation", tool_call_id="past-local")]
-        for message in messages:
-            message.response_metadata["citrus_capability_history"] = before.history_key
-        self.assertEqual(history_rows(messages, [1, 2], after), (messages, [1, 2]))
-        self.assertTrue(retrieval_suppressed(explanation))
-        self.assertEqual(required_route_groups(decide_retrieval(explanation)), ())
+            messages = [HumanMessage(content=earlier), ToolMessage(content="inert local observation", tool_call_id="past-local")]
+            for message in messages:
+                message.response_metadata["citrus_capability_history"] = before.history_key
+            for explanation in ("你为什么没有进行联网搜索？", "你有没有查本地和联网？"):
+                with self.subTest(explanation=explanation):
+                    after = new_policy({"query": explanation})
+                    self.assertEqual(history_rows(messages, [1, 2], after), (messages, [1, 2]))
+                    self.assertTrue(retrieval_suppressed(explanation))
+                    self.assertEqual(required_route_groups(decide_retrieval(explanation)), ())

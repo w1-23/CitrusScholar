@@ -1,0 +1,2 @@
+# Retain the publication regression tests despite the host-level pattern.
+!/tests/test_*.py

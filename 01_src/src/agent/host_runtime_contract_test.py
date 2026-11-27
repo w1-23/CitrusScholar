@@ -84,13 +84,15 @@ class DeliveryDispatchTests(unittest.IsolatedAsyncioTestCase):
         for scenario, status, uncertain, artifacts in traces:
             with self.subTest(scenario=scenario):
                 def dispatch(_request):
-                    from src.research.delivery_reconciliation import publication_started, publication_confirmed
+                    from src.research.delivery_reconciliation import publication_committed, publication_confirmed, publication_started
                     if scenario == "preflight":
                         raise ValueError("review source changed")
-                    publication_started()
-                    publication_confirmed(url)
+                    good = publication_started("review.xlsx")
+                    publication_committed(sha256="c" * 64, artifact_id="a" * 32, receipt=good)
+                    publication_confirmed(url, receipt=good)
                     if scenario == "unknown":
-                        publication_started()
+                        pending = publication_started("second.xlsx")
+                        publication_committed(sha256="d" * 64, artifact_id="e" * 32, receipt=pending)
                     return f"[ERR_DATA_AUDIT_EXPORT] source failed\n{url}"
 
                 with (patch.object(tracing, "get_user_id", return_value=7),
@@ -115,6 +117,10 @@ class DeliveryDispatchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bool(message.additional_kwargs.get("operation_uncertain")), uncertain)
                 self.assertEqual("host_preflight_reconciled" in message.additional_kwargs, scenario == "preflight")
                 finish.assert_called_once()
+                if scenario == "unknown":
+                    saved = finish.call_args.args[2].artifact["op_receipt"]["coverage"]["publication"]
+                    self.assertEqual([(row["stage"], row["artifact_id"]) for row in saved],
+                                     [("confirmed", "a" * 32), ("committed", "e" * 32)])
 
 
 class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):

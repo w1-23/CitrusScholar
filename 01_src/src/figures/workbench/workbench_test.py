@@ -83,10 +83,11 @@ class Library:
         render = render_resolved(resolved, formats=("svg",), dpi=90)
         return self.project(source, render.manifest, render.blobs["svg"], owner, title)
 
-    def project(self, source, manifest, blob, owner=OWNER, title="Historical figure", kind="spec", refs=()):
-        entry = self.publish(owner, "isolated-session", "figure.svg", blob, "image/svg+xml")
+    def project(self, source, manifest, blob, owner=OWNER, title="Historical figure", kind="spec", refs=(),
+                session_id="isolated-session"):
+        entry = self.publish(owner, session_id, "figure.svg", blob, "image/svg+xml")
         row = store.create_project(owner_user_id=owner, title=title, source_kind=kind,
-                                   source=source, session_id="isolated-session", data_refs=list(refs))
+                                   source=source, session_id=session_id, data_refs=list(refs))
         assert store.update_project(row["figure_id"], owner, expected_revision=0,
                                     manifest_json=manifest, exports_json={"svg": entry}, render_version=1)
         return row["figure_id"]
@@ -453,7 +454,7 @@ from matplotlib.patches import FancyArrow, Rectangle
 axes[0].add_patch(Rectangle((.12, .48), .14, .12, transform=axes[0].transAxes,
                             facecolor='#610afd', edgecolor='#441099', zorder=8))
 axes[0].add_patch(FancyArrow(.35, .85, .2, 0, width=.04, transform=axes[0].transAxes,
-                             facecolor='#ab3412', zorder=8))
+                             facecolor='#ab341299', edgecolor='none', zorder=8))
 axes[0].add_patch(Rectangle((.05, .28), .05, .08, transform=axes[0].transAxes,
                             gid='author-patch', facecolor='#167887', zorder=8))
 axes[0].annotate('Measured effect', xy=(.88, .50), xytext=(.57, .81),

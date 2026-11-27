@@ -16,6 +16,7 @@ class AgentState(TypedDict, total=False):
     attachment_refs: list[dict]
     agent_resume: bool
     agent_question_resume: dict
+    agent_approval_restart_checkpoint: str
     agent_recovery_answered: bool
     context_compression: bool
     capability_snapshot: dict

@@ -114,20 +114,22 @@ async def _run(state, identity, ledger):
     catalog = build_preset_catalog()
     from .context_tools import register_context_reader
     register_context_reader(catalog)
-    from .workspace_tools import register_workspace_tools, WORKSPACE_TOOL_NAMES
-    register_workspace_tools(catalog)
     from .code_tools import register_code_tools, CODE_TOOL_NAMES
     register_code_tools(catalog)
-    from .fusion_tools import (FUSION_TOOL_NAMES, REPLACED_TOOLS, SKILL_IDS, external_fusion_required,
-                               fusion_delivery_scope, installed_fusion, register_fusion_tools, verified_report_route)
+    from .fusion_tools import (CAPABILITY_UNAVAILABLE, FUSION_TOOL_NAMES, REPLACED_TOOLS, SKILL_IDS,
+                               external_fusion_required, fusion_capability_notice, fusion_capability_state,
+                               fusion_delivery_scope, fusion_retires_legacy_tools, installed_fusion,
+                               register_fusion_tools, verified_report_route)
     from src.graph.task_contract import fusion_delivery_for_turn
     from .nature_skill_tools import NATURE_TOOL_NAMES, installed_nature, register_nature_tools
-    external_release = installed_fusion(release, installed_rows)
+    from .scientific_method_tools import TOOL_SCOPES, method_only_deployment, method_only_release
+    methods_only = method_only_release(release, installed_rows)
+    external_release = not method_only_deployment() and installed_fusion(release, installed_rows)
     external_nature = installed_nature(release, installed_rows)
     legacy_receipt_pins = frozenset(os.getenv("CITRUS_PRE_FUSION_INVENTORY_SHA256", "").split())
     legacy_resume = (resume and release is not None and not (release / "fusion").exists()
                      and state["skill_release_inventory_sha256"] in legacy_receipt_pins)
-    external_required = external_fusion_required() and not legacy_resume
+    external_required = method_only_deployment() or (external_fusion_required() and not legacy_resume)
     previous_report_query = ""
     report_routes = {}
 
@@ -157,6 +159,17 @@ async def _run(state, identity, ledger):
         tables = get_request_tables()
     except ImportError:
         tables = []
+    # One atomic capability decision per refresh: the new Fusion surface is only
+    # enabled when release + Worker + an authorized Skill are all ready. The old
+    # analyzers are withdrawn only in that same transition.
+    fusion_capability = {"state": "capability_unavailable", "reason": ""}
+    from .research_routes import accepts_method, scientific_scope, scoped_tools
+    method_scope = frozenset()
+
+    def authorized_methods():
+        return {name for name in SKILL_IDS if policy.allows("skill:" + name)
+                and (not method_scope or name in method_scope)}
+
     def refresh_allowed():
         # A ToolNode task may populate the verified candidate handoff in its
         # own context. Resolve readiness from the current authenticated scope.
@@ -173,33 +186,45 @@ async def _run(state, identity, ledger):
         if retrieval_suppressed(str(state.get("query") or "")):
             from src.graph.tool_availability import retrieval_tool_names
             host.allowed_names.difference_update(retrieval_tool_names())
-        host.allowed_names.update(WORKSPACE_TOOL_NAMES)
-        if external_release or external_required:
-            # Old analyzers are reachable only by exact historical releases.
+        from src.code_execution.presence import worker_available
+        from src.config import PROJECT_ROOT as runtime_root
+        worker_ready = worker_available(runtime_root / "state" / "code_executions.sqlite3")
+        capability, fusion_names, capability_reason = fusion_capability_state(
+            release=release, installed_rows=installed_rows, worker_ready=worker_ready,
+            allowed_skills=authorized_methods(),
+            external_release=external_release, external_required=external_required,
+            report_followup=report_followup())
+        fusion_capability.update(state=capability, reason=capability_reason,
+                                 notice=fusion_capability_notice(capability, capability_reason))
+        if fusion_retires_legacy_tools(capability) or capability == CAPABILITY_UNAVAILABLE:
             host.allowed_names.difference_update(REPLACED_TOOLS)
+        host.allowed_names.update(fusion_names)
+        scientific_candidates = set().union(*TOOL_SCOPES.values())
+        eligible = host.allowed_names & scientific_candidates
+        host.allowed_names.difference_update(scientific_candidates)
+        if methods_only:
+            fusion_capability["notice"] = ""
+            host.allowed_names.update(name for skill in authorized_methods()
+                for name in TOOL_SCOPES.get(skill, ()) if name in eligible
+                and (name != "run_numeric_integrity" or worker_ready))
         if os.getenv("CITRUS_CODE_EXECUTION") == "offline-development":
-            from src.code_execution.presence import worker_available
-            from src.config import PROJECT_ROOT as runtime_root
             host.allowed_names.update(CODE_TOOL_NAMES)
-            worker_ready = worker_available(runtime_root / "state" / "code_executions.sqlite3")
-            if external_release and any(policy.allows("skill:" + name) for name in SKILL_IDS):
-                if worker_ready:
-                    host.allowed_names.update(FUSION_TOOL_NAMES - {"resolve_external_report"})
-                if report_followup():
-                    host.allowed_names.add("resolve_external_report")
             if not worker_ready:
                 host.allowed_names.difference_update({"code_execute", "code_environment_install"})
-            else:
-                if external_nature and policy.allows("skill:nature-figure"):
-                    host.allowed_names.update(NATURE_TOOL_NAMES)
+            elif external_nature and policy.allows("skill:nature-figure"):
+                host.allowed_names.update(NATURE_TOOL_NAMES)
         if report_followup():
             # A report continuation cannot rerun the audit, invoke code, or
             # advertise another source of findings if exact evidence is absent.
             host.allowed_names.intersection_update({"resolve_external_report", "read_tool_result", "request_user_input"})
         current_query = str(state.get("query") or "")
+        if method_scope and not report_followup():
+            from src.graph.retrieval_router import parse_request_constraints
+            constraints = parse_request_constraints(current_query, has_table_attachment=bool(tables))
+            retrieval = set().union(*constraints.required_tool_groups) if constraints.source_policy == "required" else ()
+            host.allowed_names = scoped_tools(host.allowed_names, method_scope, retrieval=retrieval)
         tracing.set_request_authorizations(executor_authorizations(current_query), note_target=explicit_note_target(current_query))
         return set(host.allowed_names)
-    refresh_allowed()
     # Host readiness remains independent of method loading; new generic tools
     # registered by the application must not inherit a scientific allowlist.
     loaded = build_loaded_context(state, mode="general_agent", format_hint=state.get("format_hint"))
@@ -213,8 +238,16 @@ async def _run(state, identity, ledger):
         selected_metadata = []
         human.content = str(human.content) + "\n所选历史技能不是当前场景发行物；可继续使用其他已授权能力，不得声称已加载该方法。"
     selected_metadata = [row for row in selected_metadata if policy.allows("skill:" + row["id"])]
-    host.turn_skills = TurnSkills.from_selection(release, selected_metadata)
     pinned_skills = [row["id"] for row in selected_metadata]
+    if not resume:
+        method_scope = scientific_scope(str(state.get("query") or ""), selected=pinned_skills,
+                                        has_tables=bool(tables))
+    else:
+        # Resume with the same tool/Skill scope that admitted the original turn;
+        # pre-scope checkpoints keep their original graph configuration.
+        method_scope = frozenset((state.get("capability_runtime") or {}).get("scientific_scope", ()))
+    host.turn_skills = TurnSkills(release, method_scope)
+    refresh_allowed()
     human.additional_kwargs.update(identity.message_metadata("user"), user_text=str(state.get("query") or ""),
         attachment_refs=state.get("attachment_refs") or [], selected_skills=selected_metadata)
     if any(ref.get("source") == "previous_turn" for ref in state.get("attachment_refs") or []):
@@ -229,23 +262,48 @@ async def _run(state, identity, ledger):
                 for image in images if image.get("url")]
         else:
             human.content = str(human.content) + "\n当前主模型不支持图片输入；不可声称已看到原图。"
-    prompt = await asyncio.to_thread(system_prompt, host.allowed_names)
-    prompt += ("\nFile 是基础能力。按任务需要自主列举、搜索、读取已授权输入，在当前会话工作区创建或编辑中间文件。"
-               "不依赖所选 Skill、任务类型或逐次确认。读取已有文件版本后再编辑；不要修改输入原件。")
-    if external_required and not (host.allowed_names & FUSION_TOOL_NAMES):
-        prompt += ("\n外部审查运行能力暂不可用，或已安装的审查 Skill 未获本轮授权。不得替换为旧分析器，"
-                   "不得引用未经验证的检查结果。仍可提供独立的原文读取及普通问答。")
-    if host.allowed_names & FUSION_TOOL_NAMES:
-        prompt += ("\n外部核验、数据审查与科研诚信按已安装 Skill 和绑定的文件身份运行。"
-                   "文献先从原件或类型化输入提取条目，再调用 run_external_skill 解析。"
-                   "用 continue_external_literature 对同一执行批量补查，只有回执 can_continue 明确为真时再继续；"
-                   "最后收集证据和缺口。通用搜索结果不能替代核验回执。"
-                   "数据审查先确认实际工作表及明确 A1 矩形（如 'Sheet 1'!A1:D20）；不能自行确认候选区域。collect_external_skill 按本轮用户明确需要的格式交付，"
-                   "以实际附带的文件回执为准。仅文字结论及未要求文件时不发布工作簿。"
-                   "追问审查清单，应读取可验证的既有报告，而不重新执行检查或编造位置和数量。")
-    if host.allowed_names & NATURE_TOOL_NAMES:
-        prompt += ("\n使用已安装上游 Nature Skill。固定模板可用 run_nature_plot 然后 collect_nature_plot。"
-                   "以实收产物和工作台编辑能力为准。用户明确要求 R 而当前 Worker 不支持时，说明限制，不替换成 Python。")
+    from src.code_execution.execution_bridge import sandbox_ready as native_execute_ready
+    from .runtime_capability_table import build as build_runtime_capabilities
+
+    read_only_followup = report_followup()
+    execute_ready = not read_only_followup and not method_scope and native_execute_ready()
+    task_enabled = not read_only_followup and not method_scope and settings.AGENT_ENABLE_TASK_SUBAGENT
+    allowed = set(host.allowed_names)
+    args_by_name = {row["function"]["name"]: tuple(row["function"]["parameters"].get("properties", {}))
+                    for row in catalog.schemas(allowed)}
+    runtime_capabilities = build_runtime_capabilities(
+        available_names=allowed | ({"execute"} if execute_ready else set()),
+        authorized_skills=authorized_methods(),
+        fusion_state=fusion_capability["state"], tool_arguments=args_by_name,
+        sandbox_ready=execute_ready, read_only_report=read_only_followup, release=release)
+    prompt = await asyncio.to_thread(system_prompt, allowed)
+    prompt += ("\n原生文件工具 ls/glob/grep/read_file 可读取本轮获授权的文件、技能和只读资源。")
+    if not read_only_followup:
+        prompt += (" write_file/edit_file/delete 仅作用于 /workspace 或 /outputs。"
+                   "编辑前先读取当前版本；/outputs 只是暂存，正式交付仍须宿主产物发布回执。")
+    if fusion_capability.get("notice") and (not method_scope or method_scope & SKILL_IDS):
+        prompt += fusion_capability["notice"]
+    prompt += "\n" + runtime_capabilities.prompt_fragment()
+    if "prepare_audit_dataset" in allowed:
+        prompt += ("\n数据质量审查先调用 prepare_audit_dataset，再把原样 DatasetRef 交给 audit_prepared_dataset。"
+                   "明确受限时保持用户给定范围。已覆盖请求时，以 audit_prepared_dataset 回执结算目标，不再做预览或读原文件。")
+    if "run_numeric_integrity" in allowed:
+        prompt += ("\n仅在用户明确请求数值科研诚信检查时，调用 run_numeric_integrity，"
+                   "恢复后用原 execution_id 调用 collect_numeric_integrity。禁用图像检查；受限范围不能改成全表。")
+    if "verify_literature_references" in allowed:
+        prompt += ("\n普通 DOI 或小批题录的核验用 verify_literature_references 一次调用。"
+                   "区分来源不可用、题录冲突和无匹配，不自动生成报告。")
+    if method_scope:
+        prompt += ("\n本轮科学方法范围：" + ", ".join(sorted(method_scope)) +
+            "。仅用本轮工具完成用户目标；已取得足够的正式结果后直接交付，不重复运行或读取已有结果。"
+            "单表 CSV 无工作表/区域；真实歧义才澄清。审查不附带作图；分析回执不等同于图件。")
+    if "nature-figure" in method_scope and "run_research_figure_script" in allowed:
+        prompt += ("\n绘图平台合同：本轮统一科研绘图工具运行 Python/Matplotlib。"
+                   "未指定语言而且没有既定任务语言时，直接使用这个后端，不询问 Python/R，不读取或写入默认偏好。"
+                   "明确指定 R 时保留该约束，不静默改用 Python；没有可用的 R 执行入口就说明限制。"
+                   "要报告样本量时，让脚本输出 rows_read、rows_plotted、rows_excluded 和 n_per_group。"
+                   "只用渲染回执的 render_data_summary 或 script_report 样本量；读表预览不是全量数据。"
+                   "figure_published 且所需格式均已出具时直接交付；缺少统计摘要不能作为重复渲染的理由。")
     if "local_hybrid_search" in host.allowed_names:
         try:
             from src.retrieval.corpus_registry import load_corpus_registry
@@ -307,15 +365,20 @@ async def _run(state, identity, ledger):
         completion_digest, completion_errors, reviewed_turn_outcome,
     )
     from .recovery import capture_original_request_state
-    from .deep_agent_runtime import EXECUTOR_ID, NATIVE_READ_TOOLS
+    from .deep_agent_runtime import EXECUTOR_ID, NATIVE_FILE_TOOLS, NATIVE_READ_TOOLS
 
+    summary_enabled = policy.allows("summarization") and state.get("context_compression") is not False
     if not resume or not state.get("capability_runtime"):
         state["capability_runtime"] = {
             "schema": 1,
             "executor": EXECUTOR_ID,
             "model": provider_scope[1], "provider_protocol": "deepseek" if uses_deepseek_protocol(provider_scope[1], provider_scope[0]) else "openai",
             "search_provider": settings.RESOLVED_WEB_SEARCH_PROVIDER,
-            "summary_enabled": False,
+            "summary_enabled": summary_enabled,
+            "native_execute_ready": execute_ready,
+            "scientific_scope": sorted(method_scope),
+            "native_task_enabled": task_enabled,
+            "runtime_capabilities": runtime_capabilities.as_dict(),
             "skills": [{key: row[key] for key in ("id", "version", "sha256")}
                        for row in installed_rows if policy.allows("skill:" + row["id"])],
             "skill_release_inventory_sha256": state["skill_release_inventory_sha256"],
@@ -327,8 +390,12 @@ async def _run(state, identity, ledger):
             "host_prompt_sha256": digest(prompt),
             "host_tool_schema_sha256": digest(catalog.schemas(host.allowed_names)),
             "native_read_tools": sorted(NATIVE_READ_TOOLS),
+            "native_file_tools": sorted(NATIVE_FILE_TOOLS),
             "budget": {"max_output_tokens": budget.max_output_tokens, "model_window": budget.model_window,
                        "input_limit": budget.input_limit(), "output_limit_source": budget.output_limit_source,
+                       "provider_id": transport.provider_id, "provider_model": transport.model,
+                       "max_model_calls": settings.AGENT_MAX_MODEL_CALLS,
+                       "max_model_tokens": settings.AGENT_MAX_MODEL_TOKENS,
                        "working_max_input_tokens": settings.CONTEXT_WORKING_MAX_INPUT_TOKENS,
                        "working_soft_tokens": settings.CONTEXT_WORKING_SOFT_TOKENS},
             "retrieval": {"rrf_k": settings.RRF_K, "candidate_window": settings.CANDIDATE_WINDOW,
@@ -352,6 +419,7 @@ async def _run(state, identity, ledger):
                 "query": state["query"], "previous_report_query": previous_report_query,
                 "update_version": update_version, "final_review": deepcopy(final_review),
                 "artifact_requirements": deepcopy(requirements),
+                "retrieval_timer": retrieval_ledger.timer_state(),
                 "records": host.records,
                 "main_results": host.main_results, "web_results": host.web_results,
                 "pending_question": host.pending_question, "workbook_confirmation": workbook_confirmation,
@@ -409,6 +477,7 @@ async def _run(state, identity, ledger):
         if final_review and (final_review.get("request_version") != update_version
                 or final_review.get("request_hash") != completion_digest(state["query"])):
             final_review.clear()
+        retrieval_ledger.restore_timer_state(saved.get("retrieval_timer"))
         host.records[:] = saved.get("records", [])
         host.main_results[:] = saved.get("main_results", [])
         host.web_results[:] = saved.get("web_results", [])
@@ -477,6 +546,8 @@ async def _run(state, identity, ledger):
         from src.tools.argument_check import validate_tool_arguments
         await asyncio.to_thread(require_unclaimed_call, identity, call)
         error, normalized_args = validate_tool_arguments(tool, call["name"], call["args"])
+        if not error and not accepts_method(call["name"], normalized_args, method_scope):
+            return await not_run(call, "skill_outside_turn_scope"), {}
         if not error and call["name"] == "request_user_input":
             from src.core.user_questions import validate_question_refs
             try:
@@ -495,6 +566,8 @@ async def _run(state, identity, ledger):
                     additional_kwargs={"execution_dispatched": False},
                     artifact={"_tool_outcome": {"status": "skipped", "reason_code": "duplicate_request"}})
                 return await host.publish(duplicate, ToolExecution(observation), identity), {}
+            if reason := retrieval_ledger.admit(call["name"], call["id"], normalized_args):
+                return await not_run(call, reason), {}
         scope = nullcontext()
         if call["name"] in {"research_workspace", "run_research_figure_script"}:
             from src.research.script_runtime import bind_task_scope, reset_task_scope
@@ -518,6 +591,15 @@ async def _run(state, identity, ledger):
             retrieval_ledger.settle(call["name"], normalized_args, call["id"],
                                     status=record.get("status", ""), reason=record.get("reason", ""),
                                     uncertain=execution.uncertain)
+            if message.additional_kwargs.get("execution_dispatched") and not execution.uncertain:
+                from src.retrieval.evidence_contract import evidence_contract
+                evidence = evidence_contract(call["name"], execution.message.artifact,
+                    provider=str(getattr(settings, "RESOLVED_WEB_SEARCH_PROVIDER", "") or ""),
+                    status=record.get("status", ""), reason=record.get("reason", ""))
+                if evidence is not None:
+                    message.additional_kwargs["retrieval_evidence"] = evidence
+                retrieval_ledger.observe(call["name"], call["id"], execution.message.artifact,
+                    status=record.get("status", ""), reason=record.get("reason", ""), content=execution.message.content)
         return message, {"uncertain": execution.uncertain, "operation_id": execution.operation_id,
                          "pending_question": {"question_id": host.pending_question["id"],
                               "version": host.pending_question["version"]} if execution.pending_question else None,
@@ -527,51 +609,64 @@ async def _run(state, identity, ledger):
         notes = await prepare(identity)
         if notes:
             return FinalCheck(False, notes)
-        from src.core.public_delivery import public_answer_text
+        from src.core.public_delivery import public_answer_text, verified_figure_previews
         text = public_answer_text(answer.content)
         if not text.strip() or ops._DSML_PROTOCOL_RE.search(text):
             return FinalCheck(False, ("尚未形成有效答复。需要工具时使用原生工具调用；不要用工具协议文本冒充答案。",))
-        from src.core.turn_outcome import claims_file_delivery, completion_from_answer, repairable_proposal_reason
+        from src.core.turn_outcome import (claims_file_delivery, completion_from_answer, repairable_proposal_reason,
+                                           uses_single_render_delivery)
         statement = completion_from_answer(text, host.records)
         if any(row.get('name') == 'browse_web' for row in host.records):
             from src.core.progress_bus import emit_progress
             emit_progress('browse_phase', {'phase': 'organizing'})
         public_answer = statement.answer
+        retrieval_summary = retrieval_ledger.summary()
+        if retrieval_summary.get("stop_reasons"):
+            limitations = ", ".join(retrieval_summary["stop_reasons"])
+            public_answer += "\n\n检索已停止补查（" + limitations + "）。结论以已取得的证据为限。"
+            statement = statement.model_copy(update={"answer": public_answer})
         if settings.RESEARCH_ROUTE_NOTICE_ENABLED:
             from .research_routes import dual_source_notice
             notice = dual_source_notice(state["query"], host.records)
             if notice and notice not in public_answer:
                 public_answer += "\n\n" + notice
                 statement = statement.model_copy(update={"answer": public_answer})
-        delivery_gaps, artifact_contract = [], None
+        delivery_gaps, artifact_contract, delivery_manifest = [], None, None
+        figure_previews = {}
         if requirements:
-            from src.core.task_result import effective_tool_records
-            from src.core.turn_outcome import artifact_goal_evidence
+            from src.core.turn_outcome import _effective_artifact_records, artifact_goal_evidence, figure_answer_refs
             from src.research.tools import validate_artifact_links
-            effective = effective_tool_records(host.records)
+            effective = _effective_artifact_records(host.records)
             links = list(dict.fromkeys(item["link"] for row in effective
                 for item in row.get("artifact_validations", []) if item.get("valid") and item.get("link")))
             verified = await asyncio.to_thread(validate_artifact_links, links, session_id=identity.session_id,
                          owner_user_id=identity.owner_user_id, request_id=host._result_request_id()) if links else []
             verified_links = sorted(item["link"] for item in verified if item.get("valid"))
-            goals, delivery_gaps = artifact_goal_evidence(requirements, effective, set(verified_links))
+            answer_render_refs = figure_answer_refs(public_answer)
+            goals, delivery_gaps = artifact_goal_evidence(requirements, effective, set(verified_links),
+                single_render_receipt=True, answer_render_refs=answer_render_refs)
             artifact_contract = {"schema_version": 1, "request_version": update_version,
-                                 "requirements": requirements, "verified_links": verified_links}
-            delivery_links = list(dict.fromkeys(link for goal in goals for link in goal.artifact_links
-                                                if link not in public_answer))
-            if delivery_links:
-                public_answer += "\n\n已核验的交付文件\n" + "\n".join(
-                    f"- [下载文件 {index}]({link})" for index, link in enumerate(delivery_links, start=1))
+                                 "requirements": requirements, "verified_links": verified_links,
+                                 "single_render_receipt": True, "answer_render_refs": answer_render_refs}
+            from src.research.artifact_delivery import build_delivery
+            selected_delivery_links = {link for goal in goals for link in goal.artifact_links}
+            delivery_manifest = await asyncio.to_thread(build_delivery, identity=identity,
+                request_id=host._result_request_id(), rows=effective, messages=host.messages,
+                requirements=requirements, select_links=selected_delivery_links if not delivery_gaps or uses_single_render_delivery(requirements) else None,
+                gaps=delivery_gaps, verified=verified)
             if (delivery_gaps and not verified_links and not allow_delivery_gaps
                     and claims_file_delivery(statement.answer)):
                 return FinalCheck(False, tuple(gap["detail"] for gap in delivery_gaps))
             if delivery_gaps:
                 public_answer += "\n\n" + "\n".join(gap["detail"] for gap in delivery_gaps)
+            elif "[[FIGURE:" in public_answer:
+                figure_previews = await asyncio.to_thread(verified_figure_previews, state["query"], public_answer,
+                    requirements, goals, verified, session_id=identity.session_id, owner_user_id=identity.owner_user_id)
             statement = statement.model_copy(update={"answer": public_answer,
                 "status": "partial" if delivery_gaps else statement.status,
                 "goals": [*statement.goals, *goals], "remaining": [gap["detail"] for gap in delivery_gaps]})
         if "[[FIGURE:" in public_answer:
-            public_answer = figures.expand(public_answer)
+            public_answer = figures.expand(public_answer, verified_previews=figure_previews)
             statement = statement.model_copy(update={"answer": public_answer})
         native_calls = [call for message in history if isinstance(message, AIMessage)
                         for call in message.tool_calls]
@@ -590,6 +685,15 @@ async def _run(state, identity, ledger):
             and row["tool_call_id"] not in host.dispatched
             and not host.messages[row["tool_call_id"]].additional_kwargs.get("execution_dispatched")
             and not host.messages[row["tool_call_id"]].additional_kwargs.get("operation_uncertain")]
+        figure_refs = {cid for goal in statement.goals if goal.kind == "deliverable" for cid in goal.evidence_call_ids}
+
+        def repair_matches(rejected_id, corrected_id):
+            rejected, corrected = calls.get(rejected_id), calls.get(corrected_id)
+            return (_same_repair_target(rejected, corrected, records=host.records)
+                    or (corrected_id in figure_refs and uses_single_render_delivery(requirements)
+                        and _already_succeeded_render_repair(
+                        rejected, corrected, host.messages, positions)))
+
         repairs = list(statement.proposal_repairs)
         claimed_repairs = {claim.rejected_call_id for claim in repairs}
         if statement.status == "completed" and not statement.remaining:
@@ -605,8 +709,7 @@ async def _run(state, identity, ledger):
                 corrected = next((r.get("tool_call_id") for r in host.records
                     if r.get("status") == "complete" and r.get("tool_call_id") in goal_refs
                     and positions.get(cid, float("inf")) < positions.get(r.get("tool_call_id"), -1)
-                    and _same_repair_target(calls.get(cid), calls.get(r.get("tool_call_id")),
-                                            records=host.records)), None)
+                    and repair_matches(cid, r.get("tool_call_id"))), None)
                 if corrected:
                     repairs.append(ProposalRepair(rejected_call_id=cid, corrected_call_id=corrected,
                         reason="提案在执行前被拒绝；本轮随后使用成功操作满足了所声明的目标。"))
@@ -622,8 +725,7 @@ async def _run(state, identity, ledger):
             no_dispatch = host.proven_no_dispatch(claim.rejected_call_id)
             if (no_dispatch and positions.get(claim.rejected_call_id, float("inf")) <
                     positions.get(claim.corrected_call_id, -1)
-                    and _same_repair_target(calls.get(claim.rejected_call_id), calls.get(claim.corrected_call_id),
-                                            records=host.records)):
+                    and repair_matches(claim.rejected_call_id, claim.corrected_call_id)):
                 verified_repairs.append(claim.rejected_call_id)
         # Exploratory read receipts describe individual attempts, not additional
         # user obligations. Once the agent cites successful evidence for its
@@ -682,6 +784,15 @@ async def _run(state, identity, ledger):
                 "goals": [goal for goal in statement.goals if goal.evidence_call_ids],
                 "proposal_repairs": [claim for claim in statement.proposal_repairs
                                      if claim.rejected_call_id in verified_repairs]})
+        from .research_routes import uncollected_skill_results
+
+        pending_results = uncollected_skill_results(host.records, calls, host.messages)
+        if pending_results:
+            labels = {"data-audit": "数据审查", "literature-verification": "文献核验", "research-integrity": "科研诚信筛查"}
+            gap = "本轮已提交" + "、".join(labels[skill] for skill in sorted(pending_results)) + "，尚未取得执行结果。"
+            public_answer += "\n\n" + gap
+            statement = statement.model_copy(update={"answer": public_answer,
+                "status": "partial", "remaining": [*statement.remaining, gap]})
         from src.core.turn_sources import answer_citations
         public_answer, ref_data = await asyncio.to_thread(answer_citations, public_answer,
             session_id=identity.session_id, request_id=host._result_request_id(),
@@ -695,7 +806,8 @@ async def _run(state, identity, ledger):
             artifact_contract=artifact_contract, delivery_gaps=delivery_gaps)
         host.publish_resolutions(outcome)
         final_review.update(phase="accepted", answer=public_answer, outcome=outcome.as_dict(), references=ref_data,
-            request_version=update_version, request_hash=completion_digest(state["query"]))
+            request_version=update_version, request_hash=completion_digest(state["query"]),
+            artifact_delivery=delivery_manifest)
         return FinalCheck()
 
     from .batch_journal import BatchObservationNotStored, RecoveryRequiresReconciliation
@@ -705,7 +817,14 @@ async def _run(state, identity, ledger):
 
     async def metered_model(request, handler, current_identity, host_tools):
         model_allowed = set(refresh_allowed())
-        historical_readback = host if "read_tool_result" in model_allowed else None
+        from .dataset_tool_scope import csv_audit_supplies_locations
+        if ("inspect_uploaded_table" in model_allowed and not update_version and not requirements
+                and csv_audit_supplies_locations(str(state.get("query") or ""), tables, host.messages.values())):
+            model_allowed.discard("inspect_uploaded_table")
+        # A fresh attachment run should use its own observations. Explicit
+        # report follow-up has a separate, provenance-bound read-only route.
+        historical_readback = host if ("read_tool_result" in model_allowed
+            and not (method_scope and tables)) else None
         edit_history = policy.allows("summarization") and state.get("context_compression") is not False
         if not host.has_result_readback():
             model_allowed.discard("read_tool_result")
@@ -726,6 +845,9 @@ async def _run(state, identity, ledger):
                 host.validate_observation(message)
                 record = message.additional_kwargs.get("host_publication") or {}
                 retrieval_ledger.restore(message.name, call["args"], message.tool_call_id)
+                retrieval_ledger.restore_admission(message.name, message.tool_call_id, call["args"])
+                retrieval_ledger.observe(message.name, message.tool_call_id, message.artifact,
+                    status=record.get("status", ""), reason=record.get("reason", ""), content=message.content)
                 retrieval_ledger.settle(message.name, call["args"], message.tool_call_id,
                                         status=record.get("status", ""), reason=record.get("reason", ""))
 
@@ -802,6 +924,15 @@ async def _run(state, identity, ledger):
         except (OSError, sqlite3.Error, task_events.TaskConflict) as exc:
             raise QuestionWakeDeferred("question_wake_ack_deferred") from exc
 
+    from .native_execute_receipt import dispatch_once as guard_native_execute
+    from .native_approval import wait_for_approval_decisions
+
+    approval_tools = (("commit_document_index",) if settings.PERMISSION_NATIVE_SHARED_INDEX
+                      and "commit_document_index" in allowed else ())
+
+    async def wait_native_approval(who, keys):
+        await wait_for_approval_decisions(who, keys, timeout=settings.PERMISSION_WAIT_SEC)
+
     runtime = HarnessRuntime(model, execute, admit, check_final,
         RunLimits(max_model_steps=settings.AGENT_MAX_MODEL_CALLS, deadline=deadline),
         schemas=catalog.schemas({row["name"] for row in catalog.describe()}),
@@ -813,6 +944,11 @@ async def _run(state, identity, ledger):
         check_final_after_followup=check_final_after_followup, tool_mode=catalog.execution_mode,
         not_run=not_run, check_terminal_orphan=lambda values: is_terminal_orphan(identity, values),
         restore_tool_observation=restore_tool_observation, model_call=metered_model,
+        can_recover_output=lambda: task_events.budget_headroom(identity.run_id),
+        guard_native_execute=guard_native_execute if execute_ready else None,
+        native_approval_tools=approval_tools,
+        wait_native_approval=wait_native_approval if approval_tools else None,
+        approval_restart_checkpoint=state.get("agent_approval_restart_checkpoint", ""),
         user_input=state.get("agent_question_resume"), bind_user_input=bind_user_input,
         accept_user_input=accept_user_input, acknowledge_user_input=acknowledge_user_input,
         check_retired_question=lambda run_id: asyncio.to_thread(user_questions.retired_question, identity, run_id))
@@ -828,7 +964,10 @@ async def _run(state, identity, ledger):
             async with open_framework_checkpoint(state_root, identity, provider_scope, **checkpoint_options) as saver:
                 result = await runtime.run(identity, messages, saver=saver, resume=resume,
                     checkpoint_config=checkpoint_config, agent_options={"skill_root": skill_root,
-                        "system_prompt": prompt, "capability_policy": policy, "turn_skills": host.turn_skills}, pinned_skills=pinned_skills)
+                        "system_prompt": prompt, "capability_policy": policy, "turn_skills": host.turn_skills,
+                        "model_budget": budget, "summary_enabled": summary_enabled, "execute_ready": execute_ready,
+                        "task_subagent": task_enabled, "workspace_read_only": read_only_followup},
+                    pinned_skills=pinned_skills)
                 if result.status == "suspended" and result.reason == "execution_pending":
                     if parked_execution is None:
                         raise ValueError("execution_suspension_checkpoint_invalid")
@@ -895,6 +1034,31 @@ def _same_audit_target(original, replacement):
         return False
 
 
+def _already_succeeded_render_repair(rejected, corrected, messages, positions):
+    """Match a preflight-only rejection to the selected, same-source render."""
+    name = "run_research_figure_script"
+    if not rejected or not corrected or rejected["name"] != name or corrected["name"] != name:
+        return False
+    parent = (rejected.get("args") or {}).get("repair_from_run_id")
+    denied, delivered = messages.get(rejected["id"]), messages.get(corrected["id"])
+    denied = getattr(denied, "artifact", None) or {}
+    delivered = getattr(delivered, "artifact", None) or {}
+    snapshots = delivered.get("input_snapshots")
+    published = {"status": "complete", "reason_code": "figure_published"}
+    if (not parent or not snapshots or denied.get("error_code") != "repair_target_already_succeeded"
+            or any((delivered.get("_tool_outcome") or {}).get(k) != v for k, v in published.items())
+            or denied.get("repair_from_run_id") != parent):
+        return False
+    for cid, message in messages.items():
+        if message.name != name or positions.get(cid, float("inf")) >= positions[rejected["id"]]:
+            continue
+        artifact = message.artifact or {}
+        if (artifact.get("run_id") == parent and artifact.get("input_snapshots") == snapshots
+                and all((artifact.get("_tool_outcome") or {}).get(k) == v for k, v in published.items())):
+            return True
+    return False
+
+
 def _same_repair_target(rejected, corrected, *, records=()):
     if not rejected or not corrected or rejected["name"] != corrected["name"]:
         return False
@@ -911,6 +1075,16 @@ def _same_repair_target(rejected, corrected, *, records=()):
         # target; a pre-dispatch rejection is repaired by the later write.
         return all(original.get(key) and original[key] == replacement.get(key)
                    for key in ("workspace_id", "task_id"))
+    if name == "draw_svg":
+        from src.graph.export_contract import artifact_matches_requirement
+        original_label = str(original.get("alt_text") or "图形").strip()
+        replacement_label = str(replacement.get("alt_text") or "图形").strip()
+        return original_label == replacement_label and any(
+            row.get("tool_call_id") == corrected.get("id") and row.get("name") == name
+            and row.get("status") == "complete" and any(
+                item.get("request_matches") is True and item.get("link") and
+                artifact_matches_requirement(item, {"kinds": ["figure"], "formats": ["svg"]})
+                for item in row.get("artifact_validations", ())) for row in records)
     if name == "run_research_figure_script":
         parent = original.get("repair_from_run_id")
         if not parent or replacement.get("repair_from_run_id") not in (None, "", parent):
@@ -1125,13 +1299,18 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
         if verified is not None:
             figure_summary, length_gaps = verified
             answer = answer + "\n\n" + figure_summary if uncertain else figure_summary
-    delivery = {"status": "not_checked", "verified_file_ids": [], "unavailable_count": 0}
-    if result.status != "complete" and status in {"partial", "failed", "cancelled"}:
-        links, delivery = await asyncio.to_thread(_verified_turn_delivery, host)
-        if links and (result.reason != "model_length" or verified is None or length_gaps):
-            answer += "\n\n已生成并核对文件完整性的产物（不表示整项任务已完成或已通过 QA）：\n" + "\n".join(links)
-        if delivery["status"] in {"partial", "unavailable"}:
-            answer += "\n\n部分或全部已登记文件当前无法核验；未提供未经核验的链接。"
+    delivery = (final_review or {}).get("artifact_delivery") if result.status == "complete" else None
+    if delivery is None:
+        from src.core.turn_outcome import _effective_artifact_records
+        from src.research.artifact_delivery import build_delivery
+
+        stopped = result.status != "complete" and status in {"partial", "failed", "cancelled"}
+        gaps = list(length_gaps) or ([{"reason_code": "required_deliverable_unconfirmed"}]
+                                     if stopped and requirements else [])
+        delivery = await asyncio.to_thread(build_delivery, identity=identity, request_id=host._result_request_id(),
+            rows=_effective_artifact_records(host.records), messages=host.messages, requirements=requirements,
+            gaps=gaps, delivery_uncertain=uncertain)
+    if delivery.get("status") != "none":
         emit_encoded("artifact_delivery", delivery)
     ledger.close(status="unknown" if uncertain else
                  "cancelled" if status == "cancelled" else "failed", reason_code=result.reason)

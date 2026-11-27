@@ -83,7 +83,7 @@ def run(browser, origin, output):
     objects_tab = page.get_by_role("tab", name="对象", exact=True)
     assets = page.locator("#assetList")
     expect(library_tab).to_have_attribute("aria-selected", "true")
-    expect(page.get_by_role("link", name="返回资料库")).to_have_attribute("href", "/?files=1")
+    expect(page.get_by_role("link", name="返回会话")).to_have_attribute("href", "/")
     library_tab.focus()
     page.keyboard.press("ArrowRight")
     expect(objects_tab).to_be_focused()

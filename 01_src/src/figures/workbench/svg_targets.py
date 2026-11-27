@@ -1,6 +1,7 @@
 """Verify renderer addresses against the exact owned or replayed SVG bytes."""
 from collections import defaultdict
 from hashlib import sha256
+import math
 import re
 import xml.etree.ElementTree as ET
 
@@ -138,6 +139,38 @@ class SvgTargets:
         if node is not None and len(node) and all(child.tag == _SVG + "path" and child.get("d") for child in node):
             return node
         return None
+
+    def mark_node(self, row, annotation):
+        locator = row["locator"]
+        if (locator.get("paint_version") != 1 or locator.get("role") != row["role"]
+                or row.get("svg_nodes") != [row["gid"]]):
+            return None
+        if locator.get("parent_gid") is not None and (annotation is None or annotation.get("role") != "annot"):
+            return None
+        return self.visual_mark({**locator, "gid": row["gid"]}, annotation)
+
+    @staticmethod
+    def mark_geometry(node):
+        return (node.get("transform"), tuple((child.get("d"), child.get("transform")) for child in node))
+
+    @staticmethod
+    def mark_paint(node, prop, value):
+        """Confirm a normalized paint acknowledgement against exact SVG paths."""
+        paint = {"facecolor": "fill", "edgecolor": "stroke"}
+        if prop in paint and isinstance(value, str):
+            key = paint[prop]
+            default = "#000000" if key == "fill" else "none"
+            return any(child.get(key, default).lower() == value.lower() for child in node)
+        if prop == "linewidth" and type(value) in (int, float) and 0.2 <= value <= 8:
+            for child in node:
+                if child.get("stroke", "none") == "none":
+                    continue
+                try:
+                    if math.isclose(float(child.get("stroke-width", "1")), value, abs_tol=1e-6):
+                        return True
+                except ValueError:
+                    continue
+        return False
 
     def projection(self, nodes):
         clips = set()

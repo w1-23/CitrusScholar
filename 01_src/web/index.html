@@ -13,18 +13,20 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/assets/app.css?v=45">
 <link rel="stylesheet" href="/assets/skill-picker.css?v=6">
-<link rel="stylesheet" href="/assets/guide.css?v=4">
+<link rel="stylesheet" href="/assets/guide.css?v=7">
 <link rel="stylesheet" href="/assets/loading-sprout.css?v=5">
-<link rel="stylesheet" href="/assets/session_files.css?v=8">
+<link rel="stylesheet" href="/assets/session_files.css?v=10">
 <link rel="stylesheet" href="/assets/corpus_reader.css?v=9">
 <link rel="stylesheet" href="/assets/citrus-theme.css?v=2">
 <link rel="stylesheet" href="/assets/chat-ui.css?v=6">
-<link rel="stylesheet" href="/assets/context-view.css?v=4">
-</head>
+<link rel="stylesheet" href="/assets/context-view.css?v=5">
+<link rel="stylesheet" href="/assets/auth-presentation.css?v=1">
+<link rel="stylesheet" href="/assets/app-icon.css?v=2">
+<link rel="icon" type="image/png" href="/assets/citrus-brand.png"></head>
 <body data-page="chat">
 
 <header class="app-header">
-  <img class="brand-mascot" src="/assets/citrus-mark.svg" alt="">
+  <img class="brand-mascot" src="/assets/citrus-brand.png" alt="">
   <h1>CitrusScholar</h1>
   <div class="header-actions">
     <button type="button" class="ctx-circle-btn" id="ctxCircleBtn" aria-controls="ctxDrawer" aria-expanded="false" onclick="toggleCtxDrawer()" aria-label="上下文用量" title="上下文用量">
@@ -39,7 +41,7 @@
 
 <div class="auth-gate" id="authGate">
   <form class="auth-card" id="authLoginCard" onsubmit="event.preventDefault();authenticate(document.getElementById('authMode').value)">
-    <div class="auth-brand"><img src="/assets/citrus-mark.svg" alt=""> CitrusScholar</div>
+    <div class="auth-brand"><img src="/assets/citrus-brand.png" alt=""> CitrusScholar</div>
     <div class="auth-title">登录或注册</div>
     <input id="authUsername" required minlength="3" maxlength="32" autocomplete="username" placeholder="用户名（3–32 位）">
     <input id="authPassword" required minlength="10" maxlength="256" type="password" autocomplete="current-password" placeholder="密码（至少 10 位）">
@@ -60,10 +62,11 @@
     <button class="api-save" type="submit">继续</button>
     <button class="auth-forgot" type="button" onclick="openRecoverPane()">忘记密码？使用恢复码重置</button>
     <p>对话与附件可能发送至所配置的模型和联网服务。</p>
-    <details class="auth-data-note"><summary>数据与隐私</summary><p>账号数据彼此隔离。问题、回答和工具执行摘要供管理员排障，保留一年。上传文件保存在账号资料库，默认 30 天未使用后清理，不进入共享语料库。</p></details>
+    <p class="auth-icon-attribution">Icons: <a href="https://github.com/480-Design/Solar-icon-set" target="_blank" rel="noopener noreferrer">Solar Icon Set by 480 Design</a> &middot; <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">CC BY 4.0</a></p>
+    <details class="auth-data-note icon-disclosure"><summary><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/auth-solar-icon.svg#ui-chevron-right"></use></svg>数据与隐私</summary><p>账号数据彼此隔离。问题、回答和工具执行摘要供管理员排障，保留一年。上传文件保存在账号资料库，默认 30 天未使用后清理，不进入共享语料库。</p></details>
   </form>
   <form class="auth-card" id="authRecoverCard" hidden onsubmit="event.preventDefault();submitPasswordRecovery()">
-    <div class="auth-brand"><img src="/assets/citrus-mark.svg" alt=""> CitrusScholar</div>
+    <div class="auth-brand"><img src="/assets/citrus-brand.png" alt=""> CitrusScholar</div>
     <div class="auth-title">使用恢复码重置密码</div>
     <input id="recoverUsername" required minlength="3" maxlength="32" autocomplete="username" placeholder="用户名（3–32 位）">
     <input id="recoverCode" maxlength="128" autocomplete="one-time-code" spellcheck="false" placeholder="恢复码">
@@ -80,7 +83,7 @@
 <!-- v8.5.0 开源版：首次启动 API Key 引导（未配置时全屏遮罩，配置后隐藏） -->
 <div class="api-setup-overlay" id="apiSetupOverlay" style="display:none">
   <div class="api-setup-card">
-    <div class="api-heading"><div class="api-logo"><img src="/assets/citrus-mark.svg" alt=""> <span>CitrusScholar</span></div><button class="api-close" id="settingsCloseBtn" onclick="closeSettingsModal()" style="display:none" title="关闭">✕</button></div>
+    <div class="api-heading"><div class="api-logo"><img src="/assets/citrus-brand.png" alt=""> <span>CitrusScholar</span></div><button class="api-close" id="settingsCloseBtn" onclick="closeSettingsModal()" style="display:none" title="关闭">✕</button></div>
     <div class="api-title">模型设置</div>
 
     <div class="configured-providers" id="configuredProvidersList" hidden></div>
@@ -238,7 +241,7 @@
       <div id="selected-skills" class="selected-skills" aria-live="polite" hidden></div>
       <div id="composer-admission-recovery" class="composer-admission-recovery" aria-live="polite" hidden></div>
       <!-- 输入区：自然语言请求、附件与发送控件 -->
-      <div id="composer-continuation" class="composer-task-status" hidden>继续所选轮次并继承其附件 · <button type="button" id="clear-composer-continuation" class="history-retry">取消继承</button></div>
+      <div id="composer-continuation" class="composer-task-status" hidden><span class="continuation-attachment-references" aria-label="已引用附件"></span> <button type="button" id="clear-composer-continuation" class="history-retry">取消继承</button></div>
       <div class="composer-meta">
         <p id="composer-task-status" class="composer-task-status" role="status" aria-live="polite" hidden></p>
 
@@ -286,24 +289,24 @@
        aria-valuemin="300" aria-valuenow="468" tabindex="0"
        title="拖动调整资料库宽度，双击复位"></div>
   <header class="session-files-head">
-    <span class="library-heading-icon"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-folder"></use></svg></span>
+    <span class="library-heading-icon"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/file-solar-icons.svg#ui-folder"></use></svg></span>
     <div><h2 id="sessionFilesTitle">资料库</h2><p id="sessionFilesStats" aria-live="polite"></p></div>
-    <button class="session-files-close" type="button" onclick="toggleSessionFiles(false)" title="收起资料库" aria-label="收起资料库">×</button>
+    <button class="session-files-close" type="button" onclick="toggleSessionFiles(false)" title="收起资料库" aria-label="收起资料库"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/file-solar-icons.svg#ui-close"></use></svg></button>
   </header>
   <div class="session-files-body" id="sessionFilesBody">
     <section class="library-upload-zone" id="libraryUploadZone" aria-labelledby="libraryUploadLabel">
-      <span class="library-heading-icon"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-upload"></use></svg></span>
+      <span class="library-heading-icon"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/file-solar-icons.svg#ui-upload"></use></svg></span>
       <div class="library-upload-copy">
         <strong id="libraryUploadLabel">上传资料</strong>
         <p>拖放表格、图片、PDF 或 Word，单个文件最多 20 MB</p>
       </div>
       <input type="file" id="libraryUploadInput" hidden multiple accept="image/jpeg,image/png,image/webp,image/gif,.pdf,.docx,.csv,.tsv,.xlsx,.xls,.xlsm,.xlsb,.svg">
-      <button type="button" id="libraryUploadButton"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-plus"></use></svg> 上传资料</button>
+      <button type="button" id="libraryUploadButton"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/file-solar-icons.svg#ui-plus"></use></svg> 上传资料</button>
       <span id="libraryUploadStatus" role="status" hidden></span>
     </section>
     <div class="library-filters">
       <label class="library-search">
-        <svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-search"></use></svg>
+        <svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/file-solar-icons.svg#ui-search"></use></svg>
         <input type="search" id="librarySearch" placeholder="搜索资料名称" aria-label="搜索资料名称">
       </label>
       <select id="libraryKind" aria-label="文件类型">
@@ -337,10 +340,8 @@
     <header class="session-file-preview-head">
       <h2 id="sessionFilePreviewTitle">文件预览</h2>
       <div class="session-file-preview-actions">
-        <a id="sessionFilePreviewDownload" class="api-secondary" href="#" download>下载原件</a>
-        <button class="api-secondary" type="button" id="sessionFilePreviewCopySvg" hidden
-                title="复制这份 SVG 的源码文本">复制 SVG 源码</button>
-        <button class="overlay-close" type="button" onclick="closeSessionFilePreview()" aria-label="关闭预览">×</button>
+        <a id="sessionFilePreviewDownload" class="api-secondary" href="#" download><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/file-solar-icons.svg#ui-download"></use></svg><span data-icon-label>下载原件</span></a>
+        <button class="overlay-close" type="button" onclick="closeSessionFilePreview()" aria-label="关闭预览"><svg class="ui-icon app-icon" aria-hidden="true" focusable="false"><use href="/assets/file-solar-icons.svg#ui-close"></use></svg></button>
       </div>
     </header>
     <div class="session-file-preview-meta" id="sessionFilePreviewMeta"></div>
@@ -372,7 +373,7 @@
     <button class="overlay-close" type="button" onclick="closeMemorySettings()" aria-label="关闭">×</button>
     <div class="overlay-eyebrow">CitrusScholar 账户</div>
     <h2 id="memorySettingsTitle">个人偏好</h2>
-    <p class="overlay-subtitle">偏好由你直接设置，仅对当前账号生效。自动记忆已停用；项目资料请使用科研笔记保存。</p>
+    <p class="overlay-subtitle">偏好由你直接设置，仅对当前账号生效。</p>
     <div id="preferencesPane" class="preference-pane">
       <form id="preferenceForm">
         <div class="preference-grid">
@@ -501,11 +502,6 @@
     <button class="ctx-drawer-close" id="ctxClose" type="button" onclick="toggleCtxDrawer()" aria-label="关闭上下文窗口"><svg class="ui-icon" aria-hidden="true"><use href="/assets/citrus-icons.svg#ui-close"></use></svg></button>
   </div>
   <div class="ctx-drawer-body">
-    <div class="context-amount">
-      <div><strong id="ctxUsed" aria-describedby="ctxValueNote">—</strong><p id="ctxValueNote">占用量暂不可用</p></div>
-      <span class="context-level" id="ctxStatus" hidden></span>
-    </div>
-    <p class="context-meta" id="ctxMetadata" hidden></p>
     <div class="context-treemap" id="ctxTreemap" role="group" aria-label="上下文令牌构成图" hidden></div>
     <div class="context-gauge-grid" id="ctxGrid" aria-hidden="true" hidden></div>
     <p class="context-meta" id="ctxChartNote" hidden></p>
@@ -537,17 +533,19 @@
     <span class="load-sprout-text">小橘正在回答您的问题<span class="load-sprout-dots" aria-hidden="true"><i>.</i><i>.</i><i>.</i></span></span>
   </div>
 </template>
-<script src="/assets/guide.js?v=5"></script>
-<script src="/assets/task-state.js?v=14"></script>
-<script src="/assets/context-view.js?v=5"></script>
-<script src="/assets/task-transport.js?v=8"></script>
-<script src="/assets/task-cards.js?v=13"></script>
+<script src="/assets/guide.js?v=7"></script>
+<script src="/assets/task-state.js?v=15"></script>
+<script src="/assets/context-view.js?v=6"></script>
+<script src="/assets/task-transport.js?v=10"></script>
+<script src="/assets/task-cards.js?v=14"></script>
 <script src="/assets/task-controls.js?v=6"></script>
 <script src="/assets/skill-picker.js?v=11"></script>
-<script src="/assets/app.js?v=77"></script>
+<script src="/assets/app.js?v=79"></script>
 <script src="/assets/turn_rail.js?v=2"></script>
 <script src="/assets/corpus_reader.js?v=12"></script>
 <script src="/assets/xlsx.full.min.js?v=1"></script>
-<script src="/assets/session_files.js?v=15"></script>
+<script src="/assets/app-icon-names.js?v=2"></script>
+<script src="/assets/app-icon.js?v=2"></script>
+<script src="/assets/session_files.js?v=17"></script>
 </body>
 </html>

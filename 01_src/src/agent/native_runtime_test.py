@@ -102,7 +102,10 @@ async def _pinned_skill_and_read_file_survive_thread_reopen(tmp_path):
 
     async def model(history, identity, *, native_schemas):
         histories.append(history)
-        assert {entry["function"]["name"] for entry in native_schemas} == {"read_file", "ls", "glob", "grep", "write_todos"}
+        # One native file surface plus the metered delegation and sandbox tools.
+        assert {entry["function"]["name"] for entry in native_schemas} == {
+            "ls", "glob", "grep", "read_file", "write_file", "edit_file", "delete",
+            "execute", "write_todos", "task"}
         if len(histories) == 1:
             assert any("Read-only demo" in str(message.content) for message in history)
             return AIMessage(content="", tool_calls=[{"id": "read-1", "name": "read_file",
@@ -920,7 +923,8 @@ def test_sdk_discovers_unselected_method_without_carrying_prior_method_bytes(tmp
                 leaked = [(type(message).__name__, getattr(message, "name", ""), message.content,
                            message.additional_kwargs) for message in outgoing if "Scope specimen 9651." in str(message.content)]
                 assert not leaked
-                assert any("Exact method specimen" in str(message.content) for message in outgoing)
+                assert any("Updated method specimen" in str(message.content) for message in outgoing)
+                assert all("Exact method specimen" not in str(message.content) for message in outgoing)
                 assert all(message.additional_kwargs.get("skill", {}).get("name") != RQA_ID
                            for message in outgoing if isinstance(message, HumanMessage))
                 assert any(message.tool_call_id == "rqa-native" for message in observations)
@@ -935,6 +939,11 @@ def test_sdk_discovers_unselected_method_without_carrying_prior_method_bytes(tmp
         runtime = HarnessRuntime(ScriptedModel(script=model), execute, lambda *_: None, accept, RunLimits(3), [])
         config = {"thread_id": "same-thread"}
         for identity, view in ((parent, selected), (current, unselected)):
+            if identity == current:
+                refreshed = raw.replace("Exact method specimen.", "Updated method specimen.")
+                entry.write_text(refreshed)
+                (tmp_path / "inventory.json").write_text(json.dumps({str(entry.relative_to(tmp_path)):
+                    hashlib.sha256(refreshed.encode()).hexdigest()}))
             result = await runtime.run(identity, [HumanMessage(identity.user_turn_id,
                 additional_kwargs=identity.message_metadata("user"))], saver=saver, checkpoint_config=config,
                 agent_options={"skill_root": tmp_path / "skills", "capability_policy": CapabilityPolicy(),

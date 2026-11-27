@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "selfcorpus"
+version = "0.1.2"
+description = "Standalone scoped research corpus and evidence service"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+cpu = ["numpy>=1.26,<3", "tokenizers>=0.20,<1", "onnxruntime>=1.19,<2"]
+gpu = ["numpy>=1.26,<3", "tokenizers>=0.20,<1", "onnxruntime-gpu[cuda,cudnn]>=1.21,<2"]
+docling = ["docling>=2,<3"]
+
+[project.scripts]
+selfcorpus = "corpus.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["corpus*"]
+
+[tool.setuptools.package-data]
+corpus = ["migrations/*.sql"]

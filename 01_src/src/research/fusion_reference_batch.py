@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 from citrus_refcheck import providers
 from citrus_refcheck.audit import BudgetExceeded
+from citrus_refcheck.compare import compare_fields
 from citrus_refcheck.inventory import digest
 from citrus_refcheck.lookup import AuditStopped
 from citrus_refcheck.verification import BatchLimits, Capabilities, Observation, verify_batch
@@ -203,7 +204,8 @@ def _project_match(row):
             "candidates": [{field: item[field] for field in fields if item.get(field)} for item in candidates[:3]]}
 
 
-def run_reference_batch(records, *, check, send, deadline, strict=False):
+def run_reference_batch(records, *, check, send, deadline, strict=False,
+                        query_budget=MAX_RECORDS * 3, include_field_checks=False):
     if not 1 <= len(records) <= MAX_RECORDS:
         raise ValueError("fusion_reference_batch_size_invalid")
     registry = _Registries(check, send, strict)
@@ -212,7 +214,7 @@ def run_reference_batch(records, *, check, send, deadline, strict=False):
         lookup_arxiv=registry.for_query, lookup_pmid=registry.for_query, search=registry.for_query)
     start = time.monotonic()
     outcome = verify_batch(_inventory(records), capabilities=capabilities,
-                           limits=BatchLimits(request_budget=MAX_RECORDS * 3, timeout=timeout, item_timeout=min(timeout, 8)))
+                           limits=BatchLimits(request_budget=query_budget, timeout=timeout, item_timeout=min(timeout, 8)))
     attempts_by_ref = {attempt["record_id"]: attempt for attempts in registry.attempts.copy().values() for attempt in attempts}
     projected = []
     for row in outcome["entries"]:
@@ -225,6 +227,13 @@ def run_reference_batch(records, *, check, send, deadline, strict=False):
                       attempts=attempts, identifier_checks=checks,
                       fields_checked=list(row["claims"]), method=METHOD,
                       retraction_status=result.get("retraction_status", "not_established"))
+        if include_field_checks:
+            claims = row["claims"]
+            record["field_checks"] = {field: {
+                key: _text(value, 350) for key, value in values.items()
+                if key in {"status", "submitted", "registered", "reason"}
+            } for field, values in compare_fields(claims, result.get("match")).items()
+              if field in claims or (field == "journal" and claims.get("venue"))}
         if not any(row["claims"].get(field) for field in ("doi", "arxiv_id", "pmid")):
             # A title-only candidate is a lead. Require corroborating submitted metadata.
             if record["status"] == "verified" and not all(row["claims"].get(field) for field in ("authors", "year")):

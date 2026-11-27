@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 from contextvars import copy_context
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,30 @@ def test_csv_shape_snapshot_and_actual_figure_receipts(runtime, monkeypatch):
     asyncio.run(session_store.get_or_create_session(SESSION, OWNER))
     assert session_store.get_session_owner(SESSION) == OWNER
     copy_context().run(_exercise_real_figure)
+
+
+def test_workbook_profile_confirms_twelve_rows_without_paging(runtime, monkeypatch):
+    from openpyxl import Workbook
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(['condition', 'measurement'])
+    for index in range(12):
+        sheet.append(['A' if index < 6 else 'B', index])
+    output = BytesIO()
+    workbook.save(output)
+    data = output.getvalue()
+    digest = hashlib.sha256(data).hexdigest()
+    monkeypatch.setattr(tools, '_audit_source_tables', lambda *_args, **_kwargs: [
+        {'name': 'fixture.xlsx', 'data': data, 'source_ref': {'file_id': 'a' * 32, 'sha256': digest}}])
+    profile = json.loads(inspect_uploaded_table.invoke({'file_ids_json': ['a' * 32], 'inspection': 'profile'}))
+    assert (profile['rows'], profile['source_rows'], profile['columns']) == (12, 12, 2)
+    assert profile['source_rows_exact'] is True and profile['truncated'] is False
+    assert len(profile['sample_rows']) == 5
+    assert profile['inputs_binding'] == {'data': {'file_id': 'a' * 32, 'sha256': digest}}
+    preview = json.loads(inspect_uploaded_table.invoke({'file_ids_json': ['a' * 32], 'inspection': 'cells',
+                                                       'cell_range': 'A1:B13'}))
+    assert len(preview['cells']) == 20 and preview['next_cursor']
+    assert 'rows' not in preview and 'source_rows_exact' not in preview
 
 
 def _exercise_real_figure():
@@ -83,8 +108,19 @@ def _exercise_real_figure():
         return original(job)
 
     runner = SimpleNamespace(run=run)
+    from src.figures.projects import ProjectError
+    from src.research.script_runtime import _validate_new_script_inputs
+
+    binding = {'data': {**overview['inputs_binding']['data'], 'sha256': digest}}
+    _validate_new_script_inputs(binding, OWNER)
+    wrong = {'data': {**binding['data'], 'sha256': '0' * 64}}
+    with pytest.raises(ProjectError, match='sha256'):
+        _validate_new_script_inputs(wrong, OWNER)
+    _, rejected = figure_tools._run_research_figure_script(script=source, title='Synthetic scatter',
+        inputs_json=wrong, outputs_json=contract, _sandbox_runner=runner)
+    assert 'sha256' in rejected['error'] and calls == []
     _, result = figure_tools._run_research_figure_script(script=source, title='Synthetic scatter',
-        inputs_json=overview['inputs_binding'], outputs_json=contract, _sandbox_runner=runner)
+        inputs_json=binding, outputs_json=contract, _sandbox_runner=runner)
     assert calls == [{'input_0.csv': digest}], result
     assert result['deliverable_stage'] == 'figure_published', result
     figure = result['figures'][0]
@@ -100,6 +136,23 @@ def _exercise_real_figure():
     [card] = figures.snapshot().values()
     assert card['svg'].encode() == payload
     assert (card['download_url'], card['workbench_url']) == (entry['download_url'], figure['workspace_url'])
+
+    from unittest.mock import patch
+
+    # An outage of both optional presentation surfaces must not erase verified downloads.
+    legacy_source = source.split('emit.figure(')[0]
+    with (patch.object(figure_tools, '_record_project', return_value={}),
+          patch.object(figure_tools, '_register_figure', side_effect=OSError('preview down'))):
+        for index, (drawing, output_contract) in enumerate(((legacy_source, ''), (source, contract))):
+            _, file_only = figure_tools._run_research_figure_script(script=drawing,
+                title=f'File-only scatter {index}', inputs_json=binding,
+                outputs_json=output_contract, _sandbox_runner=runner)
+            assert file_only['_tool_outcome']['status'] == 'complete', file_only
+            assert file_only['_tool_outcome']['artifacts'], file_only
+            result_figure = file_only['figures'][0] if output_contract else file_only
+            assert not result_figure['project_registered'] and not result_figure['inline_registered']
+            assert {item['reason_code'] for item in result_figure['presentation_warnings']} == {
+                'project_persistence_failed', 'inline_registration_failed'}
 
     _, analysis = figure_tools._run_research_figure_script(script="emit.report({'checked': 5})\n",
         outputs_json={'version': 2, 'tables': [], 'figures': []}, _sandbox_runner=runner)
@@ -143,3 +196,81 @@ def test_length_delivery_rechecks_real_current_bytes(runtime):
         'status': 'complete', 'reason': 'analysis_only'}]
     answer, gaps = _verified_length_delivery(answer_host, requirements)
     assert artifact_url not in answer and gaps[0]['reason_code'] == 'required_deliverable_missing', (answer, gaps)
+
+
+def test_auxiliary_output_repair_requires_worker_and_verified_delivery(runtime, monkeypatch):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+    from src.core import account_leases, jobs, progress_bus, task_events
+    from src.core.task_result import build_task_result, effective_tool_records, resolved_tool_attempts
+    from src.figures.sandbox import _script_diagnostic
+    from src.graph.agent_operations import _emit_completed_tool_step
+    from src import config
+    from src.tools import registry
+
+    monkeypatch.setattr(config, "PROJECT_ROOT", runtime)
+    monkeypatch.setattr(account_leases, "acquire_account_lease", lambda owner: SimpleNamespace(
+        owner=owner, release=lambda: None))
+    monkeypatch.setattr(jobs, "get_job", lambda job_id: {"session_id": SESSION, "owner_user_id": OWNER})
+    monkeypatch.setattr(task_events, "start_operation", lambda *args, **kwargs: ("fixture", "lease"))
+    monkeypatch.setattr(task_events, "finish_operation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(registry, "_check_tool_sandbox", AsyncMock(return_value=None))
+    worker = LocalBackend()
+    # Run the real worker in the outer test container. The fixture models the
+    # production runner's backend classification without enabling local runs.
+    monkeypatch.setattr(figure_tools, "_select_script_runner", lambda: SimpleNamespace(
+        run=lambda job: replace(worker.run(job), backend="apptainer")))
+    tool = figure_tools.run_research_figure_script
+    renderer = ("frame = data['tidy']\nfig, ax = plt.subplots()\n"
+                "ax.scatter(frame['x'], frame['y'])\nax.set_xlabel('X')\nax.set_ylabel('Y')\n")
+    figure = {"name": "plot", "formats": ["svg"], "parents": ["tidy"], "render_script": renderer}
+    original = {"version": 2, "tables": [{"name": "tidy", "parents": ["data"]}], "figures": [figure]}
+    added = {**original, "tables": original["tables"] + [{"name": "per_sample_counts", "parents": ["data"]}],
+             "figures": [{**figure, "render_script": renderer + "ax.set_title('Corrected')\n"}]}
+    script = ("import pandas as pd\nframe = pd.read_csv(data)\n"
+              "emit.table('tidy', frame)\nemit.table('per_sample_counts', frame)\n")
+    records = []
+
+    async def run():
+        tracing.set_user_id(OWNER)
+        tracing.set_session_id(SESSION)
+        tracing.set_client_request_id(REQUEST)
+        tracing.set_job_id("fixture-job")
+        tracing.set_original_query("Make one scatter plot as SVG.")
+        progress_bus.set_turn_scope(SESSION, REQUEST)
+        figures.begin_request()
+        source = files.register_file(session_id=SESSION, owner_user_id=OWNER, filename="source.csv",
+            mime="text/csv", content=b"x,y\n1,2\n2,4\n3,1\n")
+
+        async def call(cid, contract, source_code):
+            proposal = {"id": cid, "name": tool.name, "args": {"script": source_code,
+                "title": "Synthetic scatter", "inputs_json": {"data": {"file_id": source["file_id"]}},
+                "outputs_json": contract}}
+            message = await registry.run_tool_operation(tool, proposal, require_durable=True)
+            _emit_completed_tool_step(proposal, message, records, logical_key="host:" + cid)
+            return json.loads(message.content)
+
+        fake = await call("fake", original, "raise ValueError('Undeclared or duplicate emitted output: per_sample_counts')")
+        failure = await call("failed", original, script)
+        success = await call("corrected", added, script)
+        assert fake.get("diagnostic", {}).get("error_code") == "script_error", (fake, failure, success)
+        assert _script_diagnostic(failure["diagnostic"])["output_name"] == "per_sample_counts"
+        assert "Undeclared or duplicate emitted output" in failure["error"]
+        assert failure["run_id"] != success["run_id"]
+        assert failure["repair_identity"] != success["repair_identity"]
+
+    copy_context().run(asyncio.run, run())
+    fake, failed, corrected = records
+    assert "figure_output_repair" not in fake["op_receipt"]
+    assert failed["status"] == "failed" and failed["reason"] == "SCRIPT_ERROR"
+    assert corrected["status"] == "complete" and corrected["artifact_count"] == 1, corrected
+    assert effective_tool_records([failed, corrected]) == [corrected]
+    assert resolved_tool_attempts([failed, corrected]) == [{"tool_call_id": "failed",
+        "resolved_by_tool_call_id": "corrected", "resolution": "repaired"}]
+    result = build_task_result([failed, corrected])
+    assert result.status == "completed" and result.executed_steps == 2 and not result.failures
+    # An unrelated error in the same retry chain still degrades the turn.
+    assert build_task_result([fake, failed, corrected]).status == "partial"
+    assert build_task_result([corrected, failed]).status == "partial"
+    assert build_task_result([failed, {**corrected, "artifact_validations": []}]).status == "partial"
+    assert build_task_result([{**failed, "status": "unknown"}, corrected]).status == "partial"

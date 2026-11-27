@@ -1,64 +1,76 @@
-"""Test the real chat shell with context metadata only and a loopback fixture."""
+"""Test the real chat shell with browser-local context fixtures."""
 import argparse
-import threading
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.sync_api import expect, sync_playwright
 
 WEB = Path(__file__).resolve().parent.parent
+ORIGIN = 'http://context-fixture.test'
 SNAPSHOT = {
     'snapshot_version': 1, 'scope': 'context_snapshot', 'status': 'complete', 'seq': 11,
     'session_id': 'observed', 'request_id': 'synthetic-request', 'logical_call_id': 'synthetic-call',
     'attempt_id': 'synthetic-attempt', 'estimate_scope': 'full_request_estimate',
     'estimate_method': 'character_heuristic', 'estimated_input_tokens': 23332,
     'input_limit': 128000, 'model_window': None, 'model_window_status': 'unknown', 'output_tokens': 4096,
+    'model': 'hidden-fixture-model', 'view_scope': 'active', 'history_load_status': 'loaded',
+    'actual_output_tokens': 4096, 'attempt_elapsed_ms': 5000,
+    'task_budget': {'calls': 2, 'max_calls': 8, 'tokens': 4000, 'max_tokens': 9000},
     'components': {'system': 2962, 'messages': 914, 'tool_arguments': 0, 'tool_schemas': 19432, 'images': 0, 'protocol': 24},
     'provider_usage': {'scope': 'single_call', 'logical_call_id': 'synthetic-call', 'attempt_id': 'synthetic-attempt',
                        'input_tokens': 24354, 'output_tokens': 1858, 'cache_read': 0},
 }
 
 
-class QuietHandler(SimpleHTTPRequestHandler):
-    def log_message(self, *_):
-        pass
-
-
-def assert_inner_bounds(drawer):
-    overflow = drawer.evaluate("""el => {
+def assert_fully_expanded(drawer):
+    geometry = drawer.evaluate("""el => {
+      const body = el.querySelector('.ctx-drawer-body'), rect = el.getBoundingClientRect();
       const checks = [
-        ['.ctx-drawer-header', ['.ctx-view-picker', '#ctxClose']],
-        ['.ctx-drawer-body', ['#ctxTreemap', '#ctxGrid', '#ctxLegend', '#ctxCategoryDetail', '#ctxUsage']]
+        ['.ctx-drawer-header', ['.ctx-drawer-title', '.ctx-view-picker', '#ctxClose']],
+        ['.ctx-drawer-body', ['#ctxTreemap', '#ctxGrid', '#ctxLegend', '#ctxCategoryDetail', '#ctxUsage']],
+        ['#ctxLegend', ['.context-legend-row']],
+        ['.context-legend-row', ['.ctx-item-name', '.ctx-item-value', '.ctx-item-percent']],
+        ['.ctx-item-name', ['span']]
       ];
-      return checks.flatMap(([parent, children]) => {
-        const container = el.querySelector(parent), box = container.getBoundingClientRect();
+      const clipped = checks.flatMap(([parent, children]) => [...el.querySelectorAll(parent)].flatMap(container => {
+        if (!container.getClientRects().length) return [];
+        const box = container.getBoundingClientRect();
         const css = getComputedStyle(container), zoom = container.currentCSSZoom || 1;
         const left = box.left + parseFloat(css.paddingLeft) * zoom;
         const right = box.right - parseFloat(css.paddingRight) * zoom;
-        return children.flatMap(selector => {
-          const node = el.querySelector(selector), rect = node.getBoundingClientRect();
-          return !node.hidden && (rect.left < left - 1 || rect.right > right + 1 || node.scrollWidth > node.clientWidth + 1)
+        return children.flatMap(selector => [...container.querySelectorAll(selector)].flatMap(node => {
+          if (!node.getClientRects().length) return [];
+          const rect = node.getBoundingClientRect();
+          return rect.left < left - 1 || rect.right > right + 1 || node.scrollWidth > node.clientWidth + 1
             ? [[selector, rect.left, rect.right, left, right, node.scrollWidth, node.clientWidth]] : [];
-        });
-      });
+        }));
+      }));
+      return {left: rect.left, right: rect.right, bottom: rect.bottom, clipped,
+              width: innerWidth, height: innerHeight,
+              overflowX: Math.max(el.scrollWidth - el.clientWidth, body.scrollWidth - body.clientWidth),
+              overflowY: Math.max(el.scrollHeight - el.clientHeight, body.scrollHeight - body.clientHeight)};
     }""")
-    assert not overflow, overflow
+    assert 0 <= geometry['left'] < geometry['right'] <= geometry['width'] + 1, geometry
+    assert geometry['bottom'] <= geometry['height'] + 1, geometry
+    assert geometry['overflowX'] <= 1 and geometry['overflowY'] <= 1 and not geometry['clipped'], geometry
 
 
-def verify(page, origin, width, output):
+def verify(page, width, output):
     page.set_default_timeout(8000)
     errors = []
     page.on('pageerror', lambda error: errors.append(str(error)))
 
     def respond(route):
-        if not route.request.url.startswith(origin + '/'):
+        if not route.request.url.startswith(ORIGIN + '/'):
             route.abort()
             return
         path = urlparse(route.request.url).path
         if not path.startswith('/api/'):
-            route.continue_()
+            asset = (WEB / ('index.html' if path == '/' else path.lstrip('/'))).resolve()
+            if asset.is_relative_to(WEB) and asset.is_file():
+                route.fulfill(path=asset)
+            else:
+                route.fulfill(status=404)
             return
         body = {}
         if path == '/api/v2/auth/me':
@@ -78,7 +90,7 @@ def verify(page, origin, width, output):
 
     page.route('**/*', respond)
     page.add_init_script("localStorage.setItem('citrus_session_id_context-fixture', 'observed')")
-    page.goto(origin + '/', wait_until='domcontentloaded')
+    page.goto(ORIGIN + '/', wait_until='domcontentloaded')
     ring, drawer = page.locator('#ctxCircleBtn'), page.locator('#ctxDrawer')
     expect(ring).to_have_text('18%')
     page.keyboard.press('Tab')
@@ -89,36 +101,56 @@ def verify(page, origin, width, output):
     assert focus == {'border': 'rgb(189, 97, 40)', 'focus': '#BD6128'}, focus
     page.screenshot(path=output / f'composer-{width}.png', animations='disabled')
     assert abs(float(page.locator('#ctxBtnFg').get_attribute('stroke-dasharray').split()[0]) - 23332 / 128000 * 100) < 1e-8
-    ring.click()
-    expect(page.locator('#ctxUsed')).to_have_text('23.3K / 128K')
-    expect(page.locator('#ctxValueNote')).to_contain_text('应用单次输入上限')
-    expect(page.locator('#ctxMetadata')).to_contain_text('模型窗口未知')
+    ring.focus()
+    expect(ring).to_be_focused()
+    page.keyboard.press('Enter')
+    expect(ring).to_have_attribute('aria-expanded', 'true')
+    expect(page.locator('#ctxClose')).to_be_focused()
+    expect(drawer.locator('#ctxUsed, #ctxValueNote, #ctxStatus, #ctxMetadata')).to_have_count(0)
+    for hidden in ('23.3K / 128K', '估算输入 ·', 'hidden-fixture-model', '当前调用', '历史已加载',
+                   '应用单次输入上限', '输出预留', '实际发包输出上限', '本次调用用时', '本轮预算'):
+        expect(drawer).not_to_contain_text(hidden)
     expect(page.locator('#ctxTreemap')).to_be_visible()
-    assert_inner_bounds(drawer)
-    assert drawer.evaluate('el => {const r=el.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth + 1 && el.scrollWidth <= el.clientWidth;}')
+    assert_fully_expanded(drawer)
     free = page.locator('#ctxTreemap [data-category="free"]')
     assert abs(free.evaluate('el => parseFloat(el.style.width) * parseFloat(el.style.height) / 10000') - 104668 / 128000) < 1e-6
     page.screenshot(path=output / f'treemap-{width}.png', animations='disabled')
-    page.locator('#ctxLegend [data-category="tool_schemas"]').click()
+    row = page.locator('#ctxLegend [data-category="tool_schemas"]')
+    row.focus()
+    page.keyboard.press('Enter')
+    expect(row).to_have_attribute('aria-expanded', 'true')
     expect(page.locator('#ctxCategoryDetail')).to_contain_text('19,432 令牌')
     expect(page.locator('#ctxCategoryDetail')).to_contain_text('工具名称、说明和参数定义')
-    page.locator('#ctxViewGrid').check()
+    page.locator('#ctxViewTreemap').focus()
+    page.keyboard.press('ArrowRight')
+    expect(page.locator('#ctxViewGrid')).to_be_checked()
     expect(page.locator('#ctxGrid')).to_be_visible()
     expect(page.locator('#ctxGrid i')).to_have_count(100)
     expect(page.locator('#ctxGrid i.is-used')).to_have_count(18)
     expect(page.locator('#ctxGrid .ctx-slot--1')).to_have_count(82)
-    assert_inner_bounds(drawer)
+    assert_fully_expanded(drawer)
     page.screenshot(path=output / f'grid-{width}.png', animations='disabled')
-    page.locator('#ctxUsage summary').click()
+    provider = page.locator('#ctxUsage summary')
+    provider.focus()
+    page.keyboard.press('Space')
+    expect(page.locator('#ctxUsageRows')).to_contain_text('24,354')
     expect(page.locator('#ctxUsageRows')).to_contain_text('缓存读取')
     expect(page.locator('#ctxUsageRows')).not_to_contain_text('缓存覆盖率')
+    assert_fully_expanded(drawer)
+    page.screenshot(path=output / f'expanded-{width}.png', animations='disabled')
+    if width >= 1025:
+        page.evaluate("const files = document.getElementById('sessionFilesPanel'); files.style.visibility = 'hidden'; files.hidden = false; document.body.classList.add('session-files-open')")
+        dock_geometry = "[document.querySelector('#ctxDrawer').getBoundingClientRect().bottom, document.querySelector('#sessionFilesPanel').getBoundingClientRect().top, document.body.style.getPropertyValue('--context-dock-height')]"
+        drawer_bottom, files_top, observed_height = page.evaluate(dock_geometry)
+        assert drawer_bottom <= files_top, (drawer_bottom, files_top, observed_height)
+        assert_fully_expanded(drawer)
+        page.evaluate("document.getElementById('sessionFilesPanel').hidden = true; document.body.classList.remove('session-files-open')")
     page.keyboard.press('Escape')
     expect(ring).to_be_focused()
     page.evaluate("switchSession('unknown')")
     expect(ring).to_have_text('23.3K')
     assert page.locator('#ctxBtnFg').get_attribute('stroke-dasharray') == '0 100'
     ring.click()
-    expect(page.locator('#ctxUsed')).to_have_text('23.3K')
     expect(page.locator('#ctxChartNote')).to_contain_text('不表示窗口占用率')
     expect(page.locator('#ctxCategoryDetail')).to_be_hidden()
     expect(page.locator('#ctxGrid .ctx-slot--1')).to_have_count(0)
@@ -127,7 +159,7 @@ def verify(page, origin, width, output):
     page.evaluate("switchSession('empty')")
     expect(ring).to_have_text('—')
     ring.click()
-    expect(page.locator('#ctxUsed')).to_have_text('—')
+    expect(page.locator('#ctxChartNote')).to_have_text('暂无可显示的上下文构成。')
     expect(page.locator('#ctxTreemap')).to_be_hidden()
     expect(page.locator('#ctxGrid')).to_be_hidden()
     expect(page.locator('#ctxLegend')).to_be_hidden()
@@ -138,23 +170,17 @@ def verify(page, origin, width, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--chromium', type=Path, help='Use an already installed browser')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    with ThreadingHTTPServer(('127.0.0.1', 0), partial(QuietHandler, directory=WEB)) as server:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(args=['--no-sandbox'])
-                for width, height in ((1360, 860), (390, 760), (320, 570)):
-                    page = browser.new_page(viewport={'width': width, 'height': height}, has_touch=width < 600)
-                    verify(page, f'http://127.0.0.1:{server.server_port}', width, args.output)
-                    print(f'PASS: composer + context live metadata + session transitions, {width}x{height}', flush=True)
-                    page.close()
-                browser.close()
-        finally:
-            server.shutdown()
-            thread.join()
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path=args.chromium, args=['--no-sandbox', '--disable-gpu'])
+        for width, height in ((1360, 860), (390, 760), (320, 570)):
+            page = browser.new_page(viewport={'width': width, 'height': height}, has_touch=width < 600)
+            verify(page, width, args.output)
+            print(f'PASS: context layout, keyboard, provider data, session transitions, {width}x{height}', flush=True)
+            page.close()
+        browser.close()
 
 
 if __name__ == '__main__':

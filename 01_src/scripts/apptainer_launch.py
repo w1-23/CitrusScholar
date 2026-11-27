@@ -108,7 +108,9 @@ def isolated_corpus(config, binds):
     occupied = [Path(path).resolve() for path, _mode in binds]
     if any(root.is_relative_to(path) or path.is_relative_to(root) for path in occupied):
         raise ValueError('Isolated corpus root overlaps a deployment bind')
-    mounts = [(str(root), 'rw')]
+    if config.get('external_modules'):
+        growth = read = durable = False
+    mounts = [(str(root), 'ro' if config.get('external_modules') else 'rw')]
     variables = ['CITRUS_CORPUS_MODE=isolated', 'CITRUS_ISOLATED_CORPUS_ROOT=' + str(root),
                  'CITRUS_CORPUS_FETCH_GROWTH=' + str(int(growth)), 'CITRUS_CORPUS_READ=' + str(int(read)),
                  'CITRUS_CORPUS_DURABLE_INTAKE=' + str(int(durable))]
@@ -126,6 +128,60 @@ def isolated_corpus(config, binds):
             raise ValueError('Invalid isolated corpus experiment generation')
         variables.append('CITRUS_CORPUS_READ_GENERATION=' + generation)
     return mounts, [arg for value in variables for arg in ('--env', value)]
+
+
+def external_module_bindings(config, binds):
+    values = config.get('external_modules')
+    if values is None:
+        return [], [], []
+    if not isinstance(values, dict) or set(values) != {'selfcorpus', 'workbench'}:
+        raise ValueError('Invalid external modules')
+    corpus, workbench = values['selfcorpus'], values['workbench']
+    keys = {'client_path', 'client_sha256', 'secret_file'}
+    if (not isinstance(corpus, dict) or not keys <= set(corpus) <= keys | {'auto_intake'}
+            or type(corpus.get('auto_intake', False)) is not bool
+            or not isinstance(workbench, dict) or set(workbench) != {'secret_file'}):
+        raise ValueError('Invalid external module configuration')
+    client = Path(absolute(corpus['client_path']))
+    if not client.is_dir() or client.resolve(strict=True) != client or client.stat().st_mode & 0o222:
+        raise ValueError('Selfcorpus client package must be immutable')
+    pins = corpus['client_sha256']
+    required = {'corpus/__init__.py', 'corpus/auth.py'}
+    if not isinstance(pins, dict) or set(pins) != required:
+        raise ValueError('Selfcorpus client requires exact file pins')
+    files = set()
+    for path in client.rglob('*'):
+        if path.is_symlink() or path.stat().st_mode & 0o222:
+            raise ValueError('Invalid Selfcorpus client package member')
+        if path.is_dir():
+            continue
+        rel = path.relative_to(client).as_posix()
+        if rel not in pins or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != pins[rel]:
+            raise ValueError('Selfcorpus package file digest mismatch')
+        files.add(rel)
+    if files != required:
+        raise ValueError('Incomplete Selfcorpus client package')
+    secrets = []
+    for value in (corpus['secret_file'], workbench['secret_file']):
+        path = Path(absolute(value))
+        if (path.resolve(strict=True) != path or not path.is_file() or path.stat().st_mode & 0o077
+                or not 32 <= path.stat().st_size <= 4096):
+            raise ValueError('Module secret must be a private regular file')
+        secrets.append(path)
+    mounts = [client, *secrets]
+    seen = [Path(path).resolve() for path, _ in binds]
+    for path in mounts:
+        if any(path.is_relative_to(other) or other.is_relative_to(path) for other in seen):
+            raise ValueError('External module bind overlaps another deployment bind')
+        seen.append(path)
+    env = ['CITRUS_SELFCORPUS_RETRIEVAL=1', 'CITRUS_SELFCORPUS_URL=http://127.0.0.1:8061',
+           f'CITRUS_SELFCORPUS_SECRET_FILE={secrets[0]}', 'CITRUS_WORKBENCH_BRIDGE_ENABLED=1',
+           f'WORKBENCH_HOST_KEY_FILE={secrets[1]}', 'CITRUS_WORKBENCH_UPSTREAM=http://127.0.0.1:8062',
+           'CITRUS_WORKBENCH_PUBLIC_URL=/workbench/workbench/',
+           'CITRUS_WORKBENCH_LAUNCH_ENDPOINT=/workbench/api/v1/launch']
+    if corpus.get('auto_intake'):
+        env.append('CITRUS_SELFCORPUS_AUTO_INTAKE=1')
+    return [(str(path), 'ro') for path in mounts], [arg for value in env for arg in ('--env', value)], [str(client)]
 
 
 def command(config, role):
@@ -203,6 +259,11 @@ def command(config, role):
         corpus_binds, corpus_env = isolated_corpus(config, binds)
         binds += corpus_binds
         result += corpus_env
+    module_paths = []
+    if role == 'web':
+        module_binds, module_env, module_paths = external_module_bindings(config, binds)
+        binds += module_binds
+        result += module_env
     if role == 'web' and config.get('browse_config'):
         # Script is launched with -I; import only from this trusted source snapshot.
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -229,28 +290,36 @@ def command(config, role):
                    '--env', 'CITRUS_BROWSE_APPTAINER=1']
     skill_release = verified_skill_release(config, binds)
     external_required = config.get('external_fusion_required', False)
-    if type(external_required) is not bool:
-        raise ValueError('Invalid external Skill policy')
+    methods_only = config.get('scientific_methods_only', False)
+    if type(external_required) is not bool or type(methods_only) is not bool or (methods_only and not external_required):
+        raise ValueError('Invalid scientific Skill policy')
+    if methods_only:
+        if (skill_release is None or not (skill_release / 'scientific-methods.json').is_file()
+                or (skill_release / 'fusion').exists() or (skill_release / 'python').exists()):
+            raise ValueError('Pinned method-only release unavailable')
+        result += ['--env', 'CITRUS_SCIENTIFIC_METHODS_ONLY=1']
     if external_required:
-        if skill_release is None or not (skill_release / 'fusion/bundle.json').is_file():
+        if not methods_only and (skill_release is None or not (skill_release / 'fusion/bundle.json').is_file()):
             raise ValueError('Required external Skill bundle unavailable')
         result += ['--env', 'CITRUS_EXTERNAL_FUSION=required']
     # The release source tree is the single authority for both the application
     # and the method packages. Without ``packages/`` on PYTHONPATH the image's
     # site-packages copy shadows a freshly published skill package, so a fixed
     # reference kernel or audit rule never reaches the running task.
-    python_path = [f'{source}/packages', f'{source}/01_src']
+    python_path = [*module_paths, f'{source}/packages', f'{source}/01_src']
     if skill_release is not None:
         binds.append((str(skill_release), 'ro'))
         result += ['--env', 'CITRUS_SKILL_RELEASE=' + str(skill_release)]
         if (skill_release / 'python').is_dir():
             python_path.insert(0, f'{skill_release}/python')
+        if methods_only and role == 'web' and (skill_release / 'host-python').is_dir():
+            python_path.insert(0, f'{skill_release}/host-python')
     historical = config.get('historical_skill_releases', [])
-    if not isinstance(historical, list) or len(historical) > 16:
+    if not isinstance(historical, list) or len(historical) > 64:
         raise ValueError('Invalid historical Skill release registry')
     if role == 'web':
         used = {Path(path) for path, _mode in binds}
-        pre_fusion, fusion_history = [], []
+        pre_fusion, fusion_history, seen_inventory = [], [], set()
         for item in historical:
             if not isinstance(item, dict) or item.keys() != {'path', 'mount_path', 'sha256'}:
                 raise ValueError('Invalid historical Skill release entry')
@@ -262,6 +331,9 @@ def command(config, role):
                 raise ValueError('Historical Skill mount overlaps an existing deployment bind')
             used.add(destination)
             result += ['--bind', f'{prior}:{destination}:ro']
+            if item['sha256'] in seen_inventory:
+                continue  # Preserve the mount for exact path pins, but index identical bytes once.
+            seen_inventory.add(item['sha256'])
             if (prior / 'fusion/bundle.json').is_file():
                 fusion_history.append(str(destination))
             elif not (prior / 'fusion').exists():

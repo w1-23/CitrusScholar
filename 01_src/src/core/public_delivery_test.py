@@ -107,6 +107,13 @@ class PublicDeliveryTests(unittest.TestCase):
         task_events.init_schema(conn)
         conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", ("job", 1, "text", json.dumps({"content": "old private preview"}), 102))
         conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", ("job", 2, "text_reset", "{}", 103))
+        model_preview = {"origin": "langgraph", "source": "native_stream", "visibility": "public",
+            "schema_version": 1, "job_id": "job", "run_id": "job", "kind": "model_preview",
+            "status": "streaming", "at_ms": 1700000000000, "note_id": "stream:" + "a" * 64,
+            "call_id": "mdl:" + "a" * 16, "delta_index": 0, "text": "legacy provisional fixture"}
+        conn.execute("INSERT INTO task_events VALUES (?,?,?,?,?)", ("job", 3, "assistant_progress", json.dumps(model_preview), 103))
+        self.assertIsNone(task_events._append(conn, "job", "assistant_progress", model_preview))
+        self.assertIsNone(task_events._append(conn, "job", "text", {"content": "new unmarked draft"}))
         task_events._append(conn, "job", "task_state", {"schema_version": 1, "system_prompt": "storage fixture"})
         self.assertIsNone(task_events._append(conn, "job", "text", {"content": "new draft", "delivery": "draft"}))
         task_events._append(conn, "job", "answer_start", {})
@@ -125,6 +132,8 @@ class PublicDeliveryTests(unittest.TestCase):
         self.assertNotIn("storage fixture", public)
         self.assertNotIn("hidden fixture", public)
         self.assertIn("public final", public)
+        self.assertNotIn("legacy provisional fixture", public)
+        self.assertEqual(exported["events"][2]["data"], {"seq": 3})
         self.assertEqual(exported["events"][-2]["data"]["turn_timings"]["visible_answer_first_ms"], 8000)
         self.assertEqual(exported["events"][-1]["data"], {
             "seq": exported["events"][-1]["seq"], "status": "compacted", "elapsed_ms": 55})
@@ -165,6 +174,8 @@ class PublicDeliveryTests(unittest.TestCase):
                       json.dumps({"role": "system", "content": "private fixture"}),
                       {"draft": "private fixture", "value": "normal evidence"}]},
                   "authorization": "Bearer protected-credential"}
+        self.assertEqual(module.event_details("assistant_progress", {"visibility": "public",
+            "kind": "model_preview", "text": "uncommitted fixture", "seq": 2}), {"seq": 2})
         safe = module.render(sample)
         for visible in ("LC-MS sample", "peak area", "normal evidence", "[REDACTED]"):
             self.assertIn(visible, safe)
@@ -174,3 +185,60 @@ class PublicDeliveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_verified_plot_placeholder_keeps_preview_links_and_prose_without_pasting_source(monkeypatch):
+    from hashlib import sha256
+
+    from src.core import figures
+    from src.core.public_delivery import verified_figure_previews
+    from src.core.turn_outcome import CompletionGoal
+    from src.graph.task_contract import contract_for_turn
+    from src.session import files
+
+    query = "用这份工作簿按 group 做箱线图叠加原始数据点，使用 Nature 科研风格，交付可下载 SVG、PNG 和 PDF。只使用附件，不联网。"
+    requirements = contract_for_turn(query, has_tables=True).deliverables
+    session, owner, fid, aid = "fixture-session", 8, "a" * 32, "b" * 32
+    link = f"/api/v2/session/{session}/artifacts/{aid}"
+    downloadable_svg = f"/api/v2/files/{fid}/download"
+    preview = f"/api/v2/files/{fid}/preview"
+    workbench = f"/figures?project={'c' * 32}"
+    svg = '<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0 L1 1"/></svg>'
+    entry = {"artifact_id": aid, "mime_type": "image/svg+xml", "sha256": sha256(svg.encode()).hexdigest()}
+
+    def get_file(sid, file_id, *, owner_user_id):
+        assert (sid, owner_user_id) == (session, owner)
+        return entry if file_id == fid else None
+
+    monkeypatch.setattr(files, "get_file", get_file)
+    figures.begin_request()
+    figures.register(svg, "Value by group [box plot]", download_url=downloadable_svg, workbench_url=workbench)
+    figures.register("<svg><title>Other schematic</title></svg>", download_url=f"/api/v2/files/{'d' * 32}/download")
+    goals = [CompletionGoal(goal="figure", kind="deliverable", evidence_call_ids=["plot-current"], artifact_links=[link])]
+    validated = [{"valid": True, "request_matches": True, "producer_tool": "run_research_figure_script",
+                  "artifact_id": aid, "link": link, "mime": "image/svg+xml"}]
+    code = "```python\nprint('keep code here')\n```"
+    text = f"Before\n\n[[FIGURE:1]]\n\n[[FIGURE:2]]\n\n{code}\n\n[Download all]({link})\n\nAfter"
+
+    def previews(request=query, contract=requirements, evidence=goals, rows=validated):
+        return verified_figure_previews(request, text, contract, evidence, rows, session_id=session, owner_user_id=owner)
+
+    assert previews() == {1: preview}
+    rendered = figures.expand(text, verified_previews=previews())
+    assert svg not in rendered
+    assert f"![Value by group \\[box plot\\]]({preview})" in rendered
+    assert f"]({downloadable_svg})" in rendered and f"]({workbench})" in rendered
+    assert f"[Download all]({link})" in rendered and code in rendered
+    assert "```svg\n<svg><title>Other schematic</title></svg>\n```" in rendered
+    assert rendered.startswith("Before") and rendered.endswith("After")
+    for request in (query + " 请同时粘贴 SVG 源代码。", "Download SVG and paste the SVG markup.",
+                    "Paste the SVG source for this schematic."):
+        assert previews(request=request) == {}
+        assert svg in figures.expand(text, verified_previews=previews(request=request))
+    assert not previews(contract=contract_for_turn("绘制这个图", has_tables=True).deliverables)
+    assert not previews(evidence=[])
+    assert not previews(rows=[validated[0] | {"request_matches": False}])
+    assert not previews(rows=[validated[0] | {"producer_tool": "draw_svg"}])
+    assert not previews(rows=[validated[0] | {"link": f"{link}-old"}])
+    entry["sha256"] = "0" * 64
+    assert not previews()  # The registered placeholder and owned SVG must be identical bytes.

@@ -101,8 +101,12 @@ def replay_baseline(figure, objects=()):
         rgba = canvas.buffer_rgba()
         pixels = typed_payload_sha256({"shape": list(rgba.shape), "rgba": hashlib.sha256(rgba).hexdigest()})
         coordinates = coordinate_sha256(figure)
+        from .svg_projection import MARK_ROLES
+        # Preserve the v1 receipt for older frozen projects. Independent marks
+        # are additionally bound to the actual SVG and their versioned locator
+        # by the workbench; baseline pixels and coordinates still include them.
         targets = [{key: item.get(key) for key in ("gid", "role", "artist", "label", "semantic_key", "locator", "editable")}
-                   for item in objects]
+                   for item in objects if item.get("role") not in MARK_ROLES]
     except Exception:
         return {"version": 1, "unavailable": "replay_observation_failed"}
     return {"version": 1, "baseline_sha256": pixels, "coordinates_sha256": coordinates,
@@ -161,7 +165,7 @@ def style_capabilities(artist, role, members, properties):
     from matplotlib.collections import LineCollection, PathCollection, PolyCollection
     from matplotlib.legend import Legend
     from matplotlib.lines import Line2D
-    from matplotlib.patches import Rectangle
+    from matplotlib.patches import Arrow, Circle, Ellipse, FancyArrow, FancyArrowPatch, PathPatch, Polygon, Rectangle, Wedge
     from matplotlib.spines import Spine
     from matplotlib.text import Annotation, Text
     from .core import ScatterPoint
@@ -175,6 +179,8 @@ def style_capabilities(artist, role, members, properties):
         "ticklabel": (Text,), "grid": (Line2D,), "errorbar": (Line2D, LineCollection),
         "series": (Line2D, LineCollection, PathCollection, PolyCollection, Rectangle),
         "point": (PathCollection,), "bar": (Rectangle,),
+        "patch": (Circle, Ellipse, PathPatch, Polygon, Rectangle, Wedge),
+        "arrow": (Arrow, FancyArrow, FancyArrowPatch),
     }
     if any(type(member) not in allowed.get(role, ()) for member in edited):
         return [], "unsupported_artist_type"

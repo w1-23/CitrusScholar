@@ -80,7 +80,7 @@ def test_cutover_mixed_phase_is_read_only_until_exact_rollback(tmp_path):
     harness.write_text(f"#!{sys.executable}\n" + FAKE_SYSTEMCTL)
     harness.chmod(0o700)
     script = scripts / "cutover_8043.sh"
-    script.write_text((SOURCE / script.name).read_text().replace("root=/home/WZQ/citrusscholar", f"root={root}")
+    script.write_text((SOURCE / script.name).read_text().replace("root=/srv/citrusscholar", f"root={root}")
                       .replace("py=/usr/bin/python3.12", f"py={sys.executable}"))
     shutil.copyfile(SOURCE / "cutover_8043_record.py", scripts / "cutover_8043_record.py")
     operations = root / "rollbacks/8043-before-auto-corpus-1125"

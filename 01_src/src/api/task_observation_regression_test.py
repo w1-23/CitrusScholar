@@ -33,6 +33,7 @@ class TaskObservationTests(unittest.TestCase):
         app = FastAPI()
         app.add_api_route('/jobs/{job_id}', main.get_job_status)
         app.add_api_route('/jobs/{job_id}/events', main.get_job_events)
+        app.add_api_route('/jobs/{job_id}/operations/{operation_id}/result', main.get_operation_result)
         app.add_api_route('/sessions/{session_id}/messages', main.session_messages)
         app.add_api_route('/sessions/{session_id}/task-by-request/{client_request_id}', main.discover_chat_job)
         self.client = self.enterContext(TestClient(app))
@@ -47,6 +48,30 @@ class TaskObservationTests(unittest.TestCase):
         self.owner += 1
         self.assertEqual(self.client.get(path).status_code, 404)
         self.assertEqual(jobs.get_job(self.claim.job_id)['status'], 'running')
+
+    def test_unknown_operation_receipt_is_owned_and_does_not_dispatch(self):
+        job_id = self.claim.job_id
+        operation_id, _ = task_events.start_operation(job_id, self.owner, "fixture_tool",
+            {"private": "synthetic private input"}, tool_call_id="fixture-call")
+        with task_events.transaction() as conn:
+            conn.execute("UPDATE task_operations SET status='unknown' WHERE operation_id=?", (operation_id,))
+        before = task_events.projection(job_id)
+        path = f"/jobs/{job_id}/operations/{operation_id}/result"
+        with patch("src.tools.registry.resume_safe_operation", side_effect=AssertionError("unexpected dispatch")) as dispatch:
+            for _ in range(2):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                body = response.json()
+                self.assertEqual(body["status"], "unknown")
+                self.assertFalse(body["result_available"])
+                self.assertIsNone(body["result"])
+                self.assertNotIn("synthetic private input", response.text)
+            self.assertEqual(self.client.get(path.replace(operation_id, "not-found")).status_code, 404)
+            self.owner += 1
+            self.assertEqual(self.client.get(path).status_code, 404)
+            dispatch.assert_not_called()
+        self.assertEqual(task_events.projection(job_id), before)
 
     def test_history_failure_still_discovers_tasks_and_signals_retry(self):
         with patch.object(self.sessions, 'get_display_history_page', side_effect=OSError('internal detail')):

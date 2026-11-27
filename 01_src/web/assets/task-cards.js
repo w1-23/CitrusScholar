@@ -239,7 +239,8 @@
         row.dataset.resolvedBy = resolution ? resolution.resolved_by_tool_call_id : '';
         row.className = 'term-line ' + (['running', 'resuming'].indexOf(status) >= 0 ? 'is-running'
           : ['complete', 'completed', 'no_results'].indexOf(status) >= 0 ? 'is-complete'
-          : status === 'partial' ? 'is-partial' : ['skipped', 'cancelled', 'not_run', 'interrupted'].indexOf(status) >= 0 ? 'is-skipped' : 'is-failed');
+          : status === 'partial' ? 'is-partial' : ['proposed', 'unrecorded'].indexOf(status) >= 0 ? 'is-unconfirmed'
+          : ['skipped', 'cancelled', 'not_run', 'interrupted'].indexOf(status) >= 0 ? 'is-skipped' : 'is-failed');
         var running = ['running', 'resuming'].indexOf(status) >= 0;
         if (resolution) row.className = 'term-line is-resolved';
         if ((settled || paused) && running) row.className = 'term-line is-unconfirmed';
@@ -248,7 +249,9 @@
         row.dataset.attempt = item.attempt; row.dataset.operationId = operationId;
         var title = options.clean(data.display_name || options.toolName(data.tool_name || data.name) || '科研任务');
         var text = title + ' · ' + (resolution ? resolution.resolution === 'repaired' ? '已修复' : '已由后续结果替代'
-          : running ? settled ? '未记录结束状态' : paused ? '当前状态待确认' : '处理中' : options.statusText(status, data.reason_code));
+          : running ? settled ? '未记录结束状态' : paused ? '当前状态待确认' : '处理中'
+            : status === 'proposed' ? settled ? '未记录结束状态' : '已提交'
+            : status === 'unrecorded' ? '未记录结束状态' : options.statusText(status, data.reason_code));
         var rawSummary = data.summary || data.result_summary || (data.outcome || {}).summary;
         var summary = /^\s*[\[{]/.test(rawSummary || '') ? '执行结果已记录' : options.clean(rawSummary);
         var hint = options.clean(data.action_hint);
@@ -282,6 +285,7 @@
     }
     return {element: host, projection: projection, activeTool: activeTool,
       begin: function (generation) { if (projection.begin(generation)) draw(); },
+      reset: function () { projection.reset(); draw(); },
       pause: function (value) { if (paused !== value) { paused = value; draw(); } },
       note: function (data) {
         var item = projection.note(data);
@@ -290,7 +294,7 @@
       },
       plan: function (data) { if (projection.plan(data)) draw(); },
       terminal: function (value) { settled = value !== false; host.classList.toggle('is-terminal', settled); draw(); },
-      action: function (data) { projection.action(data); draw(); },
+      action: function (data) { projection.action(data); projection.milestone(data); draw(); },
       resolution: function (data) { if (projection.resolution(data)) draw(); },
       progress: function (data) {
         // Progress can update an existing real operation, never invent a tool.
@@ -300,5 +304,81 @@
         }
       }};
   }
-  root.CitrusTaskCards = {model: model, render: render, updateToolRow: updateToolRow, createProcessView: createProcessView};
+  // ── F-14: native stream timeline ─────────────────────────────────────────
+  // A pure projection of the normalized stream state. Nothing here reads a
+  // checkpoint, channel or graph namespace: only public lifecycle facts reach
+  // the DOM, and an unrecorded ending is shown as such instead of invented.
+  var NATIVE_STATUS_TEXT = {active: '执行中', completed: '已完成', failed: '未完成',
+    unrecorded: '未记录结束状态', proposed: '已提交', 'streaming': '生成中'};
+  function nativeStreamModel(stream, options) {
+    options = options || {};
+    if (!stream || stream.schema_version !== 1) return null;
+    var label = typeof options.toolName === 'function' ? options.toolName : function (name) { return String(name || '工具'); };
+    var clean = typeof options.clean === 'function' ? options.clean : function (text) { return String(text == null ? '' : text); };
+    var rows = [];
+    (Array.isArray(stream.subagents) ? stream.subagents : []).forEach(function (item, index) {
+      var status = item.status === 'active' ? 'active' : item.status === 'completed' ? 'completed'
+        : item.status === 'failed' ? 'failed' : 'unrecorded';
+      rows.push({key: 'subagent:' + item.subagent_id, kind: 'subagent', status: status,
+        seq: Number.isSafeInteger(item.started_seq) ? item.started_seq : 0, order: index,
+        title: '子任务' + (item.depth > 1 ? '（第 ' + item.depth + ' 层）' : ''),
+        detail: NATIVE_STATUS_TEXT[status] +
+          (item.reason_code && item.reason_code !== status ? ' · ' + clean(item.reason_code) : '')});
+    });
+    (Array.isArray(stream.tools) ? stream.tools : []).forEach(function (item, index) {
+      var status = item.status === 'unrecorded' ? 'unrecorded' : 'proposed';
+      rows.push({key: 'tool:' + item.tool_call_id, kind: 'tool', status: status,
+        seq: Number.isSafeInteger(item.seq) ? item.seq : 0, order: index,
+        title: clean(label(item.tool_name)), detail: NATIVE_STATUS_TEXT[status]});
+    });
+    if (stream.interrupt) {
+      rows.push({key: 'interrupt', kind: 'interrupt', status: stream.interrupt.status || 'requested',
+        seq: Number.isSafeInteger(stream.interrupt.seq) ? stream.interrupt.seq : 0, order: 0,
+        title: '等待确认', detail: '已请求你的确认后继续。'});
+    }
+    if (stream.resume) {
+      rows.push({key: 'resume', kind: 'resume', status: 'resumed',
+        seq: Number.isSafeInteger(stream.resume.seq) ? stream.resume.seq : 0, order: 0,
+        title: '已恢复任务', detail: clean(stream.resume.reason_code || '')});
+    }
+    rows.sort(function (left, right) { return (left.seq - right.seq) || (left.order - right.order); });
+    var preview = stream.preview && typeof stream.preview.text === 'string' ? stream.preview.text : '';
+    // Model preview is provisional narration; a product may opt out entirely
+    // without touching the ordered projection.
+    var showPreview = options.preview !== false;
+    return {rows: rows, preview: clean(preview.slice(-600)),
+      previewing: showPreview && !stream.closed && !!(stream.preview && preview),
+      unrecorded: Number(stream.unrecorded) || 0, closed: !!stream.closed};
+  }
+  function renderNativeStream(container, model) {
+    if (!container || !model) return null;
+    var host = container.querySelector('.task-native-stream');
+    if (!host) { host = node('div', 'task-native-stream'); container.appendChild(host); }
+    var parts = [];
+    model.rows.forEach(function (row) {
+      var line = node('div', 'task-native-row');
+      line.setAttribute('data-kind', row.kind);
+      line.setAttribute('data-status', row.status);
+      line.classList.add('is-' + row.status);
+      var text = node('span', 'task-native-copy');
+      text.appendChild(node('span', 'task-native-title', row.title));
+      if (row.detail) text.appendChild(node('span', 'task-native-detail', ' · ' + row.detail));
+      line.appendChild(text);
+      parts.push(line);
+    });
+    if (model.previewing) {
+      var preview = node('div', 'task-native-preview');
+      preview.appendChild(node('span', 'task-native-detail', '正在生成（预览，以交付答复为准）'));
+      preview.appendChild(node('pre', 'task-native-preview-text', model.preview));
+      parts.push(preview);
+    }
+    host.replaceChildren();
+    parts.forEach(function (part) { host.appendChild(part); });
+    host.setAttribute('data-unrecorded', String(model.unrecorded));
+    host.hidden = !parts.length;
+    return host;
+  }
+  root.CitrusTaskCards = {model: model, render: render, updateToolRow: updateToolRow,
+    createProcessView: createProcessView, nativeStreamModel: nativeStreamModel,
+    renderNativeStream: renderNativeStream, NATIVE_STATUS_TEXT: NATIVE_STATUS_TEXT};
 }(typeof window !== 'undefined' ? window : globalThis));

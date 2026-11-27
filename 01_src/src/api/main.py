@@ -507,6 +507,17 @@ async def account_auth_guard(request: Request, call_next):
         if denied is not None:
             return denied
     path = request.url.path
+    if (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+            and (path == "/figure-workbench" or path == "/figures/legacy"
+                 or path.startswith(("/api/v2/figure-workbench/", "/api/v2/figures/")))):
+        # Existing assets use the stable session/file APIs. Legacy project GETs
+        # may reconcile publication, so do not expose them as read-only routes.
+        return JSONResponse({"detail": {"code": "legacy_workbench_retired"}}, status_code=410,
+                            headers={"Cache-Control": "no-store"})
+    if (os.getenv("CITRUS_SELFCORPUS_RETRIEVAL") == "1" and request.method not in {"GET", "HEAD", "OPTIONS"}
+            and (path.startswith(("/api/v2/isolated-corpus/", "/api/v2/shared-corpus/", "/api/v2/admin/corpus/")))):
+        return JSONResponse({"detail": {"code": "legacy_corpus_read_only"}}, status_code=410,
+                            headers={"Cache-Control": "no-store"})
     if (getattr(request.app.state, "core_accepting_requests", None) is False
             and (path in {"/admin", "/figures", "/figure-workbench"} or path.startswith(("/api/", "/jobs/", "/sessions/", "/figures/")))
             and request.method != "OPTIONS"):
@@ -532,8 +543,10 @@ async def account_auth_guard(request: Request, call_next):
             # Cookie-bearing writes must prove same-origin. Logout remains
             # callable so a stale cookie can always be cleared.
             return JSONResponse({"detail": "缺少同源请求校验信息，请刷新页面后重试。"}, status_code=403)
+    workbench_browser = (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+                         and (path == "/figures" or path == "/workbench" or path.startswith("/workbench/")))
     if (path in _ANONYMOUS_AUTH_PATHS or path == "/health"
-            or (not path.startswith("/api/")
+            or (not workbench_browser and not path.startswith("/api/")
                 and not path.startswith(("/jobs/", "/sessions/")))):
         return await call_next(request)
 
@@ -2277,6 +2290,77 @@ async def cancel_chat_turn(session_id: str, client_request_id: str, request: Req
 
 
 
+@app.get("/api/v2/session/{session_id}/turn-queue/{client_request_id}/reconcile/publications")
+async def list_chat_turn_publications(session_id: str, client_request_id: str, request: Request):
+    return await _chat_turn_publications(session_id, client_request_id, request)
+
+
+@app.post("/api/v2/session/{session_id}/turn-queue/{client_request_id}/reconcile/publications/{operation_id}/{file_index}")
+async def restore_chat_turn_publication(session_id: str, client_request_id: str, operation_id: str,
+                                        file_index: int, request: Request):
+    if not re.fullmatch(r"[a-f0-9]{32}", operation_id) or not 1 <= file_index <= 1000:
+        raise HTTPException(status_code=400, detail="发布回执标识无效。")
+    return await _chat_turn_publications(session_id, client_request_id, request, (operation_id, file_index))
+
+
+async def _chat_turn_publications(session_id, client_request_id, request, target=None):
+    from src.agent.harness import execution_lock
+    from src.core import chat_turn_queue as queue, publication_reconcile as publication
+    from src.core.account_leases import AccountUnavailable, acquire_account_lease, run_account_thread
+
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", client_request_id):
+        raise HTTPException(status_code=400, detail="请求标识无效。")
+    user = current_user(request)
+    owner = int(user["user_id"])
+
+    def read_or_restore():
+        turn = queue.get_turn(owner_user_id=owner, session_id=session_id, client_request_id=client_request_id)
+        if not turn:
+            raise queue.TurnNotFound("turn_not_found")
+        if turn["state"] not in {queue.RECONCILE_REQUIRED, queue.TERMINAL}:
+            raise queue.TurnStateConflict(turn["state"])
+        job = _turn_job(turn)
+        facts = publication.operation_publication_evidence(owner=owner, session_id=session_id,
+                                                           job_id=job["job_id"]) if job else []
+        if target is None:
+            return {"files": [{key: value for key, value in row.items() if key not in {"artifact_id", "sha256"}}
+                              | {"can_restore": row["stage"] == "committed" and bool(row.get("artifact_id"))}
+                              for row in facts]}
+        row = next((row for row in facts if (row["operation_id"], row["file_index"]) == target), None)
+        if not row or row["stage"] != "committed" or not row.get("artifact_id"):
+            raise HTTPException(status_code=409, detail="此文件没有可恢复的持久发布记录。")
+        aid = row["artifact_id"]
+        publication.register_publication(db_path=PROJECT_ROOT / "state/research_artifacts.sqlite3", artifact_id=aid,
+                                         project_root=PROJECT_ROOT,
+                                         expected_scope=(owner, session_id, client_request_id, row["sha256"]))
+        return {"operation_id": target[0], "file_index": target[1], "stage": "confirmed",
+                "url": f"/api/v2/session/{session_id}/artifacts/{aid}"}
+
+    async with _turn_session_lock(session_id):
+        _require_active_turn_session(session_id, user)
+        try:
+            lease = acquire_account_lease(owner)
+        except AccountUnavailable as exc:
+            raise HTTPException(status_code=409, detail="账号当前不可用。") from exc
+        try:
+            if target is None:
+                result = await run_account_thread(lease, read_or_restore)
+            else:
+                with execution_lock(PROJECT_ROOT / "state" / "agent_locks", (owner, session_id)):
+                    result = await run_account_thread(lease, read_or_restore)
+        except queue.TurnQueueError as exc:
+            raise _turn_queue_http_error(exc) from exc
+        except (publication.PublicationRejected, OSError, sqlite3.Error) as exc:
+            raise HTTPException(status_code=409, detail="文件仍待确认，未重新执行计算。") from exc
+        except RuntimeError as exc:
+            if str(exc) != "agent_run_already_active":
+                raise
+            raise HTTPException(status_code=409, detail="此会话仍有执行中的任务。") from exc
+        finally:
+            lease.release()
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/v2/session/{session_id}/turn-queue/{client_request_id}/reconcile")
 async def reconcile_chat_turn(session_id: str, client_request_id: str, request: Request):
     """Settle exact run evidence, or deliberately isolate a stopped unknown run."""
@@ -3051,7 +3135,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
         init_budget(job_id, (time.time() + max(0.0, request_deadline - time.monotonic())
                              if math.isfinite(request_deadline) else math.inf),
                     max_calls=int(settings.AGENT_MAX_MODEL_CALLS),
-                    max_tokens=int(settings.AGENT_MAX_MODEL_TOKENS))
+                    max_tokens=int(settings.AGENT_MAX_MODEL_TOKENS), final_calls=1)
     from src.agent.identity import ExecutionIdentity
     from src.agent.execution_segments import ExecutionSegments
     identity = ExecutionIdentity(int(user["user_id"]), sid, rid, job_id)
@@ -3201,7 +3285,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             await event_queue.put(evt)
 
         async def commit_terminal(done_payload, *, status, current_step,
-                                  progress_summary="", error="", stop_reason="user",
+                                  progress_summary="", error="", stop_reason=None,
                                   stop_note="", completed_note=""):
             """Persist one terminal view and close its segment atomically.
 
@@ -3210,6 +3294,7 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             The live notification then dedups to that same terminal sequence.
             Legacy explicit recovery without a segment keeps the old ordering.
             """
+            stop_reason = stop_reason or str((done_payload.get("turn_envelope") or {}).get("stop_reason") or "")
             if segments is not None and segment_claim is not None:
                 segments.finish_terminal(
                     segment_claim, done_payload=done_payload, status=status,
@@ -3263,6 +3348,9 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
         async def process_graph():
             nonlocal park_prepared, question_wake_deferred
             from src.agent.recovery import QuestionWakeDeferred
+            from src.core.progress_bus import emit_progress
+            from src.core.public_progress import (
+                NATIVE_STREAM_MODES, NativeStreamProjector, unpack_stream_chunk)
             from src.core.tracing import set_session_id, set_user_id, set_user_role
             set_session_id(sid)
             set_user_id(int(user["user_id"]))
@@ -3276,11 +3364,45 @@ async def _prepare_claimed_chat(req: ChatRequest, request_lease,
             # The shared Agent reasons directly from the user's original query;
             # no separate intake model or confirmation card rewrites it.
 
+            # F-14: the native LangGraph stream is the execution source of truth.
+            # Frames are projected onto the existing public protocol and stored by
+            # the durable event queue; this never rebuilds the Agent Loop and a
+            # projection failure can only lose progress detail, never the turn.
+            native_stream = NativeStreamProjector(job_id=job_id, run_id=identity.run_id, model_preview=False)
+
+            def emit_native(frames) -> None:
+                for frame in frames or ():
+                    try:
+                        emit_progress("assistant_progress", frame)
+                    except Exception as exc:
+                        logger.warning("native_stream_emit_failed kind=%s",
+                                       type(exc).__name__)
+
+            if recovery_cursor or recovery_state:
+                reason = "answer" if initial_state.get("agent_question_resume") else "recovery"
+                emit_native(native_stream.resume(reason))
+
             pending_supervisor_output = None
-            graph_stream = graph.astream(initial_state, stream_mode="updates",
+            graph_stream = graph.astream(initial_state, stream_mode=list(NATIVE_STREAM_MODES),
+                                         subgraphs=True,
                                          recursion_limit=settings.RECURSION_LIMIT)
             try:
-                async for node_output in graph_stream:
+                async for stream_chunk in graph_stream:
+                    namespace, mode, node_output = unpack_stream_chunk(stream_chunk)
+                    if mode == "messages":
+                        emit_native(native_stream.feed("messages", node_output, namespace))
+                        continue
+                    if namespace:
+                        # Sub-agent activity is reported as lifecycle only; its
+                        # tokens and state never cross the public projection.
+                        emit_native(native_stream.feed(mode, node_output, namespace))
+                        continue
+                    # Settle the held-back model tail before a state transition,
+                    # so preview text always precedes the fact that replaced it.
+                    emit_native(native_stream.flush())
+                    if mode != "updates":
+                        continue
+                    emit_native(native_stream.feed("updates", node_output))
                     for node_name, output in node_output.items():
                         if node_name == "session_load":
                             continue
@@ -4131,7 +4253,7 @@ async def get_operation_result(job_id: str, operation_id: str, request: Request)
         with jobs.read_transaction() as conn:
             _read_owned_job(conn, job_id, owner)
             try:
-                return task_events.operation_result(job_id, operation_id, conn=conn)
+                return task_events.operation_result(job_id, operation_id, allow_pending_receipt=True, conn=conn)
             except task_events.TaskConflict as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -4451,9 +4573,11 @@ async def recover_chat_agent(job_id: str, req: RecoverAgentRequest, request: Req
                 if _turn_execution_busy(job_id):
                     raise task_events.TaskConflict("recovery_already_active")
                 identity = ExecutionIdentity(owner, sid, str(job["request_id"]), job_id)
+                approval_policy = (("commit_document_index",) if settings.PERMISSION_NATIVE_SHARED_INDEX else ())
+                approval_options = {"native_approval_tools": approval_policy} if approval_policy else {}
                 state = await run_account_async(lease, load_recovery_state(
                     PROJECT_ROOT / "state", identity,
-                    (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model())))
+                    (settings.RESOLVED_MAIN_BASE_URL, get_deepseek_model()), **approval_options))
                 # All file identities come from the protected original request. Resolve
                 # ownership and current availability again while the account is leased.
                 file_ids = [str(ref["file_id"]) for ref in state.get("attachment_refs", [])]
@@ -5125,11 +5249,19 @@ if _frontend_assets.exists():
 # ── The figure workspace ──────────────────────────────────────────────────
 # A separate page and a separate family of endpoints, mounted here so that
 # the rest of the service is untouched by the feature.
-from src.api import figure_router, figure_workbench_router  # noqa: E402
+_workbench_external = os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
+if _workbench_external:
+    from src.api.workbench_gateway import workbench_gateway
 
-app.include_router(figure_router.router)
-app.include_router(figure_workbench_router.router)
-app.include_router(figure_workbench_router.page_router)
+    app.include_router(workbench_gateway(current_user))
+else:
+    from src.api import figure_router, figure_workbench_router
+
+    app.include_router(figure_router.router)
+    app.include_router(figure_workbench_router.router)
+    app.include_router(figure_workbench_router.page_router)
+from src.api.workbench_bridge import register_workbench_bridge  # noqa: E402
+register_workbench_bridge(app, current_user=current_user, require_owned_session=require_owned_session)
 from src.api.integrity_router import router as integrity_router  # noqa: E402
 app.include_router(integrity_router)
 from src.api.reference_router import router as reference_router  # noqa: E402
@@ -5145,7 +5277,15 @@ if os.getenv("CITRUS_CORPUS_MODE") == "isolated":
 
 @app.get("/figures")
 async def serve_figures_page(request: Request):
-    return await figure_workbench_router.workbench_page(request)
+    if not _workbench_external:
+        return await figure_workbench_router.workbench_page(request)
+    from fastapi.responses import HTMLResponse
+
+    current_user(request)
+    return HTMLResponse("""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<title>Workbench</title><body><main><h1>工作台</h1><p id="workbench-open-status" role="status">正在打开工作台…</p>
+<p><a href="/">返回会话</a></p></main><script src="/assets/workbench-launch.js" defer></script></body></html>""",
+        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/figures/legacy", include_in_schema=False)
@@ -6211,7 +6351,7 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
             notes = public_working_notes(job["job_id"])
         except Exception as exc:
             logger.warning("public_progress_failed stage=history kind=%s", type(exc).__name__)
-            notes = []
+            return questions
         turn["trace"] = [item for item in turn["trace"] if item.get("kind") != "note"]
         turn["trace"].extend(notes)
         return questions
@@ -6737,8 +6877,9 @@ def _original_file_download(info: dict):
 async def preview_account_file(file_id: str, request: Request, library_tile: bool = False):
     user = current_user(request)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_account_file, file_id,
-                                   int(user["user_id"]), touch=not library_tile)
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_account_file(file_id,
+                                   int(user["user_id"]), touch=not library_tile)))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
     return _protected_file_preview(info, library_tile=library_tile)
@@ -6748,8 +6889,9 @@ async def preview_account_file(file_id: str, request: Request, library_tile: boo
 async def download_account_file(file_id: str, request: Request):
     user = current_user(request)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_account_file, file_id,
-                                   int(user["user_id"]), touch=True)
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_account_file(file_id,
+                                   int(user["user_id"]), touch=True)))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于当前账号。")
     return _original_file_download(info)
@@ -6793,8 +6935,9 @@ async def preview_session_file(session_id: str, file_id: str, request: Request):
     from src.core.resource_access import PRIVATE_FILE
     require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_file, session_id, file_id,
-                                   touch=True, owner_user_id=int(user["user_id"]))
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_file(session_id, file_id,
+                                   touch=True, owner_user_id=int(user["user_id"]))))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于此会话")
 
@@ -6808,8 +6951,9 @@ async def download_session_file(session_id: str, file_id: str, request: Request)
     from src.core.resource_access import PRIVATE_FILE
     require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
     from src.session import files as session_files
-    info = await asyncio.to_thread(session_files.get_file, session_id, file_id,
-                                   touch=True, owner_user_id=int(user["user_id"]))
+    info = await asyncio.to_thread(lambda: session_files.verified_public_file(
+        session_files.get_file(session_id, file_id,
+                                   touch=True, owner_user_id=int(user["user_id"]))))
     if not info:
         raise HTTPException(status_code=404, detail="文件不存在、已过期或不属于此会话")
     return _original_file_download(info)
@@ -6921,6 +7065,23 @@ def _turn_producer_job(session_id: str, owner: int, request_id: str, producer_jo
 
 def _producer_request_id(job: dict) -> str:
     return str(job.get("client_request_id") or job.get("request_id") or "")
+
+
+@app.get("/api/v2/session/{session_id}/continuation/{request_id}")
+async def session_continuation_inputs(session_id: str, request_id: str, request: Request):
+    """List only persisted inputs eligible for explicit reuse in this session."""
+    from src.api.turn_envelope import _continued_inputs
+    from src.core.resource_access import PRIVATE_FILE
+
+    user = current_user(request)
+    require_owned_session(session_id, user, resource_class=PRIVATE_FILE)
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", request_id):
+        raise HTTPException(400, "无效的附件继承来源。")
+    items = await asyncio.to_thread(_continued_inputs, int(user["user_id"]), session_id,
+                                    request_id, verify_bytes=True)
+    return JSONResponse({"attachments": [{"file_id": item["file_id"], "filename": item["name"],
+        "mime_type": item["type"], "size_bytes": item["size_bytes"]} for item in items]},
+        headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/api/v2/session/{session_id}/turn-artifacts")

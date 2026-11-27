@@ -122,7 +122,10 @@ def _adapt_worker_sandbox(raw: bytes, pin: dict) -> bytes:
 
 _ADAPTER_PATCH = "02_config/skill-fusion-adapters.patch.json"
 _ADAPTER_PATCH_MEMBERS = frozenset(f"{name}/{item}" for name in ("data-audit", "literature-verification")
-                                 for item in ("scripts/adapter.py", "manifest.json")) | {"contract.py", "run.py", "INTERFACE_CONTRACT.md"}
+                                 for item in ("scripts/adapter.py", "manifest.json")) | {
+    "contract.py", "run.py", "INTERFACE_CONTRACT.md", "research-integrity/scripts/adapter.py",
+    "research-integrity/manifest.json", "research-integrity/SKILL.md",
+}
 
 
 def _adapter_revisions(repo: Path, handoff: Path, lock: dict) -> dict[str, bytes]:
@@ -206,7 +209,8 @@ def _stage_analysis(repo: Path, handoff: Path, upstreams: Path, release: Path,
         public = {}
         for source, dest in ((f"{name}/SKILL.md", "SKILL.md"),
                              (f"{name}/references/workflow.md", "references/workflow.md")):
-            public[dest] = _locked_copy(handoff, source, lock["handoff_files"][source], release, f"{base}/{dest}")
+            staged = f"03_skill_fusion/{source}"
+            public[dest] = _locked_copy(bundle, staged, files[staged], release, f"{base}/{dest}")
         interface = "INTERFACE_CONTRACT.md"
         staged_interface = f"03_skill_fusion/{interface}"
         public[interface] = _locked_copy(bundle, staged_interface, files[staged_interface], release, f"{base}/{interface}")

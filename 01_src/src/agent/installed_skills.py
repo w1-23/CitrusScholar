@@ -75,16 +75,18 @@ class TurnSkills:
     """One authorized method view for the SDK, File and research workspace."""
 
     release: Path | None
+    scope: frozenset[str] = frozenset()
 
     @classmethod
     def from_selection(cls, release, selected):
-        # Explicit selections are validated and surfaced independently by the host.
+        # Explicit selections can also be descriptive on an unrestricted turn.
         return cls(release)
 
     def allows(self, skill_id: str) -> bool:
         from src.core.capability_policy import allows
 
-        return self.release is not None and allows("skill:" + skill_id)
+        return (self.release is not None and (not self.scope or skill_id in self.scope)
+                and allows("skill:" + skill_id))
 
     def rows(self) -> list[dict]:
         if self.release is None:

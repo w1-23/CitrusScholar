@@ -301,3 +301,42 @@ test('first sequenced SSE job binds its exact replay before a legacy gap is fill
   assert.deepEqual(frames, ['job', 'done']);
   assert.equal(store.state.cursor, 22);
 });
+
+
+test('status recovers the identified committed payload after replay lacked the final text', async t => {
+  const terminalSnapshot = {...envelope, terminal_seq: 3};
+  const recovered = {...terminal.data, seq: 3, turn_envelope: terminalSnapshot};
+  const snapshot = {...job, terminal_snapshot: terminalSnapshot, terminal_delivery: recovered};
+  const pages = [page([running, output, {seq: 3, event: 'done', data: {}}], 3, {status: 'completed', terminal_snapshot: terminalSnapshot}),
+    reply(snapshot), reply({...snapshot, terminal_delivery: {...recovered, job_id: 'old-parent'}})];
+  const received = [];
+  const store = CitrusTaskState.create({});
+  const transport = CitrusTaskTransport.create({store, owns: () => true, fetch: async () => pages.shift(),
+    onTerminalDelivery: data => received.push(data.answer)});
+  t.after(() => transport.stop());
+  await transport.follow(job.job_id);
+  assert.equal(CitrusTaskState.isTerminal(store.state), true);
+  await transport.refresh(job.job_id, false);
+  assert.deepEqual(received, ['Final answer']);
+});
+
+
+test('a busy event endpoint observes Retry-After and resumes the same cursor without resending', async t => {
+  t.mock.timers.enable({apis: ['setTimeout']});
+  const busy = {...reply({}, 503), json: async () => { throw new SyntaxError('non-JSON 503'); },
+    headers: {get: key => key === 'Retry-After' ? '4' : null}};
+  const responses = [busy, page([running, output, terminal], 3), reply(job)];
+  const {transport, requests, store, frames} = observation(responses);
+  t.after(() => transport.stop());
+  await transport.follow(job.job_id);
+  assert.equal(store.state.cursor, 0);
+  t.mock.timers.tick(3999);
+  assert.equal(requests.length, 1);
+  t.mock.timers.tick(1);
+  for (let n = 0; n < 40; n++) { await Promise.resolve(); }
+  assert.equal(store.state.status, 'completed');
+  assert.equal(frames.filter(frame => frame.type === 'done').length, 1);
+  assert.deepEqual(requests.slice(0, 2), [['/jobs/job-1/events?after=0&limit=200', 'GET'],
+    ['/jobs/job-1/events?after=0&limit=200', 'GET']]);
+  assert.ok(requests.every(entry => entry[1] === 'GET'));
+});

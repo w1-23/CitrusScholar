@@ -301,6 +301,9 @@ class Settings(BaseSettings):
     # the model context window; explicit administrator values remain binding.
     AGENT_MAX_MODEL_TOKENS: int = Field(default_factory=lambda: _yaml_val(
         "agent", "max_model_tokens", default=1000000), ge=1)
+    # Native `task` subagent: explicit, file-only, metered on the same job ledger.
+    AGENT_ENABLE_TASK_SUBAGENT: bool = Field(default_factory=lambda: _yaml_val(
+        "agent", "enable_task_subagent", default=True))
     # Auxiliary model calls use the configured provider's supported reasoning-off
     # payload. The main conversation request does not inherit this setting.
     MODEL_REASONING_OFF_BODY: dict = Field(default_factory=lambda: _yaml_val(
@@ -343,6 +346,11 @@ class Settings(BaseSettings):
     PERMISSION_MODE: str = Field(default_factory=lambda: _yaml_val("permission", "mode", default="auto_workspace"))
     # v8.4.5: ask 模式授权等待秒数（前端卡片未回应时超时按拒绝处理）
     PERMISSION_WAIT_SEC: int = Field(default_factory=lambda: _yaml_val("permission", "wait_sec", default=90))
+    # Opt-in only for the bounded shared index build request; does not grant publication rights.
+    PERMISSION_NATIVE_SHARED_INDEX: bool = Field(
+        default_factory=lambda: _yaml_val("permission", "native_shared_index", default=False))
+    AGENT_PROJECT_RULE_BINDINGS: list[dict[str, Any]] = Field(
+        default_factory=lambda: _yaml_val("agent", "project_rule_bindings", default=[]), repr=False)
     # A workspace-scoped grant is still session-bound by default. Operators may
     # explicitly opt into cross-session reuse; the agent never assumes it.
     PERMISSION_WORKSPACE_CROSS_SESSION: bool = Field(

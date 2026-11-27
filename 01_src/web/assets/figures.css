@@ -44,7 +44,7 @@ body.figure-app {
 .workspace-identity, .toolbar-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .workspace-identity { gap: 12px; }
 .brand { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); text-decoration: none; flex-shrink: 0; }
-.brand-mark { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 7px; color: var(--ui-on-control); background: var(--ui-control); font-weight: 700; font-size: 16px; }
+.brand-mark { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 7px; color: var(--ui-on-control); object-fit:contain; background:transparent; font-weight: 700; font-size: 16px; }
 .brand strong { font-size: 15px; letter-spacing: -.3px; }
 .identity-divider { width: 1px; height: 17px; background: var(--line); }
 .workspace-name { font-size: 12px; color: var(--muted); white-space: nowrap; }

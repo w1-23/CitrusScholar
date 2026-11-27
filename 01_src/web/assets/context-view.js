@@ -13,7 +13,6 @@
     ['protocol', '协议开销', '消息边界、命名字段与部分请求选项的估算。']
   ];
   const CELL_COUNT = 100;
-  const LIMIT_LABEL = { window: '模型上下文窗口', input: '应用单次输入上限' };
   const HISTORY_LABEL = { loaded: '历史已加载', success: '历史已加载', empty: '暂无历史', degraded: '历史加载受限', failed: '历史加载失败' };
   const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
 
@@ -124,7 +123,7 @@
     const drawer = el('ctxDrawer'), backdrop = el('ctxBackdrop'), trigger = el('ctxCircleBtn');
     const close = el('ctxClose'), treeMode = el('ctxViewTreemap'), gridMode = el('ctxViewGrid');
     const tree = el('ctxTreemap'), grid = el('ctxGrid'), headerArc = el('ctxBtnFg');
-    const legend = el('ctxLegend'), description = el('ctxCategoryDetail'), metadata = el('ctxMetadata');
+    const legend = el('ctxLegend'), description = el('ctxCategoryDetail'), chartNote = el('ctxChartNote');
     const usageBlock = el('ctxUsage'), usageRows = el('ctxUsageRows');
     const cells = Array.from({length: CELL_COUNT}, () => doc.createElement('i'));
     grid.replaceChildren(...cells);
@@ -146,13 +145,15 @@
 
     function addCategory(row) {
       const button = doc.createElement('button'), swatch = doc.createElement('i');
-      const label = doc.createElement('span'), value = doc.createElement('span'), share = doc.createElement('span');
+      const label = doc.createElement('span'), name = doc.createElement('span');
+      const value = doc.createElement('span'), share = doc.createElement('span');
       button.type = 'button'; button.className = 'ctx-item context-legend-row';
       button.dataset.category = row.key;
       button.setAttribute('aria-controls', description.id);
       swatch.className = 'ctx-swatch ctx-slot-' + row.slot;
       swatch.setAttribute('aria-hidden', 'true');
-      label.className = 'ctx-item-name'; label.append(swatch, row.label);
+      name.textContent = row.label;
+      label.className = 'ctx-item-name'; label.append(swatch, name);
       value.className = 'ctx-item-value'; share.className = 'ctx-item-percent';
       button.append(label, value, share);
       button.addEventListener('click', () => showCategory(row.key));
@@ -224,41 +225,23 @@
     }
 
     function render() {
-      const {used, capacity, ratio, state, historical, limitKind, chartTotal, inputLimit, modelWindow, breakdown, ringRatio} = current;
+      const {used, ratio, chartTotal, breakdown, ringRatio} = current;
       const chartAvailable = chartTotal > 0;
-      const percentage = percent(ratio);
-      const basis = LIMIT_LABEL[limitKind] || '';
-      drawer.dataset.level = state;
       trigger.dataset.level = ringRatio == null ? 'unknown' : ringRatio >= .93 ? 'critical' : ringRatio >= .75 ? 'warning' : 'healthy';
       tree.hidden = !chartAvailable || !treeMode.checked;
       grid.hidden = !chartAvailable || !gridMode.checked;
       gridMode.disabled = treeMode.disabled = !chartAvailable;
       headerArc.setAttribute('stroke-dasharray', `${Math.min(ringRatio ?? 0, 1) * 100} 100`);
       el('ctxTriggerPct').textContent = ringRatio == null ? short(used) : percent(ringRatio);
-      el('ctxUsed').textContent = short(used) + (used == null || capacity == null ? '' : ' / ' + short(capacity));
-      el('ctxUsed').title = used == null ? '' : `${used.toLocaleString()}${capacity == null ? '' : ' / ' + capacity.toLocaleString()} tokens`;
-      el('ctxStatus').textContent = ratio == null ? '' : percentage;
-      el('ctxStatus').hidden = ratio == null;
-      el('ctxValueNote').textContent = used == null ? '占用量暂不可用' : historical ? '历史估算 · 容量未知'
-        : '估算输入 · ' + (basis || '模型窗口与应用上限均未知');
       const notes = [];
+      if (!chartAvailable && breakdown !== 'inconsistent') notes.push('暂无可显示的上下文构成。');
       if (chartAvailable && ratio == null) notes.push('仅显示已估算输入的构成，不表示窗口占用率。');
       if (breakdown === 'partial') notes.push('分类统计不完整。');
       if (breakdown === 'unavailable' && chartAvailable && used > 0) notes.push('本次未记录分类。');
       if (breakdown === 'inconsistent') notes.push('分类合计与输入总数不一致，未绘制比例。');
       if (ratio > 1) notes.push('估算输入超过显示上限，图示按估算输入构成填满。');
-      el('ctxChartNote').textContent = notes.join(' ');
-      el('ctxChartNote').hidden = !notes.length;
-      const budget = current.budget;
-      const extra = [current.model, current.scope === 'previous' ? '上一调用' : current.scope === 'active' ? '当前调用' : '',
-        current.history, current.estimateMethod === 'character_heuristic' ? '字符估算' : '',
-        limitKind === 'input' ? '模型窗口未知' : modelWindow != null && inputLimit != null ? '应用单次输入上限 ' + inputLimit.toLocaleString() : '',
-        current.outputReserve != null ? '输出预留 ' + current.outputReserve.toLocaleString() : '',
-        current.actualOutputLimit != null ? '实际发包输出上限 ' + current.actualOutputLimit.toLocaleString() : '',
-        current.attemptElapsed != null ? '本次调用用时 ' + (current.attemptElapsed / 1000).toFixed(2) + ' 秒' : '',
-        budget ? `本轮预算已计入 ${budget.tokens.toLocaleString()} / ${budget.maxTokens.toLocaleString()} 令牌，${budget.calls} / ${budget.maxCalls} 次调用` : ''].filter(Boolean);
-      metadata.textContent = extra.join(' · ');
-      metadata.hidden = !extra.length;
+      chartNote.textContent = notes.join(' ');
+      chartNote.hidden = !notes.length;
       trigger.setAttribute('aria-label', used == null ? '上下文用量' : `估算输入 ${short(used)}${ringRatio == null ? '，应用上限比例未知' : `，占应用单次输入上限 ${percent(ringRatio)}`}`);
       trigger.title = trigger.getAttribute('aria-label');
       renderCharts();
@@ -271,9 +254,22 @@
       backdrop.classList.toggle('open', open);
       trigger.setAttribute('aria-expanded', String(open));
       drawer.inert = !open;
-      if (focus) (open ? close : trigger).focus({preventScroll: true});
+      if (!focus) return;
+      if (!open) { trigger.focus({preventScroll:true}); return; }
+      const from = doc.activeElement;
+      // Let the newly visible drawer settle before moving focus inside it.
+      const focusClose = () => {
+        if (!drawer.inert && doc.activeElement === from) close.focus();
+      };
+      doc.defaultView.requestAnimationFrame(focusClose);
+      doc.defaultView.setTimeout(focusClose, 200);
     }
 
+    // Reserve the actual drawer height above the desktop files pane when both are open.
+    const ResizeObserver = doc.defaultView?.ResizeObserver;
+    if (ResizeObserver) new ResizeObserver(() => {
+      doc.body.style.setProperty('--context-dock-height', `${drawer.offsetHeight}px`);
+    }).observe(drawer);
     treeMode.addEventListener('change', render);
     gridMode.addEventListener('change', render);
     doc.addEventListener('keydown', event => {

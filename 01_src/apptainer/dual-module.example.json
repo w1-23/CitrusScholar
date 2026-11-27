@@ -1,0 +1,14 @@
+{
+  "selfcorpus": {
+    "client_path": "/opt/citrusscholar/selfcorpus-client",
+    "client_sha256": {
+      "corpus/__init__.py": "REPLACE_WITH_SHA256",
+      "corpus/auth.py": "REPLACE_WITH_SHA256"
+    },
+    "secret_file": "/etc/citrusscholar/private/selfcorpus-hmac.key",
+    "auto_intake": true
+  },
+  "workbench": {
+    "secret_file": "/etc/citrusscholar/private/workbench-host-hmac.key"
+  }
+}

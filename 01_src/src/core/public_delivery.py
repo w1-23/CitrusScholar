@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 
 _PRIVATE_KEYS = frozenset("""
     systemprompt developerprompt privateprompt systemmessage developermessage rawrequest
@@ -35,6 +36,55 @@ _DURATION_LIMIT_MS = 7 * 24 * 60 * 60 * 1000
 TIMING_KEYS = ("queue_wait_ms", "provider_first_packet_ms", "visible_answer_first_ms",
                "tool_elapsed_ms", "context_maintenance_ms")
 MAINTENANCE_PURPOSES = {"context_hints", "context_summary", "turn_checkpoint"}
+
+
+# Prefer preserving source for an ambiguous request about a figure or code.
+# An ordinary “download SVG” is a file obligation, not a request for XML in chat.
+_FIGURE_SOURCE_INTENT = re.compile(
+    r"源码|源代码|源文件|绘图代码|生成代码|脚本|标记语言|XML|"
+    r"\b(?:source(?:[ -]code|[ -]file)?|markup|code|script|inline[ -]SVG|"
+    r"SVG[ -]text)\b", re.I)
+
+
+def verified_figure_previews(query, answer, requirements, goals, verified, *, session_id, owner_user_id):
+    """Return protected previews for exact SVG placeholders in a proven file obligation."""
+    from src.core import figures
+    from src.graph.task_contract import FIGURE_KINDS
+    from src.session.files import get_file
+
+    if owner_user_id <= 0 or _FIGURE_SOURCE_INTENT.search(query or "") or len(requirements) != 1:
+        return {}
+    req = requirements[0]
+    if (req.get("phase", "initial") != "initial" or req.get("figure_id")
+            or req.get("all_formats") is not True or "svg" not in (req.get("formats") or ())
+            or not set(req.get("kinds") or ()).intersection(FIGURE_KINDS)):
+        return {}
+    if len(goals) != 1 or goals[0].kind != "deliverable" or len(goals[0].evidence_call_ids) != 1:
+        return {}
+    goal = goals[0]
+    assets = {row["artifact_id"] for row in verified if row.get("valid") and row.get("request_matches")
+              and row.get("mime") == "image/svg+xml" and row.get("producer_tool") == "run_research_figure_script"
+              and row.get("artifact_id") and row.get("link") in goal.artifact_links}
+    if not assets:
+        return {}
+    indices = set(figures.PLACEHOLDER_RE.findall(answer))
+    previews = {}
+    for index, figure in figures.snapshot().items():
+        if str(index) not in indices:
+            continue
+        match = re.fullmatch(r"/api/v2/files/([a-f0-9]{32})/download", figure["download_url"])
+        if not match:
+            continue
+        file_id = match[1]
+        try:
+            entry = get_file(session_id, file_id, owner_user_id=owner_user_id)
+        except (OSError, ValueError, sqlite3.Error):
+            continue
+        digest = hashlib.sha256(figure["svg"].encode("utf-8")).hexdigest()
+        if (entry and entry.get("artifact_id") in assets and entry.get("mime_type") == "image/svg+xml"
+                and entry.get("sha256") == digest):
+            previews[index] = f"/api/v2/files/{file_id}/preview"
+    return previews
 
 
 def _key(value):
@@ -241,8 +291,31 @@ def _set_object(dst, src, key, projector):
 
 def project_artifact_delivery(value):
     row = _object(value)
-    return project_fields(row, ids="status", numbers="unavailable_count", nullable="unavailable_count") | {
-        "verified_file_ids": _ids(row.get("verified_file_ids"))}
+    result = project_fields(row, ids="status", numbers="unavailable_count", nullable="unavailable_count") | {
+        "verified_file_ids": list(dict.fromkeys(_ids(row.get("verified_file_ids"))))}
+    if row.get("schema_version") != "artifact-delivery/1":
+        return result
+
+    def asset(item):
+        fields = project_fields(item, ids="asset_ref format sha256 render_id qa_status", numbers="size_bytes",
+                                texts="filename mime_type", nullable="render_id")
+        if not fields.get("asset_ref") or not fields.get("sha256"):
+            return {}
+        url = item.get("url")
+        if not isinstance(url, str) or not re.fullmatch(r"/api/v2/session/[A-Za-z0-9_-]{8,128}/artifacts/[a-f0-9]{32}", url):
+            return {}
+        validation = _object(item.get("validation"))
+        fields.update(url=url, validation={"status": project_fields(validation, ids="status").get("status", ""),
+                                           "checks": _ids(validation.get("checks"))})
+        return fields
+
+    assets = _array(row.get("artifacts"), asset)
+    return result | project_fields(row, ids="delivery_id logical_task_id delivery_status render_id", nullable="render_id") | {
+        "schema_version": "artifact-delivery/1", "artifacts": assets,
+        "user_links": list(dict.fromkeys(item["url"] for item in assets)),
+        "limitations": _ids(row.get("limitations")),
+        "obligations": _array(row.get("obligations"), lambda item: project_fields(item, texts="label") | {
+            "formats": _ids(_object(item).get("formats"))})}
 
 
 def _source_ref(value):
@@ -472,6 +545,22 @@ def project_public_event(event, data):
     else:
         result = {}
     return result | cursor
+
+
+def project_diagnostic_progress(event, value):
+    """Stdlib-only progress projection for private operator archives.
+
+    Exporting structured evidence never requires rendering the browser's
+    richer labels or loading the LangGraph runtime on the operator host.
+    """
+    if event == "context_maintenance":
+        return project_public_event(event, value)
+    row = _object(value)
+    cursor = project_fields(row, numbers="seq")
+    if event != "assistant_progress" or private_record(row) or row.get("kind") == "model_preview":
+        return cursor
+    return cursor | project_fields(row, ids="schema event_id job_id run_id tool_call_id operation_id logical_step_id "
+                                         "note_id kind status reason_code tool_name")
 
 
 def _since_ms(start, end):

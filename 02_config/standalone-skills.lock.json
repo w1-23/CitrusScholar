@@ -7,8 +7,9 @@
     },
     "source_bundle": {
       "base_commit": "484b598cfbb2b041ec199abe8ae2ebf818db59e5",
+      "fetch_commit": "f62b87b1e72cc11e9e04f8b6aaaa727979d83e07",
       "file": "research-question-answering.bundle",
-      "sha256": "e2ffac3176928999bdbf009781007d6a0879999bfd587983c3c7b6704570e363",
+      "sha256": "a082e006c7da968b5097802309ce74b825b51b885e840324e3a78ba8fa6f7458",
       "ref": "refs/heads/fix/8043-skill-convergence"
     }
   },
@@ -18,6 +19,13 @@
     "python_package": "packages/citrus_refcheck",
     "dependencies": {
       "requirements.lock": "cd20b991f67fe502e91121b1dbad17284a8a45ddac86383196d6f4a840e5da3e"
+    },
+    "source_bundle": {
+      "base_commit": "a0ee4d23be2b02b268d06763cfd3b494f3887a86",
+      "fetch_commit": "beca4972e9b83997aefddb38cfd2683596f21e28",
+      "file": "reference-verification.bundle",
+      "sha256": "9d423f82186418dde25b5b0db9e3a99b14bbb7c4a1226ccd19365bf703396aa1",
+      "ref": "refs/heads/fix/8043-skill-convergence"
     }
   },
   "data-audit": {
@@ -29,7 +37,14 @@
     },
     "approved_scripts": [
       "scripts/audit.py"
-    ]
+    ],
+    "source_bundle": {
+      "base_commit": "c6595bc1d5bd420347cba8fd827f42fe45c3d7c8",
+      "fetch_commit": "355ebd53876664865d645154437b5a21fd33c1c8",
+      "file": "data-audit.bundle",
+      "sha256": "a5ce364e89051e82efb20a08019312c1c1a6b580e577fdb024f99238842426d3",
+      "ref": "refs/heads/fix/8043-skill-convergence"
+    }
   },
   "nature-figure": {
     "repository": "https://github.com/w1-23/nature-figure.git",
@@ -38,6 +53,13 @@
       "requirements.lock": "62ae43981affcb09e465ef6abefb5f122e3c34f71aef30258eb80ab300815506",
       "requirements-dev.lock": "fe4a3e03e01c9d400603daa6012070233eb1eedf8524cf264039e583c6684eff",
       "requirements-pdf.lock": "7012f5553e551e6442de6f1caabcae3548423748ef63a9ec1a6dbfb2802459b1"
+    },
+    "source_bundle": {
+      "base_commit": "0d73f20e70543c2daea4d129932fa337c4a912cf",
+      "fetch_commit": "39402dead4c0f95e438d67ef73d4310cd41d2f06",
+      "file": "nature-figure.bundle",
+      "sha256": "fd87e3f5d172d15c3ad20a27bc84e9408338243c2ccdd616fee6b1126a275221",
+      "ref": "refs/heads/fix/8043-skill-convergence"
     }
   }
 }

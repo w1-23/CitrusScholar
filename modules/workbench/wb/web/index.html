@@ -1,0 +1,77 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>科研图件工作台 · Citrus Scholar</title>
+  <link rel="stylesheet" href="static/workbench.css">
+  <script type="module" src="static/main.mjs"></script>
+</head>
+<body>
+  <a class="skip" href="#canvas-title">跳到画布</a>
+  <header class="masthead">
+    <div><a id="return" hidden>← 返回会话</a><p class="eyebrow">CITRUS SCHOLAR / FIGURE STUDIO</p><h1>科研图件工作台</h1></div>
+    <div class="actions"><span id="revision" class="tag" hidden></span><button id="signin" hidden>令牌登录</button><button id="export-open" class="primary" disabled>导出图件</button></div>
+  </header>
+  <p id="status" class="status" role="status" aria-live="polite">正在验证工作台会话…</p>
+  <main id="studio" aria-busy="true">
+    <aside class="panel navigator" aria-label="工作区导航">
+      <header class="bar"><div><p class="eyebrow">01 / WORKSPACE</p><h2>工作区</h2></div><button id="import-open" disabled>＋ 导入</button></header>
+      <div class="switcher" role="group" aria-label="工作区视图">
+        <button data-page="library" aria-pressed="true" aria-controls="library">图件库</button><button data-page="objects" aria-pressed="false" aria-controls="objects">对象</button><button data-page="history" aria-pressed="false" aria-controls="history">版本</button>
+      </div>
+      <section id="library" class="panel-body">
+        <h3>我的图件</h3><div id="figures" class="rows"></div>
+        <div class="asset-heading"><h3>已授权资料</h3><label><span class="sr-only">资料格式</span><select id="filter" disabled>
+          <option value="">全部格式</option><option value="py">Python</option><option value="r">R</option><option value="svg">SVG</option><option value="png">PNG</option><option value="jpg">JPG</option><option value="jpeg">JPEG</option><option value="pdf">PDF</option>
+        </select></label></div><div id="assets" class="rows"></div>
+      </section>
+      <section id="objects" class="panel-body" hidden><div id="object-list" class="rows"></div></section>
+      <section id="history" class="panel-body" hidden><div id="version-list" class="rows"></div></section>
+    </aside>
+    <section class="panel canvas" aria-labelledby="canvas-title">
+      <header class="bar"><div><p class="eyebrow">02 / CANVAS</p><h2 id="canvas-title" tabindex="-1">画布预览</h2></div>
+        <div class="actions" role="group" aria-label="预览控制"><button id="zoom-out" aria-label="缩小" disabled>−</button><button id="zoom-reset" aria-label="重置缩放" disabled>适合</button><button id="zoom-in" aria-label="放大" disabled>＋</button><button id="cycle" disabled>轮选</button><button id="refresh" disabled>刷新</button></div>
+      </header>
+      <div class="stage" id="stage" tabindex="0" aria-label="图件画布">
+        <div id="empty"><p class="eyebrow">FIGURE PREVIEW</p><h3>这里会显示你的图件</h3><p>打开已有图件，或导入单个绘图脚本或静态图片。</p></div>
+        <div id="paper" hidden><img id="preview" alt="图件预览" draggable="false"><div id="outline" aria-hidden="true" hidden></div></div>
+      </div>
+      <p id="canvas-note" class="muted canvas-note">打开图件后可缩放。键盘可通过对象列表选取。</p>
+    </section>
+    <aside class="panel inspector" aria-labelledby="inspector-title">
+      <header class="bar"><div><p class="eyebrow">03 / INSPECTOR</p><h2 id="inspector-title" tabindex="-1">图件属性</h2></div><span id="mode" class="tag" hidden></span></header>
+      <div class="panel-body"><div id="properties" class="rows"></div><div id="limitations"></div></div>
+    </aside>
+  </main>
+  <footer class="legal"><details open><summary>许可与对应源码</summary><p>本工作台适用 AGPL-3.0-only，不附带任何担保。<a href="https://www.gnu.org/licenses/agpl-3.0.html" rel="noreferrer">许可全文</a> · <!-- source-offer --></p></details></footer>
+  <dialog id="import-dialog" aria-labelledby="import-title"><form id="import-form">
+    <header class="bar"><h2 id="import-title">导入图件</h2><button type="button" data-close aria-label="关闭导入">×</button></header>
+    <p id="import-asset" hidden></p>
+    <label id="file-label">源文件（单个）<input id="file" type="file" accept=".py,.r,.svg,.png,.jpg,.jpeg,.pdf"></label>
+    <label>解析方式<select id="parse"><option value="auto">自动识别</option><option value="editable">要求语义可编辑</option><option value="preview_only">仅预览</option></select></label>
+    <p class="muted">支持 Python、R、PNG、JPEG、SVG 和 PDF 首页。绘图脚本会在隔离环境执行，不写回源文件。</p>
+    <p class="form-error" role="alert" hidden></p><div class="actions"><button type="button" data-close>取消</button><button class="primary" type="submit">确认导入</button></div>
+  </form></dialog>
+  <dialog id="login-dialog" aria-labelledby="login-title"><form id="login-form">
+    <header class="bar"><h2 id="login-title">独立模式登录</h2><button type="button" data-close aria-label="关闭登录">×</button></header>
+    <p>请通过 Citrus Scholar 会话打开工作台，或在独立模式已启用时输入访问令牌。</p>
+    <label>访问令牌<input name="token" type="password" autocomplete="off" required></label>
+    <p class="form-error" role="alert" hidden></p><div class="actions"><button type="button" data-close>取消</button><button class="primary" type="submit">登录</button></div>
+  </form></dialog>
+  <dialog id="export-dialog" aria-labelledby="export-title"><form id="export-form">
+    <header class="bar"><h2 id="export-title">导出图件</h2><button type="button" data-close aria-label="关闭导出">×</button></header>
+    <p class="muted">导出服务器当前版本。物理尺寸与预览缩放无关，留空使用原图尺寸。</p>
+    <label>格式<select name="format"><option value="png">PNG</option><option value="svg">SVG</option><option value="pdf">PDF</option></select></label>
+    <div class="fields"><label>宽度（mm）<input name="width_mm" type="number" min="15" max="400" step="any"></label><label>高度（mm）<input name="height_mm" type="number" min="15" max="400" step="any"></label></div>
+    <label>分辨率（DPI）<input name="dpi" type="number" min="72" max="450" step="1" value="150" required></label>
+    <p class="form-error" role="alert" hidden></p><div class="actions"><button type="button" data-close>取消</button><button class="primary" type="submit">下载</button></div>
+  </form></dialog>
+  <dialog id="restore-dialog" aria-labelledby="restore-title"><form id="restore-form">
+    <header class="bar"><h2 id="restore-title">恢复版本</h2><button type="button" data-close aria-label="关闭恢复">×</button></header>
+    <p id="restore-description"></p><p class="form-error" role="alert" hidden></p><div class="actions"><button type="button" data-close>取消</button><button class="primary" type="submit">确认恢复</button></div>
+  </form></dialog>
+</body>
+</html>

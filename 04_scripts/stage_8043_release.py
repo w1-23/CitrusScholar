@@ -151,6 +151,33 @@ def hashes(members):
     return {name: item['sha256'] for name, item in members.items()}
 
 
+METHOD_RELEASE_FILE = 'scientific-methods.json'
+METHOD_RELEASE_SCHEMA = 'citrusscholar.scientific-methods/1'
+METHOD_IDS = frozenset({'data-audit', 'research-integrity', 'literature-verification'})
+RETAINED_METHODS = frozenset({'nature-figure', 'research-question-answering'})
+
+
+def method_only_release(root, files):
+    if METHOD_RELEASE_FILE not in files:
+        return False
+    descriptor = read_object(root / METHOD_RELEASE_FILE)
+    require(descriptor == {'schema': METHOD_RELEASE_SCHEMA, 'methods': sorted(METHOD_IDS)},
+            'Invalid scientific methods release descriptor')
+    selected = read_object(root / 'release.json')
+    require(set(selected) == METHOD_IDS | RETAINED_METHODS and all(
+            isinstance(version, str) and re.fullmatch('[0-9a-f]{40}', version)
+            for version in selected.values()), 'Unexpected active method catalog')
+    require(not (root / 'fusion').exists() and not (root / 'python').exists(),
+            'Method-only release must not ship legacy executable bundles')
+    entries = {name.split('/')[1] for name in files
+               if name.startswith('skills/') and name.endswith('/SKILL.md')}
+    require(entries == set(selected), 'Unexpected discoverable method entries')
+    require(all(name.endswith('.md') for name in files
+                if name.startswith(tuple(f'skills/{skill}/' for skill in METHOD_IDS))),
+            'Scientific methods may contain documentation only')
+    return True
+
+
 def check_skills(path, pin, *, active=False):
     root = existing(path, directory=True)
     check_pin(root / 'inventory.json', pin)
@@ -159,8 +186,9 @@ def check_skills(path, pin, *, active=False):
     files.pop('inventory.json')
     require(files == expected and (root / 'skills').is_dir(), f'Skill inventory content mismatch: {root}')
     if active:
-        require('fusion/bundle.json' in files and ALIAS_ROOT + 'SKILL.md' not in files,
-                'Active release requires Fusion and must not expose the shared Nature tree as a Skill')
+        methods_only = method_only_release(root, files)
+        require((methods_only or 'fusion/bundle.json' in files) and ALIAS_ROOT + 'SKILL.md' not in files,
+                'Active release requires a pinned scientific profile and must not expose Nature aliases as a Skill')
         shared = {key.removeprefix(ALIAS_ROOT): val for key, val in files.items() if key.startswith(ALIAS_ROOT)}
         aliases = {key.removeprefix(ALIAS_COPY): val for key, val in files.items() if key.startswith(ALIAS_COPY)}
         require(len(shared) == 14 and shared == aliases, 'The 14 shared Nature aliases must match byte-for-byte')
@@ -172,7 +200,7 @@ def history(config):
     require(isinstance(old, list), 'Invalid baseline historical release list')
     path = config['skill_release']
     result = [*old, {'path': path, 'mount_path': path, 'sha256': config['skill_release_sha256']}]
-    require(len(result) <= 16, 'Too many historical releases for the launcher')
+    require(len(result) <= 64, 'Too many historical releases for the launcher')
     mounts = set()
     for item in result:
         require(isinstance(item, dict) and set(item) == {'path', 'mount_path', 'sha256'},
@@ -274,13 +302,22 @@ def overlap(left, right):
     return left.is_relative_to(right) or right.is_relative_to(left)
 
 
-def release_config(baseline, preserved, output, commit, sandbox_pin, skill_pin):
+def release_config(baseline, preserved, output, commit, sandbox_pin, skill_pin, *, methods_only=False, modules=None):
     config = dict(baseline, source_root=str(output / 'source'), source_head=commit,
                   sandbox_sha256=sandbox_pin, skill_release=str(output / 'skills-release'),
                   skill_release_sha256=skill_pin, external_fusion_required=True,
                   historical_skill_releases=preserved)
+    if methods_only:
+        config['scientific_methods_only'] = True
+    else:
+        config.pop('scientific_methods_only', None)
     for label, filename in IMAGES.items():
         config[f'{label}_sif'] = str(output / 'images' / filename)
+    if modules is not None:
+        require(isinstance(modules, dict) and set(modules) == {'selfcorpus', 'workbench'},
+                'Invalid external module contract')
+        config['external_modules'] = modules
+        config['port'] = 8060
     return config
 
 
@@ -323,7 +360,10 @@ def stage(args):
     (source / SOURCE_MANIFEST).unlink(missing_ok=True)
     write_object(source / SOURCE_MANIFEST, source_overlay(args.commit, tree, baseline['source_head'], members))
     write_object(output / 'source-sha256.json', {'commit': args.commit, 'files': hashes(inventory(source))})
-    config = release_config(baseline, preserved, output, args.commit, args.sandbox_sha256, args.skill_release_sha256)
+    module_input = getattr(args, 'external_modules', None)
+    modules = read_object(existing(module_input)) if module_input is not None else None
+    config = release_config(baseline, preserved, output, args.commit, args.sandbox_sha256, args.skill_release_sha256,
+                            methods_only=(skill / METHOD_RELEASE_FILE).is_file(), modules=modules)
     write_object(output / 'deployment.json', config)
     (output / 'launch.py').write_text(WRAPPER, encoding='utf-8')
     (output / 'launch.py').chmod(0o700)
@@ -369,14 +409,15 @@ def verify(output, repository=None, manifest_pin=None):
     baseline = read_object(baseline_path)
     preserved = history(baseline)
     config = read_object(output / 'deployment.json')
+    skill = check_skills(output / 'skills-release', meta['active_skill_sha256'], active=True)
     require(set(meta['images']) == set(IMAGES) and
             config == release_config(baseline, preserved, output, commit,
-                                     meta['images']['sandbox'], meta['active_skill_sha256']),
+                                     meta['images']['sandbox'], meta['active_skill_sha256'],
+                                     methods_only=(skill / METHOD_RELEASE_FILE).is_file(), modules=config.get('external_modules')),
             'Deployment does not match pinned paths and inherited runtime contract')
     for label in IMAGES:
         require(meta['images'][label] == config[f'{label}_sha256'], f'{label} SIF manifest mismatch')
         check_pin(config[f'{label}_sif'], meta['images'][label])
-    check_skills(config['skill_release'], meta['active_skill_sha256'], active=True)
     if repository is not None:
         repo = existing(repository, directory=True)
         with tempfile.TemporaryDirectory(prefix='8043-archive-check-') as temp:
@@ -407,6 +448,7 @@ def main():
     for arg in ('repository', 'commit', 'baseline-deployment', 'sandbox-sif', 'sandbox-sha256',
                 'skill-release', 'skill-release-sha256', 'output'):
         create.add_argument(f'--{arg}', required=True)
+    create.add_argument('--external-modules', help='Explicit independent module contract configuration')
     check = commands.add_parser('verify', help='Verify a staged release without starting it')
     check.add_argument('--release', required=True)
     check.add_argument('--repository', help='Rebuild and compare the entire committed archive')

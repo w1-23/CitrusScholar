@@ -134,7 +134,11 @@ def normalize_script_bindings(bindings: Any) -> dict:
         if set(raw) == {"dataset_ref"}:
             resolved[variable] = raw
             continue
-        if set(raw) == {"file_id"} and isinstance(raw["file_id"], str) and re.fullmatch(r"[a-f0-9]{32}", raw["file_id"]):
+        if (set(raw) in ({"file_id"}, {"file_id", "sha256"}) and isinstance(raw["file_id"], str)
+                and re.fullmatch(r"[a-f0-9]{32}", raw["file_id"])):
+            if "sha256" in raw and (not isinstance(raw["sha256"], str)
+                                    or not re.fullmatch(r"[a-f0-9]{64}", raw["sha256"])):
+                raise ProjectError("invalid_inputs", "sha256 必须是文件的 64 位小写十六进制摘要。")
             resolved[variable] = raw
             continue
         candidates = []
@@ -176,8 +180,13 @@ def snapshot_script_inputs(bindings: Any, owner: int, session_id: str, *,
             if set(raw) == {"dataset_ref"}:
                 from src.research.analysis_results import load_dataset_snapshot
                 dataset = load_dataset_snapshot(owner, raw["dataset_ref"])
+                metadata = dataset.to_dict()
+                provenance = metadata.get("source")
+                if (isinstance(provenance, dict) and provenance.get("tool_name") == "audit_uploaded_data"
+                        and metadata.get("session_id") != session_id):
+                    raise ProjectError("data_unavailable", "审查冻结数据只在生成它的会话内可用。")
                 dataset_ref = dataset.ref
-                file_id = dataset.to_dict().get("payload_file_ref")
+                file_id = metadata.get("payload_file_ref")
                 if not file_id:
                     from src.figures.dataset_codec import encode_frame
                     payload = json.dumps(encode_frame(dataset.to_frame()), ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -201,8 +210,8 @@ def snapshot_script_inputs(bindings: Any, owner: int, session_id: str, *,
             if len(data) > 32 * 1024 * 1024 or total > 64 * 1024 * 1024:
                 raise ProjectError("invalid_inputs", "脚本输入超过体积上限。")
             digest = hashlib.sha256(data).hexdigest()
-            if original.get("sha256") and original["sha256"] != digest:
-                raise ProjectError("source_changed", "原始输入已改变，请登记新的数据版本。")
+            if any(expected != digest for expected in (original.get("sha256"), raw.get("sha256")) if expected):
+                raise ProjectError("source_changed", "输入字节与登记或调用提供的 sha256 不匹配。请重新探查并绑定正确的文件版本。")
             filename = str(original.get("filename") or "input.bin")
             suffix = Path(filename).suffix.lower()
             if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):

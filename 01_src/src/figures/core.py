@@ -82,13 +82,20 @@ class _OutputEmitter:
         self.result = result
         self.output_key = output_key
         self.seen: set[str] = set()
+        self.undeclared_table: tuple[ValueError, str] | None = None
 
     def _entry(self, name: str, kind: str) -> dict:
         from src.figures.script_outputs import output_name
         output_name(name)
         entry = next((item for item in self.contract[kind] if item["name"] == name), None)
         if entry is None or name in self.seen:
-            raise ValueError("Undeclared or duplicate emitted output: " + name)
+            error = ValueError("Undeclared or duplicate emitted output: " + name)
+            if (kind == "tables" and entry is None and name not in self.seen
+                    and not any(item["name"].casefold() == name.casefold()
+                                for entries in self.contract.values() if isinstance(entries, list)
+                                for item in entries)):
+                self.undeclared_table = error, name
+            raise error
         self.seen.add(name)
         return entry
 
@@ -173,8 +180,8 @@ def capture_outputs(script: str, *, output_contract: dict,
     plt.close("all")
     result = ScriptOutputsResult()
     scope = {"__name__": "__citrusfig__", **(namespace or {})}
-    scope.update(plt=plt, matplotlib=matplotlib, show=lambda *a, **k: None,
-                 emit=_OutputEmitter(contract, result, output_key))
+    emitter = _OutputEmitter(contract, result, output_key)
+    scope.update(plt=plt, matplotlib=matplotlib, show=lambda *a, **k: None, emit=emitter)
     previous_show, original_stdout = plt.show, sys.stdout
     stdout = io.StringIO()
     try:
@@ -238,6 +245,11 @@ def capture_outputs(script: str, *, output_contract: dict,
             result.error = str(exc)
             result.error_type = exc.reason_code
             result.error_details = exc.diagnostic()
+        elif (result.error_stage == "analysis" and emitter.undeclared_table
+              and exc is emitter.undeclared_table[0]):
+            result.error = f"ValueError: {exc}"
+            result.error_type = "undeclared_table_output"
+            result.error_details = {"output_name": emitter.undeclared_table[1]}
         elif isinstance(exc, RenderScriptEmitUnavailable):
             result.error = f"[RENDER_SCRIPT_EMIT_NOT_AVAILABLE] {exc}"
             result.error_type = exc.reason_code

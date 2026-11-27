@@ -496,9 +496,9 @@ class ExecutionSegments:
                     (current_step, progress_summary, now, now, self.identity.run_id)).rowcount
         else:
             changed = conn.execute(
-                "UPDATE task_jobs SET status=?,current_step=?,progress_summary=?,error=?,"
+                "UPDATE task_jobs SET status=?,current_step=?,progress_summary=?,error=?,stop_reason=?,"
                 "finished_at=?,updated_at=? WHERE " + guard,
-                (status, current_step, progress_summary, error, now, now,
+                (status, current_step, progress_summary, error, stop_reason, now, now,
                  self.identity.run_id)).rowcount
         if changed != 1:
             raise task_events.TaskConflict("execution_segment_terminal_conflict")

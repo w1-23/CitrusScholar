@@ -22,6 +22,7 @@ LIMITS = ExecutionLimits(timeout_sec=90, memory_mb=2048, cpu_millis=1000, pids=6
                          scratch_bytes=32 << 20, log_bytes=128 << 10,
                          output_bytes=9 << 20, output_files=1)
 OBSERVATIONS = INPUT_ROOT + "observations.json"
+PLOT_SNAPSHOT = INPUT_ROOT + "host-plot-snapshot.json"
 
 
 @contextmanager
@@ -69,9 +70,12 @@ def _meta(bundle):
             "bundle_sha256": bundle.sha256, "lock_sha256": bundle.lock_sha256}
 
 
-def _content(bundle, refs, request_digest):
-    return sha(encode({**_meta(bundle), "inputs": refs, "request_sha256": request_digest,
-                       "launcher_sha256": sha(bundle.launcher)}))
+def _content(bundle, refs, request_digest, projection_digest=None):
+    facts = {**_meta(bundle), "inputs": refs, "request_sha256": request_digest,
+             "launcher_sha256": sha(bundle.launcher)}
+    if projection_digest is not None:
+        facts["plot_projection_sha256"] = projection_digest
+    return sha(encode(facts))
 
 
 def _register(identity, path, data):
@@ -104,7 +108,7 @@ def _bind(identity, workspace, current, task, public_refs, blobs):
         bound = workspace.bind(wid, path=path, file_id=file_id, expected_revision=revision,
                                expected_sha256=ref["sha256"], source={"scope": SCOPE})
         revision = bound["revision"]
-    return revision, tuple(sorted(expected.keys() - {LAUNCHER}))
+    return revision, tuple(sorted(expected.keys() - {LAUNCHER, PLOT_SNAPSHOT}))
 
 
 def _load_bound(service, identity, row, bundle, *, content_sha256=None):
@@ -118,12 +122,17 @@ def _load_bound(service, identity, row, bundle, *, content_sha256=None):
         raise PermissionError("fusion_execution_scope_denied")
     current = service.workspace.open(request.workspace_id)
     meta, fixed = current["metadata"], _meta(bundle)
-    if (current["task_id"] != request.task_id or meta.keys() != fixed.keys() | {"content_sha256", "request_sha256"}
+    keys = fixed.keys() | {"content_sha256", "request_sha256"}
+    if "plot_projection_sha256" in meta:
+        if bundle.skill != "data-audit" or not is_hash(meta["plot_projection_sha256"]):
+            raise PermissionError("fusion_execution_projection_mismatch")
+        keys |= {"plot_projection_sha256"}
+    if (current["task_id"] != request.task_id or meta.keys() != keys
             or any(meta[name] != val for name, val in fixed.items()) or not is_hash(meta["content_sha256"])
             or content_sha256 is not None and meta["content_sha256"] != content_sha256):
         raise PermissionError("fusion_execution_release_mismatch")
     bindings = {item.path: item for item in request.inputs}
-    if (REQUEST not in bindings or bindings[REQUEST].sha256 != meta["request_sha256"]
+    if (PLOT_SNAPSHOT in bindings or REQUEST not in bindings or bindings[REQUEST].sha256 != meta["request_sha256"]
             or any(BUNDLE_ROOT + path not in bindings or bindings[BUNDLE_ROOT + path].sha256 != sha(data)
                    for path, data in bundle.members.items())
             or len(bindings) != len(bundle.members) + 1 + sum(path.startswith(INPUT_ROOT) for path in bindings)):
@@ -156,7 +165,8 @@ def find_fusion(identity, *, operation_id, skill_release, skill_id):
         return _submission(service, identity, rows[0], bundle) if rows else None
 
 
-def schedule_fusion(identity, *, operation_id, skill_release, skill_id, inputs, options, observations=None):
+def schedule_fusion(identity, *, operation_id, skill_release, skill_id, inputs, options, observations=None,
+                    plot_projection=None):
     """Schedule one content-identified offline child using only host-approved bytes."""
     authorize_fusion_code(identity, skill_release)
     task = _operation_key(identity, operation_id)
@@ -166,10 +176,18 @@ def schedule_fusion(identity, *, operation_id, skill_release, skill_id, inputs, 
         refs = _refs(identity, bundle, inputs)
         raw, cassette = make_request(skill_id, refs, options, observations)
         request_digest = sha(raw)
-        content = _content(bundle, refs, request_digest)
+        projection_meta = {}
+        if plot_projection is not None:
+            from src.research.fusion_plot_projection import MAX_PROJECTION_BYTES
+
+            if (skill_id != "data-audit" or set(refs) != {"workbook"} or type(plot_projection) is not bytes
+                    or not 0 < len(plot_projection) <= MAX_PROJECTION_BYTES):
+                raise ValueError("fusion_projection_invalid")
+            projection_meta = {"plot_projection_sha256": sha(plot_projection)}
+        content = _content(bundle, refs, request_digest, projection_meta.get("plot_projection_sha256"))
         deadline = _deadline(identity)
         current = service.workspace.create(task_id=task, request_id=task, make_current=False,
-            metadata={**_meta(bundle), "request_sha256": request_digest, "content_sha256": content})
+            metadata={**_meta(bundle), **projection_meta, "request_sha256": request_digest, "content_sha256": content})
         wid = current["workspace_id"]
         prior = service.repository.find_submission(owner=identity.owner_user_id, session=identity.session_id,
             workspace_id=wid, operation_id=task, idempotency_key=task)
@@ -181,6 +199,8 @@ def schedule_fusion(identity, *, operation_id, skill_release, skill_id, inputs, 
         blobs.update({BUNDLE_ROOT + path: data for path, data in bundle.members.items()})
         if cassette is not None:
             blobs[OBSERVATIONS] = cassette
+        if plot_projection is not None:
+            blobs[PLOT_SNAPSHOT] = plot_projection
         revision, selected = _bind(identity, service.workspace, current, task, refs, blobs)
         row = service.submit(task_id=task, workspace_id=wid, expected_revision=revision, script_path=LAUNCHER,
             inputs=selected, outputs=(OUTPUT,), arguments=(skill_id,), operation_id=task, idempotency_key=task,
@@ -218,7 +238,7 @@ def _original_inputs(service, request, bindings, bundle, meta, *, historical=Fal
             if live is None or live.get("size_bytes") != snap.size_bytes:
                 raise PermissionError("fusion_input_scope_denied")
         exact[role] = {**public[role], "path": target, "size_bytes": snap.size_bytes}
-    if (_content(bundle, exact, ref.sha256) != meta["content_sha256"]
+    if (_content(bundle, exact, ref.sha256, meta.get("plot_projection_sha256")) != meta["content_sha256"]
             or len(scoped) != sum(path.startswith(INPUT_ROOT) for path in bindings)):
         raise ValueError("fusion_request_content_mismatch")
     return payload, public
@@ -278,7 +298,7 @@ def _historical_bundle(service, row, skill_id, current):
     if all(stored.get(field) == value for field, value in _meta(current).items()):
         return current
     roots = os.environ.get("CITRUS_FUSION_REPORT_RELEASES", "").split(os.pathsep)
-    if len(roots) > 12:
+    if len(roots) > 32:
         raise ValueError("external_report_release_limit")
     candidates = []
     for raw in dict.fromkeys(roots):
@@ -315,6 +335,19 @@ def historical_fusion_source(identity, report_value, reference):
         if len(data) != snap.size_bytes or sha(data) != snap.sha256:
             raise ValueError("fusion_source_snapshot_changed")
         return data, metadata["filename"]
+
+
+def _accepted_plot_projection(service, request, meta):
+    digest = meta.get("plot_projection_sha256")
+    if digest is None:
+        return {}
+    from src.research.fusion_plot_projection import MAX_PROJECTION_BYTES
+
+    raw = service.workspace.read_bytes(request.workspace_id, path=PLOT_SNAPSHOT, version=1,
+                                       expected_sha256=digest)
+    if not 0 < len(raw) <= MAX_PROJECTION_BYTES or sha(raw) != digest:
+        raise ValueError("fusion_frozen_projection_mismatch")
+    return {"_plot_projection": raw}
 
 
 def consume_fusion(identity, *, execution_id, skill_release, skill_id, content_sha256=None, source_identity=None):
@@ -362,7 +395,16 @@ def consume_fusion(identity, *, execution_id, skill_release, skill_id, content_s
                     if (type(versions) is not dict or versions.get("python") != runtime.get("python")
                             or any(versions.get(name) != version for name, version in runtime["dependencies"].items())):
                         raise ValueError("fusion_worker_environment_receipt_mismatch")
-                return {**result, "inputs": inputs, "options": payload["options"], "report": report,
+                projection = {}
+                if not historical and "plot_projection_sha256" in meta:
+                    if report["status"] == "complete":
+                        try:
+                            projection = _accepted_plot_projection(service, request, meta)
+                        except (LookupError, PermissionError, ValueError, OSError):
+                            projection = {"_plot_projection_unavailable": True}
+                    else:
+                        projection = {"_plot_projection_unavailable": True}
+                return {**result, **projection, "inputs": inputs, "options": payload["options"], "report": report,
                         "_account_epoch": request.account_epoch,
                         "_source_snapshot": {"identity": request.identity, "workspace_id": request.workspace_id,
                             "refs": tuple(snap for snap in request.inputs if snap.path.startswith(INPUT_ROOT)

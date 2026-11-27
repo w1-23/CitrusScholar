@@ -93,7 +93,7 @@ def _validate_new_script_inputs(bindings, owner, analysis_result_ref=None):
     resolved = normalize_script_bindings(bindings)
     total = 0
 
-    def check_file(file_id, *, allow_internal=False):
+    def check_file(file_id, *, allow_internal=False, expected_sha256=None):
         nonlocal total
         original = files.get_account_file(file_id, owner, allow_internal=allow_internal)
         if not original:
@@ -107,8 +107,8 @@ def _validate_new_script_inputs(bindings, owner, analysis_result_ref=None):
         if len(payload) > 32 * 1024 * 1024 or total > 64 * 1024 * 1024:
             raise ProjectError("invalid_inputs", "脚本输入超过体积上限。")
         digest = hashlib.sha256(payload).hexdigest()
-        if original.get("sha256") and original["sha256"] != digest:
-            raise ProjectError("source_changed", "原始输入已改变，请登记新的数据版本。")
+        if any(expected != digest for expected in (original.get("sha256"), expected_sha256) if expected):
+            raise ProjectError("source_changed", "输入字节与登记或调用提供的 sha256 不匹配。请重新探查并绑定正确的文件版本。")
 
     if analysis_result_ref:
         analysis = load_analysis_result(owner, analysis_result_ref)
@@ -133,7 +133,7 @@ def _validate_new_script_inputs(bindings, owner, analysis_result_ref=None):
             if payload_file_ref:
                 check_file(payload_file_ref, allow_internal=True)
         else:
-            check_file(raw["file_id"])
+            check_file(raw["file_id"], expected_sha256=raw.get("sha256"))
 
 
 def _finalize(assets, owner, session, run, status, payload):
@@ -218,8 +218,10 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
         if warning:
             payload['run_record'] = warning
             content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-        from src.research.script_reconciliation import finalize_failed_worker
+        from src.research.script_reconciliation import finalize_failed_worker, finalize_output_contract
         finalize_failed_worker(owner, session, run, payload, warning)
+        finalize_output_contract(owner, session, run, payload, warning,
+            snapshots=context.get("input_snapshots"), environment=environment)
         return content, payload
 
     try:
@@ -244,7 +246,14 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                 # internal file IDs. Running/unknown writes cannot be replayed.
                 previous = assets.get_run(owner, session, repair_from_run_id)
                 if previous["status"] == "succeeded":
-                    raise ValueError("Repair target already succeeded; this is not a failed run. Create a new run with explicit input bindings and figure outputs instead.")
+                    error = "Repair target already succeeded; this is not a failed run. Create a new run with explicit input bindings and figure outputs instead."
+                    content, payload = receipt(error, {"error": error, "failure_phase": "preflight",
+                        "error_code": "repair_target_already_succeeded", "script_persisted": False,
+                        "run_reserved": False, "_tool_outcome": {"status": "not_run",
+                            "reason_code": "script_execution_rejected", "artifacts": []}})
+                    from src.research.script_reconciliation import observe_preflight_rejection
+                    observe_preflight_rejection(payload)
+                    return content, payload
                 if previous["status"] not in {"failed", "partial"}:
                     raise ValueError("Repair requires a retained failed or partial run; inspect other run states first")
                 replay = (previous.get("result") or {}).get("replay")
@@ -277,12 +286,14 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                     name = 'analysis_' + name
                 saved = assets.save_script(owner, session, name=name, source=script)
             phase = "source_persisted"
-            from src.figures.script_outputs import normalize_output_contract
+            from src.figures.script_outputs import MainScriptBindingUnavailable, normalize_output_contract, validate_main_script_bindings
             try:
                 contract = _object(kwargs.get("outputs_json"), "outputs_json")
                 if not contract and preset:
                     contract = preset["outputs"]
                 contract = normalize_output_contract(contract)
+                validate_main_script_bindings(saved["source"], contract, bindings,
+                    analysis_input=bool(kwargs.get("analysis_result_ref_json")))
             except ValueError as exc:
                 # Source persistence above has an acknowledged exact ref. This
                 # pure validation cannot have reserved a run, executed code or
@@ -295,6 +306,8 @@ def execute_script_request(executor, *, script="", script_ref_json="", parameter
                 if getattr(exc, "reason_code", "") == "render_script_emit_not_available":
                     payload["error"] = f"[RENDER_SCRIPT_EMIT_NOT_AVAILABLE] {exc}"
                     payload["error_code"] = "render_script_emit_not_available"
+                if isinstance(exc, MainScriptBindingUnavailable):
+                    payload["error_code"] = exc.reason_code
                 content, payload = receipt(str(exc), payload)
                 from src.research.script_reconciliation import observe_preflight_rejection
                 observe_preflight_rejection(payload)

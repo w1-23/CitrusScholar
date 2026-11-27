@@ -18,7 +18,7 @@ LOCAL_GROUP = _GROUPS["route_local"]
 _REUSE_CUE = re.compile(
     r"(?:上述|前面|刚才|刚刚|这些|其中|前者|后者|该项|该结果|该文献|它|这个结果|"
     r"上一轮|进一步比较|哪个更重要|继续分析|基于以上|据此|从中|"
-    r"the above|these results?|former|latter|it|compare (?:them|these)|which is more)",
+    r"\b(?:the above|these results?|former|latter|it|compare (?:them|these)|which is more)\b)",
     re.I,
 )
 _NEW_RETRIEVAL_CUE = re.compile(
@@ -30,9 +30,10 @@ _NEW_RETRIEVAL_CUE = re.compile(
     re.I,
 )
 _PURE_TRANSFORM = re.compile(
-    r"(?:请)?(?:改写|润色|翻译|概括|总结一下(?:上面|上述)|压缩|扩写|"
-    r"把上面|基于上文|解释一下(?:上面|上述)|计算|换算|"
-    r"rewrite|proofread|translate|summari[sz]e\s+the\s+above|reformat)",
+    r"^\s*(?:(?:请|帮我|请帮我|please)\s*)?"
+    r"(?:改写|润色|翻译|概括|总结一下(?:上面|上述)|压缩|扩写|"
+    r"把上面|解释一下(?:上面|上述)|计算|换算|"
+    r"\b(?:rewrite|proofread|translate|summari[sz]e\s+the\s+above|reformat)\b)",
     re.I,
 )
 _SOCIAL = re.compile(
@@ -50,9 +51,10 @@ _LATEST = re.compile(
     re.I,
 )
 _REQUIRED = re.compile(
-    r"请(?:你|帮我)?(?:联网|网上|网页)?(?:检索|搜索|搜一下|查找|查最新|查这篇|查阅)|"
+    r"请(?:你|帮我)?(?:再|重新|补充)?(?:联网|网上|网页)?(?:检索|搜索|搜一下|查找|查最新|查这篇|查阅)|"
     r"(?:帮我|麻烦)?(?:联网|网上|网页)(?:检索|搜索|搜|查)|"
-    r"(?:^|[，,])\s*(?:检索|搜索|查找|搜一下)|search for|please search|find papers?|look up",
+    r"(?:^|[，,])\s*(?:(?:重新|补充|再)?(?:检索|搜索|查找|搜一下)|再查)|"
+    r"search for|please search|find papers?|look up",
     re.I,
 )
 _DATA_AUDIT = re.compile(
@@ -97,9 +99,16 @@ _PRIVATE_EGRESS_DENIAL = re.compile(
 _SOURCE_EXPLANATION = re.compile(
     rf"(?:为什么|为何|怎么|\bwhy\b)[^。！？；!?;\n]{{0,30}}?"
     rf"(?:没(?:有)?|未|不曾|did(?:\s+not|n['’]t)|haven['’]t)[^。！？；!?;\n]{{0,18}}?"
-    rf"(?:{_SOURCE}|{_ACTION})|(?:{_SOURCE_CHAIN}|融合搜索|融合检索)[^。！？；!?;\n]{{0,16}}"
+    rf"(?:{_SOURCE}|{_ACTION})|^\s*(?:{_SOURCE}(?:{_ACTION})?(?:\s*{_CONNECT}\s*{_SOURCE}(?:{_ACTION})?)?|"
+    r"融合搜索|融合检索)\s*(?:到底)?"
     r"(?:是什么|什么意思|有什么区别|含义|如何理解)|"
     rf"(?:什么是|何谓|\bwhat\s+is\b)\s*(?:{_SOURCE}\s*{_ACTION}|融合搜索|融合检索)", re.I)
+_SOURCE_HISTORY = re.compile(
+    rf"\s*(?:你|您)?\s*(?:(?:刚才|刚刚|上一轮|上轮|之前)\s*)?"
+    rf"(?:有没有|是否)\s*(?:在|用|进行)?\s*"
+    rf"(?:{_ACTION}\s*(?:过|了)?\s*{_SOURCE_CHAIN}|{_SOURCE_CHAIN}\s*(?:{_ACTION})?)(?:过|了)?(?:吗|呢)?\s*",
+    re.I,
+)
 _SCOPE_VALUES = {"auto", "local", "web", "fusion"}
 
 
@@ -127,8 +136,9 @@ def _source_intent(query: str) -> _SourceIntent:
     clauses = intent_clauses(query)
     # An explanatory follow-up does not ask for fresh retrieval. Preserve a
     # separate actionable clause such as “为何没查？现在请联网检索”.
-    explanation = any(_SOURCE_EXPLANATION.search(clause) for clause in clauses)
-    action_text = "，".join(clause for clause in clauses if not _SOURCE_EXPLANATION.search(clause))
+    actionable = [clause for clause in clauses
+                  if not (_SOURCE_EXPLANATION.search(clause) or _SOURCE_HISTORY.fullmatch(clause))]
+    action_text = "，".join(actionable)
     blocked = {name for match in _SOURCE_BAN.finditer(action_text) for name in ("local", "web")
                if _has_source(match[0], name)}
     positive = _SOURCE_BAN.sub(" ", action_text)
@@ -146,7 +156,7 @@ def _source_intent(query: str) -> _SourceIntent:
     mentions_both = all(_has_source(positive, name) for name in ("local", "web"))
     either = bool(mentions_both and _PAIR_ALTERNATIVE.search(positive) and not _BOTH_ACTION.search(positive))
     if not either and (_GENERIC_FUSION.search(positive) or (mentions_both and (
-            _BOTH_ACTION.search(positive) or (_PAIR_JOIN.search(positive) and _ACTION.search(positive))))):
+            _BOTH_ACTION.search(positive) or (_PAIR_JOIN.search(positive) and re.search(_ACTION, positive, re.I))))):
         requested.update(("local", "web"))
     elif not either:
         for match in _SOURCE_ACTION.finditer(positive):
@@ -155,6 +165,7 @@ def _source_intent(query: str) -> _SourceIntent:
         if re.search(r"(?:请|帮我|麻烦|继续|现在|重新)\s*(?:你|先|进行)?\s*联网|"
                      r"^\s*联网\s*(?:回答|给出|帮我|核实)", positive, re.I):
             requested.add("web")
+    explanation = len(actionable) < len(clauses) and not positive.strip(" ，\t")
     return _SourceIntent(_route_for(requested & allowed),
                          _route_for(allowed) if len(allowed) == 1 else "auto",
                          either, frozenset(blocked), explanation, positive)
@@ -180,9 +191,7 @@ def retrieval_suppressed(query: str) -> bool:
     """Suppress new retrieval without filtering authorized historical context."""
     q = str(query or "").strip()
     intent = _source_intent(q)
-    return (bool(_SOCIAL.fullmatch(q) or _MEMORY_COMMAND.search(q))
-            or (intent.explanation and intent.requested == "auto"
-                and not _REQUIRED.search(intent.action_text)))
+    return bool(_SOCIAL.fullmatch(q) or _MEMORY_COMMAND.search(q) or intent.explanation)
 
 
 @dataclass(frozen=True)
@@ -211,15 +220,28 @@ def parse_request_constraints(
     intent = _source_intent(q)
     explicit = bool(_REQUIRED.search(intent.action_text))
     audit = bool(_DATA_AUDIT.search(q))
-    pure = bool(_PURE_TRANSFORM.search(q))
+    pure = bool(_PURE_TRANSFORM.search(intent.action_text))
+    if pure:
+        # A second requested action makes this a mixed turn. Payload text
+        # and explicit bans were already removed by the source parser.
+        explicit = explicit or bool(re.search(
+            rf"(?:同时|并且|然后|之后|并|再|另外|\b(?:and|then)\b)\s*{_ACTION}|"
+            r"重新(?:检索|搜索)|补充(?:检索|搜索)|(?:翻译|translate).{0,35}?https?://",
+            intent.action_text, re.I))
+        # Calculations may depend on newly requested values. Do not suppress
+        # optional retrieval when the calculation explicitly requests current data.
+        if re.match(r"^\s*(?:请)?(?:计算|换算)", intent.action_text) and _LATEST.search(intent.action_text):
+            pure = False
 
-    if intent.explanation and intent.requested == "auto" and not explicit:
+    if intent.explanation:
         return RequestConstraints("deny", "none", (), audit, pure, "retrieval_explanation")
     if _SOCIAL.fullmatch(q) or _MEMORY_COMMAND.search(q):
         return RequestConstraints("deny", "none", (), audit, pure, "no_retrieval_or_social")
     if len(intent.blocked) == 2 or selected_scope in intent.blocked:
         return RequestConstraints("deny", "none", (), audit, pure, "user_denied_retrieval")
     mode = intent.requested
+    if pure and mode == "auto" and not explicit and selected_scope == "auto":
+        return RequestConstraints("deny", "none", (), audit, True, "transformation_from_context")
     if (mode == "auto" and intent.exclusive != "auto" and not explicit
             and selected_scope in {"auto", intent.exclusive}):
         other = next(iter(intent.blocked))
@@ -330,7 +352,13 @@ def decide_retrieval(
         return RetrievalDecision(mode, tuple(groups), history, reason, policy)
 
     constraints = parse_request_constraints(query, scope)
+    from src.graph.intent_text import mask_literal_payload
+    intent_text = mask_literal_payload(q)
+    new_evidence = bool(_NEW_RETRIEVAL_CUE.search(intent_text))
+    reuse = bool(has_history_evidence and recent and _REUSE_CUE.search(intent_text) and not new_evidence)
     if constraints.source_policy == "deny":
+        if constraints.reason_code == "transformation_from_context" and reuse:
+            return decision("reuse", (), recent, constraints.reason_code, "deny")
         return decision("none", (), (), constraints.reason_code, "deny")
     if constraints.source_policy == "required":
         return decision(
@@ -350,13 +378,9 @@ def decide_retrieval(
     if _MEMORY_COMMAND.search(q):
         return decision("none", (), (), "memory_write_only", policy)
 
-    new_evidence = bool(_NEW_RETRIEVAL_CUE.search(q))
-    if has_history_evidence and recent and _REUSE_CUE.search(q) and not new_evidence:
+    if reuse:
         return decision("reuse", (), recent, "recent_evidence_reuse", policy)
 
-    if _PURE_TRANSFORM.search(q):
-        return decision("none", (), (), "transformation_from_context", policy)
-
-    if _LATEST.search(q) or new_evidence:
+    if _LATEST.search(intent_text) or new_evidence:
         return decision("web", reason="time_sensitive_web", policy=policy)
     return decision("auto", reason="automatic_advice", policy=policy)

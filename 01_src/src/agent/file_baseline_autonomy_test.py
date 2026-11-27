@@ -184,7 +184,10 @@ def test_framework_no_skill_file_dispatch_and_replay(tmp_path, file_run, interru
 
         async def model(history, _, *, native_schemas):
             model_calls.append(1)
-            assert not {"write_file", "edit_file"} & {row["function"]["name"] for row in native_schemas}
+            # Native write tools are part of the single file surface now; the
+            # private workspace_* names are only kept as deprecated dispatch.
+            assert {"write_file", "edit_file", "delete"} <= {
+                row["function"]["name"] for row in native_schemas}
             observed = [m for m in history if isinstance(m, ToolMessage)]
             if not observed:
                 return AIMessage("", tool_calls=[call])

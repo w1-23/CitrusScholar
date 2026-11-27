@@ -54,7 +54,7 @@ def _receipt(http_status, data, scope):
     if isinstance(data, dict):
         error = data.get("error")
         if http_status == 409 and isinstance(error, dict) and "request_ref" not in data:
-            if error.get("code") in {"already_present", "already_pending"}:
+            if error.get("code") in ("already_present", "already_pending"):
                 return {"status": error["code"]}
             if error.get("code") == "idempotency_conflict":
                 return {"status": "unavailable", "reason": "selfcorpus_idempotency_conflict"}

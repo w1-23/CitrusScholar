@@ -140,6 +140,7 @@ def test_unverified_or_unauthorized_inputs_never_post(monkeypatch, fixture, case
 @pytest.mark.parametrize("status,response,expected", [
     (409, {"error": {"code": "already_present"}}, {"status": "already_present"}),
     (409, {"error": {"code": "already_pending"}}, {"status": "already_pending"}),
+    (409, {"error": {"code": ["already_pending"]}}, {"status": "unavailable", "reason": "selfcorpus_invalid_response"}),
     (409, {"error": {"code": "idempotency_conflict", "message": "private"}},
      {"status": "unavailable", "reason": "selfcorpus_idempotency_conflict"}),
     (202, _queued("personal:99"), {"status": "unavailable", "reason": "selfcorpus_invalid_response"}),

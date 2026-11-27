@@ -438,6 +438,70 @@ def test_explicit_three_formats_cannot_be_filled_by_a_different_render():
     assert not gaps and goals[0].artifact_links == [v["link"] for v in later["artifact_validations"][:2]]
 
 
+def test_final_answer_file_alias_binds_delivery_and_review_to_the_same_render():
+    from types import SimpleNamespace
+
+    from src.core.turn_outcome import (completion_digest, completion_from_answer, figure_answer_refs,
+                                       reviewed_completion_valid, reviewed_turn_outcome)
+    from src.research.artifact_delivery import build_delivery, missing_answer_links
+
+    query = ("只用附带的合成 CSV，不联网。以 sample 为横轴、signal_a 为纵轴绘制散点图，按 cohort 区分；"
+             "排除 cohort 缺失的记录，保留重复观测。不做统计检验。"
+             "交付同一次渲染的可下载 SVG、PNG、PDF，用简短中文说明纳入记录数。")
+    requirements = contract_for_turn(query, has_tables=True).deliverables
+    assert len(requirements) == 1 and requirements[0]["all_formats"] is True
+    assert requirements[0]["formats"] == ["svg", "png", "pdf"]
+    first = _published_figure("first", "a" * 32, ("svg", "png", "pdf"))
+    second = _published_figure("second", "b" * 32, ("svg", "png", "pdf"))
+    messages, projects, verified = {}, {}, []
+    aliases = [f"/api/v2/files/{i:032x}/download" for i in range(1, 7)]
+    for row, downloads, render_id in ((first, aliases[:3], "c" * 32), (second, aliases[3:], "d" * 32)):
+        [figure] = row["op_receipt"]["coverage"]["figures"]
+        for item, ref, download in zip(figure["exports"], row["artifact_validations"], downloads):
+            item.update(download_url=download, sha256=ref["artifact_id"] * 2)
+            ref.update(sha256=item["sha256"], size_bytes=42, reason_code="verified")
+            verified.append(ref)
+        messages[row["tool_call_id"]] = SimpleNamespace(artifact={"figures": [figure | {"qa_receipt": {"status": "pass"}}]})
+        projects[figure["figure_id"]] = {"exports_json": {item["format"]: item for item in figure["exports"]},
+                                         "document_json": {"render_id": render_id}}
+
+    # Exercise retained records whose traversal puts the stale receipt first.
+    rows = [second, first]
+    external = "/api/v2/files/" + "f" * 32 + "/download"
+    answer = "已完成配图。\n" + "\n".join(f"- `{link}`" for link in [*aliases[3:], external])
+    refs = figure_answer_refs(answer)
+    assert refs == [*aliases[3:], external]
+    links = {ref["link"] for ref in verified}
+    expected = [ref["link"] for ref in second["artifact_validations"]]
+    goals, gaps = artifact_goal_evidence(requirements, rows, links, single_render_receipt=True,
+                                         answer_render_refs=refs)
+    assert not gaps and len(goals) == 1
+    assert goals[0].evidence_call_ids == ["second"] and goals[0].artifact_links == expected
+
+    identity = SimpleNamespace(run_id="run", session_id="fixture-session", owner_user_id=7)
+    manifest = build_delivery(identity=identity, request_id="request", rows=rows, messages=messages,
+        requirements=requirements, select_links=goals[0].artifact_links, verified=verified,
+        project_lookup=lambda figure_id, _: projects.get(figure_id))
+    assert manifest["delivery_status"] == "complete"
+    assert manifest["render_id"] == "d" * 32
+    assert manifest["user_links"] == expected
+    answer += "\n" + "\n".join(missing_answer_links(manifest, answer))
+    assert not any(ref["link"] in answer for ref in first["artifact_validations"])
+    statement = completion_from_answer(answer, rows)
+    statement = statement.model_copy(update={"goals": [*statement.goals, *goals]})
+    proof = reviewed_turn_outcome(statement, rows, identity={"run_id": "run"}, request_version=1,
+        request_hash=completion_digest(query), artifact_contract={"schema_version": 1, "request_version": 1,
+        "requirements": requirements, "verified_links": sorted(links), "single_render_receipt": True,
+        "answer_render_refs": refs})
+    assert reviewed_completion_valid(proof, rows, answer=answer)
+
+    # A missing format on the named render stays missing even when the other render has it.
+    for selected, checked in ((refs, links - {expected[-1]}), (refs + [aliases[0]], links)):
+        goals, gaps = artifact_goal_evidence(requirements, rows, checked, single_render_receipt=True,
+                                             answer_render_refs=selected)
+        assert not goals and gaps[0]["reason_code"] == "required_deliverable_missing"
+
+
 def test_separate_figures_in_the_same_receipt_cannot_fill_one_format_set():
     requirement = contract_for_turn("画箱线图，交付可下载 SVG、PNG 和 PDF。", has_tables=True).deliverables
     latest = _published_figure("same-call", "svg-figure", ("svg", "png"))
@@ -452,3 +516,7 @@ def test_separate_figures_in_the_same_receipt_cannot_fill_one_format_set():
 def test_format_only_figure_continuation_does_not_absorb_separate_pdf():
     requirements = contract_for_turn("画箱线图，交付可下载 SVG、PNG。另做一份 PDF 报告。", has_tables=True).deliverables
     assert [frozenset(r["formats"]) for r in requirements] == [frozenset({"svg", "png"}), frozenset({"pdf"})]
+    same_render = contract_for_turn("画箱线图，交付同一次渲染的可下载 SVG、PNG、PDF。另做一份 PDF 报告。",
+                                    has_tables=True).deliverables
+    assert [r["formats"] for r in same_render] == [["svg", "png", "pdf"], ["pdf"]]
+    assert same_render[1]["kinds"] == ["report_html"]

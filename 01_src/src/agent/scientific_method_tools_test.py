@@ -2,8 +2,10 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from src.agent.dataset_tool_scope import authorized_scope, csv_audit_supplies_locations
 from src.agent.preset_catalog import build_preset_catalog
-from src.agent.dataset_tool_scope import authorized_scope
 
 
 def test_method_catalog_signature_and_inline_verification(monkeypatch):
@@ -32,7 +34,6 @@ def test_method_catalog_signature_and_inline_verification(monkeypatch):
 
 
 def test_explicit_coordinates_or_sheet_are_never_replaced_by_default():
-    import pytest
     with pytest.raises(ValueError):
         authorized_scope(None, '只审查 data!A1:C52')
     with pytest.raises(ValueError):
@@ -44,6 +45,78 @@ def test_explicit_coordinates_or_sheet_are_never_replaced_by_default():
     assert authorized_scope(None, 'Report only missing cells and exact duplicate rows, with source locations.') is None
     with pytest.raises(ValueError):
         authorized_scope(None, 'Audit only rows 3 to 8')
+
+
+@pytest.fixture
+def csv_audit_observations():
+    source_ref = {'file_id': 'a' * 32, 'sha256': 'b' * 64}
+    scope = {'selection': 'single_csv_table'}
+    dataset_ref = {'file_id': 'c' * 32, 'sha256': 'd' * 64}
+    source = {'file_id': source_ref['file_id'], 'name': 'example.csv', 'source_ref': source_ref}
+    prepare = SimpleNamespace(name='prepare_audit_dataset', artifact={
+        'status': 'complete', 'reason_code': 'dataset_prepared', 'format': 'csv',
+        'source_ref': source_ref, 'dataset_ref': dataset_ref, 'scope': scope})
+    audit = SimpleNamespace(name='audit_prepared_dataset', artifact={
+        'status': 'complete', 'reason_code': 'dataset_audit_completed', 'dataset_ref': dataset_ref,
+        'scope': scope, 'checks': [{'check': 'missing', 'status': 'checked'},
+                                  {'check': 'duplicate', 'status': 'checked'}]})
+    return source, prepare, audit
+
+
+_CSV_AUDIT_QUERY = 'Report only missing cells and exact duplicate rows, with source locations.'
+
+
+def test_complete_csv_audit_supplies_locations(csv_audit_observations):
+    source, prepare, audit = csv_audit_observations
+    assert csv_audit_supplies_locations(_CSV_AUDIT_QUERY, [source], [prepare, audit])
+
+
+@pytest.mark.parametrize('request_suffix', [
+    ' Also preview the first 3 rows.',
+    ' Also list the headers.',
+    ' Show me the first five rows.',
+    ' 并给我预览原始值。',
+    ' Inspect only rows 3 to 8.',
+    ' 核对工作表 data!A1:D11。',
+])
+def test_csv_audit_preserves_explicit_inspection(csv_audit_observations, request_suffix):
+    source, prepare, audit = csv_audit_observations
+    assert not csv_audit_supplies_locations(_CSV_AUDIT_QUERY + request_suffix, [source], [prepare, audit])
+
+
+@pytest.mark.parametrize('change', [
+    'partial', 'failed', 'missing_prepare', 'late_prepare', 'missing_check', 'unchecked_check',
+    'unmatched_ref', 'stale_source', 'different_file', 'multiple_sources', 'workbook',
+])
+def test_csv_audit_keeps_inspection_for_unproven_coverage(csv_audit_observations, change):
+    source, prepare, audit = csv_audit_observations
+    sources = [source]
+    observations = [prepare, audit]
+    if change in {'partial', 'failed'}:
+        later_audit = SimpleNamespace(name=audit.name, artifact={**audit.artifact, 'status': change})
+        observations.append(later_audit)
+    elif change == 'missing_prepare':
+        observations = [audit]
+    elif change == 'late_prepare':
+        observations = [audit, prepare]
+    elif change == 'missing_check':
+        audit.artifact['checks'].pop()
+    elif change == 'unchecked_check':
+        audit.artifact['checks'][1]['status'] = 'not_evaluated'
+    elif change == 'unmatched_ref':
+        audit.artifact['dataset_ref'] = {'file_id': 'e' * 32, 'sha256': 'f' * 64}
+    elif change == 'stale_source':
+        source['source_ref'] = {**source['source_ref'], 'sha256': 'e' * 64}
+    elif change == 'different_file':
+        source['file_id'] = 'e' * 32
+        source['source_ref'] = {**source['source_ref'], 'file_id': source['file_id']}
+    elif change == 'multiple_sources':
+        sources.append({'name': 'other.csv'})
+    elif change == 'workbook':
+        source['name'] = 'example.xlsx'
+        prepare.artifact['format'] = 'xlsx'
+        prepare.artifact['scope'] = {'selection': 'whole_workbook'}
+    assert not csv_audit_supplies_locations(_CSV_AUDIT_QUERY, sources, observations)
 
 
 def test_delivery_outputs_one_verified_asset_and_one_render():

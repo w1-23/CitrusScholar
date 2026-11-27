@@ -633,7 +633,7 @@ async def _run(state, identity, ledger):
         delivery_gaps, artifact_contract, delivery_manifest = [], None, None
         figure_previews = {}
         if requirements:
-            from src.core.turn_outcome import _effective_artifact_records, artifact_goal_evidence
+            from src.core.turn_outcome import _effective_artifact_records, artifact_goal_evidence, figure_answer_refs, uses_single_render_delivery
             from src.research.tools import validate_artifact_links
             effective = _effective_artifact_records(host.records)
             links = list(dict.fromkeys(item["link"] for row in effective
@@ -641,16 +641,17 @@ async def _run(state, identity, ledger):
             verified = await asyncio.to_thread(validate_artifact_links, links, session_id=identity.session_id,
                          owner_user_id=identity.owner_user_id, request_id=host._result_request_id()) if links else []
             verified_links = sorted(item["link"] for item in verified if item.get("valid"))
+            answer_render_refs = figure_answer_refs(public_answer)
             goals, delivery_gaps = artifact_goal_evidence(requirements, effective, set(verified_links),
-                                                         single_render_receipt=True)
+                single_render_receipt=True, answer_render_refs=answer_render_refs)
             artifact_contract = {"schema_version": 1, "request_version": update_version,
                                  "requirements": requirements, "verified_links": verified_links,
-                                 "single_render_receipt": True}
+                                 "single_render_receipt": True, "answer_render_refs": answer_render_refs}
             from src.research.artifact_delivery import build_delivery, missing_answer_links
             selected_delivery_links = {link for goal in goals for link in goal.artifact_links}
             delivery_manifest = await asyncio.to_thread(build_delivery, identity=identity,
                 request_id=host._result_request_id(), rows=effective, messages=host.messages,
-                requirements=requirements, select_links=selected_delivery_links if not delivery_gaps else None,
+                requirements=requirements, select_links=selected_delivery_links if not delivery_gaps or uses_single_render_delivery(requirements) else None,
                 gaps=delivery_gaps, verified=verified)
             delivery_links = missing_answer_links(delivery_manifest, public_answer)
             if delivery_links:
@@ -812,6 +813,10 @@ async def _run(state, identity, ledger):
 
     async def metered_model(request, handler, current_identity, host_tools):
         model_allowed = set(refresh_allowed())
+        from .dataset_tool_scope import csv_audit_supplies_locations
+        if ("inspect_uploaded_table" in model_allowed and not update_version and not requirements
+                and csv_audit_supplies_locations(str(state.get("query") or ""), tables, host.messages.values())):
+            model_allowed.discard("inspect_uploaded_table")
         # A fresh attachment run should use its own observations. Explicit
         # report follow-up has a separate, provenance-bound read-only route.
         historical_readback = host if ("read_tool_result" in model_allowed

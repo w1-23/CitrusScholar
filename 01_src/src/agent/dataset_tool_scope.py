@@ -53,3 +53,43 @@ def authorized_scope(proposed, request, clarification=""):
     if value.get("header_rows"):
         raise ValueError("dataset_sheet_scope_cannot_override_headers")
     return WorkbookScope(sheet=sheet, bounds=None, header_rows=())
+
+
+_PREVIEW = re.compile(r"预览|原始(?:值|数据|内容)|表头|列名|前.{0,8}行|其他文件|另一个文件|"
+                      r"\b(?:preview|headers?|raw (?:data|values|rows)|sample rows|first [\w-]+ rows|"
+                      r"columns? names?|(?:other|another|previous) (?:file|attachment))\b", re.I)
+_AUDIT_CHECK_INTENT = {
+    "missing": re.compile(r"缺失|空值|\b(?:missing|null|empty)\b", re.I),
+    "duplicate": re.compile(r"重复|\bduplicat(?:e|es|ed|ion)\b", re.I),
+}
+
+
+def csv_audit_supplies_locations(query, tables, observations):
+    """Recognize a complete, present-turn audit of its sole CSV attachment."""
+    text = mask_literal_payload(query)
+    requested = {check for check, pattern in _AUDIT_CHECK_INTENT.items() if pattern.search(text)}
+    if len(tables) != 1 or not requested or _PREVIEW.search(text) or restricted_request(text):
+        return False
+    source = tables[0]
+    pinned = source.get("source_ref") or {}
+    source_ref = {"file_id": source.get("file_id") or pinned.get("file_id"),
+                  "sha256": pinned.get("sha256") or source.get("sha256")}
+    if not all(source_ref.values()):
+        return False
+    prepared, covered = [], False
+    for message in observations:
+        artifact = message.artifact or {}
+        if message.name == "audit_prepared_dataset":
+            checks = {item.get("check") for item in artifact.get("checks") or ()
+                      if isinstance(item, dict) and item.get("status") == "checked"}
+            ref = artifact.get("dataset_ref")
+            covered = bool(artifact.get("status") == "complete"
+                           and artifact.get("reason_code") == "dataset_audit_completed"
+                           and ref and ref in prepared and requested <= checks)
+        if artifact.get("status") != "complete":
+            continue
+        if (message.name == "prepare_audit_dataset" and artifact.get("reason_code") == "dataset_prepared"
+                and artifact.get("format") == "csv" and artifact.get("source_ref") == source_ref
+                and (artifact.get("scope") or {}).get("selection") == "single_csv_table"):
+            prepared.append(artifact.get("dataset_ref"))
+    return covered

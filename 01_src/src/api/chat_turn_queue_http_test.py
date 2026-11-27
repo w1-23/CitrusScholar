@@ -1102,7 +1102,7 @@ def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime,
         "data-audit": ("审查这个数据有没有异常，只要文字结论。", "audit_uploaded_data", {
             "file_indexes_json": [0]}, "数据审查结果已返回。"),
         "question-answering": ("转座子是什么？", "", {}, "转座子是能在基因组中改变位置的 DNA 序列。"),
-        "dataset-audit": ("Audit this CSV for data quality. Report exact duplicate rows. No network.",
+        "dataset-audit": ("Audit the attached CSV for data quality. Report only missing cells and exact duplicate rows, with source locations. Use only the attachment. No web, generated files, or source edits.",
             "prepare_audit_dataset", {"file_index": 0}, "The duplicate rows are 2 and 3."),
         "dataset-audit-partial": ("Audit this CSV for data quality. Check numeric ranges. No network.",
             "prepare_audit_dataset", {"file_index": 0}, "No range bounds were supplied."),
@@ -1129,12 +1129,13 @@ def test_scientific_source_chain_uses_expected_tool_and_persists_answer(runtime,
             if len(wire) == 2:
                 content, = [row["content"] for row in body["messages"] if row.get("tool_call_id") == "source-chain-tool"]
                 ref = json.loads(content)["dataset_ref"]
-                checks = {"checks": ["range" if partial else "duplicate"]}
+                checks = {"checks": ["range"] if partial else ["missing", "duplicate"]}
                 return _chat_stream([("dataset-check", "audit_prepared_dataset", {"dataset_ref": ref, "checks": checks})])
             content, = [row["content"] for row in body["messages"] if row.get("tool_call_id") == "dataset-check"]
             assert content.startswith("{"), repr(content)[:3500]
             report = json.loads(content)
             assert report["status"] == ("partial" if partial else "complete")
+            assert ("inspect_uploaded_table" in names) == partial
             if not partial:
                 assert [row["row"] for row in report["findings"]] == [2, 3]
             return _chat_stream(answer=answer)

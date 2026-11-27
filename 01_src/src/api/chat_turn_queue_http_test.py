@@ -928,6 +928,7 @@ def test_publication_reconciliation_only_registers_owned_committed_bytes(runtime
         monkeypatch.setattr(module, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(tools, "get_user_id", lambda: runtime.owner)
     monkeypatch.setattr(tools, "get_session_id", lambda: runtime.sid)
+    monkeypatch.setattr(tracing, "get_user_id", lambda: runtime.owner)
     monkeypatch.setattr(tracing, "get_client_request_id", lambda: "file-turn")
     monkeypatch.setattr(tracing, "get_current_tool_name", lambda: "deliver_research_artifact")
     root = send(runtime, "file-turn", "publication only")

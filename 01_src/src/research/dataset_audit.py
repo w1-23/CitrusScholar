@@ -68,6 +68,20 @@ class AuditChecks(_Contract):
     ranges: dict[Column, NumericRange] = Field(default_factory=dict, max_length=256)
     outlier_fields: tuple[Column, ...] = Field(default=(), max_length=256)
 
+    @model_validator(mode='before')
+    @classmethod
+    def unpack_json_arrays(cls, value):
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        for field in ('checks', 'required_fields', 'unique_fields', 'outlier_fields'):
+            if isinstance(data.get(field), list):
+                data[field] = tuple(data[field])
+        if isinstance(data.get('categories'), dict):
+            data['categories'] = {column: tuple(items) if isinstance(items, list) else items
+                                  for column, items in data['categories'].items()}
+        return data
+
     @model_validator(mode='after')
     def validate_fields(self):
         for name, items in (('missing', self.required_fields), ('duplicate', self.unique_fields),

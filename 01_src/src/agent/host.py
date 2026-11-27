@@ -286,7 +286,7 @@ async def _run(state, identity, ledger):
     prompt += "\n" + runtime_capabilities.prompt_fragment()
     if "prepare_audit_dataset" in allowed:
         prompt += ("\n数据质量审查先调用 prepare_audit_dataset，再把原样 DatasetRef 交给 audit_prepared_dataset。"
-                   "明确受限时保持用户给定范围，未知结构才澄清。不要用多次表格预览替代冻结引用。")
+                   "明确受限时保持用户给定范围。已覆盖请求时，以 audit_prepared_dataset 回执结算目标，不再做预览或读原文件。")
     if "run_numeric_integrity" in allowed:
         prompt += ("\n仅在用户明确请求数值科研诚信检查时，调用 run_numeric_integrity，"
                    "恢复后用原 execution_id 调用 collect_numeric_integrity。禁用图像检查；受限范围不能改成全表。")

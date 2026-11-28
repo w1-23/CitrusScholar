@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 from contextvars import ContextVar
@@ -180,6 +181,10 @@ def expand(text: str, *, verified_previews: dict[int, str] | None = None) -> str
             ("workbench_url", "在图件工作台打开", r"/figures(?:/legacy)?\?project=[a-f0-9]{32}"),
         ):
             url = figure[key]
+            # External Workbench needs a verified figure-card handoff, not a legacy project query.
+            if (key == "workbench_url" and url.startswith("/figures?")
+                    and os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"):
+                continue
             if url and re.fullmatch(pattern, url):
                 links.append(f"[{label}]({url})")
         preview = (verified_previews or {}).get(int(match.group(1)), "")

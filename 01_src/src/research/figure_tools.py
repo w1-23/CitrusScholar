@@ -204,6 +204,7 @@ def _run_research_figure_script(
     默认或请求 SVG 的矩阵热图用 ax.pcolormesh(..., shading='flat', rasterized=False)，
     不用 imshow；若有色标，创建后将 colorbar.solids.set_rasterized(False)（solids 非空时）。
     保留矩阵值、遮罩、轴顺序、坐标、色标范围和色标单位；不擅自替换像素插值等非等价表示。
+    需要在工作台继续编辑时，使用独立 render_script 和冻结数据；仅在本轮图件卡有「在工作台打开」时引导，勿给通用工作台地址。
     不打开或粘贴 SVG/XML 源码，除非用户明确要求源码。
     只有缺必要细节时才按原文 JSON Pointer 读取，例如 /script_report、/exports、/figures/0/qa_receipt、/figures/0/current_qa。
     修复真实失败才读取已有 run_id 或明确失败字段，复用真实输入与脚本版本；不要以演示数据或放宽 QA 替代正式成果。
@@ -495,8 +496,8 @@ def _run_research_figure_script(
         "timeout": timeout_receipt,
         "failures": publish_failures,
         "presentation_warnings": stage_failures,
-        "note": ("脚本图件已保存，可在「图表工作台」查看和下载（/figures）。"
-                 "这份脚本尚未分离分析与渲染；样式编辑需要冻结中间表和独立render_script，避免重算改变数值。"
+        "note": ("图件已保存。以本轮图件卡为准，有「在工作台打开」才可接手脚本和冻结数据；"
+                 "不要引导用户从通用工作台或旧项目地址导入。仅有下载入口时，如实说明可下载。"
                  if project else "图件已导出，但未能保存工作台项目；当前只能下载。"),
     }
     if template_meta:

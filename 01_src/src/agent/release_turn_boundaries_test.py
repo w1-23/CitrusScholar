@@ -576,7 +576,13 @@ def test_same_render_partial_assets_survive_without_fulfilling_svg_contract():
     manifest = build_delivery(identity=identity, request_id="request", rows=rows, messages={},
                               requirements=requirements, select_links=expected, gaps=gaps, verified=refs)
     assert manifest["status"] == "partial" and set(manifest["user_links"]) == expected
-    assert project_artifact_delivery(manifest)["missing_formats"] == ["svg"]
+    public = project_artifact_delivery(manifest)
+    assert manifest["limitations"] and "limitations" not in public
+    assert public["missing_formats"] == ["svg"]
+    assert set(public["user_links"]) == expected
+    assert all(a["validation"] == {"status": "passed"} for a in public["artifacts"])
+    assert all(a["validation"]["checks"] for a in manifest["artifacts"])
+    assert project_artifact_delivery(public) == public
     pending = build_delivery(identity=identity, request_id="request", rows=[], messages={},
                              delivery_uncertain=True, verified=[])
     assert pending["status"] == pending["delivery_status"] == "unknown"

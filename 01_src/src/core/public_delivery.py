@@ -350,15 +350,13 @@ def project_artifact_delivery(value):
             fields["workbench_project_ref"] = ref
             if version > 1:
                 fields["workbench_render_version"] = version
-        fields.update(url=url, validation={"status": project_fields(validation, ids="status").get("status", ""),
-                                           "checks": _ids(validation.get("checks"))})
+        fields.update(url=url, validation={"status": project_fields(validation, ids="status").get("status", "")})
         return fields
 
     assets = _array(row.get("artifacts"), asset)
     return result | project_fields(row, ids="delivery_id logical_task_id delivery_status render_id", nullable="render_id") | {
         "schema_version": "artifact-delivery/1", "artifacts": assets,
         "user_links": list(dict.fromkeys(item["url"] for item in assets)),
-        "limitations": _ids(row.get("limitations")),
         "missing_formats": [fmt for fmt in _ids(row.get("missing_formats"))
                             if fmt in {"svg", "png", "pdf", "tiff"}],
         "obligations": _array(row.get("obligations"), lambda item: project_fields(item, texts="label") | {

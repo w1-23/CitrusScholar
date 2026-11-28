@@ -244,7 +244,7 @@
           place(host, row, hostIndex++); return;
         }
         var data = item.data, status = data.status || 'running';
-        if (inline && status === 'proposed') {
+        if (status === 'proposed') {
           row.remove(); rows.delete(item.id); return;
         }
         var operationId = data.logical_key || data.operation_id || data.tool_call_id || item.id;
@@ -325,7 +325,7 @@
       progress: function (data) {
         // Progress can update an existing real operation, never invent a tool.
         var keys = [data.tool_call_id, data.operation_id, data.logical_key].filter(Boolean).map(String);
-        if (keys.length && projection.entries.some(function (entry) { return entry.kind === 'action' && keys.some(function (key) { return entry.aliases.indexOf(key) >= 0; }); })) {
+        if (keys.length && projection.entries.some(function (entry) { return entry.kind === 'action' && entry.data.status !== 'proposed' && keys.some(function (key) { return entry.aliases.indexOf(key) >= 0; }); })) {
           projection.action(data); draw();
         }
       }};

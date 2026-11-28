@@ -354,8 +354,7 @@
       keys.forEach(function (key) { if (item.aliases.indexOf(key) < 0) item.aliases.push(key); });
       // A late proposal must not change any field of a formal attempt.
       if (data.status === 'proposed' && item.data.status && item.data.status !== 'proposed') return item;
-      if (item.data.status === 'proposed' && data.status !== 'proposed' &&
-          entries.some(function (entry) { return entry.narration && entry.generation === generation; })) {
+      if (item.data.status === 'proposed' && data.status !== 'proposed') {
         // If proposed was hidden, place its first visible receipt at the
         // actual dispatch/result position, not before the preceding explanation.
         entries.splice(entries.indexOf(item), 1); entries.push(item);
@@ -372,7 +371,6 @@
       if (!key || key === generation) return false;
       generation = key; currentPlan = null; resolutions.clear();
       actions.forEach(function (item) {
-        if (item.data.status === 'proposed') item.data.status = 'unrecorded';
         if (['running', 'resuming'].indexOf(item.data.status) >= 0) item.data.status = 'interrupted';
       });
       return true;

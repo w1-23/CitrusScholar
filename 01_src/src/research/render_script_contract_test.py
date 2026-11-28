@@ -176,6 +176,45 @@ class RealCaptureContractTests(unittest.TestCase):
         self.assertEqual(
             result.frozen_render_receipts["relations"]["version"], 1)
 
+    def test_vector_heatmap_worker_exports_three_formats_from_one_frozen_matrix(self):
+        import xml.etree.ElementTree as ET
+
+        # A continuous colorbar also rasterizes by default in Matplotlib.
+        script = ("matrix = data['tidy'].to_numpy()\n"
+                  "fig, ax = plt.subplots()\n"
+                  "mesh = ax.pcolormesh(matrix, cmap='viridis', shading='flat', rasterized=False)\n"
+                  "ax.invert_yaxis()\n"
+                  "colorbar = fig.colorbar(mesh, ax=ax, label='Measured value')\n"
+                  "colorbar.solids.set_rasterized(False)\n"
+                  "ax.set(xlabel='Variable', ylabel='Sample')\n")
+        contract = _contract(script, name="heatmap")
+        contract["figures"][0]["formats"] = ["svg", "png", "pdf"]
+        contract = normalize_output_contract(contract)
+        with tempfile.TemporaryDirectory() as root:
+            from src.figures.dataset_codec import encode_frame
+            frozen = Path(root) / "matrix.json"
+            frozen.write_text(json.dumps(encode_frame(pd.DataFrame({"x": [1, 3, 5], "y": [2, 4, 6]}))),
+                              encoding="utf-8")
+            result = LocalBackend().run(SandboxJob(job_id="vector-heatmap-fixture",
+                script="emit.table('tidy', load_dataset(data), parents=['data'])",
+                inputs={"data": "matrix.json"}, sources={"data": str(frozen)},
+                outputs=output_slots(contract), output_contract=contract))
+        self.assertTrue(result.ok, result.message)
+        files = {Path(filename).suffix: result.outputs[key] for key, filename in output_slots(contract).items()
+                 if key in result.outputs}
+        self.assertTrue(files['.png'].startswith(b'\x89PNG\r\n\x1a\n'))
+        self.assertTrue(files['.pdf'].startswith(b'%PDF-'))
+        root = ET.fromstring(files['.svg'])
+        tag = '{http://www.w3.org/2000/svg}'
+        self.assertListEqual(list(root.iter(tag + 'image')), [])
+        from matplotlib import colormaps
+        from matplotlib.colors import to_hex
+        expected = [to_hex(colormaps['viridis'](index / 5)) for index in range(6)]
+        # The sanitizer strips IDs. A matrix group still has exactly six
+        # individually editable paths in row-major order with the original colors.
+        self.assertTrue(any([cell.get('fill') for cell in group.findall(tag + 'path')] == expected
+                            for group in root.iter(tag + 'g')))
+
     def test_frozen_table_replay_executes_without_the_main_script(self):
         contract = normalize_output_contract(_contract(GOOD_RENDERER))
         result = capture_outputs(

@@ -53,6 +53,42 @@ def make_skill(root, *, active=False):
     return gate.sha(root / 'inventory.json')
 
 
+class ExternalModuleLaunchTest(unittest.TestCase):
+    def test_bilingual_requires_unified_and_does_not_change_old_configs(self):
+        import runpy
+
+        launcher = Path(__file__).resolve().parents[1] / '01_src/scripts/apptainer_launch.py'
+        bindings = runpy.run_path(str(launcher))['external_module_bindings']
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            client = root / 'client'
+            names = ('corpus/__init__.py', 'corpus/auth.py')
+            for name in names:
+                make_file(client / name, '# pinned fixture\n').chmod(0o400)
+            (client / 'corpus').chmod(0o500)
+            client.chmod(0o500)
+            try:
+                corpus_key, workbench_key = root / 'corpus.key', root / 'workbench.key'
+                for key in (corpus_key, workbench_key):
+                    make_file(key, 'x' * 48).chmod(0o600)
+                base = {'client_path': str(client), 'client_sha256': {name: gate.sha(client / name) for name in names},
+                        'secret_file': str(corpus_key)}
+
+                def env(**extra):
+                    return bindings({'external_modules': {'selfcorpus': base | extra,
+                        'workbench': {'secret_file': str(workbench_key)}}}, [])[1]
+
+                flag = 'CITRUS_CORPUS_BILINGUAL_RETRIEVAL=1'
+                self.assertNotIn(flag, env(unified_retrieval=True))
+                self.assertIn(flag, env(unified_retrieval=True, bilingual_retrieval=True))
+                for invalid in ({'bilingual_retrieval': True}, {'unified_retrieval': True, 'bilingual_retrieval': '1'}):
+                    with self.assertRaisesRegex(ValueError, 'external module configuration'):
+                        env(**invalid)
+            finally:
+                client.chmod(0o700)
+                (client / 'corpus').chmod(0o700)
+
+
 class ReleaseGateTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

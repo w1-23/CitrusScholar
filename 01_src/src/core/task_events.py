@@ -106,7 +106,7 @@ def current_terminal_event(conn, job_id):
 
 
 def _append(conn, job_id, event, data):
-    _job(conn, job_id)
+    job = _job(conn, job_id)
     from src.core.progress_bus import stamp_sse_event, _encode_event
     from src.core.public_delivery import project_public_event
     if event == "text" and data.get("delivery") != "committed":
@@ -115,6 +115,14 @@ def _append(conn, job_id, event, data):
         data = project_public_event(event, data)
     if event == "text" and "content" not in data:
         return None
+    if event == "execution_narration":
+        if (data.get("job_id") != job_id or data.get("thread_id") != job["session_id"]
+                or data.get("client_request_id") != (job["client_request_id"] or job["request_id"])):
+            return None
+        if conn.execute("SELECT 1 FROM task_events WHERE job_id=? AND event='execution_narration' "
+                        "AND seq>? AND json_extract(data, '$.event_id')=? LIMIT 1",
+                        (job_id, recovery_cursor(conn, job_id), data["event_id"])).fetchone():
+            return None
     if event == "assistant_progress":
         if not data.get("status") or data.get("job_id") != job_id:
             return None
@@ -149,7 +157,7 @@ def _append(conn, job_id, event, data):
     if event == "done" and isinstance(payload.get("turn_envelope"), dict):
         conn.execute("UPDATE task_jobs SET terminal_snapshot=? WHERE job_id=?", (canonical(payload["turn_envelope"]), job_id))
     return {"seq": seq, "event": event,
-            "data": project_public_event(event, payload) if event == "task_state" else payload,
+            "data": project_public_event(event, payload) if event in {"task_state", "done"} else payload,
             "created_at": now}
 
 
@@ -170,6 +178,21 @@ def _terminal_timings(conn, job_id, payload, now):
         evidence.observe(event, json.loads(data), created_at=created_at)
     evidence.observe("done", payload, created_at=now)
     return evidence.values()
+
+
+def public_execution_timeline(job_id):
+    """Return bounded canonical replay only for runs with execution narration."""
+    from src.core.public_delivery import project_public_event
+    with read_transaction() as conn:
+        if not conn.execute("SELECT 1 FROM task_events WHERE job_id=? AND event='execution_narration' LIMIT 1",
+                            (job_id,)).fetchone():
+            return []
+        rows = conn.execute("SELECT seq,event,data FROM task_events WHERE job_id=? AND event IN "
+                            "('execution_narration','tool_call_start','tool_executing','tool_progress','tool_result',"
+                            "'operation','tool_resolution','assistant_progress','agent_recovery') "
+                            "ORDER BY seq DESC LIMIT ?", (job_id, LIVE_QUEUE_SIZE)).fetchall()
+    return [{"seq": row["seq"], "event": row["event"],
+             "data": project_public_event(row["event"], json.loads(row["data"]))} for row in reversed(rows)]
 
 
 def public_working_notes(job_id):
@@ -234,14 +257,12 @@ def replay(job_id, after=0, limit=200, *, conn=None):
 
 def _public_terminal(envelope):
     from src.core.progress_bus import public_tool_reason, public_tool_resolutions
-    from src.core.public_delivery import private_record, project_artifact_delivery, project_fields, timing_fields
+    from src.core.public_delivery import private_record, project_artifact_delivery, project_fields
     if not isinstance(envelope, dict) or private_record(envelope):
         return {}
     visible = project_fields(envelope,
         ids="display_status execution_status acceptance_status acceptance_reason job_status stop_reason",
         numbers="schema_version verified_artifacts terminal_seq", bools="history_saved")
-    if isinstance(envelope.get("turn_timings"), dict):
-        visible["turn_timings"] = timing_fields(envelope["turn_timings"])
     if isinstance(envelope.get("artifact_ids"), (list, tuple)):
         visible["artifact_ids"] = [item for item in envelope["artifact_ids"]
                                   if project_fields({"id": item}, ids="id").get("id")]

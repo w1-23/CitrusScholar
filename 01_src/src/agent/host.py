@@ -34,7 +34,7 @@ async def general_agent_node(state: dict) -> dict:
     from src.core.request_context import ContextEpoch, _epoch
     from src.core.execution_ledger import ExecutionLedger, bind_execution_ledger, reset_execution_ledger
     from src.tools.interaction import bind_question_context, reset_question_context
-    from src.graph.session_nodes import _release_candidate_pool
+    from src.corpus_integration.settings import unified_enabled
     identity = ExecutionIdentity(int(state.get("user_id") or 0), str(state.get("session_id") or ""),
         str(state.get("request_id") or ""), tracing.get_job_id())
     state = dict(state)
@@ -68,11 +68,13 @@ async def general_agent_node(state: dict) -> dict:
         reset_question_context(question_token)
         _epoch.reset(epoch_token)
         reset_execution_ledger(ledger_token)
-        if preserve_pool:
-            from src.retrieval.candidate_pool import clear_current_candidate_pool
-            clear_current_candidate_pool()
-        else:
-            _release_candidate_pool(state)
+        if not unified_enabled():
+            if preserve_pool:
+                from src.retrieval.candidate_pool import clear_current_candidate_pool
+                clear_current_candidate_pool()
+            else:
+                from src.graph.session_nodes import _release_candidate_pool
+                _release_candidate_pool(state)
 
 
 async def _run(state, identity, ledger):
@@ -148,10 +150,9 @@ async def _run(state, identity, ledger):
         register_nature_tools(catalog)
     host = HostTools(identity, state, skill_release=release)
     host.assert_context()
-    pool = ops._bind_request_candidate_pool(state) if policy.allows("local_rag") else None
+    state.pop("candidate_pool_notice", None)
     if not policy.allows("local_rag"):
         state.pop("history_evidence_block", None)
-        state.pop("candidate_pool_notice", None)
     # A table attachment is a runtime fact; no scientific module is needed to
     # offer the catalogue or answer an unrelated question.
     try:
@@ -171,16 +172,7 @@ async def _run(state, identity, ledger):
                 and (not method_scope or name in method_scope)}
 
     def refresh_allowed():
-        # A ToolNode task may populate the verified candidate handoff in its
-        # own context. Resolve readiness from the current authenticated scope.
-        live_pool = pool
-        if live_pool is None and policy.allows("local_rag"):
-            from src.retrieval.candidate_handoff import scoped_candidate_pool
-            try:
-                live_pool = scoped_candidate_pool()
-            except (LookupError, PermissionError):
-                pass
-        host.allowed_names = allowed_presets(state, has_tables=bool(tables), has_pool=live_pool is not None)
+        host.allowed_names = allowed_presets(state, has_tables=bool(tables), has_pool=False)
         host.allowed_names.add("read_context_evidence")
         from src.graph.retrieval_router import retrieval_suppressed
         if retrieval_suppressed(str(state.get("query") or "")):
@@ -228,7 +220,7 @@ async def _run(state, identity, ledger):
     # Host readiness remains independent of method loading; new generic tools
     # registered by the application must not inherit a scientific allowlist.
     loaded = build_loaded_context(state, mode="general_agent", format_hint=state.get("format_hint"))
-    human = build_human_message(loaded, retrieval_context=str(state.get("candidate_pool_notice") or "") if pool else "")
+    human = build_human_message(loaded)
     try:
         selected_metadata = await asyncio.to_thread(
             validate_scenario_selection, state.get("selected_skills"), catalog=installed_rows)
@@ -312,7 +304,7 @@ async def _run(state, identity, ledger):
 
                 prompt += ("\n本地资料统一用 local_hybrid_search。未限定来源时传 corpus_types=[]，"
                            "明确限定时只选对应来源。evolution 是有权读取的增量资料，"
-                           "l1_categories 仅用于明确指定的既有库主题。保留原查询。\n已登记来源："
+                           "l1_categories 仅用于明确指定的既有库主题。保留原查询。直接使用已排序的证据正文和引用；只有确需更多上下文才用 read_local_evidence 按返回引用读取。不要列候选或重新挑选。\n已登记来源："
                            + ", ".join(sorted(SOURCE_IDS)))
             else:
                 from src.retrieval.corpus_registry import load_corpus_registry
@@ -576,7 +568,7 @@ async def _run(state, identity, ledger):
                     additional_kwargs={"execution_dispatched": False},
                     artifact={"_tool_outcome": {"status": "skipped", "reason_code": "duplicate_request"}})
                 return await host.publish(duplicate, ToolExecution(observation), identity), {}
-            if reason := retrieval_ledger.admit(call["name"], call["id"], normalized_args):
+            if reason := retrieval_ledger.reserve(call["name"], call["id"], normalized_args):
                 return await not_run(call, reason), {}
         scope = nullcontext()
         if call["name"] in {"research_workspace", "run_research_figure_script"}:
@@ -592,9 +584,17 @@ async def _run(state, identity, ledger):
                     reset_task_scope(token)
             scope = script_scope()
         query = str(state.get("query") or "")
-        with scope, fusion_delivery_scope(fusion_delivery_for_turn(query, has_tables=bool(tables)),
-                                          query=query, previous_query=previous_report_query, workbook_confirmation=workbook_confirmation):
-            execution = await host.invoke(tool, call, identity)
+        def charge_dispatch():
+            if not error:
+                retrieval_ledger.restore_admission(call["name"], call["id"], normalized_args)
+
+        try:
+            with scope, fusion_delivery_scope(fusion_delivery_for_turn(query, has_tables=bool(tables)),
+                                              query=query, previous_query=previous_report_query, workbook_confirmation=workbook_confirmation):
+                execution = await host.invoke(tool, call, identity, on_dispatch=charge_dispatch)
+        finally:
+            if not error and call["id"] not in host.dispatched:
+                retrieval_ledger.release_unexecuted(call["name"], call["id"], normalized_args)
         message = await host.publish(call, execution, identity)
         if not error:
             record = message.additional_kwargs.get("host_publication") or {}
@@ -630,17 +630,8 @@ async def _run(state, identity, ledger):
             from src.core.progress_bus import emit_progress
             emit_progress('browse_phase', {'phase': 'organizing'})
         public_answer = statement.answer
-        retrieval_summary = retrieval_ledger.summary()
-        if retrieval_summary.get("stop_reasons"):
-            limitations = ", ".join(retrieval_summary["stop_reasons"])
-            public_answer += "\n\n检索已停止补查（" + limitations + "）。结论以已取得的证据为限。"
-            statement = statement.model_copy(update={"answer": public_answer})
-        if settings.RESEARCH_ROUTE_NOTICE_ENABLED:
-            from .research_routes import dual_source_notice
-            notice = dual_source_notice(state["query"], host.records)
-            if notice and notice not in public_answer:
-                public_answer += "\n\n" + notice
-                statement = statement.model_copy(update={"answer": public_answer})
+        # Retrieval stop reasons and source coverage remain in the execution
+        # ledger. The answer carries only evidence limits relevant to the user.
         delivery_gaps, artifact_contract, delivery_manifest = [], None, None
         figure_previews = {}
         if requirements:
@@ -660,16 +651,24 @@ async def _run(state, identity, ledger):
                                  "single_render_receipt": True, "answer_render_refs": answer_render_refs}
             from src.research.artifact_delivery import build_delivery
             selected_delivery_links = {link for goal in goals for link in goal.artifact_links}
+            if delivery_gaps and uses_single_render_delivery(requirements):
+                from src.core.turn_outcome import available_single_render_links
+
+                selected_delivery_links = available_single_render_links(
+                    requirements, effective, set(verified_links), answer_render_refs)
             delivery_manifest = await asyncio.to_thread(build_delivery, identity=identity,
                 request_id=host._result_request_id(), rows=effective, messages=host.messages,
                 requirements=requirements, select_links=selected_delivery_links if not delivery_gaps or uses_single_render_delivery(requirements) else None,
                 gaps=delivery_gaps, verified=verified)
+            artifact_contract["verified_card_links"] = sorted(selected_delivery_links.intersection(
+                asset["url"] for asset in delivery_manifest.get("artifacts", ())
+                if (asset.get("validation") or {}).get("status") == "passed"))
             if (delivery_gaps and not verified_links and not allow_delivery_gaps
                     and claims_file_delivery(statement.answer)):
                 return FinalCheck(False, tuple(gap["detail"] for gap in delivery_gaps))
-            if delivery_gaps:
-                public_answer += "\n\n" + "\n".join(gap["detail"] for gap in delivery_gaps)
-            elif "[[FIGURE:" in public_answer:
+            # The structured delivery projection reports unavailable files.
+            # Do not duplicate that marker as a defensive answer suffix.
+            if not delivery_gaps and "[[FIGURE:" in public_answer:
                 figure_previews = await asyncio.to_thread(verified_figure_previews, state["query"], public_answer,
                     requirements, goals, verified, session_id=identity.session_id, owner_user_id=identity.owner_user_id)
             statement = statement.model_copy(update={"answer": public_answer,
@@ -767,7 +766,8 @@ async def _run(state, identity, ledger):
             statement = statement.model_copy(update={"incidental_partials": claims})
         errors = list(completion_errors(statement, host.records,
             state.get("missing_requirements") or (), verified_repairs=verified_repairs,
-            superseded_proposals=superseded))
+            superseded_proposals=superseded,
+            verified_card_links=(artifact_contract or {}).get("verified_card_links", ())))
         if ops._DSML_PROTOCOL_RE.search(public_answer) or not public_answer.strip():
             errors.append("invalid_public_answer")
         if ops._sanitize_answer_artifact_links(public_answer) != public_answer:
@@ -787,8 +787,6 @@ async def _run(state, identity, ledger):
             if any(code in {"invalid_public_answer", "unverified_answer_artifact_links"} for code in errors):
                 return FinalCheck(False, ("答复未通过执行/交付校验：" + "; ".join(errors) +
                     "。沿用现有结果修正；不能假称未完成的操作已完成。",))
-            limits = "\n\n执行限制：部分操作或必需范围未完成，不能视为整项任务已完成。"
-            public_answer += limits
             statement = statement.model_copy(update={"answer": public_answer, "status": "partial",
                 "remaining": [*statement.remaining, *errors],
                 "goals": [goal for goal in statement.goals if goal.evidence_call_ids],
@@ -826,7 +824,7 @@ async def _run(state, identity, ledger):
     from .recovery import is_terminal_orphan, validate_legacy_native_head
 
     async def metered_model(request, handler, current_identity, host_tools):
-        model_allowed = set(refresh_allowed())
+        model_allowed = retrieval_ledger.budget.visible_tools(refresh_allowed())
         from .dataset_tool_scope import csv_audit_supplies_locations
         if ("inspect_uploaded_table" in model_allowed and not update_version and not requirements
                 and csv_audit_supplies_locations(str(state.get("query") or ""), tables, host.messages.values())):
@@ -849,9 +847,12 @@ async def _run(state, identity, ledger):
     def restore_tool_observation(message, call):
         if message.tool_call_id not in host.messages:
             host.restore_observation(message)
-        if (message.additional_kwargs.get("execution_dispatched")
-                and not message.additional_kwargs.get("operation_uncertain")):
-            if call and call["name"] == message.name:
+        if message.additional_kwargs.get("execution_dispatched") and call and call["name"] == message.name:
+            if message.additional_kwargs.get("operation_uncertain"):
+                # A lost receipt never buys another retrieval slot or permits a duplicate.
+                retrieval_ledger.restore(message.name, call["args"], message.tool_call_id)
+                retrieval_ledger.restore_admission(message.name, message.tool_call_id, call["args"])
+            else:
                 host.validate_observation(message)
                 record = message.additional_kwargs.get("host_publication") or {}
                 retrieval_ledger.restore(message.name, call["args"], message.tool_call_id)
@@ -1069,11 +1070,46 @@ def _already_succeeded_render_repair(rejected, corrected, messages, positions):
     return False
 
 
+def _same_table_page_repair(original, replacement, rejected_id, corrected_id, records):
+    from src.core.tool_errors import ToolArgumentError
+    from src.research.tools import inspect_uploaded_table, validate_inspection_request
+    from src.tools.argument_check import validate_tool_arguments
+
+    bad, fixed = original.get("page_rows"), replacement.get("page_rows")
+    if (type(bad) is not int or 1 <= bad <= 50 or type(fixed) is not int or not 1 <= fixed <= 50
+            or not rejected_id or not corrected_id or rejected_id == corrected_id):
+        return False
+    by_id = {row.get("tool_call_id"): row for row in records
+             if row.get("name") == "inspect_uploaded_table"}
+    rejected, corrected = by_id.get(rejected_id, {}), by_id.get(corrected_id, {})
+    if (rejected.get("status") != "not_run" or corrected.get("status") != "complete"
+            or (rejected.get("reason") or rejected.get("reason_code")) != "invalid_tool_arguments"):
+        return False
+    targets = []
+    for args in (original | {"page_rows": fixed}, replacement):
+        error, validated = validate_tool_arguments(inspect_uploaded_table, "inspect_uploaded_table", args)
+        if error:
+            return False
+        try:
+            opts = inspect_uploaded_table.args_schema.model_validate(validated).model_dump()
+            validate_inspection_request(**opts)
+        except (ValueError, ToolArgumentError):
+            return False
+        if opts["inspection"] != "cells":
+            return False
+        targets.append(opts)
+    # Deliberately compare the complete validated binding, including pagination
+    # cursor. A narrower range or another source is not a repair of this call.
+    return targets[0] == targets[1]
+
+
 def _same_repair_target(rejected, corrected, *, records=()):
     if not rejected or not corrected or rejected["name"] != corrected["name"]:
         return False
     name = rejected["name"]
     original, replacement = rejected.get("args") or {}, corrected.get("args") or {}
+    if name == "inspect_uploaded_table" and original.get("page_rows") != replacement.get("page_rows"):
+        return _same_table_page_repair(original, replacement, rejected.get("id"), corrected.get("id"), records)
     if name == "audit_uploaded_data":
         return _same_audit_target(original, replacement)
     if name == "code_bind_input":
@@ -1258,38 +1294,12 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
     elif result.status == "cancelled":
         answer = "本轮已停止，已完成的操作与文件已保留。"
         if uncertain:
-            answer += " 未确认的写入须先对账。"
+            answer += " 部分结果仍待确认。"
         status = "cancelled"
     else:
-        notices = {
-            "batch_observation_not_stored": "执行结果与模型回执分开保存；批次回执未能提交，未重跑操作。",
-            "recovery_requires_reconciliation": "批次状态尚不能安全恢复。",
-            "model_length": "模型服务提前结束了输出，未完成的提议没有执行。",
-            "model_stream_unconfirmed": "未收到可确认的模型流结束信号，未执行该次返回的工具提议。",
-            "model_budget_exhausted:tokens": "本轮累计模型用量预算不足以继续请求。",
-            "model_budget_exhausted:calls": "本轮模型调用次数已达上限。",
-            "model_budget_exhausted:deadline": "本轮任务时间预算已用完。",
-            "deadline": "本轮任务时间预算已用完。",
-            "model_step_limit": "本轮模型调用次数已达上限。",
-            "context_budget_exhausted": "当前模型上下文无法安全容纳下一次请求。",
-            "context_budget_exhausted:tool_observations": "工具结果和已读取的证据超出本轮发送预算，请缩小读取范围后再试。",
-            "checkpoint_recovery_incomplete": "无法安全恢复本轮执行状态，已登记的成果仍可查看。",
-            "native_thread_requires_reconciliation": "此会话的上一轮尚未确认收尾，请先恢复原任务。",
-            "model_budget_reserved:finalization": "余量已为最终答复保留，不再发起中间调用。",
-        }
-        answer = "本轮尚未完成。" + notices.get(result.reason, "执行在完成全部要求前停止。")
-        answer += " 已取得的结果和原始证据已保留。"
-        if uncertain:
-            answer += " 部分已执行操作结果尚未确认，须先对账，不能直接重放。"
-        elif result.pending_tool_calls and result.reason != "batch_observation_not_stored":
-            answer += " 尚未派发的提议标记为未执行，无需为它们对账。"
-        if host.records:
-            from collections import Counter
-            counts = Counter(str(record.get("status") or "unknown") for record in host.records)
-            labels = {"complete": "完成", "partial": "部分完成", "not_run": "未执行",
-                      "failed": "失败", "unknown": "结果未知", "no_results": "无结果"}
-            answer += "\n\n实际操作：" + "、".join(f"{labels.get(key, key)} {value} 项" for key, value in counts.items()) + "。"
-        answer += f"\n\n停止原因：`{result.reason}`。"
+        # Operational reasons and counts stay in the ledger and diagnostics.
+        answer = ("还有部分结果未确认，暂时不能交付这些结果。" if uncertain
+                  else "这次未能完成你的请求。")
         status = "partial" if host.messages else "failed"
     budget_blocked = result.reason == "context_budget_exhausted:tool_observations"
     if budget_blocked:
@@ -1299,9 +1309,6 @@ async def _finish(state, identity, ledger, host, result, trace_start, started, *
         page = last_readback_range(list(host.messages.values()))
         if page:
             notice["last_readback_page"] = page
-            if page["offset_basis"] == "stored_text":
-                answer += (f"\n\n可沿用最近一次回执的引用，从第 {page['retry']['start_char']} 个字符起"
-                           f"读取最多 {page['retry']['max_chars']} 个字符。")
         emit_encoded("context_degraded", notice)
     length_gaps = ()
     if result.reason == "model_length":

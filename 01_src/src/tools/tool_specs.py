@@ -172,12 +172,9 @@ _DECLARATIONS: tuple[ToolSpec, ...] = (
              "local_hybrid_search", write_scope=None, requires=("local_corpus",),
              display_label="本地检索",
              capabilities=("literature_retrieval", "local_corpus", "local_retrieval", "route_local")),
-    ToolSpec("read_candidate", "src.tools.candidate_tools", "rag", "candidate_pool",
-             write_scope=None, requires=("local_corpus", "candidate_pool"), display_label="读取候选原文",
-             capabilities=("local_corpus",)),
-    ToolSpec("search_candidates", "src.tools.candidate_tools", "rag", "candidate_pool",
-             write_scope=None, requires=("local_corpus", "candidate_pool"), display_label="补充候选检索",
-             capabilities=("local_corpus",)),
+    ToolSpec("read_local_evidence", "src.tools.deepseek_search_fetch", "rag", "read_local_evidence",
+             write_scope=None, requires=("session",), recovery_mode="local_read",
+             display_label="读取文献原文", capabilities=("local_corpus",)),
     ToolSpec("draw_svg", "src.tools.draw_svg", "analysis", "draw_svg",
              write_scope="session_artifact", requires=(), produces=("figure",), display_label="绘图",
              validator="preflight_draw_svg", link_label="下载 SVG",
@@ -265,9 +262,7 @@ _DECLARATIONS: tuple[ToolSpec, ...] = (
     ToolSpec("commit_document_index", "src.shared_corpus.tool_adapter", "research",
              "shared_corpus_build", write_scope="account_record", requires=("shared_corpus",),
              display_label="更新共享索引", capabilities=("shared_corpus",)),
-    ToolSpec("search_agent_corpus", "src.shared_corpus.tool_adapter", "rag",
-             "shared_corpus_search", write_scope=None, requires=("shared_corpus",),
-             display_label="检索共享文献库", capabilities=("shared_corpus",)),
+
 )
 
 

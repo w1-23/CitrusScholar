@@ -29,6 +29,28 @@ def test_invalid_configuration_never_launches(monkeypatch):
         sandbox.run('r', b'1', {'format': 'png'})
 
 
+def test_frozen_codec_mount_is_read_only_and_limited_to_required_packages(tmp_path, monkeypatch):
+    image = tmp_path / "fixture.sif"
+    image.touch()
+    (tmp_path / "tavotto" / "src").mkdir(parents=True)
+    packages = tmp_path / "packages"
+    for module in ("citrus_figures", "citrus_audit", "not_needed"):
+        (packages / module).mkdir(parents=True)
+    monkeypatch.setenv("WORKBENCH_IMAGE", str(image))
+    monkeypatch.setenv("WORKBENCH_TAVOTTO", str(tmp_path / "tavotto"))
+    monkeypatch.setenv("WORKBENCH_FROZEN_PACKAGES", str(packages))
+    def codec_mounts(command):
+        return [command[i + 1] for i, arg in enumerate(command) if arg == "--bind"
+                and ":/citrus-packages" in command[i + 1]]
+
+    regular = sandbox._container_command("python", "png", tmp_path)
+    assert not codec_mounts(regular)
+    command = sandbox._container_command("python", "png", tmp_path, frozen=True)
+    mounts = codec_mounts(command)
+    assert mounts == [f"{packages / name}:/citrus-packages/{name}:ro"
+                      for name in ("citrus_figures", "citrus_audit")]
+
+
 def test_exact_frame():
     data = json.dumps({'ok': True}).encode()
     assert sandbox._decode(struct.pack('!II', len(data), 3) + data + b'fig') == ({'ok': True}, b'fig')

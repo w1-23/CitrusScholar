@@ -1,4 +1,5 @@
 """Server-to-server Host resource adapter, never a filesystem adapter."""
+import re
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -91,6 +92,22 @@ class Library:
         except ValidationError as exc:
             raise LibraryUnavailable from exc
         return [item for item in items[:100] if item.format.lower() in allowed and (not fmt or item.format.lower() == fmt)]
+
+    def frozen_inputs(self, session, ref, render_version=1):
+        from .bundle import InvalidInput
+        from .frozen_inputs import HEADER_LIMIT, MEDIA_TYPE, STYLE_MEDIA_TYPE, _valid_revision, decode_frozen_inputs
+
+        if not isinstance(ref, str) or not re.fullmatch(r"[a-f0-9]{32}", ref) or not _valid_revision(render_version):
+            raise LibraryMissing
+        suffix = "1" if render_version == 1 else f"v2/{render_version}"
+        payload, headers = self._get(f"/_internal/workbench/frozen-bundles/{ref}/{suffix}", session,
+                                     limit=MAX_BYTES + HEADER_LIMIT + 4)
+        if headers.get("content-type") != (MEDIA_TYPE if render_version == 1 else STYLE_MEDIA_TYPE):
+            raise LibraryUnavailable
+        try:
+            return decode_frozen_inputs(payload, render_version=render_version)
+        except InvalidInput as exc:
+            raise LibraryUnavailable from exc
 
     def asset(self, session, ref, role):
         if role not in {"source", "preview", "dependency"}:

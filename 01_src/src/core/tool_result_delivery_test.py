@@ -361,6 +361,14 @@ class ToolResultDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["page"]["next_start_char"])
         self.assertIsNone(result["page"]["next_args"])
 
+    async def test_readback_with_no_available_fields_is_not_complete(self):
+        delivered = self.delivery("only-real-fields", '{"result":{"value":42}}')
+        result = json.loads(read_tool_result.invoke({"tool_call_id": delivered.tool_call_id,
+                                                     "fields": ["/table_overview/preview_notice"]}))
+        self.assertEqual(result["_tool_outcome"]["status"], "not_run")
+        self.assertEqual(result["_tool_outcome"]["reason_code"], "result_fields_missing")
+        self.assertNotIn("result_text", result)
+
     async def test_readback_rejections_and_corruption_do_not_count_as_execution_failures(self):
         from src.tools.outcome import safe_tool_step
 

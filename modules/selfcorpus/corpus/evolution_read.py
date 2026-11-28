@@ -18,8 +18,8 @@ class EvolutionReader:
     def __init__(self, retrieval):
         self.retrieval = retrieval
         self.embedding = retrieval.embedding
-        self.query_vector = None
-        self.vector_failed = False
+        self.query_vectors = {}
+        self.vector_failed = set()
 
     def search(self, db, scope, g, query, filters, caps, check):
         clauses, args = _filter(filters)
@@ -46,13 +46,13 @@ class EvolutionReader:
         vectors = []
         if not caps['dense']:
             reasons.append('candidate_budget_exhausted')
-        elif self.vector_failed or (g['embedding'], g['dimension']) != (self.embedding.signature, self.embedding.dimension):
+        elif query in self.vector_failed or (g['embedding'], g['dimension']) != (self.embedding.signature, self.embedding.dimension):
             reasons.append('vector_unavailable')
         else:
             try:
                 check()
-                if self.query_vector is None:
-                    self.query_vector = encode_vector(self.embedding.embed([query], query=True)[0], g['dimension'])
+                if query not in self.query_vectors:
+                    self.query_vectors[query] = encode_vector(self.embedding.embed([query], query=True)[0], g['dimension'])
                 rows = db.execute('SELECT ' + _COLUMNS + ',c.content_hash,v.year,e.vector' + _BASE +
                     ' JOIN embeddings e ON e.chunk_id=c.id AND e.model=? AND e.dimension=? WHERE m.gen=?' + clauses,
                     [params[0], g['embedding'], g['dimension'], *params[1:]])
@@ -60,10 +60,10 @@ class EvolutionReader:
                     for row in rows:
                         check()
                         yield row
-                vectors = self.retrieval.vector_index.rank(checked_rows(), self.query_vector, g['dimension'], caps['dense'],
-                            admit=lambda row, cosine: row['chunk_ref'] in supported or relevance.semantic(row['content'], cosine))
+                vectors = self.retrieval.vector_index.rank(checked_rows(), self.query_vectors[query], g['dimension'], caps['dense'],
+                            admit=lambda row, cosine: row['chunk_ref'] in supported or relevance.semantic(row['translation_en'] or row['content'], cosine))
             except (CorpusError, ValueError, RuntimeError, IndexError):
-                self.vector_failed = True
+                self.vector_failed.add(query)
                 reasons.append('vector_unavailable')
         check()
         score, rows = defaultdict(float), {}

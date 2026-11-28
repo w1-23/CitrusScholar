@@ -512,9 +512,13 @@ if legacy_enabled():
 async def account_auth_guard(request: Request, call_next):
     ingress = getattr(request.app.state, "lan_ingress", None)
     if ingress is not None:
-        denied = ingress.check(request)
-        if denied is not None:
-            return denied
+        from src.api.workbench_bridge import signed_loopback_resource
+
+        if not signed_loopback_resource(request, authority=ingress.health_authority,
+                bridge=getattr(request.app.state, "workbench_bridge_config", None)):
+            denied = ingress.check(request)
+            if denied is not None:
+                return denied
     path = request.url.path
     if (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1"
             and (path == "/figure-workbench" or path == "/figures/legacy"
@@ -5294,7 +5298,7 @@ async def serve_figures_page(request: Request):
     current_user(request)
     return HTMLResponse("""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <title>Workbench</title><body><main><h1>工作台</h1><p id="workbench-open-status" role="status">正在打开工作台…</p>
-<p><a href="/">返回会话</a></p></main><script src="/assets/workbench-launch.js" defer></script></body></html>""",
+<p><a href="/">返回会话</a></p></main><script src="/assets/workbench-launch.js?v=2" defer></script></body></html>""",
         headers={"Cache-Control": "no-store"})
 
 
@@ -6343,7 +6347,8 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
                        include_pending: bool = True) -> list[dict]:
     """Join saved turns and rediscover unsaved tasks by durable identities only."""
     from src.core import jobs
-    from src.core.task_events import latest_context_snapshot, public_job_terminal, public_working_notes
+    from src.core.task_events import (latest_context_snapshot, public_execution_timeline,
+                                      public_job_terminal, public_working_notes)
     from src.core.user_questions import list_questions, question_history_input
     keys = [str(turn.get("turn_request_id") or "") for turn in turns]
     saved = {key for key in (saved_request_ids or []) if key}
@@ -6360,6 +6365,10 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
                     context_snapshot=latest_context_snapshot(job["job_id"]),
                     question=questions[0] if questions else None)
         try:
+            timeline = public_execution_timeline(job["job_id"])
+            if timeline:
+                turn["trace"] = timeline
+                return questions
             notes = public_working_notes(job["job_id"])
         except Exception as exc:
             logger.warning("public_progress_failed stage=history kind=%s", type(exc).__name__)
@@ -6421,6 +6430,9 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
             pending["history_pending"] = True
             result.append(pending)
             present.add(job["job_id"])
+    from src.research.artifact_delivery import restore_history_workbench_links
+    for turn in result:
+        restore_history_workbench_links(turn.get("terminal_snapshot") or {}, owner, session_id)
     return result
 
 

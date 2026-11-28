@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -15,7 +16,9 @@ _SHA = re.compile(r"[0-9a-f]{64}")
 def _render_receipts(rows, messages):
     """Never infer a render from filenames or merge assets across tool calls."""
     for row in rows:
-        if row.get("name") != _FIGURE_TOOL or row.get("inherited_from_job_id"):
+        edited = (row.get("name") == "research_workspace" and row.get("status") == "complete"
+                  and row.get("reason") == "figure_edit_saved")
+        if (row.get("name") != _FIGURE_TOOL and not edited) or row.get("inherited_from_job_id"):
             continue
         artifact = getattr(messages.get(row.get("tool_call_id")), "artifact", None)
         if not isinstance(artifact, dict):
@@ -34,25 +37,78 @@ def _render_receipts(rows, messages):
             tested = "failed" if qa_failed else "passed" if qa and row.get("status") == "complete" else "not_verified"
             for export in figure.get("exports") or ():
                 if isinstance(export, dict) and export.get("artifact_id"):
-                    yield export["artifact_id"], figure.get("figure_id"), export, tested
+                    yield export["artifact_id"], figure.get("figure_id"), export, tested, (
+                        figure.get("render_version") if edited else 1)
 
 
-def _render_id(owner, project_id, export, checksum, lookup):
+def _render_metadata(owner, session, project_id, export, checksum, lookup, revision=1):
     if not isinstance(project_id, str) or not _ID.fullmatch(project_id):
-        return None
+        return {}
     try:
         project = lookup(project_id, owner)
     except (OSError, sqlite3.Error):
-        return None
+        return {}
     if not project:
-        return None
+        return {}
     registered = (project.get("exports_json") or {}).get(export.get("format"))
     document = project.get("document_json") or {}
     key = document.get("render_id")
-    if (isinstance(registered, dict) and registered.get("artifact_id") == export.get("artifact_id")
-            and registered.get("sha256") == checksum and isinstance(key, str) and _ID.fullmatch(key)):
-        return key
-    return None
+    if (not isinstance(registered, dict) or registered.get("artifact_id") != export.get("artifact_id")
+            or registered.get("sha256") != checksum):
+        return {}
+    result = {"render_id": key} if isinstance(key, str) and _ID.fullmatch(key) else {}
+    frozen = (project.get("source_json") or {}).get("frozen_render")
+    if (os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") == "1" and project.get("session_id") == session
+            and project.get("source_kind") == "script" and type(revision) is int
+            and 1 <= revision <= 999_999_999 and project.get("render_version") == revision
+            and isinstance(frozen, dict)):
+        if revision > 1:
+            if os.getenv("CITRUS_WORKBENCH_STYLED_IMPORT") != "1":
+                return result
+            from src.figures.projects import ProjectError
+            from src.figures.workbench_source import _saved_style
+
+            receipt = frozen.get("receipt")
+            if not isinstance(receipt, dict):
+                return result
+            try:
+                _saved_style(project, receipt)
+            except ProjectError:
+                return result
+            result["workbench_render_version"] = revision
+        result["workbench_project_ref"] = project_id
+    return result
+
+
+def restore_history_workbench_links(terminal, owner, session):
+    """Fill missing links only from an unambiguous, already verified export."""
+    if os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") != "1" or not session:
+        return
+    from src.figures.store import find_current_script_exports
+
+    delivery = terminal.get("artifact_delivery") or {}
+    if delivery.get("status") not in {"available", "partial"}:
+        return
+    verified = set(delivery.get("verified_file_ids") or ())
+    for asset in delivery.get("artifacts") or ():
+        ref, fmt, checksum = (asset.get(k) for k in ("asset_ref", "format", "sha256"))
+        if (asset.get("workbench_project_ref") or ref not in verified or fmt not in {"svg", "png", "pdf", "tiff"}
+                or asset.get("validation", {}).get("status") != "passed" or not _SHA.fullmatch(checksum or "")):
+            continue
+        try:
+            projects = find_current_script_exports(owner, session, fmt, ref, checksum)
+        except (OSError, sqlite3.Error):
+            continue
+        if len(projects) != 1:
+            continue
+        project, = projects
+        frozen = (project.get("source_json") or {}).get("frozen_render") or {}
+        if not isinstance(frozen, dict) or not isinstance(frozen.get("receipt"), dict):
+            continue
+        meta = _render_metadata(owner, session, project["figure_id"], {"format": fmt, "artifact_id": ref},
+                                checksum, lambda *_: project, project.get("render_version"))
+        if "workbench_project_ref" in meta:
+            asset.update(meta)
 
 
 def build_delivery(*, identity, request_id, rows, messages, requirements=(), select_links=None,
@@ -65,7 +121,8 @@ def build_delivery(*, identity, request_id, rows, messages, requirements=(), sel
         for item in row.get("artifact_validations", ()) if item.get("link") and item.get("request_matches") is True))
     result = verified if verified is not None else (validate(links, session_id=identity.session_id,
              owner_user_id=identity.owner_user_id, request_id=request_id) if links else [])
-    receipts = {asset_id: (project_id, export, qa) for asset_id, project_id, export, qa in _render_receipts(rows, messages)}
+    receipts = {asset_id: (project_id, export, qa, revision)
+                for asset_id, project_id, export, qa, revision in _render_receipts(rows, messages)}
     selected = set(select_links) if select_links is not None else None
     assets, unavailable, seen = [], 0, set()
     for ref in result:
@@ -84,11 +141,13 @@ def build_delivery(*, identity, request_id, rows, messages, requirements=(), sel
                  "sha256": checksum, "size_bytes": ref["size_bytes"], "url": link,
                  "validation": {"status": "passed", "checks": ["stored_bytes", "sha256", "format", "owner", "turn"]}}
         if asset_id in receipts:
-            project_id, export, qa = receipts[asset_id]
+            project_id, export, qa, revision = receipts[asset_id]
             asset["qa_status"] = qa
-            asset["render_id"] = _render_id(identity.owner_user_id, project_id, export, checksum, project_lookup)
+            asset["render_id"] = None
+            asset.update(_render_metadata(identity.owner_user_id, identity.session_id, project_id, export,
+                                          checksum, project_lookup, revision))
         assets.append(asset)
-    if not assets and not unavailable and not requirements:
+    if not assets and not unavailable and not requirements and not delivery_uncertain:
         return {"status": "none", "verified_file_ids": [], "unavailable_count": 0}
     renders = {a["render_id"] for a in assets if a.get("render_id")}
     qa_gaps = any(a.get("qa_status") in {"failed", "not_verified"} for a in assets)
@@ -102,12 +161,20 @@ def build_delivery(*, identity, request_id, rows, messages, requirements=(), sel
         limitations.append("asset_validation_failed")
     if delivery_uncertain:
         limitations.append("delivery_reconciliation_required")
+    missing_formats = []
+    if gaps and len(requirements) == 1:
+        supported = {"svg", "png", "pdf", "tiff"}
+        formats = {a["format"] for a in assets}
+        missing_formats = [fmt for fmt in requirements[0].get("formats", ())
+                           if fmt in supported and fmt not in formats]
     delivery_id = hashlib.sha256((identity.run_id + "\0" + request_id).encode()).hexdigest()[:32]
     return {"schema_version": SCHEMA, "delivery_id": delivery_id, "logical_task_id": identity.run_id,
-            "status": "available" if state == "complete" else "partial" if assets else "unavailable",
+            "status": ("unknown" if state == "unknown" else "available" if state == "complete"
+                        else "partial" if assets else "unavailable"),
             "delivery_status": state, "verified_file_ids": [a["asset_ref"] for a in assets],
             "unavailable_count": unavailable, "render_id": next(iter(renders)) if len(renders) == 1 else None,
-            "artifacts": assets, "user_links": [a["url"] for a in assets], "limitations": list(dict.fromkeys(limitations)),
+            "missing_formats": missing_formats,
+             "artifacts": assets, "user_links": [a["url"] for a in assets], "limitations": list(dict.fromkeys(limitations)),
             "obligations": [{"formats": list(r.get("formats") or ()), "label": str(r.get("label") or "")}
                             for r in requirements]}
 

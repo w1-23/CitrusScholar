@@ -7,7 +7,7 @@ from src.core.tool_catalog import capability_groups
 from src.graph.retrieval_router import parse_request_constraints
 
 _GROUPS = capability_groups()
-_LOCAL_TOOLS = _GROUPS["route_local"] | {"read_candidate", "read_local_evidence", "search_candidates", "search_agent_corpus"}
+_LOCAL_TOOLS = _GROUPS["route_local"] | {"read_local_evidence"}
 _WEB_TOOLS = _GROUPS["web_retrieval"] | {"search_literature"}
 _OBSERVED = frozenset({"complete", "partial", "no_results"})
 

@@ -86,6 +86,13 @@ class ParserRouter:
         self._timeout = timeout
 
     def parse(self, source: "Source") -> Parsed:
+        mime = source.media_type.split(";", 1)[0].strip().lower()
+        suffix = PurePosixPath(urlsplit(source.uri).path).suffix.lower()
+        head = source.content[:32]
+        if (mime.startswith("image/") or suffix in {".svg", ".png", ".jpeg", ".jpg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".avif", ".heic"}
+                or head.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a"))
+                or head[:4] == b"RIFF" and head[8:12] == b"WEBP"):
+            raise CorpusError("image_not_indexed", "Image files are not added to the corpus.", 415)
         if len(source.content) > _MAX_INPUT:
             raise CorpusError("document_too_large", "Document exceeds the parser byte limit.", 413)
         if source.metadata.get("fulltext") is False or source.metadata.get("coverage") == "metadata_only":

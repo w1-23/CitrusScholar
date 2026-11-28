@@ -40,6 +40,10 @@ class Database:
                 db.executescript((Path(__file__).parent/'migrations/002_evidence.sql').read_text())
             if not db.execute("SELECT 1 FROM corpus_extensions WHERE name='evidence_refs' AND version=1").fetchone():
                 raise RuntimeError('Unsupported evidence extension schema')
+            if not db.execute("SELECT 1 FROM corpus_extensions WHERE name='chunk_translations'").fetchone():
+                db.executescript((Path(__file__).parent/'migrations/003_translations.sql').read_text())
+            if not db.execute("SELECT 1 FROM corpus_extensions WHERE name='chunk_translations' AND version=1").fetchone():
+                raise RuntimeError('Unsupported translation extension schema')
 
     @contextmanager
     def connection(self, *, timeout=15):

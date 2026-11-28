@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import {previewPoint} from './api.mjs';
-import {$, make} from './views.mjs';
+import {previewPoint} from './api.mjs?v=2';
+import {$, make} from './views.mjs?v=2';
 import {drawRulers, movePatch, moveTarget, nativePatch, nativeText, nativeWritable, visibleBounds} from './viewport.mjs';
 
 export function createCanvas({state, latest, pick, save, error}) {

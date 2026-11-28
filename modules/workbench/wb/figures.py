@@ -8,8 +8,9 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from .bundle import bundle_digest, validate_bundle
-from .models import EngineDocument, FigureDocument, SourceInfo
+from .bundle import bundle_digest, digest, validate_bundle
+from .frozen_inputs import decode_frozen_style
+from .models import FrozenSource, EngineDocument, FigureDocument, SourceInfo
 from .store import Conflict
 
 
@@ -87,9 +88,11 @@ class Figures:
         self.run = run
         self.runtime = runtime
 
-    def render(self, language, source, settings, dependencies=()):
+    def render(self, language, source, settings, dependencies=(), *, renderer=None):
         worker = language if language in {"python", "r"} else "static"
         bundle = {"bundle": (source, dependencies)} if dependencies or ("figure_ordinal" in settings and worker != "static") else {}
+        if renderer is not None:
+            bundle["renderer"] = renderer
         result, output = self.run(worker, source.body, settings, **bundle)
         try:
             engine = EngineDocument.model_validate(result)
@@ -114,8 +117,26 @@ class Figures:
         return self.save_import(owner, asset, lang, engine, preview, mode=mode, dependencies=dependencies,
                                 library_ref=library_ref, library_version=library_version)
 
+    def import_frozen(self, owner, project_ref, version, inputs):
+        asset, dependencies = inputs.entrypoint, inputs.dependencies
+        validate_bundle(asset, dependencies)
+        style = inputs.style_json
+        if version != inputs.render_version or (version > 1) != (style is not None):
+            raise FigureError("冻结输入与请求版本不符，未导入图件。")
+        options = {"host_style_replay": decode_frozen_style(style)} if style is not None else {}
+        runtime = self.runtime("frozen-python")
+        metadata = FrozenSource(project_ref=project_ref, render_version=version, bindings=list(inputs.bindings),
+                                bundle_sha256=bundle_digest((asset, *dependencies), "frozen-python", runtime),
+                                runtime_ref=runtime, style_sha256=digest(style) if style is not None else None)
+        engine, preview = self.render("python", asset, {"format": "png", "dpi": 120, "overrides": {},
+                                                       "frozen_bindings": metadata.bindings, **options}, dependencies)
+        if self.runtime("frozen-python") != runtime:
+            raise FigureError("冻结数据渲染环境已变更，未导入图件。")
+        return self.save_import(owner, asset, "python", engine, preview, mode="editable",
+                                dependencies=dependencies, frozen=metadata, style=style)
+
     def save_import(self, owner, asset, lang, engine, preview, *, mode, dependencies=(),
-                    library_ref=None, library_version=None, receipt=None, name=None):
+                    library_ref=None, library_version=None, receipt=None, name=None, frozen=None, style=None):
         if mode == "editable" and not (any(o.editable for o in engine.objects)
                                       or engine.native_editability in {"semantic", "partial"}):
             raise FigureError("来源没有可验证的语义编辑对象。可改用自动或仅预览导入。")
@@ -129,8 +150,8 @@ class Figures:
         layout = figure_layout(engine)
         doc = FigureDocument(**engine.model_dump(), figure_id=f"figure_{uuid4().hex}", name=name or asset.name,
                              revision=1, layout=layout, source=SourceInfo(language=lang, source_ref=asset.ref,
-                             source_hash=asset.sha, library_asset_ref=library_ref, library_version=library_version, receipt=receipt))
-        self.store.create(owner, doc, preview, asset, dependencies)
+                             source_hash=asset.sha, library_asset_ref=library_ref, library_version=library_version, receipt=receipt, frozen=frozen))
+        self.store.create(owner, doc, preview, asset, dependencies, style=style)
         return doc
 
     def get(self, owner, ref, revision=None):
@@ -166,7 +187,7 @@ class Figures:
 
     def _save(self, owner, doc, row, normalized, native):
         asset, dependencies = self.store.figure_inputs(owner, doc, row)
-        engine, preview = self.replay(doc, asset, dependencies, {
+        engine, preview = self.replay(owner, doc, asset, dependencies, {
             "overrides": normalized, **({"native_patches": native} if native else {}), "format": "png", "dpi": 120,
         })
         self._verify_normalized(engine, normalized)
@@ -175,16 +196,43 @@ class Figures:
         self.store.save(owner, revised, {"normalized": normalized, "native": native}, preview, doc.revision)
         return revised
 
-    def replay(self, doc, asset, dependencies, settings):
+    def receipt_renderer(self, language, expected):
+        from .runtime_pin import historical_renderer
+
+        current = lambda: self.runtime(language)
+        return (None, current) if current() == expected else historical_renderer(language, expected)
+
+    def frozen_style_settings(self, owner, doc):
+        frozen = doc.source.frozen
+        if frozen is None or (frozen.render_version == 1 and frozen.style_sha256 is None):
+            return {}
+        style = self.store.frozen_style(owner, doc.figure_id)
+        if frozen.render_version < 2 or style is None or digest(style) != frozen.style_sha256:
+            raise FigureError("冻结样式记录缺失或发生变更，未重新渲染。")
+        return {"host_style_replay": decode_frozen_style(style)}
+
+    def replay(self, owner, doc, asset, dependencies, settings):
+        frozen = doc.source.frozen
+        if frozen:
+            if (doc.source.language != "python" or
+                    bundle_digest((asset, *dependencies), "frozen-python", frozen.runtime_ref) != frozen.bundle_sha256):
+                raise FigureError("冻结数据或原渲染环境已变更，未修改图件。")
+            renderer, identify_runtime = self.receipt_renderer("frozen-python", frozen.runtime_ref)
+            request = {**settings, "frozen_bindings": frozen.bindings, **self.frozen_style_settings(owner, doc)}
+            engine, output = self.render("python", asset, request, dependencies, renderer=renderer)
+            if identify_runtime() != frozen.runtime_ref:
+                raise FigureError("冻结数据渲染环境已变更，未保存图件。")
+            return engine, output
         receipt = doc.source.receipt if doc.source.language in {"python", "r"} else None
+        renderer = None
+        identify_runtime = lambda: self.runtime(doc.source.language)
         if receipt:
             if bundle_digest((asset, *dependencies), doc.source.language, receipt.runtime_ref) != receipt.bundle_sha256:
                 raise FigureError("已保存的图件来源与预览回执不符。")
-            if self.runtime(doc.source.language) != receipt.runtime_ref:
-                raise FigureError("原渲染运行环境不可用，未修改图件。")
+            renderer, identify_runtime = self.receipt_renderer(doc.source.language, receipt.runtime_ref)
             settings = {**settings, "figure_ordinal": receipt.capture.ordinal}
-        engine, output = self.render(doc.source.language, asset, settings, dependencies)
-        if receipt and (engine.capture != receipt.capture or self.runtime(doc.source.language) != receipt.runtime_ref):
+        engine, output = self.render(doc.source.language, asset, settings, dependencies, renderer=renderer)
+        if receipt and (engine.capture != receipt.capture or identify_runtime() != receipt.runtime_ref):
             raise FigureError("冷重绘未匹配原图件捕获身份，未保存修改或导出。")
         return engine, output
 
@@ -200,6 +248,7 @@ class Figures:
             raise Conflict
         old, row = self.get(owner, ref, change.revision)
         self.store.figure_inputs(owner, old, row)
+        self.frozen_style_settings(owner, old)
         revised = old.model_copy(update={"revision": doc.revision + 1})
         self.store.save(owner, revised, json.loads(row["overrides"]), row["preview"], doc.revision)
         return revised
@@ -212,7 +261,7 @@ class Figures:
         settings = dict(params, overrides=normalized)
         if native:
             settings["native_patches"] = native
-        engine, output = self.replay(doc, asset, dependencies, settings)
+        engine, output = self.replay(owner, doc, asset, dependencies, settings)
         self._verify_normalized(engine, normalized)
         export_id, sha = self.store.export_record(ref, doc.revision, options.format, params, output)
         return output, export_id, sha, doc.revision

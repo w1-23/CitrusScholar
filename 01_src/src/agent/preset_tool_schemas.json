@@ -285,7 +285,7 @@
       "type": "function",
       "function": {
         "name": "local_hybrid_search",
-        "description": "Search authorized local sources for relevant evidence. Select only explicit source IDs from the runtime catalog, or pass an empty list to search the authorized default scope when unified retrieval is enabled.",
+        "description": "Search authorized local sources and return ranked passage text and stable citations in one call. Use runtime source IDs or [] for defaults.",
         "parameters": {
           "properties": {
             "query": {
@@ -327,72 +327,29 @@
     {
       "type": "function",
       "function": {
-        "name": "read_candidate",
-        "description": "List the local candidate pool or read one bounded evidence slice.\n\nWith neither source_ref nor candidate_id, list candidates. Optional gap,\nlimit, lang and family apply to listing. For a deeper read pass the\nsource_ref returned by local search, or a candidate_id from the list.\nStart at the default offset. If more is needed, use the returned cursor.\nWhen reading an older source, use its saved read_entry if supplied.",
+        "name": "read_local_evidence",
+        "description": "Optionally read more original text when this turn's returned evidence is insufficient. Copy evidence_ref exactly and use next_offset to continue. Does not re-run search.",
         "parameters": {
           "properties": {
-            "candidate_id": {
-              "default": "",
+            "ref": {
+              "maxLength": 128,
+              "minLength": 1,
               "type": "string"
             },
             "offset": {
               "default": 0,
+              "minimum": 0,
               "type": "integer"
             },
             "max_chars": {
               "default": 4000,
-              "type": "integer"
-            },
-            "turn_id": {
-              "default": "",
-              "type": "string"
-            },
-            "generation": {
-              "default": "",
-              "type": "string"
-            },
-            "source_ref": {
-              "default": "",
-              "type": "string"
-            },
-            "gap": {
-              "default": "",
-              "type": "string"
-            },
-            "limit": {
-              "default": 6,
-              "type": "integer"
-            },
-            "lang": {
-              "default": "",
-              "type": "string"
-            },
-            "family": {
-              "default": "",
-              "type": "string"
-            }
-          },
-          "type": "object"
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "search_candidates",
-        "description": "Run one additional local retrieval and append new candidates to the pool.\n\nUse this when the current candidates do not cover the gap, or when the\nprefetch notice said the pool was empty. The query is translated to English\nby the existing local-search gate; translation failure fails closed. Returns\nmetadata for newly added candidates only — read their text with\n``read_candidate``. Existing candidate ids stay stable.",
-        "parameters": {
-          "properties": {
-            "query": {
-              "type": "string"
-            },
-            "limit": {
-              "default": 6,
+              "maximum": 30000,
+              "minimum": 1,
               "type": "integer"
             }
           },
           "required": [
-            "query"
+            "ref"
           ],
           "type": "object"
         }
@@ -634,7 +591,7 @@
       "type": "function",
       "function": {
         "name": "inspect_uploaded_table",
-        "description": "查看 CSV/TSV/Excel/PDF/Word 表格结构、字段样例与覆盖。\n\nfile_ids_json 显式选择本账号真实文件ID，可跨轮读取，无需重附；不接受latest、文件名或路径。\n非空ID列表是本次源列表，file_index 在该列表内从0选择；不会混入本轮附件或其他历史文件。\n空ID列表保留原本轮附件file_index逻辑。账号来源校验owner、实际SHA-256与大小，合计最多20MB/20文件。\nXLSX/XLSM 默认 layout，返回工作表、可见性、合并格和已发现区域。查看 detection 的扫描范围和完整性；同一文件版本和读法可复用已存结构。\ninspection=cells、cell_range=\"A1:F40\" 按原坐标读取公式或值，默认10行，宽页也按单元格数和字节缩小。\n常规单表绘图优先一次 inspection=\"profile\"，取得字段、表头、行数与 inputs_binding；结构不明确才做 layout 或 cells。\ncells 是坐标样例，不是全表或样本量。只有确需核对特定坐标才续读，原样使用相同工作表、范围与 next_cursor。\nheader_row 选择表头，header_rows_json=[2,3] 指定多层表头。新规则审查用audit_uploaded_data；\n已有review_id仅需导出时用deliver_research_artifact，不重新扫描。",
+        "description": "查看 CSV/TSV/Excel/PDF/Word 表格结构、字段样例与覆盖。\n\nfile_ids_json 显式选择本账号真实文件ID，可跨轮读取，无需重附；不接受latest、文件名或路径。\n非空ID列表是本次源列表，file_index 在该列表内从0选择；不会混入本轮附件或其他历史文件。\n空ID列表保留原本轮附件file_index逻辑。账号来源校验owner、实际SHA-256与大小，合计最多20MB/20文件。\nXLSX/XLSM 默认 layout，返回工作表、可见性、合并格和已发现区域。查看 detection 的扫描范围和完整性；同一文件版本和读法可复用已存结构。\ninspection=cells、cell_range=\"A1:F40\" 按原坐标读取公式或值，page_rows 为 1–50，默认10行，宽页也按单元格数和字节缩小。\n常规单表绘图优先一次 inspection=\"profile\"，取得字段、表头、行数与 inputs_binding；结构不明确才做 layout 或 cells。\ncells 是坐标样例，不是全表或样本量。只有确需核对特定坐标才续读，原样使用相同工作表、范围与 next_cursor。\nheader_row 选择表头，header_rows_json=[2,3] 指定多层表头。新规则审查用audit_uploaded_data；\n已有review_id仅需导出时用deliver_research_artifact，不重新扫描。",
         "parameters": {
           "properties": {
             "file_index": {
@@ -687,6 +644,8 @@
             },
             "page_rows": {
               "default": 10,
+              "maximum": 50,
+              "minimum": 1,
               "type": "integer"
             },
             "cursor": {
@@ -2325,7 +2284,7 @@
       "type": "function",
       "function": {
         "name": "run_research_figure_script",
-        "description": "在一次性隔离Python环境中探索/整理数据，生成命名科研图（SVG/PNG/PDF）。\n\n首选的科研绘图路径，配合 figure-export 的 nature-figure 工作流。\n仅在服务端已配置隔离沙箱时可用；未配置时本工具不会出现。\n三种隔离环境：Docker、WSL-Docker、Apptainer；脚本仍不联网、不建子进程。\n常规单表绘图用 inspect_uploaded_table(inspection=\"profile\") 一次确认表头、列名、类型与来源绑定。\n已知字段和绑定时直接复用。仅遇真实工作簿结构歧义才用 layout/cells，不分页搜集绘图数据。\n预览和单元格样例不能用于推算样本量；勿把全表或分页内容写进脚本字面量。\nMatplotlib 和产生 Matplotlib Artist 的 Seaborn 均支持，不承诺其他后端。\n先按已加载的 figure-export/nature-figure 工作流确定问题、变量与单位；\n高唯一率编号不默认作处理组，不能默取第一数值列或截前 N 行。多指标按\n研究目的分面/热图，保留原始点及明确的聚合/变换；缺少关键设计时询问。\n单套底部/左侧刻度，实际 draw 后验证标签密度及固定画布边界；布局不合格\n会返回可修正错误，不能以文件生成代替科学表达与视觉检查。\ninputs_json、outputs_json、qa_profile_json 直接传 JSON 对象；formats_json 直接传数组。\nrender_script 是 outputs_json 对象中的源码字符串，只有 Python 源码需要字符串；不要把 JSON 对象再次编码。\ninputs_json 是变量名到当前账号文件的映射，优先照用 inspect 返回的 inputs_binding。\n例如 {\"data\":{\"file_id\":\"...\"}}，也接受同一文件的 {\"file_id\":\"...\",\"sha256\":\"...\"}；\n提供 sha256 时必须与当前授权文件的真实字节完全匹配。脚本中 pd.read_csv(data) 或 pd.read_excel(data,\nsheet_name=..., header=...) 读取完整固定字节快照。模型只需列/类型/维度与\n少量样例的结构摘要；不要分页读出、复述全表或把全表手写进脚本字面量。\n预览截短不等于源数据截短，不用 nrows/head 代替全表；纯绘图不需先做推断检验。\n不允许路径；快照保存摘要并固定引用，原文件变更需新建图件来源。\nanalysis_result_ref_json 接收统计工具返回的 analysis_result_ref，按账号核验；\nanalysis_result 变量是全精度结果 JSON Path，analysis_data 是对应 CSV Path。\nqa_profile_json 支持 name(scientific/nature_single/nature_double)、final_size_mm、\nmin_font_pt、min_linewidth_pt、caption，返回实际测量及明确的 unsupported 检查。\ninputs_json也可绑定 {\"tidy\":{\"dataset_ref\":上一执行返回的dataset_ref}}，\n主脚本用 df=load_dataset(tidy) 读取该绑定，保留表的类型和精度；普通文件仍用 pandas。\n不要用 pandas 读取内部快照 JSON 或自行解码。独立 render_script 只读取 data 中的冻结 DataFrame。\n可选 outputs_json.input_contract 版本 1 区分原始文件和读入的表。raw 声明 Path 变量。tables 逐项声明 name、input、format（csv/tsv/excel/dataset）及需要时的 sheet、header，主脚本收到对应 DataFrame。独立 renderer 只收到冻结表映射 data。可用 render 指定 renderer 键到父表的映射。emit.table 的 parents 使用 inputs_json 中的原始绑定名。省略 input_contract 时沿用旧变量合同。\n默认用冻结表与独立渲染的outputs_json版本2协议，支持后续保真样式编辑。例如：\n{\"version\":2,\"tables\":[{\"name\":\"tidy\",\"parents\":[\"data\"]}],\n\"figures\":[{\"name\":\"relations\",\"title\":\"变量关系\",\"formats\":[\"svg\"],\n\"parents\":[\"tidy\"],\"render_script\":\"frame=data['tidy']; fig,ax=plt.subplots(); ax.scatter(frame['x'],frame['y'])\"}]}。\n主script只读取、整理、分析输入，用emit.table('tidy',df,parents=['data'])保存完整结果。\nrender_script通过data['tidy']取得冻结DataFrame，仅构造并保留一个Figure；不调用emit、\n不读取主脚本变量/输入路径、不重新抽样或分析。渲染所需数值及标签先保存在表内。\n最多8表/8图。每张独立图声明不同的 name；只有用户明确要求科学组合图时才共用一个多面板 Figure。\n导出和Nature审核由worker完成，不自行savefig。\n旧混写v2仍兼容：未声明render_script的图必须emit.figure('relations',fig)明确登记，\n只创建Figure或末尾写fig不算登记；该路径可下载，但没有保真样式编辑凭证。\nemit.report(value)最多调用一次，集中提交结构化观察；过程日志用print，不把报告接口当追加日志。\nemit.table的单元格须为标量（字符串、数值、布尔或空），dict/list应拆列或显式编码为JSON字符串。\n用户要求图件时声明至少一张图，实际导出并登记后才有交付凭据。\n纯探索/整理可声明空figures，emit.report返回有界观察；中间表不作默认附件，\n下一执行可用 dataset_ref。图型与字段已经明确时，第一次调用就声明用户所需的真实 figures 和导出格式，\n同一调用内读表、整理、渲染、QA、导出；不要先单独做只冻结表或只统计的运行。\n主 script 使用 inputs_json 的实际键名（绑 tidy 就用 tidy），不默认有 data 字典；\n只有独立 render_script 的 data 才是冻结表映射。图件条目不接受 render_script_ref。\n没有 outputs_json 时为旧单图模式，仅构造一个 Figure，不可调用 emit。\n用户已指定 Python 或图型时直接沿用，只有影响科学含义的未知选择才询问。\n有匹配的内置模板时优先按引用和参数执行，仅传必要参数。\n需要样本量时由绘图脚本 emit.report 记录 rows_read、rows_plotted、rows_excluded、n_per_group。\nfigure_published 且所需格式齐全时直接给 exports 下载链接和已有 QA 摘要，不因视觉审查未执行、摘要缺字段而重绘。\n不打开或粘贴 SVG/XML 源码，除非用户明确要求源码。\n只有缺必要细节时才按原文 JSON Pointer 读取，例如 /script_report、/exports、/figures/0/qa_receipt、/figures/0/current_qa。\n修复真实失败才读取已有 run_id 或明确失败字段，复用真实输入与脚本版本；不要以演示数据或放宽 QA 替代正式成果。\n图件parents只引用输入绑定名或命名中间表；未声明时保守依赖全部输入与表。\noutputs_json省略时兼容旧协议，最后恰好保留一张Figure。所有脚本必须使用Agg、\n不联网、不创建子进程、不访问沙箱以外文件；类型不明或关键设计不明先探索/必要提问。\n\nscript 是完整的 Python 源码，例如：\nimport matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(7, 5))\nax.bar(['CK', 'T1'], [10.1, 12.2], color='#0F4D92', label='果实重量')\nax.set_ylabel('g'); ax.set_title('果实重量')\n\nformats_json：覆盖各输出的请求格式。省略时沿用输出契约，没有契约时默认 SVG。\noutput_name：文件名（不含扩展名）。\n\n失败时返回 [FIGURE_...] 形式的说明，指出问题与改法；沙箱不会执行任何\n需要网络或特权的操作。\n\n\n复用优先：先用research_workspace发现适用内置工具/脚本和任务脚本。\nscript与script_ref_json二选一；源码执行前自动暂存，返回script_ref及run_id，\n失败也保留源码。parameters_json是JSON对象，脚本内通过parameters读取，不拼接代码。\n修复已保存的failed/partial运行时，只提供修改后的script或script_ref_json与repair_from_run_id；\n其余参数留空。宿主继承该运行的固定输入、参数、输出约定和审核选项，重新校验后创建新运行，沿用原运行的交付格式。\n改变输出契约（如改为独立render_script）需显式绑定授权输入发起新运行，不传repair_from_run_id。\n先read_run查看具体失败；running或状态未知的运行不能重放。旧记录缺少完整修复输入时须显式绑定授权来源。\n内置脚本可自动使用其声明的输出契约；任务脚本需要明确绑定输入和输出。\n同一任务局部修改用research_workspace.patch创建子版本，再按引用执行。\n已有工具或参数化脚本能完成时，不从头重写算法。中间表和脚本默认不是下载附件。\n\n唯一绘图入口（F-04）：任意 Matplotlib/Seaborn 脚本用 mode=\"script\"；五种固定科研图型\n（volcano/ROC/dotplot/marginal/paired）用 mode=\"template\" + template_id + 类型化\ntemplate_parameters_json + 单张表绑定 inputs_json（或 analysis_result_ref_json）。\n模板与脚本共用同一冻结输入快照、同一 Worker、同一超时策略、同一输出合同、同一 QA 与\n同一工作台项目；模板不接受 script/script_ref_json/outputs_json，参数或绑定错误在派发前\n返回 not_run。旧工具 run_nature_plot/collect_nature_plot 已弃用并只转发到这里，\n不得同时使用两套入口。",
+        "description": "在一次性隔离Python环境中探索/整理数据，生成命名科研图（SVG/PNG/PDF）。\n\n首选的科研绘图路径，配合 figure-export 的 nature-figure 工作流。\n仅在服务端已配置隔离沙箱时可用；未配置时本工具不会出现。\n三种隔离环境：Docker、WSL-Docker、Apptainer；脚本仍不联网、不建子进程。\n常规单表绘图用 inspect_uploaded_table(inspection=\"profile\") 一次确认表头、列名、类型与来源绑定。\n已知字段和绑定时直接复用。仅遇真实工作簿结构歧义才用 layout/cells，不分页搜集绘图数据。\n预览和单元格样例不能用于推算样本量；勿把全表或分页内容写进脚本字面量。\nMatplotlib 和产生 Matplotlib Artist 的 Seaborn 均支持，不承诺其他后端。\n先按已加载的 figure-export/nature-figure 工作流确定问题、变量与单位；\n高唯一率编号不默认作处理组，不能默取第一数值列或截前 N 行。多指标按\n研究目的分面/热图，保留原始点及明确的聚合/变换；缺少关键设计时询问。\n单套底部/左侧刻度，实际 draw 后验证标签密度及固定画布边界；布局不合格\n会返回可修正错误，不能以文件生成代替科学表达与视觉检查。\ninputs_json、outputs_json、qa_profile_json 直接传 JSON 对象；formats_json 直接传数组。\nrender_script 是 outputs_json 对象中的源码字符串，只有 Python 源码需要字符串；不要把 JSON 对象再次编码。\ninputs_json 是变量名到当前账号文件的映射，优先照用 inspect 返回的 inputs_binding。\n例如 {\"data\":{\"file_id\":\"...\"}}，也接受同一文件的 {\"file_id\":\"...\",\"sha256\":\"...\"}；\n提供 sha256 时必须与当前授权文件的真实字节完全匹配。脚本中 pd.read_csv(data) 或 pd.read_excel(data,\nsheet_name=..., header=...) 读取完整固定字节快照。模型只需列/类型/维度与\n少量样例的结构摘要；不要分页读出、复述全表或把全表手写进脚本字面量。\n预览截短不等于源数据截短，不用 nrows/head 代替全表；纯绘图不需先做推断检验。\n不允许路径；快照保存摘要并固定引用，原文件变更需新建图件来源。\nanalysis_result_ref_json 接收统计工具返回的 analysis_result_ref，按账号核验；\nanalysis_result 变量是全精度结果 JSON Path，analysis_data 是对应 CSV Path。\nqa_profile_json 支持 name(scientific/nature_single/nature_double)、final_size_mm、\nmin_font_pt、min_linewidth_pt、caption，返回实际测量及明确的 unsupported 检查。\ninputs_json也可绑定 {\"tidy\":{\"dataset_ref\":上一执行返回的dataset_ref}}，\n主脚本用 df=load_dataset(tidy) 读取该绑定，保留表的类型和精度；普通文件仍用 pandas。\n不要用 pandas 读取内部快照 JSON 或自行解码。独立 render_script 只读取 data 中的冻结 DataFrame。\n可选 outputs_json.input_contract 版本 1 区分原始文件和读入的表。raw 声明 Path 变量。tables 逐项声明 name、input、format（csv/tsv/excel/dataset）及需要时的 sheet、header，主脚本收到对应 DataFrame。独立 renderer 只收到冻结表映射 data。可用 render 指定 renderer 键到父表的映射。emit.table 的 parents 使用 inputs_json 中的原始绑定名。省略 input_contract 时沿用旧变量合同。\n默认用冻结表与独立渲染的outputs_json版本2协议，支持后续保真样式编辑。例如：\n{\"version\":2,\"tables\":[{\"name\":\"tidy\",\"parents\":[\"data\"]}],\n\"figures\":[{\"name\":\"relations\",\"title\":\"变量关系\",\"formats\":[\"svg\"],\n\"parents\":[\"tidy\"],\"render_script\":\"frame=data['tidy']; fig,ax=plt.subplots(); ax.scatter(frame['x'],frame['y'])\"}]}。\n主script只读取、整理、分析输入，用emit.table('tidy',df,parents=['data'])保存完整结果。\nrender_script通过data['tidy']取得冻结DataFrame，仅构造并保留一个Figure；不调用emit、\n不读取主脚本变量/输入路径、不重新抽样或分析。渲染所需数值及标签先保存在表内。\n最多8表/8图。每张独立图声明不同的 name；只有用户明确要求科学组合图时才共用一个多面板 Figure。\n导出和Nature审核由worker完成，不自行savefig。\n旧混写v2仍兼容：未声明render_script的图必须emit.figure('relations',fig)明确登记，\n只创建Figure或末尾写fig不算登记；该路径可下载，但没有保真样式编辑凭证。\nemit.report(value)最多调用一次，集中提交结构化观察；过程日志用print，不把报告接口当追加日志。\nemit.table的单元格须为标量（字符串、数值、布尔或空），dict/list应拆列或显式编码为JSON字符串。\n用户要求图件时声明至少一张图，实际导出并登记后才有交付凭据。\n纯探索/整理可声明空figures，emit.report返回有界观察；中间表不作默认附件，\n下一执行可用 dataset_ref。图型与字段已经明确时，第一次调用就声明用户所需的真实 figures 和导出格式，\n同一调用内读表、整理、渲染、QA、导出；不要先单独做只冻结表或只统计的运行。\n主 script 使用 inputs_json 的实际键名（绑 tidy 就用 tidy），不默认有 data 字典；\n只有独立 render_script 的 data 才是冻结表映射。图件条目不接受 render_script_ref。\n没有 outputs_json 时为旧单图模式，仅构造一个 Figure，不可调用 emit。\n用户已指定 Python 或图型时直接沿用，只有影响科学含义的未知选择才询问。\n有匹配的内置模板时优先按引用和参数执行，仅传必要参数。\n需要样本量时由绘图脚本 emit.report 记录 rows_read、rows_plotted、rows_excluded、n_per_group。\n使用已验证可下载的同版产物交付；已有产物卡片时不在正文重复贴下载链接或默认复述 QA。只说明会影响使用的缺项，不因摘要缺字段而重绘。\n同时交付 SVG/PNG/PDF 时在同一输出条目声明格式，三个文件共用同一 Figure。\n默认或请求 SVG 的矩阵热图用 ax.pcolormesh(..., shading='flat', rasterized=False)，\n不用 imshow；若有色标，创建后将 colorbar.solids.set_rasterized(False)（solids 非空时）。\n保留矩阵值、遮罩、轴顺序、坐标、色标范围和色标单位；不擅自替换像素插值等非等价表示。\n需要在工作台继续编辑时，使用独立 render_script 和冻结数据；仅在本轮图件卡有「在工作台打开」时引导，勿给通用工作台地址。\n不打开或粘贴 SVG/XML 源码，除非用户明确要求源码。\n只有缺必要细节时才按原文 JSON Pointer 读取，例如 /script_report、/exports、/figures/0/qa_receipt、/figures/0/current_qa。\n修复真实失败才读取已有 run_id 或明确失败字段，复用真实输入与脚本版本；不要以演示数据或放宽 QA 替代正式成果。\n图件parents只引用输入绑定名或命名中间表；未声明时保守依赖全部输入与表。\noutputs_json省略时兼容旧协议，最后恰好保留一张Figure。所有脚本必须使用Agg、\n不联网、不创建子进程、不访问沙箱以外文件；类型不明或关键设计不明先探索/必要提问。\n\nscript 是完整的 Python 源码，例如：\nimport matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\nfig, ax = plt.subplots(figsize=(7, 5))\nax.bar(['CK', 'T1'], [10.1, 12.2], color='#0F4D92', label='果实重量')\nax.set_ylabel('g'); ax.set_title('果实重量')\n\nformats_json：覆盖各输出的请求格式。省略时沿用输出契约，没有契约时默认 SVG。\noutput_name：文件名（不含扩展名）。\n\n失败时返回 [FIGURE_...] 形式的说明，指出问题与改法；沙箱不会执行任何\n需要网络或特权的操作。\n\n\n复用优先：先用research_workspace发现适用内置工具/脚本和任务脚本。\nscript与script_ref_json二选一；源码执行前自动暂存，返回script_ref及run_id，\n失败也保留源码。parameters_json是JSON对象，脚本内通过parameters读取，不拼接代码。\n修复已保存的failed/partial运行时，只提供修改后的script或script_ref_json与repair_from_run_id；\n其余参数留空。宿主继承该运行的固定输入、参数、输出约定和审核选项，重新校验后创建新运行，沿用原运行的交付格式。\n改变输出契约（如改为独立render_script）需显式绑定授权输入发起新运行，不传repair_from_run_id。\n先read_run查看具体失败；running或状态未知的运行不能重放。旧记录缺少完整修复输入时须显式绑定授权来源。\n内置脚本可自动使用其声明的输出契约；任务脚本需要明确绑定输入和输出。\n同一任务局部修改用research_workspace.patch创建子版本，再按引用执行。\n已有工具或参数化脚本能完成时，不从头重写算法。中间表和脚本默认不是下载附件。\n\n唯一绘图入口（F-04）：任意 Matplotlib/Seaborn 脚本用 mode=\"script\"；五种固定科研图型\n（volcano/ROC/dotplot/marginal/paired）用 mode=\"template\" + template_id + 类型化\ntemplate_parameters_json + 单张表绑定 inputs_json（或 analysis_result_ref_json）。\n模板与脚本共用同一冻结输入快照、同一 Worker、同一超时策略、同一输出合同、同一 QA 与\n同一工作台项目；模板不接受 script/script_ref_json/outputs_json，参数或绑定错误在派发前\n返回 not_run。旧工具 run_nature_plot/collect_nature_plot 已弃用并只转发到这里，\n不得同时使用两套入口。",
         "parameters": {
           "properties": {
             "script": {
@@ -2525,28 +2484,6 @@
         "description": "Queue a trusted host rebuild of the shared literature index. Takes no arguments, paths or commands. Only administratively published documents are indexed; this call cannot publish content, grant rights or read unpublished documents.",
         "parameters": {
           "properties": {},
-          "type": "object"
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "search_agent_corpus",
-        "description": "Search the shared literature corpus published by administrators. Returns bounded excerpts with document and version read references. Only published, non-revoked content is visible; the query is plain text.",
-        "parameters": {
-          "properties": {
-            "query": {
-              "type": "string"
-            },
-            "limit": {
-              "default": 6,
-              "type": "integer"
-            }
-          },
-          "required": [
-            "query"
-          ],
           "type": "object"
         }
       }

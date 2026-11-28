@@ -161,7 +161,7 @@ def _render_receipt_figures(row, name):
     return figures if isinstance(figures, list) and figures else None
 
 
-def _single_render_assets(requirements, rows, assets, answer_render_refs):
+def _single_render_assets(requirements, rows, assets, answer_render_refs, *, allow_incomplete=False):
     """Prefer the figure named by the answer, with the latest receipt as fallback."""
     from src.graph.export_contract import deliverable_match_groups
 
@@ -189,11 +189,11 @@ def _single_render_assets(requirements, rows, assets, answer_render_refs):
                 group = [(owner, asset) for owner, asset in current
                          if (asset.get("link"), asset.get("artifact_id"), asset.get("mime")) in keys]
                 complete = deliverable_match_groups([asset for _, asset in group], requirements)
-                if complete:
+                if group and (complete or allow_incomplete):
                     matches.append(group)
                 if any(answer_refs.intersection((item.get("artifact_url"), item.get("download_url")))
                        for item in exports):
-                    identified.append(group if complete else [])
+                    identified.append(group if complete or allow_incomplete else [])
             if first_row:
                 fallback = matches[0] if len(matches) == 1 else []
         if not answer_refs:
@@ -213,13 +213,24 @@ def _effective_artifact_records(records):
     return sorted(effective_tool_records(records), key=lambda row: positions[row.get("tool_call_id")])
 
 
+def _verified_render_assets(rows, verified_links):
+    return [(row["tool_call_id"], item) for row in rows
+            if row.get("tool_call_id") and row.get("status") in {"complete", "partial"}
+            for item in row.get("artifact_validations", ())
+            if (item.get("valid") and item.get("request_matches") is True
+                and item.get("link") in verified_links)]
+
+
+def available_single_render_links(requirements, rows, verified_links, answer_render_refs):
+    """Keep available files of one proven render without satisfying format obligations."""
+    assets = _verified_render_assets(rows, verified_links)
+    group = _single_render_assets(requirements, rows, assets, answer_render_refs, allow_incomplete=True)
+    return {item['link'] for _, item in group or ()}
+
+
 def artifact_goal_evidence(requirements, rows, verified_links, *, single_render_receipt=False, answer_render_refs=()):
     from src.graph.export_contract import deliverable_match_groups
-    assets = [(row["tool_call_id"], item) for row in rows
-              if row.get("tool_call_id") and row.get("status") in {"complete", "partial"}
-              for item in row.get("artifact_validations", ())
-              if (item.get("valid") and item.get("request_matches") is True
-                  and item.get("link") in verified_links)]
+    assets = _verified_render_assets(rows, verified_links)
     render_assets = (_single_render_assets(requirements, rows, assets, answer_render_refs)
                      if single_render_receipt else None)
     if render_assets is not None:
@@ -267,7 +278,8 @@ def verified_delivery_after_length(requirements, records, verified_links):
     return answer, tuple(gaps)
 
 
-def completion_errors(statement: CompletionEnvelope, records, missing=(), *, verified_repairs=(), superseded_proposals=()) -> tuple[str, ...]:
+def completion_errors(statement: CompletionEnvelope, records, missing=(), *, verified_repairs=(),
+                      superseded_proposals=(), verified_card_links=()) -> tuple[str, ...]:
     """Check references and hard facts; this does not certify scientific truth."""
     from src.core.task_result import effective_tool_records, incidental_partial_candidate
     rows = effective_tool_records(records)
@@ -290,6 +302,7 @@ def completion_errors(statement: CompletionEnvelope, records, missing=(), *, ver
                                     if row.get("status") == "partial"
                                     and any(item.get("valid") and item.get("request_matches") is True
                                             for item in row.get("artifact_validations", ()))}
+    card_links = set(verified_card_links)
     referenced = set()
     for goal in statement.goals:
         refs = goal.evidence_call_ids
@@ -303,7 +316,8 @@ def completion_errors(statement: CompletionEnvelope, records, missing=(), *, ver
             errors.append("required_deliverable_missing:" + goal.goal)
         verified_links = {v.get("link") for cid in refs for v in
                           by_id.get(cid, {}).get("artifact_validations", []) if v.get("valid")}
-        if any(link not in verified_links or link not in statement.answer for link in goal.artifact_links):
+        if any(link not in verified_links or (link not in card_links and link not in statement.answer)
+               for link in goal.artifact_links):
             errors.append("unverified_delivery:" + goal.goal)
     # Failed/unknown executions are never proposal repairs. A code-owned pure
     # admission rejection may be superseded only after the host proves zero
@@ -368,12 +382,15 @@ def reviewed_completion_valid(outcome, records, *, answer=None) -> bool:
                 type(proof.get("request_version")) is not int or proof["request_version"] <= 0):
             return False
         statement = CompletionEnvelope.model_validate(proof["statement"])
+        contract = proof.get("artifact_contract")
+        cards = contract.get("verified_card_links", []) if isinstance(contract, dict) else []
+        if not isinstance(cards, list) or any(not isinstance(link, str) for link in cards):
+            return False
         if (statement.status != data.get("status") or completion_errors(statement, records,
                 verified_repairs=proof.get("verified_proposal_repairs", ()),
-                superseded_proposals=proof.get("superseded_proposal_ids", ()))
+                superseded_proposals=proof.get("superseded_proposal_ids", ()), verified_card_links=cards)
                 or proof.get("answer_hash") != completion_digest(statement.answer)):
             return False
-        contract = proof.get("artifact_contract")
         if contract is not None:
             if (contract.get("schema_version") != 1
                     or contract.get("request_version") != proof.get("request_version")):
@@ -387,7 +404,8 @@ def reviewed_completion_valid(outcome, records, *, answer=None) -> bool:
                 return False
             goals, gaps = artifact_goal_evidence(contract["requirements"], rows, set(contract["verified_links"]),
                 single_render_receipt=single_render_receipt, answer_render_refs=answer_render_refs)
-            if (goals != [goal for goal in statement.goals if goal.kind == "deliverable"]
+            if (not set(cards).issubset({link for goal in goals for link in goal.artifact_links})
+                    or goals != [goal for goal in statement.goals if goal.kind == "deliverable"]
                     or (gaps and statement.status == "completed")
                     or tuple(gaps) != tuple(gap for gap in data.get("gaps", ())
                                            if gap.get("kind") == "deliverable")):

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import {api, safeReturn, exportOptions} from './api.mjs';
+import {api, safeReturn, exportOptions} from './api.mjs?v=2';
 import {createAssistant} from './assistant-ui.mjs';
-import {createCanvas} from './canvas-ui.mjs';
-import {createResources} from './resources.mjs';
+import {createCanvas} from './canvas-ui.mjs?v=2';
+import {createResources} from './resources.mjs?v=3';
 import {push} from './tavotto-primitives.mjs';
-import {$, inspector, listFigures, listHistory, listObjects, make} from './views.mjs';
+import {$, inspector, listFigures, listHistory, listObjects, make} from './views.mjs?v=2';
 
 const state = {session:null, figures:[], versions:[], doc:null, head:null, selected:null, group:null, locks:new Set(), point:null, candidates:[], zoom:1, pending:false, restore:null, nameRevision:null, past:[], future:[]};
 const known = (kind, id) => {
@@ -12,6 +12,7 @@ const known = (kind, id) => {
   return objects?.some(item => (item.gid ?? item.id) === id);
 };
 const latest = () => state.head === state.doc?.revision;
+const frozenOffer = () => /^[a-f0-9]{32}$/.test(state.session?.frozen_project ?? '') ? state.session.frozen_project : '';
 const message = (text, error = false) => { $('status').textContent = text; $('status').dataset.error = error; };
 const switchPage = id => {
   for (const button of document.querySelectorAll('[data-page]')) {
@@ -24,7 +25,17 @@ const switchPage = id => {
 function buttons() {
   const doc = state.doc;
   const disabled = state.pending || !state.session;
-  for (const id of ['import-open','empty-prepare','static-open']) $(id).disabled = disabled;
+  const workerOnly = state.session?.worker_only === true;
+  for (const id of ['import-open','empty-prepare','static-open']) {
+    $(id).hidden = workerOnly;
+    $(id).disabled = disabled || workerOnly;
+  }
+  $('library').hidden = workerOnly;
+  $('worker-source-note').hidden = !workerOnly || !!frozenOffer();
+  $('empty-source-note').textContent = workerOnly
+    ? '打开左侧已导入图件，或返回聊天，从图件卡接手 Worker 图件。'
+    : '从左侧打开图件或选择已渲染的预览。也可准备 Python 或 R，或打开静态图。';
+  if (workerOnly) for (const id of ['import-dialog','card-dialog']) if ($(id).open) $(id).close();
   $('undo').disabled = disabled || !latest() || !state.past.length || doc?.editability === 'preview_only';
   $('redo').disabled = disabled || !latest() || !state.future.length || doc?.editability === 'preview_only';
   canvas.buttons(disabled);
@@ -33,6 +44,8 @@ function buttons() {
   $('export-open').disabled = disabled || !doc || !latest();
   $('cycle').disabled = disabled || !state.point || state.candidates.length < 2;
   $('refresh').disabled = disabled;
+  $('frozen-import').hidden = !frozenOffer();
+  $('frozen-import').disabled = disabled || !frozenOffer();
   $('signin').hidden = !!state.session;
   $('signin').disabled = state.pending;
   $('studio').setAttribute('aria-busy', String(state.pending));
@@ -278,6 +291,14 @@ for (const button of document.querySelectorAll('[data-close]')) button.addEventL
 for (const dialog of document.querySelectorAll('dialog')) dialog.addEventListener('cancel', event => { if (state.pending) event.preventDefault(); });
 $('signin').addEventListener('click', () => $('login-dialog').showModal());
 $('login-dialog').addEventListener('close', () => { $('login-form').reset(); formMessage($('login-form'), ''); });
+$('frozen-import').addEventListener('click', () => run(async () => {
+  const ref = frozenOffer();
+  if (!ref) return;
+  const imported = await api.importFrozen(ref, state.session.frozen_render_version ?? 1);
+  await refreshList();
+  await readFigure(imported.figure_id);
+  state.session = {...state.session, frozen_project:''};
+}, {busy:'正在用原脚本和数据渲染…', done:'图件已导入，可以开始编辑。'}));
 $('refresh').addEventListener('click',() => run(async () => {
   await refreshList();
   if (state.doc) await readFigure(state.doc.figure_id); else refreshViews();

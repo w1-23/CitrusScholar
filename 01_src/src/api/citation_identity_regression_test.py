@@ -327,7 +327,10 @@ def test_mixed_search_preserves_legacy_exact_span_and_rejects_selfcorpus_replay(
                    "selfcorpus_citation_ref": "corpus:chunk-new", "excerpt": "Incremental bounded evidence"}
     monkeypatch.setattr(selfcorpus_search, "tool_result", lambda *args, **kwargs: {
         "results": [incremental], "local_status": "hit", "_tool_outcome": {"status": "complete"}})
-    content, artifact = fetch.local_hybrid_search.func("citrus", ["literature", selfcorpus_search.FAMILY_ID])
+    _, direct = fetch.local_hybrid_search.func("citrus", ["literature", selfcorpus_search.FAMILY_ID])
+    assert direct["local_status"] == "unavailable" and direct["main_results"] == []
+    # Reconstruct the saved legacy observation without exposing it to the Agent.
+    content, artifact = fetch._local_hybrid_search_impl("citrus", ["literature", selfcorpus_search.FAMILY_ID])
     assert [item["title"] for item in json.loads(content)["candidates"]] == ["Legacy fixture", "New fixture"]
     assert artifact["main_results"][0]["citation_ref"] == "L1"
     assert artifact["shared_results"] == [incremental]
@@ -342,3 +345,46 @@ def test_mixed_search_preserves_legacy_exact_span_and_rejects_selfcorpus_replay(
     assert run.client.get("/corpus/source", params={"record": source["record_key"]}).json()["markdown"] == original
     run.user["user_id"] = 32
     assert run.client.get("/corpus/source", params={"record": source["record_key"]}).status_code == 404
+
+
+
+def test_unified_search_delivers_passage_for_direct_citation(citation_session, monkeypatch):
+    import hashlib
+
+    from src.core.turn_sources import answer_citations
+    from src.corpus_integration import evidence_client
+    from src.graph.tool_availability import runtime_env
+    from src.retrieval import unified_evidence
+    from src.tools.deepseek_search_fetch import local_hybrid_search
+
+    run = citation_session
+    monkeypatch.setenv("CITRUS_CORPUS_UNIFIED_RETRIEVAL", "1")
+    env = runtime_env(script_sandbox=False, shared_corpus=False)
+    assert {"read_candidate", "inspect_candidates", "search_candidates"} <= env.denied
+    assert "read_local_evidence" not in env.denied
+    assert set(read_local_evidence.args_schema.model_json_schema()["properties"]) == {
+        "ref", "offset", "max_chars"}
+    text = "Citrus evidence for direct citation. " * 25
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    row = dict(source_id="cqa_literature", document_ref="doc-1", version_ref="version-1", passage_ref="passage-1",
+               generation_ref="generation-1", passage_hash=digest, title="Verified citrus study",
+               excerpt=text, readback="exact", evidence_ref="fixture-source-ref")
+    monkeypatch.setattr(evidence_client, "search", lambda *args: dict(status="hit", snapshot_ref="seed",
+        results=[row], source_outcomes=[dict(source_id="cqa_literature", status="hit")]))
+    monkeypatch.setattr(unified_evidence, "read_exact", lambda binding, offset, length, **kw:
+        (text[offset:offset+length], len(text), offset+length if offset+length < len(text) else None))
+    body, artifact = local_hybrid_search.func("柑橘", [])
+    evidence, = json.loads(body)["evidence"]
+    assert evidence["passage"] == text and "read_entry" not in evidence and "generation" not in evidence
+    assert "candidates" not in json.loads(body)
+    record_tool("local_hybrid_search", "direct-search", body, artifact)
+    source, = run.client.get(f"/sessions/{run.sid}/turn-sources?request_id=client-request").json()["sources"]
+    assert source["read_ref"]["end"] == len(text)
+    assert source["source_ref"] == evidence["evidence_ref"]
+    response = run.client.get("/corpus/source", params={"record": source["record_key"]})
+    assert response.status_code == 200 and response.json()["markdown"] == text
+    answer, citations = answer_citations("有相关证据" + evidence["citation_ref"], session_id=run.sid,
+                                        request_id="client-request", user=run.user)
+    assert answer.startswith("有相关证据") and citations
+    _, readback = read_local_evidence.func(evidence["evidence_ref"], offset=7, max_chars=52)
+    assert readback["text"] == text[7:59]

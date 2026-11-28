@@ -89,8 +89,7 @@ test('lifecycle rows are visible in the default surface', () => {
   const {process, body} = panel();
   nativeEvents().forEach(event => process.receive('assistant_progress', event));
   assert.deepEqual(rowKinds(body), ['subagent', 'interrupt']);
-  assert.equal(actions(body).length, 1);
-  assert.match(actions(body)[0].textContent, /已提交/);
+  assert.equal(actions(body).length, 0);
   const node = host(body);
   assert.equal(node.hidden, false);
   assert.equal(node.querySelectorAll('.task-native-row.is-active').length, 1);
@@ -109,7 +108,7 @@ test('a replayed page appends nothing twice', () => {
   events.slice().reverse().forEach(event => process.receive('assistant_progress', event));
   assert.equal(rows(body).length, first);
   assert.deepEqual(rowKinds(body), ['subagent', 'interrupt']);
-  assert.equal(actions(body).length, 1);
+  assert.equal(actions(body).length, 0);
 });
 
 test('a terminal frame freezes the surface and marks unrecorded endings', () => {
@@ -125,7 +124,7 @@ test('a terminal frame freezes the surface and marks unrecorded endings', () => 
     {tool_call_id: 'call_9', tool_name: 'execute'}, 15));
   assert.equal(rows(body).length, 2);
   assert.deepEqual(rowKinds(body), ['subagent', 'interrupt']);
-  assert.equal(actions(body).length, 1);
+  assert.equal(actions(body).length, 0);
 });
 
 test('legacy preview switches cannot expose provisional text', () => {
@@ -149,13 +148,11 @@ test('recovery reopens the native surface for the same turn', () => {
     {tool_call_id: 'call_1', tool_name: 'read_tool_result'}, 51));
   process.receive('done', {job_id: JOB, answer: '', seq: 52,
     turn_envelope: {display_status: 'failed'}});
-  assert.equal(actions(body).length, 1);
+  assert.equal(actions(body).length, 0);
   process.receive('agent_recovery', {job_id: JOB, status: 'admitted', seq: 53, recovery_cursor: 53});
   process.receive('assistant_progress', frame('tool_proposed',
     {tool_call_id: 'call_2', tool_name: 'execute'}, 54));
-  assert.equal(actions(body).length, 2);
-  assert.match(actions(body)[0].textContent, /未记录结束状态/);
-  assert.match(actions(body)[1].textContent, /已提交/);
+  assert.equal(actions(body).length, 0);
 });
 
 test('a client without the native projection keeps working unchanged', () => {
@@ -197,10 +194,11 @@ test('one card owns proposal, execution, and receipt in either order', () => {
   const receipt = {job_id: JOB, tool_call_id: 'call_1', tool_name: 'read_tool_result', status: 'complete'};
   const proposed = nativeEvents()[1];
   process.receive('assistant_progress', proposed);
+  assert.equal(actions(body).length, 0);
+  process.receive('tool_progress', {...receipt, status: 'running'});
+  assert.equal(actions(body).length, 0);
+  process.receive('tool_call_start', {...receipt, status: 'running'});
   const original = actions(body)[0];
-  assert.match(original.textContent, /已提交/);
-  process.receive('tool_call_start', Object.assign({}, receipt, {status: 'running'}));
-  assert.equal(actions(body)[0], original);
   assert.match(original.textContent, /处理中/);
   process.receive('operation', Object.assign({}, receipt, {operation_id: 'op-1'}));
   process.receive('tool_result', receipt);
@@ -232,5 +230,5 @@ test('continuation rejects proposals from another job or run', () => {
   process.receive('assistant_progress', proposal);
   assert.equal(actions(body).length, 0);
   process.receive('assistant_progress', Object.assign({}, proposal, {run_id: 'child-job'}));
-  assert.equal(actions(body).length, 1);
+  assert.equal(actions(body).length, 0);
 });

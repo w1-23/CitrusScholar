@@ -44,6 +44,7 @@ export function createApi(moduleUrl = import.meta.url) {
     })),
     library: (format, type = '') => request(`library?${new URLSearchParams({format, type})}`),
     upload: file => request('assets', {method:'POST', headers:{'X-Filename':encodeURIComponent(file.name), 'Content-Type':'application/octet-stream'}, body:file}),
+    importFrozen: (project_ref, render_version = 1) => request('figures/import-frozen', body('POST', {project_ref, render_version})),
     importFigure: (source, parse_mode) => request('figures/import', body('POST', {source, options:{parse_mode}})),
     doc: (id, revision) => request(figure(id) + rev(revision)),
     objects: (id, revision) => request(`${figure(id)}/objects${rev(revision)}`),

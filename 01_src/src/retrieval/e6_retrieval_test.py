@@ -142,3 +142,50 @@ def test_budget_denial_never_creates_a_false_existing_result():
     for call_id in ("blocked", "blocked-again"):
         assert ledger.claim(_SEARCH, args, call_id) is None
         assert ledger.admit(_SEARCH, call_id, args) == "retrieval_call_budget_exhausted"
+
+
+
+def test_preflight_release_keeps_discovery_credit_and_exact_tool_visibility():
+    ledger = RetrievalLedger()
+    names = {_LOCAL, _SEARCH, _FETCH, "browse_web", "read_local_evidence", "inspect_uploaded_table"}
+    args = {"query": "queries only charge on verified dispatch"}
+    assert ledger.claim(_LOCAL, args, "proposal") is None
+    assert ledger.reserve(_LOCAL, "proposal", args) is None
+    assert ledger.timer_state() is None and ledger.summary()["calls"] == {}
+    ledger.release_unexecuted(_LOCAL, "proposal", args)
+    assert ledger.claim(_LOCAL, args, "fixed") is None
+    assert ledger.reserve(_LOCAL, "fixed", args) is None
+    ledger.restore_admission(_LOCAL, "fixed", args)
+    for i in ("followup-1", "followup-2"):
+        assert ledger.reserve(_LOCAL, i, {}) is None
+    assert _LOCAL not in ledger.budget.visible_tools(names)
+    ledger.release_unexecuted(_LOCAL, "followup-1", {})
+    assert ledger.budget.visible_tools(names) == names
+    ledger.restore_admission(_LOCAL, "followup-2", {})
+    assert ledger.reserve(_LOCAL, "followup-3", {}) is None
+    ledger.restore_admission(_LOCAL, "followup-3", {})
+    assert ledger.budget.visible_tools(names) == names - {_LOCAL}
+    assert ledger.summary()["calls"] == {"local": 3}
+    assert ledger.timer_state() is not None
+
+
+def test_global_exhaustion_preserves_existing_evidence_and_browser_cleanup():
+    ledger = RetrievalLedger(budget=TurnRetrievalBudget(RetrievalLimits(calls=1)))
+    assert ledger.reserve(_LOCAL, "first", {}) is None
+    ledger.restore_admission(_LOCAL, "first", {})
+    names = {_LOCAL, _SEARCH, _FETCH, "browse_web", "read_candidate", "read_local_evidence",
+             "read_tool_result", "run_research_figure_script"}
+    assert ledger.budget.visible_tools(names) == names - {_LOCAL, _SEARCH, _FETCH}
+    assert ledger.reserve("browse_web", "navigate", {"action": "open"}) == "retrieval_call_budget_exhausted"
+    assert ledger.reserve("browse_web", "cleanup", {"action": "close"}) is None
+    assert ledger.reserve("read_local_evidence", "same-passage", {}) is None
+    assert ledger.summary()["calls"] == {"local": 1}
+
+
+def test_uncitable_passages_are_not_a_verified_empty_search():
+    ledger = RetrievalLedger()
+    for i in ("excerpt-only-1", "excerpt-only-2"):
+        assert ledger.admit(_LOCAL, i, {}) is None
+        ledger.observe(_LOCAL, i, {"corpus_contract": 1, "main_results": [], "selected_result_count": 1},
+                       status="complete", reason="")
+    assert ledger.admit(_LOCAL, "additional", {}) is None

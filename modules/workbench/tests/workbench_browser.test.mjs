@@ -228,3 +228,59 @@ test('three-column workbench explicitly renders and opens pinned cards, then edi
     assert.deepEqual(errors,[]);
   } finally { await browser.close(); }
 });
+
+
+test('opens an offered Host revision only after explicit confirmation', {skip:!entry,timeout:25_000}, async () => {
+  const {chromium} = await import(entry);
+  const browser = await chromium.launch({executablePath:process.env.WORKBENCH_CHROME || undefined});
+  try {
+    const page = await browser.newPage();
+    page.setDefaultTimeout(5000);
+    const imports = [], errors = [], ref = 'b'.repeat(32);
+    let offered = false;
+    page.on('pageerror', error => errors.push(error.message));
+    await page.route('**/*', async route => {
+      const request = route.request(), path = new URL(request.url()).pathname;
+      const file = /^\/prefix\/workbench\/(static\/[a-z.-]+)?$/.exec(path);
+      if (file) {
+        const name = file[1] || 'index.html';
+        return route.fulfill({contentType:contentTypes[name.split('.').pop()],body:await readFile(new URL(name,web)),headers:{'Content-Security-Policy':csp}});
+      }
+      const suffix = path.replace(/^\/prefix\/api\/v1\//,'');
+      if (suffix === 'session') return route.fulfill({json:{worker_only:true, return_to:'/', ...(offered ? {frozen_project:ref,frozen_render_version:2} : {})}});
+      if (suffix === 'figures') return route.fulfill({json:{figures:[]}});
+      if (suffix === 'figures/import-frozen') {
+        imports.push([request.method(),request.postDataJSON()]);
+        return route.fulfill({status:201,json:{figure_id:'figure_saved'}});
+      }
+      if (suffix === 'figures/figure_saved') return route.fulfill({json:{figure_id:'figure_saved',revision:1,name:'Edited fixture',editability:'preview_only',panels:[],objects:[],limitations:[],source:{language:'python'}}});
+      if (suffix === 'figures/figure_saved/history') return route.fulfill({json:{versions:[]}});
+      if (suffix === 'figures/figure_saved/objects') return route.fulfill({json:{objects:[]}});
+      if (suffix === 'preview-cards') return route.fulfill({json:{cards:[]}});
+      if (suffix === 'figures/figure_saved/preview') return route.fulfill({contentType:'image/svg+xml',body:svg});
+      return route.fulfill({status:404,body:''});
+    });
+    await page.goto(root+'/prefix/workbench/');
+    const button = page.locator('#frozen-import');
+    await page.locator('#worker-source-note').waitFor({state:'visible'});
+    assert.equal(await button.isVisible(),false);
+    for (const id of ['import-open','empty-prepare','static-open','file','dependencies']) {
+      assert.equal(await page.locator('#'+id).isVisible(),false);
+    }
+    assert.equal(await page.locator('#return').isVisible(),true);
+    offered = true;
+    await page.reload();
+    await button.waitFor({state:'visible'});
+    for (const id of ['import-open','empty-prepare','static-open','file','dependencies']) {
+      assert.equal(await page.locator('#'+id).isVisible(),false);
+    }
+    assert.deepEqual(imports,[]);
+    await button.click();
+    await button.waitFor({state:'hidden'});
+    assert.deepEqual(imports,[['POST',{project_ref:ref,render_version:2}]]);
+    await page.reload();
+    await button.waitFor({state:'visible'});
+    assert.equal(imports.length,1);
+    assert.deepEqual(errors,[]);
+  } finally { await browser.close(); }
+});

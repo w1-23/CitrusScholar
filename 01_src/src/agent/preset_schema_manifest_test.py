@@ -96,7 +96,7 @@ def test_presentation_catalog_matches_the_pre_migration_snapshot():
     """The capability/label catalog is derived now; the values must not move."""
     derived = tool_catalog.TOOL_METADATA
     new_methods = {'prepare_audit_dataset', 'audit_prepared_dataset', 'run_numeric_integrity',
-                   'collect_numeric_integrity', 'verify_literature_references'}
+                   'collect_numeric_integrity', 'verify_literature_references', 'read_local_evidence'}
     assert set(derived) == set(_MIGRATED) | new_methods
     for name, row in _MIGRATED.items():
         (label, link, capabilities, requires, produces, write_scope,
@@ -298,14 +298,6 @@ _MIGRATED = {
         "本地检索", "", ("literature_retrieval", "local_corpus", "local_retrieval", "route_local"),
         ("local_corpus",), (), None, "local_hybrid_search",
         "rag", "", "never", "src.tools.deepseek_search_fetch"),
-    "read_candidate": (
-        "读取候选原文", "", ("local_corpus",),
-        ("local_corpus", "candidate_pool"), (), None, "candidate_pool",
-        "rag", "", "never", "src.tools.candidate_tools"),
-    "search_candidates": (
-        "补充候选检索", "", ("local_corpus",),
-        ("local_corpus", "candidate_pool"), (), None, "candidate_pool",
-        "rag", "", "never", "src.tools.candidate_tools"),
     "draw_svg": (
         "绘图", "下载 SVG", ("artifact", "visualization"),
         (), ("figure",), "session_artifact", "draw_svg",
@@ -382,8 +374,5 @@ _MIGRATED = {
         "更新共享索引", "", ("shared_corpus",),
         ("shared_corpus",), (), "account_record", "shared_corpus_build",
         "research", "", "never", "src.shared_corpus.tool_adapter"),
-    "search_agent_corpus": (
-        "检索共享文献库", "", ("shared_corpus",),
-        ("shared_corpus",), (), None, "shared_corpus_search",
-        "rag", "", "never", "src.shared_corpus.tool_adapter"),
+
 }

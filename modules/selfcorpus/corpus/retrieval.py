@@ -12,9 +12,11 @@ from .sources import normalize_doi
 from .vector_index import ExactVectorIndex, encode_vector
 
 _BASE = ''' FROM generation_members m JOIN versions v ON v.ref=m.version_ref
-JOIN chunks c ON c.parsed_ref=m.parsed_ref AND c.chunker=? '''
+JOIN chunks c ON c.parsed_ref=m.parsed_ref AND c.chunker=?
+LEFT JOIN chunk_translations t ON t.chunk_id=c.id '''
 _COLUMNS = '''m.document_ref,m.version_ref AS document_version_ref,c.ref AS chunk_ref,v.title,v.doi,
-v.source_uri,v.source_hash,c.text AS content,c.heading_path,c.page_start,c.page_end,c.ordinal'''
+v.source_uri,v.source_hash,c.text AS content,c.heading_path,c.page_start,c.page_end,c.ordinal,
+ t.text_en AS translation_en'''
 _DOCUMENT_REF = re.compile(r'doc_[0-9a-f]{40}')
 
 
@@ -44,7 +46,8 @@ def _lexical(db, clause, params, match, query, cap, admit, *, extra_columns=''):
         words = row['indexed_terms'].split()
         matched = needle.intersection(words)
         return (len(matched), len(matched) / max(1, len(words)), row['chunk_ref'])
-    return nlargest(cap, (row for row in rows if admit(row['content'])), key=key)
+    return nlargest(cap, (row for row in rows if admit(row['content']) or
+                          row['translation_en'] and admit(row['translation_en'])), key=key)
 
 
 def _filter(filters):
@@ -127,7 +130,7 @@ class Retrieval:
                     vectors = self.vector_index.rank(
                         rows, qvector, g['dimension'], cap,
                         admit=lambda row, cosine: (
-                            row['chunk_ref'] in supported or relevance.semantic(row['content'], cosine)
+                            row['chunk_ref'] in supported or relevance.semantic(row['translation_en'] or row['content'], cosine)
                         ),
                     )
                 except (CorpusError, ValueError, RuntimeError, IndexError):

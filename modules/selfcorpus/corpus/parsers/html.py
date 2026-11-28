@@ -6,7 +6,7 @@ from html.parser import HTMLParser
 from .model import Block, Parsed, build, heading_path
 
 _VOID = set("area base br col embed hr img input link meta param source track wbr".split())
-_SKIP = set("script style noscript template svg nav footer aside form button select dialog iframe object".split())
+_SKIP = set("script style noscript template svg nav footer aside form button select dialog iframe object picture canvas".split())
 _HEADING = {f"h{i}" for i in range(1, 7)}
 _CONTAINER = set("document html body main article div section header figure fieldset dl ol ul".split())
 _LEAF = set("p li dt dd blockquote pre figcaption table address".split())
@@ -73,7 +73,7 @@ def _text(node):
     if node.tag in {"br", "hr"}:
         return "\n"
     if node.tag == "img":
-        return node.attrs.get("alt") or ""
+        return ""
     result = "".join(_text(child) for child in node.children)
     return f"\n{result}\n" if node.tag in _BLOCK else result
 
@@ -112,6 +112,8 @@ def parse_html(text: str, warnings: list[str] | None = None) -> Parsed:
     for node in _walk(tree.root):
         if node.tag in {"body", "main", "article"}:
             containers.setdefault(node.tag, node)
+        elif node.tag == "html" and (language := node.attrs.get("lang") or node.attrs.get("xml:lang")):
+            metadata.setdefault("language", language[:64])
         elif node.tag == "title" and (value := _clean(_text(node))):
             metadata.setdefault("title", value)
         elif node.tag == "meta":
@@ -127,6 +129,8 @@ def parse_html(text: str, warnings: list[str] | None = None) -> Parsed:
                 metadata.setdefault("authors", []).append(value)
             elif name in {"citation_date", "citation_publication_date", "dc.date"}:
                 metadata.setdefault("date", value)
+            elif name in {"citation_language", "dc.language", "content-language"}:
+                metadata.setdefault("language", value[:64])
             elif name == "isaccessibleforfree" and value.lower() in {"false", "0"}:
                 notes.append("html_declares_restricted_access")
     blocks: list[Block] = []

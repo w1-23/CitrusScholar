@@ -6,6 +6,15 @@ from .model import Block, Parsed, build, heading_path
 
 _ATX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)|[ \t]*)$")
 _SETEXT = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+# Inline and reference-form image markup is not indexed as prose.
+_IMAGE = re.compile(r'!\[(?:[^\]\\]|\\.)*\](?:\((?:[^()\r\n]|\([^()\r\n]*\))*\)|\[[^\]\r\n]*\])')
+_IMAGE_DATA_REF = re.compile(r'^ {0,3}\[[^\]\r\n]+\]:[ \t]*<?data:image/[^\r\n]*$', re.I | re.M)
+
+
+def _without_images(text: str) -> str:
+    return _IMAGE_DATA_REF.sub('', _IMAGE.sub('', text))
+
+
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
@@ -35,6 +44,7 @@ def parse_markdown(text: str, warnings: list[str] | None = None, *, version: str
             fence = marker[1]
             pending.append(line)
             continue
+        line = _without_images(line)
         atx = _ATX.fullmatch(line)
         setext = _SETEXT.fullmatch(line)
         if atx and atx[2]:
@@ -57,7 +67,7 @@ def parse_markdown(text: str, warnings: list[str] | None = None, *, version: str
             if level == 1 and not title:
                 title = label
     flush("code" if fence else "paragraph")
-    return build(version, blocks, {"title": title} if title else {}, warnings=warnings, markdown=text)
+    return build(version, blocks, {"title": title} if title else {}, warnings=warnings, markdown=_without_images(text))
 
 
 def parse_text(text: str, warnings: list[str] | None = None) -> Parsed:

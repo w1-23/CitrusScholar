@@ -1279,7 +1279,6 @@ function rememberComposerSession() {
 }
 
 function restoreComposerSession(preserve) {
-  composerContinuation = null;
   var key = composerDraftKey();
   var saved = composerSelections.get(key);
   _composerNotice = '';
@@ -2662,7 +2661,7 @@ var historyRequest = null, historyPageRequest = null;
 var turnQueueBindings = [];
 var turnAdmissionChains = new Map();
 var TURN_POST_DEADLINE_MS = 15000;
-var turnQueueReads = [], turnQueueObserver = null, composerContinuation = null;
+var turnQueueReads = [], turnQueueObserver = null;
 
 function sessionQueueObserver(sid) {
   var observer = turnQueueObserver;
@@ -2850,24 +2849,16 @@ function appendPublicationReconciliation(node, sid, cid) {
 
 function queueStateLabel(entry) {
   if (!entry) return '';
-  var names = {queued: '待发送', claimed: '准备执行', running: '执行中',
+  var names = {queued: '已排队', claimed: '准备执行', running: '执行中',
     awaiting_input: '等待你的选择', settling: '正在保存结果', terminal: '已结束',
     reconcile_required: '状态待核对'};
   return names[entry.state] || '等待确认';
 }
 
-function markQueuedBubble(userContent, assistantContent, entry) {
-  var queued = !!(entry && ['queued', 'claimed'].indexOf(entry.state) >= 0);
+function markQueuedBubble(assistantContent, entry) {
+  var queued = !entry || ['queued', 'claimed'].includes(entry.state);
   var row = assistantContent && assistantContent.closest('.message');
   if (row) row.classList.toggle('turn-awaiting-dispatch', queued);
-  if (!userContent) return;
-  var badge = userContent.querySelector('.turn-user-queue-state');
-  if (!queued) { if (badge) badge.remove(); return; }
-  if (!badge) {
-    badge = document.createElement('span'); badge.className = 'turn-user-queue-state';
-    badge.setAttribute('role', 'status'); userContent.appendChild(badge);
-  }
-  badge.textContent = '待发送';
 }
 
 // Only one turn can drive the composer: the executing job first, otherwise the
@@ -2925,23 +2916,6 @@ function refreshTaskComposer() {
     var icon = button.querySelector('use');
     if (icon) icon.setAttribute('href', executing ? '/assets/citrus-icons.svg#ui-stop' : '/assets/citrus-icons.svg#ui-send');
   }
-  var continuation = document.getElementById('composer-continuation');
-  if (continuation) {
-    var selection = composerContinuation && composerContinuation.session === sessionId ? composerContinuation : null;
-    continuation.hidden = !selection;
-    var references = continuation.querySelector('.continuation-attachment-references');
-    if (references && references._selection !== selection) {
-      references._selection = selection;
-      references.replaceChildren();
-      (selection && selection.attachments || []).forEach(function (file) {
-        var chip = document.createElement('span');
-        chip.className = 'continuation-attachment-reference';
-        chip.textContent = file.filename;
-        chip.title = file.filename;
-        references.appendChild(chip);
-      });
-    }
-  }
   var hint = document.getElementById('composer-task-status');
   if (hint) {
     hint.textContent = queueSyncUnavailable ? '消息状态待同步，可刷新重试。'
@@ -2952,13 +2926,6 @@ function refreshTaskComposer() {
     hint.title = hint.textContent;
   }
 }
-
-function setComposerContinuation(requestId, attachments) {
-  composerContinuation = requestId ? {session: sessionId, requestId: requestId, attachments: attachments || []} : null;
-  refreshTaskComposer();
-}
-var clearContinuation = document.getElementById('clear-composer-continuation');
-if (clearContinuation) clearContinuation.addEventListener('click', function () { setComposerContinuation(null); });
 
 function activateComposer() {
   var binding = activeTurnComposer;
@@ -3498,6 +3465,15 @@ function publicTaskStage(value) {
 
 /* Native lifecycle facts are public. Model drafts never reach this panel. */
 
+function publicNarratedToolLabel(name) {
+  var labels = {local_hybrid_search: '检索本地资料', read_local_evidence: '核对原文',
+    deepseek_search: '查找公开来源', deepseek_fetch: '阅读公开来源', deepseek_fetch_paper: '阅读论文',
+    inspect_uploaded_table: '读取表格', audit_uploaded_data: '检查数据质量',
+    audit_prepared_dataset: '检查数据质量', run_research_figure_script: '渲染图件',
+    draw_svg: '生成图件', read_account_file: '阅读资料', deliver_research_artifact: '准备文件'};
+  return Object.prototype.hasOwnProperty.call(labels, name) ? labels[name] : '处理任务';
+}
+
 function createResearchProcessPanel(goal) {
   var epoch = authEpoch, sid = sessionId, knownJobId = '';
   var settled = false, activeMilestone = '', progressSeq = 0;
@@ -3575,7 +3551,7 @@ function createResearchProcessPanel(goal) {
   }
   function ownsDetails() { return epoch === authEpoch && sid === sessionId && chatContainer.contains(panel); }
   var view = CitrusTaskCards.createProcessView({container: body, clean: publicTaskStage,
-    toolName: displayToolName, statusText: toolStatusText, owns: ownsDetails,
+    toolName: displayToolName, publicToolLabel: publicNarratedToolLabel, statusText: toolStatusText, owns: ownsDetails,
     loadToolResult: async function (callId) {
       if (!ownsDetails()) return null;
       var response = await accountFetch('/api/v2/session/' + encodeURIComponent(sid) + '/tool-result/' + encodeURIComponent(callId), {credentials: 'same-origin'});
@@ -3600,6 +3576,8 @@ function createResearchProcessPanel(goal) {
   function renderNativeStreamPanel() {
     if (!nativeStream || typeof CitrusTaskCards.renderNativeStream !== 'function') return;
     if (!ownsDetails()) return;
+    nativeHost.hidden = view.narrated();
+    if (nativeHost.hidden) { nativeHost.replaceChildren(); return; }
     CitrusTaskCards.renderNativeStream(nativeHost, CitrusTaskCards.nativeStreamModel(
       nativeStream.view(), {toolName: displayToolName, clean: publicTaskStage,
         preview: false}));
@@ -3658,6 +3636,9 @@ function createResearchProcessPanel(goal) {
       readFailures.clear(); readState('', false);
       resetNativeStreamPanel();
       view.terminal(false); label.textContent = '正在恢复任务'; panel.classList.remove('has-failure');
+    }
+    else if (type === 'execution_narration') {
+      view.narration(data); renderNativeStreamPanel(); refreshActiveLabel();
     }
     else if (type === 'tool_resolution') view.resolution(data);
     else if (type === 'answer_start') {
@@ -3757,7 +3738,6 @@ function appendMessageActions(content, role, text) {
     edit.textContent = '✎ 编辑';
     edit.addEventListener('click', function() {
       userInput.value = String(text || '');
-      setComposerContinuation(null);
       userInput.focus();
       refreshTaskComposer();
       userInput.setSelectionRange(userInput.value.length, userInput.value.length);
@@ -3767,45 +3747,6 @@ function appendMessageActions(content, role, text) {
   }
   actionHost.appendChild(actions);
   if (assistant) appendFeedback(actions);
-}
-
-function confirmTurnAttachmentInheritance(content) {
-  var host = content.closest('.message') || content;
-  var actions = host.querySelector('.assistant-actions');
-  var sid = content.dataset.sessionId, rid = content.dataset.requestId;
-  if (!content._hasAttachmentInputs || !actions || !rid || sid !== sessionId || content._inheritanceRead) return;
-  var view = captureSessionView(), read = {};
-  content._inheritanceRead = read;
-  function owns() { return view.owns() && chatContainer.contains(content) && content._inheritanceRead === read && host.contains(actions); }
-  async function load(attempt) {
-    if (!owns()) return;
-    try {
-      var response = await accountFetch('/api/v2/session/' + encodeURIComponent(sid) + '/continuation/' + encodeURIComponent(rid));
-      if (!owns()) return;
-      var data = await response.json();
-      if (!owns()) return;
-      // A terminal event can arrive just before the durable queue receipt settles.
-      if (response.status === 409 && data && data.detail && data.detail.code === 'turn_baseline_not_ready' && attempt < 2) {
-        setTimeout(function () { void load(attempt + 1); }, 600 * (attempt + 1));
-        return;
-      }
-      if (!response.ok) return;
-      var attachments = data && Array.isArray(data.attachments) ? data.attachments.filter(function (file) {
-        return file && typeof file.file_id === 'string' && !!file.file_id && typeof file.filename === 'string';
-      }) : [];
-      if (!owns() || !attachments.length) return;
-      var next = document.createElement('button');
-      next.type = 'button'; next.className = 'message-action turn-explicit-continuation';
-      next.textContent = '沿用本轮附件';
-      next.title = '明确继承此轮保存的附件';
-      next.addEventListener('click', function () {
-        if (!owns()) return;
-        setComposerContinuation(rid, attachments); userInput.focus();
-      });
-      actions.insertBefore(next, actions.querySelector('.msg-feedback'));
-    } catch (_) { /* Only a positive server confirmation exposes this action. */ }
-  }
-  void load(0);
 }
 
 function renderPublicTerminalNotice(content, data, hasAnswer) {
@@ -3843,7 +3784,6 @@ function resetTurnOutcome(content) {
     var node = host.querySelector(selector);
     if (node) node.remove();
   });
-  content._inheritanceRead = null;
   content._turnFileRead = null;
   content._turnFileProducerIds = null;
   content._verifiedDeliveryAssets = null;
@@ -3966,16 +3906,56 @@ function suppressDuplicateTurnArtifactLinks(content) {
   if (!answer) return;
   var host = content.closest('.message') || content;
   var urls = new Set();
+  function key(value) {
+    if (!value) return '';
+    if (/^\/(?!\/)/.test(value) && !/[?#\\]/.test(value)) return value;
+    try {
+      var parsed = new URL(value);
+      return parsed.origin === location.origin && !parsed.search && !parsed.hash ? parsed.pathname : '';
+    } catch (_) { return ''; }
+  }
   host.querySelectorAll('.turn-file-card').forEach(function (card) {
-    if (card.dataset.assetUrl) urls.add(card.dataset.assetUrl);
+    var path = key(card.dataset.assetUrl);
+    if (!path || !card.querySelector('a')) return;
+    urls.add(path);
+    var fid = card.dataset.fileId;
+    if (/^[A-Za-z0-9_-]+$/.test(fid || '')) urls.add('/api/v2/files/' + fid + '/download');
   });
   if (!urls.size) return;
   answer.querySelectorAll('a').forEach(function (link) {
-    if (!urls.has(link.getAttribute('href'))) return;
+    if (!urls.has(key(link.getAttribute('href')))) return;
     var label = document.createElement('span'); label.textContent = link.textContent;
     link.parentNode.insertBefore(label, link);
     link.remove();
   });
+}
+
+function attachTurnFileDownload(card, url) {
+  if (!url || card.querySelector('a')) return;
+  var download = document.createElement('a');
+  download.className = 'turn-file-open';
+  download.href = url;
+  download.download = '';
+  download.textContent = '下载原件';
+  card.appendChild(download);
+}
+
+function attachTurnWorkbench(card, asset, session, seen) {
+  var ref = asset && asset.workbench_project_ref;
+  var version = asset && asset.workbench_render_version !== undefined ? asset.workbench_render_version : 1;
+  var key = ref + ':' + version;
+  if (!asset || !safeProductUrl(asset.url, true) || !/^[a-f0-9]{32}$/.test(ref || '') ||
+      !/^[A-Za-z0-9_-]{8,128}$/.test(session || '') || !Number.isInteger(version) ||
+      version < 1 || version > 999999999 || seen.has(key)) return;
+  var link = document.createElement('a');
+  link.className = 'turn-file-workbench';
+  link.dataset.project = ref;
+  link.dataset.renderVersion = String(version);
+  link.href = '/figures?session_ref=' + encodeURIComponent(session) + '&frozen_project=' + ref +
+    (version === 1 ? '' : '&frozen_render_version=' + version);
+  link.textContent = '在工作台打开';
+  card.appendChild(link);
+  seen.add(key);
 }
 
 function appendTurnGeneratedFiles(content, files) {
@@ -4009,6 +3989,7 @@ function appendTurnGeneratedFiles(content, files) {
   }
   var added = 0;
   var seen = new Map();
+  var workbenchProjects = new Set(Array.from(section.querySelectorAll('.turn-file-workbench'), function (link) { return link.dataset.project + ':' + (link.dataset.renderVersion || '1'); }));
   host.querySelectorAll('.turn-file-card').forEach(function(existing) {
     seen.set(String(existing.dataset.fileId || ''), existing);
   });
@@ -4018,7 +3999,11 @@ function appendTurnGeneratedFiles(content, files) {
     var assetUrl = asset && safeProductUrl(asset.url, true);
     var existing = seen.get(fid);
     if (existing) { // A later manifest can verify a card already rendered from history.
-      if (assetUrl) existing.dataset.assetUrl = assetUrl;
+      if (assetUrl) {
+        existing.dataset.assetUrl = assetUrl;
+        attachTurnFileDownload(existing, assetUrl);
+        attachTurnWorkbench(existing, asset, ownerSession, workbenchProjects);
+      }
       return;
     }
     var card = document.createElement('div'); card.className = 'turn-file-card';
@@ -4052,14 +4037,8 @@ function appendTurnGeneratedFiles(content, files) {
       card.appendChild(image);
     }
     card.appendChild(type); card.appendChild(info); card.appendChild(preview);
-    if (svgUrl || assetUrl) {
-      var download = document.createElement('a');
-      download.className = 'turn-file-open';
-      download.href = svgUrl || assetUrl;
-      download.download = '';
-      download.textContent = '下载原件';
-      card.appendChild(download);
-    }
+    attachTurnFileDownload(card, svgUrl || assetUrl);
+    attachTurnWorkbench(card, asset, ownerSession, workbenchProjects);
     list.appendChild(card);
     added++;
   });
@@ -4337,13 +4316,7 @@ async function sendMsg(paperVerification) {
     }
     return;
   }
-  var inherited = null;
-  if (!paperVerification) {
-    _composerNotice = '';
-    if (composerContinuation && composerContinuation.session === requestSessionId) inherited = composerContinuation;
-    setComposerContinuation(null);
-  }
-  var continueFrom = inherited && inherited.requestId;
+  if (!paperVerification) _composerNotice = '';
   mascotSay('planning');
   var visualizeForRequest = !paperVerification && visualizationEnabled;
   var draftKey = composerDraftKey();
@@ -4373,11 +4346,7 @@ async function sendMsg(paperVerification) {
   appendSentAttachmentPreviews(userMessageContent, filesForRequest);
   // Only URLs created for this optimistic row are revoked if admission fails.
   var _optimisticSentPreviewUrls = _sentAttachmentPreviewUrls.slice(_sentPreviewStart);
-  var shownRefs = inherited ? inherited.attachments.slice() : [];
-  fileRefsForRequest.forEach(function (file) {
-    if (!shownRefs.some(function (ref) { return ref.file_id === file.file_id; })) shownRefs.push(file);
-  });
-  appendSentLibraryReferences(userMessageContent, shownRefs);
+  appendSentLibraryReferences(userMessageContent, fileRefsForRequest);
   appendMessageActions(userMessageContent, 'user', query);
   // P0: 提交瞬间先给导航一个临时刻度，服务端确认后换成正式 message_id
   if (window.turnRail && window.turnRail.addPending) window.turnRail.addPending(clientRequestId, query);
@@ -4391,6 +4360,7 @@ async function sendMsg(paperVerification) {
   setComposerAdmission(draftKey, clientRequestId, admission, false);
 
   var botContent = addMessage('bot', '', null, true);
+  markQueuedBubble(botContent, null);
   // P0-A: 实时气泡带与历史恢复相同的轮次锚点（同一套归属规则，文件/跳转可定位）
   if (botContent) { botContent.dataset.requestId = clientRequestId; botContent.dataset.sessionId = requestSessionId; }
   var botMessage = botContent && botContent.closest ? botContent.closest('.message') : botContent.parentNode;
@@ -4518,7 +4488,6 @@ async function sendMsg(paperVerification) {
   var answerDiv = document.createElement('div'); answerDiv.className = 'turn-answer';
   answerDiv.style.display = 'none';
 
-  botContent._hasAttachmentInputs = !!(filesForRequest.length || fileRefsForRequest.length || continueFrom);
   var citationsDiv = document.createElement('div');
   citationsDiv.hidden = true;
 
@@ -4584,7 +4553,6 @@ async function sendMsg(paperVerification) {
     if (!ownsTurn()) return;
     _turnDisconnected = false;
     processPanel.receive('snapshot', job);
-    renderTurnTimings(botContent, job);
     renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     syncWaiting();
     if (taskStore.state.question && taskStore.state.question.status === 'pending' && !CitrusTaskState.displayStatus(job)) {
@@ -4617,7 +4585,6 @@ async function sendMsg(paperVerification) {
       suppressDuplicateTurnArtifactLinks(botContent);
       processPanel.answerVisible();
       appendMessageActions(botContent, 'assistant', fullText.replace(/__NEED_COMPLEX__/g, ''));
-      confirmTurnAttachmentInheritance(botContent);
     }
     renderPublicTerminalNotice(botContent, data, hasAnswer);
   }
@@ -4701,7 +4668,6 @@ async function sendMsg(paperVerification) {
 
   function handleSendFollowUp(q) {
     userInput.value = q;
-    setComposerContinuation(null);
     sendMsg();
   }
 
@@ -4732,7 +4698,6 @@ async function sendMsg(paperVerification) {
       resetTurnOutcome(botContent);
       answerDiv.replaceChildren(); answerDiv.style.display = 'none';
       renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
-      var timing = botContent.querySelector('.turn-timings'); if (timing) timing.remove();
       isFinalAnswerArmed = false; isAnswerStarted = false;
     }
     if (type === 'answer_start' || type === 'text' || type === 'text_reset') {
@@ -4760,7 +4725,6 @@ async function sendMsg(paperVerification) {
       }
       return;
     }
-    if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) renderTurnTimings(botContent, data);
     // Retired rounds may finish replaying into their own DOM. They cannot
     // release the composer, alter context usage, permissions or the sidebar.
     if (!ownsControls()) {
@@ -5001,7 +4965,7 @@ async function sendMsg(paperVerification) {
     var node = queueStatusNode();
     if (!node) return;
     var entry = queueEntry;
-    markQueuedBubble(userMessageContent, botContent, entry);
+    markQueuedBubble(botContent, entry);
     if (entry.state !== 'reconcile_required') {
       node.replaceChildren();
       if (entry.state !== 'terminal' || !entry.clear_reason) { node.hidden = true; return; }
@@ -5120,7 +5084,6 @@ async function sendMsg(paperVerification) {
     writeComposerDraft(draftKey, rawDraft);
     if (current) {
       userInput.value = rawDraft;
-      if (inherited) setComposerContinuation(inherited.requestId, inherited.attachments);
       refreshTaskComposer();
     }
     return true;
@@ -5159,7 +5122,6 @@ async function sendMsg(paperVerification) {
     var detail = body && body.detail && typeof body.detail === 'object' ? body.detail : {};
     var code = detail.code || (body && body.code);
     if (!admissionRejectionConfirmed(status, code)) { recordUnknownAdmission(); return; }
-    if (code === 'turn_baseline_unavailable' || code === 'turn_baseline_not_found') inherited = null;
     requestSubmitted = false;
     recordKnownNonAdmission();
     if (!ownsTurn()) return;
@@ -5263,7 +5225,6 @@ async function sendMsg(paperVerification) {
           selected_skills: skillsForRequest, attachments: attachments,
           file_refs: fileRefsForRequest.map(function (file) { return file.file_id; })
         };
-        if (!paperVerification && typeof continueFrom === 'string' && continueFrom) payload.continue_from = continueFrom;
         requestSubmitted = true;
         admission.state = 'posting'; setComposerAdmission(draftKey, clientRequestId, admission, false);
         var outcome = await submitTurnBeforeDeadline(turnQueueURL(requestSessionId), payload, streamAbortController);
@@ -5929,10 +5890,17 @@ function orderHistoryTrace(trace) {
 function artifactDeliveryText(delivery) {
   if (!delivery || !delivery.status || ['none', 'not_checked'].includes(delivery.status)) return '';
   var statuses = {available: '文件已交付', delivered: '文件已交付', verified: '文件已核实', partial: '部分文件已交付',
-    unavailable: '文件暂不可用', failed: '文件交付未完成'};
+    unavailable: '文件暂不可用', failed: '文件交付未完成', unknown: '正在确认交付'};
   var ids = Array.isArray(delivery.verified_file_ids) ? delivery.verified_file_ids : [];
   var unavailable = Number(delivery.unavailable_count);
-  var parts = [statuses[delivery.status] || ('文件交付状态：' + delivery.status)];
+  var parts = [statuses[delivery.status] || '文件交付未完成'];
+  var missing = (Array.isArray(delivery.missing_formats) ? delivery.missing_formats : []).filter(function (fmt) {
+    return ['svg', 'png', 'pdf', 'tiff'].includes(fmt);
+  });
+  if (delivery.status !== 'unknown' && missing.length) {
+    if (!ids.length) parts[0] = '本轮未交付所需格式';
+    parts.push('缺少 ' + missing.map(function (fmt) { return fmt.toUpperCase(); }).join('、'));
+  }
   if (ids.length) parts.push('已核实 ' + ids.length + ' 个文件');
   if (Number.isFinite(unavailable) && unavailable > 0) parts.push(Math.floor(unavailable) + ' 个文件暂不可用');
   return parts.join(' · ');
@@ -6226,7 +6194,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (!owns()) return;
     disconnected = false;
     process.receive('snapshot', job);
-    renderTurnTimings(content, job);
     renderArtifactDelivery(content, store.state.artifact_delivery);
     answer.dataset.displayStatus = store.state.display_status;
     if (!process.terminal(store.state.display_status)) {
@@ -6271,7 +6238,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       finalAnswerReceived = false; armed = false; streamedAnswer = ''; resetTurnOutcome(content);
       hasSavedAnswer = false; answer.replaceChildren();
       if (citationContainer) renderCitationBubbles(citationContainer, [], turn.turnRequestId, sid);
-      var timing = content.querySelector('.turn-timings'); if (timing) timing.remove();
     }
     if (type.indexOf('context_') === 0 || data.context_snapshot) projectContext();
     if (type === 'citations' && data.display === 'bubble_only') {
@@ -6293,7 +6259,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       }
     }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
-      renderTurnTimings(content, data);
       projectTerminal(data);
       process.terminal(CitrusTaskState.displayStatus(data));
       answer.dataset.displayStatus = CitrusTaskState.displayStatus(data);
@@ -6311,7 +6276,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       suppressDuplicateTurnArtifactLinks(content);
       process.answerVisible();
       appendMessageActions(content, 'assistant', text);
-      confirmTurnAttachmentInheritance(content);
     }
     renderPublicTerminalNotice(content, data, !!String(text || '').trim());
     finalAnswerReceived = true;
@@ -6355,7 +6319,7 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (entryNow.state === 'terminal' && unwatchQueue) { unwatchQueue(); unwatchQueue = null; }
     entry = entryNow;
     if (binding) binding.queueEntry = entry;
-    markQueuedBubble(userContent, content, entry);
+    markQueuedBubble(content, entry);
     var reconciled = entry.state === 'terminal' && entry.clear_reason === 'turn_reconciled_by_user';
     queueStatus.hidden = entry.state !== 'reconcile_required' && !reconciled;
     queueStatus.replaceChildren();
@@ -6434,13 +6398,11 @@ function bindSettledHistoryDetails(turn, content, answer, process) {
       if (!applying) { process.resetDetails(jobId); applying = true; }
       process.receive(type, data);
       if (type !== 'done' && type !== 'error') return;
-      renderTurnTimings(content, data);
       if (recoveryAnswer && typeof data.answer === 'string' && data.answer.trim() && isPublicAnswerEvent(data)) {
         recoveredAnswer = true;
         answer.innerHTML = renderMarkdownSafe(data.answer);
         suppressDuplicateTurnArtifactLinks(content);
         appendMessageActions(content, 'assistant', data.answer);
-        confirmTurnAttachmentInheritance(content);
         renderPublicTerminalNotice(content, data, true);
       } else if (recoveryAnswer && !recoveredAnswer && CitrusTaskState.displayStatus(data)) {
         renderPublicTerminalNotice(content, data, false);
@@ -6502,7 +6464,6 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     if (turn.turnRequestId) contentEl.dataset.requestId = String(turn.turnRequestId);
     (turn.fileProducerRequestIds || []).forEach(function (rid) { recordTurnFileProducer(contentEl, rid); });
     contentEl.dataset.sessionId = sessionId;
-    contentEl._hasAttachmentInputs = !!(turn.user && turn.user.attachments && turn.user.attachments.length);
     var answerBody = document.createElement('div'); answerBody.className = 'turn-answer';
     answerBody.dataset.displayStatus = turn.displayStatus;
     answerBody.innerHTML = renderMarkdownSafe(answer.content); contentEl.appendChild(answerBody);
@@ -6514,7 +6475,6 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
       renderCitationBubbles(citationRow, answer.citation_bubbles, turn.turnRequestId, sessionId, turn.answerProducerJobId);
     }
     if (turn.artifactDelivery) renderArtifactDelivery(contentEl, turn.artifactDelivery);
-    renderTurnTimings(contentEl, turn.terminalSnapshot);
     var process = createResearchProcessPanel(turn.intentSummary || (turn.user && turn.user.content));
     contentEl.insertBefore(process.element, contentEl.firstChild);
     process.receive('snapshot', {terminal_snapshot: turn.terminalSnapshot});
@@ -6543,7 +6503,6 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
     }
     if (!turn.jobId || process.terminal(turn.displayStatus)) {
       appendMessageActions(contentEl, 'assistant', answer.content || '');
-      confirmTurnAttachmentInheritance(contentEl);
     }
     // P0-A: 该轮生成文件只在这一处、按 file_id 幂等追加一次。
     if (turn.files.length) appendTurnGeneratedFiles(contentEl, turn.files);
@@ -6556,25 +6515,6 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
 
 /* v8.10: 无会话时自动创建默认会话（主流行为）——打开即有一个会话，历史回答有处可存，
    不再依赖用户手动点 ＋ 新建 */
-function renderTurnTimings(container, source) {
-  var envelope = source && (source.turn_envelope || source.terminal_snapshot);
-  var timing = source && (source.turn_timings || envelope && envelope.turn_timings);
-  if (!timing) return;
-  var labels = {visible_answer_first_ms: '提交到首段可见答复', provider_first_packet_ms: '模型调用到服务商首包',
-    queue_wait_ms: '队列等待', tool_elapsed_ms: '工具累计用时', context_maintenance_ms: '上下文维护用时'};
-  var rows = Object.keys(labels).filter(function (key) { return Number.isFinite(timing[key]) && timing[key] >= 0; })
-    .map(function (key) { return labels[key] + ' ' + (timing[key] / 1000).toFixed(1) + ' 秒'; });
-  if (!rows.length) return;
-  var badge = container.querySelector('.turn-timings');
-  if (!badge) {
-    badge = document.createElement('div'); badge.className = 'turn-timings';
-    badge.style.cssText = 'margin-top:8px;font-size:11px;color:var(--text-muted)';
-    badge.title = '服务端记录的各阶段用时，统计起点不同，不应直接相加。';
-    container.appendChild(badge);
-  }
-  badge.textContent = rows.join(' · ');
-}
-
 var _sessionCreation = null;
 async function createDefaultSession(epoch, preserveComposer) {
   if (epoch !== authEpoch || sessionId) return;

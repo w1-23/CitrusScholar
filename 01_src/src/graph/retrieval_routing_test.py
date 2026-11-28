@@ -39,10 +39,9 @@ class RetrievalRoutingTest(TestCase):
                 self.assertTrue(retrieval_denied(query, "web" if scope == "local" else "local"))
         env = runtime_env(source_scope="web", shared_corpus=False, script_sandbox=False)
         self.assertIn("read_candidate", env.denied)
-        self.assertTrue(unavailable_capability("search_agent_corpus", Env(source_scope="web")))
         self.assertTrue(unavailable_capability("browse_web", Env(source_scope="local")))
         self.assertFalse(unavailable_capability("draw_svg", Env(retrieval=False)))
-        self.assertTrue({_LOCAL, _WEB, "browse_web", "search_literature", "read_candidate", "search_agent_corpus"}
+        self.assertTrue({_LOCAL, _WEB, "browse_web", "search_literature"}
                         <= retrieval_tool_names())
         self.assertNotIn("read_context_evidence", retrieval_tool_names())
 

@@ -183,8 +183,35 @@ def search(query, families, limit, topics=None):
     payload = {"query": query, "sources": selectors, "budget": budget}
     if "evolution" in families:
         payload["evolution_scope"] = {"personal": True, "shared": True, "projects": []}
+    import os
+    from time import monotonic
+
+    translated = None
+    degraded = False
+    if os.getenv("CITRUS_CORPUS_BILINGUAL_RETRIEVAL") == "1":
+        from src.retrieval.local_query_language import normalize_search_query
+
+        started = monotonic()
+        translated, info = normalize_search_query(query, timeout_s=1.2)
+        budget["timeout_ms"] = max(1, 4000 - int((monotonic() - started) * 1000))
+        if translated and info.get("translation_used"):
+            # Keep stable Latin terms, accessions, names and numeric handles verbatim.
+            original_terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9._/-]*", query)
+            present = {m.casefold() for m in re.findall(r"[A-Za-z0-9][A-Za-z0-9._/-]*", translated)}
+            terms = list(dict.fromkeys(t for t in original_terms if t.casefold() not in present))
+            variant = " ".join([translated, *terms])
+            if len(variant) <= 4096:
+                payload["english_query"] = variant
+            else:
+                degraded = True
+        else:
+            degraded = translated is None
     owner, data = _transport(SEARCH_PATH, payload, None)
-    return _normalize(data, set(families), owner, budget)
+    result = _normalize(data, set(families), owner, budget)
+    if degraded and result["status"] != "unavailable":
+        result["status"] = "partial"
+        result["query_translation_degraded"] = True
+    return result
 
 
 def read_exact(binding, offset, max_chars, *, user=None):

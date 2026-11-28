@@ -27,7 +27,9 @@ from contextlib import closing
 from itertools import islice
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Annotated, Any, Iterable
+
+from pydantic import Field
 from urllib.parse import quote
 
 import numpy as np
@@ -972,6 +974,12 @@ def _publish_artifact(filename: str, content: bytes, mime: str, *,
     return url
 
 
+def _registered_artifact_size_matches(row, size: int) -> bool:
+    """Do not require metadata that predates the length column on legacy rows."""
+    expected = row['artifact_size_bytes'] if 'artifact_size_bytes' in row.keys() else None
+    return expected in (None, 0) or (type(expected) is int and size == expected)
+
+
 def resolve_artifact(session_id: str, artifact_id: str) -> dict[str, Any] | None:
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", str(session_id or "")) or not re.fullmatch(
             r"[a-f0-9]{32}", str(artifact_id or "")):
@@ -1005,7 +1013,7 @@ def resolve_artifact(session_id: str, artifact_id: str) -> dict[str, Any] | None
     expected_sha = str(row["artifact_sha256"] or "") if "artifact_sha256" in row.keys() else ""
     if expected_sha:
         try:
-            actual_sha = _sha256_file(path)
+            actual_sha = _sha256_file(path) if _registered_artifact_size_matches(row, path.stat().st_size) else ""
         except OSError:
             actual_sha = ""
         if actual_sha != expected_sha:
@@ -1125,8 +1133,12 @@ def validate_artifact_links(
                         base["hash_matches"] = actual_sha == expected_sha
                         if base["hash_matches"]:
                             try:
-                                base["sha256"] = expected_sha
-                                base["size_bytes"] = path.stat().st_size
+                                size = path.stat().st_size
+                                if not _registered_artifact_size_matches(row, size):
+                                    base["hash_matches"] = False
+                                    base["reason_code"] = "size_mismatch"
+                                else:
+                                    base.update(sha256=expected_sha, size_bytes=size)
                             except OSError:
                                 base["hash_matches"] = False
                     else:
@@ -1593,14 +1605,15 @@ def _workbook_snapshot_ref(data, source, sheet, headers, mode, cell_range, page_
 def inspect_uploaded_table(file_index: int = 0, sheet_name: str = "", header_row: int = 1,
                            header_rows_json: str | list[int] = "",
                            file_ids_json: str | list[str] = "", inspection: str = "auto",
-                           cell_range: str = "", page_rows: int = 10, cursor: str = "") -> str:
+                           cell_range: str = "",
+                           page_rows: Annotated[int, Field(ge=1, le=50)] = 10, cursor: str = "") -> str:
     """查看 CSV/TSV/Excel/PDF/Word 表格结构、字段样例与覆盖。
 
     file_ids_json 显式选择本账号真实文件ID，可跨轮读取，无需重附；不接受latest、文件名或路径。
     非空ID列表是本次源列表，file_index 在该列表内从0选择；不会混入本轮附件或其他历史文件。
     空ID列表保留原本轮附件file_index逻辑。账号来源校验owner、实际SHA-256与大小，合计最多20MB/20文件。
     XLSX/XLSM 默认 layout，返回工作表、可见性、合并格和已发现区域。查看 detection 的扫描范围和完整性；同一文件版本和读法可复用已存结构。
-    inspection=cells、cell_range="A1:F40" 按原坐标读取公式或值，默认10行，宽页也按单元格数和字节缩小。
+    inspection=cells、cell_range="A1:F40" 按原坐标读取公式或值，page_rows 为 1–50，默认10行，宽页也按单元格数和字节缩小。
     常规单表绘图优先一次 inspection="profile"，取得字段、表头、行数与 inputs_binding；结构不明确才做 layout 或 cells。
     cells 是坐标样例，不是全表或样本量。只有确需核对特定坐标才续读，原样使用相同工作表、范围与 next_cursor。
     header_row 选择表头，header_rows_json=[2,3] 指定多层表头。新规则审查用audit_uploaded_data；

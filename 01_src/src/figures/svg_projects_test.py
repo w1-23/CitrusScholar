@@ -369,7 +369,7 @@ def test_draw_svg_keeps_the_existing_chat_placeholder_without_auth_context():
     assert "工作台：" not in text
 
 
-def test_chat_figure_link_allowlist_keeps_historical_and_exact_legacy_routes():
+def test_chat_figure_link_allowlist_keeps_historical_and_exact_legacy_routes(monkeypatch):
     from src.core import figures
 
     figures.begin_request()
@@ -382,7 +382,10 @@ def test_chat_figure_link_allowlist_keeps_historical_and_exact_legacy_routes():
         (f"/figures/legacy?project={figure_id[:-1]}", False),
     ):
         _, placeholder = figures.register(_architecture_svg(), "Synthetic", workbench_url=url)
+        monkeypatch.delenv("CITRUS_WORKBENCH_BRIDGE_ENABLED", raising=False)
         assert (f"]({url})" in figures.expand(placeholder)) is accepted
+        monkeypatch.setenv("CITRUS_WORKBENCH_BRIDGE_ENABLED", "1")
+        assert (f"]({url})" in figures.expand(placeholder)) is (accepted and not url.startswith("/figures?"))
 
 
 @pytest.mark.parametrize("source, marker", [("", "SVG_INPUT_MISSING"), ("<svg>", "SVG_FORMAT_ERROR")])

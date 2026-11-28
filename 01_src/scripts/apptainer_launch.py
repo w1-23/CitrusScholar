@@ -138,10 +138,13 @@ def external_module_bindings(config, binds):
         raise ValueError('Invalid external modules')
     corpus, workbench = values['selfcorpus'], values['workbench']
     keys = {'client_path', 'client_sha256', 'secret_file'}
-    if (not isinstance(corpus, dict) or not keys <= set(corpus) <= keys | {'auto_intake', 'unified_retrieval'}
+    if (not isinstance(corpus, dict) or not keys <= set(corpus) <= keys | {'auto_intake', 'unified_retrieval', 'bilingual_retrieval'}
             or type(corpus.get('auto_intake', False)) is not bool
             or type(corpus.get('unified_retrieval', False)) is not bool
-            or not isinstance(workbench, dict) or set(workbench) != {'secret_file'}):
+            or type(corpus.get('bilingual_retrieval', False)) is not bool
+            or (corpus.get('bilingual_retrieval', False) and not corpus.get('unified_retrieval', False))
+            or not isinstance(workbench, dict) or not {'secret_file'} <= set(workbench) <= {'secret_file', 'styled_import'}
+            or type(workbench.get('styled_import', False)) is not bool):
         raise ValueError('Invalid external module configuration')
     client = Path(absolute(corpus['client_path']))
     if not client.is_dir() or client.resolve(strict=True) != client or client.stat().st_mode & 0o222:
@@ -180,10 +183,14 @@ def external_module_bindings(config, binds):
            f'WORKBENCH_HOST_KEY_FILE={secrets[1]}', 'CITRUS_WORKBENCH_UPSTREAM=http://127.0.0.1:8062',
            'CITRUS_WORKBENCH_PUBLIC_URL=/workbench/workbench/',
            'CITRUS_WORKBENCH_LAUNCH_ENDPOINT=/workbench/api/v1/launch']
+    if workbench.get('styled_import'):
+        env.append('CITRUS_WORKBENCH_STYLED_IMPORT=1')
     if corpus.get('auto_intake'):
         env.append('CITRUS_SELFCORPUS_AUTO_INTAKE=1')
     if corpus.get('unified_retrieval'):
         env.append('CITRUS_CORPUS_UNIFIED_RETRIEVAL=1')
+    if corpus.get('bilingual_retrieval'):
+        env.append('CITRUS_CORPUS_BILINGUAL_RETRIEVAL=1')
     return [(str(path), 'ro') for path in mounts], [arg for value in env for arg in ('--env', value)], [str(client)]
 
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import {api, importPlan, selectedHash} from './api.mjs';
-import {$, listCards, cardEditable, cardOrdinal} from './views.mjs';
+import {api, importPlan, selectedHash} from './api.mjs?v=2';
+import {$, listCards, cardEditable, cardOrdinal} from './views.mjs?v=2';
 
 const formats = {
   script:[['','全部脚本'], ['py','Python'], ['r','R']],
@@ -102,6 +102,7 @@ export function createResources({run, session, pending, formMessage, onImport}) 
     if (script) void loadDependencies();
   }
   async function refresh() {
+    if (session()?.worker_only) return;
     const id = ++cardLoad;
     $('assets').textContent = '正在读取已准备的图件…';
     try {

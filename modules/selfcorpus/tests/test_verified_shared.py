@@ -144,7 +144,7 @@ class VerifiedSharedTests(unittest.TestCase):
         self._error(400, 'invalid_source', self.client.submit_verified_shared, self.alice,
                     upload('10.1000/example', 'ordinary'), 'upload')
         self._error(403, 'forbidden', self.client.submit, self.alice, source, 'shared', 'generic')
-        self._error(400, 'invalid_source', self.client.submit, self.governor,
+        self._error(403, 'forbidden', self.client.submit, self.governor,
                     {'kind': VERIFIED_SHARED_JOB, 'source': source}, 'shared', 'marker')
         oversized_for_normal = b'x' * (MAX_BODY_BYTES + 1)
         damaged = spec(content_b64=b64(oversized_for_normal))

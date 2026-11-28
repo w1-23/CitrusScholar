@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import {api} from './api.mjs';
+import {api} from './api.mjs?v=2';
 import {nativeEditor} from './inspector-fields.mjs';
 import {treeKeyAction} from './tavotto-primitives.mjs';
 

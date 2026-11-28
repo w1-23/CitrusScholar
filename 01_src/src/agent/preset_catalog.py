@@ -207,15 +207,8 @@ def allowed_presets(state: dict, *, has_tables: bool, has_pool: bool) -> set[str
         if local_processing and (name == "verify_uploaded_references" or
                                  caps & {"network", "local_corpus", "shared_corpus"}):
             continue
-        # A persisted evidence ref is readable without a process-local pool or
-        # a currently loaded index. The adapter rechecks session/corpus rights.
-        if name == "read_candidate":
-            needed = tuple(r for r in preset.requires
-                           if r not in {"candidate_pool", "local_corpus"})
-        else:
-            needed = preset.requires
         if (not policy.tool_allowed(name) or name in env.denied
-                or not all(env.has(requirement) for requirement in needed)):
+                or not all(env.has(requirement) for requirement in preset.requires)):
             continue
         if not state.get("visualization_enabled", True) and "visualization" in caps:
             continue

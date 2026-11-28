@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -82,6 +83,8 @@ class OpenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     session_ref: str = Field(default="", pattern=rf"^(?:{wire.SESSION_REF})?$")
     source_assets: list[FileRef] = Field(default_factory=list, max_length=12)
+    frozen_project: FileRef | None = None
+    frozen_render_version: int = Field(default=1, ge=1, le=999_999_999)
 
 
 def _deny(status: int, detail: str):
@@ -194,7 +197,24 @@ def bridge_router(config: BridgeConfig, *, current_user, require_owned_session,
             require_owned_session(body.session_ref, user)
         for ref in set(body.source_assets):
             owned(ref, owner, body.session_ref)
-        ticket = wire.launch_ticket(config.key, config.audience, owner, body.session_ref, body.source_assets)
+        if body.frozen_render_version != 1 and (not body.frozen_project or not wire.styled_import_enabled()):
+            _missing()
+        if body.frozen_project:
+            from src.figures.projects import ProjectError
+            from src.figures.workbench_source import prepare_frozen_bundle
+
+            if not body.session_ref:
+                _missing()
+            try:
+                version = {} if body.frozen_render_version == 1 else {"render_version": body.frozen_render_version}
+                prepare_frozen_bundle(figure_id=body.frozen_project, owner=owner, session=body.session_ref, **version)
+            except ProjectError as error:
+                if error.status == 404:
+                    _missing()
+                _deny(409, "Frozen figure source is not available for import")
+        ticket = wire.launch_ticket(config.key, config.audience, owner, body.session_ref, body.source_assets,
+                                    frozen_project=body.frozen_project or "",
+                                    frozen_render_version=body.frozen_render_version)
         return JSONResponse({"status": "authorized", "workbench_url": config.page,
                              "launch_endpoint": config.endpoint, "launch_ticket": ticket}, headers=_PRIVATE)
 
@@ -245,7 +265,71 @@ def bridge_router(config: BridgeConfig, *, current_user, require_owned_session,
             "Content-Security-Policy": "sandbox; default-src 'none'; frame-ancestors 'none'",
         })
 
+    @router.get(wire.FROZEN_BUNDLE_PATH + "/{ref}/1", include_in_schema=False)
+    def frozen_bundle(ref: FileRef, request: Request,
+                      authorization: Annotated[str | None, Header()] = None):
+        return frozen_response(ref, request, authorization, 1, f"{wire.FROZEN_BUNDLE_PATH}/{ref}/1")
+
+    @router.get(wire.FROZEN_BUNDLE_PATH + "/{ref}/v2/{revision}", include_in_schema=False)
+    def frozen_revision(ref: FileRef, revision: str, request: Request,
+                        authorization: Annotated[str | None, Header()] = None):
+        if not wire.styled_import_enabled() or not re.fullmatch(wire.FROZEN_REVISION, revision) or revision == "1":
+            _missing()
+        return frozen_response(ref, request, authorization, int(revision),
+                               f"{wire.FROZEN_BUNDLE_PATH}/{ref}/v2/{revision}")
+
+    def frozen_response(ref, request, authorization, revision, path):
+        from src.figures.projects import ProjectError
+        from src.figures.workbench_source import prepare_frozen_bundle
+
+        owner, session = delegated_actor(request, authorization, path)
+        if not session:
+            _missing()
+        try:
+            version = {} if revision == 1 else {"render_version": revision}
+            bundle = prepare_frozen_bundle(figure_id=ref, owner=owner, session=session, **version)
+        except ProjectError as error:
+            if error.status == 404:
+                _missing()
+            _deny(409, "Frozen figure source is not available for import")
+        renderer = bundle.renderer.encode("utf-8")
+        style = bundle.style_json
+        if bundle.render_version != revision or (revision > 1) != bool(style):
+            _deny(409, "Frozen figure source is not available for import")
+        metadata = {"version": 1 if style is None else 2, "language": "python",
+            "renderer": {"size": len(renderer), "sha256": bundle.renderer_sha256},
+            "inputs": [{"binding": item.binding, "name": item.filename, "size": len(item.content),
+                        "sha256": item.sha256} for item in bundle.inputs]}
+        if style is not None:
+            metadata.update(render_version=revision, style={"size": len(style),
+                            "sha256": hashlib.sha256(style).hexdigest()})
+        header = json.dumps(metadata, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if len(header) > wire.FROZEN_BUNDLE_HEADER_LIMIT:
+            _deny(409, "Frozen figure source is not available for import")
+        payload = b"".join((len(header).to_bytes(4, "big"), header, renderer,
+                            *(item.content for item in bundle.inputs), style or b""))
+        media = wire.FROZEN_BUNDLE_MEDIA if style is None else wire.FROZEN_STYLE_MEDIA
+        return Response(payload, media_type=media, headers={
+            **_PRIVATE, "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox; default-src 'none'; frame-ancestors 'none'",
+        })
+
     return router
+
+
+def signed_loopback_resource(request: Request, *, authority: str, bridge: BridgeConfig | None) -> bool:
+    """Match only the machine reads already authenticated by the resource bridge."""
+    if (bridge is None or request.method != "GET" or not request.client
+            or request.client.host != "127.0.0.1" or request.headers.getlist("host") != [authority]):
+        return False
+    path = request.scope["path"]
+    if not (path == wire.ASSETS_PATH or re.fullmatch(
+            wire.ASSETS_PATH + r"/" + wire.FILE_REF + r"/(?:preview|source|dependency)", path)
+            or re.fullmatch(wire.FROZEN_BUNDLE_PATH + r"/" + wire.FILE_REF
+                            + r"/(?:1|v2/" + wire.FROZEN_REVISION + r")", path)):
+        return False
+    tokens = request.headers.getlist("authorization")
+    return len(tokens) == 1 and wire.resource_principal(bridge.key, tokens[0], path) is not None
 
 
 def register_workbench_bridge(app, *, current_user, require_owned_session):
@@ -254,6 +338,8 @@ def register_workbench_bridge(app, *, current_user, require_owned_session):
         return
     from src.auth import user_by_id
     from src.session.files import get_account_file, list_account_files
+
+    app.state.workbench_bridge_config = config
 
     app.include_router(bridge_router(config, current_user=current_user,
         require_owned_session=require_owned_session, account_user=user_by_id,

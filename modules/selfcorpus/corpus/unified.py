@@ -5,6 +5,8 @@ from time import monotonic
 
 from . import evidence_refs
 from .evolution_read import EvolutionReader, pin
+from .errors import CorpusError
+from .sources import normalize_doi
 from .storage import digest, dumps
 from .unified_request import EVOLUTION, requests
 
@@ -13,12 +15,28 @@ class Deadline(Exception):
     pass
 
 
+def _copy_key(scope, row, text):
+    # Only collapse byte-identical passages in the same visibility boundary.
+    # Public legacy and public Shared can share a key, never a private scope.
+    try:
+        doi = normalize_doi(row['doi']) if row.get('doi') else None
+    except (CorpusError, TypeError, ValueError):
+        doi = None
+    if doi:
+        identity = ('doi', doi)
+    elif row.get('source_hash'):
+        identity = ('sha256', row['source_hash'])
+    else:
+        return None
+    return (scope if scope not in ('', 'shared') else 'public', identity, digest(text))
+
+
 class Unified:
     def __init__(self, database, retrieval, legacy=None):
         self.database, self.retrieval, self.legacy = database, retrieval, legacy
 
     def search(self, actor, payload):
-        query, choices, scopes, filters, budget = requests(actor, payload)
+        query, english, choices, scopes, filters, budget = requests(actor, payload)
         due = monotonic() + budget.timeout_ms / 1000
 
         def check():
@@ -53,7 +71,21 @@ class Unified:
                 generations[EVOLUTION] = [{'scope_ref': s, 'generation_ref': g['ref']} for s, g in pinned.items()]
             caps = budget.caps(base_lanes + [(EVOLUTION, scope) for scope in pinned])
             db.set_progress_handler(lambda: monotonic() >= due, 1000)
-            for (source, scope), quota in caps.items():
+            bilingual = bool(english and english.casefold() != query.casefold())
+            fused = {}
+            lanes = []
+            if bilingual:
+                primary, auxiliary = [], []
+                for (source, scope), quota in caps.items():
+                    # Reserve at least three quarters of each channel for the English main pass.
+                    extra = {channel: cap // 4 for channel, cap in quota.items()}
+                    primary.append((source, scope, {k: v-extra[k] for k, v in quota.items()}, english, 2))
+                    if any(extra.values()):
+                        auxiliary.append((source, scope, extra, query, 1))
+                lanes = primary + auxiliary
+            else:
+                lanes = [(source, scope, quota, query, 1) for (source, scope), quota in caps.items()]
+            for source, scope, quota, lane_query, weight in lanes:
                 maximum = sum(quota.values())
                 outcome = outcomes[source]
                 if not maximum:
@@ -66,16 +98,15 @@ class Unified:
                     continue
                 try:
                     if scope is None:
-                        data = base.search(source, query, choices[source], filters, quota, check)
+                        data = base.search(source, lane_query, choices[source], filters, quota, check)
                     else:
-                        data = evolution.search(db, scope, pinned[scope], query, filters, quota, check)
+                        data = evolution.search(db, scope, pinned[scope], lane_query, filters, quota, check)
                     rows, reasons, count = data
                     if (type(count) is not int or not 0 <= len(rows) <= count <= maximum or
                             any(row.get('source_id') != source or row.get('scope_ref') != scope or
                                 row.get('generation_ref') != (base.generation if scope is None else pinned[scope]['ref'])
                                 for row in rows)):
                         raise ValueError('candidate budget or generation invariant')
-                    check()
                 except Deadline:
                     outcome['candidate_count'] += maximum
                     outcome['reason_codes'].append('timeout')
@@ -88,7 +119,15 @@ class Unified:
                 outcome['candidate_count'] += count
                 outcome['reason_codes'].extend(reasons)
                 for rank, row in enumerate(rows):
-                    candidates.append((rank, source, scope or '', row))
+                    if not bilingual:
+                        candidates.append((rank, source, scope or '', row))
+                        continue
+                    key = (source, scope, row['document_ref'], row['version_ref'], row['passage_ref'])
+                    score, saved = fused.get(key, (0, row))
+                    fused[key] = (score + weight / (60 + rank + 1), saved)
+            if bilingual:
+                candidates.extend((-score, source, scope or '', row)
+                                  for (source, scope, _, _, _), (score, row) in fused.items())
             db.set_progress_handler(None, 0)
         if EVOLUTION in choices and not pinned:
             # An authorized Evolution scope with no published generation is a known empty read.
@@ -104,11 +143,10 @@ class Unified:
                     outcomes[s]['reason_codes'].append('legacy_generation_changed')
                 fingerprint = None
         results, used_chars = self._select(actor, candidates, outcomes, budget, due)
-        hits = {source for _, source, _, row in candidates if str(row.get('text') or '').strip()}
         for s, out in outcomes.items():
             out['reason_codes'] = sorted(set(out['reason_codes']))
             out['status'] = ('unavailable' if not ready[s] else 'partial' if out['reason_codes'] else
-                             'hit' if s in hits else 'empty')
+                             'hit' if out['returned_count'] else 'empty')
         statuses = {out['status'] for out in outcomes.values()}
         status = ('unavailable' if statuses == {'unavailable'} else
                   'partial' if statuses & {'unavailable', 'partial'} else 'hit' if results else 'empty')
@@ -125,6 +163,7 @@ class Unified:
     def _select(self, actor, candidates, outcomes, budget, due):
         results, refs, seen = [], [], set()
         counts = Counter()
+        copies = set()
         used_chars = 0
         for _, source, scope, row in sorted(candidates, key=lambda item: (*item[:3], item[3]['passage_ref'])):
             if len(results) >= budget.max_results or used_chars >= budget.max_chars:
@@ -132,10 +171,15 @@ class Unified:
             key = (source, scope, row['document_ref'], row['version_ref'], row['passage_ref'])
             if key in seen or counts[key[:4]] >= 2 or not (text := row.get('text')):
                 continue
+            copy = _copy_key(scope, row, text)
+            if copy is not None and copy in copies:
+                continue
             excerpt = text[:min(2400, budget.max_chars - used_chars)]
             if not excerpt.strip():
                 continue
             seen.add(key)
+            if copy is not None:
+                copies.add(copy)
             counts[key[:4]] += 1
             exact = row.get('locator') is not None and row.get('passage_hash') == digest(text)
             mapping = evidence_refs.build(actor.subject, row) if exact else None

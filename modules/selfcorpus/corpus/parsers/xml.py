@@ -7,6 +7,8 @@ from xml.parsers import expat
 from .model import Block, Parsed, build
 
 MAX_XML_BYTES = 32 * 1024 * 1024
+_IMAGE_ELEMENTS = frozenset({'graphic', 'inline-graphic', 'media', 'binary', 'svg'})
+_XML_LANG = '{http://www.w3.org/XML/1998/namespace}lang'
 
 
 def read_xml(data: bytes) -> ET.Element:
@@ -60,7 +62,17 @@ def local(tag: str) -> str:
 
 
 def text(node) -> str:
-    return " ".join("".join(node.itertext()).split())
+    def parts(element):
+        if local(element.tag) in _IMAGE_ELEMENTS:
+            return
+        if element.text:
+            yield element.text
+        for child in element:
+            yield from parts(child)
+            if child.tail:
+                yield child.tail
+
+    return " ".join("".join(parts(node)).split())
 
 
 def first(node, name):
@@ -87,6 +99,13 @@ def parse_article(root: ET.Element, *, parser: str | None = None) -> Parsed:
     jats = version.startswith("jats/")
     title = ""
     metadata = {}
+    language = root.get(_XML_LANG) or root.get('lang')
+    if not language and not jats:
+        body_language = first(root, 'text')
+        if body_language is not None:
+            language = body_language.get(_XML_LANG)
+    if language:
+        metadata['language'] = language[:64]
     blocks: list[Block] = []
     path: tuple[str, ...] = ()
     page: int | None = None
@@ -125,7 +144,7 @@ def parse_article(root: ET.Element, *, parser: str | None = None) -> Parsed:
             label = node.get("n", "")
             page = int(label) if re.fullmatch(r"[1-9][0-9]{0,6}", label) else None
             return
-        if name in {"title", "head", "teiHeader", "front-stub", "label", "sub-article", "response"}:
+        if name in _IMAGE_ELEMENTS or name in {"title", "head", "teiHeader", "front-stub", "label", "sub-article", "response"}:
             return
         if name in {"sec", "div", "abstract", "ref-list", "listBibl"}:
             heading = next((child for child in node if local(child.tag) in {"head", "title"}), None)

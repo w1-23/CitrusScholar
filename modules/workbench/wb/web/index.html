@@ -7,7 +7,7 @@
   <meta name="referrer" content="no-referrer">
   <title>科研图件工作台 · Citrus Scholar</title>
   <link rel="stylesheet" href="static/workbench.css">
-  <script type="module" src="static/main.mjs"></script>
+  <script type="module" src="static/main.mjs?v=3"></script>
 </head>
 <body>
   <a class="skip" href="#canvas-title">跳到画布</a>
@@ -19,6 +19,8 @@
     <aside class="panel navigator" aria-label="工作区导航">
       <section class="nav-section">
         <header class="bar"><h2><svg class="icon" aria-hidden="true"><use href="static/solar.svg#ui-folder"></use></svg>项目</h2><button id="import-open" class="quiet icon-button" title="准备可编辑预览" aria-label="准备可编辑预览" disabled><svg class="icon" aria-hidden="true"><use href="static/solar.svg#ui-plus"></use></svg></button></header>
+        <button id="frozen-import" type="button" class="primary" hidden disabled>导入本轮图件并渲染</button>
+        <p id="worker-source-note" class="muted" hidden>请返回聊天，从图件卡打开 Worker 已生成的图件。</p>
         <div id="figures" class="rows section-rows"></div>
       </section>
       <section id="library" class="nav-section library">
@@ -38,7 +40,7 @@
         <div class="ruler-corner" id="ruler-unit" aria-hidden="true">%</div><svg id="ruler-x" class="ruler ruler-x" aria-hidden="true" preserveAspectRatio="none"></svg><svg id="ruler-y" class="ruler ruler-y" aria-hidden="true" preserveAspectRatio="none"></svg>
         <div class="stage" id="stage" tabindex="0" aria-label="图件画布">
           <div id="surface">
-            <div id="empty"><svg class="icon" aria-hidden="true"><use href="static/solar.svg#ui-chart"></use></svg><h3>在画布上检查和编辑图件</h3><p>从左侧打开图件或选择已渲染的预览。也可准备 Python 或 R，或打开静态图。</p><button id="empty-prepare" class="primary" disabled><svg class="icon" aria-hidden="true"><use href="static/solar.svg#ui-plus"></use></svg>准备图件预览</button></div>
+            <div id="empty"><svg class="icon" aria-hidden="true"><use href="static/solar.svg#ui-chart"></use></svg><h3>在画布上检查和编辑图件</h3><p id="empty-source-note">从左侧打开图件或选择已渲染的预览。也可准备 Python 或 R，或打开静态图。</p><button id="empty-prepare" class="primary" disabled><svg class="icon" aria-hidden="true"><use href="static/solar.svg#ui-plus"></use></svg>准备图件预览</button></div>
             <div id="paper" hidden><img id="preview" alt="图件预览" draggable="false"><div id="paper-grid" aria-hidden="true"></div><div id="outline" aria-hidden="true" hidden></div><form id="inline-form" hidden><textarea id="inline-text" aria-label="编辑所选原生文字"></textarea><div class="inline-actions"><button type="button" id="inline-paste" class="quiet" hidden>粘贴</button><button type="button" id="inline-cancel">取消</button><button type="submit" class="primary">保存</button></div></form></div>
           </div>
         </div>

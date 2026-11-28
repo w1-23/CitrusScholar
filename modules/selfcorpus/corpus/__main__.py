@@ -99,7 +99,12 @@ def main():
         from .parsers import ParserRouter
         from .sources import Sources
         from .worker import Worker
-        worker = Worker(database, Sources(), ParserRouter(), embedding)
+        from .translation_provider import TranslationProvider
+        try:
+            translator = TranslationProvider.from_environment()
+        except ValueError:
+            raise SystemExit('Invalid worker translation configuration.') from None
+        worker = Worker(database, Sources(), ParserRouter(), embedding, translator=translator)
         worker.once() if args.once else worker.run()
 
 

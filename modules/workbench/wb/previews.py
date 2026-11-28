@@ -181,8 +181,6 @@ class Previews:
                 mode=mode, receipt=receipt, name=row["label"])
         if capability(engine) == "preview_only":
             raise FigureError("此预览没有可验证的语义编辑对象，请使用仅预览。")
-        if self.runtime(source["language"]) != source["runtime"]:
-            raise FigureError("原渲染运行环境不可用，请重新准备图件。")
         try:
             assets = tuple(self.store.input_asset(owner, item["ref"]) for item in source["pins"])
         except Missing as exc:
@@ -190,6 +188,9 @@ class Previews:
         if [asset.pin() for asset in assets] != source["pins"] or bundle_digest(assets, source["language"], source["runtime"]) != source["bundle"]:
             raise FigureError("此预览的绑定来源已变化，请重新准备图件。")
         validate_bundle(assets[0], assets[1:])
+        _, identify_runtime = self.figures.receipt_renderer(source["language"], receipt.runtime_ref)
+        if identify_runtime() != receipt.runtime_ref:
+            raise FigureError("原渲染运行环境不可用，请重新准备图件。")
         return self.figures.save_import(owner, assets[0], source["language"], engine, row["preview"],
             mode="editable", dependencies=assets[1:], receipt=receipt, name=row["label"],
             library_ref=source["library_ref"], library_version=source["library_version"])

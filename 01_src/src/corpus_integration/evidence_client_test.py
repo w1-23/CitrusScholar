@@ -45,6 +45,25 @@ def test_one_search_and_scoped_topics(monkeypatch):
     assert received["results"][0]["readback"] == "exact"
 
 
+def test_bilingual_preserves_query_identifiers_and_degrades_without_second_request(monkeypatch):
+    from src.retrieval import local_query_language as language
+
+    monkeypatch.setenv("CITRUS_CORPUS_BILINGUAL_RETRIEVAL", "1")
+    calls = []
+    monkeypatch.setattr(client, "_transport", lambda path, request, actor:
+                        (calls.append(deepcopy(request)) or (19, reply())))
+    monkeypatch.setattr(language, "normalize_search_query", lambda query, *, timeout_s:
+                        ("citrus transformation", {"translation_used": True}))
+    query = "柑橘遗传转化 Carrizo CsLOB1 10.1234/AbC"
+    assert client.search(query, ["cqa_literature", "evolution"], 5)["status"] == "hit"
+    assert len(calls) == 1 and calls[0]["query"] == query
+    assert calls[0]["english_query"] == "citrus transformation Carrizo CsLOB1 10.1234/AbC"
+    monkeypatch.setattr(language, "normalize_search_query", lambda *a, **k: (None, {}))
+    result = client.search(query, ["cqa_literature", "evolution"], 5)
+    assert result["status"] == "partial" and result["results"]
+    assert len(calls) == 2 and "english_query" not in calls[1]
+
+
 @pytest.mark.parametrize("tamper", ["wrong_generation", "foreign_scope", "missing_hash", "budget", "count", "no_results"])
 def test_rejects_invalid_contract(monkeypatch, tamper):
     data = reply()

@@ -15,8 +15,9 @@ def reembed_scope(database, embedding, scope):
             raise CorpusError('not_found','No active generation exists for this scope.', 404)
         if (old['embedding'], old['dimension']) == (signature,dimension):
             return old['ref']
-        selection = db.execute('''SELECT c.id,c.text,v.title,c.heading_path FROM generation_members m
+        selection = db.execute('''SELECT c.id,COALESCE(t.text_en,c.text) AS text,v.title,c.heading_path FROM generation_members m
             JOIN versions v ON v.ref=m.version_ref JOIN chunks c ON c.parsed_ref=m.parsed_ref AND c.chunker=?
+            LEFT JOIN chunk_translations t ON t.chunk_id=c.id
             LEFT JOIN embeddings e ON e.chunk_id=c.id AND e.model=?
             WHERE m.gen=? AND e.chunk_id IS NULL ORDER BY c.id''', (old['chunker'],signature,old['ref'])).fetchall()
     for start in range(0, len(selection), 32):

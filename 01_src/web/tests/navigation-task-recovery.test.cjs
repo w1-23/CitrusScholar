@@ -39,7 +39,8 @@ test('a restored queued job leaves Send available and is never the target of Sto
     query: '原有排队消息', queue_seq: 1, queue_position: 2, state: 'queued'};
   b.context.renderHistoryMessages([], b.context.mergeQueuedHistory([], [turn]));
   const chat = b.get('chat-container');
-  assert.equal(chat.querySelector('.user').querySelector('.turn-user-queue-state').textContent, '待发送');
+  assert.equal(chat.querySelectorAll('.user').length, 1);
+  assert.equal(chat.querySelector('.turn-user-queue-state'), null);
   assert.ok(chat.querySelector('.bot').classList.contains('turn-awaiting-dispatch'));
   assert.equal(chat.querySelector('.turn-queue-cancel'), null);
   assert.equal(b.get('send-btn').getAttribute('aria-label'), '发送消息');

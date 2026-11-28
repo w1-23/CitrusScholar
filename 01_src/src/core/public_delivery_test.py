@@ -51,6 +51,7 @@ class PublicDeliveryTests(unittest.TestCase):
             "artifact_ids": ["a" * 32, {"content": secret}],
             "turn_envelope": {"history_saved": True, "verified_artifacts": 1,
                 "acceptance_reason": {"content": secret}, "task_snapshot": {"completion": secret},
+                "turn_timings": {"queue_wait_ms": 0},
                 "artifact_delivery": {"status": "available", "verified_file_ids": ["b" * 32], "reasoning": secret}},
             "turn_timings": {"queue_wait_ms": 0, "visible_answer_first_ms": 60, "extra": secret}, "seq": 12}
         projected = project_public_event("done", event)
@@ -58,8 +59,9 @@ class PublicDeliveryTests(unittest.TestCase):
         self.assertEqual(projected["answer"], "Result [C2].")
         self.assertEqual(projected["question"]["options"][0]["refs"][0]["column"], "peak area")
         self.assertEqual(projected["turn_envelope"]["artifact_delivery"]["verified_file_ids"], ["b" * 32])
-        self.assertEqual(projected["turn_timings"]["queue_wait_ms"], 0)
-        self.assertIsNone(projected["turn_timings"]["provider_first_packet_ms"])
+        self.assertNotIn("turn_timings", projected)
+        self.assertNotIn("turn_timings", projected["turn_envelope"])
+        self.assertEqual(project_public_event("turn_timings", {"seq": 12, "queue_wait_ms": 3}), {"seq": 12})
         self.assertEqual(project_public_event("unknown", event), {"seq": 12})
         self.assertEqual(project_public_event("text", {"content": secret, "phase": "draft", "seq": 13}), {"seq": 13})
         self.assertNotIn(secret, json.dumps([projected, project_citation_bubbles([evidence])]))
@@ -119,7 +121,10 @@ class PublicDeliveryTests(unittest.TestCase):
         task_events._append(conn, "job", "answer_start", {})
         with patch.object(task_events.time, "time", side_effect=[108, 109]):
             task_events._append(conn, "job", "text", {"content": "public final", "delivery": "committed"})
-            task_events._append(conn, "job", "done", {"answer": "public final", "unknown": "hidden fixture"})
+            live = task_events._append(conn, "job", "done", {"answer": "public final", "unknown": "hidden fixture",
+                                                             "turn_envelope": {"display_status": "completed"}})
+        self.assertNotIn("turn_timings", live["data"])
+        self.assertNotIn("turn_timings", live["data"]["turn_envelope"])
         task_events._append(conn, "job", "context_maintenance", {
             "status": "compacted", "elapsed_ms": 55, "draft": "hidden fixture"})
 
@@ -134,7 +139,10 @@ class PublicDeliveryTests(unittest.TestCase):
         self.assertIn("public final", public)
         self.assertNotIn("legacy provisional fixture", public)
         self.assertEqual(exported["events"][2]["data"], {"seq": 3})
-        self.assertEqual(exported["events"][-2]["data"]["turn_timings"]["visible_answer_first_ms"], 8000)
+        self.assertNotIn("turn_timings", exported["events"][-2]["data"])
+        saved = json.loads(conn.execute("SELECT data FROM task_events WHERE event='done'").fetchone()[0])
+        self.assertEqual(saved["turn_timings"]["visible_answer_first_ms"], 8000)
+        self.assertEqual(saved["turn_envelope"]["turn_timings"], saved["turn_timings"])
         self.assertEqual(exported["events"][-1]["data"], {
             "seq": exported["events"][-1]["seq"], "status": "compacted", "elapsed_ms": 55})
         conn.close()
@@ -242,3 +250,33 @@ def test_verified_plot_placeholder_keeps_preview_links_and_prose_without_pasting
     assert not previews(rows=[validated[0] | {"link": f"{link}-old"}])
     entry["sha256"] = "0" * 64
     assert not previews()  # The registered placeholder and owned SVG must be identical bytes.
+
+
+
+def test_public_answer_drops_known_trace_but_keeps_findings_and_natural_limits():
+    text = "找到了两篇相关文献[L1]。内部查询停止：`retrieval_followup_budget_exhausted`。\n目前只读到摘要，不据此判断试验条件。"
+    clean = "找到了两篇相关文献[L1]。\n目前只读到摘要，不据此判断试验条件。"
+    assert public_answer_text(text) == clean
+    assert project_public_event("text", {"content": text, "delivery": "committed"})["content"] == clean
+    assert public_answer_text([{"type": "text", "text": "no_candidate_"},
+                               {"type": "text", "text": "pool。保留的证据[W1]。"}]) == "保留的证据[W1]。"
+    assert public_answer_text("The nominal budget was 1.5 kg; recovery was partial.") == "The nominal budget was 1.5 kg; recovery was partial."
+
+
+
+def test_terminal_diagnostics_do_not_replace_findings_or_escape_in_side_fields():
+    finding = "已核对表 2，处理组的均值为 2.5[L2]。"
+    answer = (finding[:-1] + "（交付诊断 `completion_proof_invalid`）。\n"
+              "```json\n{\"code\": \"turn_reconcile_required\"}\n```\n"
+              "另一个样本缺少原始测量值[W1]。")
+    expected = finding + "\n另一个样本缺少原始测量值[W1]。"
+    row = {"answer": answer, "turn_status": "partial", "artifact_ids": ["verified-file"],
+           "tools_called": ["internal_executor"], "export_gate": {"status": "private_code"},
+           "retrieval_trace": {"retrieval_reason_code": "private_reason"}}
+    terminal = project_public_event("done", row)
+    assert terminal == {"answer": expected, "turn_status": "partial", "artifact_ids": ["verified-file"]}
+    assert project_public_event("done", terminal) == terminal
+    assert project_public_event("text", {"content": answer, "delivery": "committed"})["content"] == expected
+    scientific = ("结论（3 个重复）[L7]。\n```python\n"
+                  "estimate = {'budget': 2.5, 'partial': False}\n```\n")
+    assert public_answer_text(scientific) == scientific

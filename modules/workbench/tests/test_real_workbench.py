@@ -190,20 +190,37 @@ with TestClient(create_app(db_path=database, standalone_token="test")) as client
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_real_r_script_resolves_only_passed_relative_data(client):
+def test_real_r_script_resolves_only_passed_relative_data(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKBENCH_SECURE_COOKIE", "0")
     code = b"""library(ggplot2)
 observations <- read.csv('observations.csv')
-p <- ggplot(observations, aes(x, y)) + geom_point() + labs(title=observations$label[1])
+p <- ggplot(observations, aes(x, y, colour=series)) + geom_point() + labs(title=observations$label[1])
 print(p)
 """
-    inputs = [require(client.post(BASE + "/assets", content=body, headers={"X-Filename": name}), 201).json()
-              for name, body in [("chart.R", code), ("observations.csv", b"x,y,label\n1,2,R CSV title\n3,4,R CSV title\n")]]
-    result = require(client.post(BASE + "/figures/import", json={"source": {"kind": "script", "language": "r",
-        "entrypoint_ref": inputs[0]["asset_ref"], "assets": [inputs[1]["asset_ref"]]},
-        "options": {"parse_mode": "editable"}}), 201).json()
-    assert result["renderer_id"] == "r-ggplot2"
-    url = BASE + "/figures/" + result["figure_id"]
-    assert b"R CSV title" in require(client.post(url + "/export", json={"format": "svg"})).content
+    data = b"x,y,label,series\n1,2,R CSV title,Frozen series\n3,4,R CSV title,Frozen series\n"
+    db = tmp_path / "r-cold.sqlite"
+    with TestClient(create_app(db_path=db, standalone_token="test")) as client:
+        require(client.post(BASE + "/standalone", json={"token": "test"}))
+        inputs = [require(client.post(BASE + "/assets", content=body, headers={"X-Filename": name}), 201).json()
+                  for name, body in [("chart.R", code), ("observations.csv", data)]]
+        result = require(client.post(BASE + "/figures/import", json={"source": {"kind": "script", "language": "r",
+            "entrypoint_ref": inputs[0]["asset_ref"], "assets": [inputs[1]["asset_ref"]]},
+            "options": {"parse_mode": "editable"}}), 201).json()
+        assert result["renderer_id"] == "r-ggplot2"
+        url = BASE + "/figures/" + result["figure_id"]
+        assert b"R CSV title" in require(client.post(url + "/export", json={"format": "svg"})).content
+    with TestClient(create_app(db_path=db, standalone_token="test")) as reopened:
+        require(reopened.post(BASE + "/standalone", json={"token": "test"}))
+        before = require(reopened.get(url)).json()
+        edited = require(reopened.patch(url + "/overrides", json={"expected_revision": 1,
+            "overrides": {"plot.title": {"text": "After R reopen"}}})).json()
+        assert edited["revision"] == 2
+        assert before["source"] == edited["source"]
+        assert edited["source"]["source_hash"] == hashlib.sha256(code).hexdigest()
+        svg = require(reopened.post(url + "/export", json={"format": "svg"}))
+        assert b"After R reopen" in svg.content and b"Frozen series" in svg.content
+        assert svg.headers["x-figure-revision"] == "2"
+        assert svg.headers["x-content-sha256"] == hashlib.sha256(svg.content).hexdigest()
 
 
 def test_real_native_canvas_resize_updates_preview_and_allows_explicit_export_width(client):
@@ -227,3 +244,254 @@ def test_real_native_canvas_resize_updates_preview_and_allows_explicit_export_wi
         png = require(client.post(url + "/export", json=params))
         assert Image.open(io.BytesIO(png.content)).size == pixels
     assert require(client.get(url)).json()["layout"] == resized["layout"]
+
+
+
+@pytest.mark.skipif(not os.getenv("WORKBENCH_FROZEN_PACKAGES"), reason="Frozen codec runtime not configured")
+@pytest.mark.parametrize("previous", [False, True])
+def test_real_frozen_import_cold_edit_and_export(tmp_path, monkeypatch, previous):
+    import json
+    from uuid import uuid4
+    from wb.auth import issue
+    from wb.bundle import InputAsset, digest
+    from wb.frozen_inputs import FrozenInputs
+
+    monkeypatch.setenv("WORKBENCH_SECURE_COOKIE", "0")
+    ref = "1" * 32
+    source = (b"fig, ax = plt.subplots()\n"
+              b"frame = data['chart']\n"
+              b"assert frame['value'].tolist() == [2.25, 4.125]\n"
+              b"ax.bar(frame['sample'], frame['value'])\n"
+              b"ax.set_title('Baseline')\n")
+    integers = {"dtype": {"kind": "dtype", "name": "int64"}}
+    int_values = lambda values: [{"t": "int", "v": str(v)} for v in values]
+    table = json.dumps({"format": "citrus.dataset", "version": 1, "columns": ["sample", "value"],
+        "index": {**integers, "values": int_values(range(2)), "name": {"t": "none"}, "range": [0, 2, 1]},
+        "series": [{**integers, "values": int_values([1, 2])},
+                   {"dtype": {"kind": "dtype", "name": "float64"},
+                    "values": [{"t": "float", "v": v.hex()} for v in (2.25, 4.125)]}]}).encode()
+
+    class HostLibrary:
+        def frozen_inputs(self, actor, project_ref):
+            assert actor.project == "session:frozen-render-fixture" and project_ref == ref
+            return FrozenInputs(InputAsset.snapshot("render.py", digest(source), source),
+                                (InputAsset.snapshot("input_0.json", digest(table), table),), ("chart",))
+
+    key = b"f" * 32
+    options = {"db_path": tmp_path / "frozen.sqlite", "secret": b"s" * 32, "host_key": key,
+               "library": HostLibrary()}
+
+    def launch(client):
+        ticket = issue(key, "citrus-workbench-launch", "citrus-workbench", {
+            "jti": uuid4().hex, "user_ref": "51", "project_ref": "session:frozen-render-fixture",
+            "frozen_project": ref, "return_to": "/"})
+        require(client.post(BASE + "/launch", json={"ticket": ticket}))
+
+    if previous:
+        historical = os.environ.get("WORKBENCH_PREVIOUS_SOURCE")
+        if not historical:
+            pytest.skip("Previous frozen release not configured")
+        (tmp_path / "script.py").write_bytes(source)
+        (tmp_path / "input.json").write_bytes(table)
+        code = """
+from pathlib import Path
+import sys
+from wb.auth import Session
+from wb.bundle import InputAsset, digest
+from wb.figures import Figures
+from wb.frozen_inputs import FrozenInputs
+from wb.runtime_pin import identity
+from wb.sandbox import run
+from wb.store import Store
+root=Path(sys.argv[1]); source=(root/'script.py').read_bytes(); table=(root/'input.json').read_bytes()
+inputs=FrozenInputs(InputAsset.snapshot('render.py',digest(source),source),
+  (InputAsset.snapshot('input_0.json',digest(table),table),), ('chart',))
+owner=Session('host:51','session:frozen-render-fixture','/').owner
+print(Figures(Store(root/'frozen.sqlite'),run,identity).import_frozen(owner,'1'*32,1,inputs).figure_id)
+"""
+        figure_id = subprocess.check_output([sys.executable, "-B", "-c", code, str(tmp_path)],
+            cwd=Path(historical), env=os.environ | {"PYTHONPATH": historical}, text=True, timeout=60).strip()
+    else:
+        with TestClient(create_app(**options)) as api:
+            launch(api)
+            imported = require(api.post(BASE + "/figures/import-frozen",
+                                        json={"project_ref": ref, "render_version": 1}), 201).json()
+            figure_id = imported["figure_id"]
+    with TestClient(create_app(**options)) as api:
+        launch(api)
+        url = BASE + "/figures/" + figure_id
+        before = require(api.get(url)).json()
+        assert prop(before, "axes_0.title", "text") == "Baseline"
+        assert before["source"]["source_hash"] == digest(source)
+    with TestClient(create_app(**options)) as api:
+        launch(api)
+        patch = {"expected_revision": 1, "patches": [{"gid": "axes_0.title", "prop": "text", "value": "Revised"}]}
+        if previous:
+            with monkeypatch.context() as missing:
+                missing.delenv("WORKBENCH_PREVIOUS_SOURCE", raising=False)
+                missing.delenv("WORKBENCH_OLDER_SOURCE", raising=False)
+                assert api.patch(url + "/native-overrides", json=patch).status_code >= 400
+            assert require(api.get(url)).json()["revision"] == 1
+        after = require(api.patch(url + "/native-overrides", json=patch)).json()
+        assert after["revision"] == 2 and prop(after, "axes_0.title", "text") == "Revised"
+        png = require(api.post(url + "/export", json={"format": "png"}))
+        assert Image.open(io.BytesIO(png.content)).format == "PNG"
+        assert png.headers["x-content-sha256"] == digest(png.content)
+
+
+@pytest.mark.skipif(not os.getenv("WORKBENCH_PREVIOUS_SOURCE"), reason="Previous sealed runtime not configured")
+@pytest.mark.parametrize("language", ["python", "r"])
+def test_real_reopen_previous_runtime_receipt(tmp_path, monkeypatch, language):
+    import json
+
+    monkeypatch.setenv("WORKBENCH_SECURE_COOKIE", "0")
+    db = tmp_path / "previous.sqlite"
+    boot = r"""
+import json, sys
+from fastapi.testclient import TestClient
+from wb.api import create_app
+with TestClient(create_app(db_path=sys.argv[1], standalone_token='test')) as api:
+    assert api.post('/api/v1/standalone', json={'token':'test'}).is_success
+    language = sys.argv[2]
+    refs = []
+    r_source = [('chart.R', b"library(ggplot2)\nd <- read.csv('exact.csv')\nprint(ggplot(d,aes(x,y))+geom_point()+labs(title='Old title'))"),
+                       ('exact.csv', b'x,y\n1,2\n3,4\n')]
+    py_source = [('chart.py', b"import csv\nimport matplotlib.pyplot as plt\nwith open('exact.csv') as f: data=list(csv.DictReader(f))\nfig,ax=plt.subplots()\nax.plot([float(r['x']) for r in data],[float(r['y']) for r in data])\nax.set_title('Old title')\n"), r_source[1]]
+    for name, blob in r_source if language == 'r' else py_source:
+        reply = api.post('/api/v1/assets', headers={'X-Filename':name}, content=blob)
+        assert reply.status_code == 201, reply.text
+        refs.append(reply.json()['asset_ref'])
+    run = api.post('/api/v1/preview-runs', headers={'Idempotency-Key':'previous-receipt-fixture'},
+        json={'source':{'kind':'script','language':language,'entrypoint_ref':refs[0],'assets':refs[1:]}})
+    assert run.is_success, run.text
+    card, = run.json()['cards']
+    reply = api.post('/api/v1/figures/import', json={'preview_ref':card['preview_ref'],
+        'preview_version':card['preview_version'], 'options':{'parse_mode':'editable'}})
+    assert reply.status_code == 201, reply.text
+    url = '/api/v1/figures/' + reply.json()['figure_id']
+    print(json.dumps([url, api.get(url).json()['source'], {'preview_ref':card['preview_ref'], 'preview_version':card['preview_version']}]))
+"""
+    previous = os.environ["WORKBENCH_PREVIOUS_SOURCE"]
+    old = subprocess.check_output([sys.executable, '-B', '-c', boot, str(db), language], cwd=previous,
+                                  env=os.environ | {'PYTHONPATH': previous}, text=True, timeout=80)
+    url, identity, prepared = json.loads(old)
+    assert identity["receipt"]["runtime_ref"]
+    with TestClient(create_app(db_path=db, standalone_token="test")) as api:
+        require(api.post(BASE + "/standalone", json={"token": "test"}))
+        imported = require(api.post(BASE + "/figures/import", json=prepared), 201).json()
+        assert imported["detected_language"] == language
+        imported_url = BASE + "/figures/" + imported["figure_id"]
+        assert require(api.get(imported_url)).json()["source"]["receipt"] == identity["receipt"]
+        patch = {"expected_revision": 1, "overrides": {"plot.title": {"text": "New app, old renderer"}}}
+        edit_url = url + "/overrides"
+        if language == "python":
+            edit_url = url + "/native-overrides"
+            patch = {"expected_revision": 1, "patches": [{"gid":"axes_0.title", "prop":"text", "value":"New app, old renderer"}]}
+        with monkeypatch.context() as missing:
+            missing.setenv("WORKBENCH_PREVIOUS_SOURCE", str(tmp_path))
+            assert api.patch(edit_url, json=patch).status_code >= 400
+        assert require(api.get(url)).json()["revision"] == 1
+        changed = require(api.patch(edit_url, json=patch)).json()
+        assert changed["revision"] == 2 and {k:v for k,v in changed["source"].items() if v is not None} == {k:v for k,v in identity.items() if v is not None}
+        output = require(api.post(url + "/export", json={"format":"svg"}))
+        assert b"New app, old renderer" in output.content
+        assert hashlib.sha256(output.content).hexdigest() == output.headers["x-content-sha256"]
+
+
+@pytest.mark.skipif(not os.getenv("WORKBENCH_TEST_HOST_SANDBOX") or not os.getenv("WORKBENCH_FROZEN_PACKAGES"),
+                    reason="Set sealed Host sandbox and frozen package paths")
+def test_real_styled_import_survives_disabled_intake_in_new_process(tmp_path, monkeypatch):
+    from uuid import uuid4
+    from wb.auth import issue
+    from wb.bundle import InputAsset, digest
+    from wb.frozen_inputs import FrozenInputs
+
+    script = ("fig, ax = plt.subplots()\nframe = data['tidy']\n"
+              "assert frame['y'].tolist() == [2.25, 4.125]\nax.bar(frame['x'], frame['y'])\n"
+              "ax.set_title('Original title')\n")
+    (tmp_path / "render.py").write_text(script)
+    make = """
+from pathlib import Path
+import json
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib import pyplot as plt
+import pandas as pd
+from citrus_figures.core import RenderedFigure
+from citrus_figures.dataset_codec import encode_frame, decode_frame
+from citrus_figures.manifest import assign_locators, build_manifest
+from citrus_figures.overrides import apply_overrides, validate_overrides
+from citrus_figures.style_replay import coordinate_sha256, replay_baseline, typed_payload_sha256
+from citrus_figures.styling import prepare_figure_fonts
+frame = encode_frame(pd.DataFrame({'x': [1, 2], 'y': [2.25, 4.125]}))
+Path('input_0.json').write_text(json.dumps(frame))
+state = {'plt': plt, 'data': {'tidy': decode_frame(frame)}}
+exec(Path('render.py').read_text(), state)
+fig = state['fig']
+prepare_figure_fonts(fig)
+rendered = assign_locators(RenderedFigure(figure=fig, axes=list(fig.axes), qa_profile={}))
+manifest = build_manifest(rendered, source='script', include_qa=False)
+base = replay_baseline(fig, manifest['objects'])
+gid = next(obj['gid'] for obj in manifest['objects'] if obj['role'] == 'title')
+edits = validate_overrides([{'gid': gid, 'prop': 'text', 'value': 'Host edited'}], manifest)
+assert apply_overrides(rendered, manifest, edits) == [gid]
+assert coordinate_sha256(fig) == base['coordinates_sha256']
+Path('style.json').write_text(json.dumps({'baseline': base, 'overrides': edits,
+    'overrides_sha256': typed_payload_sha256(edits)}))
+"""
+    packages = os.environ["WORKBENCH_FROZEN_PACKAGES"]
+    subprocess.run(["apptainer", "exec", "--cleanenv", "--env", f"PYTHONPATH={packages},MPLCONFIGDIR={tmp_path}",
+                    os.environ["WORKBENCH_TEST_HOST_SANDBOX"], "python", "-B", "-c", make],
+                   cwd=tmp_path, check=True, timeout=40)
+
+    def snapshot(name):
+        data = (tmp_path / name).read_bytes()
+        return InputAsset.snapshot(name, digest(data), data)
+
+    class Host:
+        def frozen_inputs(self, actor, ref, version):
+            assert actor.project == "session:styled-fixture" and ref == "1" * 32 and version == 2
+            return FrozenInputs(snapshot("render.py"), (snapshot("input_0.json"),), ("tidy",),
+                                version, (tmp_path / "style.json").read_bytes())
+
+    monkeypatch.setenv("WORKBENCH_SECURE_COOKIE", "0")
+    monkeypatch.setenv("WORKBENCH_STYLED_IMPORT", "1")
+    key = b"h" * 32
+    db = tmp_path / "figures.sqlite3"
+    with TestClient(create_app(db_path=db, host_key=key, library=Host())) as api:
+        ticket = issue(key, "citrus-workbench-launch", "citrus-workbench", {"jti": uuid4().hex,
+                       "user_ref": "51", "project_ref": "session:styled-fixture", "return_to": "/",
+                       "frozen_project": "1" * 32, "frozen_render_version": 2})
+        require(api.post(BASE + "/launch", json={"ticket": ticket}))
+        doc = require(api.post(BASE + "/figures/import-frozen", json={"project_ref": "1" * 32,
+                                                                     "render_version": 2}), 201).json()
+        url = BASE + "/figures/" + doc["figure_id"]
+        assert prop(require(api.get(url)).json(), "axes_0.title", "text") == "Host edited"
+
+    cold = """
+from hashlib import sha256
+from pathlib import Path
+from uuid import uuid4
+import sys
+from fastapi.testclient import TestClient
+from wb.api import create_app
+from wb.auth import issue
+key = b'h' * 32
+with TestClient(create_app(db_path=Path(sys.argv[1]), host_key=key)) as api:
+    ticket = issue(key, 'citrus-workbench-launch', 'citrus-workbench', {'jti': uuid4().hex,
+        'user_ref':'51', 'project_ref':'session:styled-fixture', 'return_to':'/',
+        'frozen_project':'1'*32, 'frozen_render_version':2})
+    assert api.post('/api/v1/launch', json={'ticket':ticket}).status_code == 200
+    assert api.post('/api/v1/figures/import-frozen', json={'project_ref':'1'*32, 'render_version':2}).status_code == 404
+    url = sys.argv[2]
+    edit = api.patch(url+'/native-overrides', json={'expected_revision':1, 'patches':[
+        {'gid':'axes_0.title','prop':'text','value':'Edited while intake off'}]})
+    assert edit.status_code == 200 and edit.json()['revision'] == 2, edit.status_code
+    svg = api.post(url+'/export',json={'format':'svg'})
+    assert svg.status_code == 200 and b'Edited while intake off' in svg.content
+    assert sha256(svg.content).hexdigest() == svg.headers['x-content-sha256']
+"""
+    env = os.environ.copy()
+    env.pop("WORKBENCH_STYLED_IMPORT", None)
+    subprocess.run([sys.executable, "-B", "-c", cold, str(db), url], env=env,
+                   cwd=Path(__file__).resolve().parents[1], check=True, timeout=70)

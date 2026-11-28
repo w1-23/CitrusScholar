@@ -192,6 +192,23 @@ class EngineDocument(Strict):
     capture: Capture | None = None
 
 
+FrozenProjectRef = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
+
+
+class FrozenImport(Strict):
+    project_ref: FrozenProjectRef
+    render_version: int = Field(ge=1, le=999_999_999)
+
+
+class FrozenSource(Strict):
+    project_ref: FrozenProjectRef
+    render_version: int = Field(ge=1, le=999_999_999)
+    style_sha256: Sha256 | None = Field(default=None, exclude_if=lambda value: value is None)
+    bindings: list[Annotated[str, StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,47}$")]] = Field(min_length=1, max_length=8)
+    bundle_sha256: Sha256
+    runtime_ref: Sha256
+
+
 class SourceInfo(Strict):
     language: Literal["python", "r", "vector", "raster"]
     source_ref: Ref
@@ -199,6 +216,7 @@ class SourceInfo(Strict):
     library_asset_ref: Ref | None = None
     library_version: str | None = Field(default=None, max_length=120)
     receipt: SourceReceipt | None = None
+    frozen: FrozenSource | None = None
 
 
 class FigureDocument(EngineDocument):

@@ -241,10 +241,3 @@ body:is(.session-files-open, :has(#ctxDrawer.open)) .chat-panel :is(.turn-rail,.
 
 /* Queue ownership is exposed on the corresponding user turn, never as a bot reply. */
 .message.turn-awaiting-dispatch { display:none; }
-.message.user .content:has(.turn-user-queue-state) { display:flex; flex-direction:column; gap:5px; }
-.turn-user-queue-state {
-  display:inline-flex; align-items:center; align-self:flex-end; gap:5px;
-  padding:2px 7px; border:1px solid var(--border-hairline); border-radius:999px;
-  color:var(--text-secondary); background:var(--bg-surface); font-size:11px; line-height:1.35;
-}
-.turn-user-queue-state::before { content:""; width:5px; height:5px; flex:none; border-radius:50%; background:var(--accent); }

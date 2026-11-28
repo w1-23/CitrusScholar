@@ -2,7 +2,7 @@ import json
 import logging
 from threading import Event, Thread
 
-from .catalog import active_doi, document_rows, save_chunks
+from .catalog import active_copy, active_doi, document_identity, document_rows, save_chunks
 from .chunking import CHUNKER_VERSION, chunk
 from .errors import CorpusError
 from .generations import build
@@ -15,12 +15,13 @@ log = logging.getLogger(__name__)
 
 
 class Worker:
-    def __init__(self, database, sources, parser, embedding):
+    def __init__(self, database, sources, parser, embedding, *, translator=None):
         self.database = database
         self.queue = Queue(database)
         self.sources = sources
         self.parser = parser
         self.embedding = embedding
+        self.translator = translator
 
     def once(self):
         job = self.queue.claim()
@@ -100,10 +101,28 @@ class Worker:
                 result = document_rows(db, job['scope'], source, parsed)
                 finish(db, job, 'partial', {**result, 'limitations':['no_indexable_fulltext']})
             return
-        self.queue.phase(job, 'embedding')
         model, dimension = self.embedding.signature, self.embedding.dimension
+        identity, source_hash, _ = document_identity(source, parsed)
+
+        def finish_copy(db):
+            present = active_copy(db, job['scope'], identity, source_hash, model, dimension, CHUNKER_VERSION)
+            if present:
+                assert_lease(db, job)
+                finish(db, job, 'already_present', dict(present))
+            return bool(present)
+
+        with self.database.transaction(write=True) as db:
+            if finish_copy(db):
+                return
+        alignment = None
+        allows_translation = getattr(self.translator, 'allows_scope', None)
+        if self.translator is not None and (allows_translation is None or allows_translation(job['scope'])):
+            from .translation_alignment import align_for_index
+            chunks, alignment = align_for_index(chunks, parsed.metadata.get('language') or source.metadata.get('language'),
+                                                self.translator)
+        self.queue.phase(job, 'embedding')
         title = parsed.metadata.get('title') or source.metadata.get('title')
-        vectors = self.embedding.embed(['\n'.join(x for x in [title, *ch['heading_path'], ch['text']] if x) for ch in chunks])
+        vectors = self.embedding.embed(['\n'.join(x for x in [title, *ch['heading_path'], ch.get('text_en') or ch['text']] if x) for ch in chunks])
         if len(chunks) != len(vectors):
             raise CorpusError('embedding_invalid', 'Embedding count does not match the document chunks.', 422)
         encode_vector(vectors[0], dimension)
@@ -113,7 +132,9 @@ class Worker:
             # Another intake may have published the same DOI after this request queued.
             if verified and self._skip_active_doi(db, job, source.metadata['doi']):
                 return
-            result = document_rows(db, job['scope'], source, parsed)
+            if finish_copy(db):
+                return
+            result = document_rows(db, job['scope'], source, parsed, alignment=alignment)
             save_chunks(db, result, chunks, vectors, model, dimension, CHUNKER_VERSION, title)
             result.update({'embedding':model, 'dimension':dimension, 'chunker':CHUNKER_VERSION, 'chunks':len(chunks)})
             event(db, job['scope'], 'worker', 'validating', request_ref=job['ref'])

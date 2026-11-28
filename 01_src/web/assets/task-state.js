@@ -293,6 +293,13 @@
       entries.push(item);
       return item;
     }
+    function narration(data) {
+      if (!data || data.type !== 'execution_narration' || data.visibility !== 'public' ||
+          !data.event_id || typeof data.text !== 'string' || !data.text.trim()) return null;
+      var item = addNote('narration:' + generation + ':' + data.event_id, data.text);
+      if (item) item.narration = true;
+      return item;
+    }
     function note(data) {
       return nativeProgress(data) && data.status === 'in_progress' ? addNote(data.note_id, data.text) : null;
     }
@@ -347,6 +354,11 @@
       keys.forEach(function (key) { if (item.aliases.indexOf(key) < 0) item.aliases.push(key); });
       // A late proposal must not change any field of a formal attempt.
       if (data.status === 'proposed' && item.data.status && item.data.status !== 'proposed') return item;
+      if (item.data.status === 'proposed' && data.status !== 'proposed') {
+        // If proposed was hidden, place its first visible receipt at the
+        // actual dispatch/result position, not before the preceding explanation.
+        entries.splice(entries.indexOf(item), 1); entries.push(item);
+      }
       var incoming = Object.assign({}, data);
       // An alias start arriving after a result must not erase its outcome.
       if (['running', 'resuming'].indexOf(incoming.status) >= 0 && item.data.status &&
@@ -359,7 +371,6 @@
       if (!key || key === generation) return false;
       generation = key; currentPlan = null; resolutions.clear();
       actions.forEach(function (item) {
-        if (item.data.status === 'proposed') item.data.status = 'unrecorded';
         if (['running', 'resuming'].indexOf(item.data.status) >= 0) item.data.status = 'interrupted';
       });
       return true;
@@ -368,7 +379,7 @@
       entries.length = 0; actions.length = 0; seen.clear(); resolutions.clear();
       generation = ''; currentPlan = null;
     }
-    return {begin: begin, reset: reset, entries: entries, note: note, milestone: milestone, action: action, plan: plan, resolution: resolution, currentPlan: function () { return currentPlan; }};
+    return {begin: begin, reset: reset, entries: entries, note: note, narration: narration, milestone: milestone, action: action, plan: plan, resolution: resolution, currentPlan: function () { return currentPlan; }};
   }
   // Presentation only: queue and job state remain authoritative. Time starts at
   // the durable execution stamp, never at submission or observer attachment.

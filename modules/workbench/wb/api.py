@@ -18,7 +18,7 @@ from .figures import FigureError, Figures, saved_edits
 from .import_inputs import ASSET_NS, filename, resolve_inputs
 from .library import Library, LibraryMissing, LibraryUnavailable
 from .models import (
-    Edit, Export, FigureDocument, GroupMove, GroupScale, GroupSelection,
+    Edit, Export, FigureDocument, FrozenImport, GroupMove, GroupScale, GroupSelection,
     ImportRequest, Launch, NativeEdit, Pick, PreviewCards, PreviewImport, PreviewOperation, PreviewRun, Ref, Restore,
     RevisionHistory, RevisionName, RevisionSummary,
 )
@@ -70,11 +70,11 @@ def create_app(*, db_path=None, run=None, library=None, secret=None, host_key=No
     origin = os.getenv("WORKBENCH_PUBLIC_ORIGIN", "").rstrip("/")
     permits = BoundedSemaphore(2)
 
-    def limited_run(*args, **kwargs):
+    def limited_run(*args, renderer=None, **kwargs):
         if not permits.acquire(blocking=False):
             raise HTTPException(503, "当前渲染队列已满，请稍后再试。", headers={"Retry-After": "2"})
         try:
-            return (run or sandbox_run)(*args, **kwargs)
+            return (renderer or run or sandbox_run)(*args, **kwargs)
         finally:
             permits.release()
 
@@ -115,6 +115,14 @@ def create_app(*, db_path=None, run=None, library=None, secret=None, host_key=No
     def context(claims=Depends(login_claims)):
         return parse_session(claims)
 
+    def worker_only(session):
+        return session.user.startswith("host:") and os.getenv("WORKBENCH_HOST_WORKER_ONLY") == "1"
+
+    def standalone_sources(session=Depends(context)):
+        if worker_only(session):
+            raise HTTPException(403, "请返回聊天，从图件卡打开 Worker 已生成的图件。")
+        return session
+
     def establish(request, claims, session_ref):
         stable = {**claims, "session_ref": session_ref}
         token = issue(secret, "workbench-session", audience, stable, lifetime=HOURS_8)
@@ -152,7 +160,10 @@ def create_app(*, db_path=None, run=None, library=None, secret=None, host_key=No
         import time
         store.consume_ticket(nonce, int(time.time()), claims["exp"])
         return establish(request, {"user_ref": session.user, "project_ref": session.project,
-                          "return_to": session.return_to, "source_assets": list(session.source_assets)}, uuid4().hex)
+                          "return_to": session.return_to, "source_assets": list(session.source_assets),
+                          "frozen_project": session.frozen_project,
+                          **({"frozen_render_version": session.frozen_render_version}
+                             if session.frozen_render_version > 1 else {})}, uuid4().hex)
 
     @app.post("/api/v1/standalone")
     async def standalone(request: Request):
@@ -170,10 +181,13 @@ def create_app(*, db_path=None, run=None, library=None, secret=None, host_key=No
     @app.get("/api/v1/session")
     def get_session(claims=Depends(login_claims), session=Depends(context)):
         return {"workbench_session_ref": claims["session_ref"], "return_to": session.return_to,
-                "source_assets": list(session.source_assets)}
+                "source_assets": [] if worker_only(session) else list(session.source_assets),
+                "worker_only": worker_only(session),
+                **({"frozen_project": session.frozen_project} if session.frozen_project else {}),
+                **({"frozen_render_version": session.frozen_render_version} if session.frozen_render_version > 1 else {})}
 
     @app.post("/api/v1/assets", status_code=201)
-    async def upload(request: Request, x_filename: str = Header(), session=Depends(context)):
+    async def upload(request: Request, x_filename: str = Header(), session=Depends(standalone_sources)):
         try:
             name = filename(x_filename)
         except ValueError:
@@ -214,7 +228,7 @@ def create_app(*, db_path=None, run=None, library=None, secret=None, host_key=No
 
     @app.post("/api/v1/preview-runs", response_model=PreviewOperation, response_model_exclude_none=True)
     def prepare_preview(body: PreviewRun, idempotency_key: str = Header(pattern=r"^[A-Za-z0-9_.:-]{8,128}$"),
-                        session=Depends(context)):
+                        session=Depends(standalone_sources)):
         if body.source.kind != "script":
             raise InvalidInput("只有明确选取的绘图脚本可以准备来源预览。")
         ref, started = previews.begin(session.owner, idempotency_key, body.source)
@@ -244,7 +258,7 @@ def create_app(*, db_path=None, run=None, library=None, secret=None, host_key=No
         return previews.operation(session.owner, ref)
 
     @app.post("/api/v1/figures/import", status_code=201)
-    def import_figure(body: ImportRequest | PreviewImport, session=Depends(context)):
+    def import_figure(body: ImportRequest | PreviewImport, session=Depends(standalone_sources)):
         if isinstance(body, PreviewImport):
             doc = previews.import_card(session.owner, body)
         else:
@@ -254,6 +268,17 @@ def create_app(*, db_path=None, run=None, library=None, secret=None, host_key=No
         return {"import_id": uuid4().hex, "figure_id": doc.figure_id, "detected_language": doc.source.language,
                 "renderer_id": doc.renderer.id, "editability": doc.editability, "status": "ready",
                 "limitations": doc.limitations}
+
+    @app.post("/api/v1/figures/import-frozen", status_code=201)
+    def import_frozen(body: FrozenImport, session=Depends(context)):
+        # Resolve after explicit user action, never while opening Workbench.
+        if (body.project_ref != session.frozen_project or body.render_version != session.frozen_render_version
+                or (body.render_version > 1 and os.getenv("WORKBENCH_STYLED_IMPORT") != "1")):
+            raise LibraryMissing
+        revision = () if body.render_version == 1 else (body.render_version,)
+        frozen = library.frozen_inputs(session, body.project_ref, *revision)
+        doc = figures.import_frozen(session.owner, body.project_ref, body.render_version, frozen)
+        return {"figure_id": doc.figure_id, "status": "ready", "editability": doc.editability}
 
     @app.get("/api/v1/figures/{ref}", response_model=FigureDocument)
     def get_figure(ref: Ref, revision: int | None = Query(default=None, ge=1), session=Depends(context)):

@@ -71,10 +71,14 @@ def _scopes(actor, selection):
 
 
 def requests(actor, payload):
-    fields(payload, ('query', 'sources'), ('evolution_scope', 'filters', 'budget'))
+    fields(payload, ('query', 'sources'), ('evolution_scope', 'filters', 'budget', 'english_query'))
     query, sources = payload['query'], payload['sources']
     if not isinstance(query, str) or not query.strip() or len(query) > 4096:
         raise CorpusError('invalid_query', 'Query must contain 1 to 4096 characters.')
+    english = payload.get('english_query')
+    if english is not None and (not isinstance(english, str) or not 1 <= len(english.strip()) <= 4096
+                                or not re.search(r'[A-Za-z]', english)):
+        raise CorpusError('invalid_query', 'Invalid English retrieval query.')
     if not isinstance(sources, list) or not 1 <= len(sources) <= len(SOURCE_IDS):
         raise CorpusError('invalid_sources', 'Choose one or more Corpus sources.')
     choices = {}
@@ -105,4 +109,4 @@ def requests(actor, payload):
     if 'document_ref' in filters and (not isinstance(filters['document_ref'], str) or
             not re.fullmatch(r'[A-Za-z0-9._:@-]{1,200}', filters['document_ref'])):
         raise CorpusError('invalid_filters', 'Invalid document reference filter.')
-    return query.strip(), choices, scopes, filters, Budget.parse(payload.get('budget', {}))
+    return query.strip(), english.strip() if english else None, choices, scopes, filters, Budget.parse(payload.get('budget', {}))

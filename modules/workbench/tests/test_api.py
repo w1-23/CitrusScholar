@@ -48,9 +48,10 @@ def assert_ok(response, status=200):
     return response
 
 
-def launch(client, user="51", project="account"):
+def launch(client, user="51", project="account", frozen_project=""):
     ticket = issue(KEY, "citrus-workbench-launch", "citrus-workbench", {
         "jti": uuid4().hex, "user_ref": user, "project_ref": project, "return_to": "/conversation/123",
+        **({"frozen_project": frozen_project} if frozen_project else {}),
     })
     assert_ok(client.post(BASE + "/launch", json={"ticket": ticket}))
     return ticket
@@ -306,3 +307,152 @@ def test_revision_name_is_scoped_metadata_and_restore_does_not_rename(app_settin
     with TestClient(create_app(**app_settings)) as cold:
         launch(cold)
         assert assert_ok(cold.get(history)).json()["versions"][2] == original
+
+
+
+def test_frozen_import_explicit_then_cold_edit_and_runtime_fencing(app_settings):
+    from wb.bundle import InputAsset, digest
+    from wb.frozen_inputs import FrozenInputs
+    from wb.library import LibraryMissing
+
+    host_ref = "f" * 32
+    session = "session:workbench-fixture"
+    table = b'{"typed":"fixture"}'
+    source = b"plt.plot(data['tidy']['x'])\n"
+    runtime = ["1" * 64]
+    requests, renders = [], []
+
+    class Library:
+        def frozen_inputs(self, actor, ref):
+            requests.append((actor.project, ref))
+            if actor.project != session or ref != host_ref:
+                raise LibraryMissing
+            return FrozenInputs(InputAsset.snapshot("render.py", digest(source), source),
+                (InputAsset.snapshot("input_0.json", digest(table), table),), ("tidy",))
+
+    def renderer(language, code, settings, *, bundle):
+        asset, (dependency,) = bundle
+        assert asset.body == code == source and dependency.body == table
+        assert language == "python" and settings["frozen_bindings"] == ["tidy"]
+        renders.append(settings)
+        return fake_render(language, code, settings)
+
+    settings = {**app_settings, "run": renderer, "library": Library(), "runtime": lambda kind: runtime[0]}
+    endpoint = BASE + "/figures/import-frozen"
+    with TestClient(create_app(**settings)) as client:
+        launch(client, project=session)
+        assert client.post(endpoint, json={"project_ref": host_ref, "render_version": 1}).status_code == 404
+        launch(client, project=session, frozen_project=host_ref)
+        assert assert_ok(client.get(BASE + "/session")).json()["frozen_project"] == host_ref
+        assert client.post(endpoint, json={"project_ref": "e" * 32, "render_version": 1}).status_code == 404
+        assert not requests and not renders
+        assert client.post(endpoint, json={"project_ref": host_ref, "render_version": 2}).status_code == 404
+        saved = assert_ok(client.post(endpoint, json={"project_ref": host_ref, "render_version": 1}), 201).json()
+        url = BASE + "/figures/" + saved["figure_id"]
+        initial = assert_ok(client.get(url)).json()
+        assert initial["source"]["frozen"]["bindings"] == ["tidy"]
+        assert initial["source"]["source_hash"] == digest(source)
+        assert len(requests) == len(renders) == 1
+    with TestClient(create_app(**settings)) as client:
+        launch(client, project=session)
+        assert_ok(client.get(url))
+        patch = {"expected_revision": 1, "overrides": {"title": {"text": "Changed"}}}
+        document = assert_ok(client.patch(url + "/overrides", json=patch)).json()
+        assert document["revision"] == 2 and document["objects"][0]["properties"]["text"] == "Changed"
+        runtime[0] = "2" * 64
+        assert client.post(url + "/export", json={"format": "png"}).status_code == 422
+        assert len(requests) == 1 and len(renders) == 2
+
+
+def test_versioned_frozen_style_survives_restart_without_host(tmp_path):
+    from wb.bundle import digest
+    from wb.figures import FigureError, Figures
+    from wb.frozen_inputs import decode_frozen_inputs
+    from wb.models import Export
+    from wb.store import Store
+    from test_frozen_inputs import styled_envelope
+
+    payload = styled_envelope()
+    inputs = decode_frozen_inputs(payload, render_version=7)
+    path = tmp_path / "styled.sqlite3"
+    calls = []
+
+    def render(language, code, settings, *, bundle):
+        assert bundle[0].body == code == inputs.entrypoint.body
+        assert bundle[1][0].body == inputs.dependencies[0].body
+        assert settings["host_style_replay"]["overrides"][0]["value"] == "New title"
+        calls.append(settings["format"])
+        return fake_render(language, code, settings)
+
+    service = Figures(Store(path), render, lambda _: "1" * 64)
+    saved = service.import_frozen("owner", "1" * 32, 7, inputs)
+    assert saved.source.frozen.render_version == 7
+    assert saved.source.frozen.style_sha256 == digest(inputs.style_json)
+    assert "New title" not in saved.model_dump_json()
+    assert service.store.frozen_style("other", saved.figure_id) is None
+    service = Figures(Store(path), render, lambda _: "1" * 64)
+    assert service.export("owner", saved.figure_id, Export(format="png"))[0] == sample_png()
+    with service.store.connect() as db:
+        db.execute("UPDATE frozen_styles SET body=? WHERE figure=?", (b"{}", saved.figure_id))
+    with pytest.raises(FigureError, match="冻结样式"):
+        service.export("owner", saved.figure_id, Export(format="png"))
+    assert calls == ["png", "png"]
+
+
+def test_versioned_frozen_launch_limits_import_to_exact_revision(app_settings, monkeypatch):
+    from wb.frozen_inputs import decode_frozen_inputs
+    from test_frozen_inputs import styled_envelope
+
+    project = "session:workbench-fixture"
+    ref = "a" * 32
+    calls = []
+
+    class Library:
+        def frozen_inputs(self, actor, requested_ref, version=1):
+            calls.append((actor.project, requested_ref, version))
+            return decode_frozen_inputs(styled_envelope(), render_version=version)
+
+    def render(language, code, settings, *, bundle):
+        assert settings["host_style_replay"]["overrides"][0]["value"] == "New title"
+        return fake_render(language, code, settings)
+
+    options = {**app_settings, "run": render, "library": Library(), "runtime": lambda _: "1" * 64}
+    with TestClient(create_app(**options)) as client:
+        ticket = issue(KEY, "citrus-workbench-launch", "citrus-workbench", {
+            "jti": uuid4().hex, "user_ref": "51", "project_ref": project, "return_to": "/",
+            "frozen_project": ref, "frozen_render_version": 7})
+        assert_ok(client.post(BASE + "/launch", json={"ticket": ticket}))
+        assert assert_ok(client.get(BASE + "/session")).json()["frozen_render_version"] == 7
+        assert calls == []
+        endpoint = BASE + "/figures/import-frozen"
+        for requested_ref, version in ((ref, 1), (ref, 8), ("b" * 32, 7)):
+            assert client.post(endpoint, json={"project_ref": requested_ref, "render_version": version}).status_code == 404
+        assert calls == []
+        monkeypatch.delenv("WORKBENCH_STYLED_IMPORT", raising=False)
+        payload = {"project_ref": ref, "render_version": 7}
+        assert client.post(endpoint, json=payload).status_code == 404 and calls == []
+        with monkeypatch.context() as enable:
+            enable.setenv("WORKBENCH_STYLED_IMPORT", "1")
+            saved = assert_ok(client.post(endpoint, json=payload), 201).json()
+        assert_ok(client.post(BASE + "/figures/" + saved["figure_id"] + "/export", json={"format": "png"}))
+        assert assert_ok(client.get(BASE + "/figures/" + saved["figure_id"])).json()["source"]["frozen"]["render_version"] == 7
+        assert calls == [(project, ref, 7)]
+
+
+def test_worker_only_host_session_rejects_non_worker_intake(app_settings, monkeypatch):
+    monkeypatch.setenv("WORKBENCH_HOST_WORKER_ONLY", "1")
+    with TestClient(create_app(**app_settings)) as client:
+        launch(client)
+        assert assert_ok(client.get(BASE + "/session")).json()["worker_only"] is True
+        source = {"kind": "script", "language": "python", "entrypoint_ref": "a" * 32}
+        for path, args in (
+            ("/assets", {"headers": {"X-Filename": "figure.py"}, "content": SOURCE}),
+            ("/preview-runs", {"headers": {"Idempotency-Key": "fixture-key"}, "json": {"source": source}}),
+            ("/figures/import", {"json": {"source": source}}),
+        ):
+            assert client.post(BASE + path, **args).status_code == 403
+        assert client.get(BASE + "/figures").status_code == 200
+        assert client.post(BASE + "/figures/import-frozen", json={"project_ref": "b" * 32, "render_version": 1}).status_code == 404
+        assert_ok(client.post(BASE + "/standalone", json={"token": app_settings["standalone_token"]}))
+        assert assert_ok(client.get(BASE + "/session")).json()["worker_only"] is False
+        assert_ok(client.post(BASE + "/assets", headers={"X-Filename": "figure.py"}, content=SOURCE), 201)

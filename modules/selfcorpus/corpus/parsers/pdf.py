@@ -49,7 +49,7 @@ def _grobid(data: bytes, endpoint: str, timeout: float) -> Parsed:
     if local(root.tag) != "TEI":
         raise ValueError("GROBID did not return TEI")
     parsed = parse_article(root, parser="grobid-tei/1")
-    return replace(parsed, structured={**parsed.structured, "tei_xml": xml.decode("utf-8-sig", "replace")})
+    return parsed
 
 
 def _docling(data: bytes, artifacts_path: str) -> Parsed:
@@ -61,7 +61,8 @@ def _docling(data: bytes, artifacts_path: str) -> Parsed:
     if not path.is_dir():
         raise ValueError("Docling requires a local artifacts directory")
     # An explicit model directory and disabled remote services keep documents in this process.
-    options = PdfPipelineOptions(artifacts_path=path, enable_remote_services=False, do_ocr=False)
+    options = PdfPipelineOptions(artifacts_path=path, enable_remote_services=False, do_ocr=False,
+                                 generate_picture_images=False, generate_page_images=False)
     converter = DocumentConverter(allowed_formats=[InputFormat.PDF], format_options={
         InputFormat.PDF: PdfFormatOption(pipeline_options=options),
     })
@@ -75,6 +76,8 @@ def _docling(data: bytes, artifacts_path: str) -> Parsed:
     seen_pages = set()
     for item, _level in result.document.iterate_items():
         label = getattr(getattr(item, "label", None), "value", "")
+        if label in {'picture', 'image', 'figure'}:
+            continue
         text = (getattr(item, "text", "") or "").strip()
         if label == "table" and hasattr(item, "export_to_markdown"):
             text = item.export_to_markdown(doc=result.document).strip()
@@ -96,8 +99,7 @@ def _docling(data: bytes, artifacts_path: str) -> Parsed:
         adapter_version = version("docling")
     except PackageNotFoundError:
         adapter_version = "unknown"
-    parsed = build(f"docling-pdf/1:{adapter_version}", blocks, warnings=warnings)
-    return replace(parsed, structured={**parsed.structured, "docling": result.document.export_to_dict()})
+    return build(f"docling-pdf/2:{adapter_version}", blocks, warnings=warnings)
 
 
 def parse_pdf(data: bytes, endpoint: str | None, artifacts_path: str | None, timeout: float) -> Parsed:

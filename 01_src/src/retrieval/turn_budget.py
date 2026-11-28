@@ -64,6 +64,7 @@ class TurnRetrievalBudget:
     _started: float | None = None
     _wall_started: float | None = None
     _calls: dict[str, str] = field(default_factory=dict)
+    _pending: dict[str, str] = field(default_factory=dict)
     _lanes: Counter = field(default_factory=Counter)
     _seen: dict[str, set[tuple]] = field(default_factory=dict)
     _observed: set[str] = field(default_factory=set)
@@ -86,31 +87,53 @@ class TurnRetrievalBudget:
         lane = _lane(name, args)
         if not lane or not call_id or call_id in self._calls:
             return
+        self._pending.pop(call_id, None)
         if self._started is None:
             self._started = time.monotonic()
             self._wall_started = time.time()
         self._calls[call_id] = lane
         self._lanes[lane] += 1
 
-    def admit(self, name: str, call_id: str, args: Mapping) -> str | None:
+    def _stop_reason(self, lane: str) -> str | None:
+        if len(self._calls) + len(self._pending) >= self.limits.calls:
+            return "retrieval_call_budget_exhausted"
+        if self._token_count >= self.limits.observed_tokens:
+            return "retrieval_token_budget_exhausted"
+        if self._started is not None and time.monotonic() - self._started >= self.limits.seconds:
+            return "retrieval_deadline_exhausted"
+        if self._no_gain[lane] >= 2:
+            return "retrieval_no_new_evidence"
+        if lane in _DISCOVERY and self._lanes[lane] + sum(v == lane for v in self._pending.values()) >= self.limits.discovery_calls:
+            return "retrieval_followup_budget_exhausted"
+        return None
+
+    def visible_tools(self, names) -> set[str]:
+        """Retire discovery/fetch schemas, keeping exact reads and non-search tools.
+
+        The browser also closes tabs and downloads existing results. Gate its
+        retrieval actions per invocation instead of removing its whole schema.
+        """
+        return {name for name in names if name == "browse_web" or name not in _LANES
+                or not self._stop_reason(_LANES[name])}
+
+    def reserve(self, name: str, call_id: str, args: Mapping) -> str | None:
         lane = _lane(name, args)
-        if not lane or call_id in self._calls:
+        if not lane or call_id in self._calls or call_id in self._pending:
             return None
-        if len(self._calls) >= self.limits.calls:
-            reason = "retrieval_call_budget_exhausted"
-        elif self._token_count >= self.limits.observed_tokens:
-            reason = "retrieval_token_budget_exhausted"
-        elif self._started is not None and time.monotonic() - self._started >= self.limits.seconds:
-            reason = "retrieval_deadline_exhausted"
-        elif self._no_gain[lane] >= 2:
-            reason = "retrieval_no_new_evidence"
-        elif lane in _DISCOVERY and self._lanes[lane] >= self.limits.discovery_calls:
-            reason = "retrieval_followup_budget_exhausted"
-        else:
-            self.restore(name, call_id, args)
-            return None
-        self._stops.setdefault(reason, set()).add(lane)
-        return reason
+        if reason := self._stop_reason(lane):
+            self._stops.setdefault(reason, set()).add(lane)
+            return reason
+        self._pending[call_id] = lane
+        return None
+
+    def release(self, call_id: str) -> None:
+        self._pending.pop(call_id, None)
+
+    def admit(self, name: str, call_id: str, args: Mapping) -> str | None:
+        if reason := self.reserve(name, call_id, args):
+            return reason
+        self.restore(name, call_id, args)
+        return None
 
     def observe(self, name: str, call_id: str, artifact, *, status: str, reason: str, content=None) -> None:
         lane = self._calls.get(call_id)
@@ -136,7 +159,8 @@ class TurnRetrievalBudget:
             self._no_gain[lane] = 0
         elif keys or reason == "no_new_candidates":
             self._no_gain[lane] = 2
-        elif projected["status"] == "no_results":
+        elif (projected["status"] == "no_results"
+              and not (artifact.get("corpus_contract") == 1 and artifact.get("selected_result_count"))):
             self._no_gain[lane] += 1
 
     def summary(self) -> dict:

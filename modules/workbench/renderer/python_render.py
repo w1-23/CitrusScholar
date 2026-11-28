@@ -68,7 +68,26 @@ def load_engine():
     )
 
 
-def capture_figures(source: Path) -> list[Figure]:
+def frozen_globals(source: Path, bindings) -> dict:
+    """Restore the same typed data mapping as the Host's separated renderer."""
+    import keyword
+    import re
+
+    if (not isinstance(bindings, list) or not 1 <= len(bindings) <= 8
+            or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", name)
+                   or keyword.iskeyword(name) for name in bindings)
+            or len(set(bindings)) != len(bindings)):
+        raise ValueError("Invalid frozen data bindings")
+    from citrus_figures.dataset_codec import decode_frame
+
+    data = {}
+    for index, binding in enumerate(bindings):
+        with (source.parent / f"input_{index}.json").open(encoding="utf-8") as stream:
+            data[binding] = decode_frame(json.load(stream))
+    return {"data": data, "plt": plt, "matplotlib": matplotlib}
+
+
+def capture_figures(source: Path, *, init_globals=None) -> list[Figure]:
     """Run a script and retain open, shown, or saved figures."""
     captured = {}
     original_savefig = Figure.savefig
@@ -94,7 +113,7 @@ def capture_figures(source: Path) -> list[Figure]:
         chdir(source.parent) if source.parent == Path("/inputs/project") else nullcontext(),
     ):
         try:
-            namespace = runpy.run_path(str(source), run_name="__main__")
+            namespace = runpy.run_path(str(source), run_name="__main__", init_globals=init_globals)
         except SystemExit as exc:
             if exc.code not in (None, 0):
                 raise ValueError(f"source exited with status {exc.code}") from exc
@@ -219,6 +238,35 @@ def export_size_patches(patches, request, figure_gid):
     return sized
 
 
+def replay_host_style(figure, replay):
+    from citrus_figures.core import RenderedFigure
+    from citrus_figures.manifest import assign_locators, build_manifest
+    from citrus_figures.overrides import apply_overrides, validate_overrides
+    from citrus_figures.styling import prepare_figure_fonts
+    from citrus_figures.style_replay import (coordinate_sha256, replay_baseline,
+                                              typed_payload_sha256, valid_baseline)
+
+    if not isinstance(replay, dict) or set(replay) != {"baseline", "overrides", "overrides_sha256"}:
+        raise ValueError("Invalid saved style receipt")
+    expected = replay["baseline"]
+    if not valid_baseline(expected) or not isinstance(replay["overrides"], list) or not replay["overrides"]:
+        raise ValueError("Invalid saved style receipt")
+    prepare_figure_fonts(figure)
+    rendered = assign_locators(RenderedFigure(figure=figure, axes=list(figure.axes), qa_profile={}))
+    manifest = build_manifest(rendered, source="script", include_qa=False)
+    if replay_baseline(figure, manifest["objects"]) != expected:
+        raise ValueError("The original figure could not be reproduced")
+    edits = validate_overrides(replay["overrides"], manifest)
+    if typed_payload_sha256(edits) != replay["overrides_sha256"]:
+        raise ValueError("The saved style changes do not match the receipt")
+    applied = apply_overrides(rendered, manifest, edits)
+    if sorted(applied) != sorted(edit["gid"] for edit in edits):
+        raise ValueError("The saved style changes were not applied")
+    figure.canvas.draw()
+    if coordinate_sha256(figure) != expected["coordinates_sha256"]:
+        raise ValueError("The saved style changes altered figure data or geometry")
+
+
 def render(source: Path, request: dict, output: Path) -> None:
     matplotlib.use("Agg")
     engine = load_engine()
@@ -228,12 +276,18 @@ def render(source: Path, request: dict, output: Path) -> None:
     if ordinal is not None:
         random.seed(1)
         np.random.seed(1)
-    captured = capture_figures(source)
+    bindings = request.get("frozen_bindings")
+    captured = (capture_figures(source) if bindings is None else
+                capture_figures(source, init_globals=frozen_globals(source, bindings)))
     if ordinal is None and len(captured) != 1:
         raise ValueError(f"source must create one Matplotlib Figure, found {len(captured)}")
     if ordinal is not None and ordinal >= len(captured):
         raise ValueError("Figure ordinal not captured")
     figure = captured[ordinal or 0]
+    if "host_style_replay" in request:
+        if bindings is None or ordinal is not None:
+            raise ValueError("Saved Host style is only supported with a frozen renderer")
+        replay_host_style(figure, request["host_style_replay"])
     capture = None
     if ordinal is not None:
         # Witness the unmodified capture before a requested size or any native patch.

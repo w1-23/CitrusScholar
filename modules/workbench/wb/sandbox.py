@@ -79,6 +79,8 @@ assert not os.path.exists('/sys/fs/cgroup')
 readonly = ['/', '/inputs', '/app/renderer']
 if language == 'python':
     readonly.append('/tavotto/src')
+    if os.path.exists('/citrus-packages/citrus_figures'):
+        readonly.extend(('/citrus-packages/citrus_figures', '/citrus-packages/citrus_audit'))
 assert all(os.statvfs(p).f_flag & os.ST_RDONLY for p in readonly)
 volume = os.stat('/outputs').st_dev
 for path in ('/outputs', '/tmp', '/var/tmp', '/dev/shm', '/dev', os.environ['HOME']):
@@ -121,7 +123,7 @@ def _absolute_path(value, *, file=False):
     return resolved
 
 
-def _container_command(language, fmt, inputs, entrypoint=None):
+def _container_command(language, fmt, inputs, entrypoint=None, *, frozen=False):
     suffix, *renderer = _LANGUAGES[language]
     image_value = os.environ.get("WORKBENCH_IMAGE", "")
     if not image_value.endswith(".sif"):
@@ -134,7 +136,16 @@ def _container_command(language, fmt, inputs, entrypoint=None):
         upstream = _absolute_path(os.environ.get("WORKBENCH_TAVOTTO", ""))
         tavotto_src = _absolute_path(str(upstream / "src"))
         binds.extend(("--bind", f"{tavotto_src}:/tavotto/src:ro"))
-        renderer_env += ",PYTHONPATH=/tavotto/src,MPLCONFIGDIR=/tmp/matplotlib,PYTHONHASHSEED=0"
+        package_path = ""
+        if frozen:
+            package_dir = _absolute_path(os.environ.get("WORKBENCH_FROZEN_PACKAGES", ""))
+            if not all((package_dir / name).is_dir() and not (package_dir / name).is_symlink()
+                       for name in ("citrus_figures", "citrus_audit")):
+                raise SandboxError("Frozen dataset runtime is unavailable.")
+            for name in ("citrus_figures", "citrus_audit"):
+                binds.extend(("--bind", f"{package_dir / name}:/citrus-packages/{name}:ro"))
+            package_path = ":/citrus-packages"
+        renderer_env += f",PYTHONPATH=/tavotto/src{package_path},MPLCONFIGDIR=/tmp/matplotlib,PYTHONHASHSEED=0"
     namespaces = [os.readlink(f"/proc/self/ns/{name}") for name in ("net", "pid", "ipc")]
     return [
         "/usr/bin/apptainer", "exec", "--disable-cache", "--containall", "--cleanenv",
@@ -249,6 +260,9 @@ def run(language: str, source: bytes, request: dict, *, bundle=None) -> tuple[di
     if len(encoded) > _REQUEST_MAX:
         raise SandboxError("Render request exceeded the size limit.")
 
+    frozen = "frozen_bindings" in request
+    if frozen and (language != "python" or bundle is None):
+        raise SandboxError("Frozen datasets require an isolated Python script bundle.")
     if bundle is not None:
         entry, dependencies = bundle
         try:
@@ -270,7 +284,8 @@ def run(language: str, source: bytes, request: dict, *, bundle=None) -> tuple[di
                 project.mkdir(mode=0o700)
                 for asset in (entry, *dependencies):
                     (project / asset.name).write_bytes(asset.body)
-                container = _container_command(language, fmt, inputs, f"/inputs/project/{entry.name}")
+                container = (_container_command(language, fmt, inputs, f"/inputs/project/{entry.name}", frozen=True)
+                             if frozen else _container_command(language, fmt, inputs, f"/inputs/project/{entry.name}"))
             unit = f"workbench-render-{uuid.uuid4().hex}.service"
             command = _systemd_command(unit, container)
             return _decode(_capture(unit, command))

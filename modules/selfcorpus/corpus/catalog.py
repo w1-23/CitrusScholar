@@ -14,7 +14,7 @@ def active_doi(db, scope, doi):
                          WHERE d.scope=? AND d.identity=?''', (scope, 'doi:' + doi)).fetchone()
 
 
-def document_rows(db, scope, source, parsed):
+def document_identity(source, parsed):
     metadata = {**source.metadata, **{k:v for k,v in parsed.metadata.items() if v not in (None, '', [])}}
     raw_doi = metadata.get('doi')
     doi = normalize_doi(raw_doi) if raw_doi else None
@@ -23,15 +23,33 @@ def document_rows(db, scope, source, parsed):
         raise CorpusError('identity_mismatch', 'Resolved DOI and parsed DOI do not match.', 422)
     if doi:
         metadata['doi'] = doi
+    source_hash = digest(source.content)
+    identity = ('doi:' + str(doi).casefold()) if doi else ('uri:' + source.uri if source.kind != 'upload' else 'sha256:' + source_hash)
+    return identity, source_hash, metadata
+
+
+def active_copy(db, scope, identity, source_hash, model, dimension, chunker):
+    return db.execute('''SELECT m.document_ref, m.gen AS generation_ref
+        FROM active a JOIN generations g ON g.ref=a.gen
+        JOIN generation_members m ON m.gen=g.ref
+        JOIN documents d ON d.ref=m.document_ref AND d.scope=a.scope
+        JOIN versions v ON v.ref=m.version_ref AND v.document_ref=d.ref
+        WHERE a.scope=? AND d.identity=? AND v.source_hash=? AND g.embedding=? AND g.dimension=? AND g.chunker=?
+        ''', (scope, identity, source_hash, model, dimension, chunker)).fetchone()
+
+
+def document_rows(db, scope, source, parsed, *, alignment=None):
+    identity, source_hash, metadata = document_identity(source, parsed)
+    doi = metadata.get('doi')
     title = metadata.get('title') or None
     year = metadata.get('year')
     year = int(year) if re.fullmatch(r'[12][0-9]{3}', str(year)) else None
-    source_hash = digest(source.content)
-    identity = ('doi:' + str(doi).casefold()) if doi else ('uri:' + source.uri if source.kind != 'upload' else 'sha256:' + source_hash)
     doc = ref('doc', scope, identity)
     uri = metadata.get('fulltext_url') or source.uri
     version = ref('ver', doc, uri, source_hash, metadata, source.access_note)
-    parsed_ref = ref('parse', version, parsed.parser, digest(parsed.markdown), digest(dumps(parsed.structured)))
+    alignment_identity = ('aligned-english-v1', alignment) if alignment else ()
+    parsed_ref = ref('parse', version, parsed.parser, digest(parsed.markdown), digest(dumps(parsed.structured)),
+                     *alignment_identity)
     db.execute('INSERT OR IGNORE INTO documents VALUES(?,?,?)', (doc, scope, identity))
     db.execute('INSERT OR IGNORE INTO versions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                (version, doc, doi, title, year, uri, source.kind, source_hash, source.retrieved_at,
@@ -51,7 +69,10 @@ def save_chunks(db, result, chunks, vectors, model, dimension, chunker, title):
              ch.get('page_start'), ch.get('page_end'), ch['text'], ch['token_count'], ch['content_hash']))
         if cursor.rowcount:
             id_ = cursor.lastrowid
-            terms = ' '.join(tokens(' '.join([title or '', *ch['heading_path'], ch['text']])))
+            translation = ch.get('text_en', '')
+            if translation:
+                db.execute('INSERT INTO chunk_translations VALUES(?,?,?)', (id_, translation, digest(translation)))
+            terms = ' '.join(tokens(' '.join([title or '', *ch['heading_path'], ch['text'], translation])))
             db.execute('INSERT INTO chunk_fts(rowid,terms) VALUES(?,?)', (id_, terms))
         else:
             id_ = db.execute('SELECT id FROM chunks WHERE ref=?', (chunk_ref,)).fetchone()[0]

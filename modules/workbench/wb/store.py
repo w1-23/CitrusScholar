@@ -35,6 +35,10 @@ class Store:
                     figure TEXT PRIMARY KEY REFERENCES figures(id) NOT NULL,
                     manifest TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS frozen_styles (
+                    figure TEXT PRIMARY KEY REFERENCES figures(id) NOT NULL,
+                    body BLOB NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS revisions (
                     figure TEXT REFERENCES figures(id) NOT NULL, rev INTEGER NOT NULL,
                     doc TEXT NOT NULL, overrides TEXT NOT NULL, preview BLOB NOT NULL,
@@ -96,16 +100,24 @@ class Store:
                 if row is None or tuple(row) != (asset.name, asset.sha, len(asset.body)):
                     raise Missing
 
-    def create(self, owner, doc, preview, source, dependencies=()):
+    def create(self, owner, doc, preview, source, dependencies=(), *, style=None):
         validate_bundle(source, dependencies)
         inputs = (source, *dependencies)
         with self.connect() as db:
             self.pin_assets(db, owner, inputs)
             db.execute("INSERT INTO figures VALUES (?,?,?,?,1)",
                        (doc.figure_id, owner, doc.name, source.ref))
+            if style is not None:
+                db.execute("INSERT INTO frozen_styles VALUES (?,?)", (doc.figure_id, style))
             manifest = json.dumps([asset.pin() for asset in inputs])
             db.execute("INSERT INTO figure_inputs VALUES (?,?)", (doc.figure_id, manifest))
             self._insert(db, doc, {"inputs_sha256": digest(manifest.encode())}, preview)
+
+    def frozen_style(self, owner, ref):
+        with self.connect() as db:
+            row = db.execute("SELECT s.body FROM frozen_styles s JOIN figures f ON f.id=s.figure "
+                             "WHERE f.owner=? AND f.id=?", (owner, ref)).fetchone()
+        return row["body"] if row is not None else None
 
     def figure_inputs(self, owner, doc, row):
         if row["asset"] != doc.source.source_ref:

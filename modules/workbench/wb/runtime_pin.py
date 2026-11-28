@@ -8,6 +8,42 @@ from pathlib import Path
 
 from .sandbox import SandboxError
 
+from types import ModuleType
+
+
+def historical_renderer(language, expected):
+    if language not in {"python", "r", "frozen-python"}:
+        raise SandboxError("The original renderer is unavailable.")
+    candidates = (os.getenv("WORKBENCH_PREVIOUS_SOURCE", ""),
+                  os.getenv("WORKBENCH_OLDER_SOURCE", ""))
+    for configured in dict.fromkeys(filter(None, candidates)):
+        root = Path(configured)
+        try:
+            if not root.is_absolute() or root.resolve(strict=True) != root or any(
+                    p.is_symlink() or p.stat().st_mode & 0o222 for p in (root, *root.rglob("*"))):
+                continue
+            if identity(language, root=root) != expected:
+                continue
+            path = root / "wb/sandbox.py"
+            module = ModuleType("wb._historical_sandbox")
+            module.__file__ = str(path)
+            module.__package__ = "wb"
+            exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
+            break
+        except (OSError, SandboxError):
+            continue
+    else:
+        raise SandboxError("The original renderer is unavailable.")
+
+    def run(*args, **kwargs):
+        try:
+            return module.run(*args, **kwargs)
+        except module.SandboxError as exc:
+            raise SandboxError(str(exc)) from None
+
+    return run, lambda: identity(language, root=root)
+
+
 POLICY = "isolated-relative-bundle/v1"
 
 
@@ -28,15 +64,15 @@ def _hash_image(path):
     return result
 
 
-def identity(language):
-    root = Path(__file__).resolve().parents[1]
+def identity(language, *, root=None):
+    root = root or Path(__file__).resolve().parents[1]
     try:
         image = Path(os.environ["WORKBENCH_IMAGE"]).resolve(strict=True)
         if image.suffix != ".sif" or not image.is_file():
             raise OSError("invalid image")
         paths = [(root, root / "requirements.lock"), (root, root / "wb/sandbox.py")]
         paths += [(root, f) for f in sorted((root / "renderer").iterdir()) if f.is_file()]
-        if language == "python":
+        if language in {"python", "frozen-python"}:
             upstream = Path(os.environ["WORKBENCH_TAVOTTO"]).resolve(strict=True)
             paths.extend((upstream, upstream / f) for f in ("uv.lock", "packaging/runtime-lock.json"))
             src = upstream / "src/tavotto"
@@ -44,6 +80,13 @@ def identity(language):
                 raise OSError("missing Tavotto source")
             paths.extend((upstream, f) for f in sorted(src.rglob("*"))
                          if f.is_file() and "__pycache__" not in f.parts and f.suffix != ".pyc")
+        if language == "frozen-python":
+            packages = Path(os.environ["WORKBENCH_FROZEN_PACKAGES"]).resolve(strict=True)
+            for name in ("citrus_figures", "citrus_audit"):
+                package = packages / name
+                if not package.is_dir() or package.is_symlink() or not (package / "__init__.py").is_file():
+                    raise OSError("missing frozen dataset runtime")
+                paths.extend((packages, f) for f in sorted(package.rglob("*.py")) if f.is_file())
         combined = sha256(json.dumps([POLICY, language, _hash_image(image)]).encode())
         for base, path in paths:
             if path.is_symlink():

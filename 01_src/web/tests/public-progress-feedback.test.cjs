@@ -53,11 +53,6 @@ test('native note drives waiting, tool activity takes priority, and finish clear
   assert.equal([...panel.element.querySelectorAll('.research-process-note')]
     .filter(note => note.textContent === waiting.text).length, 1);
   assert.doesNotMatch(panel.element.textContent, /private fixture|内部工作说明|外部任务信息|首批响应/);
-  b.ctx.renderTurnTimings(panel.element, {turn_timings: {visible_answer_first_ms: 2500, provider_first_packet_ms: 350}});
-  assert.equal(panel.element.querySelector('.turn-timings').textContent,
-    '提交到首段可见答复 2.5 秒 · 模型调用到服务商首包 0.3 秒');
-  b.ctx.renderTurnTimings(panel.element, {terminal_snapshot: {turn_timings: {queue_wait_ms: 100}}});
-  assert.equal(panel.element.querySelectorAll('.turn-timings').length, 1);
   panel.terminal('completed');
   panel.syncTask({...state, display_status: 'completed', finished_at: start + 45}, null, {});
   assert.equal(panel.label.textContent, '已完成');
@@ -163,4 +158,56 @@ test('public figure milestones are deduplicated in live and restored timelines',
       ['已读取附件中的表格信息', '图件已渲染并通过交付校验']);
     assert.doesNotMatch(view.body.textContent, /untrusted-draft|private-raw/);
   }
+});
+
+
+test('narrated timeline shows ordered public labels, never raw tool metadata', t => {
+  const {b, panel} = mount();
+  const replay = mount().panel;
+  t.after(panel.stopClock);
+  t.after(replay.stopClock);
+  const mark = (stage, text, seq) => ({type:'execution_narration', event_id:stage,
+    visibility:'public', job_id:'job', text, seq});
+  const privateBits = {tool_name:'secret_internal_name', display_name:'raw name',
+    reason_code:'context_budget_exhausted', summary:'private summary',
+    action_hint:'raw hint', attempt:2, elapsed_ms:9183};
+  const frames = [
+    ['job', {job_id:'job'}],
+    ['tool_call_start', {tool_call_id:'t', status:'proposed', ...privateBits}],
+    ['execution_narration', mark('read','我先查看表格。',3)],
+    ['tool_executing', {tool_call_id:'t', status:'running', ...privateBits}],
+    ['tool_result', {tool_call_id:'t', status:'failed', ...privateBits}],
+    ['execution_narration', mark('check','接下来检查数据质量。',6)],
+    ['execution_narration', mark('read','我先查看表格。',3)]
+  ];
+  for (const [type,data] of frames.slice(0,3)) panel.receive(type,data);
+  const pending = panel.body.querySelector('.research-process-timeline');
+  assert.equal(pending.children.length, 1);
+  assert.equal(pending.children[0].textContent, frames[2][1].text);
+  assert.equal(pending.querySelector('.research-action-group'), null);
+  for (const [type,data] of frames.slice(3)) panel.receive(type,data);
+  const entries = frames.slice(0,6).map(([event,data],i)=>({seq:i+1,event,data}));
+  b.ctx.projectHistoryTrace(replay,entries.reverse());
+  for (const view of [panel, replay]) {
+    const timeline = view.body.querySelector('.research-process-timeline');
+    assert.deepEqual(Array.from(timeline.children, row => row.textContent),
+      ['我先查看表格。', '处理任务 · 未完成', '接下来检查数据质量。']);
+    assert.doesNotMatch(view.body.textContent,
+      /secret_internal_name|raw name|private summary|raw hint|第 2 次|上下文|9\.2 秒/);
+    assert.equal(timeline.querySelector('.research-action-group'), null);
+  }
+});
+
+
+test('historical terminal diagnostics do not appear beside the user answer', () => {
+  const b = browser();
+  const rows = b.ctx.normalizeHistoryTurns([{turn_request_id:'fixture',
+    user:{content:'问题', request_id:'fixture'}, answer:{content:'可确认的结论。'},
+    terminal_snapshot:{display_status:'completed',turn_timings:{provider_first_packet_ms:350,
+      queue_wait_ms:100, context_maintenance_ms:990, visible_answer_first_ms:2000}}}]);
+  b.ctx.renderHistoryMessages([], rows);
+  const chat = b.get('chat-container');
+  assert.match(chat.querySelector('.turn-answer').innerHTML, /可确认的结论/);
+  assert.equal(chat.querySelector('.turn-timings'), null);
+  assert.doesNotMatch(chat.textContent, /服务商首包|上下文维护用时|队列等待/);
 });

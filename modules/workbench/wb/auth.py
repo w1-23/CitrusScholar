@@ -22,6 +22,8 @@ class Session:
     project: str
     return_to: str
     source_assets: tuple[str, ...] = ()
+    frozen_project: str = ""
+    frozen_render_version: int = 1
 
     @property
     def owner(self):
@@ -75,7 +77,14 @@ def parse_session(claims, *, from_host=False):
         raise InvalidTicket
     if not isinstance(assets, list) or len(assets) > 32 or any(not isinstance(a, str) or not _REF.fullmatch(a) for a in assets):
         raise InvalidTicket
-    return Session("host:" + user if from_host else user, project, return_to, tuple(assets))
+    frozen = claims.get("frozen_project", "")
+    if (not isinstance(frozen, str) or frozen and (not re.fullmatch(r"[a-f0-9]{32}", frozen)
+            or not project.startswith("session:") or not (from_host or user.startswith("host:")))):
+        raise InvalidTicket
+    revision = claims.get("frozen_render_version", 1)
+    if type(revision) is not int or not 1 <= revision <= 999_999_999 or (revision > 1 and not frozen):
+        raise InvalidTicket
+    return Session("host:" + user if from_host else user, project, return_to, tuple(assets), frozen, revision)
 
 
 def session_key():

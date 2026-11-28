@@ -1039,10 +1039,17 @@ def _dedupe_local_passages(rows: list[dict], limit: int) -> list[dict]:
 @tool(response_format="content_and_artifact")
 def local_hybrid_search(query: str, corpus_types: list[str], limit: int = 5,
                         l1_categories: list[str] | None = None) -> Tuple[str, dict]:
-    """Search authorized local sources for relevant evidence. Select only explicit source IDs from the runtime catalog, or pass an empty list to search the authorized default scope when unified retrieval is enabled."""
-    # The inner cache rechecks account permissions and keys the active generation,
-    # authorized corpus IDs and ranking parameters before every cache hit.
-    return _local_hybrid_search_impl(query, corpus_types, min(limit, 5), l1_categories)
+    """Search authorized local sources and return ranked passage text and stable citations in one call. Use runtime source IDs or [] for defaults."""
+    if not _enabled("local_rag"):
+        message, artifact = _disabled("local_rag", "main_results")
+        return message, {**artifact, "local_status": "disabled"}
+    from src.corpus_integration.settings import unified_enabled
+    if not unified_enabled():
+        return "Local evidence service is unavailable.", {
+            "main_results": [], "local_status": "unavailable",
+            "_tool_outcome": {"status": "not_run", "reason_code": "unified_evidence_unavailable", "artifacts": []}}
+    from src.retrieval.unified_observation import observe
+    return observe(query, corpus_types, min(limit, 5), l1_categories, render=True)
 
 
 def _local_hybrid_search_impl(query: str, corpus_types: list[str], limit: int = 6,
@@ -1672,13 +1679,19 @@ def _attach_local_evidence(artifact: dict, generation: str) -> dict:
     return {**artifact, "main_results": rows, "evidence": receipt}
 
 
-@tool(response_format="content_and_artifact")
-def read_local_evidence(ref: str, turn_id: str, generation: str,
-                        offset: int = 0, max_chars: int = 4000) -> Tuple[str, dict]:
-    """Read a bounded slice using a new local candidate's stable read_entry.
+from pydantic import BaseModel, Field
 
-    Use the ref, turn_id and generation returned with that observation. Missing
-    evidence expires explicitly; this operation never re-runs retrieval.
+
+class _LocalEvidenceReadArgs(BaseModel):
+    ref: str = Field(min_length=1, max_length=128)
+    offset: int = Field(default=0, ge=0)
+    max_chars: int = Field(default=4000, ge=1, le=30000)
+
+
+@tool(response_format="content_and_artifact", args_schema=_LocalEvidenceReadArgs)
+def read_local_evidence(ref: str, turn_id: str = "", generation: str = "",
+                        offset: int = 0, max_chars: int = 4000) -> Tuple[str, dict]:
+    """Optionally read more original text when this turn's returned evidence is insufficient. Copy evidence_ref exactly and use next_offset to continue. Does not re-run search.
     """
     if not _enabled("local_rag"):
         return _disabled("local_rag", "main_results")

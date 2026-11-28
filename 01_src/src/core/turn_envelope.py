@@ -177,7 +177,7 @@ def public_task_snapshot(snapshot: dict) -> dict:
 
 def _public_artifact_delivery(delivery: Any) -> dict | None:
     if not isinstance(delivery, dict) or delivery.get("status") not in (
-            "available", "partial", "unavailable"):
+            "available", "partial", "unavailable", "unknown"):
         return None
     from src.core.public_delivery import project_artifact_delivery
 

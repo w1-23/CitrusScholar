@@ -588,6 +588,20 @@ def test_same_render_partial_assets_survive_without_fulfilling_svg_contract():
     assert pending["status"] == pending["delivery_status"] == "unknown"
     assert not pending["artifacts"]
 
+    import json
+
+    from src.core.task_events import public_job_record
+    from src.core.turn_envelope import public_terminal_snapshot
+
+    snapshot = {"display_status": "partial", "artifact_delivery": pending}
+    projected = public_terminal_snapshot(snapshot)
+    assert projected["artifact_delivery"]["status"] == "unknown"
+    assert "limitations" not in projected["artifact_delivery"]
+    job = {"job_id": "fixture", "terminal_snapshot": json.dumps(projected)}
+    history = public_job_record(job)["terminal_snapshot"]["artifact_delivery"]
+    assert history["status"] == "unknown"
+    assert not history["verified_file_ids"] and not history["user_links"]
+
 
 
 def test_frozen_workbench_project_matches_the_verified_render_export(monkeypatch):

@@ -344,6 +344,17 @@ def get_project(figure_id: str, owner_user_id: int) -> dict[str, Any] | None:
     return _row_to_project(row)
 
 
+def find_current_script_exports(owner, session, fmt, asset_id, checksum):
+    """At most two exact matches so a caller can reject ambiguity."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT p.* FROM figure_projects p, json_each(p.exports_json) e "
+            "WHERE p.owner_user_id=? AND p.session_id=? AND p.source_kind='script' "
+            "AND e.key=? AND json_extract(e.value,'$.artifact_id')=? "
+            "AND json_extract(e.value,'$.sha256')=? LIMIT 2", (owner, session, fmt, asset_id, checksum)).fetchall()
+    return [_row_to_project(row) for row in rows]
+
+
 def _export_payload(row, figure_id, version, fmt):
     if row is None:
         return None

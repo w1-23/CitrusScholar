@@ -6430,6 +6430,9 @@ def _history_with_jobs(turns: list[dict], session_id: str, owner: int, *,
             pending["history_pending"] = True
             result.append(pending)
             present.add(job["job_id"])
+    from src.research.artifact_delivery import restore_history_workbench_links
+    for turn in result:
+        restore_history_workbench_links(turn.get("terminal_snapshot") or {}, owner, session_id)
     return result
 
 

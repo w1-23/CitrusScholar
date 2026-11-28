@@ -731,3 +731,32 @@ def test_card_only_completion_revalidates_selected_verified_links_on_replay():
     assert reviewed_completion_valid(proof(contract), rows)
     assert not reviewed_completion_valid(proof(contract | {"verified_card_links": [link + "-other"]}), rows)
     assert not reviewed_completion_valid(proof(contract | {"verified_links": []}), rows)
+
+
+
+def test_historical_workbench_link_requires_exact_unambiguous_export(tmp_path, monkeypatch):
+    import json
+    from src.figures import store
+    from src.research.artifact_delivery import restore_history_workbench_links
+
+    monkeypatch.setattr(store, "_STATE_DIR", tmp_path)
+    monkeypatch.setenv("CITRUS_WORKBENCH_BRIDGE_ENABLED", "1")
+    fid, asset_id, sha = "a" * 32, "b" * 32, "c" * 64
+    sid = "fixture-session"
+    def add(ref):
+        with store._connect() as db:
+            db.execute("INSERT INTO figure_projects (figure_id,owner_user_id,session_id,source_kind,source_json,exports_json,created_at,updated_at,render_version) VALUES (?,?,?,?,?,?,1,1,1)",
+                       (ref, 7, sid, "script", json.dumps({"frozen_render":{"receipt":{}}}),
+                        json.dumps({"svg":{"artifact_id":asset_id,"sha256":sha}})))
+    def check(owner=7, session=sid, fmt="svg", checksum=sha, status="passed"):
+        asset = {"asset_ref":asset_id,"format":fmt,"sha256":checksum,"validation":{"status":status}}
+        terminal = {"artifact_delivery":{"status":"partial","artifacts":[asset],"verified_file_ids":[asset_id]}}
+        restore_history_workbench_links(terminal, owner, session)
+        return asset.get("workbench_project_ref")
+    add(fid)
+    assert check() == fid
+    assert check(8) is None and check(session="other-session") is None
+    assert check(fmt="png") is None and check(checksum="d"*64) is None
+    assert check(status="failed") is None
+    add("e" * 32)
+    assert check() is None

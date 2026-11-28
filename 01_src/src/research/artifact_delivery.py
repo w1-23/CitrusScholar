@@ -80,6 +80,37 @@ def _render_metadata(owner, session, project_id, export, checksum, lookup, revis
     return result
 
 
+def restore_history_workbench_links(terminal, owner, session):
+    """Fill missing links only from an unambiguous, already verified export."""
+    if os.getenv("CITRUS_WORKBENCH_BRIDGE_ENABLED") != "1" or not session:
+        return
+    from src.figures.store import find_current_script_exports
+
+    delivery = terminal.get("artifact_delivery") or {}
+    if delivery.get("status") not in {"available", "partial"}:
+        return
+    verified = set(delivery.get("verified_file_ids") or ())
+    for asset in delivery.get("artifacts") or ():
+        ref, fmt, checksum = (asset.get(k) for k in ("asset_ref", "format", "sha256"))
+        if (asset.get("workbench_project_ref") or ref not in verified or fmt not in {"svg", "png", "pdf", "tiff"}
+                or asset.get("validation", {}).get("status") != "passed" or not _SHA.fullmatch(checksum or "")):
+            continue
+        try:
+            projects = find_current_script_exports(owner, session, fmt, ref, checksum)
+        except (OSError, sqlite3.Error):
+            continue
+        if len(projects) != 1:
+            continue
+        project, = projects
+        frozen = (project.get("source_json") or {}).get("frozen_render") or {}
+        if not isinstance(frozen, dict) or not isinstance(frozen.get("receipt"), dict):
+            continue
+        meta = _render_metadata(owner, session, project["figure_id"], {"format": fmt, "artifact_id": ref},
+                                checksum, lambda *_: project, project.get("render_version"))
+        if "workbench_project_ref" in meta:
+            asset.update(meta)
+
+
 def build_delivery(*, identity, request_id, rows, messages, requirements=(), select_links=None,
                    gaps=(), delivery_uncertain=False, validate=None, project_lookup=None, verified=None):
     if validate is None:

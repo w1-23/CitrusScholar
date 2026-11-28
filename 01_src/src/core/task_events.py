@@ -157,7 +157,7 @@ def _append(conn, job_id, event, data):
     if event == "done" and isinstance(payload.get("turn_envelope"), dict):
         conn.execute("UPDATE task_jobs SET terminal_snapshot=? WHERE job_id=?", (canonical(payload["turn_envelope"]), job_id))
     return {"seq": seq, "event": event,
-            "data": project_public_event(event, payload) if event == "task_state" else payload,
+            "data": project_public_event(event, payload) if event in {"task_state", "done"} else payload,
             "created_at": now}
 
 
@@ -257,14 +257,12 @@ def replay(job_id, after=0, limit=200, *, conn=None):
 
 def _public_terminal(envelope):
     from src.core.progress_bus import public_tool_reason, public_tool_resolutions
-    from src.core.public_delivery import private_record, project_artifact_delivery, project_fields, timing_fields
+    from src.core.public_delivery import private_record, project_artifact_delivery, project_fields
     if not isinstance(envelope, dict) or private_record(envelope):
         return {}
     visible = project_fields(envelope,
         ids="display_status execution_status acceptance_status acceptance_reason job_status stop_reason",
         numbers="schema_version verified_artifacts terminal_seq", bools="history_saved")
-    if isinstance(envelope.get("turn_timings"), dict):
-        visible["turn_timings"] = timing_fields(envelope["turn_timings"])
     if isinstance(envelope.get("artifact_ids"), (list, tuple)):
         visible["artifact_ids"] = [item for item in envelope["artifact_ids"]
                                   if project_fields({"id": item}, ids="id").get("id")]

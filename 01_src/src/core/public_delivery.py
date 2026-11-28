@@ -524,7 +524,6 @@ def _terminal_event(row):
         _set_object(result, row, key, project_public_question)
     _set_array(result, row, "artifact_ids", _ids)
     _set_object(result, row, "turn_envelope", _public_terminal)
-    _set_object(result, row, "turn_timings", timing_fields)
     return result
 
 
@@ -600,8 +599,6 @@ def project_public_event(event, data):
             result["events_url"] = row["events_url"]
     elif event in ("execution_segment", "retrieval_cache"):
         result = project_fields(row, ids="job_id phase reason_code kind status")
-    elif event == "turn_timings":
-        result = timing_fields(row)
     elif event == "context_maintenance":
         result = {"elapsed_ms": duration_ms(row.get("elapsed_ms"))}
         if row.get("status") in ("compacted", "failed"):

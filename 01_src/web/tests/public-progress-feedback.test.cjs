@@ -53,11 +53,6 @@ test('native note drives waiting, tool activity takes priority, and finish clear
   assert.equal([...panel.element.querySelectorAll('.research-process-note')]
     .filter(note => note.textContent === waiting.text).length, 1);
   assert.doesNotMatch(panel.element.textContent, /private fixture|内部工作说明|外部任务信息|首批响应/);
-  b.ctx.renderTurnTimings(panel.element, {turn_timings: {visible_answer_first_ms: 2500, provider_first_packet_ms: 350}});
-  assert.equal(panel.element.querySelector('.turn-timings').textContent,
-    '提交到首段可见答复 2.5 秒 · 模型调用到服务商首包 0.3 秒');
-  b.ctx.renderTurnTimings(panel.element, {terminal_snapshot: {turn_timings: {queue_wait_ms: 100}}});
-  assert.equal(panel.element.querySelectorAll('.turn-timings').length, 1);
   panel.terminal('completed');
   panel.syncTask({...state, display_status: 'completed', finished_at: start + 45}, null, {});
   assert.equal(panel.label.textContent, '已完成');
@@ -201,4 +196,18 @@ test('narrated timeline shows ordered public labels, never raw tool metadata', t
       /secret_internal_name|raw name|private summary|raw hint|第 2 次|上下文|9\.2 秒/);
     assert.equal(timeline.querySelector('.research-action-group'), null);
   }
+});
+
+
+test('historical terminal diagnostics do not appear beside the user answer', () => {
+  const b = browser();
+  const rows = b.ctx.normalizeHistoryTurns([{turn_request_id:'fixture',
+    user:{content:'问题', request_id:'fixture'}, answer:{content:'可确认的结论。'},
+    terminal_snapshot:{display_status:'completed',turn_timings:{provider_first_packet_ms:350,
+      queue_wait_ms:100, context_maintenance_ms:990, visible_answer_first_ms:2000}}}]);
+  b.ctx.renderHistoryMessages([], rows);
+  const chat = b.get('chat-container');
+  assert.match(chat.querySelector('.turn-answer').innerHTML, /可确认的结论/);
+  assert.equal(chat.querySelector('.turn-timings'), null);
+  assert.doesNotMatch(chat.textContent, /服务商首包|上下文维护用时|队列等待/);
 });

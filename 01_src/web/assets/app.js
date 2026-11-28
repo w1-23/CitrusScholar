@@ -4553,7 +4553,6 @@ async function sendMsg(paperVerification) {
     if (!ownsTurn()) return;
     _turnDisconnected = false;
     processPanel.receive('snapshot', job);
-    renderTurnTimings(botContent, job);
     renderArtifactDelivery(botContent, taskStore.state.artifact_delivery);
     syncWaiting();
     if (taskStore.state.question && taskStore.state.question.status === 'pending' && !CitrusTaskState.displayStatus(job)) {
@@ -4699,7 +4698,6 @@ async function sendMsg(paperVerification) {
       resetTurnOutcome(botContent);
       answerDiv.replaceChildren(); answerDiv.style.display = 'none';
       renderCitationBubbles(citationsDiv, [], clientRequestId, requestSessionId);
-      var timing = botContent.querySelector('.turn-timings'); if (timing) timing.remove();
       isFinalAnswerArmed = false; isAnswerStarted = false;
     }
     if (type === 'answer_start' || type === 'text' || type === 'text_reset') {
@@ -4727,7 +4725,6 @@ async function sendMsg(paperVerification) {
       }
       return;
     }
-    if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) renderTurnTimings(botContent, data);
     // Retired rounds may finish replaying into their own DOM. They cannot
     // release the composer, alter context usage, permissions or the sidebar.
     if (!ownsControls()) {
@@ -6197,7 +6194,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
     if (!owns()) return;
     disconnected = false;
     process.receive('snapshot', job);
-    renderTurnTimings(content, job);
     renderArtifactDelivery(content, store.state.artifact_delivery);
     answer.dataset.displayStatus = store.state.display_status;
     if (!process.terminal(store.state.display_status)) {
@@ -6242,7 +6238,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       finalAnswerReceived = false; armed = false; streamedAnswer = ''; resetTurnOutcome(content);
       hasSavedAnswer = false; answer.replaceChildren();
       if (citationContainer) renderCitationBubbles(citationContainer, [], turn.turnRequestId, sid);
-      var timing = content.querySelector('.turn-timings'); if (timing) timing.remove();
     }
     if (type.indexOf('context_') === 0 || data.context_snapshot) projectContext();
     if (type === 'citations' && data.display === 'bubble_only') {
@@ -6264,7 +6259,6 @@ function bindHistoryTask(turn, content, answer, process, ownsContext, useCompose
       }
     }
     if ((type === 'done' || type === 'error') && CitrusTaskState.displayStatus(data)) {
-      renderTurnTimings(content, data);
       projectTerminal(data);
       process.terminal(CitrusTaskState.displayStatus(data));
       answer.dataset.displayStatus = CitrusTaskState.displayStatus(data);
@@ -6404,7 +6398,6 @@ function bindSettledHistoryDetails(turn, content, answer, process) {
       if (!applying) { process.resetDetails(jobId); applying = true; }
       process.receive(type, data);
       if (type !== 'done' && type !== 'error') return;
-      renderTurnTimings(content, data);
       if (recoveryAnswer && typeof data.answer === 'string' && data.answer.trim() && isPublicAnswerEvent(data)) {
         recoveredAnswer = true;
         answer.innerHTML = renderMarkdownSafe(data.answer);
@@ -6482,7 +6475,6 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
       renderCitationBubbles(citationRow, answer.citation_bubbles, turn.turnRequestId, sessionId, turn.answerProducerJobId);
     }
     if (turn.artifactDelivery) renderArtifactDelivery(contentEl, turn.artifactDelivery);
-    renderTurnTimings(contentEl, turn.terminalSnapshot);
     var process = createResearchProcessPanel(turn.intentSummary || (turn.user && turn.user.content));
     contentEl.insertBefore(process.element, contentEl.firstChild);
     process.receive('snapshot', {terminal_snapshot: turn.terminalSnapshot});
@@ -6523,25 +6515,6 @@ function renderHistoryMessages(msgs, serverTurns, placement) {
 
 /* v8.10: 无会话时自动创建默认会话（主流行为）——打开即有一个会话，历史回答有处可存，
    不再依赖用户手动点 ＋ 新建 */
-function renderTurnTimings(container, source) {
-  var envelope = source && (source.turn_envelope || source.terminal_snapshot);
-  var timing = source && (source.turn_timings || envelope && envelope.turn_timings);
-  if (!timing) return;
-  var labels = {visible_answer_first_ms: '提交到首段可见答复', provider_first_packet_ms: '模型调用到服务商首包',
-    queue_wait_ms: '队列等待', tool_elapsed_ms: '工具累计用时', context_maintenance_ms: '上下文维护用时'};
-  var rows = Object.keys(labels).filter(function (key) { return Number.isFinite(timing[key]) && timing[key] >= 0; })
-    .map(function (key) { return labels[key] + ' ' + (timing[key] / 1000).toFixed(1) + ' 秒'; });
-  if (!rows.length) return;
-  var badge = container.querySelector('.turn-timings');
-  if (!badge) {
-    badge = document.createElement('div'); badge.className = 'turn-timings';
-    badge.style.cssText = 'margin-top:8px;font-size:11px;color:var(--text-muted)';
-    badge.title = '服务端记录的各阶段用时，统计起点不同，不应直接相加。';
-    container.appendChild(badge);
-  }
-  badge.textContent = rows.join(' · ');
-}
-
 var _sessionCreation = null;
 async function createDefaultSession(epoch, preserveComposer) {
   if (epoch !== authEpoch || sessionId) return;

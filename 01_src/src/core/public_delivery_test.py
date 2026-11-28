@@ -51,6 +51,7 @@ class PublicDeliveryTests(unittest.TestCase):
             "artifact_ids": ["a" * 32, {"content": secret}],
             "turn_envelope": {"history_saved": True, "verified_artifacts": 1,
                 "acceptance_reason": {"content": secret}, "task_snapshot": {"completion": secret},
+                "turn_timings": {"queue_wait_ms": 0},
                 "artifact_delivery": {"status": "available", "verified_file_ids": ["b" * 32], "reasoning": secret}},
             "turn_timings": {"queue_wait_ms": 0, "visible_answer_first_ms": 60, "extra": secret}, "seq": 12}
         projected = project_public_event("done", event)
@@ -58,8 +59,9 @@ class PublicDeliveryTests(unittest.TestCase):
         self.assertEqual(projected["answer"], "Result [C2].")
         self.assertEqual(projected["question"]["options"][0]["refs"][0]["column"], "peak area")
         self.assertEqual(projected["turn_envelope"]["artifact_delivery"]["verified_file_ids"], ["b" * 32])
-        self.assertEqual(projected["turn_timings"]["queue_wait_ms"], 0)
-        self.assertIsNone(projected["turn_timings"]["provider_first_packet_ms"])
+        self.assertNotIn("turn_timings", projected)
+        self.assertNotIn("turn_timings", projected["turn_envelope"])
+        self.assertEqual(project_public_event("turn_timings", {"seq": 12, "queue_wait_ms": 3}), {"seq": 12})
         self.assertEqual(project_public_event("unknown", event), {"seq": 12})
         self.assertEqual(project_public_event("text", {"content": secret, "phase": "draft", "seq": 13}), {"seq": 13})
         self.assertNotIn(secret, json.dumps([projected, project_citation_bubbles([evidence])]))
@@ -119,7 +121,10 @@ class PublicDeliveryTests(unittest.TestCase):
         task_events._append(conn, "job", "answer_start", {})
         with patch.object(task_events.time, "time", side_effect=[108, 109]):
             task_events._append(conn, "job", "text", {"content": "public final", "delivery": "committed"})
-            task_events._append(conn, "job", "done", {"answer": "public final", "unknown": "hidden fixture"})
+            live = task_events._append(conn, "job", "done", {"answer": "public final", "unknown": "hidden fixture",
+                                                             "turn_envelope": {"display_status": "completed"}})
+        self.assertNotIn("turn_timings", live["data"])
+        self.assertNotIn("turn_timings", live["data"]["turn_envelope"])
         task_events._append(conn, "job", "context_maintenance", {
             "status": "compacted", "elapsed_ms": 55, "draft": "hidden fixture"})
 
@@ -134,7 +139,10 @@ class PublicDeliveryTests(unittest.TestCase):
         self.assertIn("public final", public)
         self.assertNotIn("legacy provisional fixture", public)
         self.assertEqual(exported["events"][2]["data"], {"seq": 3})
-        self.assertEqual(exported["events"][-2]["data"]["turn_timings"]["visible_answer_first_ms"], 8000)
+        self.assertNotIn("turn_timings", exported["events"][-2]["data"])
+        saved = json.loads(conn.execute("SELECT data FROM task_events WHERE event='done'").fetchone()[0])
+        self.assertEqual(saved["turn_timings"]["visible_answer_first_ms"], 8000)
+        self.assertEqual(saved["turn_envelope"]["turn_timings"], saved["turn_timings"])
         self.assertEqual(exported["events"][-1]["data"], {
             "seq": exported["events"][-1]["seq"], "status": "compacted", "elapsed_ms": 55})
         conn.close()
